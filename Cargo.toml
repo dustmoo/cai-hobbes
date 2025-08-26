@@ -1,0 +1,86 @@
+[package]
+name = "cai-hobbes"
+version = "0.1.0"
+authors = ["Dustin Moore <dustin@clearmirror.ai>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[workspace]
+members = [
+    "apps/macos_app",
+    "apps/windows_app",
+    "packages/feature_clipboard",
+    "packages/hobbes_core",
+]
+
+[workspace.dependencies]
+dioxus = { version = "0.6.3", features = ["router", "fullstack", "desktop"] }
+dioxus-desktop = "0.6.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tray-icon = "0.19.3"
+image = { version = "0.25.1", default-features = false, features = ["png"] }
+dioxus-signals = "0.6.3"
+global-hotkey = "0.5.0"
+dioxus-logger = "0.5.0"
+futures-util = "0.3.31"
+serde_json = "1.0.141"
+tracing = "0.1.40"
+macos-accessibility-client = "0.0.1"
+hobbes_core = { path = "packages/hobbes_core" }
+serde = { version = "1.0", features = ["derive"] }
+dirs = "5.0"
+dioxus-free-icons = { version = "0.9.0", features = ["feather", "font-awesome-brands"] }
+uuid = { version = "1.8.0", features = ["v4", "serde"] }
+reqwest = { version = "0.12.5", features = ["json"] }
+dotenvy = "0.15.7"
+pulldown-cmark = "0.11.0"
+[dependencies]
+dioxus = { version = "0.6.3", features = ["router", "fullstack", "desktop"] }
+dioxus-desktop = "0.6.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tray-icon = "0.19.3"
+image = { version = "0.25.1", default-features = false, features = ["png"] }
+dioxus-signals = "0.6.3"
+global-hotkey = "0.5.0"
+dioxus-logger = "0.5.0"
+futures-util = "0.3.31"
+serde_json = "1.0.141"
+tracing = "0.1.40"
+serde = { version = "1.0", features = ["derive"] }
+macos-accessibility-client = { version = "0.0.1", optional = true }
+dirs = "5.0"
+dioxus-free-icons = { version = "0.9.0", features = ["feather", "font-awesome-brands"] }
+uuid = { version = "1.8.0", features = ["v4", "serde"] }
+reqwest = { version = "0.12.5", features = ["json"] }
+dotenvy = "0.15.7"
+pulldown-cmark = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+macos-accessibility-client = { workspace = true }
+[package.metadata.bundle]
+name = "cai-hobbes"
+identifier = "ai.clearmirror.cai-hobbes"
+icon = ["assets/icon.icns"]
+[package.metadata.bundle.plist]
+NSAppleEventsUsageDescription = "The application needs to listen for global hotkeys to show and hide the main window."
+
+[features]
+default = ["desktop"]
+web = ["dioxus/web"]
+desktop = ["dioxus/desktop", "macos-accessibility-client"]
+mobile = ["dioxus/mobile"]
+
+[profile]
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+
+[profile.server-dev]
+inherits = "dev"
+
+[profile.android-dev]
+inherits = "dev"
+
+

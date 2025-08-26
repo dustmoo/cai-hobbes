@@ -1,0 +1,28 @@
+[package]
+name = "windows_app"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "windows_app"
+path = "../../src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+dioxus = { workspace = true, features = ["desktop"] }
+dioxus-desktop = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tray-icon = { workspace = true }
+image = { workspace = true, features = ["png"] }
+dioxus-signals = { workspace = true }
+global-hotkey = { workspace = true }
+dioxus-logger = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+# Internal packages
+hobbes_core = { path = "../../packages/hobbes_core" }
+serde = { version = "1.0", features = ["derive"] }
