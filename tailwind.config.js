@@ -11,6 +11,24 @@ module.exports = {
   ],
   theme: {
     extend: {
+      typography: ({ theme }) => ({
+        DEFAULT: {
+          css: {
+            '--tw-prose-code': theme('colors.pink[400]'),
+            'code': {
+              color: '#c0c5ce', // base16-ocean.dark default text
+              fontFamily: "'Fira Code', 'Courier New', monospace",
+            },
+            'pre': {
+              backgroundColor: '#2b303b', // base16-ocean.dark background
+              color: '#c0c5ce',
+            },
+            // This is a simplified approach. For full syntect theme mapping,
+            // you would add more specific selectors here if needed,
+            // but syntect applies inline styles, so this primarily sets the container.
+          },
+        },
+      }),
       keyframes: {
         'pulse-fast': {
           '0%, 100%': { opacity: '1' },

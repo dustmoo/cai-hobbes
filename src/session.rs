@@ -5,17 +5,22 @@ use std::path::PathBuf;
 use uuid;
 use dirs;
 
+use serde_json::Value;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Session {
     pub id: String,
     pub name: String,
     pub messages: Vec<super::components::chat::Message>,
+    pub active_context: HashMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionState {
     pub sessions: HashMap<String, Session>,
     pub active_session_id: String,
+    pub window_width: f64,
+    pub window_height: f64,
 }
 
 fn get_sessions_path() -> Option<PathBuf> {
@@ -38,10 +43,12 @@ impl SessionState {
         })
     }
 
-    fn load() -> Result<Self, std::io::Error> {
+    pub fn load() -> Result<Self, std::io::Error> {
         let path = get_sessions_path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find sessions path"))?;
         let data = fs::read_to_string(path)?;
-        serde_json::from_str(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let state: Self = serde_json::from_str(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        tracing::info!("Loaded window size: {}x{}", state.window_width, state.window_height);
+        Ok(state)
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
@@ -56,6 +63,7 @@ impl SessionState {
             id: new_id.clone(),
             name: format!("Chat {}", self.sessions.len() + 1),
             messages: vec![],
+            active_context: HashMap::new(),
         };
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id;
@@ -79,19 +87,36 @@ impl SessionState {
         }
     }
 
+    pub fn get_active_session(&self) -> Option<&Session> {
+        self.sessions.get(&self.active_session_id)
+    }
+
+    pub fn get_active_session_mut(&mut self) -> Option<&mut Session> {
+        self.sessions.get_mut(&self.active_session_id)
+    }
     pub fn set_active_session(&mut self, id: String) {
         self.active_session_id = id;
         if let Err(e) = self.save() {
             tracing::error!("Failed to save session state after setting active session: {}", e);
         }
     }
-}
 
+    pub fn update_window_size(&mut self, width: f64, height: f64) {
+        tracing::info!("Updating window size in state to: {}x{}", width, height);
+        self.window_width = width;
+        self.window_height = height;
+        if let Err(e) = self.save() {
+            tracing::error!("Failed to save session state after updating window size: {}", e);
+        }
+    }
+}
 impl Default for SessionState {
     fn default() -> Self {
         Self {
             sessions: HashMap::new(),
             active_session_id: String::new(),
+            window_width: 675.0,
+            window_height: 750.0,
         }
     }
 }

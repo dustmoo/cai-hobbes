@@ -10,4 +10,5 @@ name = "feature_clipboard"
 path = "src/lib.rs"
 
 [dependencies]
-# Dependencies will be added here as needed.
+arboard = "3.4.0"
+tracing = "0.1"

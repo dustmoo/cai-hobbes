@@ -28,6 +28,7 @@ serde_json = "1.0.141"
 tracing = "0.1.40"
 macos-accessibility-client = "0.0.1"
 hobbes_core = { path = "packages/hobbes_core" }
+feature_clipboard = { path = "packages/feature_clipboard" }
 serde = { version = "1.0", features = ["derive"] }
 dirs = "5.0"
 dioxus-free-icons = { version = "0.9.0", features = ["feather", "font-awesome-brands"] }
@@ -35,6 +36,8 @@ uuid = { version = "1.8.0", features = ["v4", "serde"] }
 reqwest = { version = "0.12.5", features = ["json"] }
 dotenvy = "0.15.7"
 pulldown-cmark = "0.11.0"
+syntect = "5.2.0"
+lazy_static = "1.4.0"
 [dependencies]
 dioxus = { version = "0.6.3", features = ["router", "fullstack", "desktop"] }
 dioxus-desktop = "0.6.3"
@@ -55,9 +58,14 @@ uuid = { version = "1.8.0", features = ["v4", "serde"] }
 reqwest = { version = "0.12.5", features = ["json"] }
 dotenvy = "0.15.7"
 pulldown-cmark = { workspace = true }
+syntect = { workspace = true }
+lazy_static = { workspace = true }
+feature_clipboard = { workspace = true }
+thiserror = "1.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = { workspace = true }
+security-framework = "2.11.0"
 [package.metadata.bundle]
 name = "cai-hobbes"
 identifier = "ai.clearmirror.cai-hobbes"
