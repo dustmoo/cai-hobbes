@@ -62,7 +62,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     const el = document.getElementById('message-list');
                     if (el) {
                         // If the user is within 50px of the bottom, we consider them "at the bottom".
-                        const threshold = 150;
+                        const threshold = el.clientHeight * 0.2; // 20% of the viewport height
                         return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
                     }
                     // Default to true if the element doesn't exist yet, so we scroll on the first load.

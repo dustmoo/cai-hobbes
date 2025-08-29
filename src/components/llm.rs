@@ -183,7 +183,7 @@ A crucial part of your task is to analyze the **sentiment and mood** of the user
 
 Format your response as a single, clean JSON object with three keys: "summary", "entities", and "sentiment".
 - "summary": A concise, updated summary of the entire conversation so far.
-- "entities": An object containing all key-value pairs of extracted information from the whole conversation.
+- "entities": An object containing all key-value pairs of extracted information. If the user mentions their name, be sure to extract it and include it as `{{\"user_name\": \"...\"}}` in this object.
 - "sentiment": A brief string describing the user's current sentiment or mood (e.g., "curious and collaborative", "frustrated but focused", "pleased with the progress", "neutral"). This should reflect the feeling of the recent messages.
 
 Previous Summary:
