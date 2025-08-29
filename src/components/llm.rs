@@ -4,7 +4,7 @@ use std::env;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-const API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent";
+const API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:streamGenerateContent";
 const FLASH_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
 
 #[derive(Serialize)]
@@ -56,7 +56,10 @@ struct PartResponse {
 
 pub async fn generate_content_stream(prompt: String, tx: mpsc::UnboundedSender<String>) {
     let api_key = env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set");
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .expect("Failed to build reqwest client");
 
     let request_body = GeminiRequest {
         contents: vec![Content {
@@ -86,38 +89,54 @@ pub async fn generate_content_stream(prompt: String, tx: mpsc::UnboundedSender<S
     }
 
     let mut stream = response.bytes_stream();
-
-    let mut buffer = String::new();
     let mut has_sent_data = false;
+    let mut finish_reason: Option<String> = None;
+
+    // With the `:streamGenerateContent` endpoint, we receive Server-Sent Events (SSE).
+    // This is a much simpler and more robust way to handle streaming compared to
+    // manually buffering bytes and searching for JSON objects. The previous implementation
+    // was unnecessarily complex because it was trying to stream from a non-streaming endpoint.
     while let Some(item) = stream.next().await {
         match item {
             Ok(bytes) => {
-                let chunk = match std::str::from_utf8(&bytes) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-
-                for line in chunk.lines() {
+                // The SSE format sends data in chunks, often line-by-line.
+                // We process each line that starts with "data: ".
+                for line in std::str::from_utf8(&bytes).unwrap_or("").lines() {
                     if line.starts_with("data: ") {
-                        buffer.push_str(&line[6..]);
-                        if let Ok(parsed) = serde_json::from_str::<GeminiResponse>(&buffer) {
-                            if let Some(candidate) = parsed.candidates.get(0) {
-                                if let Some(reason) = &candidate.finish_reason {
-                                    if reason != "STOP" {
-                                        tracing::warn!("Gemini stream finished with reason: {}", reason);
-                                    }
-                                }
-                                if let Some(part) = candidate.content.parts.get(0) {
-                                    if !part.text.is_empty() {
-                                        if tx.send(part.text.clone()).is_err() {
-                                            tracing::error!("Failed to send content chunk to UI.");
-                                            return;
+                        let json_str = &line["data: ".len()..];
+                        match serde_json::from_str::<GeminiResponse>(json_str) {
+                            Ok(parsed) => {
+                                if let Some(candidate) = parsed.candidates.get(0) {
+                                    // Capture the finish reason if the API provides it.
+                                    if let Some(reason) = &candidate.finish_reason {
+                                        finish_reason = Some(reason.clone());
+                                        if reason != "STOP" {
+                                            tracing::warn!("Gemini stream finished with reason: {}", reason);
                                         }
-                                        has_sent_data = true;
+                                    }
+                                    // Extract the text part and send it to the UI.
+                                    if let Some(part) = candidate.content.parts.get(0) {
+                                        if !part.text.is_empty() {
+                                            if tx.send(part.text.clone()).is_err() {
+                                                tracing::error!("Failed to send content chunk to UI.");
+                                                return; // Exit if the UI receiver is gone.
+                                            }
+                                            has_sent_data = true;
+                                        }
                                     }
                                 }
                             }
-                            buffer.clear();
+                            Err(e) => {
+                                // If we receive malformed JSON, it indicates a problem with the stream.
+                                // We log the detailed error for debugging and send a user-friendly
+                                // message to the UI, then terminate the stream.
+                                let error_message = "[Hobbes encountered a stream error. Please check the logs for details.]";
+                                tracing::error!("Failed to parse JSON chunk from stream: {}. Chunk: '{}'", e, json_str);
+                                if tx.send(error_message.to_string()).is_err() {
+                                    tracing::error!("Failed to send stream error message to UI.");
+                                }
+                                return; // Stop processing the stream.
+                            }
                         }
                     }
                 }
@@ -129,8 +148,14 @@ pub async fn generate_content_stream(prompt: String, tx: mpsc::UnboundedSender<S
         }
     }
 
+    // After the stream, if no actual content was sent, we send a default message
+    // based on the finish reason we captured.
     if !has_sent_data {
-        let default_message = "[Hobbes did not provide a response. This could be due to a safety filter or an internal error.]".to_string();
+        let default_message = match finish_reason.as_deref() {
+            Some("SAFETY") => "[Hobbes did not provide a response due to the safety filter.]".to_string(),
+            Some(reason) => format!("[Hobbes did not provide a response. Finish Reason: {}]", reason),
+            None => "[Hobbes did not provide a response due to an internal error.]".to_string(),
+        };
         if tx.send(default_message).is_err() {
             tracing::error!("Failed to send default message to UI.");
         }
@@ -139,7 +164,10 @@ pub async fn generate_content_stream(prompt: String, tx: mpsc::UnboundedSender<S
 
 pub async fn summarize_conversation(recent_messages: String) -> Result<serde_json::Value, reqwest::Error> {
     let api_key = env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set");
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .expect("Failed to build reqwest client");
 
     let system_prompt = r#"
 You are an AI assistant that processes a conversation and extracts key entities and a brief summary.

@@ -348,6 +348,7 @@ dependencies = [
  "dirs 5.0.1",
  "dotenvy",
  "feature_clipboard",
+ "futures",
  "futures-util",
  "global-hotkey",
  "image",

@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 use dioxus_free_icons::{Icon, icons::fi_icons};
 use std::rc::Rc;
@@ -39,8 +40,8 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     let mut draft = use_signal(|| "".to_string());
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut has_interacted = use_signal(|| false);
+    let is_sending = use_signal(|| false);
     let stream_manager = consume_context::<StreamManagerContext>();
-
     // Effect to report content size changes and conditionally scroll to bottom
     use_effect(move || {
         // By reading the session state here, the effect becomes dependent on it.
@@ -86,6 +87,12 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
 
     // Reusable closure for sending a message
     let mut send_message = move || {
+        tracing::info!("'send_message' entered.");
+        // Prevent concurrent message sends.
+        if *is_sending.read() {
+            tracing::warn!("'send_message' blocked: already sending.");
+            return;
+        }
         let user_message = draft.read().clone();
         if user_message.is_empty() {
             return;
@@ -102,9 +109,16 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         // Clone necessary signals and data for the async task
         let mut session_state_clone = session_state.clone();
         let stream_manager_clone = stream_manager.clone();
-
+        let mut is_sending_clone = is_sending.clone();
+ 
         // Spawn a single async task to handle all state mutations and side effects
         spawn(async move {
+            // Set the lock.
+            is_sending_clone.set(true);
+            tracing::info!("Lock ACQUIRED.");
+
+            // Create a channel to signal completion from the stream manager.
+            let (tx, mut rx) = mpsc::unbounded_channel::<()>();
             // 1. Prepare message and context
             let hobbes_message_id = Uuid::new_v4();
             // 2. Perform initial state mutations
@@ -160,7 +174,22 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             }
 
             // 5. Start the stream using the manager
-            stream_manager_clone.start_stream(hobbes_message_id, final_message);
+            // 5. Start the stream using the manager
+            let on_complete = move || {
+                // This closure is now Send-able as it only moves the sender.
+                let _ = tx.send(());
+            };
+            tracing::info!(message_id = %hobbes_message_id, "'send_message' calling 'start_stream'.");
+            stream_manager_clone.start_stream(hobbes_message_id, final_message, on_complete);
+
+            // 6. Wait for the stream to complete
+            // This will pause the execution of this task until the on_complete callback is called.
+            rx.recv().await;
+            tracing::info!(message_id = %hobbes_message_id, "Stream completion signal RECEIVED.");
+
+            // 7. Release the lock
+            is_sending_clone.set(false);
+            tracing::info!("Lock RELEASED.");
         });
     };
 

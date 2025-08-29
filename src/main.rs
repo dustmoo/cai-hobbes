@@ -41,7 +41,7 @@ fn main() {
                 .with_menu(None)
                 .with_window(
                     WindowBuilder::new()
-                        .with_visible(false)
+                        .with_visible(true)
                         .with_resizable(true)
                         .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(initial_width, initial_height)),
                 )
@@ -77,17 +77,15 @@ fn app() -> Element {
     let session_state = use_context_provider(|| Signal::new(SessionState::new()));
     let mut show_session_manager = use_signal(|| false);
     let mut last_known_size = use_signal(|| PhysicalSize::new(0, 0));
-
-
     // This handler continuously updates the last known size during a resize.
     use_wry_event_handler(move |event, _| {
         if let Event::WindowEvent { event, .. } = event {
-            if let WindowEvent::Resized(new_size) = event {
+             if let WindowEvent::Resized(new_size) = event {
                 last_known_size.set(*new_size);
             }
         }
     });
-
+ 
     // This single effect will run on every render, checking the current signal values.
     let window_clone = window.clone();
     use_effect(move || {
