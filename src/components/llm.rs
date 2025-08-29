@@ -162,27 +162,38 @@ pub async fn generate_content_stream(prompt: String, tx: mpsc::UnboundedSender<S
     }
 }
 
-pub async fn summarize_conversation(recent_messages: String) -> Result<serde_json::Value, reqwest::Error> {
+pub async fn summarize_conversation(
+    previous_summary: String,
+    recent_messages: String,
+) -> Result<serde_json::Value, reqwest::Error> {
     let api_key = env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set");
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .expect("Failed to build reqwest client");
 
-    let system_prompt = r#"
-You are an AI assistant that processes a conversation and extracts key entities and a brief summary.
-Analyze the following conversation snippet. Identify key facts, entities, or user-stated preferences.
+    let full_prompt = format!(
+        r#"
+You are an AI assistant that refines a conversation summary.
+You will be given a previous summary (which may be empty) and the most recent messages in a conversation.
+Your task is to integrate the new information from the recent messages into the previous summary, updating and extending it.
+Preserve existing information while incorporating new facts, entities, or user preferences.
 Format your response as a single, clean JSON object with two keys: "summary" and "entities".
-- "summary": A concise, one-sentence summary of the conversation.
-- "entities": An object containing key-value pairs of extracted information.
-For example, if a user mentions a password, you could extract: {"password": "the_password"}.
-If no specific entities are found, return an empty "entities" object.
+- "summary": A concise, updated summary of the entire conversation so far.
+- "entities": An object containing all key-value pairs of extracted information from the whole conversation.
 
-Conversation:
+Previous Summary:
 ---
-"#;
+{}
+---
 
-    let full_prompt = format!("{}{}", system_prompt, recent_messages);
+Recent Messages:
+---
+{}
+"#,
+        previous_summary,
+        recent_messages
+    );
 
     let request_body = GeminiRequest {
         contents: vec![Content {
