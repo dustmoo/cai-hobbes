@@ -176,11 +176,15 @@ pub async fn summarize_conversation(
         r#"
 You are an AI assistant that refines a conversation summary.
 You will be given a previous summary (which may be empty) and the most recent messages in a conversation.
-Your task is to integrate the new information from the recent messages into the previous summary, updating and extending it.
+Your primary task is to integrate the new information from the recent messages into the previous summary, updating and extending it.
 Preserve existing information while incorporating new facts, entities, or user preferences.
-Format your response as a single, clean JSON object with two keys: "summary" and "entities".
+
+A crucial part of your task is to analyze the **sentiment and mood** of the user in the "Recent Messages".
+
+Format your response as a single, clean JSON object with three keys: "summary", "entities", and "sentiment".
 - "summary": A concise, updated summary of the entire conversation so far.
 - "entities": An object containing all key-value pairs of extracted information from the whole conversation.
+- "sentiment": A brief string describing the user's current sentiment or mood (e.g., "curious and collaborative", "frustrated but focused", "pleased with the progress", "neutral"). This should reflect the feeling of the recent messages.
 
 Previous Summary:
 ---

@@ -36,12 +36,16 @@ pub struct Message {
 // The main ChatWindow component
 #[component]
 pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interaction: EventHandler<()>, on_toggle_sessions: EventHandler<()>) -> Element {
-    let session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let mut draft = use_signal(|| "".to_string());
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut has_interacted = use_signal(|| false);
     let is_sending = use_signal(|| false);
     let stream_manager = consume_context::<StreamManagerContext>();
+    const INITIAL_MESSAGES_TO_SHOW: usize = 20;
+    let mut show_scroll_button = use_signal(|| false);
+    let mut is_initial_load = use_signal(|| true);
+    let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     // Effect to report content size changes and conditionally scroll to bottom
     use_effect(move || {
         // By reading the session state here, the effect becomes dependent on it.
@@ -58,7 +62,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     const el = document.getElementById('message-list');
                     if (el) {
                         // If the user is within 50px of the bottom, we consider them "at the bottom".
-                        const threshold = 50;
+                        const threshold = 150;
                         return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
                     }
                     // Default to true if the element doesn't exist yet, so we scroll on the first load.
@@ -69,14 +73,20 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     true // Also default to true if the eval fails.
                 };
 
-                // Only scroll if the user was already near the bottom.
-                if is_near_bottom {
+                // Set the visibility of the scroll button based on whether the user is near the bottom.
+                show_scroll_button.set(!is_near_bottom);
+
+                // On the very first load, we always scroll to the bottom.
+                // On subsequent loads, we only scroll if the user was already near the bottom.
+                if *is_initial_load.read() || is_near_bottom {
                     let _ = document::eval(r#"
                         const el = document.getElementById('message-list');
                         if (el) { el.scrollTop = el.scrollHeight; }
                     "#).await;
+                    if *is_initial_load.read() {
+                        is_initial_load.set(false);
+                    }
                 }
-
                 // Finally, notify the parent component of the new content size.
                 if let Ok(rect) = element.get_client_rect().await {
                     on_content_resize.call(rect.cast_unit());
@@ -201,22 +211,119 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             class: "{root_classes}",
             onmounted: move |cx| container_element.set(Some(cx.data())),
             div {
-                id: "message-list",
-                class: "flex-1 overflow-y-auto p-4 space-y-4 min-h-0",
-                {
-                    let state = session_state.read();
-                    if let Some(session) = state.sessions.get(&state.active_session_id) {
-                        if session.messages.is_empty() {
-                            rsx! { WelcomeMessage {} }
-                        } else {
-                            rsx! {
-                                for message in &session.messages {
-                                    MessageBubble { key: "{message.id}", message: message.clone() }
+                class: "relative flex-1 min-h-0", // Container for positioning
+                div {
+                    id: "message-list",
+                    class: "flex-1 overflow-y-auto p-4 space-y-4 min-h-0 h-full", // Ensure it fills the container
+                    onscroll: move |_| {
+                        let mut show_scroll_button = show_scroll_button.clone();
+                        let mut visible_message_count = visible_message_count.clone();
+                        let session_state = session_state.clone();
+
+                        spawn(async move {
+                            // Check scroll position for both top and bottom
+                            let scroll_info = if let Ok(result) = document::eval(r#"
+                                const el = document.getElementById('message-list');
+                                if (el) {
+                                    const isAtTop = el.scrollTop === 0;
+                                    const threshold = 10;
+                                    const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+                                    return { isAtTop, isAtBottom };
+                                }
+                                return { isAtTop: false, isAtBottom: true }; // Default state
+                            "#).await {
+                                result
+                            } else {
+                                serde_json::from_str("{\"isAtTop\":false, \"isAtBottom\":true}").unwrap()
+                            };
+
+                            let is_at_top = scroll_info.get("isAtTop").unwrap().as_bool().unwrap_or(false);
+                            let is_at_bottom = scroll_info.get("isAtBottom").unwrap().as_bool().unwrap_or(true);
+
+                            // Show the scroll-to-bottom button if the user is NOT at the bottom
+                            show_scroll_button.set(!is_at_bottom);
+
+                            // If user scrolls to the top, load more messages while preserving scroll position
+                            if is_at_top {
+                                let total_messages = session_state.read().get_active_session().map_or(0, |s| s.messages.len());
+                                if *visible_message_count.read() < total_messages {
+                                    // 1. Get current scroll state BEFORE adding new messages
+                                    let _ = document::eval(r#"
+                                        const el = document.getElementById('message-list');
+                                        if (el) {
+                                            window.prevScrollHeight = el.scrollHeight;
+                                            window.prevScrollTop = el.scrollTop;
+                                        }
+                                    "#).await;
+
+                                    // 2. Load more messages
+                                    let current_count = *visible_message_count.read();
+                                    visible_message_count.set(current_count + INITIAL_MESSAGES_TO_SHOW);
+
+                                    // 3. After the next render, adjust scroll position
+                                    sleep(Duration::from_millis(20)).await; // Give it a moment to render
+                                    let _ = document::eval(r#"
+                                        const el = document.getElementById('message-list');
+                                        if (el && window.prevScrollHeight) {
+                                            const newScrollHeight = el.scrollHeight;
+                                            const heightDifference = newScrollHeight - window.prevScrollHeight;
+                                            el.scrollTop = window.prevScrollTop + heightDifference;
+                                            // Clean up global variables
+                                            delete window.prevScrollHeight;
+                                            delete window.prevScrollTop;
+                                        }
+                                    "#).await;
                                 }
                             }
+                        });
+                    },
+                    {
+                        let state = session_state.read();
+                        if let Some(session) = state.sessions.get(&state.active_session_id) {
+                            let total_messages = session.messages.len();
+                            let messages_to_render = session.messages.iter().skip(total_messages.saturating_sub(*visible_message_count.read())).collect::<Vec<_>>();
+
+                            if session.messages.is_empty() {
+                                rsx! { WelcomeMessage {} }
+                            } else {
+                                rsx! {
+                                    if total_messages > *visible_message_count.read() {
+                                        div {
+                                            class: "flex justify-center",
+                                            button {
+                                                class: "text-sm text-purple-400 hover:text-purple-300 focus:outline-none",
+                                                onclick: move |_| {
+                                                    let current_count = *visible_message_count.read();
+                                                    visible_message_count.set(current_count + INITIAL_MESSAGES_TO_SHOW);
+                                                },
+                                                "Load More"
+                                            }
+                                        }
+                                    }
+                                    for message in messages_to_render {
+                                        MessageBubble { key: "{message.id}", message: message.clone() }
+                                    }
+                                }
+                            }
+                        } else {
+                            rsx! { WelcomeMessage {} }
                         }
-                    } else {
-                        rsx! { WelcomeMessage {} }
+                    }
+                }
+                if *show_scroll_button.read() {
+                    button {
+                        class: "absolute bottom-4 right-4 z-10 p-2 bg-purple-600 text-white rounded-full shadow-lg hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 transition-opacity duration-300 ease-in-out",
+                        onclick: move |_| {
+                            let _ = document::eval(r#"
+                                const el = document.getElementById('message-list');
+                                if (el) { el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }); }
+                            "#);
+                        },
+                        Icon {
+                            width: 20,
+                            height: 20,
+                            icon: fi_icons::FiChevronDown
+                        }
                     }
                 }
             }
@@ -225,6 +332,15 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 onmousedown: |e| e.stop_propagation(),
                 div {
                     class: "flex items-center space-x-3",
+                    button {
+                        class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                        onclick: move |_| on_toggle_sessions.call(()),
+                        Icon {
+                            width: 20,
+                            height: 20,
+                            icon: fi_icons::FiMenu
+                        }
+                    }
                     textarea {
                         id: "chat-textarea",
                         class: "flex-1 py-2 px-4 rounded-xl bg-gray-800 border border-gray-700 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none overflow-y-hidden",
@@ -272,11 +388,13 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     }
                     button {
                         class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
-                        onclick: move |_| on_toggle_sessions.call(()),
+                        onclick: move |_| {
+                            session_state.write().create_session();
+                        },
                         Icon {
                             width: 20,
                             height: 20,
-                            icon: fi_icons::FiMenu
+                            icon: fi_icons::FiPlus
                         }
                     }
                     button {

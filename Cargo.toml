@@ -63,6 +63,7 @@ lazy_static = { workspace = true }
 feature_clipboard = { workspace = true }
 thiserror = "1.0"
 futures = "0.3.31"
+chrono = { version = "0.4.41", features = ["serde"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = { workspace = true }

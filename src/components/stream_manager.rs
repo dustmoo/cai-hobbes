@@ -59,6 +59,7 @@ impl StreamManagerContext {
             tracing::info!(message_id = %message_id, "Acquiring session state WRITE lock...");
             let mut state = self.session_state.write();
             tracing::info!(message_id = %message_id, "Session state WRITE lock ACQUIRED.");
+            state.touch_active_session();
             if let Some(session) = state.get_active_session_mut() {
                 if let Some(message) = session.messages.iter_mut().find(|m| m.id == message_id) {
                     message.content = full_response;

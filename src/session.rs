@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -13,6 +14,7 @@ pub struct Session {
     pub name: String,
     pub messages: Vec<super::components::chat::Message>,
     pub active_context: HashMap<String, Value>,
+    pub last_updated: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -64,6 +66,7 @@ impl SessionState {
             name: format!("Chat {}", self.sessions.len() + 1),
             messages: vec![],
             active_context: HashMap::new(),
+            last_updated: Utc::now(),
         };
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id;
@@ -94,6 +97,12 @@ impl SessionState {
     pub fn get_active_session_mut(&mut self) -> Option<&mut Session> {
         self.sessions.get_mut(&self.active_session_id)
     }
+
+    pub fn touch_active_session(&mut self) {
+        if let Some(session) = self.sessions.get_mut(&self.active_session_id) {
+            session.last_updated = Utc::now();
+        }
+    }
     pub fn set_active_session(&mut self, id: String) {
         self.active_session_id = id;
         if let Err(e) = self.save() {
@@ -107,6 +116,15 @@ impl SessionState {
         self.window_height = height;
         if let Err(e) = self.save() {
             tracing::error!("Failed to save session state after updating window size: {}", e);
+        }
+    }
+
+    pub fn update_session_name(&mut self, id: &str, new_name: String) {
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.name = new_name;
+            if let Err(e) = self.save() {
+                tracing::error!("Failed to save session state after updating session name: {}", e);
+            }
         }
     }
 }
