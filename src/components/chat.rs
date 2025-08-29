@@ -5,8 +5,6 @@ use std::rc::Rc;
 use dioxus::html::geometry::euclid::Rect;
 use std::time::Duration;
 use tokio::time::sleep;
-use crate::components::llm;
-use tokio::sync::mpsc;
 use pulldown_cmark::{html, Options, Parser, Event, Tag, TagEnd};
 use crate::components::stream_manager::StreamManagerContext;
 use lazy_static::lazy_static;
@@ -161,10 +159,8 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 tracing::error!("Failed to save session state: {}", e);
             }
 
-            // 5. Set up the stream and start the LLM call
-            let (tx, rx) = mpsc::unbounded_channel::<String>();
-            stream_manager_clone.start_stream(hobbes_message_id, rx);
-            llm::generate_content_stream(final_message, tx).await;
+            // 5. Start the stream using the manager
+            stream_manager_clone.start_stream(hobbes_message_id, final_message);
         });
     };
 
@@ -347,7 +343,8 @@ fn CodeBlock(code: String, lang: String) -> Element {
 #[component]
 fn MessageBubble(message: Message) -> Element {
     let stream_manager = consume_context::<StreamManagerContext>();
-    let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
+    // This is currently unused after the refactor, but we'll keep it for potential future use.
+    let _session_state = consume_context::<Signal<crate::session::SessionState>>();
     let mut content = use_signal(|| message.content.clone());
     let is_user = message.author == "User";
     let mut is_hovered = use_signal(|| false);
@@ -359,26 +356,10 @@ fn MessageBubble(message: Message) -> Element {
         if !is_user && stream_manager.is_streaming(&message.id) {
             spawn(async move {
                 if let Some(mut rx) = stream_manager.take_stream(&message.id) {
+                    // This component now ONLY updates its local content for display.
+                    // The StreamManager is responsible for the final state update and save.
                     while let Some(chunk) = rx.recv().await {
                         content.write().push_str(&chunk);
-                    }
-                    // After the stream is done, update the global state
-                    let final_content = content.read().clone();
-                    
-                    // Perform the write in a new scope to ensure the lock is dropped immediately.
-                    {
-                        let mut state = session_state.write();
-                        let active_id = state.active_session_id.clone();
-                        if let Some(session) = state.sessions.get_mut(&active_id) {
-                            if let Some(msg) = session.messages.iter_mut().find(|m| m.id == message.id) {
-                                msg.content = final_content;
-                            }
-                        }
-                    } // Write lock is dropped here
-
-                    // Save the state with a read lock, which is safer.
-                    if let Err(e) = session_state.read().save() {
-                        tracing::error!("Failed to save session state after stream: {}", e);
                     }
                 }
             });

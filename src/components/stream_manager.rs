@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 use std::collections::HashMap;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use uuid::Uuid;
 use crate::session::SessionState;
 use crate::components::llm;
@@ -16,27 +16,41 @@ impl StreamManagerContext {
         self.stream_receivers.read().contains_key(message_id)
     }
 
-    pub fn start_and_manage_stream(
+    pub fn start_stream(
         mut self,
         message_id: Uuid,
         final_prompt: String,
-        llm_tx: UnboundedSender<String>,
-        ui_rx: UnboundedReceiver<String>,
     ) {
-        // Insert the receiver for the UI to consume
+        // Create a channel for the UI to receive chunks.
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel::<String>();
+        
+        // Store the receiver for the MessageBubble to pick up.
         self.stream_receivers.write().insert(message_id, ui_rx);
 
-        // Spawn the task that handles the entire lifecycle
+        // Spawn a master task to manage the LLM call and state updates.
         spawn(async move {
-            // This task will own the final state update logic
-            let mut full_response = String::new();
-            let mut stream_rx = llm::generate_content_stream_channel(final_prompt, llm_tx).await;
+            // Create the channel for the LLM to send chunks to.
+            let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<String>();
 
-            while let Some(chunk) = stream_rx.recv().await {
+            // Spawn the LLM task. It runs in the background.
+            spawn(async move {
+                llm::generate_content_stream(final_prompt, llm_tx).await;
+            });
+
+            // This part of the task listens for chunks from the LLM,
+            // forwards them to the UI, and builds the final response.
+            let mut full_response = String::new();
+            while let Some(chunk) = llm_rx.recv().await {
+                // Forward the chunk to the UI. If it fails, the UI component
+                // has probably been dropped, so we can stop.
+                if ui_tx.send(chunk.clone()).is_err() {
+                    break;
+                }
                 full_response.push_str(&chunk);
             }
 
-            // Stream is complete, now update the global state
+            // Stream is complete. Now, write the final content to the session state.
+            // This is the single source of truth for the final state update.
             let mut state = self.session_state.write();
             if let Some(session) = state.get_active_session_mut() {
                 if let Some(message) = session.messages.iter_mut().find(|m| m.id == message_id) {
@@ -44,7 +58,7 @@ impl StreamManagerContext {
                 }
             }
             
-            // Save the session state after the update
+            // Save the session state after the update.
             if let Err(e) = state.save() {
                 tracing::error!("Failed to save session state after stream: {}", e);
             }
