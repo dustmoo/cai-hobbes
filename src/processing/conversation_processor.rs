@@ -1,4 +1,4 @@
-use crate::session::Session;
+use crate::session::{ConversationSummary, Session};
 use crate::components::llm;
 
 /// Processes conversation history to extract and update short-term context.
@@ -12,13 +12,13 @@ impl ConversationProcessor {
 
     /// Takes the last few messages, generates a context summary using a fast LLM,
     /// and updates the session's active context.
-    pub async fn generate_summary(&self, session: &Session) -> Option<serde_json::Value> {
-        // 1. Get the previous summary from the active context
-        let previous_summary = session
-            .active_context
-            .get("conversation_summary")
-            .and_then(|v| Some(v.to_string()))
-            .unwrap_or_default();
+    pub async fn generate_summary(&self, session: &Session) -> Option<ConversationSummary> {
+        // 1. Get the previous summary from the active context by serializing the struct
+        let previous_summary = serde_json::to_string(&session.active_context.conversation_summary)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to serialize previous summary: {}. Using default.", e);
+                "{}".to_string()
+            });
 
         // 2. Get the last 5 messages and format them
         let recent_history: String = session
@@ -38,13 +38,16 @@ impl ConversationProcessor {
         // 3. Call the LLM to refine the summary
         match llm::summarize_conversation(previous_summary, recent_history).await {
             Ok(summary_json) => {
-                if summary_json.is_null() {
-                    tracing::warn!("LLM summarization returned null.");
-                    return None;
+                match serde_json::from_value::<ConversationSummary>(summary_json) {
+                    Ok(summary) => {
+                        tracing::info!("Successfully deserialized new conversation summary.");
+                        Some(summary)
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to deserialize conversation summary: {}", e);
+                        None
+                    }
                 }
-                
-                tracing::info!("Generated conversation context: {}", summary_json);
-                Some(summary_json)
             }
             Err(e) => {
                 tracing::error!("Failed to summarize conversation: {}", e);

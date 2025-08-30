@@ -8,12 +8,52 @@ use dirs;
 
 use serde_json::Value;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct ConversationSummaryEntities {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user_name: String,
+    #[serde(flatten)]
+    pub other_entities: HashMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct ConversationSummary {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sentiment: String,
+    #[serde(default)]
+    pub entities: ConversationSummaryEntities,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ActiveContext {
+    pub ai_persona: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_instruction: Option<String>,
+    pub conversation_summary: ConversationSummary,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+impl Default for ActiveContext {
+    fn default() -> Self {
+        Self {
+            ai_persona: "You are Hobbes, a helpful AI assistant named after the comic, ready to act how the user needs.".to_string(),
+            user_instruction: None,
+            conversation_summary: ConversationSummary::default(),
+            extra: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Session {
     pub id: String,
     pub name: String,
     pub messages: Vec<super::components::chat::Message>,
-    pub active_context: HashMap<String, Value>,
+    pub active_context: ActiveContext,
     pub last_updated: DateTime<Utc>,
 }
 
@@ -65,7 +105,7 @@ impl SessionState {
             id: new_id.clone(),
             name: format!("Chat {}", self.sessions.len() + 1),
             messages: vec![],
-            active_context: HashMap::new(),
+            active_context: ActiveContext::default(),
             last_updated: Utc::now(),
         };
         self.sessions.insert(new_id.clone(), new_session);

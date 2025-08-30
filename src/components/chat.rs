@@ -166,7 +166,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     // Re-acquire the write lock to update the context
                     let mut state = session_state_clone.write();
                     if let Some(session) = state.get_active_session_mut() {
-                        session.active_context.insert("conversation_summary".to_string(), summary);
+                        session.active_context.conversation_summary = summary;
                     }
                 }
 
