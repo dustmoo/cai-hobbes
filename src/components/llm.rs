@@ -1,11 +1,9 @@
 use serde::{Deserialize, Serialize};
 use reqwest::Client;
-use std::env;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-const API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:streamGenerateContent";
-const FLASH_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
+const BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
 #[derive(Serialize)]
 struct GeminiRequest {
@@ -54,8 +52,12 @@ struct PartResponse {
     text: String,
 }
 
-pub async fn generate_content_stream(prompt: String, tx: mpsc::UnboundedSender<String>) {
-    let api_key = env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set");
+pub async fn generate_content_stream(
+    api_key: String,
+    model: String,
+    prompt: String,
+    tx: mpsc::UnboundedSender<String>,
+) {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -67,7 +69,8 @@ pub async fn generate_content_stream(prompt: String, tx: mpsc::UnboundedSender<S
         }],
     };
 
-    let url = format!("{}?key={}&alt=sse", API_URL, api_key);
+    tracing::info!("Using chat model: {}", model);
+    let url = format!("{}/{}:streamGenerateContent?key={}&alt=sse", BASE_API_URL, model, api_key);
 
     let response = match client.post(&url).json(&request_body).send().await {
         Ok(r) => r,
@@ -163,10 +166,11 @@ pub async fn generate_content_stream(prompt: String, tx: mpsc::UnboundedSender<S
 }
 
 pub async fn summarize_conversation(
+    api_key: String,
+    model: String,
     previous_summary: String,
     recent_messages: String,
 ) -> Result<serde_json::Value, reqwest::Error> {
-    let api_key = env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set");
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -205,7 +209,8 @@ Recent Messages:
         }],
     };
 
-    let url = format!("{}?key={}", FLASH_API_URL, api_key);
+    tracing::info!("Using summary model: {}", model);
+    let url = format!("{}/{}:generateContent?key={}", BASE_API_URL, model, api_key);
 
     let response = client
         .post(&url)

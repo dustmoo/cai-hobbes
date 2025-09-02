@@ -18,6 +18,8 @@ impl StreamManagerContext {
 
     pub fn start_stream(
         mut self,
+        api_key: String,
+        model: String,
         message_id: Uuid,
         final_prompt: String,
         on_complete: impl FnOnce() + Send + 'static,
@@ -37,7 +39,7 @@ impl StreamManagerContext {
 
             // Spawn the LLM task. It runs in the background.
             spawn(async move {
-                llm::generate_content_stream(final_prompt, llm_tx).await;
+                llm::generate_content_stream(api_key, model, final_prompt, llm_tx).await;
             });
 
             // This part of the task listens for chunks from the LLM,

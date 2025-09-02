@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use dioxus::desktop::{use_window, Config, WindowBuilder, use_wry_event_handler};
+use dioxus::desktop::{use_window, Config, WindowBuilder, use_wry_event_handler, muda::MenuEvent};
 use dioxus::prelude::*;
 use dioxus::desktop::tao::dpi::PhysicalSize;
 use dioxus::desktop::tao::event::{Event, WindowEvent};
@@ -12,14 +12,16 @@ use dotenvy::dotenv;
 mod components;
 mod hotkey;
 mod permissions;
+mod menu;
 mod tray;
 mod session;
+mod settings;
 mod context;
 mod processing;
+mod secure_storage;
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 
 static TRAY_INITIALIZED: AtomicBool = AtomicBool::new(false);
-static HOTKEY_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     dotenv().ok();
@@ -28,7 +30,6 @@ fn main() {
     #[cfg(target_os = "macos")]
     permissions::check_and_prompt_for_accessibility();
 
-    hotkey::init_hotkeys();
 
     // Load session state to get window size
     let initial_state = session::SessionState::load().unwrap_or_default();
@@ -38,7 +39,6 @@ fn main() {
     LaunchBuilder::new()
         .with_cfg(
             Config::new()
-                .with_menu(None)
                 .with_window(
                     WindowBuilder::new()
                         .with_visible(true)
@@ -46,36 +46,35 @@ fn main() {
                         .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(initial_width, initial_height)),
                 )
                 .with_custom_head(r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #111827; }</style>"#.to_string() + r#"<style>"# + include_str!("../assets/output.css") + r#"</style>"#)
-                .with_custom_event_handler(|_e, _| {
-                    if TRAY_INITIALIZED
-                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        tray::init_tray();
-                    }
-
-                    // Conditionally compile the hotkey initialization for release builds only.
-                    #[cfg(not(debug_assertions))]
-                    {
-                        if HOTKEY_INITIALIZED
-                            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                        {
-                            hotkey::init_hotkeys();
-                        }
-                    }
-                }),
         )
         .launch(app);
 }
 
 use crate::session::SessionState;
+use crate::settings::SettingsManager;
 use crate::components::stream_manager::StreamManager;
+use std::path::PathBuf;
+
+fn get_settings_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_default()
+        .join("com.hobbes.app")
+        .join("settings.json")
+}
 
 fn app() -> Element {
     let window = use_window();
     let session_state = use_context_provider(|| Signal::new(SessionState::new()));
+    let settings_manager = use_context_provider(|| Signal::new(SettingsManager::new(get_settings_path())));
+    let _settings = use_context_provider(|| {
+        let mut settings = settings_manager.read().load();
+        if let Ok(api_key) = crate::secure_storage::retrieve_secret("api_key") {
+            settings.api_key = Some(api_key);
+        }
+        Signal::new(settings)
+    });
     let mut show_session_manager = use_signal(|| false);
+    let mut show_settings_panel = use_signal(|| false);
     let mut last_known_size = use_signal(|| PhysicalSize::new(0, 0));
     // This handler continuously updates the last known size during a resize.
     use_wry_event_handler(move |event, _| {
@@ -86,7 +85,38 @@ fn app() -> Element {
         }
     });
  
-    // This single effect will run on every render, checking the current signal values.
+    // One-time setup for tray icon and menu event listener
+    use_effect(move || {
+        if TRAY_INITIALIZED
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            // Initialize the menu
+            let menu = menu::build_menu();
+            #[cfg(target_os = "macos")]
+            menu.init_for_nsapp();
+            #[cfg(target_os = "windows")]
+            menu.init_for_hwnd(window.hwnd());
+            
+            // Initialize the tray icon
+            tray::init_tray();
+
+            // Start the menu event listener
+            let menu_channel = MenuEvent::receiver();
+            std::thread::spawn(move || {
+                loop {
+                    if let Ok(event) = menu_channel.recv() {
+                        if event.id.0 == "quit" {
+                            let mut app_quit = APP_QUIT.write();
+                            *app_quit = true;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // This effect handles window visibility and quitting the app
     let window_clone = window.clone();
     use_effect(move || {
         let visible = *WINDOW_VISIBLE.read();
@@ -116,16 +146,6 @@ fn app() -> Element {
         }
     });
 
-    // Log a message in debug builds to inform the developer that hotkeys are disabled.
-    #[cfg(debug_assertions)]
-    use_effect(|| {
-        if HOTKEY_INITIALIZED
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            tracing::warn!("Hotkeys are disabled in debug mode. Use a release build for hotkey functionality.");
-        }
-    });
 
 
 
@@ -133,22 +153,36 @@ fn app() -> Element {
         StreamManager {
             div {
                 class: "dark flex flex-row h-screen",
+                // The onkeydown handler has been removed to allow native hotkeys (copy, paste, etc.) to function correctly.
+                // The global hotkey for toggling visibility is no longer required.
                 // When the user releases the mouse, save the last known size.
                 onmouseup: {
                     let mut session_state = session_state.clone();
+                    let show_session_manager = show_session_manager.clone();
+                    let window = window.clone();
                     move |_| {
-                        let size = last_known_size.read();
-                        if size.width > 0 && size.height > 0 {
-                            session_state.write().update_window_size(size.width as f64, size.height as f64);
+                        let physical_size = last_known_size.read();
+                        if physical_size.width > 0 && physical_size.height > 0 {
+                            let scale_factor = window.scale_factor();
+                            let logical_size = physical_size.to_logical::<f64>(scale_factor);
+                            let sidebar_width = if *show_session_manager.read() { 256.0 } else { 0.0 };
+                            let content_width = logical_size.width - sidebar_width;
+                            session_state.write().update_window_size(content_width, logical_size.height);
                         }
                     }
                 },
                 onmouseleave: {
                     let mut session_state = session_state.clone();
+                    let show_session_manager = show_session_manager.clone();
+                    let window = window.clone();
                     move |_| {
-                        let size = last_known_size.read();
-                        if size.width > 0 && size.height > 0 {
-                            session_state.write().update_window_size(size.width as f64, size.height as f64);
+                        let physical_size = last_known_size.read();
+                        if physical_size.width > 0 && physical_size.height > 0 {
+                            let scale_factor = window.scale_factor();
+                            let logical_size = physical_size.to_logical::<f64>(scale_factor);
+                            let sidebar_width = if *show_session_manager.read() { 256.0 } else { 0.0 };
+                            let content_width = logical_size.width - sidebar_width;
+                            session_state.write().update_window_size(content_width, logical_size.height);
                         }
                     }
                 },
@@ -158,6 +192,14 @@ fn app() -> Element {
                     div {
                         class: "w-64 bg-gray-800 text-white h-full transition-all duration-300 ease-in-out",
                         components::session_manager::SessionManager {}
+                    }
+                }
+
+                // Settings Panel Sidebar
+                if *show_settings_panel.read() {
+                    div {
+                        class: "w-64 bg-gray-800 text-white h-full transition-all duration-300 ease-in-out",
+                        components::settings_panel::SettingsPanel {}
                     }
                 }
 
@@ -174,11 +216,30 @@ fn app() -> Element {
                             move |_| {
                                 let new_show_state = !*show_session_manager.read();
                                 show_session_manager.set(new_show_state);
+                                if new_show_state {
+                                    show_settings_panel.set(false); // Hide settings if showing sessions
+                                }
 
-                                // Explicitly set the window size when toggling the sidebar
+                                // Adjust the window size based on the sidebar's visibility
+                                let session_state = session_state.clone();
+                                let sidebar_width = 256.0; // w-64 in Tailwind is 16rem which is 256px
                                 let current_size = window.inner_size();
-                                let new_width = if new_show_state { 975.0 } else { 675.0 };
+                                let persisted_width = session_state.read().window_width;
+
+                                let new_width = if new_show_state {
+                                    persisted_width + sidebar_width
+                                } else {
+                                    persisted_width
+                                };
+
                                 window.set_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(new_width, current_size.height as f64));
+                            }
+                        },
+                        on_toggle_settings: move |_| {
+                            let new_show_state = !*show_settings_panel.read();
+                            show_settings_panel.set(new_show_state);
+                            if new_show_state {
+                                show_session_manager.set(false); // Hide sessions if showing settings
                             }
                         },
                     }
@@ -187,5 +248,6 @@ fn app() -> Element {
         }
     }
 }
+
 
 

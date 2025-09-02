@@ -29,7 +29,8 @@ pub struct ConversationSummary {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ActiveContext {
-    pub ai_persona: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_persona: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_instruction: Option<String>,
     pub conversation_summary: ConversationSummary,
@@ -40,7 +41,7 @@ pub struct ActiveContext {
 impl Default for ActiveContext {
     fn default() -> Self {
         Self {
-            ai_persona: "You are Hobbes, a helpful AI assistant named after the comic, ready to act how the user needs.".to_string(),
+            system_persona: None,
             user_instruction: None,
             conversation_summary: ConversationSummary::default(),
             extra: HashMap::new(),

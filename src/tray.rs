@@ -1,7 +1,8 @@
 use dioxus_signals::{GlobalSignal, Signal};
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem},
-    TrayIconBuilder, Icon,
+    TrayIconBuilder,
+    Icon,
+    TrayIconEvent,
 };
 use tracing;
 
@@ -17,37 +18,28 @@ pub fn init_tray() {
     let icon_data = image.into_raw();
     let icon = Icon::from_rgba(icon_data, width, height).expect("Failed to create icon");
 
-    let menu = Menu::new();
-
-    let toggle_window = MenuItem::new("Toggle Window", true, None);
-    let quit = MenuItem::new("Quit", true, None);
-    let toggle_window_id = toggle_window.id().clone();
-    let quit_id = quit.id().clone();
-
-    menu.append_items(&[&toggle_window, &quit]).unwrap();
-
+    // Build a tray icon without a menu to avoid dependency conflicts.
     let tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
         .with_icon(icon)
+        .with_tooltip("Hobbes")
         .build()
         .unwrap();
     std::mem::forget(tray_icon);
 
-    let menu_channel = MenuEvent::receiver();
+    // Use the TrayIconEvent receiver for direct clicks, as per the official documentation.
+    let tray_channel = TrayIconEvent::receiver();
 
     std::thread::spawn(move || {
         tracing::info!("Tray listener thread started.");
         loop {
-            if let Ok(event) = menu_channel.recv() {
-                tracing::info!("Tray event received: {:?}", event.id);
-                if event.id == toggle_window_id {
-                    tracing::info!("Toggle window event received, toggling visibility.");
-                    let mut visible = WINDOW_VISIBLE.write();
-                    *visible = !*visible;
-                }
-                if event.id == quit_id {
-                    tracing::info!("Quit event received, setting APP_QUIT to true.");
-                    *APP_QUIT.write() = true;
+            if let Ok(event) = tray_channel.recv() {
+                match event {
+                    TrayIconEvent::Click { .. } => {
+                        tracing::info!("Tray icon clicked, toggling visibility.");
+                        let mut visible = WINDOW_VISIBLE.write();
+                        *visible = !*visible;
+                    },
+                    _ => (),
                 }
             }
         }

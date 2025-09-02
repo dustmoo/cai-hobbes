@@ -18,6 +18,7 @@ use crate::context::prompt_builder::PromptBuilder;
 use crate::processing::conversation_processor::ConversationProcessor;
 // Define a simple `Message` struct
 use serde::{Deserialize, Serialize};
+use crate::settings::Settings;
 
 
 lazy_static! {
@@ -35,8 +36,9 @@ pub struct Message {
 
 // The main ChatWindow component
 #[component]
-pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interaction: EventHandler<()>, on_toggle_sessions: EventHandler<()>) -> Element {
+pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interaction: EventHandler<()>, on_toggle_sessions: EventHandler<()>, on_toggle_settings: EventHandler<()>) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let settings = use_context::<Signal<Settings>>();
     let mut draft = use_signal(|| "".to_string());
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut has_interacted = use_signal(|| false);
@@ -120,6 +122,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         let mut session_state_clone = session_state.clone();
         let stream_manager_clone = stream_manager.clone();
         let mut is_sending_clone = is_sending.clone();
+        let settings_clone = settings.read().clone();
  
         // Spawn a single async task to handle all state mutations and side effects
         spawn(async move {
@@ -162,7 +165,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 
                 // Generate the summary asynchronously without holding any locks
                 let processor = ConversationProcessor::new();
-                if let Some(summary) = processor.generate_summary(&session_for_processing).await {
+                if let Some(summary) = processor.generate_summary(&session_for_processing, &settings_clone).await {
                     // Re-acquire the write lock to update the context
                     let mut state = session_state_clone.write();
                     if let Some(session) = state.get_active_session_mut() {
@@ -173,7 +176,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 // Get a final read lock to build the prompt with the *updated* context
                 let state = session_state_clone.read();
                 let session = state.get_active_session().unwrap();
-                let builder = PromptBuilder::new(session);
+                let builder = PromptBuilder::new(session, &settings_clone);
                 let context_string = builder.build_context_string();
                 format!("{}{}", context_string, user_message)
             };
@@ -183,14 +186,24 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 tracing::error!("Failed to save session state: {}", e);
             }
 
-            // 5. Start the stream using the manager
-            // 5. Start the stream using the manager
+            // 5. Get API key, prioritizing settings, then environment variable
+            let api_key = settings_clone.api_key.clone().unwrap_or_else(|| {
+                std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
+            });
+
+            // 6. Start the stream using the manager
             let on_complete = move || {
                 // This closure is now Send-able as it only moves the sender.
                 let _ = tx.send(());
             };
             tracing::info!(message_id = %hobbes_message_id, "'send_message' calling 'start_stream'.");
-            stream_manager_clone.start_stream(hobbes_message_id, final_message, on_complete);
+            stream_manager_clone.start_stream(
+                api_key,
+                settings_clone.chat_model,
+                hobbes_message_id,
+                final_message,
+                on_complete,
+            );
 
             // 6. Wait for the stream to complete
             // This will pause the execution of this task until the on_complete callback is called.
@@ -341,6 +354,15 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                             icon: fi_icons::FiMenu
                         }
                     }
+                    button {
+                        class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                        onclick: move |_| on_toggle_settings.call(()),
+                        Icon {
+                            width: 20,
+                            height: 20,
+                            icon: fi_icons::FiSettings
+                        }
+                    }
                     textarea {
                         id: "chat-textarea",
                         class: "flex-1 py-2 px-4 rounded-xl bg-gray-800 border border-gray-700 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none overflow-y-hidden",
@@ -358,7 +380,15 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                             "#);
                         },
                         onkeydown: move |event| {
-                            if event.key() == Key::Enter && !event.data.modifiers().contains(Modifiers::META) {
+                            let modifiers = event.data.modifiers();
+
+                            // Allow all Command, Control, and Alt-based shortcuts to pass through
+                            if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::ALT) {
+                                return;
+                            }
+
+                            // Handle plain Enter for submission, allowing Shift+Enter for newlines
+                            if event.key() == Key::Enter && !modifiers.contains(Modifiers::SHIFT) {
                                 event.prevent_default();
                                 if !*has_interacted.read() {
                                     on_interaction.call(());
@@ -373,7 +403,8 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         onclick: move |_| {
                             let state = session_state.read();
                             let context_string = if let Some(session) = state.sessions.get(&state.active_session_id) {
-                                let builder = PromptBuilder::new(session);
+                                let settings = settings.read();
+                                let builder = PromptBuilder::new(session, &settings);
                                 builder.build_context_string()
                             } else {
                                 "[No active session]".to_string()

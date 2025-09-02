@@ -23,7 +23,8 @@
         "get_recent_activity_summary",
         "get_progress",
         "get_product_context",
-        "get_custom_data"
+        "get_custom_data",
+        "update_progress"
       ]
     }
   }
