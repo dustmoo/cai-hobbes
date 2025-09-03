@@ -19,6 +19,7 @@ mod settings;
 mod context;
 mod processing;
 mod secure_storage;
+mod mcp;
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 
 static TRAY_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -52,7 +53,7 @@ fn main() {
 
 use crate::session::SessionState;
 use crate::settings::SettingsManager;
-use crate::components::stream_manager::StreamManager;
+use crate::{components::stream_manager::StreamManager, mcp::manager::McpManager};
 use std::path::PathBuf;
 
 fn get_settings_path() -> PathBuf {
@@ -62,11 +63,26 @@ fn get_settings_path() -> PathBuf {
         .join("settings.json")
 }
 
+fn get_mcp_config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_default()
+        .join("com.hobbes.app")
+        .join("mcp_servers.json")
+}
+
 fn app() -> Element {
     let window = use_window();
     let session_state = use_context_provider(|| Signal::new(SessionState::new()));
     let settings_manager = use_context_provider(|| Signal::new(SettingsManager::new(get_settings_path())));
-    let _settings = use_context_provider(|| {
+        let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(get_mcp_config_path())));
+    
+        use_effect(move || {
+            let manager = mcp_manager.read().clone();
+            tokio::spawn(async move {
+                manager.launch_servers().await;
+            });
+        });
+        let _settings = use_context_provider(|| {
         let mut settings = settings_manager.read().load();
         if let Ok(api_key) = crate::secure_storage::retrieve_secret("api_key") {
             settings.api_key = Some(api_key);

@@ -7,6 +7,7 @@ use uuid;
 use dirs;
 
 use serde_json::Value;
+use crate::mcp::manager::McpContext;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct ConversationSummaryEntities {
@@ -34,6 +35,8 @@ pub struct ActiveContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_instruction: Option<String>,
     pub conversation_summary: ConversationSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tools: Option<McpContext>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -44,6 +47,7 @@ impl Default for ActiveContext {
             system_persona: None,
             user_instruction: None,
             conversation_summary: ConversationSummary::default(),
+            mcp_tools: None,
             extra: HashMap::new(),
         }
     }

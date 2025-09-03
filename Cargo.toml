@@ -38,6 +38,7 @@ dotenvy = "0.15.7"
 pulldown-cmark = "0.11.0"
 syntect = "5.2.0"
 lazy_static = "1.4.0"
+rmcp = { version = "0.6.1", features = ["client", "transport-child-process", "transport-io"] }
 [dependencies]
 dioxus = { version = "0.6.3", features = ["router", "fullstack", "desktop"] }
 dioxus-desktop = "0.6.3"
@@ -64,7 +65,7 @@ feature_clipboard = { workspace = true }
 thiserror = "1.0"
 futures = "0.3.31"
 chrono = { version = "0.4.41", features = ["serde"] }
-
+rmcp = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = { workspace = true }
 security-framework = "2.11.0"

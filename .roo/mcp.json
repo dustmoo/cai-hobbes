@@ -24,7 +24,8 @@
         "get_progress",
         "get_product_context",
         "get_custom_data",
-        "update_progress"
+        "update_progress",
+        "get_decisions"
       ]
     }
   }

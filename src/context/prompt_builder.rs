@@ -1,22 +1,39 @@
+use crate::mcp::manager::{McpContext, McpManager, McpServerContext};
 use crate::session::Session;
 use crate::settings::Settings;
-use serde_json::{self};
+use serde_json::{self, json};
+pub struct PromptBuilder;
 
-/// A simple builder to format dynamic context for the LLM prompt.
-pub struct PromptBuilder<'a> {
-    session: &'a Session,
-    settings: &'a Settings,
-}
-
-impl<'a> PromptBuilder<'a> {
-    pub fn new(session: &'a Session, settings: &'a Settings) -> Self {
-        Self { session, settings }
+impl PromptBuilder {
+    pub fn new() -> Self {
+        Self {}
     }
 
     /// Builds a context string from the active session's context.
-    pub fn build_context_string(&self) -> String {
-        let mut active_context = self.session.active_context.clone();
-        active_context.system_persona = Some(self.settings.persona.clone());
+    pub async fn build_context_string(
+        &self,
+        session: &Session,
+        settings: &Settings,
+        mcp_manager: &McpManager,
+    ) -> String {
+        let servers = mcp_manager.servers.lock().await;
+        let mut mcp_servers = Vec::new();
+
+        for (_, server) in servers.iter() {
+            mcp_servers.push(McpServerContext {
+                name: server.config.name.clone(),
+                description: server.config.description.clone(),
+                tools: server.tools.clone(),
+            });
+        }
+
+        let mcp_context = McpContext {
+            servers: mcp_servers,
+        };
+
+        let mut active_context = session.active_context.clone();
+        active_context.system_persona = Some(settings.persona.clone());
+        active_context.mcp_tools = Some(mcp_context);
 
         // Check for user_name directly via the typed struct.
         let user_name = &active_context.conversation_summary.entities.user_name;
@@ -29,6 +46,16 @@ impl<'a> PromptBuilder<'a> {
         }
 
         let context_json = serde_json::to_string_pretty(&active_context).unwrap_or_default();
+        format!("<SYSTEM_CONTEXT>\n{}\n</SYSTEM_CONTEXT>\n", context_json)
+    }
+    pub fn build_tool_result_context(&self, tool_name: &str, result: &serde_json::Value) -> String {
+        let tool_result = json!({
+            "tool_result": {
+                "tool_name": tool_name,
+                "result": result
+            }
+        });
+        let context_json = serde_json::to_string_pretty(&tool_result).unwrap_or_default();
         format!("<SYSTEM_CONTEXT>\n{}\n</SYSTEM_CONTEXT>\n", context_json)
     }
 }

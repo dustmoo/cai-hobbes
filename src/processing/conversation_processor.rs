@@ -28,7 +28,10 @@ impl ConversationProcessor {
             .rev()
             .take(5)
             .rev()
-            .map(|m| format!("{}: {}", m.author, m.content))
+            .map(|m| format!("{}: {}", m.author, match &m.content {
+                crate::components::chat::MessageContent::Text { content } => content.clone(),
+                crate::components::chat::MessageContent::ToolCall { call } => serde_json::to_string(&call).unwrap_or_default(),
+            }))
             .collect::<Vec<String>>()
             .join("\n");
 
