@@ -8,6 +8,7 @@ use crate::components::llm;
 #[derive(Clone, Copy)]
 pub struct StreamManagerContext {
     stream_receivers: Signal<HashMap<Uuid, UnboundedReceiver<String>>>,
+    tool_call_receivers: Signal<HashMap<String, UnboundedReceiver<String>>>,
     session_state: Signal<SessionState>,
 }
 
@@ -24,6 +25,7 @@ impl StreamManagerContext {
         final_prompt: String,
         on_complete: impl FnOnce() + Send + 'static,
     ) {
+        tracing::info!(message_id = %message_id, "'start_stream' entered.");
         // Create a channel for the UI to receive chunks.
         let (ui_tx, ui_rx) = mpsc::unbounded_channel::<String>();
         
@@ -32,6 +34,7 @@ impl StreamManagerContext {
 
         // Spawn a master task to manage the LLM call and state updates.
         spawn(async move {
+            tracing::info!(message_id = %message_id, "Stream master task SPAWNED.");
             // Create the channel for the LLM to send chunks to.
             let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<String>();
 
@@ -43,6 +46,7 @@ impl StreamManagerContext {
             // This part of the task listens for chunks from the LLM,
             // forwards them to the UI, and builds the final response.
             let mut full_response = String::new();
+            tracing::info!(message_id = %message_id, "Waiting for LLM chunks...");
             while let Some(chunk) = llm_rx.recv().await {
                 // Forward the chunk to the UI. If it fails, the UI component
                 // has probably been dropped, so we can stop.
@@ -52,26 +56,17 @@ impl StreamManagerContext {
                 full_response.push_str(&chunk);
             }
 
+            tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
             // Stream is complete. Now, write the final content to the session state.
             // This is the single source of truth for the final state update.
+            tracing::info!(message_id = %message_id, "Acquiring session state WRITE lock...");
             let mut state = self.session_state.write();
+            tracing::info!(message_id = %message_id, "Session state WRITE lock ACQUIRED.");
             state.touch_active_session();
             if let Some(session) = state.get_active_session_mut() {
                 if let Some(message) = session.messages.iter_mut().find(|m| m.id == message_id) {
-                    // Attempt to parse the full_response as a tool call
-                    let new_content = if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&full_response) {
-                        if let Some(tool_call_value) = json_value.get("tool_call") {
-                            match serde_json::from_value(tool_call_value.clone()) {
-                                Ok(tool_call) => crate::components::chat::MessageContent::ToolCall { call: tool_call },
-                                Err(_) => crate::components::chat::MessageContent::Text { content: full_response },
-                            }
-                        } else {
-                            crate::components::chat::MessageContent::Text { content: full_response }
-                        }
-                    } else {
-                        crate::components::chat::MessageContent::Text { content: full_response }
-                    };
-                    message.content = new_content;
+                    message.content = crate::components::shared::MessageContent::Text(full_response);
+                    tracing::info!(message_id = %message_id, "Message content updated in state.");
                 }
             }
             
@@ -79,15 +74,32 @@ impl StreamManagerContext {
             if let Err(e) = state.save() {
                 tracing::error!("Failed to save session state after stream: {}", e);
             } else {
+                tracing::info!(message_id = %message_id, "Session state SAVED successfully.");
             }
 
             // Signal completion.
             on_complete();
+            tracing::info!(message_id = %message_id, "Completion signal SENT.");
         });
     }
 
     pub fn take_stream(mut self, message_id: &Uuid) -> Option<UnboundedReceiver<String>> {
         self.stream_receivers.write().remove(message_id)
+    }
+
+    // Methods for Tool Calls
+    pub fn is_streaming_tool_call(self, execution_id: &str) -> bool {
+        self.tool_call_receivers.read().contains_key(execution_id)
+    }
+
+    pub fn take_tool_call_stream(mut self, execution_id: &str) -> Option<UnboundedReceiver<String>> {
+        self.tool_call_receivers.write().remove(execution_id)
+    }
+
+    pub fn register_tool_call_stream(mut self, execution_id: String) -> mpsc::UnboundedSender<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.tool_call_receivers.write().insert(execution_id, rx);
+        tx
     }
 }
 
@@ -101,6 +113,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
     let session_state = consume_context::<Signal<SessionState>>();
     let context = use_hook(|| StreamManagerContext {
         stream_receivers: Signal::new(HashMap::new()),
+        tool_call_receivers: Signal::new(HashMap::new()),
         session_state,
     });
 

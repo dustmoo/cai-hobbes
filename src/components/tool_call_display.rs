@@ -1,90 +1,130 @@
 #![allow(non_snake_case)]
 use dioxus::prelude::*;
-use dioxus_free_icons::{icons::fi_icons::{FiCpu, FiLoader, FiChevronDown, FiChevronRight}, Icon as DioxusIcon};
-use serde_json::Value;
+use dioxus_free_icons::{icons::fi_icons, Icon};
+use super::chat::CodeBlock;
+use super::shared::{ToolCall, ToolCallStatus};
+use crate::components::stream_manager::StreamManagerContext;
 
-use serde::{Deserialize, Serialize};
-#[derive(PartialEq, Clone, Default, Debug, Serialize, Deserialize)]
-pub enum ToolCallStatus {
-    #[default]
-    InProgress,
-    Completed,
-    Failed,
-}
-
-#[derive(Props, PartialEq, Clone)]
+#[derive(Props, Clone, PartialEq)]
 pub struct ToolCallDisplayProps {
-    pub tool_name: String,
-    pub tool_arguments: Value,
-    #[props(default)]
-    pub status: ToolCallStatus,
-    pub result: Option<Value>,
+    pub tool_call: ToolCall,
 }
 
+#[component]
 pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
-    let mut is_open = use_signal(|| false);
+    let mut show_arguments = use_signal(|| false);
+    let mut show_response = use_signal(|| true); // Default to showing response section
+    let mut status = use_signal(|| props.tool_call.status);
+    let mut response = use_signal(|| props.tool_call.response.clone());
+    let stream_manager = consume_context::<StreamManagerContext>();
+
+    // Effect to handle streaming updates for the tool call response
+    use_effect(move || {
+        // Only stream if the tool call is currently running
+        if *status.read() == ToolCallStatus::Running {
+            let execution_id = props.tool_call.execution_id.clone();
+            
+            // Check if the stream manager is actively streaming for this execution ID
+            if stream_manager.is_streaming_tool_call(&execution_id) {
+                spawn(async move {
+                    // Take the stream from the manager
+                    if let Some(mut rx) = stream_manager.take_tool_call_stream(&execution_id) {
+                        while let Some(chunk) = rx.recv().await {
+                            // Append chunks to the response signal
+                            response.write().push_str(&chunk);
+                        }
+                        // Once the stream is done, we can assume it's completed.
+                        // The final status update will come from the processor, but this is a good UI default.
+                        status.set(ToolCallStatus::Completed);
+                    }
+                });
+            }
+        }
+    });
+
 
     rsx! {
         div {
-            class: "flex flex-col p-4 my-2 rounded-lg bg-gray-800 text-white border border-gray-700",
+            class: "flex flex-col p-4 border rounded-lg shadow-sm bg-gray-800", // Adjusted background
             div {
-                class: "flex items-center gap-3",
-                DioxusIcon {
+                class: "flex items-center gap-2 text-lg font-semibold text-gray-100", // Adjusted text color
+                Icon {
                     width: 20,
                     height: 20,
-                    icon: FiCpu,
+                    icon: fi_icons::FiCpu
                 }
+                span { "{props.tool_call.server_name}" }
                 span {
-                    class: "font-bold text-lg",
-                    "{props.tool_name}"
+                    class: format!("text-sm font-mono px-2 py-1 rounded {}", match *status.read() {
+                        ToolCallStatus::Running => "bg-blue-200 text-blue-800",
+                        ToolCallStatus::Completed => "bg-green-200 text-green-800",
+                        ToolCallStatus::Error => "bg-red-200 text-red-800",
+                    }),
+                    "{status.read()}"
                 }
+            }
+            div {
+                class: "mt-4 pt-4 border-t border-gray-600 space-y-2", // Adjusted border color
                 div {
-                    class: "flex-grow"
+                    class: "flex items-center gap-2",
+                    span { class: "font-semibold text-gray-300", "Tool:" }
+                    span { class: "font-mono text-sm text-gray-300", "{props.tool_call.tool_name}" }
                 }
-                match props.status {
-                    ToolCallStatus::InProgress => rsx!{
-                        DioxusIcon {
-                            width: 20,
-                            height: 20,
-                            class: "animate-spin",
-                            icon: FiLoader,
-                        }
-                    },
-                    _ => rsx!{
-                        button {
-                            class: "p-1 rounded-md hover:bg-gray-700",
-                            onclick: move |_| is_open.toggle(),
-                            if is_open() {
-                                DioxusIcon {
-                                    width: 20,
-                                    height: 20,
-                                    icon: FiChevronDown,
-                                }
-                            } else {
-                                DioxusIcon {
-                                    width: 20,
-                                    height: 20,
-                                    icon: FiChevronRight,
-                                }
+
+                // Arguments collapsible section
+                div {
+                    class: "flex flex-col",
+                    button {
+                        class: "flex items-center gap-1 text-sm font-semibold text-gray-400 hover:text-gray-200",
+                        onclick: move |_| show_arguments.toggle(),
+                        if *show_arguments.read() {
+                            Icon {
+                                width: 16,
+                                height: 16,
+                                icon: fi_icons::FiChevronDown
                             }
+                        } else {
+                            Icon {
+                                width: 16,
+                                height: 16,
+                                icon: fi_icons::FiChevronRight
+                            }
+                        }
+                        "Arguments"
+                    }
+                    if *show_arguments.read() {
+                        CodeBlock {
+                            code: props.tool_call.arguments.clone(),
+                            lang: "json".to_string()
                         }
                     }
                 }
-            }
-            if is_open() {
+
+                // Response collapsible section
                 div {
-                    class: "mt-4 p-3 bg-gray-900 rounded",
-                    pre {
-                        code {
-                            class: "text-sm font-mono",
-                            if let Some(result) = &props.result {
-                                "{serde_json::to_string_pretty(result).unwrap_or_default()}"
-                            } else if props.status == ToolCallStatus::Failed {
-                                "Tool execution failed."
+                    class: "flex flex-col",
+                    button {
+                        class: "flex items-center gap-1 text-sm font-semibold text-gray-400 hover:text-gray-200",
+                        onclick: move |_| show_response.toggle(),
+                        if *show_response.read() {
+                            Icon {
+                                width: 16,
+                                height: 16,
+                                icon: fi_icons::FiChevronDown
                             }
-                             else {
-                                "No result available."
+                        } else {
+                            Icon {
+                                width: 16,
+                                height: 16,
+                                icon: fi_icons::FiChevronRight
                             }
+                        }
+                        "Response"
+                    }
+                    if *show_response.read() && !response.read().is_empty() {
+                        CodeBlock {
+                            code: response.read().clone(),
+                            lang: "markdown".to_string()
                         }
                     }
                 }

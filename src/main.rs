@@ -74,14 +74,18 @@ fn app() -> Element {
     let window = use_window();
     let session_state = use_context_provider(|| Signal::new(SessionState::new()));
     let settings_manager = use_context_provider(|| Signal::new(SettingsManager::new(get_settings_path())));
-        let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(get_mcp_config_path())));
-    
-        use_effect(move || {
-            let manager = mcp_manager.read().clone();
-            tokio::spawn(async move {
-                manager.launch_servers().await;
-            });
+    let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(get_mcp_config_path())));
+    let mcp_servers_loaded = use_context_provider(|| Signal::new(false));
+
+    use_effect(move || {
+        let manager = mcp_manager.read().clone();
+        let mut loaded_writer = mcp_servers_loaded.clone();
+        spawn(async move {
+            manager.launch_servers().await;
+            loaded_writer.set(true);
+            tracing::info!("MCP servers loaded signal set to true.");
         });
+    });
         let _settings = use_context_provider(|| {
         let mut settings = settings_manager.read().load();
         if let Ok(api_key) = crate::secure_storage::retrieve_secret("api_key") {

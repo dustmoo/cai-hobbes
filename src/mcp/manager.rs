@@ -13,7 +13,14 @@ use tokio::sync::Mutex;
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(rename = "alwaysAllow", default)]
+    pub always_allow: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -56,10 +63,14 @@ impl McpManager {
         }
 
         let configs = match fs::read_to_string(config_path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
-                tracing::error!("Failed to parse mcp_servers.json: {}", e);
-                Vec::new()
-            }),
+            Ok(content) => {
+                let configs_vec: Vec<McpServerConfig> = serde_json::from_str(&content).unwrap_or_else(|e| {
+                    tracing::error!("Failed to parse mcp_servers.json: {}", e);
+                    Vec::new()
+                });
+                tracing::info!("Successfully parsed {} MCP server configs.", configs_vec.len());
+                configs_vec
+            },
             Err(e) => {
                 tracing::error!("Failed to read mcp_servers.json: {}", e);
                 Vec::new()
@@ -74,6 +85,10 @@ impl McpManager {
 
     pub async fn launch_servers(&self) {
         for server_config in self.configs.iter() {
+            if server_config.disabled {
+                tracing::info!("Skipping disabled MCP server: {}", server_config.name);
+                continue;
+            }
             let server_name = server_config.name.clone();
             tracing::info!("Launching MCP server: {}", server_name);
             let mut parts = server_config.command.split_whitespace();
@@ -87,6 +102,7 @@ impl McpManager {
 
             let mut cmd = Command::new(program);
             cmd.args(args)
+                .envs(&server_config.env)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
@@ -94,44 +110,45 @@ impl McpManager {
             let servers_map = self.servers.clone();
             let server_config_clone = server_config.clone();
 
-            tokio::spawn(async move {
-                match TokioChildProcess::new(cmd) {
-                    Ok(transport) => match ().serve(transport).await {
-                        Ok(service) => {
-                            tracing::info!("Connected to MCP server: {}", server_name);
-                            match service.list_tools(Default::default()).await {
-                                Ok(result) => {
-                                    tracing::info!(
-                                        "Discovered capabilities for MCP server: {}",
-                                        server_name
-                                    );
-                                    let active_client = ActiveMcpClient {
-                                        config: server_config_clone,
-                                        service,
-                                        tools: result.tools,
-                                    };
-                                    let mut servers = servers_map.lock().await;
-                                    servers.insert(server_name.clone(), active_client);
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to discover capabilities for MCP server '{}': {}",
-                                        server_name,
-                                        e
-                                    );
-                                }
+            // This is now a blocking async operation within the function's scope
+            match TokioChildProcess::new(cmd) {
+                Ok(transport) => match ().serve(transport).await {
+                    Ok(service) => {
+                        tracing::info!("Connected to MCP server: {}", server_name);
+                        match service.list_tools(Default::default()).await {
+                            Ok(result) => {
+                                tracing::info!(
+                                    "Discovered capabilities for MCP server: {}",
+                                    server_name
+                                );
+                                let active_client = ActiveMcpClient {
+                                    config: server_config_clone,
+                                    service,
+                                    tools: result.tools,
+                                };
+                                let mut servers = servers_map.lock().await;
+                                servers.insert(server_name.clone(), active_client);
+                                tracing::info!("Successfully added '{}' to active MCP clients.", server_name);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to discover capabilities for MCP server '{}': {}",
+                                    server_name,
+                                    e
+                                );
                             }
                         }
-                        Err(e) => {
-                            tracing::error!("Failed to connect to MCP server '{}': {}", server_name, e);
-                        }
-                    },
-                    Err(e) => {
-                        tracing::error!("Failed to launch MCP server '{}': {}", server_name, e);
                     }
+                    Err(e) => {
+                        tracing::error!("Failed to connect to MCP server '{}': {}", server_name, e);
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("Failed to launch MCP server '{}': {}", server_name, e);
                 }
-            });
+            }
         }
+        tracing::info!("All MCP server launch tasks completed.");
     }
     pub async fn use_mcp_tool(
         &self,
@@ -160,6 +177,24 @@ impl McpManager {
             }
         } else {
             Err(format!("Server not found: {}", server_name))
+        }
+    }
+
+    pub async fn get_mcp_context(&self) -> McpContext {
+        let servers = self.servers.lock().await;
+        let mut server_contexts = Vec::new();
+
+        for (_, client) in servers.iter() {
+            let server_context = McpServerContext {
+                name: client.config.name.clone(),
+                description: client.config.description.clone(),
+                tools: client.tools.clone(),
+            };
+            server_contexts.push(server_context);
+        }
+
+        McpContext {
+            servers: server_contexts,
         }
     }
 }
