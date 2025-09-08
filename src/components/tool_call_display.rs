@@ -11,7 +11,7 @@ pub struct ToolCallDisplayProps {
 #[component]
 pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
     let mut show_arguments = use_signal(|| false);
-    let mut show_response = use_signal(|| true);
+    let mut show_response = use_signal(|| false);
 
     let status = props.tool_call.status;
     let response = props.tool_call.response.clone();

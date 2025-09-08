@@ -42,6 +42,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut draft = use_signal(|| "".to_string());
+    use_context_provider(|| draft);
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut has_interacted = use_signal(|| false);
     let is_sending = use_signal(|| false);
@@ -402,7 +403,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                                                         key: "{message.id}",
                                                         class: "{container_classes} w-full",
                                                         div {
-                                                            class: "flex flex-col max-w-xs md:max-w-md",
+                                                            class: "flex flex-col max-w-2/3",
                                                             div {
                                                                 class: "relative group px-4 py-2 rounded-2xl {bubble_classes}",
                                                                 ToolCallDisplay { tool_call: tool_call.clone() }
@@ -500,48 +501,56 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                             }
                         },
                     }
-                    button {
-                        class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
-                        onclick: move |_| {
-                            let session_state = session_state.clone();
-                            let settings = settings.clone();
-                            let mcp_manager = mcp_manager.clone();
-                            spawn(async move {
-                                // Asynchronously fetch the MCP context first.
-                                let mcp_context = {
-                                    let mcp_manager_reader = mcp_manager.read();
-                                    mcp_manager_reader.get_mcp_context().await
-                                };
+                    {
+                        cfg_if::cfg_if! {
+                            if #[cfg(debug_assertions)] {
+                                rsx! {
+                                    button {
+                                        class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                                        onclick: move |_| {
+                                            let session_state = session_state.clone();
+                                            let settings = settings.clone();
+                                            let mcp_manager = mcp_manager.clone();
+                                            spawn(async move {
+                                                // Asynchronously fetch the MCP context first.
+                                                let mcp_context = {
+                                                    let mcp_manager_reader = mcp_manager.read();
+                                                    mcp_manager_reader.get_mcp_context().await
+                                                };
 
-                                // Now, read the state and build the context string for debugging.
-                                let context_string = {
-                                    let state = session_state.read();
-                                    if let Some(session) = state.get_active_session().cloned() {
-                                        let mut session_for_debug = session;
+                                                // Now, read the state and build the context string for debugging.
+                                                let context_string = {
+                                                    let state = session_state.read();
+                                                    if let Some(session) = state.get_active_session().cloned() {
+                                                        let mut session_for_debug = session;
 
-                                        // Inject the fetched MCP context into the temporary clone.
-                                        if !mcp_context.servers.is_empty() {
-                                            session_for_debug.active_context.mcp_tools = Some(mcp_context);
+                                                        // Inject the fetched MCP context into the temporary clone.
+                                                        if !mcp_context.servers.is_empty() {
+                                                            session_for_debug.active_context.mcp_tools = Some(mcp_context);
+                                                        }
+
+                                                        // Build the prompt from the modified clone to show an accurate preview.
+                                                        let settings_reader = settings.read();
+                                                        let builder = PromptBuilder::new(&session_for_debug, &settings_reader);
+                                                        // Note: This debug view might not be perfect after the refactor,
+                                                        // but it's better to show the raw prompt struct than to crash.
+                                                        let prompt_data = builder.build_prompt("[DEBUG USER MESSAGE]".to_string(), None);
+                                                        format!("{:#?}", prompt_data)
+                                                    } else {
+                                                        "[No active session]".to_string()
+                                                    }
+                                                };
+                                                tracing::info!("---\n[DEBUG] Current Context:\n{}---", context_string);
+                                            });
+                                        },
+                                        Icon {
+                                            width: 20,
+                                            height: 20,
+                                            icon: fi_icons::FiCpu
                                         }
-
-                                        // Build the prompt from the modified clone to show an accurate preview.
-                                        let settings_reader = settings.read();
-                                        let builder = PromptBuilder::new(&session_for_debug, &settings_reader);
-                                        // Note: This debug view might not be perfect after the refactor,
-                                        // but it's better to show the raw prompt struct than to crash.
-                                        let prompt_data = builder.build_prompt("[DEBUG USER MESSAGE]".to_string(), None);
-                                        format!("{:#?}", prompt_data)
-                                    } else {
-                                        "[No active session]".to_string()
                                     }
-                                };
-                                tracing::info!("---\n[DEBUG] Current Context:\n{}---", context_string);
-                            });
-                        },
-                        Icon {
-                            width: 20,
-                            height: 20,
-                            icon: fi_icons::FiCpu
+                                }
+                            }
                         }
                     }
                     button {
@@ -635,7 +644,7 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
                 }
             }
             pre {
-                class: "p-4 overflow-x-auto text-sm",
+                class: "p-4 text-sm whitespace-pre-wrap break-words",
                 code {
                     class: "language-{lang}",
                     dangerous_inner_html: "{highlighted_html}"
@@ -692,14 +701,21 @@ fn MessageBubble(message: Message) -> Element {
             let content_reader = content.read();
             let mut options = Options::empty();
             options.insert(Options::ENABLE_STRIKETHROUGH);
+            options.insert(Options::ENABLE_TASKLISTS);
+            options.insert(Options::ENABLE_TABLES);
 
             let parser = Parser::new_ext(&content_reader, options);
             
             let mut elements: Vec<Element> = Vec::new();
             let mut current_events: Vec<Event> = Vec::new();
+            
             let mut in_code_block = false;
             let mut code_buffer = String::new();
             let mut lang = String::new();
+
+            let mut in_link = false;
+            let mut link_url = String::new();
+            let mut link_text_buffer: Vec<Event> = Vec::new();
 
             let flush_events = |events: &mut Vec<Event>, elements: &mut Vec<Element>| {
                 if !events.is_empty() {
@@ -737,9 +753,29 @@ fn MessageBubble(message: Message) -> Element {
                         code_buffer.clear();
                         lang.clear();
                     }
+                    Event::Start(Tag::Link { dest_url, .. }) => {
+                        flush_events(&mut current_events, &mut elements);
+                        in_link = true;
+                        link_url = dest_url.into_string();
+                    }
+                    Event::End(TagEnd::Link) => {
+                        in_link = false;
+                        let mut text_html = String::new();
+                        html::push_html(&mut text_html, link_text_buffer.drain(..));
+                        
+                        elements.push(rsx! {
+                            LinkWithControls {
+                                href: link_url.clone(),
+                                text_html: text_html
+                            }
+                        });
+                        link_url.clear();
+                    }
                     Event::Text(text) => {
                         if in_code_block {
                             code_buffer.push_str(&text);
+                        } else if in_link {
+                            link_text_buffer.push(Event::Text(text));
                         } else {
                             current_events.push(Event::Text(text));
                         }
@@ -747,15 +783,21 @@ fn MessageBubble(message: Message) -> Element {
                     Event::SoftBreak | Event::HardBreak => {
                         if in_code_block {
                             code_buffer.push('\n');
+                        } else if in_link {
+                            link_text_buffer.push(event);
                         } else {
                             current_events.push(event);
                         }
                     }
-                    e => {
-                        if !in_code_block {
+                    // For other events like emphasis, strong, etc., inside a link
+                    e @ Event::Start(_) | e @ Event::End(_) | e @ Event::Code(_) | e @ Event::Html(_) | e @ Event::FootnoteReference(_) | e @ Event::TaskListMarker(_) => {
+                        if in_link {
+                            link_text_buffer.push(e);
+                        } else if !in_code_block {
                             current_events.push(e);
                         }
                     }
+                    _ => {} // Ignore other event types for now
                 }
             }
             flush_events(&mut current_events, &mut elements);
@@ -773,7 +815,7 @@ fn MessageBubble(message: Message) -> Element {
             div {
                 class: "{container_classes} w-full",
                 div {
-                    class: "flex flex-col max-w-xs md:max-w-md",
+                    class: "flex flex-col max-w-2/3",
                     div {
                         class: "relative group px-4 py-2 rounded-2xl {bubble_classes}",
                         onmouseenter: move |_| is_hovered.set(true),
@@ -853,6 +895,80 @@ fn WelcomeMessage() -> Element {
             p {
                 class: "text-lg",
                 "Start a new conversation"
+            }
+        }
+    }
+}
+
+#[component]
+fn LinkWithControls(href: String, text_html: String) -> Element {
+    let mut copied = use_signal(|| false);
+    let mut draft = consume_context::<Signal<String>>();
+    let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+
+    let fetch_tool_available = use_memo(move || {
+        mcp_context.read().servers.iter().any(|s| s.name == "fetch")
+    });
+
+    let href_clone_copy = href.clone();
+    let copy_onclick = move |_| {
+        let href_to_copy = href_clone_copy.clone();
+        spawn(async move {
+            if copy_to_clipboard(&href_to_copy).is_ok() {
+                copied.set(true);
+                sleep(Duration::from_secs(2)).await;
+                copied.set(false);
+            }
+        });
+    };
+
+    let href_clone_summarize = href.clone();
+    let summarize_onclick = move |_| {
+        let summary_prompt = format!("Please fetch {} and summarize.", href_clone_summarize);
+        draft.set(summary_prompt);
+        // Focus the textarea after setting the draft
+        let _ = document::eval(r#"
+            const el = document.getElementById('chat-textarea');
+            if (el) {
+                el.focus();
+                el.style.height = 'auto';
+                el.style.height = (el.scrollHeight) + 'px';
+            }
+        "#);
+    };
+
+    rsx! {
+        div {
+            class: "relative inline-block group",
+            a {
+                href: "{href}",
+                target: "_blank",
+                rel: "noopener noreferrer",
+                class: "text-purple-400 hover:underline",
+                dangerous_inner_html: "{text_html}"
+            }
+            div {
+                class: "absolute bottom-0 right-0 translate-x-1/2 translate-y-1/2 z-10 hidden group-hover:flex items-center bg-gray-900 bg-opacity-75 border border-gray-700 rounded-full shadow-lg p-1 space-x-1",
+                
+                // Copy Button
+                button {
+                    class: "p-1.5 rounded text-gray-400 hover:bg-gray-700 hover:text-white transition-colors",
+                    onclick: copy_onclick,
+                    if *copied.read() {
+                        Icon { width: 16, height: 16, icon: fi_icons::FiCheck }
+                    } else {
+                        Icon { width: 16, height: 16, icon: fi_icons::FiClipboard }
+                    }
+                }
+
+                // Summarize Button
+                if *fetch_tool_available.read() {
+                    button {
+                        class: "p-1.5 rounded text-gray-400 hover:bg-gray-700 hover:text-white transition-colors",
+                        onclick: summarize_onclick,
+                        Icon { width: 16, height: 16, icon: fi_icons::FiFileText }
+                    }
+                }
             }
         }
     }

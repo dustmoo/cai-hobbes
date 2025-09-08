@@ -89,17 +89,9 @@ impl McpManager {
             let server_name = server_config_clone.name.clone();
 
             tracing::info!("Launching MCP server: {}", server_name);
-            let mut parts = server_config_clone.command.split_whitespace();
-            let program = if let Some(p) = parts.next() {
-                p
-            } else {
-                tracing::error!("Empty command for server: {}", server_name);
-                continue;
-            };
-            let args = parts;
-
-            let mut cmd = Command::new(program);
-            cmd.args(args)
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg(&server_config_clone.command)
                 .envs(&server_config_clone.env)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
