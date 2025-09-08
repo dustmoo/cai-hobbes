@@ -8,6 +8,7 @@ pub struct Settings {
     pub chat_model: String,
     pub summary_model: String,
     pub persona: String,
+    pub force_tool_use_instruction: Option<String>,
 }
 
 impl Default for Settings {
@@ -17,6 +18,7 @@ impl Default for Settings {
             chat_model: "gemini-1.5-pro-latest".to_string(),
             summary_model: "gemini-1.5-flash-latest".to_string(),
             persona: "You are Hobbes, a helpful AI assistant.".to_string(),
+            force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available.".to_string()),
         }
     }
 }

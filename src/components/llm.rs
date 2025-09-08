@@ -5,19 +5,28 @@ use tokio::sync::mpsc;
 
 const BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
-#[derive(Serialize)]
-struct GeminiRequest {
+use crate::session::Tool;
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct GeminiRequest {
     contents: Vec<Content>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Tool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<SystemInstruction>,
 }
 
-#[derive(Serialize)]
-struct Content {
-    parts: Vec<Part>,
+#[derive(Serialize, Deserialize)]
+#[derive(Debug)]
+pub struct Content {
+    pub role: String,
+    pub parts: Vec<Part>,
 }
 
-#[derive(Serialize)]
-struct Part {
-    text: String,
+#[derive(Serialize, Deserialize)]
+#[derive(Debug)]
+pub struct Part {
+    pub text: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -28,6 +37,12 @@ struct GeminiErrorResponse {
 #[derive(Deserialize, Debug)]
 struct GeminiError {
     message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[derive(Debug)]
+pub struct SystemInstruction {
+    pub parts: Vec<Part>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -44,6 +59,7 @@ struct Candidate {
 
 #[derive(Deserialize, Debug)]
 struct ContentResponse {
+    #[serde(default)]
     parts: Vec<PartResponse>,
 }
 
@@ -52,10 +68,12 @@ struct PartResponse {
     text: String,
 }
 
+use crate::context::prompt_builder::LlmPrompt;
+
 pub async fn generate_content_stream(
     api_key: String,
     model: String,
-    prompt: String,
+    prompt_data: LlmPrompt,
     tx: mpsc::UnboundedSender<String>,
 ) {
     let client = Client::builder()
@@ -64,9 +82,9 @@ pub async fn generate_content_stream(
         .expect("Failed to build reqwest client");
 
     let request_body = GeminiRequest {
-        contents: vec![Content {
-            parts: vec![Part { text: prompt }],
-        }],
+        contents: prompt_data.contents,
+        tools: prompt_data.tools,
+        system_instruction: prompt_data.system_instruction,
     };
 
     tracing::info!("Using chat model: {}", model);
@@ -94,7 +112,7 @@ pub async fn generate_content_stream(
     let mut stream = response.bytes_stream();
     let mut has_sent_data = false;
     let mut finish_reason: Option<String> = None;
-
+    let mut buffer = Vec::<u8>::new();
     // With the `:streamGenerateContent` endpoint, we receive Server-Sent Events (SSE).
     // This is a much simpler and more robust way to handle streaming compared to
     // manually buffering bytes and searching for JSON objects. The previous implementation
@@ -102,27 +120,28 @@ pub async fn generate_content_stream(
     while let Some(item) = stream.next().await {
         match item {
             Ok(bytes) => {
-                // The SSE format sends data in chunks, often line-by-line.
-                // We process each line that starts with "data: ".
-                for line in std::str::from_utf8(&bytes).unwrap_or("").lines() {
+                buffer.extend_from_slice(&bytes);
+                while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
+                    let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
+                    let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+
                     if line.starts_with("data: ") {
                         let json_str = &line["data: ".len()..];
+                        if json_str.is_empty() { continue; }
                         match serde_json::from_str::<GeminiResponse>(json_str) {
                             Ok(parsed) => {
                                 if let Some(candidate) = parsed.candidates.get(0) {
-                                    // Capture the finish reason if the API provides it.
                                     if let Some(reason) = &candidate.finish_reason {
                                         finish_reason = Some(reason.clone());
                                         if reason != "STOP" {
                                             tracing::warn!("Gemini stream finished with reason: {}", reason);
                                         }
                                     }
-                                    // Extract the text part and send it to the UI.
                                     if let Some(part) = candidate.content.parts.get(0) {
                                         if !part.text.is_empty() {
                                             if tx.send(part.text.clone()).is_err() {
                                                 tracing::error!("Failed to send content chunk to UI.");
-                                                return; // Exit if the UI receiver is gone.
+                                                return;
                                             }
                                             has_sent_data = true;
                                         }
@@ -130,15 +149,12 @@ pub async fn generate_content_stream(
                                 }
                             }
                             Err(e) => {
-                                // If we receive malformed JSON, it indicates a problem with the stream.
-                                // We log the detailed error for debugging and send a user-friendly
-                                // message to the UI, then terminate the stream.
                                 let error_message = "[Hobbes encountered a stream error. Please check the logs for details.]";
                                 tracing::error!("Failed to parse JSON chunk from stream: {}. Chunk: '{}'", e, json_str);
                                 if tx.send(error_message.to_string()).is_err() {
                                     tracing::error!("Failed to send stream error message to UI.");
                                 }
-                                return; // Stop processing the stream.
+                                return;
                             }
                         }
                     }
@@ -205,8 +221,11 @@ Recent Messages:
 
     let request_body = GeminiRequest {
         contents: vec![Content {
+            role: "user".to_string(),
             parts: vec![Part { text: full_prompt }],
         }],
+        tools: None,
+        system_instruction: None,
     };
 
     tracing::info!("Using summary model: {}", model);

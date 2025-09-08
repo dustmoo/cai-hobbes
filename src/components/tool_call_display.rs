@@ -3,8 +3,6 @@ use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use super::chat::CodeBlock;
 use super::shared::{ToolCall, ToolCallStatus};
-use crate::components::stream_manager::StreamManagerContext;
-
 #[derive(Props, Clone, PartialEq)]
 pub struct ToolCallDisplayProps {
     pub tool_call: ToolCall,
@@ -13,34 +11,10 @@ pub struct ToolCallDisplayProps {
 #[component]
 pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
     let mut show_arguments = use_signal(|| false);
-    let mut show_response = use_signal(|| true); // Default to showing response section
-    let mut status = use_signal(|| props.tool_call.status);
-    let mut response = use_signal(|| props.tool_call.response.clone());
-    let stream_manager = consume_context::<StreamManagerContext>();
+    let mut show_response = use_signal(|| true);
 
-    // Effect to handle streaming updates for the tool call response
-    use_effect(move || {
-        // Only stream if the tool call is currently running
-        if *status.read() == ToolCallStatus::Running {
-            let execution_id = props.tool_call.execution_id.clone();
-            
-            // Check if the stream manager is actively streaming for this execution ID
-            if stream_manager.is_streaming_tool_call(&execution_id) {
-                spawn(async move {
-                    // Take the stream from the manager
-                    if let Some(mut rx) = stream_manager.take_tool_call_stream(&execution_id) {
-                        while let Some(chunk) = rx.recv().await {
-                            // Append chunks to the response signal
-                            response.write().push_str(&chunk);
-                        }
-                        // Once the stream is done, we can assume it's completed.
-                        // The final status update will come from the processor, but this is a good UI default.
-                        status.set(ToolCallStatus::Completed);
-                    }
-                });
-            }
-        }
-    });
+    let status = props.tool_call.status;
+    let response = props.tool_call.response.clone();
 
 
     rsx! {
@@ -55,12 +29,12 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                 }
                 span { "{props.tool_call.server_name}" }
                 span {
-                    class: format!("text-sm font-mono px-2 py-1 rounded {}", match *status.read() {
+                    class: format!("text-sm font-mono px-2 py-1 rounded {}", match status {
                         ToolCallStatus::Running => "bg-blue-200 text-blue-800",
                         ToolCallStatus::Completed => "bg-green-200 text-green-800",
                         ToolCallStatus::Error => "bg-red-200 text-red-800",
                     }),
-                    "{status.read()}"
+                    "{status}"
                 }
             }
             div {
@@ -121,9 +95,9 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                         }
                         "Response"
                     }
-                    if *show_response.read() && !response.read().is_empty() {
+                    if *show_response.read() && !response.is_empty() {
                         CodeBlock {
-                            code: response.read().clone(),
+                            code: response,
                             lang: "markdown".to_string()
                         }
                     }

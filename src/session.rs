@@ -28,15 +28,29 @@ pub struct ConversationSummary {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Tool {
+    pub function_declarations: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolWrapper {
+    pub tool: Tool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ActiveContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_persona: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_instruction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub force_tool_use_instruction: Option<String>,
     pub conversation_summary: ConversationSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mcp_tools: Option<McpContext>,
+    pub mcp_tools: Option<McpContext>, // Keep for now for other potential uses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolWrapper>>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -46,8 +60,10 @@ impl Default for ActiveContext {
         Self {
             system_persona: None,
             user_instruction: None,
+            force_tool_use_instruction: None,
             conversation_summary: ConversationSummary::default(),
             mcp_tools: None,
+            tools: None,
             extra: HashMap::new(),
         }
     }
@@ -171,6 +187,10 @@ impl SessionState {
                 tracing::error!("Failed to save session state after updating session name: {}", e);
             }
         }
+    }
+    pub fn get_message_mut(&mut self, message_id: &uuid::Uuid) -> Option<&mut super::components::chat::Message> {
+        self.get_active_session_mut()
+            .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
     }
 }
 impl Default for SessionState {

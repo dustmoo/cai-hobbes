@@ -19,8 +19,6 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub disabled: bool,
-    #[serde(rename = "alwaysAllow", default)]
-    pub always_allow: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

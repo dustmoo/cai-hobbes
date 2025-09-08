@@ -118,137 +118,173 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     });
 
     // Reusable closure for sending a message
-    let mut send_message = move || {
-        tracing::info!("'send_message' entered.");
-        // Prevent concurrent message sends.
-        if *is_sending.read() {
-            tracing::warn!("'send_message' blocked: already sending.");
-            return;
-        }
-        let user_message = draft.read().clone();
-        if user_message.is_empty() {
-            return;
-        }
+    let send_prompt_to_llm = {
+        // Capture signals which are all `Copy`
+        let is_sending = is_sending;
+        let session_state = session_state;
+        let stream_manager = stream_manager;
+        let settings = settings;
 
-        // Clear the draft immediately for a responsive UI
-        draft.set("".to_string());
-        // Reset textarea height
-        let _ = document::eval(r#"
-            const el = document.getElementById('chat-textarea');
-            if (el) { el.style.height = 'auto'; }
-        "#);
+        move |prompt_data: crate::context::prompt_builder::LlmPrompt| {
+            spawn(async move {
+                // Now clone/read them inside the async block
+                let mut is_sending = is_sending;
+                let mut session_state = session_state;
+                let stream_manager = stream_manager;
+                let settings = settings.read().clone();
 
-        // Clone necessary signals and data for the async task
-        let mut session_state_clone = session_state.clone();
-        let stream_manager_clone = stream_manager.clone();
-        let mut is_sending_clone = is_sending.clone();
-        let settings_clone = settings.read().clone();
-        let mcp_manager_clone = mcp_manager.clone();
- 
-        // Spawn a single async task to handle all state mutations and side effects
-        spawn(async move {
-            // Set the lock.
-            is_sending_clone.set(true);
-            tracing::info!("Lock ACQUIRED.");
+                is_sending.set(true);
+                tracing::info!("Lock ACQUIRED.");
 
-            // Create a channel to signal completion from the stream manager.
-            let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-            // 1. Prepare message and context
-            let hobbes_message_id = Uuid::new_v4();
-            // 2. Perform initial state mutations
-            {
-                let mut state = session_state_clone.write();
-                if state.active_session_id.is_empty() {
-                    state.create_session();
-                }
-                let active_id = state.active_session_id.clone();
-                let session = state.sessions.get_mut(&active_id).unwrap();
+                let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+                let hobbes_message_id = Uuid::new_v4();
 
-                // Add user message
-                session.messages.push(Message {
-                    id: Uuid::new_v4(),
-                    author: "User".to_string(),
-                    content: MessageContent::Text(user_message.clone()),
-                });
-
-                // Add bot placeholder
-                session.messages.push(Message {
-                    id: hobbes_message_id,
-                    author: "Hobbes".to_string(),
-                    content: MessageContent::Text("".to_string()),
-                });
-            } // Write lock is released here
-
-            // 3. Process context and build the final prompt
-            let final_message = {
-                // 1. Perform all asynchronous work first, without holding any state locks.
-                let mcp_context = {
-                    let mcp_manager_reader = mcp_manager_clone.read();
-                    mcp_manager_reader.get_mcp_context().await
-                };
-
-                let (user_prompt, conversation_summary) = {
-                    let mut session_for_processing = session_state_clone.read().get_active_session().cloned().unwrap();
-                    let processor = ConversationProcessor::new(stream_manager_clone);
-                    let prompt = processor.process_and_respond(&mut session_for_processing, &settings_clone).await;
-                    (prompt, session_for_processing.active_context.conversation_summary)
-                };
-
-                // 2. Acquire a single write lock to perform all synchronous state mutations.
                 {
-                    let mut state = session_state_clone.write();
+                    let mut state = session_state.write();
                     if let Some(session) = state.get_active_session_mut() {
-                        // Merge summary changes
-                        session.active_context.conversation_summary = conversation_summary;
-                        
-                        // Inject the pre-fetched MCP context
-                        if !mcp_context.servers.is_empty() {
-                            session.active_context.mcp_tools = Some(mcp_context);
-                        }
+                        session.messages.push(Message {
+                            id: hobbes_message_id,
+                            author: "Hobbes".to_string(),
+                            content: MessageContent::Text("".to_string()),
+                        });
                     }
                 }
 
-                // 3. Now, build the final prompt using the fully updated state.
-                let state = session_state_clone.read();
-                let session = state.get_active_session().unwrap();
-                let builder = PromptBuilder::new(session, &settings_clone);
-                let context_string = builder.build_context_string();
-                format!("{}{}", context_string, user_prompt)
-            };
+                let api_key = settings.api_key.clone().unwrap_or_else(|| {
+                    std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
+                });
 
-            // 4. Save state after mutations
-            if let Err(e) = session_state_clone.read().save() {
-                tracing::error!("Failed to save session state: {}", e);
-            }
+                let on_complete = move || {
+                    let _ = tx.send(());
+                };
 
-            // 5. Get API key, prioritizing settings, then environment variable
-            let api_key = settings_clone.api_key.clone().unwrap_or_else(|| {
-                std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
+                stream_manager.start_stream(
+                    api_key,
+                    settings.chat_model,
+                    hobbes_message_id,
+                    prompt_data,
+                    on_complete,
+                );
+
+                rx.recv().await;
+                tracing::info!(message_id = %hobbes_message_id, "Stream completion signal RECEIVED.");
+
+                is_sending.set(false);
+                tracing::info!("Lock RELEASED.");
             });
+        }
+    };
 
-            // 6. Start the stream using the manager
-            let on_complete = move || {
-                // This closure is now Send-able as it only moves the sender.
-                let _ = tx.send(());
-            };
-            tracing::info!(message_id = %hobbes_message_id, "'send_message' calling 'start_stream'.");
-            stream_manager_clone.start_stream(
-                api_key,
-                settings_clone.chat_model,
-                hobbes_message_id,
-                final_message,
-                on_complete,
-            );
+    // Effect to trigger LLM feedback loop after a tool call completes
+    use_effect({
+        let session_state = session_state.clone();
+        let send_prompt_to_llm = send_prompt_to_llm.clone();
+        let settings = settings.read().clone();
+        move || {
+            let messages = session_state.read().get_active_session().map_or(vec![], |s| s.messages.clone());
+            if let Some(last_message) = messages.last() {
+                if let MessageContent::ToolCall(tc) = &last_message.content {
+                    if tc.status == super::shared::ToolCallStatus::Completed {
+                        // A tool call just finished. Time to send the result back to the LLM.
+                        let tool_response_prompt = format!(
+                            "<tool_response>\n<server_name>{}</server_name>\n<tool_name>{}</tool_name>\n<response>{}</response>\n</tool_response>",
+                            tc.server_name, tc.tool_name, tc.response
+                        );
+                        
+                        let state = session_state.read();
+                        if let Some(session) = state.get_active_session() {
+                             let builder = PromptBuilder::new(session, &settings);
+                             let prompt_data = builder.build_prompt(tool_response_prompt, None);
+                             send_prompt_to_llm(prompt_data);
+                        }
+                    }
+                }
+            }
+        }
+    });
 
-            // 6. Wait for the stream to complete
-            // This will pause the execution of this task until the on_complete callback is called.
-            rx.recv().await;
-            tracing::info!(message_id = %hobbes_message_id, "Stream completion signal RECEIVED.");
+    let mut send_message = {
+        // Capture signals which are all `Copy`
+        let is_sending = is_sending;
+        let mut draft = draft;
+        let session_state = session_state;
+        let settings = settings;
+        let mcp_manager = mcp_manager;
+        let send_prompt_to_llm = send_prompt_to_llm;
 
-            // 7. Release the lock
-            is_sending_clone.set(false);
-            tracing::info!("Lock RELEASED.");
-        });
+        move || {
+            if *is_sending.read() {
+                tracing::warn!("'send_message' blocked: already sending.");
+                return;
+            }
+            let user_message = draft.read().clone();
+            if user_message.is_empty() {
+                return;
+            }
+            draft.set("".to_string());
+            let _ = document::eval(r#"
+                const el = document.getElementById('chat-textarea');
+                if (el) { el.style.height = 'auto'; }
+            "#);
+
+            spawn(async move {
+                // Clone/read signals inside the async block
+                let mut session_state = session_state;
+                let settings = settings.read().clone();
+                let mcp_manager = mcp_manager;
+                let send_prompt_to_llm = send_prompt_to_llm;
+
+                {
+                    let mut state = session_state.write();
+                    if state.active_session_id.is_empty() {
+                        state.create_session();
+                    }
+                    if let Some(session) = state.get_active_session_mut() {
+                        session.messages.push(Message {
+                            id: Uuid::new_v4(),
+                            author: "User".to_string(),
+                            content: MessageContent::Text(user_message.clone()),
+                        });
+                    }
+                }
+
+                let prompt_data = {
+                    let mcp_context = mcp_manager.read().get_mcp_context().await;
+                    let (user_prompt, conversation_summary) = {
+                        let mut session_for_processing = session_state.read().get_active_session().cloned().unwrap();
+                        let processor = ConversationProcessor::new();
+                        let prompt = processor.process_and_respond(&mut session_for_processing, &settings).await;
+                        (prompt, session_for_processing.active_context.conversation_summary)
+                    };
+
+                    {
+                        let mut state = session_state.write();
+                        if let Some(session) = state.get_active_session_mut() {
+                            session.active_context.conversation_summary = conversation_summary;
+                            if !mcp_context.servers.is_empty() {
+                                session.active_context.mcp_tools = Some(mcp_context);
+                            }
+                        }
+                    }
+
+                    let state = session_state.read();
+                    let session = state.get_active_session().unwrap();
+                    let last_agent_message = session.messages.iter().filter(|m| m.author == "Hobbes").last().and_then(|m| match &m.content {
+                        MessageContent::Text(text) => Some(text.clone()),
+                        _ => None,
+                    });
+
+                    let builder = PromptBuilder::new(session, &settings);
+                    builder.build_prompt(user_prompt, last_agent_message)
+                };
+
+                if let Err(e) = session_state.read().save() {
+                    tracing::error!("Failed to save session state: {}", e);
+                }
+
+                send_prompt_to_llm(prompt_data);
+            });
+        }
     };
 
 
@@ -494,7 +530,10 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                                         // Build the prompt from the modified clone to show an accurate preview.
                                         let settings_reader = settings.read();
                                         let builder = PromptBuilder::new(&session_for_debug, &settings_reader);
-                                        builder.build_context_string()
+                                        // Note: This debug view might not be perfect after the refactor,
+                                        // but it's better to show the raw prompt struct than to crash.
+                                        let prompt_data = builder.build_prompt("[DEBUG USER MESSAGE]".to_string(), None);
+                                        format!("{:#?}", prompt_data)
                                     } else {
                                         "[No active session]".to_string()
                                     }

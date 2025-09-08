@@ -1,18 +1,16 @@
 use crate::session::{ConversationSummary, Session};
 use crate::components::llm;
 use crate::settings::Settings;
-use crate::components::stream_manager::StreamManagerContext;
 use crate::components::shared::{MessageContent};
 
 /// Processes conversation history to extract and update short-term context.
 pub struct ConversationProcessor {
-    stream_manager: StreamManagerContext,
 }
 
 impl ConversationProcessor {
     /// Creates a new `ConversationProcessor`.
-    pub fn new(stream_manager: StreamManagerContext) -> Self {
-        Self { stream_manager }
+    pub fn new() -> Self {
+        Self {}
     }
 
     /// Takes the last few messages, generates a context summary using a fast LLM,

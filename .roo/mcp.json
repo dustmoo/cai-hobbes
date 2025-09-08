@@ -17,7 +17,6 @@
       ],
       "alwaysAllow": [
         "get_active_context",
-        "log_progress",
         "update_active_context",
         "log_decision",
         "get_recent_activity_summary",
