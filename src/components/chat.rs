@@ -40,7 +40,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let settings = use_context::<Signal<Settings>>();
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
-    let mcp_servers_loaded = use_context::<Signal<bool>>();
+    let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut draft = use_signal(|| "".to_string());
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut has_interacted = use_signal(|| false);
@@ -99,21 +99,15 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         }
     });
 
-    // Effect to update session state with MCP context once servers are loaded
+    // Effect to update session state with MCP context when it changes
     use_effect(move || {
-        if *mcp_servers_loaded.read() {
-            let mut session_state = session_state.clone();
-            let mcp_manager = mcp_manager.clone();
-            spawn(async move {
-                let mcp_context = mcp_manager.read().get_mcp_context().await;
-                if !mcp_context.servers.is_empty() {
-                    let mut state = session_state.write();
-                    if let Some(session) = state.get_active_session_mut() {
-                        session.active_context.mcp_tools = Some(mcp_context);
-                        tracing::info!("MCP context reactively loaded into session state.");
-                    }
-                }
-            });
+        let mcp_context_reader = mcp_context.read();
+        if !mcp_context_reader.servers.is_empty() {
+            let mut state = session_state.write();
+            if let Some(session) = state.get_active_session_mut() {
+                session.active_context.mcp_tools = Some(mcp_context_reader.clone());
+                tracing::info!("MCP context reactively loaded into session state.");
+            }
         }
     });
 
@@ -125,7 +119,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         let stream_manager = stream_manager;
         let settings = settings;
 
-        move |prompt_data: crate::context::prompt_builder::LlmPrompt| {
+        move |prompt_data: crate::context::prompt_builder::LlmPrompt, mcp_context: Option<crate::mcp::manager::McpContext>| {
             spawn(async move {
                 // Now clone/read them inside the async block
                 let mut is_sending = is_sending;
@@ -164,6 +158,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     hobbes_message_id,
                     prompt_data,
                     on_complete,
+                    mcp_context,
                 );
 
                 rx.recv().await;
@@ -195,7 +190,8 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         if let Some(session) = state.get_active_session() {
                              let builder = PromptBuilder::new(session, &settings);
                              let prompt_data = builder.build_prompt(tool_response_prompt, None);
-                             send_prompt_to_llm(prompt_data);
+                             let mcp_context = session.active_context.mcp_tools.clone();
+                             send_prompt_to_llm(prompt_data, mcp_context);
                         }
                     }
                 }
@@ -282,7 +278,8 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     tracing::error!("Failed to save session state: {}", e);
                 }
 
-                send_prompt_to_llm(prompt_data);
+                let mcp_context = session_state.read().get_active_session().and_then(|s| s.active_context.mcp_tools.clone());
+                send_prompt_to_llm(prompt_data, mcp_context);
             });
         }
     };
@@ -471,8 +468,8 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         id: "chat-textarea",
                         class: "flex-1 py-2 px-4 rounded-xl bg-gray-800 border border-gray-700 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none overflow-y-hidden",
                         rows: "1",
-                        placeholder: if *mcp_servers_loaded.read() { "Type your message..." } else { "Initializing..." },
-                        disabled: !*mcp_servers_loaded.read(),
+                        placeholder: if !mcp_context.read().servers.is_empty() { "Type your message..." } else { "Initializing..." },
+                        disabled: mcp_context.read().servers.is_empty(),
                         value: "{draft}",
                         oninput: move |event| {
                             draft.set(event.value());
@@ -560,7 +557,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     }
                     button {
                         class: "px-5 py-2 bg-purple-600 rounded-full text-white font-semibold hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-opacity-50 transition-colors disabled:bg-gray-500",
-                        disabled: !*mcp_servers_loaded.read(),
+                        disabled: mcp_context.read().servers.is_empty(),
                         onclick: move |_| {
                             if !*has_interacted.read() {
                                 on_interaction.call(());
@@ -668,8 +665,10 @@ fn MessageBubble(message: Message) -> Element {
             if !is_user && stream_manager.is_streaming(&message.id) {
                 spawn(async move {
                     if let Some(mut rx) = stream_manager.take_stream(&message.id) {
-                        while let Some(chunk) = rx.recv().await {
-                            content.write().push_str(&chunk);
+                        while let Some(stream_msg) = rx.recv().await {
+                            if let crate::components::shared::StreamMessage::Text(chunk) = stream_msg {
+                                content.write().push_str(&chunk);
+                            }
                         }
                     }
                 });

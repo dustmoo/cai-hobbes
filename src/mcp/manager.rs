@@ -1,3 +1,4 @@
+use dioxus_signals::Writable;
 use rmcp::model::{CallToolRequestParam, Tool};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::child_process::TokioChildProcess;
@@ -81,15 +82,14 @@ impl McpManager {
         }
     }
 
-    pub async fn launch_servers(&self) {
-        for server_config in self.configs.iter() {
-            if server_config.disabled {
-                tracing::info!("Skipping disabled MCP server: {}", server_config.name);
-                continue;
-            }
-            let server_name = server_config.name.clone();
+    pub async fn launch_servers(&self, mut mcp_context_signal: dioxus::prelude::Signal<McpContext>) {
+        for server_config in self.configs.iter().filter(|sc| !sc.disabled) {
+            let server_config_clone = server_config.clone();
+            let servers_map = self.servers.clone();
+            let server_name = server_config_clone.name.clone();
+
             tracing::info!("Launching MCP server: {}", server_name);
-            let mut parts = server_config.command.split_whitespace();
+            let mut parts = server_config_clone.command.split_whitespace();
             let program = if let Some(p) = parts.next() {
                 p
             } else {
@@ -100,25 +100,18 @@ impl McpManager {
 
             let mut cmd = Command::new(program);
             cmd.args(args)
-                .envs(&server_config.env)
+                .envs(&server_config_clone.env)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
-            let servers_map = self.servers.clone();
-            let server_config_clone = server_config.clone();
-
-            // This is now a blocking async operation within the function's scope
             match TokioChildProcess::new(cmd) {
                 Ok(transport) => match ().serve(transport).await {
                     Ok(service) => {
                         tracing::info!("Connected to MCP server: {}", server_name);
                         match service.list_tools(Default::default()).await {
                             Ok(result) => {
-                                tracing::info!(
-                                    "Discovered capabilities for MCP server: {}",
-                                    server_name
-                                );
+                                tracing::info!("Discovered capabilities for MCP server: {}", server_name);
                                 let active_client = ActiveMcpClient {
                                     config: server_config_clone,
                                     service,
@@ -126,24 +119,18 @@ impl McpManager {
                                 };
                                 let mut servers = servers_map.lock().await;
                                 servers.insert(server_name.clone(), active_client);
-                                tracing::info!("Successfully added '{}' to active MCP clients.", server_name);
+                                drop(servers); // Unlock before await
+
+                                let new_context = self.get_mcp_context().await;
+                                mcp_context_signal.set(new_context);
+                                tracing::info!("Successfully added '{}' and updated MCP context.", server_name);
                             }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Failed to discover capabilities for MCP server '{}': {}",
-                                    server_name,
-                                    e
-                                );
-                            }
+                            Err(e) => tracing::error!("Failed to list tools for '{}': {}", server_name, e),
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to connect to MCP server '{}': {}", server_name, e);
-                    }
+                    Err(e) => tracing::error!("Failed to serve MCP server '{}': {}", server_name, e),
                 },
-                Err(e) => {
-                    tracing::error!("Failed to launch MCP server '{}': {}", server_name, e);
-                }
+                Err(e) => tracing::error!("Failed to launch MCP server '{}': {}", server_name, e),
             }
         }
         tracing::info!("All MCP server launch tasks completed.");

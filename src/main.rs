@@ -75,15 +75,13 @@ fn app() -> Element {
     let session_state = use_context_provider(|| Signal::new(SessionState::new()));
     let settings_manager = use_context_provider(|| Signal::new(SettingsManager::new(get_settings_path())));
     let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(get_mcp_config_path())));
-    let mcp_servers_loaded = use_context_provider(|| Signal::new(false));
+    let mcp_context = use_context_provider(|| Signal::new(mcp::manager::McpContext { servers: Vec::new() }));
 
     use_effect(move || {
         let manager = mcp_manager.read().clone();
-        let mut loaded_writer = mcp_servers_loaded.clone();
+        let mcp_context_signal = mcp_context.clone();
         spawn(async move {
-            manager.launch_servers().await;
-            loaded_writer.set(true);
-            tracing::info!("MCP servers loaded signal set to true.");
+            manager.launch_servers(mcp_context_signal).await;
         });
     });
         let _settings = use_context_provider(|| {

@@ -3,6 +3,8 @@ use reqwest::Client;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
+use crate::components::shared::ToolCall;
+use crate::components::shared::StreamMessage;
 const BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
 use crate::session::Tool;
@@ -63,9 +65,19 @@ struct ContentResponse {
     parts: Vec<PartResponse>,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FunctionCall {
+    pub name: String,
+    pub args: serde_json::Value,
+}
+
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 struct PartResponse {
+    #[serde(default)]
     text: String,
+    function_call: Option<FunctionCall>,
 }
 
 use crate::context::prompt_builder::LlmPrompt;
@@ -74,7 +86,8 @@ pub async fn generate_content_stream(
     api_key: String,
     model: String,
     prompt_data: LlmPrompt,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::UnboundedSender<StreamMessage>,
+    mcp_context: Option<crate::mcp::manager::McpContext>,
 ) {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -86,7 +99,6 @@ pub async fn generate_content_stream(
         tools: prompt_data.tools,
         system_instruction: prompt_data.system_instruction,
     };
-
     tracing::info!("Using chat model: {}", model);
     let url = format!("{}/{}:streamGenerateContent?key={}&alt=sse", BASE_API_URL, model, api_key);
 
@@ -138,8 +150,31 @@ pub async fn generate_content_stream(
                                         }
                                     }
                                     if let Some(part) = candidate.content.parts.get(0) {
-                                        if !part.text.is_empty() {
-                                            if tx.send(part.text.clone()).is_err() {
+                                        if let Some(function_call) = &part.function_call {
+                                            let mut found_tool = false;
+                                            if let Some(context) = &mcp_context {
+                                                for server in &context.servers {
+                                                    if server.tools.iter().any(|t| t.name == function_call.name) {
+                                                        let tool_call = ToolCall::new(
+                                                            server.name.clone(),
+                                                            function_call.name.clone(),
+                                                            function_call.args.clone(),
+                                                        );
+                                                        if tx.send(StreamMessage::ToolCall(tool_call)).is_err() {
+                                                            tracing::error!("Failed to send tool call to stream manager.");
+                                                            return;
+                                                        }
+                                                        has_sent_data = true;
+                                                        found_tool = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            if !found_tool {
+                                                tracing::error!("LLM requested tool '{}' which was not found in the provided context.", function_call.name);
+                                            }
+                                        } else if !part.text.is_empty() {
+                                            if tx.send(StreamMessage::Text(part.text.clone())).is_err() {
                                                 tracing::error!("Failed to send content chunk to UI.");
                                                 return;
                                             }
@@ -151,7 +186,7 @@ pub async fn generate_content_stream(
                             Err(e) => {
                                 let error_message = "[Hobbes encountered a stream error. Please check the logs for details.]";
                                 tracing::error!("Failed to parse JSON chunk from stream: {}. Chunk: '{}'", e, json_str);
-                                if tx.send(error_message.to_string()).is_err() {
+                                if tx.send(StreamMessage::Text(error_message.to_string())).is_err() {
                                     tracing::error!("Failed to send stream error message to UI.");
                                 }
                                 return;
@@ -175,7 +210,7 @@ pub async fn generate_content_stream(
             Some(reason) => format!("[Hobbes did not provide a response. Finish Reason: {}]", reason),
             None => "[Hobbes did not provide a response due to an internal error.]".to_string(),
         };
-        if tx.send(default_message).is_err() {
+        if tx.send(StreamMessage::Text(default_message)).is_err() {
             tracing::error!("Failed to send default message to UI.");
         }
     }

@@ -130,3 +130,128 @@ fn recursively_remove_keys(value: &mut serde_json::Value, keys_to_remove: &[&str
         _ => {}
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::prompt_builder::{recursively_remove_keys, PromptBuilder};
+    use crate::mcp::manager::{McpContext, McpServerContext};
+    use crate::session::{ActiveContext, ConversationSummary, ConversationSummaryEntities, Session};
+    use crate::settings::Settings;
+    use chrono::Utc;
+    use rmcp::model::Tool;
+    use serde_json::json;
+
+    #[test]
+    fn test_recursively_remove_keys() {
+        let mut value = json!({
+            "level1": {
+                "exclusiveMaximum": 100,
+                "level2": {
+                    "exclusiveMinimum": 0,
+                    "keep": "this"
+                },
+                "another_key": "value"
+            },
+            "level1_array": [
+                { "exclusiveMaximum": 50, "data": "A" },
+                { "exclusiveMinimum": 5, "data": "B" }
+            ]
+        });
+
+        let keys_to_remove = ["exclusiveMaximum", "exclusiveMinimum"];
+        recursively_remove_keys(&mut value, &keys_to_remove);
+
+        let expected = json!({
+            "level1": {
+                "level2": {
+                    "keep": "this"
+                },
+                "another_key": "value"
+            },
+            "level1_array": [
+                { "data": "A" },
+                { "data": "B" }
+            ]
+        });
+
+        assert_eq!(value, expected);
+    }
+
+    fn create_mock_session_with_tools() -> Session {
+        let tool1: Tool = serde_json::from_value(json!({
+            "name": "get_weather",
+            "description": "Get the current weather",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city and state, e.g. San Francisco, CA",
+                        "exclusiveMaximum": 100
+                    }
+                },
+                "required": ["location"]
+            }
+        }))
+        .unwrap();
+
+        let server = McpServerContext {
+            name: "weather_server".to_string(),
+            description: "Provides weather information".to_string(),
+            tools: vec![tool1],
+        };
+
+        let mcp_context = McpContext {
+            servers: vec![server],
+        };
+
+        let active_context = ActiveContext {
+            mcp_tools: Some(mcp_context),
+            conversation_summary: ConversationSummary {
+                summary: "".to_string(),
+                sentiment: "neutral".to_string(),
+                entities: ConversationSummaryEntities {
+                    user_name: "TestUser".to_string(),
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+
+        Session {
+            id: "test_session".to_string(),
+            name: "Test Session".to_string(),
+            messages: vec![],
+            active_context,
+            last_updated: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_build_prompt_renames_schema_and_removes_keys() {
+        let session = create_mock_session_with_tools();
+        let settings = Settings::default();
+        let builder = PromptBuilder::new(&session, &settings);
+
+        let prompt = builder.build_prompt("What's the weather?".to_string(), None);
+
+        let tools = prompt.tools.expect("Should have tools");
+        let tool_declarations = &tools[0].function_declarations;
+        assert_eq!(tool_declarations.len(), 1);
+
+        let tool_json = &tool_declarations[0];
+
+        // 1. Verify "inputSchema" was renamed to "parameters"
+        assert!(tool_json.get("parameters").is_some());
+        assert!(tool_json.get("inputSchema").is_none());
+
+        // 2. Verify unsupported keys were removed
+        let parameters = tool_json.get("parameters").unwrap();
+        let properties = parameters.get("properties").unwrap();
+        let location = properties.get("location").unwrap();
+        assert!(location.get("exclusiveMaximum").is_none());
+        assert!(location.get("type").is_some());
+    }
+}

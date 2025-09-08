@@ -16,6 +16,24 @@ pub struct ToolCall {
     pub response: String,
 }
 
+pub enum StreamMessage {
+    Text(String),
+    ToolCall(ToolCall),
+}
+
+impl ToolCall {
+    pub fn new(server_name: String, tool_name: String, args: serde_json::Value) -> Self {
+        Self {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            server_name,
+            tool_name,
+            arguments: args.to_string(),
+            status: ToolCallStatus::Running,
+            response: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Copy, Debug, Default)]
 pub enum ToolCallStatus {
     #[default]
