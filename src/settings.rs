@@ -9,16 +9,24 @@ pub struct Settings {
     pub summary_model: String,
     pub persona: String,
     pub force_tool_use_instruction: Option<String>,
+    pub project_folder: Option<String>,
+    pub settings_panel_width: Option<f64>,
+    pub chat_history_length: usize,
+    pub show_tray_icon: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             api_key: None,
-            chat_model: "gemini-1.5-pro-latest".to_string(),
+            chat_model: "gemini-2.5-pro".to_string(),
             summary_model: "gemini-1.5-flash-latest".to_string(),
             persona: "You are Hobbes, a helpful AI assistant.".to_string(),
-            force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available.".to_string()),
+            force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available. When using the fetch tool, you MUST provide markdown links as sources.".to_string()),
+            project_folder: None,
+            settings_panel_width: Some(256.0),
+            chat_history_length: 4,
+            show_tray_icon: true,
         }
     }
 }

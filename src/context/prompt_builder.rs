@@ -1,7 +1,30 @@
 use crate::components::llm::{Content, Part, SystemInstruction};
 use crate::session::{Session, Tool};
 use crate::settings::Settings;
-use serde_json::{self};
+use chrono::Utc;
+use serde_json::{self, json};
+use crate::components::chat::Message;
+use crate::components::shared::MessageContent;
+
+impl From<Message> for Content {
+    fn from(msg: Message) -> Self {
+        let role = if msg.author == "User" { "user" } else { "model" }.to_string();
+        match msg.content {
+            MessageContent::Text(text) => Content {
+                role,
+                parts: vec![Part { text }],
+            },
+            MessageContent::ToolCall(_) => {
+                // We don't want to include tool calls in the history this way,
+                // so we return an empty part that can be filtered out.
+                Content {
+                    role,
+                    parts: vec![Part { text: String::new() }],
+                }
+            }
+        }
+    }
+}
 
 /// A structured container for all components of an LLM prompt.
 #[derive(Debug)]
@@ -26,7 +49,7 @@ impl<'a> PromptBuilder<'a> {
     pub fn build_prompt(
         &self,
         user_message: String,
-        last_agent_message: Option<String>,
+        _last_agent_message: Option<String>,
     ) -> LlmPrompt {
         // 1. Extract and format tools from the session context.
         let tools = self.session.active_context.mcp_tools.as_ref().map(|mcp_context| {
@@ -43,7 +66,7 @@ impl<'a> PromptBuilder<'a> {
                         }
                         
                         // Next, recursively remove any unsupported keys from the schema.
-                        recursively_remove_keys(&mut tool_value, &["exclusiveMaximum", "exclusiveMinimum"]);
+                        recursively_remove_keys(&mut tool_value, &["exclusiveMaximum", "exclusiveMinimum", "$schema", "additionalProperties", "outputSchema"]);
 
                         function_declarations.push(tool_value);
                     }
@@ -78,6 +101,14 @@ impl<'a> PromptBuilder<'a> {
             system_context_map.remove("user_instruction");
         }
 
+        system_context_map.insert(
+            "current_time".to_string(),
+            json!({
+                "iso_8601": Utc::now().to_rfc3339(),
+                "timezone": "UTC"
+            }),
+        );
+
         let instruction_text = serde_json::to_string(&system_context_map).unwrap_or_default();
         let system_instruction = if !instruction_text.is_empty() && instruction_text != "{}" {
             Some(SystemInstruction {
@@ -89,14 +120,33 @@ impl<'a> PromptBuilder<'a> {
 
         // 3. Construct the conversational contents.
         let mut contents = Vec::new();
-        if let Some(agent_msg) = last_agent_message {
-            if !agent_msg.is_empty() {
-                contents.push(Content {
-                    role: "model".to_string(),
-                    parts: vec![Part { text: agent_msg }],
-                });
+        let history_len = self.settings.chat_history_length;
+        let messages = &self.session.messages;
+        let mut first_message_id = None;
+
+        // 1. Add the first user message to preserve the original intent.
+        if let Some(first_message) = messages.iter().find(|m| m.author == "User") {
+            if let MessageContent::Text(_) = &first_message.content {
+                 contents.push(first_message.clone().into());
+                 first_message_id = Some(first_message.id);
             }
         }
+
+        // 2. Add the last `history_len` messages.
+        let start_index = messages.len().saturating_sub(history_len);
+        
+        for message in messages.iter().skip(start_index) {
+            // Avoid duplicating the first message if it's within the recent window
+            if Some(message.id) != first_message_id {
+                let content: Content = message.clone().into();
+                // Only add non-empty text messages
+                if !content.parts.iter().any(|p| p.text.is_empty()) {
+                    contents.push(content);
+                }
+            }
+        }
+        
+        // 3. Add the current user message.
         contents.push(Content {
             role: "user".to_string(),
             parts: vec![Part { text: user_message }],
@@ -184,7 +234,9 @@ mod tests {
             "name": "get_weather",
             "description": "Get the current weather",
             "inputSchema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "location": {
                         "type": "string",
@@ -253,5 +305,7 @@ mod tests {
         let location = properties.get("location").unwrap();
         assert!(location.get("exclusiveMaximum").is_none());
         assert!(location.get("type").is_some());
+        assert!(parameters.get("$schema").is_none());
+        assert!(parameters.get("additionalProperties").is_none());
     }
 }

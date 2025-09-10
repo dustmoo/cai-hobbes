@@ -3,13 +3,14 @@ use tray_icon::{
     TrayIconBuilder,
     Icon,
     TrayIconEvent,
+    TrayIcon,
 };
 use tracing;
 
 pub static WINDOW_VISIBLE: GlobalSignal<bool> = Signal::global(|| true);
 pub static APP_QUIT: GlobalSignal<bool> = Signal::global(|| false);
 
-pub fn init_tray() {
+pub fn init_tray() -> TrayIcon {
     let image_bytes = include_bytes!("../assets/favicon.png");
     let image = image::load_from_memory(image_bytes)
         .expect("Failed to load icon from memory")
@@ -18,15 +19,9 @@ pub fn init_tray() {
     let icon_data = image.into_raw();
     let icon = Icon::from_rgba(icon_data, width, height).expect("Failed to create icon");
 
-    // Build a tray icon without a menu to avoid dependency conflicts.
-    let tray_icon = TrayIconBuilder::new()
-        .with_icon(icon)
-        .with_tooltip("Hobbes")
-        .build()
-        .unwrap();
-    std::mem::forget(tray_icon);
-
-    // Use the TrayIconEvent receiver for direct clicks, as per the official documentation.
+    // Build a tray icon without a menu to avoid the muda class conflict.
+    // The main application menu is handled separately in menu.rs.
+    // Use the TrayIconEvent receiver for direct clicks.
     let tray_channel = TrayIconEvent::receiver();
 
     std::thread::spawn(move || {
@@ -44,4 +39,10 @@ pub fn init_tray() {
             }
         }
     });
+
+    TrayIconBuilder::new()
+        .with_icon(icon)
+        .with_tooltip("Hobbes")
+        .build()
+        .unwrap()
 }

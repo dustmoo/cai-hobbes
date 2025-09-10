@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::settings::Settings;
 use super::shared::{MessageContent};
 use super::tool_call_display::ToolCallDisplay;
+use super::link_with_controls::LinkWithControls;
 lazy_static! {
     static ref SYNTAX_SET: SyntaxSet = SyntaxSet::load_defaults_newlines();
     static ref THEME_SET: ThemeSet = ThemeSet::load_defaults();
@@ -721,11 +722,18 @@ fn MessageBubble(message: Message) -> Element {
                 if !events.is_empty() {
                     let mut html_output = String::new();
                     html::push_html(&mut html_output, events.drain(..));
-                    if !html_output.trim().is_empty() {
+                    let html_output = html_output.trim();
+                    // Strip wrapping <p> tags if they exist to ensure inline flow
+                    let inline_html = if html_output.starts_with("<p>") && html_output.ends_with("</p>") {
+                        &html_output[3..html_output.len() - 4]
+                    } else {
+                        html_output
+                    };
+
+                    if !inline_html.is_empty() {
                         elements.push(rsx! {
-                            div {
-                                class: "prose prose-sm dark:prose-invert max-w-none",
-                                dangerous_inner_html: "{html_output}"
+                            span {
+                                dangerous_inner_html: "{inline_html}"
                             }
                         });
                     }
@@ -817,14 +825,17 @@ fn MessageBubble(message: Message) -> Element {
                 div {
                     class: "flex flex-col max-w-2/3",
                     div {
-                        class: "relative group px-4 py-2 rounded-2xl {bubble_classes}",
+                        class: "relative px-4 py-2 rounded-2xl {bubble_classes}",
                         onmouseenter: move |_| is_hovered.set(true),
                         onmouseleave: move |_| is_hovered.set(false),
                         if is_thinking {
                             ThinkingIndicator {}
                         } else {
-                            for el in elements.read().iter() {
-                                {el}
+                            div {
+                                class: "prose prose-sm dark:prose-invert max-w-none",
+                                for el in elements.read().iter() {
+                                    {el}
+                                }
                             }
                         }
                         if *is_hovered.read() && !content.read().is_empty() {
@@ -895,80 +906,6 @@ fn WelcomeMessage() -> Element {
             p {
                 class: "text-lg",
                 "Start a new conversation"
-            }
-        }
-    }
-}
-
-#[component]
-fn LinkWithControls(href: String, text_html: String) -> Element {
-    let mut copied = use_signal(|| false);
-    let mut draft = consume_context::<Signal<String>>();
-    let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
-
-    let fetch_tool_available = use_memo(move || {
-        mcp_context.read().servers.iter().any(|s| s.name == "fetch")
-    });
-
-    let href_clone_copy = href.clone();
-    let copy_onclick = move |_| {
-        let href_to_copy = href_clone_copy.clone();
-        spawn(async move {
-            if copy_to_clipboard(&href_to_copy).is_ok() {
-                copied.set(true);
-                sleep(Duration::from_secs(2)).await;
-                copied.set(false);
-            }
-        });
-    };
-
-    let href_clone_summarize = href.clone();
-    let summarize_onclick = move |_| {
-        let summary_prompt = format!("Please fetch {} and summarize.", href_clone_summarize);
-        draft.set(summary_prompt);
-        // Focus the textarea after setting the draft
-        let _ = document::eval(r#"
-            const el = document.getElementById('chat-textarea');
-            if (el) {
-                el.focus();
-                el.style.height = 'auto';
-                el.style.height = (el.scrollHeight) + 'px';
-            }
-        "#);
-    };
-
-    rsx! {
-        div {
-            class: "relative inline-block group",
-            a {
-                href: "{href}",
-                target: "_blank",
-                rel: "noopener noreferrer",
-                class: "text-purple-400 hover:underline",
-                dangerous_inner_html: "{text_html}"
-            }
-            div {
-                class: "absolute bottom-0 right-0 translate-x-1/2 translate-y-1/2 z-10 hidden group-hover:flex items-center bg-gray-900 bg-opacity-75 border border-gray-700 rounded-full shadow-lg p-1 space-x-1",
-                
-                // Copy Button
-                button {
-                    class: "p-1.5 rounded text-gray-400 hover:bg-gray-700 hover:text-white transition-colors",
-                    onclick: copy_onclick,
-                    if *copied.read() {
-                        Icon { width: 16, height: 16, icon: fi_icons::FiCheck }
-                    } else {
-                        Icon { width: 16, height: 16, icon: fi_icons::FiClipboard }
-                    }
-                }
-
-                // Summarize Button
-                if *fetch_tool_available.read() {
-                    button {
-                        class: "p-1.5 rounded text-gray-400 hover:bg-gray-700 hover:text-white transition-colors",
-                        onclick: summarize_onclick,
-                        Icon { width: 16, height: 16, icon: fi_icons::FiFileText }
-                    }
-                }
             }
         }
     }

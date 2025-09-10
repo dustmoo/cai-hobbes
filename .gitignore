@@ -8,3 +8,6 @@
 .env
 
 /context_portal
+
+# Local MCP server configurations
+mcp_servers/

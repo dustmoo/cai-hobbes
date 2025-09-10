@@ -45,6 +45,7 @@ impl StreamManagerContext {
                 llm::generate_content_stream(api_key, model, prompt_data, llm_tx, mcp_context).await;
             });
 
+            let mut is_first_message = true;
             while let Some(message) = llm_rx.recv().await {
                 match message {
                     StreamMessage::Text(chunk) => {
@@ -57,16 +58,28 @@ impl StreamManagerContext {
                         if ui_tx.send(StreamMessage::Text(chunk)).is_err() {
                             break; // UI component likely dropped
                         }
+                        is_first_message = false;
                     }
                     StreamMessage::ToolCall(tool_call) => {
-                        let tool_call_message_id = Uuid::new_v4();
                         let mut state = self.session_state.write();
-                        if let Some(session) = state.get_active_session_mut() {
-                            session.messages.push(crate::components::chat::Message {
-                                id: tool_call_message_id,
-                                author: "Hobbes".to_string(),
-                                content: crate::components::shared::MessageContent::ToolCall(tool_call.clone()),
-                            });
+                        let tool_call_message_id;
+
+                        if is_first_message {
+                            // This is the first message. Let's replace the content of the original message.
+                            tool_call_message_id = message_id;
+                            if let Some(msg) = state.get_message_mut(&message_id) {
+                                msg.content = crate::components::shared::MessageContent::ToolCall(tool_call.clone());
+                            }
+                        } else {
+                            // This is not the first message, so create a new message for the tool call.
+                            tool_call_message_id = Uuid::new_v4();
+                            if let Some(session) = state.get_active_session_mut() {
+                                session.messages.push(crate::components::chat::Message {
+                                    id: tool_call_message_id,
+                                    author: "Hobbes".to_string(),
+                                    content: crate::components::shared::MessageContent::ToolCall(tool_call.clone()),
+                                });
+                            }
                         }
                         drop(state);
 
@@ -93,6 +106,7 @@ impl StreamManagerContext {
                                 }
                             }
                         });
+                        is_first_message = false;
                     }
                 }
             }
@@ -188,7 +202,7 @@ mod tests {
         let mut dom = VirtualDom::new(|| {
             let session_state = use_context_provider(|| Signal::new(SessionState::new()));
             let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new())));
-            let mut stream_manager = use_context_provider(|| StreamManagerContext {
+            let stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
                 session_state,
                 mcp_manager,

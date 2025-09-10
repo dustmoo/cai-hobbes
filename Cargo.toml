@@ -1,6 +1,6 @@
 [package]
-name = "cai-hobbes"
-version = "0.1.0"
+name = "Hobbes"
+version = "0.5.0"
 authors = ["Dustin Moore <dustin@clearmirror.ai>"]
 edition = "2021"
 
@@ -67,11 +67,12 @@ futures = "0.3.31"
 chrono = { version = "0.4.41", features = ["serde"] }
 rmcp = { workspace = true }
 cfg-if = "1.0.3"
+rfd = "0.15.4"
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = { workspace = true }
 security-framework = "2.11.0"
 [package.metadata.bundle]
-name = "cai-hobbes"
+name = "Hobbes"
 identifier = "ai.clearmirror.cai-hobbes"
 icon = ["assets/icon.icns"]
 [package.metadata.bundle.plist]

@@ -4,7 +4,6 @@ use dioxus::desktop::{use_window, Config, WindowBuilder, use_wry_event_handler, 
 use dioxus::prelude::*;
 use dioxus::desktop::tao::dpi::PhysicalSize;
 use dioxus::desktop::tao::event::{Event, WindowEvent};
-use std::sync::atomic::{AtomicBool, Ordering};
 use dioxus_logger;
 use tracing;
 use dotenvy::dotenv;
@@ -21,8 +20,7 @@ mod processing;
 mod secure_storage;
 mod mcp;
 use tray::{APP_QUIT, WINDOW_VISIBLE};
-
-static TRAY_INITIALIZED: AtomicBool = AtomicBool::new(false);
+use tray_icon::TrayIcon;
 
 fn main() {
     dotenv().ok();
@@ -42,6 +40,7 @@ fn main() {
             Config::new()
                 .with_window(
                     WindowBuilder::new()
+                        .with_title("Hobbes")
                         .with_visible(true)
                         .with_resizable(true)
                         .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(initial_width, initial_height)),
@@ -77,23 +76,31 @@ fn app() -> Element {
     let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(get_mcp_config_path())));
     let mcp_context = use_context_provider(|| Signal::new(mcp::manager::McpContext { servers: Vec::new() }));
 
-    use_effect(move || {
-        let manager = mcp_manager.read().clone();
-        let mcp_context_signal = mcp_context.clone();
-        spawn(async move {
-            manager.launch_servers(mcp_context_signal).await;
-        });
-    });
-        let _settings = use_context_provider(|| {
+    let mut settings = use_context_provider(|| {
         let mut settings = settings_manager.read().load();
         if let Ok(api_key) = crate::secure_storage::retrieve_secret("api_key") {
             settings.api_key = Some(api_key);
         }
         Signal::new(settings)
     });
+
+    use_effect(move || {
+        let manager = mcp_manager.read().clone();
+        let mcp_context_signal = mcp_context.clone();
+        let settings_clone = settings.read().clone();
+        spawn(async move {
+            manager.launch_servers(mcp_context_signal, settings_clone).await;
+        });
+    });
     let mut show_session_manager = use_signal(|| false);
     let mut show_settings_panel = use_signal(|| false);
+    let mut settings_panel_width = use_signal(|| settings.read().settings_panel_width.unwrap_or(256.0));
+    let mut is_dragging = use_signal(|| false);
+    let mut drag_start_info = use_signal(|| (0.0, 0.0)); // (start_x, start_width)
+    let mut final_width_on_drag_end = use_signal(|| 0.0);
     let mut last_known_size = use_signal(|| PhysicalSize::new(0, 0));
+    let mut tray_icon = use_signal::<Option<TrayIcon>>(|| None);
+
     // This handler continuously updates the last known size during a resize.
     use_wry_event_handler(move |event, _| {
         if let Event::WindowEvent { event, .. } = event {
@@ -102,35 +109,41 @@ fn app() -> Element {
             }
         }
     });
- 
-    // One-time setup for tray icon and menu event listener
-    use_effect(move || {
-        if TRAY_INITIALIZED
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            // Initialize the menu
-            let menu = menu::build_menu();
-            #[cfg(target_os = "macos")]
-            menu.init_for_nsapp();
-            #[cfg(target_os = "windows")]
-            menu.init_for_hwnd(window.hwnd());
-            
-            // Initialize the tray icon
-            tray::init_tray();
 
-            // Start the menu event listener
-            let menu_channel = MenuEvent::receiver();
-            std::thread::spawn(move || {
-                loop {
-                    if let Ok(event) = menu_channel.recv() {
-                        if event.id.0 == "quit" {
-                            let mut app_quit = APP_QUIT.write();
-                            *app_quit = true;
-                        }
+    // One-time setup for the menu
+    use_effect(move || {
+        let menu = menu::build_menu();
+        #[cfg(target_os = "macos")]
+        menu.init_for_nsapp();
+        #[cfg(target_os = "windows")]
+        menu.init_for_hwnd(window.hwnd());
+
+        let menu_channel = MenuEvent::receiver();
+        std::thread::spawn(move || {
+            loop {
+                if let Ok(event) = menu_channel.recv() {
+                    if event.id.0 == "quit" {
+                        let mut app_quit = APP_QUIT.write();
+                        *app_quit = true;
                     }
                 }
-            });
+            }
+        });
+    });
+
+    // Effect to manage the tray icon's visibility based on settings
+    use_effect(move || {
+        let show = settings.read().show_tray_icon;
+        if show {
+            if tray_icon.read().is_none() {
+                tray_icon.set(Some(tray::init_tray()));
+                tracing::info!("Tray icon has been created.");
+            }
+        } else {
+            if tray_icon.read().is_some() {
+                tray_icon.set(None);
+                tracing::info!("Tray icon has been removed.");
+            }
         }
     });
 
@@ -161,6 +174,25 @@ fn app() -> Element {
             }
         } else {
             tracing::info!("Window is hidden.");
+        }
+    });
+
+    // This effect saves the settings panel width when the user stops dragging
+    use_effect(move || {
+        if !*is_dragging.read() && *final_width_on_drag_end.read() > 0.0 {
+            let new_width = *final_width_on_drag_end.read();
+            settings_panel_width.set(new_width);
+
+            let mut current_settings = settings.read().clone();
+            if current_settings.settings_panel_width != Some(new_width) {
+                current_settings.settings_panel_width = Some(new_width);
+                settings.set(current_settings);
+                let sm = settings_manager.read();
+                if let Err(e) = sm.save(&settings.read()) {
+                    tracing::error!("Failed to save settings: {}", e);
+                }
+            }
+            final_width_on_drag_end.set(0.0); // Reset after saving
         }
     });
 
@@ -216,8 +248,51 @@ fn app() -> Element {
                 // Settings Panel Sidebar
                 if *show_settings_panel.read() {
                     div {
-                        class: "w-64 bg-gray-800 text-white h-full transition-all duration-300 ease-in-out",
-                        components::settings_panel::SettingsPanel {}
+                        class: "flex flex-row h-full",
+                        // Settings Panel
+                        div {
+                            id: "settings-panel",
+                            style: "width: {settings_panel_width}px;",
+                            class: "bg-gray-800 text-white h-full",
+                            // This is the correct location for the settings panel component
+                            components::settings_panel::SettingsPanel {}
+                        }
+                        // Draggable Divider
+                        div {
+                            class: "w-2 cursor-col-resize bg-gray-700 hover:bg-indigo-500 transition-colors",
+                            onmousedown: move |event| {
+                                drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
+                                is_dragging.set(true);
+                            },
+                        }
+                    }
+                }
+                
+                // Mouse move handler for resizing
+                if *is_dragging.read() {
+                    div {
+                        class: "fixed inset-0 z-50", // Covers the whole screen to capture mouse events
+                        onmousemove: move |event| {
+                            if *is_dragging.read() {
+                                let (start_x, start_width) = drag_start_info();
+                                let delta_x = event.data.screen_coordinates().x - start_x;
+                                let new_width = start_width + delta_x;
+                                if new_width > 200.0 && new_width < 800.0 {
+                                    let js = format!("document.getElementById('settings-panel').style.width = '{}px';", new_width);
+                                    let _ = document::eval(&js);
+                                    final_width_on_drag_end.set(new_width);
+                                }
+                            }
+                        },
+                        onmouseup: move |_| {
+                            is_dragging.set(false);
+                        },
+                        onmouseleave: move |_| {
+                            // If mouse leaves the overlay, stop dragging
+                            if *is_dragging.read() {
+                                is_dragging.set(false);
+                            }
+                        }
                     }
                 }
 

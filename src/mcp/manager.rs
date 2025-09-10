@@ -1,3 +1,4 @@
+use dioxus::prelude::spawn;
 use dioxus_signals::Writable;
 use rmcp::model::{CallToolRequestParam, Tool};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
@@ -82,50 +83,65 @@ impl McpManager {
         }
     }
 
-    pub async fn launch_servers(&self, mut mcp_context_signal: dioxus::prelude::Signal<McpContext>) {
+    pub async fn launch_servers(&self, mcp_context_signal: dioxus::prelude::Signal<McpContext>, settings: crate::settings::Settings) {
         for server_config in self.configs.iter().filter(|sc| !sc.disabled) {
             let server_config_clone = server_config.clone();
             let servers_map = self.servers.clone();
-            let server_name = server_config_clone.name.clone();
+            let mut mcp_context_signal_clone = mcp_context_signal.clone();
+            let self_clone = self.clone();
+            let settings_clone = settings.clone();
 
-            tracing::info!("Launching MCP server: {}", server_name);
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c")
-                .arg(&server_config_clone.command)
-                .envs(&server_config_clone.env)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
+            spawn(async move {
+                let server_name = server_config_clone.name.clone();
+                tracing::info!("Launching MCP server: {}", server_name);
+                let mut cmd = Command::new("sh");
+                let mut command_string = server_config_clone.command.clone();
 
-            match TokioChildProcess::new(cmd) {
-                Ok(transport) => match ().serve(transport).await {
-                    Ok(service) => {
-                        tracing::info!("Connected to MCP server: {}", server_name);
-                        match service.list_tools(Default::default()).await {
-                            Ok(result) => {
-                                tracing::info!("Discovered capabilities for MCP server: {}", server_name);
-                                let active_client = ActiveMcpClient {
-                                    config: server_config_clone,
-                                    service,
-                                    tools: result.tools,
-                                };
-                                let mut servers = servers_map.lock().await;
-                                servers.insert(server_name.clone(), active_client);
-                                drop(servers); // Unlock before await
-
-                                let new_context = self.get_mcp_context().await;
-                                mcp_context_signal.set(new_context);
-                                tracing::info!("Successfully added '{}' and updated MCP context.", server_name);
-                            }
-                            Err(e) => tracing::error!("Failed to list tools for '{}': {}", server_name, e),
-                        }
+                if server_name == "filesystem" {
+                    if let Some(project_folder) = &settings_clone.project_folder {
+                        command_string.push_str(&format!(" \"{}\"", project_folder));
+                        tracing::info!("Appending project folder to filesystem MCP command: {}", command_string);
                     }
-                    Err(e) => tracing::error!("Failed to serve MCP server '{}': {}", server_name, e),
-                },
-                Err(e) => tracing::error!("Failed to launch MCP server '{}': {}", server_name, e),
-            }
+                }
+
+                cmd.arg("-c")
+                    .arg(&command_string)
+                    .envs(&server_config_clone.env)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+
+                match TokioChildProcess::new(cmd) {
+                    Ok(transport) => match ().serve(transport).await {
+                        Ok(service) => {
+                            tracing::info!("Connected to MCP server: {}", server_name);
+                            match service.list_tools(Default::default()).await {
+                                Ok(result) => {
+                                    tracing::info!("Discovered capabilities for MCP server: {}", server_name);
+                                    let active_client = ActiveMcpClient {
+                                        config: server_config_clone,
+                                        service,
+                                        tools: result.tools,
+                                    };
+                                    {
+                                        let mut servers = servers_map.lock().await;
+                                        servers.insert(server_name.clone(), active_client);
+                                    }
+
+                                    let new_context = self_clone.get_mcp_context().await;
+                                    mcp_context_signal_clone.set(new_context);
+                                    tracing::info!("Successfully added '{}' and updated MCP context.", server_name);
+                                }
+                                Err(e) => tracing::error!("Failed to list tools for '{}': {}", server_name, e),
+                            }
+                        }
+                        Err(e) => tracing::error!("Failed to serve MCP server '{}': {}", server_name, e),
+                    },
+                    Err(e) => tracing::error!("Failed to launch MCP server '{}': {}", server_name, e),
+                }
+            });
         }
-        tracing::info!("All MCP server launch tasks completed.");
+        tracing::info!("All MCP server launch tasks initiated.");
     }
     pub async fn use_mcp_tool(
         &self,
