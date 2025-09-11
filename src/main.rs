@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use dioxus::desktop::{use_window, Config, WindowBuilder, use_wry_event_handler, muda::MenuEvent};
+use dioxus::desktop::{use_window, Config, WindowBuilder, use_wry_event_handler, muda::MenuEvent, tao::platform::macos::WindowBuilderExtMacOS};
 use dioxus::prelude::*;
 use dioxus::desktop::tao::dpi::PhysicalSize;
 use dioxus::desktop::tao::event::{Event, WindowEvent};
@@ -21,7 +21,6 @@ mod secure_storage;
 mod mcp;
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 use tray_icon::TrayIcon;
-
 fn main() {
     dotenv().ok();
     dioxus_logger::init(tracing::Level::INFO).expect("failed to init logger");
@@ -39,11 +38,20 @@ fn main() {
         .with_cfg(
             Config::new()
                 .with_window(
-                    WindowBuilder::new()
-                        .with_title("Hobbes")
-                        .with_visible(true)
-                        .with_resizable(true)
-                        .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(initial_width, initial_height)),
+                    {
+                        let mut window = WindowBuilder::new()
+                            .with_title(env!("APP_NAME"))
+                            .with_visible(true)
+                            .with_resizable(true)
+                            .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(initial_width, initial_height));
+                        #[cfg(target_os = "macos")]
+                        {
+                            window = window
+                                .with_title_hidden(true)
+                                .with_titlebar_transparent(true);
+                        }
+                        window
+                    }
                 )
                 .with_custom_head(r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #111827; }</style>"#.to_string() + r#"<style>"# + include_str!("../assets/output.css") + r#"</style>"#)
         )
@@ -92,6 +100,7 @@ fn app() -> Element {
             manager.launch_servers(mcp_context_signal, settings_clone).await;
         });
     });
+
     let mut show_session_manager = use_signal(|| false);
     let mut show_settings_panel = use_signal(|| false);
     let mut settings_panel_width = use_signal(|| settings.read().settings_panel_width.unwrap_or(256.0));
@@ -100,6 +109,11 @@ fn app() -> Element {
     let mut final_width_on_drag_end = use_signal(|| 0.0);
     let mut last_known_size = use_signal(|| PhysicalSize::new(0, 0));
     let mut tray_icon = use_signal::<Option<TrayIcon>>(|| None);
+
+    // Initialize the hotkey manager
+    // This hook will now react to the hotkey_manager signal being populated
+    // This hook will now react to the hotkey_manager_resource signal being populated
+    hotkey::use_hotkey_manager();
 
     // This handler continuously updates the last known size during a resize.
     use_wry_event_handler(move |event, _| {
@@ -199,43 +213,54 @@ fn app() -> Element {
 
 
 
+    let drag_window = window.clone();
     rsx! {
         StreamManager {
             div {
-                class: "dark flex flex-row h-screen",
-                // The onkeydown handler has been removed to allow native hotkeys (copy, paste, etc.) to function correctly.
-                // The global hotkey for toggling visibility is no longer required.
-                // When the user releases the mouse, save the last known size.
-                onmouseup: {
-                    let mut session_state = session_state.clone();
-                    let show_session_manager = show_session_manager.clone();
-                    let window = window.clone();
-                    move |_| {
-                        let physical_size = last_known_size.read();
-                        if physical_size.width > 0 && physical_size.height > 0 {
-                            let scale_factor = window.scale_factor();
-                            let logical_size = physical_size.to_logical::<f64>(scale_factor);
-                            let sidebar_width = if *show_session_manager.read() { 256.0 } else { 0.0 };
-                            let content_width = logical_size.width - sidebar_width;
-                            session_state.write().update_window_size(content_width, logical_size.height);
-                        }
+                class: "dark flex flex-col h-screen", // Changed to flex-col
+                // Draggable header area
+                div {
+                    class: "h-8 bg-transparent",
+                    onmousedown: move |_| {
+                        drag_window.drag();
                     }
-                },
-                onmouseleave: {
-                    let mut session_state = session_state.clone();
-                    let show_session_manager = show_session_manager.clone();
-                    let window = window.clone();
-                    move |_| {
-                        let physical_size = last_known_size.read();
-                        if physical_size.width > 0 && physical_size.height > 0 {
-                            let scale_factor = window.scale_factor();
-                            let logical_size = physical_size.to_logical::<f64>(scale_factor);
-                            let sidebar_width = if *show_session_manager.read() { 256.0 } else { 0.0 };
-                            let content_width = logical_size.width - sidebar_width;
-                            session_state.write().update_window_size(content_width, logical_size.height);
+                }
+                // Main content area
+                div {
+                    class: "flex flex-row flex-1", // This will contain the sidebars and chat
+                    // The onkeydown handler has been removed to allow native hotkeys (copy, paste, etc.) to function correctly.
+                    // The global hotkey for toggling visibility is no longer required.
+                    // When the user releases the mouse, save the last known size.
+                    onmouseup: {
+                        let mut session_state = session_state.clone();
+                        let show_session_manager = show_session_manager.clone();
+                        let window = window.clone();
+                        move |_| {
+                            let physical_size = last_known_size.read();
+                            if physical_size.width > 0 && physical_size.height > 0 {
+                                let scale_factor = window.scale_factor();
+                                let logical_size = physical_size.to_logical::<f64>(scale_factor);
+                                let sidebar_width = if *show_session_manager.read() { 256.0 } else { 0.0 };
+                                let content_width = logical_size.width - sidebar_width;
+                                session_state.write().update_window_size(content_width, logical_size.height);
+                            }
                         }
-                    }
-                },
+                    },
+                    onmouseleave: {
+                        let mut session_state = session_state.clone();
+                        let show_session_manager = show_session_manager.clone();
+                        let window = window.clone();
+                        move |_| {
+                            let physical_size = last_known_size.read();
+                            if physical_size.width > 0 && physical_size.height > 0 {
+                                let scale_factor = window.scale_factor();
+                                let logical_size = physical_size.to_logical::<f64>(scale_factor);
+                                let sidebar_width = if *show_session_manager.read() { 256.0 } else { 0.0 };
+                                let content_width = logical_size.width - sidebar_width;
+                                session_state.write().update_window_size(content_width, logical_size.height);
+                            }
+                        }
+                    },
 
                 // Session Manager Sidebar
                 if *show_session_manager.read() {
@@ -336,6 +361,7 @@ fn app() -> Element {
                             }
                         },
                     }
+                }
                 }
             }
         }

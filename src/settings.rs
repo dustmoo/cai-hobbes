@@ -13,6 +13,7 @@ pub struct Settings {
     pub settings_panel_width: Option<f64>,
     pub chat_history_length: usize,
     pub show_tray_icon: bool,
+    pub global_hotkey: String,
 }
 
 impl Default for Settings {
@@ -25,8 +26,9 @@ impl Default for Settings {
             force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available. When using the fetch tool, you MUST provide markdown links as sources.".to_string()),
             project_folder: None,
             settings_panel_width: Some(256.0),
-            chat_history_length: 4,
+            chat_history_length: 8,
             show_tray_icon: true,
+            global_hotkey: "CmdOrCtrl+Shift+H".to_string(),
         }
     }
 }

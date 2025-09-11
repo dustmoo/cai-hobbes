@@ -110,6 +110,22 @@ pub fn SettingsPanel() -> Element {
                 }
             }
             div {
+                class: "mt-4 mb-4",
+                label {
+                    class: "block text-sm font-medium text-gray-300",
+                    "Global Hotkey"
+                }
+                input {
+                    class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 disabled:opacity-50",
+                    r#type: "text",
+                    value: "{settings.read().global_hotkey}",
+                    oninput: move |event| {
+                        settings.write().global_hotkey = event.value();
+                        has_unsaved_changes.set(true);
+                    }
+                }
+            }
+            div {
                 class: "mb-4",
                 label {
                     class: "block text-sm font-medium text-gray-300",

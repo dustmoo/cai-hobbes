@@ -24,7 +24,8 @@
         "get_product_context",
         "get_custom_data",
         "update_progress",
-        "get_decisions"
+        "get_decisions",
+        "get_system_patterns"
       ]
     }
   }

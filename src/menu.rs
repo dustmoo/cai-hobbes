@@ -9,10 +9,10 @@ pub fn build_menu() -> Menu {
     // On macOS, the first menu item is the application menu.
     #[cfg(target_os = "macos")]
     {
-        let app_menu = Submenu::new("Hobbes", true);
+        let app_menu = Submenu::new(env!("APP_NAME"), true);
         menu.append(&app_menu).unwrap();
         app_menu.append_items(&[
-            &PredefinedMenuItem::about(Some("About Hobbes"), None),
+            &PredefinedMenuItem::about(Some(&format!("About {}", env!("APP_NAME"))), None),
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::services(None),
             &PredefinedMenuItem::separator(),

@@ -20,7 +20,7 @@ use crate::processing::conversation_processor::ConversationProcessor;
 use serde::{Deserialize, Serialize};
 use crate::settings::Settings;
 use super::shared::{MessageContent};
-use super::tool_call_display::ToolCallDisplay;
+use crate::components::tool_call_display::ToolCallDisplay;
 use super::link_with_controls::LinkWithControls;
 lazy_static! {
     static ref SYNTAX_SET: SyntaxSet = SyntaxSet::load_defaults_newlines();
@@ -52,11 +52,17 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     let mut show_scroll_button = use_signal(|| false);
     let mut is_initial_load = use_signal(|| true);
     let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
+    let mut last_session_id = use_signal(|| session_state.read().active_session_id.clone());
     // Effect to report content size changes and conditionally scroll to bottom
     use_effect(move || {
         // By reading the session state here, the effect becomes dependent on it.
         // Any change to messages will cause this to re-run.
-        let _ = session_state.read();
+        let current_session_id = session_state.read().active_session_id.clone();
+        let mut is_session_switch = false;
+        if current_session_id != *last_session_id.read() {
+            is_session_switch = true;
+            last_session_id.set(current_session_id);
+        }
 
         if let Some(element) = container_element.read().clone() {
             spawn(async move {
@@ -84,7 +90,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
 
                 // On the very first load, we always scroll to the bottom.
                 // On subsequent loads, we only scroll if the user was already near the bottom.
-                if *is_initial_load.read() || is_near_bottom {
+                if is_session_switch || *is_initial_load.read() || is_near_bottom {
                     let _ = document::eval(r#"
                         const el = document.getElementById('message-list');
                         if (el) { el.scrollTop = el.scrollHeight; }
@@ -287,132 +293,130 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     };
 
 
-    let root_classes = "flex flex-col bg-gray-900 text-gray-100 rounded-lg shadow-2xl h-full w-full";
+    let root_classes = "relative flex flex-col bg-gray-900 text-gray-100 rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
 
     rsx! {
         div {
             class: "{root_classes}",
             onmounted: move |cx| container_element.set(Some(cx.data())),
+            // This div is the new message list container
             div {
-                class: "relative flex-1 min-h-0", // Container for positioning
-                div {
-                    id: "message-list",
-                    class: "flex-1 overflow-y-auto p-4 space-y-4 min-h-0 h-full", // Ensure it fills the container
-                    onscroll: move |_| {
-                        let mut show_scroll_button = show_scroll_button.clone();
-                        let mut visible_message_count = visible_message_count.clone();
-                        let session_state = session_state.clone();
+                id: "message-list",
+                class: "flex-1 overflow-y-auto p-4 space-y-4 min-h-0 pb-32", // Add padding to the bottom
+                onscroll: move |_| {
+                    let mut show_scroll_button = show_scroll_button.clone();
+                    let mut visible_message_count = visible_message_count.clone();
+                    let session_state = session_state.clone();
 
-                        spawn(async move {
-                            // Check scroll position for both top and bottom
-                            let scroll_info = if let Ok(result) = document::eval(r#"
-                                const el = document.getElementById('message-list');
-                                if (el) {
-                                    const isAtTop = el.scrollTop === 0;
-                                    const threshold = 10;
-                                    const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
-                                    return { isAtTop, isAtBottom };
-                                }
-                                return { isAtTop: false, isAtBottom: true }; // Default state
-                            "#).await {
-                                result
-                            } else {
-                                serde_json::from_str("{\"isAtTop\":false, \"isAtBottom\":true}").unwrap()
-                            };
-
-                            let is_at_top = scroll_info.get("isAtTop").unwrap().as_bool().unwrap_or(false);
-                            let is_at_bottom = scroll_info.get("isAtBottom").unwrap().as_bool().unwrap_or(true);
-
-                            // Show the scroll-to-bottom button if the user is NOT at the bottom
-                            show_scroll_button.set(!is_at_bottom);
-
-                            // If user scrolls to the top, load more messages while preserving scroll position
-                            if is_at_top {
-                                let total_messages = session_state.read().get_active_session().map_or(0, |s| s.messages.len());
-                                if *visible_message_count.read() < total_messages {
-                                    // 1. Get current scroll state BEFORE adding new messages
-                                    let _ = document::eval(r#"
-                                        const el = document.getElementById('message-list');
-                                        if (el) {
-                                            window.prevScrollHeight = el.scrollHeight;
-                                            window.prevScrollTop = el.scrollTop;
-                                        }
-                                    "#).await;
-
-                                    // 2. Load more messages
-                                    let current_count = *visible_message_count.read();
-                                    visible_message_count.set(current_count + INITIAL_MESSAGES_TO_SHOW);
-
-                                    // 3. After the next render, adjust scroll position
-                                    sleep(Duration::from_millis(20)).await; // Give it a moment to render
-                                    let _ = document::eval(r#"
-                                        const el = document.getElementById('message-list');
-                                        if (el && window.prevScrollHeight) {
-                                            const newScrollHeight = el.scrollHeight;
-                                            const heightDifference = newScrollHeight - window.prevScrollHeight;
-                                            el.scrollTop = window.prevScrollTop + heightDifference;
-                                            // Clean up global variables
-                                            delete window.prevScrollHeight;
-                                            delete window.prevScrollTop;
-                                        }
-                                    "#).await;
-                                }
+                    spawn(async move {
+                        // Check scroll position for both top and bottom
+                        let scroll_info = if let Ok(result) = document::eval(r#"
+                            const el = document.getElementById('message-list');
+                            if (el) {
+                                const isAtTop = el.scrollTop === 0;
+                                const threshold = 10;
+                                const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+                                return { isAtTop, isAtBottom };
                             }
-                        });
-                    },
-                    {
-                        let state = session_state.read();
-                        if let Some(session) = state.sessions.get(&state.active_session_id) {
-                            let total_messages = session.messages.len();
-                            let messages_to_render = session.messages.iter().skip(total_messages.saturating_sub(*visible_message_count.read())).collect::<Vec<_>>();
+                            return { isAtTop: false, isAtBottom: true }; // Default state
+                        "#).await {
+                            result
+                        } else {
+                            serde_json::from_str("{\"isAtTop\":false, \"isAtBottom\":true}").unwrap()
+                        };
 
-                            if session.messages.is_empty() {
-                                rsx! { WelcomeMessage {} }
-                            } else {
-                                rsx! {
-                                    if total_messages > *visible_message_count.read() {
-                                        div {
-                                            class: "flex justify-center",
-                                            button {
-                                                class: "text-sm text-purple-400 hover:text-purple-300 focus:outline-none",
-                                                onclick: move |_| {
-                                                    let current_count = *visible_message_count.read();
-                                                    visible_message_count.set(current_count + INITIAL_MESSAGES_TO_SHOW);
-                                                },
-                                                "Load More"
-                                            }
+                        let is_at_top = scroll_info.get("isAtTop").unwrap().as_bool().unwrap_or(false);
+                        let is_at_bottom = scroll_info.get("isAtBottom").unwrap().as_bool().unwrap_or(true);
+
+                        // Show the scroll-to-bottom button if the user is NOT at the bottom
+                        show_scroll_button.set(!is_at_bottom);
+
+                        // If user scrolls to the top, load more messages while preserving scroll position
+                        if is_at_top {
+                            let total_messages = session_state.read().get_active_session().map_or(0, |s| s.messages.len());
+                            if *visible_message_count.read() < total_messages {
+                                // 1. Get current scroll state BEFORE adding new messages
+                                let _ = document::eval(r#"
+                                    const el = document.getElementById('message-list');
+                                    if (el) {
+                                        window.prevScrollHeight = el.scrollHeight;
+                                        window.prevScrollTop = el.scrollTop;
+                                    }
+                                "#).await;
+
+                                // 2. Load more messages
+                                let current_count = *visible_message_count.read();
+                                visible_message_count.set(current_count + INITIAL_MESSAGES_TO_SHOW);
+
+                                // 3. After the next render, adjust scroll position
+                                sleep(Duration::from_millis(20)).await; // Give it a moment to render
+                                let _ = document::eval(r#"
+                                    const el = document.getElementById('message-list');
+                                    if (el && window.prevScrollHeight) {
+                                        const newScrollHeight = el.scrollHeight;
+                                        const heightDifference = newScrollHeight - window.prevScrollHeight;
+                                        el.scrollTop = window.prevScrollTop + heightDifference;
+                                        // Clean up global variables
+                                        delete window.prevScrollHeight;
+                                        delete window.prevScrollTop;
+                                    }
+                                "#).await;
+                            }
+                        }
+                    });
+                },
+                {
+                    let state = session_state.read();
+                    if let Some(session) = state.sessions.get(&state.active_session_id) {
+                        let total_messages = session.messages.len();
+                        let messages_to_render = session.messages.iter().skip(total_messages.saturating_sub(*visible_message_count.read())).collect::<Vec<_>>();
+
+                        if session.messages.is_empty() {
+                            rsx! { WelcomeMessage {} }
+                        } else {
+                            rsx! {
+                                if total_messages > *visible_message_count.read() {
+                                    div {
+                                        class: "flex justify-center",
+                                        button {
+                                            class: "text-sm text-purple-400 hover:text-purple-300 focus:outline-none",
+                                            onclick: move |_| {
+                                                let current_count = *visible_message_count.read();
+                                                visible_message_count.set(current_count + INITIAL_MESSAGES_TO_SHOW);
+                                            },
+                                            "Load More"
                                         }
                                     }
-                                    for message in messages_to_render {
-                                        match &message.content {
-                                            MessageContent::Text(_) => rsx! {
-                                                MessageBubble {
+                                }
+                                for message in messages_to_render {
+                                    match &message.content {
+                                        MessageContent::Text(_) => rsx! {
+                                            MessageBubble {
+                                                key: "{message.id}",
+                                                message: message.clone()
+                                            }
+                                        },
+                                        MessageContent::ToolCall(tool_call) => {
+                                            // Replicating the bubble structure here for tool calls
+                                            let bubble_classes = "bg-gray-700 text-gray-200 self-start mr-auto";
+                                            let container_classes = "flex justify-start";
+                                            let author_classes = format!(
+                                                "text-xs text-gray-500 mt-1 px-2 {}",
+                                                "text-left"
+                                            );
+                                            rsx! {
+                                                div {
                                                     key: "{message.id}",
-                                                    message: message.clone()
-                                                }
-                                            },
-                                            MessageContent::ToolCall(tool_call) => {
-                                                // Replicating the bubble structure here for tool calls
-                                                let bubble_classes = "bg-gray-700 text-gray-200 self-start mr-auto";
-                                                let container_classes = "flex justify-start";
-                                                let author_classes = format!(
-                                                    "text-xs text-gray-500 mt-1 px-2 {}",
-                                                    "text-left"
-                                                );
-                                                rsx! {
+                                                    class: "{container_classes} w-full",
                                                     div {
-                                                        key: "{message.id}",
-                                                        class: "{container_classes} w-full",
+                                                        class: "flex flex-col max-w-2/3",
                                                         div {
-                                                            class: "flex flex-col max-w-2/3",
-                                                            div {
-                                                                class: "relative group px-4 py-2 rounded-2xl {bubble_classes}",
-                                                                ToolCallDisplay { tool_call: tool_call.clone() }
-                                                            }
-                                                            div {
-                                                                class: "{author_classes}",
-                                                                "{message.author}"
-                                                            }
+                                                            class: "relative group px-4 py-2 rounded-2xl {bubble_classes}",
+                                                            ToolCallDisplay { tool_call: tool_call.clone() }
+                                                        }
+                                                        div {
+                                                            class: "{author_classes}",
+                                                            "{message.author}"
                                                         }
                                                     }
                                                 }
@@ -421,9 +425,9 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                                     }
                                 }
                             }
-                        } else {
-                            rsx! { WelcomeMessage {} }
                         }
+                    } else {
+                        rsx! { WelcomeMessage {} }
                     }
                 }
                 if *show_scroll_button.read() {
@@ -442,9 +446,9 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         }
                     }
                 }
-            }
+                }
             div {
-                class: "p-4 border-t border-gray-700 flex-shrink-0",
+                class: "absolute bottom-0 left-0 right-0 bg-gray-900 p-4 border-t border-gray-700",
                 onmousedown: |e| e.stop_propagation(),
                 div {
                     class: "flex items-center space-x-3",
@@ -870,8 +874,8 @@ fn MessageBubble(message: Message) -> Element {
         // This path should not be taken, but as a fallback, render nothing.
         rsx! {}
     }
+}
 
-    }
 
 #[component]
 fn ThinkingIndicator() -> Element {
