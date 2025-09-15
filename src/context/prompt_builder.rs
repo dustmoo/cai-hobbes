@@ -21,6 +21,13 @@ impl From<Message> for Content {
                     role,
                     parts: vec![Part { text: String::new() }],
                 }
+            },
+            MessageContent::PermissionRequest(_) => {
+                // Permission requests are UI-only and should not be in the prompt history.
+                Content {
+                    role,
+                    parts: vec![Part { text: String::new() }],
+                }
             }
         }
     }

@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::context::permissions::{PermissionSettings, ToolCategory};
+use std::collections::HashMap;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
     pub api_key: Option<String>,
@@ -14,10 +17,14 @@ pub struct Settings {
     pub chat_history_length: usize,
     pub show_tray_icon: bool,
     pub global_hotkey: String,
+    pub permission_settings: PermissionSettings,
 }
 
 impl Default for Settings {
     fn default() -> Self {
+        let mut granular_permissions = HashMap::new();
+        granular_permissions.insert(ToolCategory::Mcp, true);
+
         Self {
             api_key: None,
             chat_model: "gemini-2.5-pro".to_string(),
@@ -29,6 +36,12 @@ impl Default for Settings {
             chat_history_length: 8,
             show_tray_icon: true,
             global_hotkey: "CmdOrCtrl+Shift+H".to_string(),
+            permission_settings: PermissionSettings {
+                auto_approval_enabled: true,
+                granular_permissions,
+                max_requests: 25,
+                max_cost: 1.00,
+            },
         }
     }
 }

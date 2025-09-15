@@ -9,6 +9,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::process::Command;
+use crate::context::permissions::{PermissionManager, PermissionStatus, ToolCategory};
+use dioxus::prelude::Signal;
 use tokio::sync::Mutex;
 
 #[derive(Deserialize, Debug, Clone)]
@@ -45,10 +47,11 @@ pub struct ActiveMcpClient {
 pub struct McpManager {
     configs: Vec<McpServerConfig>,
     pub servers: Arc<Mutex<HashMap<String, ActiveMcpClient>>>,
+    permission_manager: Signal<PermissionManager>,
 }
 
 impl McpManager {
-    pub fn new(config_path: PathBuf) -> Self {
+    pub fn new(config_path: PathBuf, permission_manager: Signal<PermissionManager>) -> Self {
         if !config_path.exists() {
             if let Some(parent) = config_path.parent() {
                 if !parent.exists() {
@@ -80,6 +83,7 @@ impl McpManager {
         Self {
             configs,
             servers: Arc::new(Mutex::new(HashMap::new())),
+            permission_manager,
         }
     }
 
@@ -143,12 +147,38 @@ impl McpManager {
         }
         tracing::info!("All MCP server launch tasks initiated.");
     }
+    fn map_tool_to_category(_tool_name: &str) -> ToolCategory {
+        // All tools loaded via MCP are considered MCP tools for permission purposes.
+        // The Browser/Execute categories are commented out as they are not currently used
+        // and all tools are dynamically loaded.
+        ToolCategory::Mcp
+    }
+
     pub async fn use_mcp_tool(
-        &self,
+        &mut self,
         server_name: &str,
         tool_name: &str,
         args: serde_json::Value,
+        bypass_permission_check: bool,
     ) -> Result<serde_json::Value, String> {
+        if !bypass_permission_check {
+            let category = Self::map_tool_to_category(tool_name);
+            let mut pm = self.permission_manager.write();
+            match pm.check_permission(&category) {
+                PermissionStatus::Allowed => { /* Continue */ }
+                PermissionStatus::RequiresPrompt => {
+                    let tool_call = crate::components::shared::ToolCall::new(
+                        server_name.to_string(),
+                        tool_name.to_string(),
+                        args,
+                    );
+                    return Err(serde_json::to_string(&tool_call).unwrap_or_default());
+                }
+                PermissionStatus::Denied(reason) => {
+                    return Err(format!("Tool use denied: {}", reason));
+                }
+            }
+        }
         let servers = self.servers.lock().await;
         if let Some(client) = servers.get(server_name) {
             if let Some(tool) = client.tools.iter().find(|t| t.name == tool_name) {

@@ -20,7 +20,7 @@ use crate::processing::conversation_processor::ConversationProcessor;
 use serde::{Deserialize, Serialize};
 use crate::settings::Settings;
 use super::shared::{MessageContent};
-use crate::components::tool_call_display::ToolCallDisplay;
+use crate::components::tool_call_display::{PermissionPrompt, ToolCallDisplay};
 use super::link_with_controls::LinkWithControls;
 lazy_static! {
     static ref SYNTAX_SET: SyntaxSet = SyntaxSet::load_defaults_newlines();
@@ -123,15 +123,13 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     let send_prompt_to_llm = {
         // Capture signals which are all `Copy`
         let is_sending = is_sending;
-        let session_state = session_state;
         let stream_manager = stream_manager;
         let settings = settings;
 
-        move |prompt_data: crate::context::prompt_builder::LlmPrompt, mcp_context: Option<crate::mcp::manager::McpContext>| {
+        move |prompt_data: crate::context::prompt_builder::LlmPrompt, mcp_context: Option<crate::mcp::manager::McpContext>, hobbes_message_id: Uuid| {
             spawn(async move {
                 // Now clone/read them inside the async block
                 let mut is_sending = is_sending;
-                let mut session_state = session_state;
                 let stream_manager = stream_manager;
                 let settings = settings.read().clone();
 
@@ -139,18 +137,6 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 tracing::info!("Lock ACQUIRED.");
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-                let hobbes_message_id = Uuid::new_v4();
-
-                {
-                    let mut state = session_state.write();
-                    if let Some(session) = state.get_active_session_mut() {
-                        session.messages.push(Message {
-                            id: hobbes_message_id,
-                            author: "Hobbes".to_string(),
-                            content: MessageContent::Text("".to_string()),
-                        });
-                    }
-                }
 
                 let api_key = settings.api_key.clone().unwrap_or_else(|| {
                     std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
@@ -180,7 +166,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
 
     // Effect to trigger LLM feedback loop after a tool call completes
     use_effect({
-        let session_state = session_state.clone();
+        let mut session_state = session_state.clone();
         let send_prompt_to_llm = send_prompt_to_llm.clone();
         let settings = settings.read().clone();
         move || {
@@ -194,12 +180,36 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                             tc.server_name, tc.tool_name, tc.response
                         );
                         
-                        let state = session_state.read();
-                        if let Some(session) = state.get_active_session() {
-                             let builder = PromptBuilder::new(session, &settings);
-                             let prompt_data = builder.build_prompt(tool_response_prompt, None);
-                             let mcp_context = session.active_context.mcp_tools.clone();
-                             send_prompt_to_llm(prompt_data, mcp_context);
+                        // A tool call just finished. Time to send the result back to the LLM.
+                        // Action 1: Create the new "thinking" message and get its ID.
+                        let hobbes_message_id = Uuid::new_v4();
+                        {
+                            let mut state = session_state.write();
+                            if let Some(session) = state.get_active_session_mut() {
+                                session.messages.push(Message {
+                                    id: hobbes_message_id,
+                                    author: "Hobbes".to_string(),
+                                    content: MessageContent::Text("".to_string()),
+                                });
+                            }
+                        }
+
+                        // Action 2: Build the prompt using the now-updated state.
+                        let (prompt_data, mcp_context) = {
+                             let state = session_state.read();
+                             if let Some(session) = state.get_active_session() {
+                                let builder = PromptBuilder::new(session, &settings);
+                                let prompt_data = builder.build_prompt(tool_response_prompt, None);
+                                let mcp_context = session.active_context.mcp_tools.clone();
+                                (Some(prompt_data), mcp_context)
+                             } else {
+                                (None, None)
+                             }
+                        };
+
+                        // Action 3: Send to LLM
+                        if let Some(prompt_data) = prompt_data {
+                            send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
                         }
                     }
                 }
@@ -238,16 +248,24 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 let mcp_manager = mcp_manager;
                 let send_prompt_to_llm = send_prompt_to_llm;
 
+                let hobbes_message_id = Uuid::new_v4();
                 {
                     let mut state = session_state.write();
                     if state.active_session_id.is_empty() {
                         state.create_session();
                     }
                     if let Some(session) = state.get_active_session_mut() {
+                        // Push the user's message
                         session.messages.push(Message {
                             id: Uuid::new_v4(),
                             author: "User".to_string(),
                             content: MessageContent::Text(user_message.clone()),
+                        });
+                        // Immediately push the empty "Hobbes" message to show the thinking indicator
+                        session.messages.push(Message {
+                            id: hobbes_message_id,
+                            author: "Hobbes".to_string(),
+                            content: MessageContent::Text("".to_string()),
                         });
                     }
                 }
@@ -287,7 +305,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 }
 
                 let mcp_context = session_state.read().get_active_session().and_then(|s| s.active_context.mcp_tools.clone());
-                send_prompt_to_llm(prompt_data, mcp_context);
+                send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
             });
         }
     };
@@ -300,9 +318,11 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             class: "{root_classes}",
             onmounted: move |cx| container_element.set(Some(cx.data())),
             // This div is the new message list container
-            div {
-                id: "message-list",
-                class: "flex-1 overflow-y-auto p-4 space-y-4 min-h-0 pb-32", // Add padding to the bottom
+            div { // This new div creates a relative container for the message list and the scroll button
+                class: "relative flex-1 min-h-0",
+                div {
+                    id: "message-list",
+                    class: "overflow-y-auto p-4 space-y-4 h-full", // Removed flex-1 and pb-32, added h-full
                 onscroll: move |_| {
                     let mut show_scroll_button = show_scroll_button.clone();
                     let mut visible_message_count = visible_message_count.clone();
@@ -409,7 +429,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                                                     key: "{message.id}",
                                                     class: "{container_classes} w-full",
                                                     div {
-                                                        class: "flex flex-col max-w-2/3",
+                                                        class: "flex flex-col max-w-2/3 min-w-0",
                                                         div {
                                                             class: "relative group px-4 py-2 rounded-2xl {bubble_classes}",
                                                             ToolCallDisplay { tool_call: tool_call.clone() }
@@ -417,6 +437,24 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                                                         div {
                                                             class: "{author_classes}",
                                                             "{message.author}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        MessageContent::PermissionRequest(tool_call) => {
+                                            let container_classes = "flex justify-start";
+                                            let author_classes = "text-xs text-gray-500 mt-1 px-2 text-left";
+                                            rsx! {
+                                                div {
+                                                    key: "{message.id}",
+                                                    class: "{container_classes} w-full",
+                                                    div {
+                                                        class: "flex flex-col max-w-2/3 min-w-0",
+                                                        PermissionPrompt { tool_call: tool_call.clone() },
+                                                        div {
+                                                            class: "{author_classes}",
+                                                            "System"
                                                         }
                                                     }
                                                 }
@@ -446,9 +484,10 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         }
                     }
                 }
-                }
+            }
+            }
             div {
-                class: "absolute bottom-0 left-0 right-0 bg-gray-900 p-4 border-t border-gray-700",
+                class: "bg-gray-900 p-4 border-t border-gray-700", // Removed absolute positioning
                 onmousedown: |e| e.stop_propagation(),
                 div {
                     class: "flex items-center space-x-3",
@@ -670,7 +709,6 @@ fn MessageBubble(message: Message) -> Element {
     if let MessageContent::Text(text_content) = &message.content {
         let stream_manager = consume_context::<StreamManagerContext>();
         let mut content = use_signal(|| text_content.clone());
-        let mut is_hovered = use_signal(|| false);
         let mut copied = use_signal(|| false);
 
         // This effect runs once when the component is created.
@@ -827,22 +865,20 @@ fn MessageBubble(message: Message) -> Element {
             div {
                 class: "{container_classes} w-full",
                 div {
-                    class: "flex flex-col max-w-2/3",
+                    class: "flex flex-col max-w-2/3 min-w-0",
                     div {
-                        class: "relative px-4 py-2 rounded-2xl {bubble_classes}",
-                        onmouseenter: move |_| is_hovered.set(true),
-                        onmouseleave: move |_| is_hovered.set(false),
+                        class: "relative group px-4 py-2 rounded-2xl {bubble_classes}",
                         if is_thinking {
                             ThinkingIndicator {}
                         } else {
                             div {
-                                class: "prose prose-sm dark:prose-invert max-w-none",
+                                class: "prose prose-sm dark:prose-invert max-w-none break-words",
                                 for el in elements.read().iter() {
                                     {el}
                                 }
                             }
                         }
-                        if *is_hovered.read() && !content.read().is_empty() {
+                        if !content.read().is_empty() {
                             button {
                                 class: "{button_position_classes} p-1 rounded-full text-gray-400 bg-gray-900 bg-opacity-75 hover:bg-gray-700 hover:text-white transition-all opacity-0 group-hover:opacity-100",
                                 onclick: move |_| {
@@ -914,3 +950,4 @@ fn WelcomeMessage() -> Element {
         }
     }
 }
+

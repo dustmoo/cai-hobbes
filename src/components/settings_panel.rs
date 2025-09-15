@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use rfd;
 use crate::settings::{Settings, SettingsManager};
-use crate::secure_storage;
+use crate::{context::permissions::ToolCategory, secure_storage};
 
 #[component]
 pub fn SettingsPanel() -> Element {
@@ -185,6 +185,101 @@ pub fn SettingsPanel() -> Element {
                             });
                         },
                         "Select Folder"
+                    }
+                }
+            }
+            // Auto-Approval Settings
+            div {
+                class: "mt-6 pt-4 border-t border-gray-700",
+                h3 {
+                    class: "mb-6 text-md font-semibold mb-3",
+                    "Auto-Approval Settings"
+                }
+
+                // Master Toggle
+                div {
+                    class: "flex items-center justify-between mb-3",
+                    label {
+                        class: "block text-sm font-medium text-gray-300",
+                        "Enable Auto-Approval"
+                    }
+                    label {
+                        class: "relative inline-flex items-center cursor-pointer",
+                        input {
+                            r#type: "checkbox",
+                            class: "sr-only peer",
+                            checked: settings.read().permission_settings.auto_approval_enabled,
+                            oninput: move |event| {
+                                if let Some(checked) = event.value().parse().ok() {
+                                    settings.write().permission_settings.auto_approval_enabled = checked;
+                                    has_unsaved_changes.set(true);
+                                }
+                            }
+                        }
+                        div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600" }
+                    }
+                }
+
+                // Granular Toggles (conditionally rendered)
+                if settings.read().permission_settings.auto_approval_enabled {
+                    div {
+                        class: "mb-2 pl-4 border-l-2 border-gray-700",
+                        
+                        // MCP Toggle
+                        div {
+                            class: "flex items-center justify-between mb-2",
+                            label { "MCP Tools" }
+                            label {
+                                class: "relative inline-flex items-center cursor-pointer",
+                                input {
+                                    r#type: "checkbox",
+                                    class: "sr-only peer",
+                                    checked: settings.read().permission_settings.granular_permissions.get(&ToolCategory::Mcp).copied().unwrap_or(false),
+                                    oninput: move |event| {
+                                        if let Some(checked) = event.value().parse().ok() {
+                                            settings.write().permission_settings.granular_permissions.insert(ToolCategory::Mcp, checked);
+                                            has_unsaved_changes.set(true);
+                                        }
+                                    }
+                                }
+                                div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600" }
+                            }
+                        }
+
+                        // Max Requests
+                        div {
+                            class: "mt-3",
+                            label { "Max Consecutive Requests" }
+                            input {
+                                class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm",
+                                r#type: "number",
+                                value: "{settings.read().permission_settings.max_requests}",
+                                oninput: move |event| {
+                                    if let Ok(val) = event.value().parse::<u32>() {
+                                        settings.write().permission_settings.max_requests = val;
+                                        has_unsaved_changes.set(true);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Max Cost
+                        div {
+                            class: "mt-3",
+                            label { "Max Session Cost ($)" }
+                            input {
+                                class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm",
+                                r#type: "number",
+                                step: "0.01",
+                                value: "{settings.read().permission_settings.max_cost}",
+                                oninput: move |event| {
+                                    if let Ok(val) = event.value().parse::<f64>() {
+                                        settings.write().permission_settings.max_cost = val;
+                                        has_unsaved_changes.set(true);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

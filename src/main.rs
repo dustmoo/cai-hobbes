@@ -58,6 +58,7 @@ fn main() {
         .launch(app);
 }
 
+use crate::context::permissions::PermissionManager;
 use crate::session::SessionState;
 use crate::settings::SettingsManager;
 use crate::{components::stream_manager::StreamManager, mcp::manager::McpManager};
@@ -81,9 +82,6 @@ fn app() -> Element {
     let window = use_window();
     let session_state = use_context_provider(|| Signal::new(SessionState::new()));
     let settings_manager = use_context_provider(|| Signal::new(SettingsManager::new(get_settings_path())));
-    let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(get_mcp_config_path())));
-    let mcp_context = use_context_provider(|| Signal::new(mcp::manager::McpContext { servers: Vec::new() }));
-
     let mut settings = use_context_provider(|| {
         let mut settings = settings_manager.read().load();
         if let Ok(api_key) = crate::secure_storage::retrieve_secret("api_key") {
@@ -91,6 +89,9 @@ fn app() -> Element {
         }
         Signal::new(settings)
     });
+    let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+    let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(get_mcp_config_path(), permission_manager.clone())));
+    let mcp_context = use_context_provider(|| Signal::new(mcp::manager::McpContext { servers: Vec::new() }));
 
     use_effect(move || {
         let manager = mcp_manager.read().clone();
@@ -218,7 +219,7 @@ fn app() -> Element {
         StreamManager {
             div {
                 class: "dark flex flex-col h-screen", // Changed to flex-col
-                // Draggable header area
+                // Draggable column area
                 div {
                     class: "h-8 bg-transparent",
                     onmousedown: move |_| {
@@ -227,7 +228,7 @@ fn app() -> Element {
                 }
                 // Main content area
                 div {
-                    class: "flex flex-row flex-1", // This will contain the sidebars and chat
+                    class: "flex flex-row flex-1 min-h-0", // This will contain the sidebars and chat
                     // The onkeydown handler has been removed to allow native hotkeys (copy, paste, etc.) to function correctly.
                     // The global hotkey for toggling visibility is no longer required.
                     // When the user releases the mouse, save the last known size.
@@ -325,10 +326,8 @@ fn app() -> Element {
                 div {
                     class: "flex-1",
                     components::chat::ChatWindow {
-                        on_interaction: move |_| {
-                            // No longer needed for expansion
-                        },
                         on_content_resize: move |_| {},
+                        on_interaction: move |_| {},
                         on_toggle_sessions: {
                             let window = window.clone();
                             move |_| {

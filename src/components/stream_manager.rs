@@ -83,12 +83,12 @@ impl StreamManagerContext {
                         }
                         drop(state);
 
-                        let mcp_manager = self.mcp_manager;
+                        let mut mcp_manager = self.mcp_manager;
                         let mut session_state = self.session_state;
 
                         spawn(async move {
                             let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
-                            let result = mcp_manager.read().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json).await;
+                            let result = mcp_manager.write().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, false).await;
 
                             let mut state = session_state.write();
                             if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
@@ -99,14 +99,27 @@ impl StreamManagerContext {
                                             tc.response = serde_json::to_string_pretty(&response).unwrap_or_default();
                                         },
                                         Err(e) => {
-                                            tc.status = ToolCallStatus::Error;
-                                            tc.response = e;
+                                            // Attempt to deserialize the error into a ToolCall for permission requests
+                                            if let Ok(tool_call_req) = serde_json::from_str::<crate::components::shared::ToolCall>(&e) {
+                                                // This is a permission request. Find the original tool call message and update its content.
+                                                if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
+                                                   msg.content = crate::components::shared::MessageContent::PermissionRequest(tool_call_req);
+                                                }
+                                            } else {
+                                                // This is a genuine error
+                                                tc.status = ToolCallStatus::Error;
+                                                tc.response = e;
+                                            }
                                         }
                                     }
                                 }
                             }
                         });
                         is_first_message = false;
+                    }
+                    StreamMessage::PermissionRequest(_) => {
+                        // This is unexpected from the LLM stream and handled internally.
+                        tracing::warn!("Unexpected StreamMessage::PermissionRequest received from LLM stream; ignoring.");
                     }
                 }
             }
@@ -159,12 +172,16 @@ mod tests {
     use dioxus_signals::Signal;
     use crate::mcp::manager::McpManager;
     use std::path::PathBuf;
+    use crate::context::permissions::PermissionManager;
+    use crate::settings::Settings;
 
     #[tokio::test]
     async fn test_stream_registration_and_deregistration() {
         let mut dom = VirtualDom::new(|| {
             let session_state = use_context_provider(|| Signal::new(SessionState::new()));
-            let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new())));
+            let settings = use_context_provider(|| Signal::new(Settings::default()));
+            let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+            let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
             let mut stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
                 session_state,
@@ -201,7 +218,9 @@ mod tests {
     async fn test_take_nonexistent_stream() {
         let mut dom = VirtualDom::new(|| {
             let session_state = use_context_provider(|| Signal::new(SessionState::new()));
-            let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new())));
+            let settings = use_context_provider(|| Signal::new(Settings::default()));
+            let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+            let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
             let stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
                 session_state,

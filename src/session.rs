@@ -172,7 +172,7 @@ impl SessionState {
     }
 
     pub fn update_window_size(&mut self, width: f64, height: f64) {
-        tracing::info!("Updating window size in state to: {}x{}", width, height);
+        tracing::debug!("Updating window size in state to: {}x{}", width, height);
         self.window_width = width;
         self.window_height = height;
         if let Err(e) = self.save() {
@@ -191,6 +191,16 @@ impl SessionState {
     pub fn get_message_mut(&mut self, message_id: &uuid::Uuid) -> Option<&mut super::components::chat::Message> {
         self.get_active_session_mut()
             .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
+    }
+    pub fn get_message_mut_by_execution_id(&mut self, execution_id: &str) -> Option<&mut super::components::chat::Message> {
+        self.get_active_session_mut()
+            .and_then(|session| session.messages.iter_mut().find(|m| {
+                match &m.content {
+                    super::components::shared::MessageContent::ToolCall(tc) => tc.execution_id == execution_id,
+                    super::components::shared::MessageContent::PermissionRequest(tc) => tc.execution_id == execution_id,
+                    _ => false,
+                }
+            }))
     }
 }
 impl Default for SessionState {

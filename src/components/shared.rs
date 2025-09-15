@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub enum MessageContent {
     Text(String),
     ToolCall(ToolCall),
+    PermissionRequest(ToolCall),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -19,6 +20,7 @@ pub struct ToolCall {
 pub enum StreamMessage {
     Text(String),
     ToolCall(ToolCall),
+    PermissionRequest(ToolCall),
 }
 
 impl ToolCall {
