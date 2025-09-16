@@ -19,6 +19,7 @@ mod context;
 mod processing;
 mod secure_storage;
 mod mcp;
+mod services;
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 use tray_icon::TrayIcon;
 fn main() {
@@ -61,7 +62,7 @@ fn main() {
 use crate::context::permissions::PermissionManager;
 use crate::session::SessionState;
 use crate::settings::SettingsManager;
-use crate::{components::stream_manager::StreamManager, mcp::manager::McpManager};
+use crate::{components::stream_manager::StreamManager, mcp::manager::McpManager, services::document_store::DocumentStore};
 use std::path::PathBuf;
 
 fn get_settings_path() -> PathBuf {
@@ -92,6 +93,23 @@ fn app() -> Element {
     let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
     let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(get_mcp_config_path(), permission_manager.clone())));
     let mcp_context = use_context_provider(|| Signal::new(mcp::manager::McpContext { servers: Vec::new() }));
+        let document_store = use_context_provider(|| Signal::new(None));
+    
+        use_effect(move || {
+            let mut document_store = document_store.clone();
+            spawn(async move {
+                let qdrant_url = std::env::var("QDRANT_URL").expect("QDRANT_URL must be set in .env");
+                match DocumentStore::new(&qdrant_url).await {
+                    Ok(store) => {
+                        document_store.set(Some(std::sync::Arc::new(store)));
+                        tracing::info!("DocumentStore initialized successfully.");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to initialize DocumentStore: {}", e);
+                    }
+                }
+            });
+        });
 
     use_effect(move || {
         let manager = mcp_manager.read().clone();

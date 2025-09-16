@@ -198,7 +198,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         let (prompt_data, mcp_context) = {
                              let state = session_state.read();
                              if let Some(session) = state.get_active_session() {
-                                let builder = PromptBuilder::new(session, &settings);
+                                let builder = PromptBuilder::new(session, &settings, &state);
                                 let prompt_data = builder.build_prompt(tool_response_prompt, None);
                                 let mcp_context = session.active_context.mcp_tools.clone();
                                 (Some(prompt_data), mcp_context)
@@ -296,7 +296,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         _ => None,
                     });
 
-                    let builder = PromptBuilder::new(session, &settings);
+                    let builder = PromptBuilder::new(session, &settings, &state);
                     builder.build_prompt(user_prompt, last_agent_message)
                 };
 
@@ -575,7 +575,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
 
                                                         // Build the prompt from the modified clone to show an accurate preview.
                                                         let settings_reader = settings.read();
-                                                        let builder = PromptBuilder::new(&session_for_debug, &settings_reader);
+                                                        let builder = PromptBuilder::new(&session_for_debug, &settings_reader, &state);
                                                         // Note: This debug view might not be perfect after the refactor,
                                                         // but it's better to show the raw prompt struct than to crash.
                                                         let prompt_data = builder.build_prompt("[DEBUG USER MESSAGE]".to_string(), None);

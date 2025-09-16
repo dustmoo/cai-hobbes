@@ -45,11 +45,12 @@ pub struct LlmPrompt {
 pub struct PromptBuilder<'a> {
     session: &'a Session,
     settings: &'a Settings,
+    session_state: &'a crate::session::SessionState,
 }
 
 impl<'a> PromptBuilder<'a> {
-    pub fn new(session: &'a Session, settings: &'a Settings) -> Self {
-        Self { session, settings }
+    pub fn new(session: &'a Session, settings: &'a Settings, session_state: &'a crate::session::SessionState) -> Self {
+        Self { session, settings, session_state }
     }
 
     /// Builds the structured `LlmPrompt` with system instructions, tools, and conversation history.
@@ -88,6 +89,12 @@ impl<'a> PromptBuilder<'a> {
         if let Some(instruction) = &self.settings.force_tool_use_instruction {
             persona = format!("{}\n\nCRITICAL INSTRUCTION: {}", persona, instruction);
         }
+
+        if self.session_state.tool_call_history.iter().any(|r| matches!(r.result.status, crate::components::shared::ToolCallStatus::Error)) {
+            let recovery_instruction = "\n\nCRITICAL RECOVERY INSTRUCTION: A previous tool call failed. Analyze the error message in the `<tool_response>` and attempt a different tool call to accomplish the user's goal. Do not repeat the failed tool call.";
+            persona.push_str(recovery_instruction);
+        }
+        
         active_context.system_persona = Some(persona);
         active_context.mcp_tools = None; // Exclude tools from the instruction text.
 
@@ -153,13 +160,35 @@ impl<'a> PromptBuilder<'a> {
             }
         }
         
-        // 3. Add the current user message.
+        // 3. Append the tool call history.
+        for record in &self.session_state.tool_call_history {
+            contents.push(Content {
+                role: "user".to_string(),
+                parts: vec![Part {
+                    text: format!(
+                        "<tool_code>\nserver_name: {}\ntool_name: {}\nargs: {}\n</tool_code>",
+                        record.call.server_name, record.call.tool_name, record.call.arguments
+                    ),
+                }],
+            });
+            contents.push(Content {
+                role: "model".to_string(),
+                parts: vec![Part {
+                    text: format!(
+                        "<tool_response>\nstatus: {}\nresponse: {}\n</tool_response>",
+                        record.result.status, record.result.response
+                    ),
+                }],
+            });
+        }
+
+        // 4. Add the current user message.
         contents.push(Content {
             role: "user".to_string(),
             parts: vec![Part { text: user_message }],
         });
 
-        // 4. Assemble and return the final LlmPrompt object.
+        // 5. Assemble and return the final LlmPrompt object.
         LlmPrompt {
             system_instruction,
             contents,
@@ -292,7 +321,8 @@ mod tests {
     fn test_build_prompt_renames_schema_and_removes_keys() {
         let session = create_mock_session_with_tools();
         let settings = Settings::default();
-        let builder = PromptBuilder::new(&session, &settings);
+        let session_state = crate::session::SessionState::default();
+        let builder = PromptBuilder::new(&session, &settings, &session_state);
 
         let prompt = builder.build_prompt("What's the weather?".to_string(), None);
 

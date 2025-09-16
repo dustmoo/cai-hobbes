@@ -1,5 +1,5 @@
 use dioxus::prelude::spawn;
-use dioxus_signals::Writable;
+use dioxus_signals::{Readable, Writable};
 use rmcp::model::{CallToolRequestParam, Tool};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::child_process::TokioChildProcess;
@@ -155,7 +155,7 @@ impl McpManager {
     }
 
     pub async fn use_mcp_tool(
-        &mut self,
+        &self,
         server_name: &str,
         tool_name: &str,
         args: serde_json::Value,
@@ -163,7 +163,7 @@ impl McpManager {
     ) -> Result<serde_json::Value, String> {
         if !bypass_permission_check {
             let category = Self::map_tool_to_category(tool_name);
-            let mut pm = self.permission_manager.write();
+            let pm = self.permission_manager.read();
             match pm.check_permission(&category) {
                 PermissionStatus::Allowed => { /* Continue */ }
                 PermissionStatus::RequiresPrompt => {

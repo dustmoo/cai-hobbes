@@ -1,7 +1,0 @@
-[
-  {
-    "name": "example-server",
-    "command": "echo 'MCP server starting...'",
-    "description": "An example server that does nothing."
-  }
-]

@@ -1,3 +1,4 @@
+use crate::services::tool_call_summarizer::ToolCallSummarizer;
 use dioxus::prelude::*;
 use std::collections::HashMap;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
@@ -5,12 +6,18 @@ use uuid::Uuid;
 use crate::session::SessionState;
 use crate::components::llm;
 use crate::components::shared::{StreamMessage, ToolCallStatus};
+use crate::services::document_store::DocumentStore;
+use std::sync::Arc;
+use crate::settings::Settings;
 
 #[derive(Clone, Copy)]
 pub struct StreamManagerContext {
     stream_receivers: Signal<HashMap<Uuid, UnboundedReceiver<StreamMessage>>>,
     session_state: Signal<SessionState>,
     mcp_manager: Signal<crate::mcp::manager::McpManager>,
+    document_store: Signal<Option<Arc<DocumentStore>>>,
+    tool_call_summarizer: Signal<ToolCallSummarizer>,
+    settings: Signal<Settings>,
 }
 
 impl StreamManagerContext {
@@ -37,15 +44,16 @@ impl StreamManagerContext {
         // Spawn a master task to manage the LLM call and state updates.
         spawn(async move {
             tracing::info!(message_id = %message_id, "Stream master task SPAWNED.");
-            // Create the channel for the LLM to send chunks to.
             let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<StreamMessage>();
 
-            // Spawn the LLM task. It runs in the background.
             spawn(async move {
                 llm::generate_content_stream(api_key, model, prompt_data, llm_tx, mcp_context).await;
             });
 
             let mut is_first_message = true;
+            let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<()>();
+            let mut tool_tasks_spawned = 0;
+
             while let Some(message) = llm_rx.recv().await {
                 match message {
                     StreamMessage::Text(chunk) => {
@@ -56,83 +64,102 @@ impl StreamManagerContext {
                             }
                         }
                         if ui_tx.send(StreamMessage::Text(chunk)).is_err() {
-                            break; // UI component likely dropped
+                            break;
                         }
                         is_first_message = false;
                     }
                     StreamMessage::ToolCall(tool_call) => {
-                        let mut state = self.session_state.write();
-                        let tool_call_message_id;
-
-                        if is_first_message {
-                            // This is the first message. Let's replace the content of the original message.
-                            tool_call_message_id = message_id;
-                            if let Some(msg) = state.get_message_mut(&message_id) {
-                                msg.content = crate::components::shared::MessageContent::ToolCall(tool_call.clone());
+                        tool_tasks_spawned += 1;
+                        let tool_call_message_id = {
+                            let mut state = self.session_state.write();
+                            if is_first_message {
+                                if let Some(msg) = state.get_message_mut(&message_id) {
+                                    msg.content = crate::components::shared::MessageContent::ToolCall(tool_call.clone());
+                                }
+                                message_id
+                            } else {
+                                let new_id = Uuid::new_v4();
+                                if let Some(session) = state.get_active_session_mut() {
+                                    session.messages.push(crate::components::chat::Message {
+                                        id: new_id,
+                                        author: "Hobbes".to_string(),
+                                        content: crate::components::shared::MessageContent::ToolCall(tool_call.clone()),
+                                    });
+                                }
+                                new_id
                             }
-                        } else {
-                            // This is not the first message, so create a new message for the tool call.
-                            tool_call_message_id = Uuid::new_v4();
-                            if let Some(session) = state.get_active_session_mut() {
-                                session.messages.push(crate::components::chat::Message {
-                                    id: tool_call_message_id,
-                                    author: "Hobbes".to_string(),
-                                    content: crate::components::shared::MessageContent::ToolCall(tool_call.clone()),
-                                });
-                            }
-                        }
-                        drop(state);
+                        };
 
-                        let mut mcp_manager = self.mcp_manager;
+                        let mcp_manager = self.mcp_manager;
                         let mut session_state = self.session_state;
-
+                        let document_store = self.document_store;
+                        let completion_tx = completion_tx.clone();
                         spawn(async move {
                             let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
-                            let result = mcp_manager.write().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, false).await;
+                            let result = mcp_manager.read().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, false).await;
 
                             let mut state = session_state.write();
-                            if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
-                                if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
-                                    match result {
-                                        Ok(response) => {
-                                            tc.status = ToolCallStatus::Completed;
-                                            tc.response = serde_json::to_string_pretty(&response).unwrap_or_default();
-                                        },
-                                        Err(e) => {
-                                            // Attempt to deserialize the error into a ToolCall for permission requests
-                                            if let Ok(tool_call_req) = serde_json::from_str::<crate::components::shared::ToolCall>(&e) {
-                                                // This is a permission request. Find the original tool call message and update its content.
-                                                if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
-                                                   msg.content = crate::components::shared::MessageContent::PermissionRequest(tool_call_req);
-                                                }
-                                            } else {
-                                                // This is a genuine error
-                                                tc.status = ToolCallStatus::Error;
-                                                tc.response = e;
-                                            }
+                            let (status, response_str) = match result {
+                                Ok(response) => (ToolCallStatus::Completed, serde_json::to_string_pretty(&response).unwrap_or_default()),
+                                Err(e) => {
+                                    if let Ok(tool_call_req) = serde_json::from_str::<crate::components::shared::ToolCall>(&e) {
+                                        if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
+                                            msg.content = crate::components::shared::MessageContent::PermissionRequest(tool_call_req);
                                         }
+                                        (ToolCallStatus::Error, e)
+                                    } else {
+                                        (ToolCallStatus::Error, e)
                                     }
                                 }
+                            };
+
+                            if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
+                                if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                                    tc.status = status;
+                                    tc.response = response_str.clone();
+                                }
                             }
+
+                            let record = crate::components::shared::ToolCallRecord {
+                                call: tool_call.clone(),
+                                result: crate::components::shared::ToolResult {
+                                    status,
+                                    response: response_str,
+                                },
+                            };
+                            state.tool_call_history.push(record.clone());
+                            if let Some(store) = document_store.read().as_ref().cloned() {
+                                spawn(async move {
+                                    if let Err(e) = store.upsert_tool_result(&record).await {
+                                        tracing::error!("Failed to upsert tool result: {}", e);
+                                    }
+                                });
+                            }
+                            let _ = completion_tx.send(());
                         });
                         is_first_message = false;
-                    }
-                    StreamMessage::PermissionRequest(_) => {
-                        // This is unexpected from the LLM stream and handled internally.
-                        tracing::warn!("Unexpected StreamMessage::PermissionRequest received from LLM stream; ignoring.");
                     }
                 }
             }
 
-            tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
-            let mut state = self.session_state.write();
-            state.touch_active_session();
-            if let Err(e) = state.save() {
-                tracing::error!("Failed to save session state after stream: {}", e);
-            } else {
-                tracing::info!(message_id = %message_id, "Session state SAVED successfully.");
+            for _ in 0..tool_tasks_spawned {
+                let _ = completion_rx.recv().await;
             }
 
+            tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
+            {
+                let mut state = self.session_state.write();
+                state.touch_active_session();
+                if let Err(e) = state.save() {
+                    tracing::error!("Failed to save session state after stream: {}", e);
+                } else {
+                    tracing::info!(message_id = %message_id, "Session state SAVED successfully.");
+                }
+            }
+
+            let settings = self.settings.read().clone();
+            let summarizer = self.tool_call_summarizer.read();
+            summarizer.summarize_and_cleanup(&mut self.session_state.write(), &settings).await;
             on_complete();
             tracing::info!(message_id = %message_id, "Completion signal SENT.");
         });
@@ -155,10 +182,15 @@ pub struct StreamManagerProps {
 pub fn StreamManager(props: StreamManagerProps) -> Element {
     let session_state = consume_context::<Signal<SessionState>>();
     let mcp_manager = consume_context::<Signal<crate::mcp::manager::McpManager>>();
+    let document_store = use_context_provider(|| Signal::new(None));
+    let settings = consume_context::<Signal<Settings>>();
     let context = use_hook(|| StreamManagerContext {
         stream_receivers: Signal::new(HashMap::new()),
         session_state,
         mcp_manager,
+        document_store,
+        tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
+        settings,
     });
 
     // Provide the context to children.
@@ -182,10 +214,14 @@ mod tests {
             let settings = use_context_provider(|| Signal::new(Settings::default()));
             let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
             let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
+            let document_store = use_context_provider(|| Signal::new(None));
             let mut stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
                 session_state,
                 mcp_manager,
+                document_store,
+                tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
+                settings,
             });
 
             let message_id = Uuid::new_v4();
@@ -221,10 +257,14 @@ mod tests {
             let settings = use_context_provider(|| Signal::new(Settings::default()));
             let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
             let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
+            let document_store = use_context_provider(|| Signal::new(None));
             let stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
                 session_state,
                 mcp_manager,
+                document_store,
+                tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
+                settings,
             });
 
             let message_id = Uuid::new_v4();

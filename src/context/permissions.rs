@@ -1,6 +1,6 @@
 use crate::settings::Settings;
 use dioxus::prelude::Signal;
-use dioxus_signals::{Readable, Writable};
+use dioxus_signals::Readable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -54,7 +54,7 @@ impl PermissionManager {
         }
     }
 
-    pub fn check_permission(&mut self, category: &ToolCategory) -> PermissionStatus {
+    pub fn check_permission(&self, category: &ToolCategory) -> PermissionStatus {
         let settings = self.settings.read();
         if *self.request_count.read() >= settings.permission_settings.max_requests {
             return PermissionStatus::Denied("Request limit reached".to_string());
@@ -83,16 +83,4 @@ impl PermissionManager {
         }
     }
 
-    pub fn increment_request_count(&mut self) {
-        *self.request_count.write() += 1;
-    }
-
-    pub fn add_cost(&mut self, cost: f64) {
-        *self.current_cost.write() += cost;
-    }
-
-    pub fn reset_session_limits(&mut self) {
-        *self.request_count.write() = 0;
-        *self.current_cost.write() = 0.0;
-    }
 }

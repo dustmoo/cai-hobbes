@@ -20,7 +20,6 @@ pub struct ToolCall {
 pub enum StreamMessage {
     Text(String),
     ToolCall(ToolCall),
-    PermissionRequest(ToolCall),
 }
 
 impl ToolCall {
@@ -52,4 +51,16 @@ impl std::fmt::Display for ToolCallStatus {
             ToolCallStatus::Error => write!(f, "Error"),
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolResult {
+    pub status: ToolCallStatus,
+    pub response: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallRecord {
+    pub call: ToolCall,
+    pub result: ToolResult,
 }

@@ -84,6 +84,8 @@ pub struct SessionState {
     pub active_session_id: String,
     pub window_width: f64,
     pub window_height: f64,
+    #[serde(default)]
+    pub tool_call_history: Vec<crate::components::shared::ToolCallRecord>,
 }
 
 fn get_sessions_path() -> Option<PathBuf> {
@@ -210,6 +212,7 @@ impl Default for SessionState {
             active_session_id: String::new(),
             window_width: 675.0,
             window_height: 750.0,
+            tool_call_history: Vec::new(),
         }
     }
 }
