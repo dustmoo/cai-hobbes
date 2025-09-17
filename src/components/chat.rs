@@ -138,16 +138,11 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<()>();
 
-                let api_key = settings.api_key.clone().unwrap_or_else(|| {
-                    std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
-                });
-
                 let on_complete = move || {
                     let _ = tx.send(());
                 };
 
                 stream_manager.start_stream(
-                    api_key,
                     settings.chat_model,
                     hobbes_message_id,
                     prompt_data,
@@ -163,59 +158,6 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             });
         }
     };
-
-    // Effect to trigger LLM feedback loop after a tool call completes
-    use_effect({
-        let mut session_state = session_state.clone();
-        let send_prompt_to_llm = send_prompt_to_llm.clone();
-        let settings = settings.read().clone();
-        move || {
-            let messages = session_state.read().get_active_session().map_or(vec![], |s| s.messages.clone());
-            if let Some(last_message) = messages.last() {
-                if let MessageContent::ToolCall(tc) = &last_message.content {
-                    if tc.status == super::shared::ToolCallStatus::Completed {
-                        // A tool call just finished. Time to send the result back to the LLM.
-                        let tool_response_prompt = format!(
-                            "<tool_response>\n<server_name>{}</server_name>\n<tool_name>{}</tool_name>\n<response>{}</response>\n</tool_response>",
-                            tc.server_name, tc.tool_name, tc.response
-                        );
-                        
-                        // A tool call just finished. Time to send the result back to the LLM.
-                        // Action 1: Create the new "thinking" message and get its ID.
-                        let hobbes_message_id = Uuid::new_v4();
-                        {
-                            let mut state = session_state.write();
-                            if let Some(session) = state.get_active_session_mut() {
-                                session.messages.push(Message {
-                                    id: hobbes_message_id,
-                                    author: "Hobbes".to_string(),
-                                    content: MessageContent::Text("".to_string()),
-                                });
-                            }
-                        }
-
-                        // Action 2: Build the prompt using the now-updated state.
-                        let (prompt_data, mcp_context) = {
-                             let state = session_state.read();
-                             if let Some(session) = state.get_active_session() {
-                                let builder = PromptBuilder::new(session, &settings, &state);
-                                let prompt_data = builder.build_prompt(tool_response_prompt, None);
-                                let mcp_context = session.active_context.mcp_tools.clone();
-                                (Some(prompt_data), mcp_context)
-                             } else {
-                                (None, None)
-                             }
-                        };
-
-                        // Action 3: Send to LLM
-                        if let Some(prompt_data) = prompt_data {
-                            send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
-                        }
-                    }
-                }
-            }
-        }
-    });
 
     let mut send_message = {
         // Capture signals which are all `Copy`

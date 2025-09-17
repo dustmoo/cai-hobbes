@@ -124,9 +124,10 @@ impl SessionState {
 
     pub fn create_session(&mut self) {
         let new_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Local::now();
         let new_session = Session {
             id: new_id.clone(),
-            name: format!("Chat {}", self.sessions.len() + 1),
+            name: now.format("%b %d - %I:%M %p").to_string(),
             messages: vec![],
             active_context: ActiveContext::default(),
             last_updated: Utc::now(),

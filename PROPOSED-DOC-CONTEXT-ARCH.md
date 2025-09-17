@@ -45,13 +45,17 @@ graph TD
             subgraph "NEW Tool Call Feedback Loop"
                 I -- "Responds with Tool Call" --> K[StreamManager];
                 K -- "Updates Message State" --> F;
-                K -- "Executes Tool via" --> L;
-                L -- "Returns Result" --> K;
-                K -- "Stores (Call, Result) pair in" --> TCH[ToolCallHistory];
-                TCH -- "Included in next prompt" --> H;
-                K -- "Async write of full result to" --> V;
-                
-                I -- "Responds with Text" --> TCS[ToolCallSummarizer];
+                K -- "Executes Tool(s) via" --> L;
+                L -- "Returns Result(s)" --> K;
+                K -- "Collects all results" --> K;
+                K -- "Stores (Call, Result) pairs in" --> TCH[ToolCallHistory];
+                K -- "Async write of full results to" --> V;
+                K -- "Builds new prompt via" --> H;
+                H -- "Gets context & history from" --> F;
+                K -- "Sends feedback to" --> I;
+
+                I -- "Responds with Final Text" --> K;
+                K -- "Triggers" --> TCS[ToolCallSummarizer];
                 TCS -- "Summarizes pairs from" --> TCH;
                 TCS -- "Writes 'Snapshot' to" --> F;
                 TCS -- "Clears" --> TCH;
@@ -77,7 +81,6 @@ This UML sequence diagram illustrates the detailed interaction between component
 sequenceDiagram
     participant User
     participant ChatWindow
-    participant SessionState
     participant ConversationProcessor
     participant PromptBuilder
     participant ChatLLM
@@ -85,33 +88,41 @@ sequenceDiagram
     participant McpManager
     participant DocumentStore
     participant ToolCallSummarizer
+    participant SessionState
 
     User->>ChatWindow: Sends message
     ChatWindow->>ConversationProcessor: Process dialogue
     ConversationProcessor->>SessionState: Updates dialogue summary
-    ChatWindow->>PromptBuilder: Build prompt
-    PromptBuilder->>SessionState: Get context & history
-    PromptBuilder->>ChatLLM: Send formatted prompt
+    ChatWindow->>PromptBuilder: Build initial prompt
+    PromptBuilder->>SessionState: Get context
+    ChatWindow->>StreamManager: Start Stream with initial prompt
 
-    loop Tool Call Loop
-        ChatLLM-->>StreamManager: Respond with Tool Call
-        StreamManager->>McpManager: Execute tool
-        McpManager-->>StreamManager: Return result
+    loop Tool Call & Feedback Loop
+        StreamManager->>ChatLLM: Send prompt
+        ChatLLM-->>StreamManager: Respond with Tool Call(s)
         
-        par
-            StreamManager->>SessionState: Store (call, result) in ToolCallHistory
+        par Concurrent Tool Execution
+            StreamManager->>McpManager: Execute tool 1
+            McpManager-->>StreamManager: Return result 1
         and
-            StreamManager->>DocumentStore: Async write of full result
+            StreamManager->>McpManager: Execute tool 2
+            McpManager-->>StreamManager: Return result 2
         end
-
-        StreamManager->>PromptBuilder: Re-build prompt for feedback
-        PromptBuilder->>SessionState: Get context & NEW ToolCallHistory
-        PromptBuilder->>ChatLLM: Send prompt with tool result
+        
+        StreamManager->>StreamManager: Collect all tool results
+        StreamManager->>SessionState: Store all (call, result) pairs in ToolCallHistory
+        StreamManager->>DocumentStore: Async write of full results
+        
+        StreamManager->>PromptBuilder: Build feedback prompt
+        PromptBuilder->>SessionState: Get context & updated ToolCallHistory
+        
+        note right of StreamManager: The loop continues if the LLM responds with another tool call.
     end
 
-    ChatLLM-->>ChatWindow: Respond with final text
+    ChatLLM-->>StreamManager: Respond with final text
+    StreamManager->>ChatWindow: Stream final text to UI
     
-    ChatWindow->>ToolCallSummarizer: Trigger summarization
+    StreamManager->>ToolCallSummarizer: Trigger summarization
     ToolCallSummarizer->>SessionState: Read & process ToolCallHistory
     ToolCallSummarizer->>SessionState: Write 'Snapshots' to Active Context
     ToolCallSummarizer->>SessionState: Clear ToolCallHistory
@@ -179,12 +190,12 @@ This sequence details how the system will handle a tool call from start to finis
 
 ## Code Review Findings & Justification
 
-A review of the relevant codebase (`chat.rs`, `conversation_processor.rs`, `prompt_builder.rs`, and `stream_manager.rs`) confirms that this proposed architecture is the correct approach.
+A review of the relevant codebase confirms that the initial implementation attempt was flawed, leading to a hard rollback. The architecture has now been successfully refactored according to the following principles:
 
-1.  **`ConversationProcessor` is for Dialogue Only:** The review of `src/processing/conversation_processor.rs` shows its sole responsibility is summarizing user/AI dialogue. It creates simple placeholders for tool calls but does not process them. Creating a new **`ToolCallSummarizer`** is therefore justified to maintain a clear separation of concerns, as per the system pattern we logged.
+1.  **`ConversationProcessor` is for Dialogue Only:** The review of `src/processing/conversation_processor.rs` shows its sole responsibility is summarizing user/AI dialogue. The new **`ToolCallSummarizer`** correctly separates the concern of summarizing tool interactions.
 
-2.  **`StreamManager` is the Ideal Capture Point:** The review of `src/components/stream_manager.rs` reveals that the `StreamMessage::ToolCall` match arm (line 63) is the exact point where a tool call is detected and its result is received. This is the perfect, centralized location to add the new logic for populating the **`ToolCallHistory`** and sending the full result to the **`DocumentStore`**.
+2.  **`StreamManager` is the Central Orchestrator:** The refactored `src/components/stream_manager.rs` is now the single point of control for the entire tool-call lifecycle. It uses a robust, channel-based mechanism to await concurrent tool executions, preventing deadlocks. It is also now solely responsible for managing the LLM feedback loop, removing this complex logic from the UI layer.
 
-3.  **`PromptBuilder` is Intentionally Blind:** The review of `src/context/prompt_builder.rs` shows that it currently filters out and ignores past `ToolCall` messages from the conversation history. Modifying it to explicitly read from the new **`ToolCallHistory`** is a natural and necessary extension of its role in assembling the complete context for the LLM.
+3.  **`PromptBuilder` is a Pure Function:** The review of `src/context/prompt_builder.rs` confirms its role has been simplified. It no longer needs to append the `tool_call_history`, as this is now handled by the `StreamManager`'s centralized logic. It acts as a pure builder, assembling context without managing stateful loops.
 
 This plan provides a clear and logical path to implement the required changes within the existing structure of the application.

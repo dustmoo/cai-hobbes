@@ -89,6 +89,7 @@ pub async fn generate_content_stream(
     tx: mpsc::UnboundedSender<StreamMessage>,
     mcp_context: Option<crate::mcp::manager::McpContext>,
 ) {
+    const MAX_RETRIES: u32 = 2;
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -102,117 +103,140 @@ pub async fn generate_content_stream(
     tracing::info!("Using chat model: {}", model);
     let url = format!("{}/{}:streamGenerateContent?key={}&alt=sse", BASE_API_URL, model, api_key);
 
-    let response = match client.post(&url).json(&request_body).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Error sending request: {}", e);
+    for attempt in 0..MAX_RETRIES {
+        let response = match client.post(&url).json(&request_body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Error sending request on attempt {}: {}", attempt + 1, e);
+                if attempt + 1 == MAX_RETRIES { return; }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
+            if let Ok(error_response) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
+                tracing::error!("Gemini API Error [{}]: {}", status, error_response.error.message);
+            } else {
+                tracing::error!("Gemini API Error [{}]: {}", status, body_text);
+            }
             return;
         }
-    };
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
-        if let Ok(error_response) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
-            tracing::error!("Gemini API Error [{}]: {}", status, error_response.error.message);
-        } else {
-            tracing::error!("Gemini API Error [{}]: {}", status, body_text);
-        }
-        return;
-    }
+        let mut stream = response.bytes_stream();
+        let mut has_sent_data = false;
+        let mut finish_reason: Option<String> = None;
+        let mut buffer = Vec::<u8>::new();
+        let mut malformed_call_detected = false;
 
-    let mut stream = response.bytes_stream();
-    let mut has_sent_data = false;
-    let mut finish_reason: Option<String> = None;
-    let mut buffer = Vec::<u8>::new();
-    // With the `:streamGenerateContent` endpoint, we receive Server-Sent Events (SSE).
-    // This is a much simpler and more robust way to handle streaming compared to
-    // manually buffering bytes and searching for JSON objects. The previous implementation
-    // was unnecessarily complex because it was trying to stream from a non-streaming endpoint.
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(bytes) => {
-                buffer.extend_from_slice(&bytes);
-                while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
-                    let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
-                    let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    buffer.extend_from_slice(&bytes);
+                    while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
+                        let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
+                        let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
 
-                    if line.starts_with("data: ") {
-                        let json_str = &line["data: ".len()..];
-                        if json_str.is_empty() { continue; }
-                        match serde_json::from_str::<GeminiResponse>(json_str) {
-                            Ok(parsed) => {
-                                if let Some(candidate) = parsed.candidates.get(0) {
-                                    if let Some(reason) = &candidate.finish_reason {
-                                        finish_reason = Some(reason.clone());
-                                        if reason != "STOP" {
-                                            tracing::warn!("Gemini stream finished with reason: {}", reason);
+                        if line.starts_with("data: ") {
+                            let json_str = &line["data: ".len()..];
+                            if json_str.is_empty() { continue; }
+                            match serde_json::from_str::<GeminiResponse>(json_str) {
+                                Ok(parsed) => {
+                                    if let Some(candidate) = parsed.candidates.get(0) {
+                                        if let Some(reason) = &candidate.finish_reason {
+                                            finish_reason = Some(reason.clone());
+                                            if reason == "MALFORMED_FUNCTION_CALL" {
+                                                tracing::warn!("Malformed function call detected on attempt {}. Retrying...", attempt + 1);
+                                                malformed_call_detected = true;
+                                                break; // Break from inner while to retry
+                                            }
+                                            if reason != "STOP" {
+                                                tracing::warn!("Gemini stream finished with reason: {}", reason);
+                                            }
                                         }
-                                    }
-                                    if let Some(part) = candidate.content.parts.get(0) {
-                                        if let Some(function_call) = &part.function_call {
-                                            let mut found_tool = false;
-                                            if let Some(context) = &mcp_context {
-                                                for server in &context.servers {
-                                                    if server.tools.iter().any(|t| t.name == function_call.name) {
-                                                        let tool_call = ToolCall::new(
-                                                            server.name.clone(),
-                                                            function_call.name.clone(),
-                                                            function_call.args.clone(),
-                                                        );
-                                                        if tx.send(StreamMessage::ToolCall(tool_call)).is_err() {
-                                                            tracing::error!("Failed to send tool call to stream manager.");
-                                                            return;
+                                        if let Some(part) = candidate.content.parts.get(0) {
+                                            if let Some(function_call) = &part.function_call {
+                                                let mut found_tool = false;
+                                                if let Some(context) = &mcp_context {
+                                                    for server in &context.servers {
+                                                        if server.tools.iter().any(|t| t.name == function_call.name) {
+                                                            let tool_call = ToolCall::new(
+                                                                server.name.clone(),
+                                                                function_call.name.clone(),
+                                                                function_call.args.clone(),
+                                                            );
+                                                            if tx.send(StreamMessage::ToolCall(tool_call)).is_err() {
+                                                                return;
+                                                            }
+                                                            has_sent_data = true;
+                                                            found_tool = true;
+                                                            break;
                                                         }
-                                                        has_sent_data = true;
-                                                        found_tool = true;
-                                                        break;
                                                     }
                                                 }
+                                                if !found_tool {
+                                                    tracing::error!("LLM requested tool '{}' which was not found in the provided context.", function_call.name);
+                                                }
+                                            } else if !part.text.is_empty() {
+                                                if tx.send(StreamMessage::Text(part.text.clone())).is_err() {
+                                                    return;
+                                                }
+                                                has_sent_data = true;
                                             }
-                                            if !found_tool {
-                                                tracing::error!("LLM requested tool '{}' which was not found in the provided context.", function_call.name);
-                                            }
-                                        } else if !part.text.is_empty() {
-                                            if tx.send(StreamMessage::Text(part.text.clone())).is_err() {
-                                                tracing::error!("Failed to send content chunk to UI.");
-                                                return;
-                                            }
-                                            has_sent_data = true;
                                         }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                let error_message = "[Hobbes encountered a stream error. Please check the logs for details.]";
-                                tracing::error!("Failed to parse JSON chunk from stream: {}. Chunk: '{}'", e, json_str);
-                                if tx.send(StreamMessage::Text(error_message.to_string())).is_err() {
-                                    tracing::error!("Failed to send stream error message to UI.");
+                                Err(e) => {
+                                    tracing::error!("Failed to parse JSON chunk from stream: {}. Chunk: '{}'", e, json_str);
+                                    // Check if this error is due to a malformed call finish reason
+                                    if json_str.contains("MALFORMED_FUNCTION_CALL") {
+                                        tracing::warn!("Malformed function call detected via string search on attempt {}. Retrying...", attempt + 1);
+                                        malformed_call_detected = true;
+                                        break; // Break from inner while to retry
+                                    }
+                                    let error_message = "[Hobbes encountered a stream error. Please check the logs for details.]";
+                                    if tx.send(StreamMessage::Text(error_message.to_string())).is_err() {
+                                        tracing::error!("Failed to send stream error message to UI.");
+                                    }
+                                    return;
                                 }
-                                return;
                             }
                         }
                     }
+                    if malformed_call_detected { break; }
+                }
+                Err(e) => {
+                    tracing::error!("Error in stream: {}", e);
+                    break;
                 }
             }
-            Err(e) => {
-                tracing::error!("Error in stream: {}", e);
-                break;
+        }
+
+        if malformed_call_detected {
+            if attempt + 1 < MAX_RETRIES {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue; // Go to the next iteration of the for loop
+            } else {
+                tracing::error!("Malformed function call persisted after {} retries. Aborting.", MAX_RETRIES);
+                let _ = tx.send(StreamMessage::Text("[Hobbes failed to process a tool call after multiple retries.]".to_string()));
+                return;
             }
         }
-    }
 
-    // After the stream, if no actual content was sent, we send a default message
-    // based on the finish reason we captured.
-    if !has_sent_data {
-        let default_message = match finish_reason.as_deref() {
-            Some("SAFETY") => "[Hobbes did not provide a response due to the safety filter.]".to_string(),
-            Some(reason) => format!("[Hobbes did not provide a response. Finish Reason: {}]", reason),
-            None => "[Hobbes did not provide a response due to an internal error.]".to_string(),
-        };
-        if tx.send(StreamMessage::Text(default_message)).is_err() {
-            tracing::error!("Failed to send default message to UI.");
+        if !has_sent_data {
+            let default_message = match finish_reason.as_deref() {
+                Some("SAFETY") => "[Hobbes did not provide a response due to the safety filter.]".to_string(),
+                Some(reason) => format!("[Hobbes did not provide a response. Finish Reason: {}]", reason),
+                None => "[Hobbes did not provide a response due to an internal error.]".to_string(),
+            };
+            if tx.send(StreamMessage::Text(default_message)).is_err() {
+                tracing::error!("Failed to send default message to UI.");
+            }
         }
+        // If we've successfully processed the stream without a malformed call, break the retry loop.
+        break;
     }
 }
 

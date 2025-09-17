@@ -27,7 +27,6 @@ impl StreamManagerContext {
 
     pub fn start_stream(
         mut self,
-        api_key: String,
         model: String,
         message_id: Uuid,
         prompt_data: crate::context::prompt_builder::LlmPrompt,
@@ -35,24 +34,29 @@ impl StreamManagerContext {
         mcp_context: Option<crate::mcp::manager::McpContext>,
     ) {
         tracing::info!(message_id = %message_id, "'start_stream' entered.");
-        // Create a channel for the UI to receive chunks.
-        let (ui_tx, ui_rx) = mpsc::unbounded_channel::<StreamMessage>();
+        // Create a channel for the MessageBubble to receive chunks.
+        let (stream_tx, stream_rx) = mpsc::unbounded_channel::<StreamMessage>();
         
         // Store the receiver for the MessageBubble to pick up.
-        self.stream_receivers.write().insert(message_id, ui_rx);
+        self.stream_receivers.write().insert(message_id, stream_rx);
 
         // Spawn a master task to manage the LLM call and state updates.
         spawn(async move {
             tracing::info!(message_id = %message_id, "Stream master task SPAWNED.");
             let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<StreamMessage>();
 
+            let settings = self.settings.read().clone();
+            let api_key = settings.api_key.clone().unwrap_or_else(|| {
+                std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
+            });
             spawn(async move {
                 llm::generate_content_stream(api_key, model, prompt_data, llm_tx, mcp_context).await;
             });
 
             let mut is_first_message = true;
-            let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<()>();
-            let mut tool_tasks_spawned = 0;
+            // MPSC channel to collect results from all spawned tool-call tasks.
+            let (tool_results_tx, mut tool_results_rx) = mpsc::unbounded_channel::<crate::components::shared::ToolCallRecord>();
+            let mut tool_call_count = 0;
 
             while let Some(message) = llm_rx.recv().await {
                 match message {
@@ -63,13 +67,13 @@ impl StreamManagerContext {
                                 t.push_str(&chunk);
                             }
                         }
-                        if ui_tx.send(StreamMessage::Text(chunk)).is_err() {
+                        if stream_tx.send(StreamMessage::Text(chunk)).is_err() {
                             break;
                         }
                         is_first_message = false;
                     }
                     StreamMessage::ToolCall(tool_call) => {
-                        tool_tasks_spawned += 1;
+                        tool_call_count += 1;
                         let tool_call_message_id = {
                             let mut state = self.session_state.write();
                             if is_first_message {
@@ -90,10 +94,12 @@ impl StreamManagerContext {
                             }
                         };
 
+                        // Each tool call runs in its own spawned task.
+                        // It owns a sender to the results channel.
                         let mcp_manager = self.mcp_manager;
                         let mut session_state = self.session_state;
                         let document_store = self.document_store;
-                        let completion_tx = completion_tx.clone();
+                        let tool_results_tx = tool_results_tx.clone(); // Clone sender for the task
                         spawn(async move {
                             let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
                             let result = mcp_manager.read().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, false).await;
@@ -127,23 +133,96 @@ impl StreamManagerContext {
                                     response: response_str,
                                 },
                             };
-                            state.tool_call_history.push(record.clone());
                             if let Some(store) = document_store.read().as_ref().cloned() {
+                                let record_for_store = record.clone();
                                 spawn(async move {
-                                    if let Err(e) = store.upsert_tool_result(&record).await {
+                                    if let Err(e) = store.upsert_tool_result(&record_for_store).await {
                                         tracing::error!("Failed to upsert tool result: {}", e);
                                     }
                                 });
                             }
-                            let _ = completion_tx.send(());
+                            let _ = tool_results_tx.send(record);
                         });
                         is_first_message = false;
                     }
                 }
             }
 
-            for _ in 0..tool_tasks_spawned {
-                let _ = completion_rx.recv().await;
+            // The master task will collect all results from the channel.
+            // We drop the original sender here. The loop will only complete
+            // once all the spawned tool-call tasks have finished and dropped their sender clones.
+            // This is a robust way to await an unknown number of concurrent tasks.
+            drop(tool_results_tx);
+            let mut collected_records = Vec::new();
+            while let Some(record) = tool_results_rx.recv().await {
+                collected_records.push(record);
+            }
+
+            // Centralize all SessionState mutations to occur sequentially after results are collected.
+            if tool_call_count > 0 {
+                assert_eq!(collected_records.len(), tool_call_count, "Mismatch between tool calls dispatched and results received.");
+                self.session_state.write().tool_call_history.extend(collected_records.clone());
+            }
+
+            // If tools were called, we now feed the results back to the LLM to get a final,
+            // natural-language response. This is the core of the feedback loop.
+            if !self.session_state.read().tool_call_history.is_empty() {
+                let new_hobbes_message_id = Uuid::new_v4();
+                let settings = self.settings.read().clone();
+                
+                // Create the new, empty message bubble that will display the final response.
+                {
+                    let mut state = self.session_state.write();
+                    if let Some(session) = state.get_active_session_mut() {
+                        session.messages.push(crate::components::chat::Message {
+                            id: new_hobbes_message_id,
+                            author: "Hobbes".to_string(),
+                            content: crate::components::shared::MessageContent::Text("".to_string()),
+                        });
+                    }
+                }
+
+                // Build the new prompt that includes the tool call history.
+                let (prompt_data, mcp_context_for_next_call) = {
+                    let current_state = self.session_state.read();
+                    if let Some(session) = current_state.get_active_session() {
+                        let builder = crate::context::prompt_builder::PromptBuilder::new(session, &settings, &current_state);
+                        let prompt = builder.build_prompt("".to_string(), None); // Empty message, context is now in history
+                        (Some(prompt), session.active_context.mcp_tools.clone())
+                    } else {
+                        (None, None)
+                    }
+                };
+
+                // Execute the second LLM call.
+                if let Some(prompt) = prompt_data {
+                    let (final_answer_tx, final_answer_rx) = mpsc::unbounded_channel::<StreamMessage>();
+                    self.stream_receivers.write().insert(new_hobbes_message_id, final_answer_rx);
+
+                    let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<StreamMessage>();
+                    let api_key = settings.api_key.clone().unwrap_or_else(|| {
+                        std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
+                    });
+                    let model = settings.chat_model.clone();
+
+                    spawn(async move {
+                        llm::generate_content_stream(api_key, model, prompt, llm_tx, mcp_context_for_next_call).await;
+                    });
+
+                    // Stream the final response to the new message bubble.
+                    while let Some(message) = llm_rx.recv().await {
+                        if let StreamMessage::Text(chunk) = message {
+                            if let Some(msg) = self.session_state.write().get_message_mut(&new_hobbes_message_id) {
+                                if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
+                                    t.push_str(&chunk);
+                                }
+                            }
+                            if final_answer_tx.send(StreamMessage::Text(chunk)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
 
             tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");

@@ -16,7 +16,7 @@ impl From<Message> for Content {
             },
             MessageContent::ToolCall(_) => {
                 // We don't want to include tool calls in the history this way,
-                // so we return an empty part that can be filtered out.
+                // as they are handled specially below. Return an empty part to be filtered out.
                 Content {
                     role,
                     parts: vec![Part { text: String::new() }],
@@ -160,35 +160,44 @@ impl<'a> PromptBuilder<'a> {
             }
         }
         
-        // 3. Append the tool call history.
+        // 4. Append the tool call history, correctly formatted for the model.
         for record in &self.session_state.tool_call_history {
-            contents.push(Content {
-                role: "user".to_string(),
-                parts: vec![Part {
-                    text: format!(
-                        "<tool_code>\nserver_name: {}\ntool_name: {}\nargs: {}\n</tool_code>",
-                        record.call.server_name, record.call.tool_name, record.call.arguments
-                    ),
-                }],
-            });
+            // First, add the model's tool call request to the history.
             contents.push(Content {
                 role: "model".to_string(),
                 parts: vec![Part {
+                    // TODO: Refactor the `Part` struct to natively support `functionCall` objects
+                    // instead of serializing to a string. This is a temporary workaround to match
+                    // the Gemini API's expected structure.
                     text: format!(
-                        "<tool_response>\nstatus: {}\nresponse: {}\n</tool_response>",
-                        record.result.status, record.result.response
+                        r#"{{"functionCall": {{"name": "{}", "args": {}}}}}"#,
+                        record.call.tool_name, record.call.arguments
+                    ),
+                }],
+            });
+
+            // Then, add our response containing the tool's result.
+            contents.push(Content {
+                role: "user".to_string(), // As per docs, the tool response is from the 'user'
+                parts: vec![Part {
+                    // TODO: Refactor the `Part` struct to natively support `functionResponse` objects.
+                    text: format!(
+                        r#"{{"functionResponse": {{"name": "{}", "response": {{"result": {}}}}}}}"#,
+                        record.call.tool_name, record.result.response
                     ),
                 }],
             });
         }
 
-        // 4. Add the current user message.
-        contents.push(Content {
-            role: "user".to_string(),
-            parts: vec![Part { text: user_message }],
-        });
+        // 5. Add the current user message, only if it's not empty.
+        if !user_message.is_empty() {
+            contents.push(Content {
+                role: "user".to_string(),
+                parts: vec![Part { text: user_message }],
+            });
+        }
 
-        // 5. Assemble and return the final LlmPrompt object.
+        // 6. Assemble and return the final LlmPrompt object.
         LlmPrompt {
             system_instruction,
             contents,
