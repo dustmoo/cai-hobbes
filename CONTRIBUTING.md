@@ -56,4 +56,4 @@ To learn more about rebasing and merging, check out this guide on [syncing a for
 
 ## How to get in touch
 
-You can chat with us on [Discord](https://discord.gg/your-discord-link).
+You can chat with us on [Discord](https://discord.gg/Uy9Euhgp)).
