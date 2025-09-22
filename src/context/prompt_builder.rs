@@ -1,4 +1,4 @@
-use crate::components::llm::{Content, Part, SystemInstruction};
+use crate::components::llm::{Content, FunctionCallPart, FunctionResponsePart, Part, SystemInstruction};
 use crate::session::{Session, Tool};
 use crate::settings::Settings;
 use chrono::Utc;
@@ -12,22 +12,16 @@ impl From<Message> for Content {
         match msg.content {
             MessageContent::Text(text) => Content {
                 role,
-                parts: vec![Part { text }],
+                parts: vec![Part { text: Some(text), ..Default::default() }],
             },
             MessageContent::ToolCall(_) => {
-                // We don't want to include tool calls in the history this way,
-                // as they are handled specially below. Return an empty part to be filtered out.
-                Content {
-                    role,
-                    parts: vec![Part { text: String::new() }],
-                }
+                // Tool calls are handled separately in the tool_call_history loop.
+                // Return empty parts so this message is filtered out from the main history.
+                Content { role, parts: vec![] }
             },
             MessageContent::PermissionRequest(_) => {
                 // Permission requests are UI-only and should not be in the prompt history.
-                Content {
-                    role,
-                    parts: vec![Part { text: String::new() }],
-                }
+                Content { role, parts: vec![] }
             }
         }
     }
@@ -126,7 +120,7 @@ impl<'a> PromptBuilder<'a> {
         let instruction_text = serde_json::to_string(&system_context_map).unwrap_or_default();
         let system_instruction = if !instruction_text.is_empty() && instruction_text != "{}" {
             Some(SystemInstruction {
-                parts: vec![Part { text: instruction_text }],
+                parts: vec![Part { text: Some(instruction_text), ..Default::default() }],
             })
         } else {
             None
@@ -153,8 +147,9 @@ impl<'a> PromptBuilder<'a> {
             // Avoid duplicating the first message if it's within the recent window
             if Some(message.id) != first_message_id {
                 let content: Content = message.clone().into();
-                // Only add non-empty text messages
-                if !content.parts.iter().any(|p| p.text.is_empty()) {
+                // Only add messages that have parts. This correctly filters out
+                // the ToolCall and PermissionRequest messages from the base history.
+                if !content.parts.is_empty() {
                     contents.push(content);
                 }
             }
@@ -163,28 +158,29 @@ impl<'a> PromptBuilder<'a> {
         // 4. Append the tool call history, correctly formatted for the model.
         for record in &self.session_state.tool_call_history {
             // First, add the model's tool call request to the history.
+            let args_value: serde_json::Value = serde_json::from_str(&record.call.arguments).unwrap_or_default();
             contents.push(Content {
                 role: "model".to_string(),
                 parts: vec![Part {
-                    // TODO: Refactor the `Part` struct to natively support `functionCall` objects
-                    // instead of serializing to a string. This is a temporary workaround to match
-                    // the Gemini API's expected structure.
-                    text: format!(
-                        r#"{{"functionCall": {{"name": "{}", "args": {}}}}}"#,
-                        record.call.tool_name, record.call.arguments
-                    ),
+                    function_call: Some(FunctionCallPart {
+                        name: record.call.tool_name.clone(),
+                        args: args_value,
+                    }),
+                    ..Default::default()
                 }],
             });
 
             // Then, add our response containing the tool's result.
+            let result_value: serde_json::Value = serde_json::from_str(&record.result.response)
+                .unwrap_or_else(|_| json!(record.result.response));
             contents.push(Content {
                 role: "user".to_string(), // As per docs, the tool response is from the 'user'
                 parts: vec![Part {
-                    // TODO: Refactor the `Part` struct to natively support `functionResponse` objects.
-                    text: format!(
-                        r#"{{"functionResponse": {{"name": "{}", "response": {{"result": {}}}}}}}"#,
-                        record.call.tool_name, record.result.response
-                    ),
+                    function_response: Some(FunctionResponsePart {
+                        name: record.call.tool_name.clone(),
+                        response: json!({ "result": result_value }),
+                    }),
+                    ..Default::default()
                 }],
             });
         }
@@ -193,7 +189,7 @@ impl<'a> PromptBuilder<'a> {
         if !user_message.is_empty() {
             contents.push(Content {
                 role: "user".to_string(),
-                parts: vec![Part { text: user_message }],
+                parts: vec![Part { text: Some(user_message), ..Default::default() }],
             });
         }
 

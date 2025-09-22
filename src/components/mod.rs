@@ -6,3 +6,4 @@ pub mod stream_manager;
 pub mod tool_call_display;
 pub mod shared;
 pub mod link_with_controls;
+pub mod onboarding;

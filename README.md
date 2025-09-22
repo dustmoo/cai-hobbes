@@ -26,7 +26,7 @@ dx serve --platform desktop
 
 ## Architecture
 
-The architecture is designed to integrate both external long-term memory and internal short-term memory seamlessly, with feedback loop for handling tool calls.
+The architecture is designed to integrate both external long-term memory and internal short-term memory seamlessly, with a robust feedback loop for handling tool calls. For a more detailed breakdown, please see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ```mermaid
 graph TD
@@ -90,17 +90,15 @@ graph TD
 
 ### Core Components
 
--   **Memory Systems**:
-    -   **Local Long-Term Memory (ConPort):** A local MCP that provides access to the project's strategic memory, including goals, architectural decisions, and user preferences.
+-   **Memory & State**:
+    -   **Local Long-Term Memory (ConPort):** A local MCP providing access to the project's strategic memory (goals, decisions, etc.).
+    -   **Vector Storage (`DocumentStore`):** A long-term vector store (e.g., Qdrant) for indexing verbose tool results and documents for future Retrieval Augmented Generation (RAG).
     -   **Short-Term Memory (`SessionState`):** The core of the "live" context, managed internally and stored securely in `sessions.json`. It holds messages, tool call history, and the active context for each conversation.
--   **Context Producers & Processors**:
+-   **Services & Processors**:
     -   **`McpManager`**: Manages the lifecycle of all MCP servers, launching them as child processes and discovering their available tools.
+    -   **`StreamManager`**: Orchestrates the entire tool-call lifecycle, from detecting the LLM's request to executing the tool and feeding the result back in a robust feedback loop.
     -   **`ConversationProcessor`**: Summarizes dialogue using a dedicated Summary LLM to maintain conversational memory.
--   **Tool Call Handling**:
-    -   **`StreamManager`**: Orchestrates the entire tool-call lifecycle, from detecting the LLM's request to executing the tool and feeding the result back.
-    -   **`ToolCallHistory`**: A short-lived list in `SessionState` that holds the `(tool_call, tool_result)` pairs for the current chain of interactions.
     -   **`ToolCallSummarizer`**: A dedicated service that creates concise "snapshots" of tool interactions for the active context after a tool loop concludes.
-    -   **`DocumentStore`**: A long-term vector store (e.g., Qdrant) for indexing verbose tool results and documents for future Retrieval Augmented Generation (RAG).
 
 ## Contributing
 

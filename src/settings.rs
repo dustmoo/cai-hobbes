@@ -8,6 +8,7 @@ use std::collections::HashMap;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
     pub api_key: Option<String>,
+    pub qdrant_url: Option<String>,
     pub chat_model: String,
     pub summary_model: String,
     pub persona: String,
@@ -27,6 +28,7 @@ impl Default for Settings {
 
         Self {
             api_key: None,
+            qdrant_url: None,
             chat_model: "gemini-2.5-pro".to_string(),
             summary_model: "gemini-1.5-flash-latest".to_string(),
             persona: "You are Hobbes, a helpful AI assistant.".to_string(),

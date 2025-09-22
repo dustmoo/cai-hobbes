@@ -23,7 +23,9 @@ mod services;
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 use tray_icon::TrayIcon;
 fn main() {
+    // Try to load .env file for developer convenience.
     dotenv().ok();
+    tracing::info!("Attempted to load .env file from the environment.");
     dioxus_logger::init(tracing::Level::INFO).expect("failed to init logger");
 
     #[cfg(target_os = "macos")]
@@ -56,7 +58,7 @@ fn main() {
                 )
                 .with_custom_head(r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #111827; }</style>"#.to_string() + r#"<style>"# + include_str!("../assets/output.css") + r#"</style>"#)
         )
-        .launch(app);
+        .launch(app)
 }
 
 use crate::context::permissions::PermissionManager;
@@ -90,6 +92,12 @@ fn app() -> Element {
         }
         Signal::new(settings)
     });
+
+    let needs_onboarding = use_signal(|| {
+        let key_present = settings.read().api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok();
+        let qdrant_present = settings.read().qdrant_url.is_some() || std::env::var("QDRANT_URL").is_ok();
+        !key_present || !qdrant_present
+    });
     let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
     let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(get_mcp_config_path(), permission_manager.clone())));
     let mcp_context = use_context_provider(|| Signal::new(mcp::manager::McpContext { servers: Vec::new() }));
@@ -98,7 +106,7 @@ fn app() -> Element {
         use_effect(move || {
             let mut document_store = document_store.clone();
             spawn(async move {
-                let qdrant_url = std::env::var("QDRANT_URL").expect("QDRANT_URL must be set in .env");
+                let qdrant_url = settings.read().qdrant_url.clone().unwrap_or_else(|| std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string()));
                 match DocumentStore::new(&qdrant_url).await {
                     Ok(store) => {
                         document_store.set(Some(std::sync::Arc::new(store)));
@@ -234,151 +242,160 @@ fn app() -> Element {
 
     let drag_window = window.clone();
     rsx! {
-        StreamManager {
+        if *needs_onboarding.read() {
             div {
-                class: "dark flex flex-col h-screen", // Changed to flex-col
-                // Draggable column area
-                div {
-                    class: "h-8 bg-transparent",
-                    onmousedown: move |_| {
-                        drag_window.drag();
-                    }
+                class: "dark flex items-center justify-center h-screen bg-gray-900 text-white",
+                components::onboarding::Onboarding {
+                    needs_onboarding: needs_onboarding,
                 }
-                // Main content area
+            }
+        } else {
+            StreamManager {
                 div {
-                    class: "flex flex-row flex-1 min-h-0", // This will contain the sidebars and chat
-                    // The onkeydown handler has been removed to allow native hotkeys (copy, paste, etc.) to function correctly.
-                    // The global hotkey for toggling visibility is no longer required.
-                    // When the user releases the mouse, save the last known size.
-                    onmouseup: {
-                        let mut session_state = session_state.clone();
-                        let show_session_manager = show_session_manager.clone();
-                        let window = window.clone();
-                        move |_| {
-                            let physical_size = last_known_size.read();
-                            if physical_size.width > 0 && physical_size.height > 0 {
-                                let scale_factor = window.scale_factor();
-                                let logical_size = physical_size.to_logical::<f64>(scale_factor);
-                                let sidebar_width = if *show_session_manager.read() { 256.0 } else { 0.0 };
-                                let content_width = logical_size.width - sidebar_width;
-                                session_state.write().update_window_size(content_width, logical_size.height);
+                    class: "dark flex flex-col h-screen", // Changed to flex-col
+                    // Draggable column area
+                    div {
+                        class: "h-8 bg-transparent",
+                        onmousedown: move |_| {
+                            drag_window.drag();
+                        }
+                    }
+                    // Main content area
+                    div {
+                        class: "flex flex-row flex-1 min-h-0", // This will contain the sidebars and chat
+                        // The onkeydown handler has been removed to allow native hotkeys (copy, paste, etc.) to function correctly.
+                        // The global hotkey for toggling visibility is no longer required.
+                        // When the user releases the mouse, save the last known size.
+                        onmouseup: {
+                            let mut session_state = session_state.clone();
+                            let show_session_manager = show_session_manager.clone();
+                            let window = window.clone();
+                            move |_| {
+                                let physical_size = last_known_size.read();
+                                if physical_size.width > 0 && physical_size.height > 0 {
+                                    let scale_factor = window.scale_factor();
+                                    let logical_size = physical_size.to_logical::<f64>(scale_factor);
+                                    let sidebar_width = if *show_session_manager.read() { 256.0 } else { 0.0 };
+                                    let content_width = logical_size.width - sidebar_width;
+                                    session_state.write().update_window_size(content_width, logical_size.height);
+                                }
+                            }
+                        },
+                        onmouseleave: {
+                            let mut session_state = session_state.clone();
+                            let show_session_manager = show_session_manager.clone();
+                            let window = window.clone();
+                            move |_| {
+                                let physical_size = last_known_size.read();
+                                if physical_size.width > 0 && physical_size.height > 0 {
+                                    let scale_factor = window.scale_factor();
+                                    let logical_size = physical_size.to_logical::<f64>(scale_factor);
+                                    let sidebar_width = if *show_session_manager.read() { 256.0 } else { 0.0 };
+                                    let content_width = logical_size.width - sidebar_width;
+                                    session_state.write().update_window_size(content_width, logical_size.height);
+                                }
+                            }
+                        },
+
+                    // Session Manager Sidebar
+                    if *show_session_manager.read() {
+                        div {
+                            class: "w-64 bg-gray-800 text-white h-full transition-all duration-300 ease-in-out",
+                            components::session_manager::SessionManager {}
+                        }
+                    }
+
+                    // Settings Panel Sidebar
+                    if *show_settings_panel.read() {
+                        div {
+                            class: "flex flex-row h-full",
+                            // Settings Panel
+                            div {
+                                id: "settings-panel",
+                                style: "width: {settings_panel_width}px;",
+                                class: "bg-gray-800 text-white h-full",
+                                // This is the correct location for the settings panel component
+                                components::settings_panel::SettingsPanel {}
+                            }
+                            // Draggable Divider
+                            div {
+                                class: "w-2 cursor-col-resize bg-gray-700 hover:bg-indigo-500 transition-colors",
+                                onmousedown: move |event| {
+                                    drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
+                                    is_dragging.set(true);
+                                },
                             }
                         }
-                    },
-                    onmouseleave: {
-                        let mut session_state = session_state.clone();
-                        let show_session_manager = show_session_manager.clone();
-                        let window = window.clone();
-                        move |_| {
-                            let physical_size = last_known_size.read();
-                            if physical_size.width > 0 && physical_size.height > 0 {
-                                let scale_factor = window.scale_factor();
-                                let logical_size = physical_size.to_logical::<f64>(scale_factor);
-                                let sidebar_width = if *show_session_manager.read() { 256.0 } else { 0.0 };
-                                let content_width = logical_size.width - sidebar_width;
-                                session_state.write().update_window_size(content_width, logical_size.height);
+                    }
+                    
+                    // Mouse move handler for resizing
+                    if *is_dragging.read() {
+                        div {
+                            class: "fixed inset-0 z-50", // Covers the whole screen to capture mouse events
+                            onmousemove: move |event| {
+                                if *is_dragging.read() {
+                                    let (start_x, start_width) = drag_start_info();
+                                    let delta_x = event.data.screen_coordinates().x - start_x;
+                                    let new_width = start_width + delta_x;
+                                    if new_width > 200.0 && new_width < 800.0 {
+                                        let js = format!("document.getElementById('settings-panel').style.width = '{}px';", new_width);
+                                        let _ = document::eval(&js);
+                                        final_width_on_drag_end.set(new_width);
+                                    }
+                                }
+                            },
+                            onmouseup: move |_| {
+                                is_dragging.set(false);
+                            },
+                            onmouseleave: move |_| {
+                                // If mouse leaves the overlay, stop dragging
+                                if *is_dragging.read() {
+                                    is_dragging.set(false);
+                                }
                             }
                         }
-                    },
-
-                // Session Manager Sidebar
-                if *show_session_manager.read() {
-                    div {
-                        class: "w-64 bg-gray-800 text-white h-full transition-all duration-300 ease-in-out",
-                        components::session_manager::SessionManager {}
                     }
-                }
 
-                // Settings Panel Sidebar
-                if *show_settings_panel.read() {
+                    // Main Chat Window
                     div {
-                        class: "flex flex-row h-full",
-                        // Settings Panel
-                        div {
-                            id: "settings-panel",
-                            style: "width: {settings_panel_width}px;",
-                            class: "bg-gray-800 text-white h-full",
-                            // This is the correct location for the settings panel component
-                            components::settings_panel::SettingsPanel {}
-                        }
-                        // Draggable Divider
-                        div {
-                            class: "w-2 cursor-col-resize bg-gray-700 hover:bg-indigo-500 transition-colors",
-                            onmousedown: move |event| {
-                                drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                is_dragging.set(true);
+                        class: "flex-1",
+                        components::chat::ChatWindow {
+                            on_content_resize: move |_| {},
+                            on_interaction: move |_| {},
+                            on_toggle_sessions: {
+                                let window = window.clone();
+                                move |_| {
+                                    let new_show_state = !*show_session_manager.read();
+                                    show_session_manager.set(new_show_state);
+                                    if new_show_state {
+                                        show_settings_panel.set(false); // Hide settings if showing sessions
+                                    }
+
+                                    // Adjust the window size based on the sidebar's visibility
+                                    let session_state = session_state.clone();
+                                    let sidebar_width = 256.0; // w-64 in Tailwind is 16rem which is 256px
+                                    let current_size = window.inner_size();
+                                    let persisted_width = session_state.read().window_width;
+
+                                    let new_width = if new_show_state {
+                                        persisted_width + sidebar_width
+                                    } else {
+                                        persisted_width
+                                    };
+
+                                    window.set_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(new_width, current_size.height as f64));
+                                }
+                            },
+                            on_toggle_settings: move |_| {
+                                let new_show_state = !*show_settings_panel.read();
+                                show_settings_panel.set(new_show_state);
+                                if new_show_state {
+                                    show_session_manager.set(false); // Hide sessions if showing settings
+                                }
                             },
                         }
                     }
-                }
-                
-                // Mouse move handler for resizing
-                if *is_dragging.read() {
-                    div {
-                        class: "fixed inset-0 z-50", // Covers the whole screen to capture mouse events
-                        onmousemove: move |event| {
-                            if *is_dragging.read() {
-                                let (start_x, start_width) = drag_start_info();
-                                let delta_x = event.data.screen_coordinates().x - start_x;
-                                let new_width = start_width + delta_x;
-                                if new_width > 200.0 && new_width < 800.0 {
-                                    let js = format!("document.getElementById('settings-panel').style.width = '{}px';", new_width);
-                                    let _ = document::eval(&js);
-                                    final_width_on_drag_end.set(new_width);
-                                }
-                            }
-                        },
-                        onmouseup: move |_| {
-                            is_dragging.set(false);
-                        },
-                        onmouseleave: move |_| {
-                            // If mouse leaves the overlay, stop dragging
-                            if *is_dragging.read() {
-                                is_dragging.set(false);
-                            }
-                        }
                     }
-                }
-
-                // Main Chat Window
-                div {
-                    class: "flex-1",
-                    components::chat::ChatWindow {
-                        on_content_resize: move |_| {},
-                        on_interaction: move |_| {},
-                        on_toggle_sessions: {
-                            let window = window.clone();
-                            move |_| {
-                                let new_show_state = !*show_session_manager.read();
-                                show_session_manager.set(new_show_state);
-                                if new_show_state {
-                                    show_settings_panel.set(false); // Hide settings if showing sessions
-                                }
-
-                                // Adjust the window size based on the sidebar's visibility
-                                let session_state = session_state.clone();
-                                let sidebar_width = 256.0; // w-64 in Tailwind is 16rem which is 256px
-                                let current_size = window.inner_size();
-                                let persisted_width = session_state.read().window_width;
-
-                                let new_width = if new_show_state {
-                                    persisted_width + sidebar_width
-                                } else {
-                                    persisted_width
-                                };
-
-                                window.set_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(new_width, current_size.height as f64));
-                            }
-                        },
-                        on_toggle_settings: move |_| {
-                            let new_show_state = !*show_settings_panel.read();
-                            show_settings_panel.set(new_show_state);
-                            if new_show_state {
-                                show_session_manager.set(false); // Hide sessions if showing settings
-                            }
-                        },
-                    }
-                }
                 }
             }
         }

@@ -25,10 +25,29 @@ pub struct Content {
     pub parts: Vec<Part>,
 }
 
-#[derive(Serialize, Deserialize)]
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FunctionCallPart {
+    pub name: String,
+    pub args: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FunctionResponsePart {
+    pub name: String,
+    pub response: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct Part {
-    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<FunctionCallPart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_response: Option<FunctionResponsePart>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -281,7 +300,7 @@ Recent Messages:
     let request_body = GeminiRequest {
         contents: vec![Content {
             role: "user".to_string(),
-            parts: vec![Part { text: full_prompt }],
+            parts: vec![Part { text: Some(full_prompt), ..Default::default() }],
         }],
         tools: None,
         system_instruction: None,

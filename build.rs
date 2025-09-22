@@ -1,7 +1,10 @@
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+
     // Set the app name and bundle identifier based on the profile
     let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     if profile == "debug" {
@@ -11,6 +14,7 @@ fn main() {
         println!("cargo:rustc-env=APP_NAME=Hobbes");
         println!("cargo:rustc-env=BUNDLE_IDENTIFIER=ai.clearmirror.cai-hobbes");
     }
+
 
     // Run tailwindcss to build the CSS file
     let status = Command::new("npx")
