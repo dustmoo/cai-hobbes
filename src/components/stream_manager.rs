@@ -9,6 +9,7 @@ use crate::components::shared::{StreamMessage, ToolCallStatus};
 use crate::services::document_store::DocumentStore;
 use std::sync::Arc;
 use crate::settings::Settings;
+use super::continuation_controller::ContinuationController;
 
 #[derive(Clone, Copy)]
 pub struct StreamManagerContext {
@@ -18,6 +19,7 @@ pub struct StreamManagerContext {
     document_store: Signal<Option<Arc<DocumentStore>>>,
     tool_call_summarizer: Signal<ToolCallSummarizer>,
     settings: Signal<Settings>,
+    continuation_controller: Signal<ContinuationController>,
 }
 
 impl StreamManagerContext {
@@ -210,8 +212,10 @@ impl StreamManagerContext {
                     });
 
                     // Stream the final response to the new message bubble.
+                    let mut final_text = String::new();
                     while let Some(message) = llm_rx.recv().await {
                         if let StreamMessage::Text(chunk) = message {
+                            final_text.push_str(&chunk);
                             if let Some(msg) = self.session_state.write().get_message_mut(&new_hobbes_message_id) {
                                 if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
                                     t.push_str(&chunk);
@@ -222,9 +226,22 @@ impl StreamManagerContext {
                             }
                         }
                     }
+                    // After the second LLM call is complete, check for the continuation hint.
+                    if final_text.trim().ends_with("<continue />") {
+                        // Remove the hint from the final message content.
+                        if let Some(msg) = self.session_state.write().get_message_mut(&new_hobbes_message_id) {
+                            if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
+                                *t = t.trim().strip_suffix("<continue />").unwrap_or(t).trim().to_string();
+                            }
+                        }
+                        self.continuation_controller.read().trigger_continuation();
+                        // We do NOT call on_complete here, as the turn is not over.
+                        return; // End the master task for this segment.
+                    }
                 }
             }
 
+            // This block now runs only when the conversation turn is truly complete.
             tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
             {
                 let mut state = self.session_state.write();
@@ -263,6 +280,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
     let mcp_manager = consume_context::<Signal<crate::mcp::manager::McpManager>>();
     let document_store = use_context_provider(|| Signal::new(None));
     let settings = consume_context::<Signal<Settings>>();
+    let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
     let context = use_hook(|| StreamManagerContext {
         stream_receivers: Signal::new(HashMap::new()),
         session_state,
@@ -270,6 +288,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         document_store,
         tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
         settings,
+        continuation_controller,
     });
 
     // Provide the context to children.
@@ -294,6 +313,7 @@ mod tests {
             let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
             let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
             let document_store = use_context_provider(|| Signal::new(None));
+            let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
             let mut stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
                 session_state,
@@ -301,6 +321,7 @@ mod tests {
                 document_store,
                 tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
                 settings,
+                continuation_controller,
             });
 
             let message_id = Uuid::new_v4();
@@ -337,6 +358,7 @@ mod tests {
             let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
             let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
             let document_store = use_context_provider(|| Signal::new(None));
+            let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
             let stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
                 session_state,
@@ -344,6 +366,7 @@ mod tests {
                 document_store,
                 tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
                 settings,
+                continuation_controller,
             });
 
             let message_id = Uuid::new_v4();

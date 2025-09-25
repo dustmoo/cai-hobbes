@@ -84,6 +84,15 @@ impl<'a> PromptBuilder<'a> {
             persona = format!("{}\n\nCRITICAL INSTRUCTION: {}", persona, instruction);
         }
 
+        // Add the hard-coded instruction for continuation.
+        let continuation_instruction = "\n\nCONTINUATION BEHAVIOR: If you determine the conversation should continue without user input, end your response with the exact tag: `<continue />`";
+        persona.push_str(continuation_instruction);
+
+        if user_message.is_empty() {
+            let continuation_instruction = "\n\nCONTINUATION INSTRUCTION: You were the last one to speak. The user has not replied. Continue the conversation based on the existing context. Do not repeat yourself. Provide new information or ask a clarifying question.";
+            persona.push_str(continuation_instruction);
+        }
+
         if self.session_state.tool_call_history.iter().any(|r| matches!(r.result.status, crate::components::shared::ToolCallStatus::Error)) {
             let recovery_instruction = "\n\nCRITICAL RECOVERY INSTRUCTION: A previous tool call failed. Analyze the error message in the `<tool_response>` and attempt a different tool call to accomplish the user's goal. Do not repeat the failed tool call.";
             persona.push_str(recovery_instruction);

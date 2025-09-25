@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct McpServerConfig {
+    #[serde(default)] // Name will be injected from the map key
     pub name: String,
     pub command: String,
     #[serde(default)]
@@ -23,6 +24,14 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default)]
+    pub always_allow: Vec<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct McpServersWrapper {
+    #[serde(rename = "mcpServers")]
+    mcp_servers: HashMap<String, McpServerConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -67,13 +76,25 @@ impl McpManager {
 
         let configs = match fs::read_to_string(config_path) {
             Ok(content) => {
-                let configs_vec: Vec<McpServerConfig> = serde_json::from_str(&content).unwrap_or_else(|e| {
+                let wrapper: McpServersWrapper = serde_json::from_str(&content).unwrap_or_else(|e| {
                     tracing::error!("Failed to parse mcp_servers.json: {}", e);
-                    Vec::new()
+                    McpServersWrapper {
+                        mcp_servers: HashMap::new(),
+                    }
                 });
-                tracing::info!("Successfully parsed {} MCP server configs.", configs_vec.len());
+
+                let configs_vec: Vec<McpServerConfig> =
+                    wrapper.mcp_servers.into_iter().map(|(name, mut config)| {
+                        config.name = name;
+                        config
+                    }).collect();
+
+                tracing::info!(
+                    "Successfully parsed {} MCP server configs.",
+                    configs_vec.len()
+                );
                 configs_vec
-            },
+            }
             Err(e) => {
                 tracing::error!("Failed to read mcp_servers.json: {}", e);
                 Vec::new()
@@ -161,24 +182,32 @@ impl McpManager {
         args: serde_json::Value,
         bypass_permission_check: bool,
     ) -> Result<serde_json::Value, String> {
-        if !bypass_permission_check {
-            let category = Self::map_tool_to_category(tool_name);
-            let pm = self.permission_manager.read();
-            match pm.check_permission(&category) {
-                PermissionStatus::Allowed => { /* Continue */ }
-                PermissionStatus::RequiresPrompt => {
-                    let tool_call = crate::components::shared::ToolCall::new(
-                        server_name.to_string(),
-                        tool_name.to_string(),
-                        args,
-                    );
-                    return Err(serde_json::to_string(&tool_call).unwrap_or_default());
-                }
-                PermissionStatus::Denied(reason) => {
-                    return Err(format!("Tool use denied: {}", reason));
+        let servers_guard = self.servers.lock().await;
+        if let Some(client) = servers_guard.get(server_name) {
+            if !bypass_permission_check && !client.config.always_allow.contains(&tool_name.to_string()) {
+                let category = Self::map_tool_to_category(tool_name);
+                let pm = self.permission_manager.read();
+                match pm.check_permission(&category) {
+                    PermissionStatus::Allowed => { /* Continue */ }
+                    PermissionStatus::RequiresPrompt => {
+                        let tool_call = crate::components::shared::ToolCall::new(
+                            server_name.to_string(),
+                            tool_name.to_string(),
+                            args,
+                        );
+                        return Err(serde_json::to_string(&tool_call).unwrap_or_default());
+                    }
+                    PermissionStatus::Denied(reason) => {
+                        return Err(format!("Tool use denied: {}", reason));
+                    }
                 }
             }
+        } else {
+            return Err(format!("Server not found: {}", server_name));
         }
+        // Drop the lock by moving the access logic below
+        drop(servers_guard);
+
         let servers = self.servers.lock().await;
         if let Some(client) = servers.get(server_name) {
             if let Some(tool) = client.tools.iter().find(|t| t.name == tool_name) {
@@ -199,6 +228,8 @@ impl McpManager {
                 Err(format!("Tool not found: {}", tool_name))
             }
         } else {
+            // This case should theoretically not be reached due to the check above,
+            // but it's good practice to handle it.
             Err(format!("Server not found: {}", server_name))
         }
     }

@@ -7,6 +7,7 @@ use dioxus::html::geometry::euclid::Rect;
 use std::time::Duration;
 use tokio::time::sleep;
 use pulldown_cmark::{html, Options, Parser, Event, Tag, TagEnd};
+use ammonia::clean;
 use crate::components::stream_manager::StreamManagerContext;
 use lazy_static::lazy_static;
 use syntect::easy::HighlightLines;
@@ -21,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use crate::settings::Settings;
 use super::shared::{MessageContent};
 use crate::components::tool_call_display::{PermissionPrompt, ToolCallDisplay};
-use super::link_with_controls::LinkWithControls;
+use super::continuation_controller::ContinuationController;
+
 lazy_static! {
     static ref SYNTAX_SET: SyntaxSet = SyntaxSet::load_defaults_newlines();
     static ref THEME_SET: ThemeSet = ThemeSet::load_defaults();
@@ -48,12 +50,15 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     let mut has_interacted = use_signal(|| false);
     let is_sending = use_signal(|| false);
     let stream_manager = consume_context::<StreamManagerContext>();
+    let mut continuation_controller = consume_context::<Signal<ContinuationController>>();
     const INITIAL_MESSAGES_TO_SHOW: usize = 20;
     let mut show_scroll_button = use_signal(|| false);
     let mut is_initial_load = use_signal(|| true);
     let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     let mut last_session_id = use_signal(|| session_state.read().active_session_id.clone());
-    // Effect to report content size changes and conditionally scroll to bottom
+
+
+    // Effect to report content size changes, scroll, and attach JS controls
     use_effect(move || {
         // By reading the session state here, the effect becomes dependent on it.
         // Any change to messages will cause this to re-run.
@@ -67,7 +72,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         if let Some(element) = container_element.read().clone() {
             spawn(async move {
                 // A short delay allows the DOM to render the new message before we measure/scroll.
-                sleep(Duration::from_millis(20)).await;
+                sleep(Duration::from_millis(50)).await;
 
                 // First, check if the user is already near the bottom.
                 let is_near_bottom = if let Ok(result) = document::eval(r#"
@@ -105,6 +110,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 }
             });
         }
+
     });
 
     // Effect to update session state with MCP context when it changes
@@ -117,6 +123,27 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 tracing::info!("MCP context reactively loaded into session state.");
             }
         }
+    });
+
+    // Effect to restore cursor position after re-renders
+    use_effect(move || {
+        // Read the draft to create a dependency on it
+        let _ = draft.read();
+
+        spawn(async move {
+            // A minimal delay to allow Dioxus to commit the new value to the DOM
+            sleep(Duration::from_millis(1)).await;
+            let _ = document::eval(r#"
+                const el = document.getElementById('chat-textarea');
+                // Check for the global cursor variable and that the element is focused
+                // to avoid moving cursor on background updates.
+                if (el && window.dioxusCursorPos && document.activeElement === el) {
+                    el.setSelectionRange(window.dioxusCursorPos[0], window.dioxusCursorPos[1]);
+                    // Clean up the global variable to prevent stale positions
+                    delete window.dioxusCursorPos;
+                }
+            "#).await;
+        });
     });
 
     // Reusable closure for sending a message
@@ -252,7 +279,53 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         }
     };
 
+    let continue_prompt_flow = {
+        let session_state = session_state;
+        let settings = settings;
+        let send_prompt_to_llm = send_prompt_to_llm;
 
+        Rc::new(move || {
+            spawn(async move {
+                let mut session_state = session_state;
+                let settings = settings.read().clone();
+                let send_prompt_to_llm = send_prompt_to_llm;
+
+                let hobbes_message_id = Uuid::new_v4();
+                {
+                    let mut state = session_state.write();
+                    if let Some(session) = state.get_active_session_mut() {
+                        // Add the new empty message bubble for the continued response.
+                        session.messages.push(Message {
+                            id: hobbes_message_id,
+                            author: "Hobbes".to_string(),
+                            content: MessageContent::Text("".to_string()),
+                        });
+                    }
+                }
+
+                let prompt_data = {
+                    let state = session_state.read();
+                    let session = state.get_active_session().unwrap();
+                    let builder = PromptBuilder::new(session, &settings, &state);
+                    // IMPORTANT: We pass an empty user message for continuations.
+                    builder.build_prompt("".to_string(), None)
+                };
+
+                if let Err(e) = session_state.read().save() {
+                    tracing::error!("Failed to save session state before continuation: {}", e);
+                }
+
+                let mcp_context = session_state.read().get_active_session().and_then(|s| s.active_context.mcp_tools.clone());
+                send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
+            });
+        })
+    };
+
+    // Effect to register the continuation callback with the controller.
+    use_effect(move || {
+        continuation_controller.write().register_callback(continue_prompt_flow.clone());
+    });
+    
     let root_classes = "relative flex flex-col bg-gray-900 text-gray-100 rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
 
     rsx! {
@@ -373,7 +446,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                                                     div {
                                                         class: "flex flex-col max-w-2/3 min-w-0",
                                                         div {
-                                                            class: "relative group px-4 py-2 rounded-2xl {bubble_classes}",
+                                                            class: "relative group rounded-2xl {bubble_classes}",
                                                             ToolCallDisplay { tool_call: tool_call.clone() }
                                                         }
                                                         div {
@@ -453,20 +526,27 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     }
                     textarea {
                         id: "chat-textarea",
-                        class: "flex-1 py-2 px-4 rounded-xl bg-gray-800 border border-gray-700 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none overflow-y-hidden",
+                        class: "flex-1 py-2 px-4 rounded-xl bg-gray-800 border border-gray-700 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none overflow-y-auto",
+                        style: "max-height: 50vh;",
                         rows: "1",
                         placeholder: if !mcp_context.read().servers.is_empty() { "Type your message..." } else { "Initializing..." },
                         disabled: mcp_context.read().servers.is_empty(),
                         value: "{draft}",
                         oninput: move |event| {
-                            draft.set(event.value());
+                            // This JS block is now responsible for three things:
+                            // 1. Storing the cursor position before the state update.
+                            // 2. Adjusting the textarea height.
+                            // 3. It does NOT prevent the default action, so the value change proceeds.
                             let _ = document::eval(r#"
                                 const el = document.getElementById('chat-textarea');
                                 if (el) {
+                                    window.dioxusCursorPos = [el.selectionStart, el.selectionEnd];
                                     el.style.height = 'auto';
                                     el.style.height = (el.scrollHeight) + 'px';
                                 }
                             "#);
+                            // Update the signal, which will trigger the use_effect to restore the cursor
+                            draft.set(event.value());
                         },
                         onkeydown: move |event| {
                             let modifiers = event.data.modifiers();
@@ -690,111 +770,155 @@ fn MessageBubble(message: Message) -> Element {
             options.insert(Options::ENABLE_TABLES);
 
             let parser = Parser::new_ext(&content_reader, options);
-            
-            let mut elements: Vec<Element> = Vec::new();
-            let mut current_events: Vec<Event> = Vec::new();
-            
-            let mut in_code_block = false;
-            let mut code_buffer = String::new();
-            let mut lang = String::new();
 
+            // Intermediate representation for parsed markdown
+            #[derive(Debug)]
+            enum Block {
+                Paragraph(Vec<Inline>),
+                List(Vec<Vec<Inline>>),
+                CodeBlock { lang: String, code: String },
+            }
+
+            #[derive(Debug)]
+            enum Inline {
+                Text(String),
+                Link { href: String, text: String },
+                SoftBreak,
+                HardBreak,
+            }
+
+            let mut blocks: Vec<Block> = Vec::new();
+            let mut current_paragraph: Vec<Inline> = Vec::new();
+            let mut list_stack: Vec<Vec<Vec<Inline>>> = Vec::new();
+            let mut current_list_item: Vec<Inline> = Vec::new();
+            
             let mut in_link = false;
-            let mut link_url = String::new();
-            let mut link_text_buffer: Vec<Event> = Vec::new();
+            let mut link_href = String::new();
+            let mut link_text = String::new();
 
-            let flush_events = |events: &mut Vec<Event>, elements: &mut Vec<Element>| {
-                if !events.is_empty() {
-                    let mut html_output = String::new();
-                    html::push_html(&mut html_output, events.drain(..));
-                    let html_output = html_output.trim();
-                    // Strip wrapping <p> tags if they exist to ensure inline flow
-                    let inline_html = if html_output.starts_with("<p>") && html_output.ends_with("</p>") {
-                        &html_output[3..html_output.len() - 4]
-                    } else {
-                        html_output
-                    };
+            let mut in_code_block = false;
+            let mut code_lang = String::new();
+            let mut code_buffer = String::new();
 
-                    if !inline_html.is_empty() {
-                        elements.push(rsx! {
-                            span {
-                                dangerous_inner_html: "{inline_html}"
-                            }
-                        });
-                    }
+            let flush_paragraph = |p: &mut Vec<Inline>, b: &mut Vec<Block>| {
+                if !p.is_empty() {
+                    b.push(Block::Paragraph(std::mem::take(p)));
                 }
             };
 
             for event in parser {
                 match event {
+                    // Block-level tags
+                    Event::Start(Tag::Paragraph) => {
+                        flush_paragraph(&mut current_paragraph, &mut blocks);
+                    }
+                    Event::End(TagEnd::Paragraph) => {
+                        flush_paragraph(&mut current_paragraph, &mut blocks);
+                    }
+                    Event::Start(Tag::List(_)) => {
+                        flush_paragraph(&mut current_paragraph, &mut blocks);
+                        list_stack.push(Vec::new());
+                    }
+                    Event::End(TagEnd::List(_)) => {
+                        if let Some(items) = list_stack.pop() {
+                            blocks.push(Block::List(items));
+                        }
+                    }
+                    Event::Start(Tag::Item) => {
+                        current_list_item.clear();
+                    }
+                    Event::End(TagEnd::Item) => {
+                        if let Some(list) = list_stack.last_mut() {
+                            list.push(std::mem::take(&mut current_list_item));
+                        }
+                    }
                     Event::Start(Tag::CodeBlock(kind)) => {
-                        flush_events(&mut current_events, &mut elements);
+                        flush_paragraph(&mut current_paragraph, &mut blocks);
                         in_code_block = true;
-                        lang = match kind {
+                        code_lang = match kind {
                             pulldown_cmark::CodeBlockKind::Fenced(l) => l.into_string(),
                             _ => String::new(),
                         };
+                        code_buffer.clear();
                     }
                     Event::End(TagEnd::CodeBlock) => {
                         in_code_block = false;
-                        elements.push(rsx! {
-                            CodeBlock {
-                                code: code_buffer.clone(),
-                                lang: lang.clone()
-                            }
-                        });
-                        code_buffer.clear();
-                        lang.clear();
+                        blocks.push(Block::CodeBlock { lang: code_lang.clone(), code: code_buffer.clone() });
                     }
+
+                    // Inline-level tags
                     Event::Start(Tag::Link { dest_url, .. }) => {
-                        flush_events(&mut current_events, &mut elements);
                         in_link = true;
-                        link_url = dest_url.into_string();
+                        link_href = dest_url.to_string();
+                        link_text.clear();
                     }
                     Event::End(TagEnd::Link) => {
                         in_link = false;
-                        let mut text_html = String::new();
-                        html::push_html(&mut text_html, link_text_buffer.drain(..));
-                        
-                        elements.push(rsx! {
-                            LinkWithControls {
-                                href: link_url.clone(),
-                                text_html: text_html
-                            }
-                        });
-                        link_url.clear();
+                        let target = if !list_stack.is_empty() { &mut current_list_item } else { &mut current_paragraph };
+                        target.push(Inline::Link { href: link_href.clone(), text: link_text.clone() });
                     }
                     Event::Text(text) => {
                         if in_code_block {
                             code_buffer.push_str(&text);
                         } else if in_link {
-                            link_text_buffer.push(Event::Text(text));
+                            link_text.push_str(&text);
                         } else {
-                            current_events.push(Event::Text(text));
+                            let mut raw_html = String::new();
+                            html::push_html(&mut raw_html, std::iter::once(Event::Text(text)));
+                            let sanitized = clean(&raw_html);
+                            let target = if !list_stack.is_empty() { &mut current_list_item } else { &mut current_paragraph };
+                            target.push(Inline::Text(sanitized));
                         }
                     }
-                    Event::SoftBreak | Event::HardBreak => {
-                        if in_code_block {
-                            code_buffer.push('\n');
-                        } else if in_link {
-                            link_text_buffer.push(event);
-                        } else {
-                            current_events.push(event);
-                        }
+                    Event::SoftBreak => {
+                        let target = if !list_stack.is_empty() { &mut current_list_item } else { &mut current_paragraph };
+                        target.push(Inline::SoftBreak);
                     }
-                    // For other events like emphasis, strong, etc., inside a link
-                    e @ Event::Start(_) | e @ Event::End(_) | e @ Event::Code(_) | e @ Event::Html(_) | e @ Event::FootnoteReference(_) | e @ Event::TaskListMarker(_) => {
-                        if in_link {
-                            link_text_buffer.push(e);
-                        } else if !in_code_block {
-                            current_events.push(e);
-                        }
+                    Event::HardBreak => {
+                        let target = if !list_stack.is_empty() { &mut current_list_item } else { &mut current_paragraph };
+                        target.push(Inline::HardBreak);
                     }
-                    _ => {} // Ignore other event types for now
+                    _ => {} // Ignore other events for simplicity for now
                 }
             }
-            flush_events(&mut current_events, &mut elements);
+            flush_paragraph(&mut current_paragraph, &mut blocks);
 
-            elements
+            // Render the IR to Dioxus elements
+            blocks.into_iter().map(|block| {
+                match block {
+                    Block::Paragraph(inlines) => rsx! {
+                        p {
+                            for inline in inlines {
+                                match inline {
+                                    Inline::Text(text) => rsx!{ span { dangerous_inner_html: "{text}" } },
+                                    Inline::Link { href, text } => rsx!{ LinkWithControls { href: href, text: text } },
+                                    Inline::SoftBreak => rsx!{ " " },
+                                    Inline::HardBreak => rsx!{ br {} },
+                                }
+                            }
+                        }
+                    },
+                    Block::List(items) => rsx! {
+                        ul {
+                            for item_inlines in items {
+                                li {
+                                    for inline in item_inlines {
+                                        match inline {
+                                            Inline::Text(text) => rsx!{ span { dangerous_inner_html: "{text}" } },
+                                            Inline::Link { href, text } => rsx!{ LinkWithControls { href: href, text: text } },
+                                            Inline::SoftBreak => rsx!{ " " },
+                                            Inline::HardBreak => rsx!{ br {} },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Block::CodeBlock { lang, code } => rsx! {
+                        CodeBlock { lang: lang, code: code }
+                    },
+                }
+            }).collect::<Vec<_>>()
         });
 
         let button_position_classes = if is_user {
@@ -809,14 +933,14 @@ fn MessageBubble(message: Message) -> Element {
                 div {
                     class: "flex flex-col max-w-2/3 min-w-0",
                     div {
-                        class: "relative group px-4 py-2 rounded-2xl {bubble_classes}",
+                        class: "relative group px-4 py-2 rounded-2xl message-bubble-{message.author.to_lowercase()} {bubble_classes}",
                         if is_thinking {
                             ThinkingIndicator {}
                         } else {
                             div {
                                 class: "prose prose-sm dark:prose-invert max-w-none break-words",
                                 for el in elements.read().iter() {
-                                    {el}
+                                    {el.clone()}
                                 }
                             }
                         }
@@ -854,6 +978,64 @@ fn MessageBubble(message: Message) -> Element {
     }
 }
 
+#[component]
+fn LinkWithControls(href: String, text: String) -> Element {
+    let mut draft = use_context::<Signal<String>>();
+    let mut copied = use_signal(|| false);
+    let href_clone_for_copy = href.clone();
+    let href_clone_for_summarize = href.clone();
+
+    rsx! {
+        span {
+            class: "relative group inline",
+            a {
+                href: "{href}",
+                target: "_blank",
+                rel: "noopener noreferrer",
+                class: "text-purple-400 hover:text-purple-300",
+                "{text}"
+            }
+            span {
+                class: "inline-flex items-center absolute left-full ml-1 z-10 opacity-0 group-hover:opacity-100 transition-opacity duration-200 bg-gray-900 bg-opacity-75 border border-gray-700 rounded-full shadow-lg p-0.5 space-x-0.5",
+                
+                button {
+                    class: "p-1.5 rounded text-gray-400 hover:bg-gray-700 hover:text-white transition-colors",
+                    onclick: move |_| {
+                        let href_clone = href_clone_for_copy.clone();
+                        spawn(async move {
+                            if copy_to_clipboard(&href_clone).is_ok() {
+                                copied.set(true);
+                                sleep(Duration::from_secs(2)).await;
+                                copied.set(false);
+                            }
+                        });
+                    },
+                    if *copied.read() {
+                        Icon { width: 16, height: 16, icon: fi_icons::FiCheck }
+                    } else {
+                        Icon { width: 16, height: 16, icon: fi_icons::FiClipboard }
+                    }
+                }
+                button {
+                    class: "p-1.5 rounded text-gray-400 hover:bg-gray-700 hover:text-white transition-colors",
+                    onclick: move |_| {
+                        let summary_prompt = format!("Please fetch {} and summarize.", href_clone_for_summarize);
+                        draft.set(summary_prompt);
+                        let _ = document::eval(r#"
+                            const el = document.getElementById('chat-textarea');
+                            if (el) {
+                                el.focus();
+                                el.style.height = 'auto';
+                                el.style.height = (el.scrollHeight) + 'px';
+                            }
+                        "#);
+                    },
+                    Icon { width: 16, height: 16, icon: fi_icons::FiFileText }
+                }
+            }
+        }
+    }
+}
 
 #[component]
 fn ThinkingIndicator() -> Element {
@@ -892,4 +1074,3 @@ fn WelcomeMessage() -> Element {
         }
     }
 }
-

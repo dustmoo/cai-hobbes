@@ -52,7 +52,7 @@ pub fn Onboarding(mut props: OnboardingProps) -> Element {
 
     rsx! {
         div {
-            class: "p-8 bg-gray-800 rounded-lg shadow-lg max-w-md flex flex-col gap-y-6 min-h-[450px]",
+            class: "px-8 py-10 bg-gray-800 rounded-lg shadow-lg max-w-md flex flex-col gap-y-6 min-h-[450px]",
             // Header
             div {
                 class: "text-center",
@@ -99,7 +99,7 @@ pub fn Onboarding(mut props: OnboardingProps) -> Element {
 
             // Footer
             div {
-                class: "mt-auto",
+                class: "mt-auto pt-6",
                 button {
                     class: "w-full py-2 px-4 bg-indigo-600 hover:bg-indigo-700 rounded-md font-bold transition-colors",
                     onclick: move |_| save_settings(),
