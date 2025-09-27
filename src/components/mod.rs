@@ -1,4 +1,7 @@
 pub mod chat;
+pub mod chat_input;
+pub mod message_list;
+pub mod markdown_renderer;
 pub mod session_manager;
 pub mod llm;
 pub mod settings_panel;

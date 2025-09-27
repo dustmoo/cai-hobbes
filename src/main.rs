@@ -26,7 +26,7 @@ fn main() {
     // Try to load .env file for developer convenience.
     dotenv().ok();
     tracing::info!("Attempted to load .env file from the environment.");
-    dioxus_logger::init(tracing::Level::INFO).expect("failed to init logger");
+    dioxus_logger::init(tracing::Level::DEBUG).expect("failed to init logger");
 
     #[cfg(target_os = "macos")]
     permissions::check_and_prompt_for_accessibility();
@@ -50,7 +50,6 @@ fn main() {
                         #[cfg(target_os = "macos")]
                         {
                             window = window
-                                .with_title_hidden(true)
                                 .with_titlebar_transparent(true);
                         }
                         window
@@ -300,8 +299,22 @@ fn app() -> Element {
                     // Session Manager Sidebar
                     if *show_session_manager.read() {
                         div {
-                            class: "w-64 bg-gray-800 text-white h-full transition-all duration-300 ease-in-out",
-                            components::session_manager::SessionManager {}
+                            class: "flex flex-row h-full",
+                            // Session Manager Panel
+                            div {
+                                id: "session-manager-panel",
+                                style: "width: {settings_panel_width}px;",
+                                class: "bg-gray-800 text-white h-full",
+                                components::session_manager::SessionManager {}
+                            }
+                            // Draggable Divider
+                            div {
+                                class: "w-2 cursor-col-resize bg-gray-700 hover:bg-indigo-500 transition-colors",
+                                onmousedown: move |event| {
+                                    drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
+                                    is_dragging.set(true);
+                                },
+                            }
                         }
                     }
 
@@ -338,7 +351,8 @@ fn app() -> Element {
                                     let delta_x = event.data.screen_coordinates().x - start_x;
                                     let new_width = start_width + delta_x;
                                     if new_width > 200.0 && new_width < 800.0 {
-                                        let js = format!("document.getElementById('settings-panel').style.width = '{}px';", new_width);
+                                        let panel_id = if *show_settings_panel.read() { "settings-panel" } else { "session-manager-panel" };
+                                        let js = format!("document.getElementById('{}').style.width = '{}px';", panel_id, new_width);
                                         let _ = document::eval(&js);
                                         final_width_on_drag_end.set(new_width);
                                     }
@@ -373,7 +387,7 @@ fn app() -> Element {
 
                                     // Adjust the window size based on the sidebar's visibility
                                     let session_state = session_state.clone();
-                                    let sidebar_width = 256.0; // w-64 in Tailwind is 16rem which is 256px
+                                    let sidebar_width = settings_panel_width();
                                     let current_size = window.inner_size();
                                     let persisted_width = session_state.read().window_width;
 

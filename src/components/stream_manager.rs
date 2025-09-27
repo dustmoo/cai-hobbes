@@ -20,6 +20,7 @@ pub struct StreamManagerContext {
     tool_call_summarizer: Signal<ToolCallSummarizer>,
     settings: Signal<Settings>,
     continuation_controller: Signal<ContinuationController>,
+    pub stream_activity: Signal<u64>,
 }
 
 impl StreamManagerContext {
@@ -41,6 +42,7 @@ impl StreamManagerContext {
         
         // Store the receiver for the MessageBubble to pick up.
         self.stream_receivers.write().insert(message_id, stream_rx);
+        *self.stream_activity.write() += 1;
 
         // Spawn a master task to manage the LLM call and state updates.
         spawn(async move {
@@ -56,19 +58,14 @@ impl StreamManagerContext {
             });
 
             let mut is_first_message = true;
-            // MPSC channel to collect results from all spawned tool-call tasks.
             let (tool_results_tx, mut tool_results_rx) = mpsc::unbounded_channel::<crate::components::shared::ToolCallRecord>();
             let mut tool_call_count = 0;
+            let mut final_text_for_this_turn = String::new();
 
             while let Some(message) = llm_rx.recv().await {
                 match message {
                     StreamMessage::Text(chunk) => {
-                        let mut state = self.session_state.write();
-                        if let Some(msg) = state.get_message_mut(&message_id) {
-                             if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
-                                t.push_str(&chunk);
-                            }
-                        }
+                        final_text_for_this_turn.push_str(&chunk);
                         if stream_tx.send(StreamMessage::Text(chunk)).is_err() {
                             break;
                         }
@@ -150,6 +147,15 @@ impl StreamManagerContext {
                 }
             }
 
+            if !final_text_for_this_turn.is_empty() {
+                let mut state = self.session_state.write();
+                if let Some(msg) = state.get_message_mut(&message_id) {
+                    if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
+                        *t = final_text_for_this_turn;
+                    }
+                }
+            }
+
             // The master task will collect all results from the channel.
             // We drop the original sender here. The loop will only complete
             // once all the spawned tool-call tasks have finished and dropped their sender clones.
@@ -216,19 +222,17 @@ impl StreamManagerContext {
                     while let Some(message) = llm_rx.recv().await {
                         if let StreamMessage::Text(chunk) = message {
                             final_text.push_str(&chunk);
-                            if let Some(msg) = self.session_state.write().get_message_mut(&new_hobbes_message_id) {
-                                if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
-                                    t.push_str(&chunk);
-                                }
-                            }
                             if final_answer_tx.send(StreamMessage::Text(chunk)).is_err() {
                                 break;
                             }
                         }
                     }
-                    // After the second LLM call is complete, check for the continuation hint.
+                    if let Some(msg) = self.session_state.write().get_message_mut(&new_hobbes_message_id) {
+                        if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
+                            *t = final_text.clone();
+                        }
+                    }
                     if final_text.trim().ends_with("<continue />") {
-                        // Remove the hint from the final message content.
                         if let Some(msg) = self.session_state.write().get_message_mut(&new_hobbes_message_id) {
                             if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
                                 *t = t.trim().strip_suffix("<continue />").unwrap_or(t).trim().to_string();
@@ -262,7 +266,11 @@ impl StreamManagerContext {
     }
 
     pub fn take_stream(mut self, message_id: &Uuid) -> Option<UnboundedReceiver<StreamMessage>> {
-        self.stream_receivers.write().remove(message_id)
+        let result = self.stream_receivers.write().remove(message_id);
+        if result.is_some() {
+            *self.stream_activity.write() += 1;
+        }
+        result
     }
 
 }
@@ -289,6 +297,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
         settings,
         continuation_controller,
+        stream_activity: Signal::new(0),
     });
 
     // Provide the context to children.
@@ -322,6 +331,7 @@ mod tests {
                 tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
                 settings,
                 continuation_controller,
+                stream_activity: Signal::new(0),
             });
 
             let message_id = Uuid::new_v4();
@@ -367,6 +377,7 @@ mod tests {
                 tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
                 settings,
                 continuation_controller,
+                stream_activity: Signal::new(0),
             });
 
             let message_id = Uuid::new_v4();

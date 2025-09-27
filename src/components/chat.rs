@@ -6,8 +6,6 @@ use std::rc::Rc;
 use dioxus::html::geometry::euclid::Rect;
 use std::time::Duration;
 use tokio::time::sleep;
-use pulldown_cmark::{html, Options, Parser, Event, Tag, TagEnd};
-use ammonia::clean;
 use crate::components::stream_manager::StreamManagerContext;
 use lazy_static::lazy_static;
 use syntect::easy::HighlightLines;
@@ -16,13 +14,13 @@ use syntect::parsing::SyntaxSet;
 use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
 use feature_clipboard::copy_to_clipboard;
 use crate::context::prompt_builder::PromptBuilder;
-use crate::processing::conversation_processor::ConversationProcessor;
-// Define a simple `Message` struct
 use serde::{Deserialize, Serialize};
 use crate::settings::Settings;
-use super::shared::{MessageContent};
-use crate::components::tool_call_display::{PermissionPrompt, ToolCallDisplay};
+use super::shared::{MessageContent, StreamMessage};
 use super::continuation_controller::ContinuationController;
+use super::chat_input::ChatInput;
+use super::message_list::MessageList;
+use super::markdown_renderer::MarkdownRenderer;
 
 lazy_static! {
     static ref SYNTAX_SET: SyntaxSet = SyntaxSet::load_defaults_newlines();
@@ -42,26 +40,24 @@ pub struct Message {
 pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interaction: EventHandler<()>, on_toggle_sessions: EventHandler<()>, on_toggle_settings: EventHandler<()>) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let settings = use_context::<Signal<Settings>>();
-    let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
+    let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
-    let mut draft = use_signal(|| "".to_string());
+    let draft = use_signal(|| "".to_string());
     use_context_provider(|| draft);
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
-    let mut has_interacted = use_signal(|| false);
     let is_sending = use_signal(|| false);
     let stream_manager = consume_context::<StreamManagerContext>();
     let mut continuation_controller = consume_context::<Signal<ContinuationController>>();
-    const INITIAL_MESSAGES_TO_SHOW: usize = 20;
-    let mut show_scroll_button = use_signal(|| false);
     let mut is_initial_load = use_signal(|| true);
-    let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     let mut last_session_id = use_signal(|| session_state.read().active_session_id.clone());
+    let stream_update_trigger = use_signal(|| 0);
 
 
     // Effect to report content size changes, scroll, and attach JS controls
     use_effect(move || {
         // By reading the session state here, the effect becomes dependent on it.
         // Any change to messages will cause this to re-run.
+        let _ = stream_update_trigger.read();
         let current_session_id = session_state.read().active_session_id.clone();
         let mut is_session_switch = false;
         if current_session_id != *last_session_id.read() {
@@ -90,8 +86,6 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     true // Also default to true if the eval fails.
                 };
 
-                // Set the visibility of the scroll button based on whether the user is near the bottom.
-                show_scroll_button.set(!is_near_bottom);
 
                 // On the very first load, we always scroll to the bottom.
                 // On subsequent loads, we only scroll if the user was already near the bottom.
@@ -186,99 +180,6 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         }
     };
 
-    let mut send_message = {
-        // Capture signals which are all `Copy`
-        let is_sending = is_sending;
-        let mut draft = draft;
-        let session_state = session_state;
-        let settings = settings;
-        let mcp_manager = mcp_manager;
-        let send_prompt_to_llm = send_prompt_to_llm;
-
-        move || {
-            if *is_sending.read() {
-                tracing::warn!("'send_message' blocked: already sending.");
-                return;
-            }
-            let user_message = draft.read().clone();
-            if user_message.is_empty() {
-                return;
-            }
-            draft.set("".to_string());
-            let _ = document::eval(r#"
-                const el = document.getElementById('chat-textarea');
-                if (el) { el.style.height = 'auto'; }
-            "#);
-
-            spawn(async move {
-                // Clone/read signals inside the async block
-                let mut session_state = session_state;
-                let settings = settings.read().clone();
-                let mcp_manager = mcp_manager;
-                let send_prompt_to_llm = send_prompt_to_llm;
-
-                let hobbes_message_id = Uuid::new_v4();
-                {
-                    let mut state = session_state.write();
-                    if state.active_session_id.is_empty() {
-                        state.create_session();
-                    }
-                    if let Some(session) = state.get_active_session_mut() {
-                        // Push the user's message
-                        session.messages.push(Message {
-                            id: Uuid::new_v4(),
-                            author: "User".to_string(),
-                            content: MessageContent::Text(user_message.clone()),
-                        });
-                        // Immediately push the empty "Hobbes" message to show the thinking indicator
-                        session.messages.push(Message {
-                            id: hobbes_message_id,
-                            author: "Hobbes".to_string(),
-                            content: MessageContent::Text("".to_string()),
-                        });
-                    }
-                }
-
-                let prompt_data = {
-                    let mcp_context = mcp_manager.read().get_mcp_context().await;
-                    let (user_prompt, conversation_summary) = {
-                        let mut session_for_processing = session_state.read().get_active_session().cloned().unwrap();
-                        let processor = ConversationProcessor::new();
-                        let prompt = processor.process_and_respond(&mut session_for_processing, &settings).await;
-                        (prompt, session_for_processing.active_context.conversation_summary)
-                    };
-
-                    {
-                        let mut state = session_state.write();
-                        if let Some(session) = state.get_active_session_mut() {
-                            session.active_context.conversation_summary = conversation_summary;
-                            if !mcp_context.servers.is_empty() {
-                                session.active_context.mcp_tools = Some(mcp_context);
-                            }
-                        }
-                    }
-
-                    let state = session_state.read();
-                    let session = state.get_active_session().unwrap();
-                    let last_agent_message = session.messages.iter().filter(|m| m.author == "Hobbes").last().and_then(|m| match &m.content {
-                        MessageContent::Text(text) => Some(text.clone()),
-                        _ => None,
-                    });
-
-                    let builder = PromptBuilder::new(session, &settings, &state);
-                    builder.build_prompt(user_prompt, last_agent_message)
-                };
-
-                if let Err(e) = session_state.read().save() {
-                    tracing::error!("Failed to save session state: {}", e);
-                }
-
-                let mcp_context = session_state.read().get_active_session().and_then(|s| s.active_context.mcp_tools.clone());
-                send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
-            });
-        }
-    };
-
     let continue_prompt_flow = {
         let session_state = session_state;
         let settings = settings;
@@ -332,317 +233,13 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         div {
             class: "{root_classes}",
             onmounted: move |cx| container_element.set(Some(cx.data())),
-            // This div is the new message list container
-            div { // This new div creates a relative container for the message list and the scroll button
-                class: "relative flex-1 min-h-0",
-                div {
-                    id: "message-list",
-                    class: "overflow-y-auto p-4 space-y-4 h-full", // Removed flex-1 and pb-32, added h-full
-                onscroll: move |_| {
-                    let mut show_scroll_button = show_scroll_button.clone();
-                    let mut visible_message_count = visible_message_count.clone();
-                    let session_state = session_state.clone();
-
-                    spawn(async move {
-                        // Check scroll position for both top and bottom
-                        let scroll_info = if let Ok(result) = document::eval(r#"
-                            const el = document.getElementById('message-list');
-                            if (el) {
-                                const isAtTop = el.scrollTop === 0;
-                                const threshold = 10;
-                                const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
-                                return { isAtTop, isAtBottom };
-                            }
-                            return { isAtTop: false, isAtBottom: true }; // Default state
-                        "#).await {
-                            result
-                        } else {
-                            serde_json::from_str("{\"isAtTop\":false, \"isAtBottom\":true}").unwrap()
-                        };
-
-                        let is_at_top = scroll_info.get("isAtTop").unwrap().as_bool().unwrap_or(false);
-                        let is_at_bottom = scroll_info.get("isAtBottom").unwrap().as_bool().unwrap_or(true);
-
-                        // Show the scroll-to-bottom button if the user is NOT at the bottom
-                        show_scroll_button.set(!is_at_bottom);
-
-                        // If user scrolls to the top, load more messages while preserving scroll position
-                        if is_at_top {
-                            let total_messages = session_state.read().get_active_session().map_or(0, |s| s.messages.len());
-                            if *visible_message_count.read() < total_messages {
-                                // 1. Get current scroll state BEFORE adding new messages
-                                let _ = document::eval(r#"
-                                    const el = document.getElementById('message-list');
-                                    if (el) {
-                                        window.prevScrollHeight = el.scrollHeight;
-                                        window.prevScrollTop = el.scrollTop;
-                                    }
-                                "#).await;
-
-                                // 2. Load more messages
-                                let current_count = *visible_message_count.read();
-                                visible_message_count.set(current_count + INITIAL_MESSAGES_TO_SHOW);
-
-                                // 3. After the next render, adjust scroll position
-                                sleep(Duration::from_millis(20)).await; // Give it a moment to render
-                                let _ = document::eval(r#"
-                                    const el = document.getElementById('message-list');
-                                    if (el && window.prevScrollHeight) {
-                                        const newScrollHeight = el.scrollHeight;
-                                        const heightDifference = newScrollHeight - window.prevScrollHeight;
-                                        el.scrollTop = window.prevScrollTop + heightDifference;
-                                        // Clean up global variables
-                                        delete window.prevScrollHeight;
-                                        delete window.prevScrollTop;
-                                    }
-                                "#).await;
-                            }
-                        }
-                    });
-                },
-                {
-                    let state = session_state.read();
-                    if let Some(session) = state.sessions.get(&state.active_session_id) {
-                        let total_messages = session.messages.len();
-                        let messages_to_render = session.messages.iter().skip(total_messages.saturating_sub(*visible_message_count.read())).collect::<Vec<_>>();
-
-                        if session.messages.is_empty() {
-                            rsx! { WelcomeMessage {} }
-                        } else {
-                            rsx! {
-                                if total_messages > *visible_message_count.read() {
-                                    div {
-                                        class: "flex justify-center",
-                                        button {
-                                            class: "text-sm text-purple-400 hover:text-purple-300 focus:outline-none",
-                                            onclick: move |_| {
-                                                let current_count = *visible_message_count.read();
-                                                visible_message_count.set(current_count + INITIAL_MESSAGES_TO_SHOW);
-                                            },
-                                            "Load More"
-                                        }
-                                    }
-                                }
-                                for message in messages_to_render {
-                                    match &message.content {
-                                        MessageContent::Text(_) => rsx! {
-                                            MessageBubble {
-                                                key: "{message.id}",
-                                                message: message.clone()
-                                            }
-                                        },
-                                        MessageContent::ToolCall(tool_call) => {
-                                            // Replicating the bubble structure here for tool calls
-                                            let bubble_classes = "bg-gray-700 text-gray-200 self-start mr-auto";
-                                            let container_classes = "flex justify-start";
-                                            let author_classes = format!(
-                                                "text-xs text-gray-500 mt-1 px-2 {}",
-                                                "text-left"
-                                            );
-                                            rsx! {
-                                                div {
-                                                    key: "{message.id}",
-                                                    class: "{container_classes} w-full",
-                                                    div {
-                                                        class: "flex flex-col max-w-2/3 min-w-0",
-                                                        div {
-                                                            class: "relative group rounded-2xl {bubble_classes}",
-                                                            ToolCallDisplay { tool_call: tool_call.clone() }
-                                                        }
-                                                        div {
-                                                            class: "{author_classes}",
-                                                            "{message.author}"
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        MessageContent::PermissionRequest(tool_call) => {
-                                            let container_classes = "flex justify-start";
-                                            let author_classes = "text-xs text-gray-500 mt-1 px-2 text-left";
-                                            rsx! {
-                                                div {
-                                                    key: "{message.id}",
-                                                    class: "{container_classes} w-full",
-                                                    div {
-                                                        class: "flex flex-col max-w-2/3 min-w-0",
-                                                        PermissionPrompt { tool_call: tool_call.clone() },
-                                                        div {
-                                                            class: "{author_classes}",
-                                                            "System"
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        rsx! { WelcomeMessage {} }
-                    }
-                }
-                if *show_scroll_button.read() {
-                    button {
-                        class: "absolute bottom-4 right-4 z-10 p-2 bg-purple-600 text-white rounded-full shadow-lg hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 transition-opacity duration-300 ease-in-out",
-                        onclick: move |_| {
-                            let _ = document::eval(r#"
-                                const el = document.getElementById('message-list');
-                                if (el) { el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }); }
-                            "#);
-                        },
-                        Icon {
-                            width: 20,
-                            height: 20,
-                            icon: fi_icons::FiChevronDown
-                        }
-                    }
-                }
-            }
-            }
-            div {
-                class: "bg-gray-900 p-4 border-t border-gray-700", // Removed absolute positioning
-                onmousedown: |e| e.stop_propagation(),
-                div {
-                    class: "flex items-center space-x-3",
-                    button {
-                        class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
-                        onclick: move |_| on_toggle_sessions.call(()),
-                        Icon {
-                            width: 20,
-                            height: 20,
-                            icon: fi_icons::FiMenu
-                        }
-                    }
-                    button {
-                        class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
-                        onclick: move |_| on_toggle_settings.call(()),
-                        Icon {
-                            width: 20,
-                            height: 20,
-                            icon: fi_icons::FiSettings
-                        }
-                    }
-                    textarea {
-                        id: "chat-textarea",
-                        class: "flex-1 py-2 px-4 rounded-xl bg-gray-800 border border-gray-700 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none overflow-y-auto",
-                        style: "max-height: 50vh;",
-                        rows: "1",
-                        placeholder: if !mcp_context.read().servers.is_empty() { "Type your message..." } else { "Initializing..." },
-                        disabled: mcp_context.read().servers.is_empty(),
-                        value: "{draft}",
-                        oninput: move |event| {
-                            // This JS block is now responsible for three things:
-                            // 1. Storing the cursor position before the state update.
-                            // 2. Adjusting the textarea height.
-                            // 3. It does NOT prevent the default action, so the value change proceeds.
-                            let _ = document::eval(r#"
-                                const el = document.getElementById('chat-textarea');
-                                if (el) {
-                                    window.dioxusCursorPos = [el.selectionStart, el.selectionEnd];
-                                    el.style.height = 'auto';
-                                    el.style.height = (el.scrollHeight) + 'px';
-                                }
-                            "#);
-                            // Update the signal, which will trigger the use_effect to restore the cursor
-                            draft.set(event.value());
-                        },
-                        onkeydown: move |event| {
-                            let modifiers = event.data.modifiers();
-
-                            // Allow all Command, Control, and Alt-based shortcuts to pass through
-                            if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::ALT) {
-                                return;
-                            }
-
-                            // Handle plain Enter for submission, allowing Shift+Enter for newlines
-                            if event.key() == Key::Enter && !modifiers.contains(Modifiers::SHIFT) {
-                                event.prevent_default();
-                                if !*has_interacted.read() {
-                                    on_interaction.call(());
-                                    has_interacted.set(true);
-                                }
-                                send_message();
-                            }
-                        },
-                    }
-                    {
-                        cfg_if::cfg_if! {
-                            if #[cfg(debug_assertions)] {
-                                rsx! {
-                                    button {
-                                        class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
-                                        onclick: move |_| {
-                                            let session_state = session_state.clone();
-                                            let settings = settings.clone();
-                                            let mcp_manager = mcp_manager.clone();
-                                            spawn(async move {
-                                                // Asynchronously fetch the MCP context first.
-                                                let mcp_context = {
-                                                    let mcp_manager_reader = mcp_manager.read();
-                                                    mcp_manager_reader.get_mcp_context().await
-                                                };
-
-                                                // Now, read the state and build the context string for debugging.
-                                                let context_string = {
-                                                    let state = session_state.read();
-                                                    if let Some(session) = state.get_active_session().cloned() {
-                                                        let mut session_for_debug = session;
-
-                                                        // Inject the fetched MCP context into the temporary clone.
-                                                        if !mcp_context.servers.is_empty() {
-                                                            session_for_debug.active_context.mcp_tools = Some(mcp_context);
-                                                        }
-
-                                                        // Build the prompt from the modified clone to show an accurate preview.
-                                                        let settings_reader = settings.read();
-                                                        let builder = PromptBuilder::new(&session_for_debug, &settings_reader, &state);
-                                                        // Note: This debug view might not be perfect after the refactor,
-                                                        // but it's better to show the raw prompt struct than to crash.
-                                                        let prompt_data = builder.build_prompt("[DEBUG USER MESSAGE]".to_string(), None);
-                                                        format!("{:#?}", prompt_data)
-                                                    } else {
-                                                        "[No active session]".to_string()
-                                                    }
-                                                };
-                                                tracing::info!("---\n[DEBUG] Current Context:\n{}---", context_string);
-                                            });
-                                        },
-                                        Icon {
-                                            width: 20,
-                                            height: 20,
-                                            icon: fi_icons::FiCpu
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    button {
-                        class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
-                        onclick: move |_| {
-                            session_state.write().create_session();
-                        },
-                        Icon {
-                            width: 20,
-                            height: 20,
-                            icon: fi_icons::FiPlus
-                        }
-                    }
-                    button {
-                        class: "px-5 py-2 bg-purple-600 rounded-full text-white font-semibold hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-opacity-50 transition-colors disabled:bg-gray-500",
-                        disabled: mcp_context.read().servers.is_empty(),
-                        onclick: move |_| {
-                            if !*has_interacted.read() {
-                                on_interaction.call(());
-                                has_interacted.set(true);
-                            }
-                            send_message()
-                        },
-                        "Send"
-                    }
-                }
+            MessageList {
+                stream_update_trigger: stream_update_trigger,
+            },
+            ChatInput {
+                on_interaction: on_interaction,
+                on_toggle_sessions: on_toggle_sessions,
+                on_toggle_settings: on_toggle_settings,
             }
         }
     }
@@ -722,7 +319,7 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
 
 // Sub-component for styling individual messages
 #[component]
-fn MessageBubble(message: Message) -> Element {
+pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>) -> Element {
     let is_user = message.author == "User";
 
     // This component now specifically handles Text content.
@@ -736,12 +333,15 @@ fn MessageBubble(message: Message) -> Element {
         // This effect runs once when the component is created.
         // If it's a streaming Hobbes message, it takes the stream and updates its local state.
         use_effect(move || {
+            let _stream_activity = stream_manager.stream_activity;
             if !is_user && stream_manager.is_streaming(&message.id) {
                 spawn(async move {
                     if let Some(mut rx) = stream_manager.take_stream(&message.id) {
                         while let Some(stream_msg) = rx.recv().await {
-                            if let crate::components::shared::StreamMessage::Text(chunk) = stream_msg {
+                            if let StreamMessage::Text(chunk) = stream_msg {
+                                tracing::debug!("CHUNK RECEIVED: '{}'", &chunk);
                                 content.write().push_str(&chunk);
+                                on_content_update.call(());
                             }
                         }
                     }
@@ -762,164 +362,6 @@ fn MessageBubble(message: Message) -> Element {
             if is_user { "text-right" } else { "text-left" }
         );
 
-        let elements = use_memo(move || {
-            let content_reader = content.read();
-            let mut options = Options::empty();
-            options.insert(Options::ENABLE_STRIKETHROUGH);
-            options.insert(Options::ENABLE_TASKLISTS);
-            options.insert(Options::ENABLE_TABLES);
-
-            let parser = Parser::new_ext(&content_reader, options);
-
-            // Intermediate representation for parsed markdown
-            #[derive(Debug)]
-            enum Block {
-                Paragraph(Vec<Inline>),
-                List(Vec<Vec<Inline>>),
-                CodeBlock { lang: String, code: String },
-            }
-
-            #[derive(Debug)]
-            enum Inline {
-                Text(String),
-                Link { href: String, text: String },
-                SoftBreak,
-                HardBreak,
-            }
-
-            let mut blocks: Vec<Block> = Vec::new();
-            let mut current_paragraph: Vec<Inline> = Vec::new();
-            let mut list_stack: Vec<Vec<Vec<Inline>>> = Vec::new();
-            let mut current_list_item: Vec<Inline> = Vec::new();
-            
-            let mut in_link = false;
-            let mut link_href = String::new();
-            let mut link_text = String::new();
-
-            let mut in_code_block = false;
-            let mut code_lang = String::new();
-            let mut code_buffer = String::new();
-
-            let flush_paragraph = |p: &mut Vec<Inline>, b: &mut Vec<Block>| {
-                if !p.is_empty() {
-                    b.push(Block::Paragraph(std::mem::take(p)));
-                }
-            };
-
-            for event in parser {
-                match event {
-                    // Block-level tags
-                    Event::Start(Tag::Paragraph) => {
-                        flush_paragraph(&mut current_paragraph, &mut blocks);
-                    }
-                    Event::End(TagEnd::Paragraph) => {
-                        flush_paragraph(&mut current_paragraph, &mut blocks);
-                    }
-                    Event::Start(Tag::List(_)) => {
-                        flush_paragraph(&mut current_paragraph, &mut blocks);
-                        list_stack.push(Vec::new());
-                    }
-                    Event::End(TagEnd::List(_)) => {
-                        if let Some(items) = list_stack.pop() {
-                            blocks.push(Block::List(items));
-                        }
-                    }
-                    Event::Start(Tag::Item) => {
-                        current_list_item.clear();
-                    }
-                    Event::End(TagEnd::Item) => {
-                        if let Some(list) = list_stack.last_mut() {
-                            list.push(std::mem::take(&mut current_list_item));
-                        }
-                    }
-                    Event::Start(Tag::CodeBlock(kind)) => {
-                        flush_paragraph(&mut current_paragraph, &mut blocks);
-                        in_code_block = true;
-                        code_lang = match kind {
-                            pulldown_cmark::CodeBlockKind::Fenced(l) => l.into_string(),
-                            _ => String::new(),
-                        };
-                        code_buffer.clear();
-                    }
-                    Event::End(TagEnd::CodeBlock) => {
-                        in_code_block = false;
-                        blocks.push(Block::CodeBlock { lang: code_lang.clone(), code: code_buffer.clone() });
-                    }
-
-                    // Inline-level tags
-                    Event::Start(Tag::Link { dest_url, .. }) => {
-                        in_link = true;
-                        link_href = dest_url.to_string();
-                        link_text.clear();
-                    }
-                    Event::End(TagEnd::Link) => {
-                        in_link = false;
-                        let target = if !list_stack.is_empty() { &mut current_list_item } else { &mut current_paragraph };
-                        target.push(Inline::Link { href: link_href.clone(), text: link_text.clone() });
-                    }
-                    Event::Text(text) => {
-                        if in_code_block {
-                            code_buffer.push_str(&text);
-                        } else if in_link {
-                            link_text.push_str(&text);
-                        } else {
-                            let mut raw_html = String::new();
-                            html::push_html(&mut raw_html, std::iter::once(Event::Text(text)));
-                            let sanitized = clean(&raw_html);
-                            let target = if !list_stack.is_empty() { &mut current_list_item } else { &mut current_paragraph };
-                            target.push(Inline::Text(sanitized));
-                        }
-                    }
-                    Event::SoftBreak => {
-                        let target = if !list_stack.is_empty() { &mut current_list_item } else { &mut current_paragraph };
-                        target.push(Inline::SoftBreak);
-                    }
-                    Event::HardBreak => {
-                        let target = if !list_stack.is_empty() { &mut current_list_item } else { &mut current_paragraph };
-                        target.push(Inline::HardBreak);
-                    }
-                    _ => {} // Ignore other events for simplicity for now
-                }
-            }
-            flush_paragraph(&mut current_paragraph, &mut blocks);
-
-            // Render the IR to Dioxus elements
-            blocks.into_iter().map(|block| {
-                match block {
-                    Block::Paragraph(inlines) => rsx! {
-                        p {
-                            for inline in inlines {
-                                match inline {
-                                    Inline::Text(text) => rsx!{ span { dangerous_inner_html: "{text}" } },
-                                    Inline::Link { href, text } => rsx!{ LinkWithControls { href: href, text: text } },
-                                    Inline::SoftBreak => rsx!{ " " },
-                                    Inline::HardBreak => rsx!{ br {} },
-                                }
-                            }
-                        }
-                    },
-                    Block::List(items) => rsx! {
-                        ul {
-                            for item_inlines in items {
-                                li {
-                                    for inline in item_inlines {
-                                        match inline {
-                                            Inline::Text(text) => rsx!{ span { dangerous_inner_html: "{text}" } },
-                                            Inline::Link { href, text } => rsx!{ LinkWithControls { href: href, text: text } },
-                                            Inline::SoftBreak => rsx!{ " " },
-                                            Inline::HardBreak => rsx!{ br {} },
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    Block::CodeBlock { lang, code } => rsx! {
-                        CodeBlock { lang: lang, code: code }
-                    },
-                }
-            }).collect::<Vec<_>>()
-        });
 
         let button_position_classes = if is_user {
             "absolute bottom-[-10px] left-[-10px]"
@@ -937,11 +379,8 @@ fn MessageBubble(message: Message) -> Element {
                         if is_thinking {
                             ThinkingIndicator {}
                         } else {
-                            div {
-                                class: "prose prose-sm dark:prose-invert max-w-none break-words",
-                                for el in elements.read().iter() {
-                                    {el.clone()}
-                                }
+                            MarkdownRenderer {
+                                content: content.read().clone()
                             }
                         }
                         if !content.read().is_empty() {
@@ -979,7 +418,7 @@ fn MessageBubble(message: Message) -> Element {
 }
 
 #[component]
-fn LinkWithControls(href: String, text: String) -> Element {
+pub fn LinkWithControls(href: String, text: String) -> Element {
     let mut draft = use_context::<Signal<String>>();
     let mut copied = use_signal(|| false);
     let href_clone_for_copy = href.clone();
@@ -1050,7 +489,7 @@ fn ThinkingIndicator() -> Element {
 }
 
 #[component]
-fn WelcomeMessage() -> Element {
+pub fn WelcomeMessage() -> Element {
     rsx! {
         div {
             class: "flex flex-col items-center justify-center h-full text-gray-500",
