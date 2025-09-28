@@ -175,12 +175,12 @@ fn app() -> Element {
     use_effect(move || {
         let show = settings.read().show_tray_icon;
         if show {
-            if tray_icon.read().is_none() {
+            if tray_icon.peek().is_none() {
                 tray_icon.set(Some(tray::init_tray()));
                 tracing::info!("Tray icon has been created.");
             }
         } else {
-            if tray_icon.read().is_some() {
+            if tray_icon.peek().is_some() {
                 tray_icon.set(None);
                 tracing::info!("Tray icon has been removed.");
             }
@@ -219,20 +219,22 @@ fn app() -> Element {
 
     // This effect saves the settings panel width when the user stops dragging
     use_effect(move || {
-        if !*is_dragging.read() && *final_width_on_drag_end.read() > 0.0 {
-            let new_width = *final_width_on_drag_end.read();
-            settings_panel_width.set(new_width);
-
-            let mut current_settings = settings.read().clone();
-            if current_settings.settings_panel_width != Some(new_width) {
-                current_settings.settings_panel_width = Some(new_width);
-                settings.set(current_settings);
-                let sm = settings_manager.read();
-                if let Err(e) = sm.save(&settings.read()) {
-                    tracing::error!("Failed to save settings: {}", e);
+        let new_width = final_width_on_drag_end();
+        if new_width > 0.0 {
+            // Spawn an async task to handle the state update and file I/O.
+            // This breaks the reactive loop by isolating the side-effect from the hook's dependency tracking.
+            spawn(async move {
+                settings_panel_width.set(new_width);
+                let mut current_settings = settings.write();
+                if current_settings.settings_panel_width != Some(new_width) {
+                    current_settings.settings_panel_width = Some(new_width);
+                    let sm = settings_manager.read();
+                    if let Err(e) = sm.save(&current_settings) {
+                        tracing::error!("Failed to save settings: {}", e);
+                    }
                 }
-            }
-            final_width_on_drag_end.set(0.0); // Reset after saving
+                final_width_on_drag_end.set(0.0); // Reset after saving
+            });
         }
     });
 

@@ -93,12 +93,10 @@ impl StreamManagerContext {
                             }
                         };
 
-                        // Each tool call runs in its own spawned task.
-                        // It owns a sender to the results channel.
                         let mcp_manager = self.mcp_manager;
                         let mut session_state = self.session_state;
                         let document_store = self.document_store;
-                        let tool_results_tx = tool_results_tx.clone(); // Clone sender for the task
+                        let tool_results_tx_clone = tool_results_tx.clone();
                         spawn(async move {
                             let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
                             let result = mcp_manager.read().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, false).await;
@@ -106,16 +104,7 @@ impl StreamManagerContext {
                             let mut state = session_state.write();
                             let (status, response_str) = match result {
                                 Ok(response) => (ToolCallStatus::Completed, serde_json::to_string_pretty(&response).unwrap_or_default()),
-                                Err(e) => {
-                                    if let Ok(tool_call_req) = serde_json::from_str::<crate::components::shared::ToolCall>(&e) {
-                                        if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
-                                            msg.content = crate::components::shared::MessageContent::PermissionRequest(tool_call_req);
-                                        }
-                                        (ToolCallStatus::Error, e)
-                                    } else {
-                                        (ToolCallStatus::Error, e)
-                                    }
-                                }
+                                Err(e) => (ToolCallStatus::Error, e),
                             };
 
                             if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
@@ -127,10 +116,7 @@ impl StreamManagerContext {
 
                             let record = crate::components::shared::ToolCallRecord {
                                 call: tool_call.clone(),
-                                result: crate::components::shared::ToolResult {
-                                    status,
-                                    response: response_str,
-                                },
+                                result: crate::components::shared::ToolResult { status, response: response_str },
                             };
                             if let Some(store) = document_store.read().as_ref().cloned() {
                                 let record_for_store = record.clone();
@@ -140,7 +126,7 @@ impl StreamManagerContext {
                                     }
                                 });
                             }
-                            let _ = tool_results_tx.send(record);
+                            let _ = tool_results_tx_clone.send(record);
                         });
                         is_first_message = false;
                     }
@@ -151,100 +137,36 @@ impl StreamManagerContext {
                 let mut state = self.session_state.write();
                 if let Some(msg) = state.get_message_mut(&message_id) {
                     if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
-                        *t = final_text_for_this_turn;
+                        *t = final_text_for_this_turn.clone();
                     }
                 }
             }
 
-            // The master task will collect all results from the channel.
-            // We drop the original sender here. The loop will only complete
-            // once all the spawned tool-call tasks have finished and dropped their sender clones.
-            // This is a robust way to await an unknown number of concurrent tasks.
             drop(tool_results_tx);
             let mut collected_records = Vec::new();
             while let Some(record) = tool_results_rx.recv().await {
                 collected_records.push(record);
             }
 
-            // Centralize all SessionState mutations to occur sequentially after results are collected.
             if tool_call_count > 0 {
                 assert_eq!(collected_records.len(), tool_call_count, "Mismatch between tool calls dispatched and results received.");
                 self.session_state.write().tool_call_history.extend(collected_records.clone());
+                // Tools were called in this turn. Trigger a continuation to start the next turn.
+                self.continuation_controller.read().trigger_continuation();
+                return; // End this stream task. The continuation will start a new one.
             }
 
-            // If tools were called, we now feed the results back to the LLM to get a final,
-            // natural-language response. This is the core of the feedback loop.
-            if !self.session_state.read().tool_call_history.is_empty() {
-                let new_hobbes_message_id = Uuid::new_v4();
-                let settings = self.settings.read().clone();
-                
-                // Create the new, empty message bubble that will display the final response.
-                {
-                    let mut state = self.session_state.write();
-                    if let Some(session) = state.get_active_session_mut() {
-                        session.messages.push(crate::components::chat::Message {
-                            id: new_hobbes_message_id,
-                            author: "Hobbes".to_string(),
-                            content: crate::components::shared::MessageContent::Text("".to_string()),
-                        });
+            // If we reach here, it means tool_call_count was 0. The turn is over.
+            if final_text_for_this_turn.trim().ends_with("<continue />") {
+                if let Some(msg) = self.session_state.write().get_message_mut(&message_id) {
+                    if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
+                        *t = t.trim().strip_suffix("<continue />").unwrap_or(t).trim().to_string();
                     }
                 }
-
-                // Build the new prompt that includes the tool call history.
-                let (prompt_data, mcp_context_for_next_call) = {
-                    let current_state = self.session_state.read();
-                    if let Some(session) = current_state.get_active_session() {
-                        let builder = crate::context::prompt_builder::PromptBuilder::new(session, &settings, &current_state);
-                        let prompt = builder.build_prompt("".to_string(), None); // Empty message, context is now in history
-                        (Some(prompt), session.active_context.mcp_tools.clone())
-                    } else {
-                        (None, None)
-                    }
-                };
-
-                // Execute the second LLM call.
-                if let Some(prompt) = prompt_data {
-                    let (final_answer_tx, final_answer_rx) = mpsc::unbounded_channel::<StreamMessage>();
-                    self.stream_receivers.write().insert(new_hobbes_message_id, final_answer_rx);
-
-                    let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<StreamMessage>();
-                    let api_key = settings.api_key.clone().unwrap_or_else(|| {
-                        std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
-                    });
-                    let model = settings.chat_model.clone();
-
-                    spawn(async move {
-                        llm::generate_content_stream(api_key, model, prompt, llm_tx, mcp_context_for_next_call).await;
-                    });
-
-                    // Stream the final response to the new message bubble.
-                    let mut final_text = String::new();
-                    while let Some(message) = llm_rx.recv().await {
-                        if let StreamMessage::Text(chunk) = message {
-                            final_text.push_str(&chunk);
-                            if final_answer_tx.send(StreamMessage::Text(chunk)).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(msg) = self.session_state.write().get_message_mut(&new_hobbes_message_id) {
-                        if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
-                            *t = final_text.clone();
-                        }
-                    }
-                    if final_text.trim().ends_with("<continue />") {
-                        if let Some(msg) = self.session_state.write().get_message_mut(&new_hobbes_message_id) {
-                            if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
-                                *t = t.trim().strip_suffix("<continue />").unwrap_or(t).trim().to_string();
-                            }
-                        }
-                        self.continuation_controller.read().trigger_continuation();
-                        // We do NOT call on_complete here, as the turn is not over.
-                        return; // End the master task for this segment.
-                    }
-                }
+                self.continuation_controller.read().trigger_continuation();
+                return;
             }
-
+            
             // This block now runs only when the conversation turn is truly complete.
             tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
             {

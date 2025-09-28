@@ -1,6 +1,6 @@
 [package]
 name = "Hobbes"
-version = "0.6.0-rc"
+version = "0.6.1"
 authors = ["Dustin Moore <dustin@clearmirror.ai>"]
 edition = "2021"
 

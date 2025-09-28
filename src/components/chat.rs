@@ -421,12 +421,15 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>) -> E
 pub fn LinkWithControls(href: String, text: String) -> Element {
     let mut draft = use_context::<Signal<String>>();
     let mut copied = use_signal(|| false);
+    let mut is_hovered = use_signal(|| false);
     let href_clone_for_copy = href.clone();
     let href_clone_for_summarize = href.clone();
 
     rsx! {
         span {
-            class: "relative group inline",
+            class: "relative inline-block",
+            onmouseenter: move |_| is_hovered.set(true),
+            onmouseleave: move |_| is_hovered.set(false),
             a {
                 href: "{href}",
                 target: "_blank",
@@ -435,7 +438,7 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                 "{text}"
             }
             span {
-                class: "inline-flex items-center absolute left-full ml-1 z-10 opacity-0 group-hover:opacity-100 transition-opacity duration-200 bg-gray-900 bg-opacity-75 border border-gray-700 rounded-full shadow-lg p-0.5 space-x-0.5",
+                class: format!("inline-flex items-center absolute left-full ml-1 z-10 {} transition-opacity duration-200 bg-gray-900 bg-opacity-75 border border-gray-700 rounded-full shadow-lg p-0.5 space-x-0.5", if *is_hovered.read() { "opacity-100" } else { "opacity-0" }),
                 
                 button {
                     class: "p-1.5 rounded text-gray-400 hover:bg-gray-700 hover:text-white transition-colors",

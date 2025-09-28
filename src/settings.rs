@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crate::context::permissions::{PermissionSettings, ToolCategory};
 use std::collections::HashMap;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Settings {
     pub api_key: Option<String>,
     pub qdrant_url: Option<String>,

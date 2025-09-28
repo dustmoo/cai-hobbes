@@ -19,7 +19,7 @@ pub enum PermissionStatus {
     Denied(String),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PermissionSettings {
     pub auto_approval_enabled: bool,
     pub granular_permissions: HashMap<ToolCategory, bool>,

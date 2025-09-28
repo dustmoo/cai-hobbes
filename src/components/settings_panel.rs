@@ -8,7 +8,18 @@ pub fn SettingsPanel() -> Element {
     let mut settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
 
+    // Create a local copy of the settings for editing.
+    let mut local_settings = use_signal(|| settings.read().clone());
+
+    // This signal will track if the local state differs from the global state.
     let mut has_unsaved_changes = use_signal(|| false);
+
+    // This effect hook reactively checks for differences between the local and global settings.
+    use_effect(move || {
+        let global_settings = settings.read();
+        let local = local_settings.read();
+        has_unsaved_changes.set(*global_settings != *local);
+    });
 
     rsx! {
         div {
@@ -27,10 +38,9 @@ pub fn SettingsPanel() -> Element {
                     class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
                     r#type: "password",
                     placeholder: "Using environment variable",
-                    value: "{settings.read().api_key.as_deref().unwrap_or(\"\")}",
+                    value: "{local_settings.read().api_key.as_deref().unwrap_or(\"\")}",
                     oninput: move |event| {
-                        settings.write().api_key = Some(event.value());
-                        has_unsaved_changes.set(true);
+                        local_settings.write().api_key = Some(event.value());
                     }
                 }
             }
@@ -43,10 +53,9 @@ pub fn SettingsPanel() -> Element {
                 input {
                     class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
                     r#type: "text",
-                    value: "{settings.read().chat_model}",
+                    value: "{local_settings.read().chat_model}",
                     oninput: move |event| {
-                        settings.write().chat_model = event.value();
-                        has_unsaved_changes.set(true);
+                        local_settings.write().chat_model = event.value();
                     }
                 }
             }
@@ -59,10 +68,9 @@ pub fn SettingsPanel() -> Element {
                 input {
                     class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
                     r#type: "text",
-                    value: "{settings.read().summary_model}",
+                    value: "{local_settings.read().summary_model}",
                     oninput: move |event| {
-                        settings.write().summary_model = event.value();
-                        has_unsaved_changes.set(true);
+                        local_settings.write().summary_model = event.value();
                     }
                 }
             }
@@ -76,11 +84,10 @@ pub fn SettingsPanel() -> Element {
             input {
                 class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
                 r#type: "number",
-                value: "{settings.read().chat_history_length}",
+                value: "{local_settings.read().chat_history_length}",
                 oninput: move |event| {
                     if let Ok(val) = event.value().parse::<usize>() {
-                        settings.write().chat_history_length = val;
-                        has_unsaved_changes.set(true);
+                        local_settings.write().chat_history_length = val;
                     }
                 }
             }
@@ -96,11 +103,10 @@ pub fn SettingsPanel() -> Element {
                     input {
                         r#type: "checkbox",
                         class: "sr-only peer",
-                        checked: settings.read().show_tray_icon,
+                        checked: local_settings.read().show_tray_icon,
                         oninput: move |event| {
                             if let Some(checked) = event.value().parse().ok() {
-                                settings.write().show_tray_icon = checked;
-                                has_unsaved_changes.set(true);
+                                local_settings.write().show_tray_icon = checked;
                             }
                         }
                     }
@@ -118,10 +124,9 @@ pub fn SettingsPanel() -> Element {
                 input {
                     class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 disabled:opacity-50",
                     r#type: "text",
-                    value: "{settings.read().global_hotkey}",
+                    value: "{local_settings.read().global_hotkey}",
                     oninput: move |event| {
-                        settings.write().global_hotkey = event.value();
-                        has_unsaved_changes.set(true);
+                        local_settings.write().global_hotkey = event.value();
                     }
                 }
             }
@@ -134,10 +139,9 @@ pub fn SettingsPanel() -> Element {
                 textarea {
                     class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
                     rows: "4",
-                    value: "{settings.read().persona}",
+                    value: "{local_settings.read().persona}",
                     oninput: move |event| {
-                        settings.write().persona = event.value();
-                        has_unsaved_changes.set(true);
+                        local_settings.write().persona = event.value();
                     }
                 }
             }
@@ -150,10 +154,9 @@ pub fn SettingsPanel() -> Element {
                 textarea {
                     class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
                     rows: "4",
-                    value: "{settings.read().force_tool_use_instruction.as_deref().unwrap_or(\"\")}",
+                    value: "{local_settings.read().force_tool_use_instruction.as_deref().unwrap_or(\"\")}",
                     oninput: move |event| {
-                        settings.write().force_tool_use_instruction = Some(event.value());
-                        has_unsaved_changes.set(true);
+                        local_settings.write().force_tool_use_instruction = Some(event.value());
                     }
                 }
             }
@@ -167,7 +170,7 @@ pub fn SettingsPanel() -> Element {
                     class: "mt-1 flex items-center",
                     p {
                         class: "flex-grow px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
-                        "{settings.read().project_folder.clone().unwrap_or(\"None\".to_string())}"
+                        "{local_settings.read().project_folder.clone().unwrap_or(\"None\".to_string())}"
                     }
                     button {
                         class: "ml-2 px-4 py-2 bg-indigo-600 rounded-md text-white font-semibold hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-50 transition-colors",
@@ -179,8 +182,7 @@ pub fn SettingsPanel() -> Element {
                                     .await;
 
                                 if let Some(folder_path) = folder {
-                                    settings.write().project_folder = Some(folder_path.path().to_string_lossy().to_string());
-                                    has_unsaved_changes.set(true);
+                                    local_settings.write().project_folder = Some(folder_path.path().to_string_lossy().to_string());
                                 }
                             });
                         },
@@ -208,11 +210,10 @@ pub fn SettingsPanel() -> Element {
                         input {
                             r#type: "checkbox",
                             class: "sr-only peer",
-                            checked: settings.read().permission_settings.auto_approval_enabled,
+                            checked: local_settings.read().permission_settings.auto_approval_enabled,
                             oninput: move |event| {
                                 if let Some(checked) = event.value().parse().ok() {
-                                    settings.write().permission_settings.auto_approval_enabled = checked;
-                                    has_unsaved_changes.set(true);
+                                    local_settings.write().permission_settings.auto_approval_enabled = checked;
                                 }
                             }
                         }
@@ -221,7 +222,7 @@ pub fn SettingsPanel() -> Element {
                 }
 
                 // Granular Toggles (conditionally rendered)
-                if settings.read().permission_settings.auto_approval_enabled {
+                if local_settings.read().permission_settings.auto_approval_enabled {
                     div {
                         class: "mb-2 pl-4 border-l-2 border-gray-700",
                         
@@ -234,11 +235,10 @@ pub fn SettingsPanel() -> Element {
                                 input {
                                     r#type: "checkbox",
                                     class: "sr-only peer",
-                                    checked: settings.read().permission_settings.granular_permissions.get(&ToolCategory::Mcp).copied().unwrap_or(false),
+                                    checked: local_settings.read().permission_settings.granular_permissions.get(&ToolCategory::Mcp).copied().unwrap_or(false),
                                     oninput: move |event| {
                                         if let Some(checked) = event.value().parse().ok() {
-                                            settings.write().permission_settings.granular_permissions.insert(ToolCategory::Mcp, checked);
-                                            has_unsaved_changes.set(true);
+                                            local_settings.write().permission_settings.granular_permissions.insert(ToolCategory::Mcp, checked);
                                         }
                                     }
                                 }
@@ -253,11 +253,10 @@ pub fn SettingsPanel() -> Element {
                             input {
                                 class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm",
                                 r#type: "number",
-                                value: "{settings.read().permission_settings.max_requests}",
+                                value: "{local_settings.read().permission_settings.max_requests}",
                                 oninput: move |event| {
                                     if let Ok(val) = event.value().parse::<u32>() {
-                                        settings.write().permission_settings.max_requests = val;
-                                        has_unsaved_changes.set(true);
+                                        local_settings.write().permission_settings.max_requests = val;
                                     }
                                 }
                             }
@@ -271,11 +270,10 @@ pub fn SettingsPanel() -> Element {
                                 class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm",
                                 r#type: "number",
                                 step: "0.01",
-                                value: "{settings.read().permission_settings.max_cost}",
+                                value: "{local_settings.read().permission_settings.max_cost}",
                                 oninput: move |event| {
                                     if let Ok(val) = event.value().parse::<f64>() {
-                                        settings.write().permission_settings.max_cost = val;
-                                        has_unsaved_changes.set(true);
+                                        local_settings.write().permission_settings.max_cost = val;
                                     }
                                 }
                             }
@@ -292,16 +290,22 @@ pub fn SettingsPanel() -> Element {
                 disabled: !has_unsaved_changes(),
                 onclick: move |_| {
                     if has_unsaved_changes() {
-                        let mut settings_clone = settings.read().clone();
-                        if let Some(api_key) = settings_clone.api_key.take() {
+                        // 1. Commit the local changes to the global state
+                        let mut global_settings = settings.write();
+                        *global_settings = local_settings.read().clone();
+
+                        // 2. Perform the save operations
+                        let mut settings_to_save = global_settings.clone();
+                        if let Some(api_key) = settings_to_save.api_key.take() {
                             if let Err(e) = secure_storage::save_secret("api_key", &api_key) {
                                 tracing::error!("Failed to save API key: {}", e);
                             }
                         }
-                        if let Err(e) = settings_manager.read().save(&settings_clone) {
+                        if let Err(e) = settings_manager.read().save(&settings_to_save) {
                             tracing::error!("Failed to save settings: {}", e);
                         }
-                        has_unsaved_changes.set(false);
+                        // The `has_unsaved_changes` signal will automatically become false
+                        // because the use_effect hook will see that local and global state are now equal.
                     }
                 },
                 "Save Settings"
