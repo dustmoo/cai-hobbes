@@ -195,6 +195,15 @@ impl SessionState {
         self.get_active_session_mut()
             .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
     }
+
+    pub fn remove_message(&mut self, message_id: &uuid::Uuid) {
+        if let Some(session) = self.get_active_session_mut() {
+            if let Some(index) = session.messages.iter().position(|m| m.id == *message_id) {
+                session.messages.remove(index);
+                tracing::info!(message_id = %message_id, "Removed message from active session.");
+            }
+        }
+    }
     pub fn get_message_mut_by_execution_id(&mut self, execution_id: &str) -> Option<&mut super::components::chat::Message> {
         self.get_active_session_mut()
             .and_then(|session| session.messages.iter_mut().find(|m| {

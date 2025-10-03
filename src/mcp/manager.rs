@@ -1,8 +1,12 @@
 use dioxus::prelude::spawn;
+use rmcp::service::ClientInitializeError;
 use dioxus_signals::{Readable, Writable};
-use rmcp::model::{CallToolRequestParam, Tool};
+use rmcp::model::{CallToolRequestParam, Tool, CallToolResult};
+use reqwest::Client;
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::child_process::TokioChildProcess;
+use rmcp::transport::sse_client::SseClientTransport;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -17,7 +21,8 @@ use tokio::sync::Mutex;
 pub struct McpServerConfig {
     #[serde(default)] // Name will be injected from the map key
     pub name: String,
-    pub command: String,
+    pub command: Option<String>,
+    pub uri: Option<String>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -48,7 +53,7 @@ pub struct McpServerContext {
 
 pub struct ActiveMcpClient {
     pub config: McpServerConfig,
-    pub service: RunningService<RoleClient, ()>,
+    pub service: Arc<RunningService<RoleClient, ()>>,
     pub tools: Vec<Tool>,
 }
 
@@ -58,6 +63,7 @@ pub struct McpManager {
     pub servers: Arc<Mutex<HashMap<String, ActiveMcpClient>>>,
     permission_manager: Signal<PermissionManager>,
 }
+
 
 impl McpManager {
     pub fn new(config_path: PathBuf, permission_manager: Signal<PermissionManager>) -> Self {
@@ -118,51 +124,87 @@ impl McpManager {
 
             spawn(async move {
                 let server_name = server_config_clone.name.clone();
-                tracing::info!("Launching MCP server: {}", server_name);
-                let mut cmd = Command::new("sh");
-                let mut command_string = server_config_clone.command.clone();
+                tracing::info!("Initializing MCP server: {}", server_name);
 
-                if server_name == "filesystem" {
-                    if let Some(project_folder) = &settings_clone.project_folder {
-                        command_string.push_str(&format!(" \"{}\"", project_folder));
-                        tracing::info!("Appending project folder to filesystem MCP command: {}", command_string);
-                    }
+                // If a command is provided, launch it as a background process.
+                if let Some(command_string) = server_config_clone.command.clone() {
+                    let server_name_clone = server_name.clone();
+                    let server_config_clone_for_spawn = server_config_clone.clone();
+                    spawn(async move {
+                        let mut cmd = Command::new("sh");
+                        cmd.arg("-c").arg(&command_string);
+                        cmd.envs(&server_config_clone_for_spawn.env);
+                        // We run this as a detached process. We don't care if it fails,
+                        // as the connection logic will handle that.
+                        if let Err(e) = cmd.status().await {
+                            tracing::error!("Failed to launch command for MCP server '{}': {}", server_name_clone, e);
+                        }
+                    });
                 }
 
-                cmd.arg("-c")
-                    .arg(&command_string)
-                    .envs(&server_config_clone.env)
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped());
+                let service_result = if let Some(uri) = server_config_clone.uri.clone() {
+                    // Network-based server (SSE)
+                    tracing::info!("Connecting to network MCP server '{}' at {}", server_name, uri);
+                    match SseClientTransport::start(uri).await {
+                        Ok(transport) => ().serve(transport).await,
+                        Err(e) => Err(ClientInitializeError::transport::<SseClientTransport<Client>>(
+                            e,
+                            "Failed to start SSE client transport",
+                        )),
+                    }
+                } else {
+                    // Stdio-based server
+                    tracing::info!("Launching stdio MCP server: {}", server_name);
+                    let mut cmd = Command::new("sh");
+                    let mut command_string = server_config_clone.command.clone().unwrap_or_default();
 
-                match TokioChildProcess::new(cmd) {
-                    Ok(transport) => match ().serve(transport).await {
-                        Ok(service) => {
-                            tracing::info!("Connected to MCP server: {}", server_name);
-                            match service.list_tools(Default::default()).await {
-                                Ok(result) => {
-                                    tracing::info!("Discovered capabilities for MCP server: {}", server_name);
-                                    let active_client = ActiveMcpClient {
-                                        config: server_config_clone,
-                                        service,
-                                        tools: result.tools,
-                                    };
-                                    {
-                                        let mut servers = servers_map.lock().await;
-                                        servers.insert(server_name.clone(), active_client);
-                                    }
-
-                                    let new_context = self_clone.get_mcp_context().await;
-                                    mcp_context_signal_clone.set(new_context);
-                                    tracing::info!("Successfully added '{}' and updated MCP context.", server_name);
-                                }
-                                Err(e) => tracing::error!("Failed to list tools for '{}': {}", server_name, e),
-                            }
+                    if server_name == "filesystem" {
+                        if let Some(project_folder) = &settings_clone.project_folder {
+                            command_string.push_str(&format!(" \"{}\"", project_folder));
+                            tracing::info!("Appending project folder to filesystem MCP command: {}", command_string);
                         }
-                        Err(e) => tracing::error!("Failed to serve MCP server '{}': {}", server_name, e),
-                    },
-                    Err(e) => tracing::error!("Failed to launch MCP server '{}': {}", server_name, e),
+                    }
+
+                    cmd.arg("-c")
+                        .arg(&command_string)
+                        .envs(&server_config_clone.env)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped());
+
+                    match TokioChildProcess::new(cmd) {
+                        Ok(transport) => ().serve(transport).await,
+                        Err(e) => {
+                            tracing::error!("Failed to launch stdio MCP server '{}': {}", server_name, e);
+                            return;
+                        }
+                    }
+                };
+
+                match service_result {
+                    Ok(service) => {
+                        tracing::info!("Connected to MCP server: {}", server_name);
+                        match service.list_tools(Default::default()).await {
+                            Ok(result) => {
+                                tracing::info!("Discovered capabilities for MCP server: {}", server_name);
+                                let active_client = ActiveMcpClient {
+                                    config: server_config_clone,
+                                    service: Arc::new(service),
+                                    tools: result.tools,
+                                };
+                                {
+                                    let mut servers = servers_map.lock().await;
+                                    servers.insert(server_name.clone(), active_client);
+                                }
+
+                                let new_context = self_clone.get_mcp_context().await;
+                                mcp_context_signal_clone.set(new_context);
+                                tracing::info!("Successfully added '{}' and updated MCP context.", server_name);
+                            }
+                            Err(e) => tracing::error!("Failed to list tools for '{}': {}", server_name, e),
+                        }
+                    }
+                    Err(e) => tracing::error!("Failed to serve MCP server '{}': {}", server_name, e),
                 }
             });
         }
@@ -181,14 +223,16 @@ impl McpManager {
         tool_name: &str,
         args: serde_json::Value,
         bypass_permission_check: bool,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<UnboundedReceiver<Result<CallToolResult, String>>, String> {
         let servers_guard = self.servers.lock().await;
-        if let Some(client) = servers_guard.get(server_name) {
-            if !bypass_permission_check && !client.config.always_allow.contains(&tool_name.to_string()) {
+
+        let client_service_and_tool = if let Some(client) = servers_guard.get(server_name) {
+            if !bypass_permission_check && !client.config.always_allow.contains(&tool_name.to_string())
+            {
                 let category = Self::map_tool_to_category(tool_name);
                 let pm = self.permission_manager.read();
                 match pm.check_permission(&category) {
-                    PermissionStatus::Allowed => { /* Continue */ }
+                    PermissionStatus::Allowed => {}
                     PermissionStatus::RequiresPrompt => {
                         let tool_call = crate::components::shared::ToolCall::new(
                             server_name.to_string(),
@@ -202,35 +246,49 @@ impl McpManager {
                     }
                 }
             }
-        } else {
-            return Err(format!("Server not found: {}", server_name));
-        }
-        // Drop the lock by moving the access logic below
-        drop(servers_guard);
 
-        let servers = self.servers.lock().await;
-        if let Some(client) = servers.get(server_name) {
             if let Some(tool) = client.tools.iter().find(|t| t.name == tool_name) {
-                let arguments = if let serde_json::Value::Object(map) = args {
-                    map
-                } else {
-                    return Err("Tool arguments must be a JSON object".to_string());
-                };
-                let request = CallToolRequestParam {
-                    name: tool.name.clone(),
-                    arguments: Some(arguments),
-                };
-                match client.service.call_tool(request).await {
-                    Ok(result) => Ok(serde_json::to_value(result.content).unwrap()),
-                    Err(e) => Err(format!("Failed to use tool: {}", e)),
-                }
+                Some((client.service.clone(), tool.clone()))
             } else {
-                Err(format!("Tool not found: {}", tool_name))
+                None
             }
         } else {
-            // This case should theoretically not be reached due to the check above,
-            // but it's good practice to handle it.
-            Err(format!("Server not found: {}", server_name))
+            return Err(format!("Server not found: {}", server_name));
+        };
+
+        drop(servers_guard);
+
+        if let Some((service, tool)) = client_service_and_tool {
+            let arguments = if let serde_json::Value::Object(map) = args {
+                map
+            } else {
+                return Err("Tool arguments must be a JSON object".to_string());
+            };
+            let request = CallToolRequestParam {
+                name: tool.name.clone(),
+                arguments: Some(arguments),
+            };
+
+            let (tx, rx) = mpsc::unbounded_channel();
+
+            spawn(async move {
+                match service.call_tool(request).await {
+                    Ok(result) => {
+                        if tx.send(Ok(result)).is_err() {
+                            tracing::error!("StreamManager receiver dropped for tool result.");
+                        }
+                    }
+                    Err(e) => {
+                        if tx.send(Err(format!("Failed to use tool: {}", e))).is_err() {
+                            tracing::error!("StreamManager receiver dropped for tool error.");
+                        }
+                    }
+                }
+            });
+
+            Ok(rx)
+        } else {
+            Err(format!("Tool not found: {}", tool_name))
         }
     }
 

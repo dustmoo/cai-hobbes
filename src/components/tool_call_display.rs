@@ -169,16 +169,38 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                             let tool_call = tool_call.clone();
                             async move {
                                 let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
-                                let result = mcp_manager.write().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, true).await;
+                                let result_receiver = mcp_manager.write().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, true).await;
 
                                 let mut state = session_state.write();
                                 if let Some(msg) = state.get_message_mut_by_execution_id(&tool_call.execution_id) {
                                      if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
                                         let mut updated_tc = tc.clone();
-                                        match result {
-                                            Ok(response) => {
-                                                updated_tc.status = ToolCallStatus::Completed;
-                                                updated_tc.response = serde_json::to_string_pretty(&response).unwrap_or_default();
+                                        match result_receiver {
+                                            Ok(mut receiver) => {
+                                                let mut aggregated_content: Vec<rmcp::model::Content> = Vec::new();
+                                                let mut final_status = ToolCallStatus::Completed;
+                                                let mut error_string = None;
+
+                                                while let Some(result) = receiver.recv().await {
+                                                    match result {
+                                                        Ok(call_tool_result) => {
+                                                            aggregated_content.extend(call_tool_result.content);
+                                                        }
+                                                        Err(e) => {
+                                                            final_status = ToolCallStatus::Error;
+                                                            error_string = Some(e);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+
+                                                updated_tc.status = final_status;
+                                                if final_status == ToolCallStatus::Error {
+                                                    updated_tc.response = error_string.unwrap_or_default();
+                                                } else {
+                                                    let final_json = serde_json::to_value(aggregated_content).unwrap_or(serde_json::Value::Null);
+                                                    updated_tc.response = serde_json::to_string_pretty(&final_json).unwrap_or_default();
+                                                }
                                             },
                                             Err(e) => {
                                                 updated_tc.status = ToolCallStatus::Error;

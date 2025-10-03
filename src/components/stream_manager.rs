@@ -14,6 +14,7 @@ use super::continuation_controller::ContinuationController;
 #[derive(Clone, Copy)]
 pub struct StreamManagerContext {
     stream_receivers: Signal<HashMap<Uuid, UnboundedReceiver<StreamMessage>>>,
+    active_stream_handles: Signal<HashMap<Uuid, Task>>,
     session_state: Signal<SessionState>,
     mcp_manager: Signal<crate::mcp::manager::McpManager>,
     document_store: Signal<Option<Arc<DocumentStore>>>,
@@ -33,7 +34,7 @@ impl StreamManagerContext {
         model: String,
         message_id: Uuid,
         prompt_data: crate::context::prompt_builder::LlmPrompt,
-        on_complete: impl FnOnce() + Send + 'static,
+        on_complete: impl FnOnce() + 'static,
         mcp_context: Option<crate::mcp::manager::McpContext>,
     ) {
         tracing::info!(message_id = %message_id, "'start_stream' entered.");
@@ -45,7 +46,7 @@ impl StreamManagerContext {
         *self.stream_activity.write() += 1;
 
         // Spawn a master task to manage the LLM call and state updates.
-        spawn(async move {
+        let master_task_handle = spawn(async move {
             tracing::info!(message_id = %message_id, "Stream master task SPAWNED.");
             let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<StreamMessage>();
 
@@ -99,13 +100,38 @@ impl StreamManagerContext {
                         let tool_results_tx_clone = tool_results_tx.clone();
                         spawn(async move {
                             let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
-                            let result = mcp_manager.read().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, false).await;
+                            let result_receiver = mcp_manager.read().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, false).await;
 
-                            let mut state = session_state.write();
-                            let (status, response_str) = match result {
-                                Ok(response) => (ToolCallStatus::Completed, serde_json::to_string_pretty(&response).unwrap_or_default()),
+                            let (status, response_str) = match result_receiver {
+                                Ok(mut receiver) => {
+                                    let mut aggregated_content: Vec<rmcp::model::Content> = Vec::new();
+                                    let mut final_status = ToolCallStatus::Completed;
+                                    let mut error_string = None;
+
+                                    while let Some(result) = receiver.recv().await {
+                                        match result {
+                                            Ok(call_tool_result) => {
+                                                aggregated_content.extend(call_tool_result.content);
+                                            }
+                                            Err(e) => {
+                                                final_status = ToolCallStatus::Error;
+                                                error_string = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if final_status == ToolCallStatus::Error {
+                                        (final_status, error_string.unwrap_or_default())
+                                    } else {
+                                        let final_json = serde_json::to_value(aggregated_content).unwrap_or(serde_json::Value::Null);
+                                        (final_status, serde_json::to_string_pretty(&final_json).unwrap_or_default())
+                                    }
+                                }
                                 Err(e) => (ToolCallStatus::Error, e),
                             };
+                            
+                            let mut state = session_state.write();
 
                             if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
                                 if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
@@ -184,7 +210,36 @@ impl StreamManagerContext {
             summarizer.summarize_and_cleanup(&mut self.session_state.write(), &settings).await;
             on_complete();
             tracing::info!(message_id = %message_id, "Completion signal SENT.");
+
+            // Remove the handle from the map upon completion
+            self.active_stream_handles.write().remove(&message_id);
+            tracing::info!(message_id = %message_id, "Active stream handle removed.");
         });
+
+        // Store the handle so we can abort it if needed
+        self.active_stream_handles.write().insert(message_id, master_task_handle);
+    }
+
+    pub fn cancel_stream(mut self, message_id: &Uuid) {
+        tracing::info!(message_id = %message_id, "Attempting to cancel stream.");
+        
+        // 1. Remove and abort the task handle
+        if let Some(handle) = self.active_stream_handles.write().remove(message_id) {
+            handle.cancel();
+            tracing::info!(message_id = %message_id, "Aborted stream task handle.");
+        }
+
+        // 2. Remove the message from the session state
+        self.session_state.write().remove_message(message_id);
+
+        // 3. Remove the stream receiver
+        if self.stream_receivers.write().remove(message_id).is_some() {
+            tracing::info!(message_id = %message_id, "Removed stream receiver.");
+        } else {
+            tracing::warn!(message_id = %message_id, "No stream receiver found to remove.");
+        }
+        
+        tracing::info!(message_id = %message_id, "Stream cancellation process complete.");
     }
 
     pub fn take_stream(mut self, message_id: &Uuid) -> Option<UnboundedReceiver<StreamMessage>> {
@@ -213,6 +268,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
     let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
     let context = use_hook(|| StreamManagerContext {
         stream_receivers: Signal::new(HashMap::new()),
+        active_stream_handles: Signal::new(HashMap::new()),
         session_state,
         mcp_manager,
         document_store,
@@ -247,6 +303,7 @@ mod tests {
             let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
             let mut stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
+                active_stream_handles: Signal::new(HashMap::new()),
                 session_state,
                 mcp_manager,
                 document_store,
@@ -293,6 +350,7 @@ mod tests {
             let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
             let stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
+                active_stream_handles: Signal::new(HashMap::new()),
                 session_state,
                 mcp_manager,
                 document_store,

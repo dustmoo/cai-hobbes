@@ -21,6 +21,7 @@ dependencies = [
  "futures",
  "futures-util",
  "global-hotkey",
+ "http",
  "image",
  "lazy_static",
  "macos-accessibility-client",
@@ -6660,20 +6661,23 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f521fbd040eba82684b17d787d423f43afb6e97974029b51f679157a589592a"
+checksum = "534fd1cd0601e798ac30545ff2b7f4a62c6f14edd4aaed1cc5eb1e85f69f09af"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "http",
  "paste",
  "pin-project-lite",
  "process-wrap",
+ "reqwest",
  "rmcp-macros",
  "schemars",
  "serde",
  "serde_json",
+ "sse-stream",
  "thiserror 2.0.15",
  "tokio",
  "tokio-stream",
@@ -6683,9 +6687,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c162bf8a2846f70464ded6dda6430b60d1e2fb4b0e371f0906e39f63916641b9"
+checksum = "9ba777eb0e5f53a757e36f0e287441da0ab766564ba7201600eeb92a4753022e"
 dependencies = [
  "darling 0.21.2",
  "proc-macro2",
@@ -7349,6 +7353,19 @@ dependencies = [
  "nom 7.1.3",
  "serde",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb4dc4d33c68ec1f27d386b5610a351922656e1fdf5c05bbaad930cd1519479a"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]

@@ -11,9 +11,8 @@ use super::shared::MessageContent;
 const INITIAL_MESSAGES_TO_SHOW: usize = 20;
 
 #[component]
-pub fn MessageList(stream_update_trigger: Signal<i32>) -> Element {
+pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signal<bool>) -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let show_scroll_button = use_signal(|| false);
     let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     let _ = stream_update_trigger.read();
 
@@ -24,9 +23,9 @@ pub fn MessageList(stream_update_trigger: Signal<i32>) -> Element {
                 id: "message-list",
                 class: "overflow-y-auto p-4 space-y-4 h-full",
                 onscroll: move |_| {
-                    let mut show_scroll_button = show_scroll_button.clone();
-                    let mut visible_message_count = visible_message_count.clone();
-                    let session_state = session_state.clone();
+                    let mut show_scroll_button = show_scroll_button;
+                    let mut visible_message_count = visible_message_count;
+                    let session_state = session_state;
 
                     spawn(async move {
                         let scroll_info = if let Ok(result) = document::eval(r#"
@@ -47,7 +46,13 @@ pub fn MessageList(stream_update_trigger: Signal<i32>) -> Element {
                         let is_at_top = scroll_info.get("isAtTop").unwrap().as_bool().unwrap_or(false);
                         let is_at_bottom = scroll_info.get("isAtBottom").unwrap().as_bool().unwrap_or(true);
 
-                        show_scroll_button.set(!is_at_bottom);
+                        // The parent now controls visibility on content change.
+                        // This handler just hides the button if the user scrolls down manually.
+                        if is_at_bottom {
+                            show_scroll_button.set(false);
+                        } else {
+                            show_scroll_button.set(true);
+                        }
 
                         if is_at_top {
                             let total_messages = session_state.read().get_active_session().map_or(0, |s| s.messages.len());

@@ -6,7 +6,7 @@ use std::rc::Rc;
 use dioxus::html::geometry::euclid::Rect;
 use std::time::Duration;
 use tokio::time::sleep;
-use crate::components::stream_manager::StreamManagerContext;
+use crate::{components::stream_manager::StreamManagerContext, processing::conversation_processor::ConversationProcessor};
 use lazy_static::lazy_static;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{ThemeSet, Theme};
@@ -40,17 +40,19 @@ pub struct Message {
 pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interaction: EventHandler<()>, on_toggle_sessions: EventHandler<()>, on_toggle_settings: EventHandler<()>) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let settings = use_context::<Signal<Settings>>();
-    let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
+    let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let draft = use_signal(|| "".to_string());
     use_context_provider(|| draft);
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
-    let is_sending = use_signal(|| false);
+    let mut is_sending = use_signal(|| false);
     let stream_manager = consume_context::<StreamManagerContext>();
+    let active_message_id = use_signal(|| None::<Uuid>);
     let mut continuation_controller = consume_context::<Signal<ContinuationController>>();
     let mut is_initial_load = use_signal(|| true);
     let mut last_session_id = use_signal(|| session_state.read().active_session_id.clone());
     let stream_update_trigger = use_signal(|| 0);
+    let mut show_scroll_button = use_signal(|| false);
 
 
     // Effect to report content size changes, scroll, and attach JS controls
@@ -86,7 +88,6 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     true // Also default to true if the eval fails.
                 };
 
-
                 // On the very first load, we always scroll to the bottom.
                 // On subsequent loads, we only scroll if the user was already near the bottom.
                 if is_session_switch || *is_initial_load.read() || is_near_bottom {
@@ -98,6 +99,22 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         is_initial_load.set(false);
                     }
                 }
+
+                // After scrolling, check if the scroll button should be visible.
+                let show_button = if let Ok(result) = document::eval(r#"
+                    const el = document.getElementById('message-list');
+                    if (el) {
+                        // Show button if not at the bottom (with a small threshold)
+                        return el.scrollHeight - el.scrollTop - el.clientHeight > 10;
+                    }
+                    return false; // Don't show if element doesn't exist
+                "#).await {
+                    result.as_bool().unwrap_or(false)
+                } else {
+                    false
+                };
+                show_scroll_button.set(show_button);
+
                 // Finally, notify the parent component of the new content size.
                 if let Ok(rect) = element.get_client_rect().await {
                     on_content_resize.call(rect.cast_unit());
@@ -146,6 +163,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         let is_sending = is_sending;
         let stream_manager = stream_manager;
         let settings = settings;
+        let active_message_id = active_message_id;
 
         move |prompt_data: crate::context::prompt_builder::LlmPrompt, mcp_context: Option<crate::mcp::manager::McpContext>, hobbes_message_id: Uuid| {
             spawn(async move {
@@ -153,14 +171,20 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 let mut is_sending = is_sending;
                 let stream_manager = stream_manager;
                 let settings = settings.read().clone();
+                let mut active_message_id = active_message_id;
 
                 is_sending.set(true);
+                active_message_id.set(Some(hobbes_message_id));
                 tracing::info!("Lock ACQUIRED.");
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<()>();
 
-                let on_complete = move || {
-                    let _ = tx.send(());
+                let on_complete = {
+                    let mut active_message_id = active_message_id;
+                    move || {
+                        active_message_id.set(None);
+                        let _ = tx.send(());
+                    }
                 };
 
                 stream_manager.start_stream(
@@ -180,6 +204,80 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         }
     };
 
+    let send_message = move |user_message: String| {
+        spawn(async move {
+            let mut session_state = session_state;
+            let settings = settings.read().clone();
+            let mcp_manager = mcp_manager;
+            let send_prompt_to_llm = send_prompt_to_llm;
+
+            let hobbes_message_id = Uuid::new_v4();
+            {
+                let mut state = session_state.write();
+                if state.active_session_id.is_empty() {
+                    state.create_session();
+                }
+                if let Some(session) = state.get_active_session_mut() {
+                    session.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        author: "User".to_string(),
+                        content: MessageContent::Text(user_message.clone()),
+                    });
+                    session.messages.push(Message {
+                        id: hobbes_message_id,
+                        author: "Hobbes".to_string(),
+                        content: MessageContent::Text("".to_string()),
+                    });
+                }
+            }
+
+            let prompt_data = {
+                let mcp_context = mcp_manager.read().get_mcp_context().await;
+                let (user_prompt, conversation_summary) = {
+                    let mut session_for_processing =
+                        session_state.read().get_active_session().cloned().unwrap();
+                    let processor = ConversationProcessor::new();
+                    let prompt = processor
+                        .process_and_respond(&mut session_for_processing, &settings)
+                        .await;
+                    (prompt, session_for_processing.active_context.conversation_summary)
+                };
+
+                {
+                    let mut state = session_state.write();
+                    if let Some(session) = state.get_active_session_mut() {
+                        session.active_context.conversation_summary = conversation_summary;
+                        if !mcp_context.servers.is_empty() {
+                            session.active_context.mcp_tools = Some(mcp_context);
+                        }
+                    }
+                }
+
+                let state = session_state.read();
+                let session = state.get_active_session().unwrap();
+                let builder = PromptBuilder::new(session, &settings, &state);
+                builder.build_prompt(user_prompt, None)
+            };
+
+            if let Err(e) = session_state.read().save() {
+                tracing::error!("Failed to save session state: {}", e);
+            }
+
+            let mcp_context = session_state
+                .read()
+                .get_active_session()
+                .and_then(|s| s.active_context.mcp_tools.clone());
+            send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
+        });
+    };
+
+    let mut cancel_message = move || {
+        if let Some(id) = *active_message_id.read() {
+            stream_manager.cancel_stream(&id);
+        }
+        is_sending.set(false);
+    };
+
     let continue_prompt_flow = {
         let session_state = session_state;
         let settings = settings;
@@ -195,7 +293,6 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 {
                     let mut state = session_state.write();
                     if let Some(session) = state.get_active_session_mut() {
-                        // Add the new empty message bubble for the continued response.
                         session.messages.push(Message {
                             id: hobbes_message_id,
                             author: "Hobbes".to_string(),
@@ -208,7 +305,6 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     let state = session_state.read();
                     let session = state.get_active_session().unwrap();
                     let builder = PromptBuilder::new(session, &settings, &state);
-                    // IMPORTANT: We pass an empty user message for continuations.
                     builder.build_prompt("".to_string(), None)
                 };
 
@@ -222,7 +318,6 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         })
     };
 
-    // Effect to register the continuation callback with the controller.
     use_effect(move || {
         continuation_controller.write().register_callback(continue_prompt_flow.clone());
     });
@@ -235,8 +330,12 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             onmounted: move |cx| container_element.set(Some(cx.data())),
             MessageList {
                 stream_update_trigger: stream_update_trigger,
+                show_scroll_button: show_scroll_button,
             },
             ChatInput {
+                is_sending: is_sending,
+                on_send: move |msg| send_message(msg),
+                on_cancel: move |_| cancel_message(),
                 on_interaction: on_interaction,
                 on_toggle_sessions: on_toggle_sessions,
                 on_toggle_settings: on_toggle_settings,
@@ -307,7 +406,7 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
                 }
             }
             pre {
-                class: "p-4 text-sm whitespace-pre-wrap break-words",
+                class: "w-full max-w-none p-4 text-sm whitespace-pre-wrap break-words overflow-x-auto",
                 code {
                     class: "language-{lang}",
                     dangerous_inner_html: "{highlighted_html}"

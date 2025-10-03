@@ -26,7 +26,7 @@ fn main() {
     // Try to load .env file for developer convenience.
     dotenv().ok();
     tracing::info!("Attempted to load .env file from the environment.");
-    dioxus_logger::init(tracing::Level::DEBUG).expect("failed to init logger");
+    dioxus_logger::init(tracing::Level::INFO).expect("failed to init logger");
 
     #[cfg(target_os = "macos")]
     permissions::check_and_prompt_for_accessibility();
