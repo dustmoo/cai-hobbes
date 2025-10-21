@@ -126,23 +126,22 @@ impl McpManager {
                 let server_name = server_config_clone.name.clone();
                 tracing::info!("Initializing MCP server: {}", server_name);
 
-                // If a command is provided, launch it as a background process.
-                if let Some(command_string) = server_config_clone.command.clone() {
-                    let server_name_clone = server_name.clone();
-                    let server_config_clone_for_spawn = server_config_clone.clone();
-                    spawn(async move {
-                        let mut cmd = Command::new("sh");
-                        cmd.arg("-c").arg(&command_string);
-                        cmd.envs(&server_config_clone_for_spawn.env);
-                        // We run this as a detached process. We don't care if it fails,
-                        // as the connection logic will handle that.
-                        if let Err(e) = cmd.status().await {
-                            tracing::error!("Failed to launch command for MCP server '{}': {}", server_name_clone, e);
-                        }
-                    });
-                }
-
                 let service_result = if let Some(uri) = server_config_clone.uri.clone() {
+                    // If a command is provided for a network server, launch it as a background process.
+                    if let Some(command_string) = server_config_clone.command.clone() {
+                        let server_name_clone = server_name.clone();
+                        let server_config_clone_for_spawn = server_config_clone.clone();
+                        spawn(async move {
+                            let mut cmd = Command::new("sh");
+                            cmd.arg("-c").arg(&command_string);
+                            cmd.envs(&server_config_clone_for_spawn.env);
+                            // We run this as a detached process. We don't care if it fails,
+                            // as the connection logic will handle that.
+                            if let Err(e) = cmd.status().await {
+                                tracing::error!("Failed to launch command for MCP server '{}': {}", server_name_clone, e);
+                            }
+                        });
+                    }
                     // Network-based server (SSE)
                     tracing::info!("Connecting to network MCP server '{}' at {}", server_name, uri);
                     match SseClientTransport::start(uri).await {

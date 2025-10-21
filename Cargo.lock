@@ -4,9 +4,10 @@ version = 4
 
 [[package]]
 name = "Hobbes"
-version = "0.6.1"
+version = "0.7.4"
 dependencies = [
  "ammonia",
+ "base64 0.22.1",
  "cfg-if",
  "chrono",
  "dioxus",
@@ -21,6 +22,7 @@ dependencies = [
  "futures",
  "futures-util",
  "global-hotkey",
+ "hobbes_core",
  "http",
  "image",
  "lazy_static",
@@ -3471,6 +3473,9 @@ dependencies = [
 [[package]]
 name = "hobbes_core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "home"

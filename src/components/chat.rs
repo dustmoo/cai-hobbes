@@ -6,7 +6,7 @@ use std::rc::Rc;
 use dioxus::html::geometry::euclid::Rect;
 use std::time::Duration;
 use tokio::time::sleep;
-use crate::{components::stream_manager::StreamManagerContext, processing::conversation_processor::ConversationProcessor};
+use crate::{components::stream_manager::StreamManagerContext};
 use lazy_static::lazy_static;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{ThemeSet, Theme};
@@ -15,12 +15,13 @@ use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
 use feature_clipboard::copy_to_clipboard;
 use crate::context::prompt_builder::PromptBuilder;
 use serde::{Deserialize, Serialize};
-use crate::settings::Settings;
+use crate::{settings::Settings};
+use hobbes_core::models::Attachment;
 use super::shared::{MessageContent, StreamMessage};
 use super::continuation_controller::ContinuationController;
 use super::chat_input::ChatInput;
 use super::message_list::MessageList;
-use super::markdown_renderer::MarkdownRenderer;
+use crate::components::markdown_renderer::MarkdownRenderer;
 
 lazy_static! {
     static ref SYNTAX_SET: SyntaxSet = SyntaxSet::load_defaults_newlines();
@@ -33,19 +34,19 @@ pub struct Message {
     pub id: uuid::Uuid,
     pub author: String,
     pub content: MessageContent,
+    pub attachments: Vec<Attachment>,
 }
 
 // The main ChatWindow component
 #[component]
 pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interaction: EventHandler<()>, on_toggle_sessions: EventHandler<()>, on_toggle_settings: EventHandler<()>) -> Element {
-    let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let session_state = consume_context::<Signal<crate::session::SessionState>>();
     let settings = use_context::<Signal<Settings>>();
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
-    let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let draft = use_signal(|| "".to_string());
     use_context_provider(|| draft);
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
-    let mut is_sending = use_signal(|| false);
     let stream_manager = consume_context::<StreamManagerContext>();
     let active_message_id = use_signal(|| None::<Uuid>);
     let mut continuation_controller = consume_context::<Signal<ContinuationController>>();
@@ -62,10 +63,12 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         let _ = stream_update_trigger.read();
         let current_session_id = session_state.read().active_session_id.clone();
         let mut is_session_switch = false;
-        if current_session_id != *last_session_id.read() {
-            is_session_switch = true;
-            last_session_id.set(current_session_id);
-        }
+        last_session_id.with_mut(|last_id| {
+            if current_session_id != *last_id {
+                is_session_switch = true;
+                *last_id = current_session_id;
+            }
+        });
 
         if let Some(element) = container_element.read().clone() {
             spawn(async move {
@@ -124,17 +127,6 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
 
     });
 
-    // Effect to update session state with MCP context when it changes
-    use_effect(move || {
-        let mcp_context_reader = mcp_context.read();
-        if !mcp_context_reader.servers.is_empty() {
-            let mut state = session_state.write();
-            if let Some(session) = state.get_active_session_mut() {
-                session.active_context.mcp_tools = Some(mcp_context_reader.clone());
-                tracing::info!("MCP context reactively loaded into session state.");
-            }
-        }
-    });
 
     // Effect to restore cursor position after re-renders
     use_effect(move || {
@@ -160,7 +152,6 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     // Reusable closure for sending a message
     let send_prompt_to_llm = {
         // Capture signals which are all `Copy`
-        let is_sending = is_sending;
         let stream_manager = stream_manager;
         let settings = settings;
         let active_message_id = active_message_id;
@@ -168,12 +159,10 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         move |prompt_data: crate::context::prompt_builder::LlmPrompt, mcp_context: Option<crate::mcp::manager::McpContext>, hobbes_message_id: Uuid| {
             spawn(async move {
                 // Now clone/read them inside the async block
-                let mut is_sending = is_sending;
                 let stream_manager = stream_manager;
                 let settings = settings.read().clone();
                 let mut active_message_id = active_message_id;
 
-                is_sending.set(true);
                 active_message_id.set(Some(hobbes_message_id));
                 tracing::info!("Lock ACQUIRED.");
 
@@ -198,13 +187,12 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 rx.recv().await;
                 tracing::info!(message_id = %hobbes_message_id, "Stream completion signal RECEIVED.");
 
-                is_sending.set(false);
                 tracing::info!("Lock RELEASED.");
             });
         }
     };
 
-    let send_message = move |user_message: String| {
+    let send_message = move |(user_message, attachments): (String, Vec<Attachment>)| {
         spawn(async move {
             let mut session_state = session_state;
             let settings = settings.read().clone();
@@ -222,26 +210,21 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         id: Uuid::new_v4(),
                         author: "User".to_string(),
                         content: MessageContent::Text(user_message.clone()),
+                        attachments,
                     });
                     session.messages.push(Message {
                         id: hobbes_message_id,
                         author: "Hobbes".to_string(),
                         content: MessageContent::Text("".to_string()),
+                        attachments: Vec::new(),
                     });
                 }
             }
 
             let prompt_data = {
                 let mcp_context = mcp_manager.read().get_mcp_context().await;
-                let (user_prompt, conversation_summary) = {
-                    let mut session_for_processing =
-                        session_state.read().get_active_session().cloned().unwrap();
-                    let processor = ConversationProcessor::new();
-                    let prompt = processor
-                        .process_and_respond(&mut session_for_processing, &settings)
-                        .await;
-                    (prompt, session_for_processing.active_context.conversation_summary)
-                };
+                let user_prompt = user_message.clone();
+                let conversation_summary = session_state.read().get_active_session().unwrap().active_context.conversation_summary.clone();
 
                 {
                     let mut state = session_state.write();
@@ -271,11 +254,10 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         });
     };
 
-    let mut cancel_message = move || {
+    let cancel_message = move || {
         if let Some(id) = *active_message_id.read() {
             stream_manager.cancel_stream(&id);
         }
-        is_sending.set(false);
     };
 
     let continue_prompt_flow = {
@@ -297,6 +279,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                             id: hobbes_message_id,
                             author: "Hobbes".to_string(),
                             content: MessageContent::Text("".to_string()),
+                            attachments: Vec::new(),
                         });
                     }
                 }
@@ -333,8 +316,8 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 show_scroll_button: show_scroll_button,
             },
             ChatInput {
-                is_sending: is_sending,
-                on_send: move |msg| send_message(msg),
+                is_sending: stream_manager.is_sending,
+                on_send: move |(msg, attachments)| send_message((msg, attachments)),
                 on_cancel: move |_| cancel_message(),
                 on_interaction: on_interaction,
                 on_toggle_sessions: on_toggle_sessions,
@@ -480,6 +463,24 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>) -> E
                         } else {
                             MarkdownRenderer {
                                 content: content.read().clone()
+                            }
+                        }
+                        if !message.attachments.is_empty() {
+                            div {
+                                class: "mt-2 flex flex-wrap gap-2",
+                                for attachment in &message.attachments {
+                                    if attachment.mime_type.starts_with("image/") {
+                                        img {
+                                            class: "max-w-xs rounded-lg",
+                                            src: "data:{attachment.mime_type};base64,{attachment.data}"
+                                        }
+                                    } else {
+                                        div {
+                                            class: "bg-gray-800 p-2 rounded text-sm text-gray-300",
+                                            "{attachment.file_name}"
+                                        }
+                                    }
+                                }
                             }
                         }
                         if !content.read().is_empty() {

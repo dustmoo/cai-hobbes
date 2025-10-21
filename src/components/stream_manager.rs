@@ -11,6 +11,8 @@ use std::sync::Arc;
 use crate::settings::Settings;
 use super::continuation_controller::ContinuationController;
 
+use crate::processing::summarization_scheduler::SchedulerSignal;
+
 #[derive(Clone, Copy)]
 pub struct StreamManagerContext {
     stream_receivers: Signal<HashMap<Uuid, UnboundedReceiver<StreamMessage>>>,
@@ -21,7 +23,9 @@ pub struct StreamManagerContext {
     tool_call_summarizer: Signal<ToolCallSummarizer>,
     settings: Signal<Settings>,
     continuation_controller: Signal<ContinuationController>,
+    scheduler: Coroutine<SchedulerSignal>,
     pub stream_activity: Signal<u64>,
+    pub is_sending: Signal<bool>,
 }
 
 impl StreamManagerContext {
@@ -37,6 +41,7 @@ impl StreamManagerContext {
         on_complete: impl FnOnce() + 'static,
         mcp_context: Option<crate::mcp::manager::McpContext>,
     ) {
+        self.is_sending.set(true);
         tracing::info!(message_id = %message_id, "'start_stream' entered.");
         // Create a channel for the MessageBubble to receive chunks.
         let (stream_tx, stream_rx) = mpsc::unbounded_channel::<StreamMessage>();
@@ -88,6 +93,7 @@ impl StreamManagerContext {
                                         id: new_id,
                                         author: "Hobbes".to_string(),
                                         content: crate::components::shared::MessageContent::ToolCall(tool_call.clone()),
+                                        attachments: Vec::new(),
                                     });
                                 }
                                 new_id
@@ -209,6 +215,8 @@ impl StreamManagerContext {
             let summarizer = self.tool_call_summarizer.read();
             summarizer.summarize_and_cleanup(&mut self.session_state.write(), &settings).await;
             on_complete();
+            self.is_sending.set(false);
+            self.scheduler.send(SchedulerSignal::Activity);
             tracing::info!(message_id = %message_id, "Completion signal SENT.");
 
             // Remove the handle from the map upon completion
@@ -239,6 +247,7 @@ impl StreamManagerContext {
             tracing::warn!(message_id = %message_id, "No stream receiver found to remove.");
         }
         
+        self.is_sending.set(false);
         tracing::info!(message_id = %message_id, "Stream cancellation process complete.");
     }
 
@@ -266,6 +275,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
     let document_store = use_context_provider(|| Signal::new(None));
     let settings = consume_context::<Signal<Settings>>();
     let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
+    let scheduler = use_context::<Coroutine<SchedulerSignal>>();
     let context = use_hook(|| StreamManagerContext {
         stream_receivers: Signal::new(HashMap::new()),
         active_stream_handles: Signal::new(HashMap::new()),
@@ -275,7 +285,9 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
         settings,
         continuation_controller,
+        scheduler,
         stream_activity: Signal::new(0),
+        is_sending: Signal::new(false),
     });
 
     // Provide the context to children.
@@ -311,6 +323,7 @@ mod tests {
                 settings,
                 continuation_controller,
                 stream_activity: Signal::new(0),
+                is_sending: Signal::new(false),
             });
 
             let message_id = Uuid::new_v4();
@@ -358,6 +371,7 @@ mod tests {
                 settings,
                 continuation_controller,
                 stream_activity: Signal::new(0),
+                is_sending: Signal::new(false),
             });
 
             let message_id = Uuid::new_v4();

@@ -22,6 +22,7 @@ pub fn MarkdownRenderer(content: String) -> Element {
             Paragraph(Vec<Inline>),
             List(Vec<ListItem>),
             CodeBlock { lang: String, code: String },
+            Table { headers: Vec<Vec<Inline>>, rows: Vec<Vec<Vec<Inline>>> },
         }
 
         #[derive(Debug, Clone)]
@@ -64,6 +65,8 @@ pub fn MarkdownRenderer(content: String) -> Element {
         let mut link_text_buffer = String::new();
         let mut in_link = false;
 
+       let mut in_table_header = false;
+
         let flush_inlines_to_paragraph = |inlines: &mut Vec<Inline>, blocks: &mut Vec<Block>| {
             if !inlines.is_empty() {
                 blocks.push(Block::Paragraph(std::mem::take(inlines)));
@@ -79,6 +82,43 @@ pub fn MarkdownRenderer(content: String) -> Element {
             };
 
             match event {
+               Event::Start(Tag::Table(_)) => {
+                   flush_inlines_to_paragraph(&mut current_inlines, current_blocks);
+                   current_blocks.push(Block::Table { headers: Vec::new(), rows: Vec::new() });
+               },
+               Event::Start(Tag::TableHead) => {
+                   in_table_header = true;
+               },
+               Event::Start(Tag::TableRow) => {
+                   if !in_table_header {
+                       if let Some(Block::Table { rows, .. }) = current_blocks.last_mut() {
+                           rows.push(Vec::new());
+                       }
+                   }
+               },
+               Event::Start(Tag::TableCell) => {
+                   current_inlines.clear();
+               },
+               Event::End(TagEnd::TableCell) => {
+                   if let Some(Block::Table { headers, rows, .. }) = current_blocks.last_mut() {
+                       if in_table_header {
+                           headers.push(std::mem::take(&mut current_inlines));
+                       } else {
+                           if let Some(last_row) = rows.last_mut() {
+                               last_row.push(std::mem::take(&mut current_inlines));
+                           }
+                       }
+                   }
+               },
+               Event::End(TagEnd::TableRow) => {
+                   // Handled by cell logic
+               },
+               Event::End(TagEnd::TableHead) => {
+                   in_table_header = false;
+               },
+               Event::End(TagEnd::Table) => {
+                   // Handled by cell logic
+               },
                 Event::Start(Tag::Paragraph) => {
                     flush_inlines_to_paragraph(&mut current_inlines, current_blocks);
                 },
@@ -250,10 +290,46 @@ pub fn MarkdownRenderer(content: String) -> Element {
                 Block::CodeBlock { lang, code } => rsx! {
                     CodeBlock { lang: lang, code: code }
                 },
-            }
-        }
+               Block::Table { headers, rows } => rsx! {
+                  div {
+                      class: "overflow-x-auto",
+                      table {
+                          class: "table-auto w-full my-4",
+                          thead {
+                              class: "bg-gray-800",
+                              tr {
+                                  for header_cell in headers {
+                                      th {
+                                          class: "px-4 py-2 text-left font-semibold",
+                                          for inline in header_cell {
+                                              {render_inline(inline)}
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                          tbody {
+                              for row in rows {
+                                  tr {
+                                      class: "border-b border-gray-700",
+                                      for cell in row {
+                                          td {
+                                              class: "px-4 py-2",
+                                              for inline in cell {
+                                                  {render_inline(inline)}
+                                              }
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+           }
+       }
 
-        blocks.into_iter().map(render_block).collect::<Vec<_>>()
+       blocks.into_iter().map(render_block).collect::<Vec<_>>()
     };
 
     rsx! {

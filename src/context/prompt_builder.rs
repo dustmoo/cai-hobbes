@@ -1,4 +1,4 @@
-use crate::components::llm::{Content, FunctionCallPart, FunctionResponsePart, Part, SystemInstruction};
+use crate::components::llm::{Content, FunctionCallPart, FunctionResponsePart, InlineDataPart, Part, SystemInstruction};
 use crate::session::{Session, Tool};
 use crate::settings::Settings;
 use chrono::Utc;
@@ -10,10 +10,18 @@ impl From<Message> for Content {
     fn from(msg: Message) -> Self {
         let role = if msg.author == "User" { "user" } else { "model" }.to_string();
         match msg.content {
-            MessageContent::Text(text) => Content {
-                role,
-                parts: vec![Part { text: Some(text), ..Default::default() }],
-            },
+            MessageContent::Text(text) => {
+                let mut parts = vec![Part::Text { text }];
+                for attachment in msg.attachments {
+                    parts.push(Part::InlineData {
+                        inline_data: InlineDataPart {
+                            mime_type: attachment.mime_type,
+                            data: attachment.data,
+                        },
+                    });
+                }
+                Content { role, parts }
+            }
             MessageContent::ToolCall(_) => {
                 // Tool calls are handled separately in the tool_call_history loop.
                 // Return empty parts so this message is filtered out from the main history.
@@ -68,7 +76,7 @@ impl<'a> PromptBuilder<'a> {
                         }
                         
                         // Next, recursively remove any unsupported keys from the schema.
-                        recursively_remove_keys(&mut tool_value, &["exclusiveMaximum", "exclusiveMinimum", "$schema", "additionalProperties", "outputSchema"]);
+                        recursively_remove_keys(&mut tool_value, &["exclusiveMaximum", "exclusiveMinimum", "$schema", "additionalProperties", "outputSchema", "annotations"]);
 
                         function_declarations.push(tool_value);
                     }
@@ -129,7 +137,7 @@ impl<'a> PromptBuilder<'a> {
         let instruction_text = serde_json::to_string(&system_context_map).unwrap_or_default();
         let system_instruction = if !instruction_text.is_empty() && instruction_text != "{}" {
             Some(SystemInstruction {
-                parts: vec![Part { text: Some(instruction_text), ..Default::default() }],
+                parts: vec![Part::Text { text: instruction_text }],
             })
         } else {
             None
@@ -170,12 +178,11 @@ impl<'a> PromptBuilder<'a> {
             let args_value: serde_json::Value = serde_json::from_str(&record.call.arguments).unwrap_or_default();
             contents.push(Content {
                 role: "model".to_string(),
-                parts: vec![Part {
-                    function_call: Some(FunctionCallPart {
+                parts: vec![Part::FunctionCall {
+                    function_call: FunctionCallPart {
                         name: record.call.tool_name.clone(),
                         args: args_value,
-                    }),
-                    ..Default::default()
+                    },
                 }],
             });
 
@@ -184,12 +191,11 @@ impl<'a> PromptBuilder<'a> {
                 .unwrap_or_else(|_| json!(record.result.response));
             contents.push(Content {
                 role: "user".to_string(), // As per docs, the tool response is from the 'user'
-                parts: vec![Part {
-                    function_response: Some(FunctionResponsePart {
+                parts: vec![Part::FunctionResponse {
+                    function_response: FunctionResponsePart {
                         name: record.call.tool_name.clone(),
                         response: json!({ "result": result_value }),
-                    }),
-                    ..Default::default()
+                    },
                 }],
             });
         }
@@ -198,7 +204,7 @@ impl<'a> PromptBuilder<'a> {
         if !user_message.is_empty() {
             contents.push(Content {
                 role: "user".to_string(),
-                parts: vec![Part { text: Some(user_message), ..Default::default() }],
+                parts: vec![Part::Text { text: user_message }],
             });
         }
 

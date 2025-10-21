@@ -9,7 +9,7 @@ const BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/mod
 
 use crate::session::Tool;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct GeminiRequest {
     contents: Vec<Content>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19,7 +19,7 @@ pub(crate) struct GeminiRequest {
 }
 
 #[derive(Serialize, Deserialize)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Content {
     pub role: String,
     pub parts: Vec<Part>,
@@ -39,15 +39,30 @@ pub struct FunctionResponsePart {
     pub response: serde_json::Value,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct Part {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_call: Option<FunctionCallPart>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_response: Option<FunctionResponsePart>,
+#[serde(untagged)]
+pub enum Part {
+    Text {
+        text: String,
+    },
+    FunctionCall {
+        function_call: FunctionCallPart,
+    },
+    FunctionResponse {
+        function_response: FunctionResponsePart,
+    },
+    InlineData {
+        inline_data: InlineDataPart,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineDataPart {
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    pub data: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -60,8 +75,7 @@ struct GeminiError {
     message: String,
 }
 
-#[derive(Serialize, Deserialize)]
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SystemInstruction {
     pub parts: Vec<Part>,
 }
@@ -119,7 +133,28 @@ pub async fn generate_content_stream(
         tools: prompt_data.tools,
         system_instruction: prompt_data.system_instruction,
     };
-    tracing::info!("Using chat model: {}", model);
+
+    // --- Synchronous Logging Block ---
+    {
+        // Create a sanitized version of the request for logging
+        let mut sanitized_request = request_body.clone();
+        for content in &mut sanitized_request.contents {
+            for part in &mut content.parts {
+                if let Part::InlineData { inline_data } = part {
+                    let original_len = inline_data.data.len();
+                    if original_len > 100 {
+                        let truncated_data = inline_data.data.chars().take(50).collect::<String>();
+                        inline_data.data = format!("[{} bytes, truncated]...{}", original_len, truncated_data);
+                    }
+                }
+            }
+        }
+        tracing::debug!("Sending Gemini request: {:?}", sanitized_request);
+        tracing::debug!("SERIALIZED REQUEST: {}", serde_json::to_string_pretty(&request_body).unwrap_or_else(|e| format!("Serialization failed: {}", e)));
+        tracing::info!("Using chat model: {}", model);
+    }
+    // --- End Synchronous Logging Block ---
+
     let url = format!("{}/{}:streamGenerateContent?key={}&alt=sse", BASE_API_URL, model, api_key);
 
     for attempt in 0..MAX_RETRIES {
@@ -300,7 +335,7 @@ Recent Messages:
     let request_body = GeminiRequest {
         contents: vec![Content {
             role: "user".to_string(),
-            parts: vec![Part { text: Some(full_prompt), ..Default::default() }],
+            parts: vec![Part::Text { text: full_prompt }],
         }],
         tools: None,
         system_instruction: None,

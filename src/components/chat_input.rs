@@ -1,13 +1,20 @@
-use dioxus::prelude::*;
+use dioxus::{html::HasFileData, prelude::*};
 use dioxus_free_icons::{icons::fi_icons, Icon};
+use rfd::FileDialog;
 use std::time::SystemTime;
+use base64::{engine::general_purpose, Engine as _};
+use image::{imageops, ImageFormat};
+use std::io::Cursor;
 
 use crate::{context::prompt_builder::PromptBuilder, settings::Settings};
+use hobbes_core::models::Attachment;
+
+use crate::processing::summarization_scheduler::{SchedulerSignal};
 
 #[component]
 pub fn ChatInput(
     is_sending: Signal<bool>,
-    on_send: EventHandler<String>,
+    on_send: EventHandler<(String, Vec<Attachment>)>,
     on_cancel: EventHandler<()>,
     on_interaction: EventHandler<()>,
     on_toggle_sessions: EventHandler<()>,
@@ -18,18 +25,23 @@ pub fn ChatInput(
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut draft = use_context::<Signal<String>>();
+    let mut is_dragging = use_signal(|| false);
+    let mut attachments = use_signal(Vec::<Attachment>::new);
+    let mut is_processing_attachments = use_signal(|| false);
+    let scheduler = use_context::<Coroutine<SchedulerSignal>>();
 
     let mut send_message = move || {
-        if *is_sending.read() {
-            tracing::warn!("'send_message' blocked: already sending.");
+        if *is_sending.read() || *is_processing_attachments.read() {
+            tracing::warn!("'send_message' blocked: already sending or processing attachments.");
             return;
         }
         let user_message = draft.read().clone();
-        if user_message.is_empty() {
+        if user_message.is_empty() && attachments.read().is_empty() {
             return;
         }
-        on_send.call(user_message);
+        on_send.call((user_message, attachments.read().clone()));
         draft.set("".to_string());
+        attachments.set(Vec::new());
         let _ = document::eval(r#"
             const el = document.getElementById('chat-textarea');
             if (el) { el.style.height = 'auto'; }
@@ -37,9 +49,95 @@ pub fn ChatInput(
     };
 
     rsx! {
+        if !attachments.read().is_empty() {
+            div {
+                class: "flex items-center space-x-2 p-2 bg-gray-800 rounded-t-lg",
+                for (index, attachment) in attachments.read().iter().enumerate() {
+                    div {
+                        class: "flex items-center space-x-2 bg-gray-700 p-1 rounded",
+                        span {
+                            class: "text-sm text-gray-300",
+                            "{attachment.file_name}"
+                        }
+                        button {
+                            class: "p-1 rounded-full text-gray-400 hover:bg-gray-600 hover:text-white",
+                            onclick: move |_| {
+                                attachments.write().remove(index);
+                            },
+                            Icon {
+                                width: 16,
+                                height: 16,
+                                icon: fi_icons::FiX
+                            }
+                        }
+                    }
+                }
+            }
+        }
         div {
-            class: "bg-gray-900 p-4 border-t border-gray-700",
+            class: if *is_dragging.read() {
+                "bg-gray-900 p-4 border-t-2 border-dashed border-purple-500"
+            } else {
+                "bg-gray-900 p-4 border-t border-gray-700"
+            },
             onmousedown: |e| e.stop_propagation(),
+            ondragover: move |event| {
+                event.prevent_default();
+                is_dragging.set(true);
+            },
+            ondragleave: move |_| {
+                is_dragging.set(false);
+            },
+            ondrop: move |event| {
+                event.prevent_default();
+                is_dragging.set(false);
+                if let Some(file_engine) = event.files() {
+                    is_processing_attachments.set(true);
+                    spawn(async move {
+                        let files = file_engine.files();
+                        for file_name in &files {
+                            let extension = std::path::Path::new(file_name)
+                                .extension()
+                                .and_then(std::ffi::OsStr::to_str)
+                                .unwrap_or("");
+                            if let Some(mime_type) = get_mime_type(extension) {
+                                if let Some(file_data) = file_engine.read_file(file_name).await {
+                                    let file_name = file_name.clone();
+                                    let mime_type = mime_type.to_string();
+                                    let new_attachment = tokio::task::spawn_blocking(move || {
+                                        image::load_from_memory(&file_data).ok().and_then(|img| {
+                                            let resized_img = if img.height() > 200 {
+                                                img.resize(u32::MAX, 200, imageops::FilterType::Lanczos3)
+                                            } else {
+                                                img
+                                            };
+                                            let format = match mime_type.as_str() {
+                                                "image/png" => ImageFormat::Png,
+                                                "image/jpeg" => ImageFormat::Jpeg,
+                                                "image/gif" => ImageFormat::Gif,
+                                                "image/webp" => ImageFormat::WebP,
+                                                _ => ImageFormat::Png,
+                                            };
+                                            let mut buffer = Cursor::new(Vec::new());
+                                            resized_img.write_to(&mut buffer, format).ok().map(|_| {
+                                                let data = general_purpose::STANDARD.encode(buffer.into_inner());
+                                                Attachment { file_name, mime_type, data }
+                                            })
+                                        })
+                                    }).await.ok().flatten();
+
+                                    if let Some(attachment) = new_attachment {
+                                        attachments.write().push(attachment);
+                                    }
+                                }
+                            } else {
+                                tracing::warn!("Unsupported file type dropped: {}", file_name);
+                            }
+                        }
+                        is_processing_attachments.set(false);
+                    });
+                }
+            },
             div {
                 class: "flex items-center space-x-3",
                 button {
@@ -60,6 +158,62 @@ pub fn ChatInput(
                         icon: fi_icons::FiSettings
                     }
                 }
+                button {
+                    class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                    onclick: move |_| {
+                        let mut attachments = attachments;
+                        spawn(async move {
+                            is_processing_attachments.set(true);
+                            if let Some(files) = FileDialog::new()
+                                .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
+                                .pick_files()
+                            {
+                                for file_path in files {
+                                    if let Ok(file_data) = tokio::fs::read(&file_path).await {
+                                        let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                        let extension = file_path.extension().and_then(std::ffi::OsStr::to_str).unwrap_or("");
+                                        if let Some(mime_type) = get_mime_type(extension) {
+                                            let mime_type = mime_type.to_string();
+                                            let new_attachment = tokio::task::spawn_blocking(move || {
+                                                image::load_from_memory(&file_data).ok().and_then(|img| {
+                                                    let resized_img = if img.height() > 200 {
+                                                        img.resize(u32::MAX, 200, imageops::FilterType::Lanczos3)
+                                                    } else {
+                                                        img
+                                                    };
+                                                    let format = match mime_type.as_str() {
+                                                        "image/png" => ImageFormat::Png,
+                                                        "image/jpeg" => ImageFormat::Jpeg,
+                                                        "image/gif" => ImageFormat::Gif,
+                                                        "image/webp" => ImageFormat::WebP,
+                                                        _ => ImageFormat::Png,
+                                                    };
+                                                    let mut buffer = Cursor::new(Vec::new());
+                                                    resized_img.write_to(&mut buffer, format).ok().map(|_| {
+                                                        let data = general_purpose::STANDARD.encode(buffer.into_inner());
+                                                        Attachment { file_name, mime_type, data }
+                                                    })
+                                                })
+                                            }).await.ok().flatten();
+
+                                            if let Some(attachment) = new_attachment {
+                                                attachments.write().push(attachment);
+                                            }
+                                        } else {
+                                            tracing::warn!("Unsupported file type selected: {:?}", file_path);
+                                        }
+                                    }
+                                }
+                            }
+                            is_processing_attachments.set(false);
+                        });
+                    },
+                    Icon {
+                        width: 20,
+                        height: 20,
+                        icon: fi_icons::FiPaperclip
+                    }
+                }
                 textarea {
                     id: "chat-textarea",
                     class: "flex-1 py-2 px-4 rounded-xl bg-gray-800 border border-gray-700 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none overflow-y-auto",
@@ -69,6 +223,7 @@ pub fn ChatInput(
                     disabled: mcp_context.read().servers.is_empty(),
                     value: "{draft}",
                     oninput: move |event| {
+                        scheduler.send(SchedulerSignal::Activity);
                         let _ = document::eval(r#"
                             const el = document.getElementById('chat-textarea');
                             if (el) {
@@ -80,8 +235,8 @@ pub fn ChatInput(
                         draft.set(event.value());
                     },
                     onkeydown: move |event| {
+                        scheduler.send(SchedulerSignal::Activity);
                         let modifiers = event.data.modifiers();
-
                         if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::ALT) {
                             return;
                         }
@@ -199,7 +354,7 @@ pub fn ChatInput(
                 if !*is_sending.read() {
                     button {
                         class: "px-5 py-2 bg-purple-600 rounded-full text-white font-semibold hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-opacity-50 transition-colors disabled:bg-gray-500",
-                        disabled: mcp_context.read().servers.is_empty(),
+                        disabled: mcp_context.read().servers.is_empty() || *is_processing_attachments.read(),
                         onclick: move |_| {
                             on_interaction.call(());
                             send_message();
@@ -220,5 +375,15 @@ pub fn ChatInput(
                 }
             }
         }
+    }
+}
+
+fn get_mime_type(extension: &str) -> Option<&'static str> {
+    match extension.to_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
     }
 }

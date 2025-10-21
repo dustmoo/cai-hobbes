@@ -28,10 +28,13 @@ graph TD
     subgraph "Internal Short-Term Memory & Core Logic"
         subgraph "Core Application"
             M[main.rs] -->|Spawns on startup| L[McpManager];
+            M -->|Initializes| SS[SummarizationScheduler];
             L -->|Updates available tools via Signal| F[SessionState];
             
             G[ChatWindow] -->|Reads from Active Session| F;
-            G -->|Triggers| J[ConversationProcessor];
+            G -->|Sends Activity Signal| SS;
+
+            SS -->|On Inactivity Timeout, Triggers| J[ConversationProcessor];
             J -->|"Updates Active Session (Dialogue Summary)"| F;
 
             G -->|Builds Prompt| H[PromptBuilder];
@@ -41,10 +44,11 @@ graph TD
 
             J -- "Generates Summary" --> I2["Summary LLM (e.g., Gemini Flash)"];
 
-            subgraph "NEW Tool Call Feedback Loop"
+            subgraph "Tool Call Feedback Loop"
                 I -- "Responds with Tool Call" --> K[StreamManager];
                 K -- "Updates Message State" --> F;
                 K -- "Executes Tool(s) via" --> L;
+                K -- "Sends Activity Signal" --> SS;
                 L -- "Returns Result(s)" --> K;
                 K -- "Collects all results" --> K;
                 K -- "Stores (Call, Result) pairs in" --> TCH[ToolCallHistory];
@@ -54,7 +58,7 @@ graph TD
                 K -- "Sends feedback to" --> I;
 
                 I -- "Responds with Final Text" --> K;
-                K -- "Triggers" --> TCS[ToolCallSummarizer];
+                K -- "Triggers at end of turn" --> TCS[ToolCallSummarizer];
                 TCS -- "Summarizes pairs from" --> TCH;
                 TCS -- "Writes 'Snapshot' to" --> F;
                 TCS -- "Clears" --> TCH;
@@ -65,6 +69,7 @@ graph TD
     F -.-> TCH;
     style TCH fill:#ffb703,stroke:#333,stroke-width:2px
     style TCS fill:#fb8500,stroke:#333,stroke-width:2px
+    style SS fill:#e9c46a,stroke:#333,stroke-width:2px
     style J fill:#c77dff,stroke:#333,stroke-width:2px
     style F fill:#f4a261,stroke:#333,stroke-width:2px
     style I fill:#e76f51,stroke:#333,stroke-width:2px
@@ -81,15 +86,23 @@ graph TD
 ### 2. Core Services & Processors
 
 -   **`McpManager`**: A central service responsible for managing the lifecycle of all MCP servers. On application startup, it reads `mcp_servers.json`, launches each server as a child process, and communicates with it over standard I/O. It discovers the tools each server provides and updates the `SessionState` reactively via a Dioxus `Signal`.
--   **`StreamManager`**: The central orchestrator for the entire tool-call lifecycle. It uses a robust, channel-based mechanism to await concurrent tool executions, preventing deadlocks. It is also solely responsible for managing the LLM feedback loop, removing this complex logic from the UI layer.
--   **`ConversationProcessor`**: An internal service triggered *after* a message is sent. It reads the recent conversation history, uses a fast, dedicated **Summary LLM** (e.g., Gemini Flash) to extract entities and summaries, and writes this data directly to the active session's `active_context`.
--   **`ToolCallSummarizer`**: A dedicated service triggered when a tool-calling sequence concludes. It reads the `tool_call_history`, generates a concise "snapshot" for each entry (e.g., `{ "tool_name": "...", "result_summary": "..." }`), writes these snapshots to the main `active_context` in `SessionState`, and then clears the `tool_call_history`.
+-   **`StreamManager`**: The central orchestrator for the entire tool-call lifecycle. It uses a robust, channel-based mechanism to await concurrent tool executions, preventing deadlocks. It is also solely responsible for managing the LLM feedback loop, removing this complex logic from the UI layer. At the end of a conversational turn, it triggers the `ToolCallSummarizer`.
+-   **`SummarizationScheduler`**: A background coroutine that automatically triggers **conversation dialogue** summarization. It listens for user activity (e.g., typing, receiving a message) and, after a period of inactivity (e.g., 5 seconds), it invokes the `ConversationProcessor` to update the short-term memory. This ensures the conversational context is always fresh without interrupting the user.
+-   **`ConversationProcessor`**: An internal service responsible for generating a stateful, iterative summary of the conversation. It is triggered by the `SummarizationScheduler` and takes the last few messages and the *previous* summary, using a fast LLM (e.g., Gemini Flash) to refine and update the `active_context`.
+-   **`ToolCallSummarizer`**: A dedicated service triggered by the `StreamManager` when a conversational turn concludes. It reads the `tool_call_history`, generates a concise "snapshot" for each **tool interaction**, writes these snapshots to the main `active_context` in `SessionState`, and then clears the `tool_call_history`. This is distinct from the dialogue summary.
 -   **`PromptBuilder`**: A utility that reads the `active_context` and `tool_call_history` from the current `Session`. It assembles the context, conversation history, and available MCP tools into a structured prompt object that is sent to the LLM service. It also performs crucial schema corrections to ensure compatibility with the LLM API.
 
 ### 3. Native UI Components
 
 -   **Native Menu (`menu.rs`):** To ensure standard hotkeys (e.g., Copy, Paste, Quit) work as expected, the application initializes a native OS menu bar at startup. This is built using the `muda` crate and configured in `main.rs`.
 -   **System Tray Icon (`tray.rs`):** The application features a system tray icon that allows the user to toggle the main window's visibility. The icon's presence is reactive and can be enabled or disabled in real-time from the settings panel.
+
+### 4. Multimodal Input Flow
+
+-   **`ChatInput` Component:** This component is enhanced with drag-and-drop event handlers (`ondragover`, `ondragleave`, `ondrop`) and a file picker button. It manages a list of pending attachments, displaying previews and allowing users to remove them before sending.
+-   **`Attachment` Data Structure:** A new `Attachment` struct in `packages/hobbes_core/src/models.rs` supports extensible file attachments. It contains `file_name`, `mime_type`, and `data` (a base64 data URI). The `Message` struct is modified to include a `Vec<Attachment>`.
+-   **`PromptBuilder` Refactor:** The `PromptBuilder` is updated to iterate over the `attachments` vector in each message. For each attachment, it creates a `Part` with `inlineData` containing the base64 string and the correct `mime_type`, correctly formatting the request for the Gemini API.
+-   **`MessageList` Rendering:** The message rendering logic in `MessageList` is updated to iterate over the `attachments` vector. It renders an `<img>` tag for image MIME types and a placeholder for other file types.
 
 ## Interaction Flow (UML Sequence)
 
@@ -99,6 +112,7 @@ This sequence diagram illustrates the detailed interaction between components fo
 sequenceDiagram
     participant User
     participant ChatWindow
+    participant SummarizationScheduler
     participant ConversationProcessor
     participant PromptBuilder
     participant ChatLLM
@@ -108,9 +122,9 @@ sequenceDiagram
     participant ToolCallSummarizer
     participant SessionState
 
-    User->>ChatWindow: Sends message
-    ChatWindow->>ConversationProcessor: Process dialogue
-    ConversationProcessor->>SessionState: Updates dialogue summary
+    User->>ChatWindow: Types in input / Sends message
+    ChatWindow->>SummarizationScheduler: Sends Activity Signal
+    
     ChatWindow->>PromptBuilder: Build initial prompt
     PromptBuilder->>SessionState: Get context
     ChatWindow->>StreamManager: Start Stream with initial prompt
@@ -139,8 +153,17 @@ sequenceDiagram
 
     ChatLLM-->>StreamManager: Respond with final text
     StreamManager->>ChatWindow: Stream final text to UI
+    StreamManager->>SummarizationScheduler: Sends Activity Signal on stream end
     
-    StreamManager->>ToolCallSummarizer: Trigger summarization
+    StreamManager->>ToolCallSummarizer: Trigger tool snapshotting
     ToolCallSummarizer->>SessionState: Read & process ToolCallHistory
     ToolCallSummarizer->>SessionState: Write 'Snapshots' to Active Context
     ToolCallSummarizer->>SessionState: Clear ToolCallHistory
+
+    alt Inactivity Timeout
+        SummarizationScheduler->>ConversationProcessor: Trigger Dialogue Summarization
+        ConversationProcessor->>SessionState: Get recent messages & old summary
+        ConversationProcessor->>ChatLLM: Generate new summary
+        ChatLLM-->>ConversationProcessor: Return new summary
+        ConversationProcessor->>SessionState: Updates dialogue summary
+    end

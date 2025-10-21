@@ -14,27 +14,8 @@ impl ConversationProcessor {
     }
 
     /// Takes the last few messages, generates a context summary using a fast LLM,
-    /// and updates the session's active context.
-    pub async fn process_and_respond(&self, session: &mut Session, settings: &Settings) -> String {
-        // For now, we will just generate the summary and not call tools.
-        // The logic for tool calling will be added here later.
-        if let Some(summary) = self.generate_summary(session, settings).await {
-            session.active_context.conversation_summary = summary;
-        }
-
-        // This part will be replaced with logic that decides whether to call a tool
-        // or to send the user's message to the LLM.
-        let last_message = session.messages.last().unwrap();
-        if let MessageContent::Text(text) = &last_message.content {
-            text.clone()
-        } else {
-            "".to_string()
-        }
-    }
-
-    /// Takes the last few messages, generates a context summary using a fast LLM,
-    /// and updates the session's active context.
-    async fn generate_summary(&self, session: &Session, settings: &Settings) -> Option<ConversationSummary> {
+    /// and returns the summary.
+    pub async fn generate_summary(&self, session: &Session, settings: &Settings) -> Option<ConversationSummary> {
         // 1. Get the previous summary from the active context by serializing the struct
         let previous_summary = serde_json::to_string(&session.active_context.conversation_summary)
             .unwrap_or_else(|e| {

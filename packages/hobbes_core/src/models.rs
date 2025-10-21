@@ -1,4 +1,5 @@
 //! Data models for the Hobbes application.
+use serde::{Deserialize, Serialize};
 
 /// Represents a single, independent chat conversation.
 #[derive(Debug, Clone)]
@@ -29,6 +30,8 @@ pub struct ChatMessage {
     pub timestamp: String,
     /// The source of the message, indicating who or what created it.
     pub source: MessageSource,
+    /// A list of file attachments associated with the message.
+    pub attachments: Vec<Attachment>,
 }
 
 /// An enum that holds the source-specific data for a `ChatMessage`.
@@ -54,4 +57,15 @@ pub struct LlmMetadata {
     pub token_count: u32,
     /// The reason the model stopped generating text (e.g., "stop_sequence", "max_tokens").
     pub stop_reason: String,
+}
+
+/// Represents a file attached to a message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// The name of the file.
+    pub file_name: String,
+    /// The MIME type of the file (e.g., "image/png").
+    pub mime_type: String,
+    /// The file content, encoded as a base64 data URI.
+    pub data: String,
 }
