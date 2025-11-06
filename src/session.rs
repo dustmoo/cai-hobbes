@@ -110,9 +110,49 @@ impl SessionState {
 
     pub fn load() -> Result<Self, std::io::Error> {
         let path = get_sessions_path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find sessions path"))?;
-        let data = fs::read_to_string(path)?;
-        let state: Self = serde_json::from_str(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        tracing::info!("Loaded window size: {}x{}", state.window_width, state.window_height);
+        let data = fs::read_to_string(&path)?;
+        
+        // Try direct deserialization first
+        if let Ok(state) = serde_json::from_str(&data) {
+            tracing::info!("Successfully loaded session data.");
+            return Ok(state);
+        }
+
+        // If direct deserialization fails, attempt migration
+        tracing::warn!("Failed to deserialize session state directly, attempting migration...");
+        
+        // Backup the old file before attempting to overwrite
+        let backup_path = path.with_extension("json.bak");
+        fs::copy(&path, backup_path)?;
+
+        let mut state = SessionState::default();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(sessions_val) = value.get("sessions") {
+                if let Ok(sessions) = serde_json::from_value(sessions_val.clone()) {
+                    state.sessions = sessions;
+                }
+            }
+            if let Some(active_id) = value.get("active_session_id").and_then(|v| v.as_str()) {
+                state.active_session_id = active_id.to_string();
+            }
+            if let Some(width) = value.get("window_width").and_then(|v| v.as_f64()) {
+                state.window_width = width;
+            }
+            if let Some(height) = value.get("window_height").and_then(|v| v.as_f64()) {
+                state.window_height = height;
+            }
+            if let Some(history_val) = value.get("tool_call_history") {
+                if let Ok(history) = serde_json::from_value(history_val.clone()) {
+                    state.tool_call_history = history;
+                }
+            }
+        }
+
+        // Save the migrated state
+        if let Err(e) = state.save() {
+            tracing::error!("Failed to save migrated session state: {}", e);
+        }
+
         Ok(state)
     }
 

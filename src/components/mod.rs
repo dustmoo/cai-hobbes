@@ -1,4 +1,5 @@
 pub mod chat;
+pub mod conflict_modal;
 pub mod chat_input;
 pub mod message_list;
 pub mod markdown_renderer;
