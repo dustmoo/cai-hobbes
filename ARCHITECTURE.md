@@ -39,17 +39,20 @@ graph TD
 
             G -->|Builds Prompt| H[PromptBuilder];
             H -->|Gets Active Context, Tools & Tool History| F;
-            H -->|Formats Prompt| I["Chat LLM (e.g., Gemini Pro)"];
+            M -->|Initializes| I[LlmConnector];
+            H -->|Formats Prompt| I;
             G -- "Sends Message" --> I;
 
             J -- "Generates Summary" --> I2["Summary LLM (e.g., Gemini Flash)"];
 
             subgraph "Tool Call Feedback Loop"
-                I -- "Responds with Tool Call" --> K[StreamManager];
-                K -- "Updates Message State" --> F;
+                I -- "Responds with Full Stream" --> K[StreamManager];
+                K -- "Buffers Text & Collects Tool Calls" --> K;
                 K -- "Executes Tool(s) via" --> L;
-                K -- "Sends Activity Signal" --> SS;
                 L -- "Returns Result(s)" --> K;
+                K -- "Sends Buffered Text to UI" --> G;
+                K -- "Updates Message State" --> F;
+                K -- "Sends Activity Signal" --> SS;
                 K -- "Collects all results" --> K;
                 K -- "Stores (Call, Result) pairs in" --> TCH[ToolCallHistory];
                 K -- "Async write of full results to" --> V;
@@ -85,8 +88,14 @@ graph TD
 
 ### 2. Core Services & Processors
 
+-   **`LlmConnector`**: A trait that defines a generic interface for interacting with different LLM providers. The application initializes a concrete implementation (e.g., `GeminiConnector`) based on user settings and provides it to the application context.
 -   **`McpManager`**: A central service responsible for managing the lifecycle of all MCP servers. On application startup, it reads `mcp_servers.json`, launches each server as a child process, and communicates with it over standard I/O. It discovers the tools each server provides and updates the `SessionState` reactively via a Dioxus `Signal`.
--   **`StreamManager`**: The central orchestrator for the entire tool-call lifecycle. It uses a robust, channel-based mechanism to await concurrent tool executions, preventing deadlocks. It is also solely responsible for managing the LLM feedback loop, removing this complex logic from the UI layer. At the end of a conversational turn, it triggers the `ToolCallSummarizer`.
+-   **`StreamManager`**: The central orchestrator for the entire LLM interaction. It implements an **Atomic Execution Model** for tool calls:
+    1.  It receives the *entire* raw stream from the `LlmConnector`.
+    2.  It buffers all text chunks and collects all tool call requests.
+    3.  If tool calls are present, it executes them via the `McpManager` and waits for their completion.
+    4.  Only after the tools have finished does it send the buffered text to the UI, ensuring that the AI's conversational response does not appear before the action is complete.
+    5.  It is also responsible for managing the feedback loop, sending tool results back to the LLM in a subsequent turn.
 -   **`SummarizationScheduler`**: A background coroutine that automatically triggers **conversation dialogue** summarization. It listens for user activity (e.g., typing, receiving a message) and, after a period of inactivity (e.g., 5 seconds), it invokes the `ConversationProcessor` to update the short-term memory. This ensures the conversational context is always fresh without interrupting the user.
 -   **`ConversationProcessor`**: An internal service responsible for generating a stateful, iterative summary of the conversation. It is triggered by the `SummarizationScheduler` and takes the last few messages and the *previous* summary, using a fast LLM (e.g., Gemini Flash) to refine and update the `active_context`.
 -   **`ToolCallSummarizer`**: A dedicated service triggered by the `StreamManager` when a conversational turn concludes. It reads the `tool_call_history`, generates a concise "snapshot" for each **tool interaction**, writes these snapshots to the main `active_context` in `SessionState`, and then clears the `tool_call_history`. This is distinct from the dialogue summary.
@@ -115,7 +124,7 @@ sequenceDiagram
     participant SummarizationScheduler
     participant ConversationProcessor
     participant PromptBuilder
-    participant ChatLLM
+    participant LlmConnector
     participant StreamManager
     participant McpManager
     participant DocumentStore
@@ -130,8 +139,9 @@ sequenceDiagram
     ChatWindow->>StreamManager: Start Stream with initial prompt
 
     loop Tool Call & Feedback Loop
-        StreamManager->>ChatLLM: Send prompt
-        ChatLLM-->>StreamManager: Respond with Tool Call(s)
+        StreamManager->>LlmConnector: Send prompt
+        LlmConnector-->>StreamManager: Respond with Full Stream (Text + Tool Calls)
+        StreamManager->>StreamManager: Buffer Text & Collect Tool Calls
         
         par Concurrent Tool Execution
             StreamManager->>McpManager: Execute tool 1
@@ -151,8 +161,7 @@ sequenceDiagram
         note right of StreamManager: The loop continues if the LLM responds with another tool call.
     end
 
-    ChatLLM-->>StreamManager: Respond with final text
-    StreamManager->>ChatWindow: Stream final text to UI
+    StreamManager->>ChatWindow: Send buffered text to UI
     StreamManager->>SummarizationScheduler: Sends Activity Signal on stream end
     
     StreamManager->>ToolCallSummarizer: Trigger tool snapshotting
@@ -163,7 +172,7 @@ sequenceDiagram
     alt Inactivity Timeout
         SummarizationScheduler->>ConversationProcessor: Trigger Dialogue Summarization
         ConversationProcessor->>SessionState: Get recent messages & old summary
-        ConversationProcessor->>ChatLLM: Generate new summary
-        ChatLLM-->>ConversationProcessor: Return new summary
+        ConversationProcessor->>LlmConnector: Generate new summary
+        LlmConnector-->>ConversationProcessor: Return new summary
         ConversationProcessor->>SessionState: Updates dialogue summary
     end

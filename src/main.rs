@@ -60,8 +60,9 @@ fn main() {
 use crate::context::permissions::PermissionManager;
 use crate::session::SessionState;
 use crate::settings::SettingsManager;
-use crate::{components::stream_manager::StreamManager, mcp::manager::McpManager, services::document_store::DocumentStore};
+use crate::{components::{llm::{GeminiConnector, LlmConnector}, stream_manager::StreamManager}, mcp::manager::McpManager, services::document_store::DocumentStore};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn get_settings_path() -> PathBuf {
     dirs::config_dir()
@@ -105,10 +106,22 @@ fn app() -> Element {
     let settings = use_context_provider(|| {
         let mut settings = settings_manager.read().load();
         if let Ok(api_key) = crate::secure_storage::retrieve_secret("api_key") {
-            settings.api_key = Some(api_key);
+            settings.gemini_config.api_key = Some(api_key);
         }
         Signal::new(settings)
     });
+
+    let llm_connector = use_context_provider(|| {
+        let settings = settings.read();
+        let connector: Arc<dyn LlmConnector> = match settings.active_llm {
+            crate::settings::LlmProvider::Gemini => {
+                Arc::new(GeminiConnector::new(settings.gemini_config.clone()))
+            }
+        };
+        Signal::new(connector)
+    });
+
+    use_context_provider(|| Signal::new(processing::conversation_processor::ConversationProcessor::new(llm_connector.read().clone())));
 
     let permission_status_signal = use_context_provider(|| Signal::new(permissions::PermissionStatus::Denied));
 
@@ -129,7 +142,7 @@ fn app() -> Element {
     });
 
     let needs_onboarding = use_signal(|| {
-        let key_present = settings.read().api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok();
+        let key_present = settings.read().gemini_config.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok();
         let qdrant_present = settings.read().qdrant_url.is_some() || std::env::var("QDRANT_URL").is_ok();
         !key_present || !qdrant_present
     });

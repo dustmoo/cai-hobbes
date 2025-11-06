@@ -20,7 +20,7 @@ pub fn MarkdownRenderer(content: String) -> Element {
         enum Block {
             Header { level: HeadingLevel, content: Vec<Inline> },
             Paragraph(Vec<Inline>),
-            List(Vec<ListItem>),
+            List { items: Vec<ListItem>, start: Option<u64> },
             CodeBlock { lang: String, code: String },
             Table { headers: Vec<Vec<Inline>>, rows: Vec<Vec<Vec<Inline>>> },
         }
@@ -49,7 +49,7 @@ pub fn MarkdownRenderer(content: String) -> Element {
         }
 
         let mut blocks: Vec<Block> = Vec::new();
-        let mut list_stack: Vec<Vec<ListItem>> = Vec::new();
+        let mut list_stack: Vec<(Vec<ListItem>, Option<u64>)> = Vec::new();
         let mut list_item_stack: Vec<Vec<Block>> = Vec::new();
         
         let mut current_inlines: Vec<Inline> = Vec::new();
@@ -134,14 +134,14 @@ pub fn MarkdownRenderer(content: String) -> Element {
                         current_blocks.push(Block::Header { level, content: std::mem::take(&mut current_inlines) });
                     }
                 },
-                Event::Start(Tag::List(_)) => {
+                Event::Start(Tag::List(start)) => {
                     flush_inlines_to_paragraph(&mut current_inlines, current_blocks);
-                    list_stack.push(Vec::new());
+                    list_stack.push((Vec::new(), start));
                 },
                 Event::End(TagEnd::List(_)) => {
-                    if let Some(items) = list_stack.pop() {
+                    if let Some((items, start)) = list_stack.pop() {
                         let target_blocks = if let Some(item_blocks) = list_item_stack.last_mut() { item_blocks } else { &mut blocks };
-                        target_blocks.push(Block::List(items));
+                        target_blocks.push(Block::List { items, start });
                     }
                 },
                 Event::Start(Tag::Item) => {
@@ -150,7 +150,7 @@ pub fn MarkdownRenderer(content: String) -> Element {
                 Event::End(TagEnd::Item) => {
                     if let Some(mut item_blocks) = list_item_stack.pop() {
                         flush_inlines_to_paragraph(&mut current_inlines, &mut item_blocks);
-                        if let Some(list) = list_stack.last_mut() {
+                        if let Some((list, _)) = list_stack.last_mut() {
                             list.push(ListItem { blocks: item_blocks });
                         }
                     }
@@ -276,12 +276,29 @@ pub fn MarkdownRenderer(content: String) -> Element {
                         }
                     }
                 },
-                Block::List(items) => rsx! {
-                    ul {
-                        for item in items {
-                            li {
-                                for block in item.blocks {
-                                    {render_block(block)}
+                Block::List { items, start } => {
+                    if let Some(start_num) = start {
+                        rsx! {
+                            ol {
+                                start: "{start_num}",
+                                for item in items {
+                                    li {
+                                        for block in item.blocks {
+                                            {render_block(block)}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        rsx! {
+                            ul {
+                                for item in items {
+                                    li {
+                                        for block in item.blocks {
+                                            {render_block(block)}
+                                        }
+                                    }
                                 }
                             }
                         }

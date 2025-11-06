@@ -17,7 +17,8 @@ pub enum SchedulerSignal {
 pub fn SummarizationScheduler(children: Element) -> Element {
     let session_state = use_context::<Signal<SessionState>>();
     let settings = use_context::<Signal<Settings>>();
-    let processor = use_signal(ConversationProcessor::new);
+    let llm_connector = use_context::<Signal<std::sync::Arc<dyn crate::components::llm::LlmConnector>>>();
+    let processor: Signal<ConversationProcessor> = use_signal(|| ConversationProcessor::new(llm_connector.read().clone()));
 
     let coroutine = use_coroutine(move |mut rx: UnboundedReceiver<SchedulerSignal>| {
         let mut session_state = session_state.to_owned();

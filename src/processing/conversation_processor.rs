@@ -1,21 +1,23 @@
 use crate::session::{ConversationSummary, Session};
-use crate::components::llm;
+use crate::components::llm::LlmConnector;
 use crate::settings::Settings;
 use crate::components::shared::{MessageContent};
+use std::sync::Arc;
 
 /// Processes conversation history to extract and update short-term context.
 pub struct ConversationProcessor {
+    llm_connector: Arc<dyn LlmConnector>,
 }
 
 impl ConversationProcessor {
     /// Creates a new `ConversationProcessor`.
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(llm_connector: Arc<dyn LlmConnector>) -> Self {
+        Self { llm_connector }
     }
 
     /// Takes the last few messages, generates a context summary using a fast LLM,
     /// and returns the summary.
-    pub async fn generate_summary(&self, session: &Session, settings: &Settings) -> Option<ConversationSummary> {
+    pub async fn generate_summary(&self, session: &Session, _settings: &Settings) -> Option<ConversationSummary> {
         // 1. Get the previous summary from the active context by serializing the struct
         let previous_summary = serde_json::to_string(&session.active_context.conversation_summary)
             .unwrap_or_else(|e| {
@@ -45,15 +47,8 @@ impl ConversationProcessor {
             return None;
         }
 
-        // 3. Get API key, prioritizing settings, then environment variable
-        let api_key = settings.api_key.clone().unwrap_or_else(|| {
-            std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
-        });
-
-        // 4. Call the LLM to refine the summary
-        match llm::summarize_conversation(
-            api_key,
-            settings.summary_model.clone(),
+        // 3. Call the LLM to refine the summary
+        match self.llm_connector.summarize_conversation(
             previous_summary,
             recent_history,
         )

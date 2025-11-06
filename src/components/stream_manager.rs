@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use uuid::Uuid;
 use crate::session::SessionState;
-use crate::components::llm;
 use crate::components::shared::{StreamMessage, ToolCallStatus};
 use crate::services::document_store::DocumentStore;
 use std::sync::Arc;
@@ -17,6 +16,7 @@ use crate::processing::summarization_scheduler::SchedulerSignal;
 pub struct StreamManagerContext {
     stream_receivers: Signal<HashMap<Uuid, UnboundedReceiver<StreamMessage>>>,
     active_stream_handles: Signal<HashMap<Uuid, Task>>,
+    llm_connector: Signal<std::sync::Arc<dyn crate::components::llm::LlmConnector>>,
     session_state: Signal<SessionState>,
     mcp_manager: Signal<crate::mcp::manager::McpManager>,
     document_store: Signal<Option<Arc<DocumentStore>>>,
@@ -35,7 +35,6 @@ impl StreamManagerContext {
 
     pub fn start_stream(
         mut self,
-        model: String,
         message_id: Uuid,
         prompt_data: crate::context::prompt_builder::LlmPrompt,
         on_complete: impl FnOnce() + 'static,
@@ -55,12 +54,9 @@ impl StreamManagerContext {
             tracing::info!(message_id = %message_id, "Stream master task SPAWNED.");
             let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<StreamMessage>();
 
-            let settings = self.settings.read().clone();
-            let api_key = settings.api_key.clone().unwrap_or_else(|| {
-                std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
-            });
+            let llm_connector = self.llm_connector.read().clone();
             spawn(async move {
-                llm::generate_content_stream(api_key, model, prompt_data, llm_tx, mcp_context).await;
+                llm_connector.generate_content_stream(prompt_data, llm_tx, mcp_context).await;
             });
 
             let mut is_first_message = true;
@@ -279,6 +275,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
     let context = use_hook(|| StreamManagerContext {
         stream_receivers: Signal::new(HashMap::new()),
         active_stream_handles: Signal::new(HashMap::new()),
+        llm_connector: consume_context::<Signal<Arc<dyn crate::components::llm::LlmConnector>>>(),
         session_state,
         mcp_manager,
         document_store,
@@ -313,15 +310,19 @@ mod tests {
             let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
             let document_store = use_context_provider(|| Signal::new(None));
             let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
+            let llm_connector = use_context_provider(|| Signal::new(Arc::new(crate::components::llm::GeminiConnector::new(settings.read().gemini_config.clone())) as Arc<dyn crate::components::llm::LlmConnector>));
+            let scheduler = use_coroutine(|_| async {});
             let mut stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
                 active_stream_handles: Signal::new(HashMap::new()),
+                llm_connector,
                 session_state,
                 mcp_manager,
                 document_store,
                 tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
                 settings,
                 continuation_controller,
+                scheduler,
                 stream_activity: Signal::new(0),
                 is_sending: Signal::new(false),
             });
@@ -361,15 +362,19 @@ mod tests {
             let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
             let document_store = use_context_provider(|| Signal::new(None));
             let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
+            let llm_connector = use_context_provider(|| Signal::new(Arc::new(crate::components::llm::GeminiConnector::new(settings.read().gemini_config.clone())) as Arc<dyn crate::components::llm::LlmConnector>));
+            let scheduler = use_coroutine(|_| async {});
             let stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
                 active_stream_handles: Signal::new(HashMap::new()),
+                llm_connector,
                 session_state,
                 mcp_manager,
                 document_store,
                 tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
                 settings,
                 continuation_controller,
+                scheduler,
                 stream_activity: Signal::new(0),
                 is_sending: Signal::new(false),
             });

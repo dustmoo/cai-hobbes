@@ -4,9 +4,10 @@ version = 4
 
 [[package]]
 name = "Hobbes"
-version = "0.7.4"
+version = "0.7.8"
 dependencies = [
  "ammonia",
+ "async-trait",
  "base64 0.22.1",
  "cfg-if",
  "chrono",

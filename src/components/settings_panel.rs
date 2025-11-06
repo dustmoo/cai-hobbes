@@ -34,45 +34,67 @@ pub fn SettingsPanel() -> Element {
                     class: "mb-4",
                     label {
                         class: "block text-sm font-medium text-gray-300",
-                        "API Key"
+                        "LLM Provider"
                     }
-                    input {
+                    select {
                         class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
-                        r#type: "password",
-                        placeholder: "Using environment variable",
-                        value: "{local_settings.read().api_key.as_deref().unwrap_or(\"\")}",
-                        oninput: move |event| {
-                            local_settings.write().api_key = Some(event.value());
+                        // onchange logic will be added when more providers are supported
+                        option {
+                            value: "Gemini",
+                            "Gemini"
                         }
                     }
                 }
-                div {
-                    class: "mb-4",
-                    label {
-                        class: "block text-sm font-medium text-gray-300",
-                        "Chat Model"
-                    }
-                    input {
-                        class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
-                        r#type: "text",
-                        value: "{local_settings.read().chat_model}",
-                        oninput: move |event| {
-                            local_settings.write().chat_model = event.value();
+
+                // Conditionally render Gemini settings
+                if local_settings.read().active_llm == crate::settings::LlmProvider::Gemini {
+                    div {
+                        class: "pl-4 border-l-2 border-gray-700",
+                        div {
+                            class: "mb-4",
+                            label {
+                                class: "block text-sm font-medium text-gray-300",
+                                "API Key"
+                            }
+                            input {
+                                class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
+                                r#type: "password",
+                                placeholder: "Using environment variable",
+                                value: "{local_settings.read().gemini_config.api_key.as_deref().unwrap_or(\"\")}",
+                                oninput: move |event| {
+                                    local_settings.write().gemini_config.api_key = Some(event.value());
+                                }
+                            }
                         }
-                    }
-                }
-                div {
-                    class: "mb-4",
-                    label {
-                        class: "block text-sm font-medium text-gray-300",
-                        "Summary Model"
-                    }
-                    input {
-                        class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
-                        r#type: "text",
-                        value: "{local_settings.read().summary_model}",
-                        oninput: move |event| {
-                            local_settings.write().summary_model = event.value();
+                        div {
+                            class: "mb-4",
+                            label {
+                                class: "block text-sm font-medium text-gray-300",
+                                "Chat Model"
+                            }
+                            input {
+                                class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
+                                r#type: "text",
+                                value: "{local_settings.read().gemini_config.chat_model}",
+                                oninput: move |event| {
+                                    local_settings.write().gemini_config.chat_model = event.value();
+                                }
+                            }
+                        }
+                        div {
+                            class: "mb-4",
+                            label {
+                                class: "block text-sm font-medium text-gray-300",
+                                "Summary Model"
+                            }
+                            input {
+                                class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500",
+                                r#type: "text",
+                                value: "{local_settings.read().gemini_config.summary_model}",
+                                oninput: move |event| {
+                                    local_settings.write().gemini_config.summary_model = event.value();
+                                }
+                            }
                         }
                     }
                 }
@@ -299,7 +321,7 @@ pub fn SettingsPanel() -> Element {
 
                         // 2. Perform the save operations
                         let mut settings_to_save = global_settings.clone();
-                        if let Some(api_key) = settings_to_save.api_key.take() {
+                        if let Some(api_key) = settings_to_save.gemini_config.api_key.take() {
                             if let Err(e) = secure_storage::save_secret("api_key", &api_key) {
                                 tracing::error!("Failed to save API key: {}", e);
                             }

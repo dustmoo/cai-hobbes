@@ -32,7 +32,7 @@ pub fn Onboarding(mut props: OnboardingProps) -> Element {
         // Update settings signal
         let mut current_settings = settings.read().clone();
         current_settings.qdrant_url = Some(qdrant_uri.read().clone());
-        current_settings.api_key = Some(gemini_api_key.read().clone());
+        current_settings.gemini_config.api_key = Some(gemini_api_key.read().clone());
         
         // Save settings to file
         if let Err(e) = settings_manager.read().save(&current_settings) {

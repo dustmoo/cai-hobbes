@@ -13,3 +13,10 @@
 mcp_servers/
 
 .roo*
+
+# Ignore log files
+*.log
+
+# Ignore third party and tools
+third_party/
+tools/

@@ -160,7 +160,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             spawn(async move {
                 // Now clone/read them inside the async block
                 let stream_manager = stream_manager;
-                let settings = settings.read().clone();
+                let _settings = settings.read().clone();
                 let mut active_message_id = active_message_id;
 
                 active_message_id.set(Some(hobbes_message_id));
@@ -177,7 +177,6 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 };
 
                 stream_manager.start_stream(
-                    settings.chat_model,
                     hobbes_message_id,
                     prompt_data,
                     on_complete,

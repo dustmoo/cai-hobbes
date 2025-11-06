@@ -2,9 +2,12 @@ use serde::{Deserialize, Serialize};
 use reqwest::Client;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
+use async_trait::async_trait;
 
-use crate::components::shared::ToolCall;
-use crate::components::shared::StreamMessage;
+use crate::components::shared::{StreamMessage, ToolCall};
+use crate::context::prompt_builder::LlmPrompt;
+use crate::mcp::manager::McpContext;
+use crate::settings::GeminiConfig;
 const BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
 use crate::session::Tool;
@@ -113,15 +116,45 @@ struct PartResponse {
     function_call: Option<FunctionCall>,
 }
 
-use crate::context::prompt_builder::LlmPrompt;
 
-pub async fn generate_content_stream(
-    api_key: String,
-    model: String,
-    prompt_data: LlmPrompt,
-    tx: mpsc::UnboundedSender<StreamMessage>,
-    mcp_context: Option<crate::mcp::manager::McpContext>,
-) {
+#[async_trait]
+pub trait LlmConnector: Send + Sync {
+    async fn generate_content_stream(
+        &self,
+        prompt_data: LlmPrompt,
+        tx: mpsc::UnboundedSender<StreamMessage>,
+        mcp_context: Option<McpContext>,
+    );
+
+    async fn summarize_conversation(
+        &self,
+        previous_summary: String,
+        recent_messages: String,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+pub struct GeminiConnector {
+    config: GeminiConfig,
+}
+
+impl GeminiConnector {
+    pub fn new(config: GeminiConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait]
+impl LlmConnector for GeminiConnector {
+    async fn generate_content_stream(
+        &self,
+        prompt_data: LlmPrompt,
+        tx: mpsc::UnboundedSender<StreamMessage>,
+        mcp_context: Option<McpContext>,
+    ) {
+        let api_key = self.config.api_key.clone().unwrap_or_else(|| {
+            std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
+        });
+        let model = self.config.chat_model.clone();
     const MAX_RETRIES: u32 = 2;
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -294,12 +327,15 @@ pub async fn generate_content_stream(
     }
 }
 
-pub async fn summarize_conversation(
-    api_key: String,
-    model: String,
-    previous_summary: String,
-    recent_messages: String,
-) -> Result<serde_json::Value, reqwest::Error> {
+    async fn summarize_conversation(
+        &self,
+        previous_summary: String,
+        recent_messages: String,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let api_key = self.config.api_key.clone().unwrap_or_else(|| {
+            std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
+        });
+        let model = self.config.summary_model.clone();
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -348,7 +384,8 @@ Recent Messages:
         .post(&url)
         .json(&request_body)
         .send()
-        .await?;
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -366,7 +403,7 @@ Recent Messages:
         }));
     }
 
-    let response_json: GeminiResponse = response.json().await?;
+    let response_json: GeminiResponse = response.json().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
     if let Some(candidate) = response_json.candidates.get(0) {
         if let Some(part) = candidate.content.parts.get(0) {
@@ -400,4 +437,5 @@ Recent Messages:
     }
 
     Ok(serde_json::Value::Null)
+}
 }

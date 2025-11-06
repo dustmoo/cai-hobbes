@@ -5,12 +5,24 @@ use std::path::PathBuf;
 use crate::context::permissions::{PermissionSettings, ToolCategory};
 use std::collections::HashMap;
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LlmProvider {
+    Gemini,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Settings {
+pub struct GeminiConfig {
+    #[serde(skip)]
     pub api_key: Option<String>,
-    pub qdrant_url: Option<String>,
     pub chat_model: String,
     pub summary_model: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Settings {
+    pub active_llm: LlmProvider,
+    pub gemini_config: GeminiConfig,
+    pub qdrant_url: Option<String>,
     pub persona: String,
     pub force_tool_use_instruction: Option<String>,
     pub project_folder: Option<String>,
@@ -27,10 +39,13 @@ impl Default for Settings {
         granular_permissions.insert(ToolCategory::Mcp, true);
 
         Self {
-            api_key: None,
+            active_llm: LlmProvider::Gemini,
+            gemini_config: GeminiConfig {
+                api_key: None,
+                chat_model: "gemini-2.5-pro".to_string(),
+                summary_model: "gemini-1.5-flash-latest".to_string(),
+            },
             qdrant_url: None,
-            chat_model: "gemini-2.5-pro".to_string(),
-            summary_model: "gemini-1.5-flash-latest".to_string(),
             persona: "You are Hobbes, a helpful AI assistant.".to_string(),
             force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available. When using the fetch tool, you MUST provide markdown links as sources.".to_string()),
             project_folder: None,
@@ -80,17 +95,22 @@ impl SettingsManager {
         tracing::warn!("Failed to deserialize settings directly, attempting migration...");
         let mut settings = Settings::default();
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(api_key) = value.get("api_key").and_then(|v| v.as_str()) {
-                settings.api_key = Some(api_key.to_string());
-            }
             if let Some(qdrant_url) = value.get("qdrant_url").and_then(|v| v.as_str()) {
                 settings.qdrant_url = Some(qdrant_url.to_string());
             }
-            if let Some(chat_model) = value.get("chat_model").and_then(|v| v.as_str()) {
-                settings.chat_model = chat_model.to_string();
+            if let Some(gemini_config_val) = value.get("gemini_config") {
+                if let Ok(gemini_config) = serde_json::from_value(gemini_config_val.clone()) {
+                    settings.gemini_config = gemini_config;
+                }
             }
-            if let Some(summary_model) = value.get("summary_model").and_then(|v| v.as_str()) {
-                settings.summary_model = summary_model.to_string();
+            // For backwards compatibility, migrate old fields if gemini_config doesn't exist
+            else {
+                if let Some(chat_model) = value.get("chat_model").and_then(|v| v.as_str()) {
+                    settings.gemini_config.chat_model = chat_model.to_string();
+                }
+                if let Some(summary_model) = value.get("summary_model").and_then(|v| v.as_str()) {
+                    settings.gemini_config.summary_model = summary_model.to_string();
+                }
             }
             if let Some(persona) = value.get("persona").and_then(|v| v.as_str()) {
                 settings.persona = persona.to_string();

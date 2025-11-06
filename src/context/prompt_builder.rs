@@ -76,7 +76,7 @@ impl<'a> PromptBuilder<'a> {
                         }
                         
                         // Next, recursively remove any unsupported keys from the schema.
-                        recursively_remove_keys(&mut tool_value, &["exclusiveMaximum", "exclusiveMinimum", "$schema", "additionalProperties", "outputSchema", "annotations"]);
+                        recursively_remove_keys(&mut tool_value, &["exclusiveMaximum", "exclusiveMinimum", "$schema", "additionalProperties", "outputSchema", "annotations", "ge", "le"]);
 
                         function_declarations.push(tool_value);
                     }

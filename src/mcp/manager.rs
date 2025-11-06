@@ -23,6 +23,7 @@ pub struct McpServerConfig {
     pub name: String,
     pub command: Option<String>,
     pub uri: Option<String>,
+    pub args: Option<Vec<String>>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -133,7 +134,12 @@ impl McpManager {
                         let server_config_clone_for_spawn = server_config_clone.clone();
                         spawn(async move {
                             let mut cmd = Command::new("sh");
-                            cmd.arg("-c").arg(&command_string);
+                            let mut full_command = command_string;
+                            if let Some(args) = server_config_clone_for_spawn.args {
+                                full_command.push(' ');
+                                full_command.push_str(&args.join(" "));
+                            }
+                            cmd.arg("-c").arg(&full_command);
                             cmd.envs(&server_config_clone_for_spawn.env);
                             // We run this as a detached process. We don't care if it fails,
                             // as the connection logic will handle that.
@@ -156,6 +162,11 @@ impl McpManager {
                     tracing::info!("Launching stdio MCP server: {}", server_name);
                     let mut cmd = Command::new("sh");
                     let mut command_string = server_config_clone.command.clone().unwrap_or_default();
+
+                    if let Some(ref args) = server_config_clone.args {
+                        command_string.push(' ');
+                        command_string.push_str(&args.join(" "));
+                    }
 
                     if server_name == "filesystem" {
                         if let Some(project_folder) = &settings_clone.project_folder {
