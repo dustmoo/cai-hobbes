@@ -77,7 +77,7 @@ pub fn SettingsPanel() -> Element {
                         class: "flex justify-between items-center p-3 cursor-pointer bg-gray-750 rounded-t-lg",
                         onclick: move |_| llm_config_collapsed.set(!llm_config_collapsed()),
                         h3 { class: "text-md font-semibold", "LLM Configuration" }
-                        span { class: "transform transition-transform", class: if llm_config_collapsed() { "rotate-0" } else { "-rotate-180" }, "▼" }
+                        span { if *llm_config_collapsed.read() { "▶" } else { "▼" } }
                     }
                     if !llm_config_collapsed() {
                         div {
@@ -137,7 +137,7 @@ pub fn SettingsPanel() -> Element {
                         class: "flex justify-between items-center p-3 cursor-pointer bg-gray-750 rounded-t-lg",
                         onclick: move |_| app_behavior_collapsed.set(!app_behavior_collapsed()),
                         h3 { class: "text-md font-semibold", "Application Behavior" }
-                        span { class: "transform transition-transform", class: if app_behavior_collapsed() { "rotate-0" } else { "-rotate-180" }, "▼" }
+                        span { if *app_behavior_collapsed.read() { "▶" } else { "▼" } }
                     }
                     if !app_behavior_collapsed() {
                         div {
@@ -237,7 +237,7 @@ pub fn SettingsPanel() -> Element {
                         class: "flex justify-between items-center p-3 cursor-pointer bg-gray-750 rounded-t-lg",
                         onclick: move |_| data_management_collapsed.set(!data_management_collapsed()),
                         h3 { class: "text-md font-semibold", "Data Management" }
-                        span { class: "transform transition-transform", class: if data_management_collapsed() { "rotate-0" } else { "-rotate-180" }, "▼" }
+                        span { if *data_management_collapsed.read() { "▶" } else { "▼" } }
                     }
                     if !data_management_collapsed() {
                         div {
@@ -408,7 +408,7 @@ pub fn SettingsPanel() -> Element {
                         class: "flex justify-between items-center p-3 cursor-pointer bg-gray-750 rounded-t-lg",
                         onclick: move |_| permissions_collapsed.set(!permissions_collapsed()),
                         h3 { class: "text-md font-semibold", "Permissions" }
-                        span { class: "transform transition-transform", class: if permissions_collapsed() { "rotate-0" } else { "-rotate-180" }, "▼" }
+                        span { if *permissions_collapsed.read() { "▶" } else { "▼" } }
                     }
                     if !permissions_collapsed() {
                         div {
