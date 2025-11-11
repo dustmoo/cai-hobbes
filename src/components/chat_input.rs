@@ -260,10 +260,12 @@ pub fn ChatInput(
                         }
                     },
                     onpaste: move |_| {
-                        spawn(async move {
-                            is_processing_attachments.set(true);
-                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                if let Ok(image) = clipboard.get_image() {
+                        // All clipboard operations must happen on the main thread.
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            if let Ok(image) = clipboard.get_image() {
+                                // Only spawn a task if there's an image to process.
+                                spawn(async move {
+                                    is_processing_attachments.set(true);
                                     let image_data = arboard::ImageData {
                                         width: image.width,
                                         height: image.height,
@@ -272,10 +274,10 @@ pub fn ChatInput(
                                     if let Some(attachment) = process_clipboard_image(image_data).await {
                                         attachments.write().push(attachment);
                                     }
-                                }
+                                    is_processing_attachments.set(false);
+                                });
                             }
-                            is_processing_attachments.set(false);
-                        });
+                        }
                     },
                 },
                 div {

@@ -99,13 +99,9 @@ fn get_sessions_path() -> Option<PathBuf> {
 
 impl SessionState {
     pub fn new() -> Self {
-        Self::load().unwrap_or_else(|_| {
-            let new_state = Self::default();
-            if let Err(e) = new_state.save() {
-                tracing::error!("Failed to save initial session state: {}", e);
-            }
-            new_state
-        })
+        // This should be lightweight and not perform I/O.
+        // Loading will be handled asynchronously in the UI.
+        Self::default()
     }
 
     pub fn load() -> Result<Self, std::io::Error> {

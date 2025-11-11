@@ -1,6 +1,6 @@
 use crate::settings::Settings;
 use dioxus::prelude::Signal;
-use dioxus_signals::Readable;
+use dioxus_signals::{Readable, Writable};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -23,8 +23,7 @@ pub enum PermissionStatus {
 pub struct PermissionSettings {
     pub auto_approval_enabled: bool,
     pub granular_permissions: HashMap<ToolCategory, bool>,
-    pub max_requests: u32,
-    pub max_cost: f64,
+    pub max_ai_turns: u32,
 }
 
 impl Default for PermissionSettings {
@@ -32,8 +31,7 @@ impl Default for PermissionSettings {
         Self {
             auto_approval_enabled: false,
             granular_permissions: HashMap::new(),
-            max_requests: 10,
-            max_cost: 0.50,
+            max_ai_turns: 10,
         }
     }
 }
@@ -41,28 +39,20 @@ impl Default for PermissionSettings {
 #[derive(Debug, Clone, Copy)]
 pub struct PermissionManager {
     settings: Signal<Settings>,
-    request_count: Signal<u32>,
-    current_cost: Signal<f64>,
+    turn_count: Signal<u32>,
 }
 
 impl PermissionManager {
     pub fn new(settings: Signal<Settings>) -> Self {
         Self {
             settings,
-            request_count: Signal::new(0),
-            current_cost: Signal::new(0.0),
+            turn_count: Signal::new(0),
         }
     }
 
     pub fn check_permission(&self, category: &ToolCategory) -> PermissionStatus {
         let settings = self.settings.read();
-        if *self.request_count.read() >= settings.permission_settings.max_requests {
-            return PermissionStatus::Denied("Request limit reached".to_string());
-        }
-
-        if *self.current_cost.read() >= settings.permission_settings.max_cost {
-            return PermissionStatus::Denied("Cost limit reached".to_string());
-        }
+        // Note: The turn limit is checked separately now. This check is for MCP requests.
 
         if settings.permission_settings.auto_approval_enabled {
             // If auto-approval is on, check the granular permission for the specific category
@@ -75,7 +65,10 @@ impl PermissionManager {
             {
                 PermissionStatus::Allowed
             } else {
-                PermissionStatus::Denied(format!("Auto-approval is on, but permission is denied for category: {:?}", category))
+                PermissionStatus::Denied(format!(
+                    "Auto-approval is on, but permission is denied for category: {:?}",
+                    category
+                ))
             }
         } else {
             // If auto-approval is off, always prompt
@@ -83,4 +76,52 @@ impl PermissionManager {
         }
     }
 
+    pub fn increment_turn_count(&mut self) {
+        *self.turn_count.write() += 1;
+    }
+
+    pub fn reset_turn_count(&mut self) {
+        *self.turn_count.write() = 0;
+    }
+
+    pub fn is_turn_limit_reached(&self) -> bool {
+        let settings = self.settings.read();
+        *self.turn_count.read() >= settings.permission_settings.max_ai_turns
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dioxus::prelude::*;
+
+    #[tokio::test]
+    async fn test_turn_counting() {
+        let mut dom = VirtualDom::new(|| {
+            let settings = use_context_provider(|| Signal::new(Settings::default()));
+            use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+            let mut permission_manager = consume_context::<Signal<PermissionManager>>();
+
+            use_effect(move || {
+                let mut pm = permission_manager.write();
+
+                assert!(!pm.is_turn_limit_reached());
+
+                for _ in 0..10 {
+                    pm.increment_turn_count();
+                }
+
+                assert!(pm.is_turn_limit_reached());
+
+                pm.reset_turn_count();
+
+                assert!(!pm.is_turn_limit_reached());
+            });
+
+            rsx! { div {} }
+        });
+
+        dom.rebuild_in_place();
+        dom.wait_for_suspense().await;
+    }
 }

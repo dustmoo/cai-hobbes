@@ -60,7 +60,7 @@ pub struct ActiveMcpClient {
 
 #[derive(Clone)]
 pub struct McpManager {
-    configs: Vec<McpServerConfig>,
+    config_path: Option<PathBuf>,
     pub servers: Arc<Mutex<HashMap<String, ActiveMcpClient>>>,
     permission_manager: Signal<PermissionManager>,
 }
@@ -68,59 +68,45 @@ pub struct McpManager {
 
 impl McpManager {
     pub fn new(config_path: PathBuf, permission_manager: Signal<PermissionManager>) -> Self {
-        if !config_path.exists() {
-            if let Some(parent) = config_path.parent() {
-                if !parent.exists() {
-                    if let Err(e) = fs::create_dir_all(parent) {
-                        tracing::error!("Failed to create config directory: {}", e);
-                    }
-                }
-            }
-            if let Err(e) = fs::write(&config_path, "[]") {
-                tracing::error!("Failed to write default mcp_servers.json: {}", e);
-            }
-        }
-
-        let configs = match fs::read_to_string(config_path) {
-            Ok(content) => {
-                let wrapper: McpServersWrapper = serde_json::from_str(&content).unwrap_or_else(|e| {
-                    tracing::error!("Failed to parse mcp_servers.json: {}", e);
-                    McpServersWrapper {
-                        mcp_servers: HashMap::new(),
-                    }
-                });
-
-                let configs_vec: Vec<McpServerConfig> =
-                    wrapper.mcp_servers.into_iter().map(|(name, mut config)| {
-                        config.name = name;
-                        config
-                    }).collect();
-
-                tracing::info!(
-                    "Successfully parsed {} MCP server configs.",
-                    configs_vec.len()
-                );
-                configs_vec
-            }
-            Err(e) => {
-                tracing::error!("Failed to read mcp_servers.json: {}", e);
-                Vec::new()
-            }
-        };
-
         Self {
-            configs,
             servers: Arc::new(Mutex::new(HashMap::new())),
             permission_manager,
+            config_path: Some(config_path),
         }
     }
 
     pub async fn launch_servers(&self, mcp_context_signal: dioxus::prelude::Signal<McpContext>, settings: crate::settings::Settings) {
-        for server_config in self.configs.iter().filter(|sc| !sc.disabled) {
+        let configs = if let Some(config_path) = &self.config_path {
+            self.load_configs(config_path.clone()).await
+        } else {
+            Vec::new()
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<ActiveMcpClient>();
+        let servers_map_clone = self.servers.clone();
+        let self_clone_for_receiver = self.clone();
+        let mut mcp_context_signal_clone_for_receiver = mcp_context_signal.clone();
+
+        // Spawn a dedicated receiver task to serialize context updates
+        spawn(async move {
+            while let Some(active_client) = rx.recv().await {
+                let server_name = active_client.config.name.clone();
+                tracing::info!("Received initialized client for: {}", server_name);
+                
+                // Lock and insert the new client
+                servers_map_clone.lock().await.insert(server_name.clone(), active_client);
+
+                // Get the full, updated context and set the signal
+                let new_context = self_clone_for_receiver.get_mcp_context().await;
+                mcp_context_signal_clone_for_receiver.set(new_context);
+                tracing::info!("Successfully added '{}' and updated MCP context atomically.", server_name);
+            }
+            tracing::info!("MCP context update receiver task finished.");
+        });
+
+        for server_config in configs.iter().filter(|sc| !sc.disabled) {
             let server_config_clone = server_config.clone();
-            let servers_map = self.servers.clone();
-            let mut mcp_context_signal_clone = mcp_context_signal.clone();
-            let self_clone = self.clone();
+            let tx_clone = tx.clone();
             let settings_clone = settings.clone();
 
             spawn(async move {
@@ -202,14 +188,9 @@ impl McpManager {
                                     service: Arc::new(service),
                                     tools: result.tools,
                                 };
-                                {
-                                    let mut servers = servers_map.lock().await;
-                                    servers.insert(server_name.clone(), active_client);
+                                if tx_clone.send(active_client).is_err() {
+                                    tracing::error!("Failed to send initialized MCP client for '{}' to receiver task.", server_name);
                                 }
-
-                                let new_context = self_clone.get_mcp_context().await;
-                                mcp_context_signal_clone.set(new_context);
-                                tracing::info!("Successfully added '{}' and updated MCP context.", server_name);
                             }
                             Err(e) => tracing::error!("Failed to list tools for '{}': {}", server_name, e),
                         }
@@ -220,10 +201,50 @@ impl McpManager {
         }
         tracing::info!("All MCP server launch tasks initiated.");
     }
+    async fn load_configs(&self, config_path: PathBuf) -> Vec<McpServerConfig> {
+        if !config_path.exists() {
+            if let Some(parent) = config_path.parent() {
+                if !parent.exists() {
+                    if let Err(e) = fs::create_dir_all(parent) {
+                        tracing::error!("Failed to create config directory: {}", e);
+                    }
+                }
+            }
+            // Use a valid default JSON structure
+            if let Err(e) = fs::write(&config_path, r#"{ "mcpServers": {} }"#) {
+                tracing::error!("Failed to write default mcp_servers.json: {}", e);
+            }
+        }
+
+        match fs::read_to_string(config_path) {
+            Ok(content) => {
+                let wrapper: McpServersWrapper = serde_json::from_str(&content).unwrap_or_else(|e| {
+                    tracing::error!("Failed to parse mcp_servers.json: {}", e);
+                    McpServersWrapper {
+                        mcp_servers: HashMap::new(),
+                    }
+                });
+
+                let configs_vec: Vec<McpServerConfig> =
+                    wrapper.mcp_servers.into_iter().map(|(name, mut config)| {
+                        config.name = name;
+                        config
+                    }).collect();
+
+                tracing::info!(
+                    "Successfully parsed {} MCP server configs.",
+                    configs_vec.len()
+                );
+                configs_vec
+            }
+            Err(e) => {
+                tracing::error!("Failed to read mcp_servers.json: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
     fn map_tool_to_category(_tool_name: &str) -> ToolCategory {
-        // All tools loaded via MCP are considered MCP tools for permission purposes.
-        // The Browser/Execute categories are commented out as they are not currently used
-        // and all tools are dynamically loaded.
         ToolCategory::Mcp
     }
 

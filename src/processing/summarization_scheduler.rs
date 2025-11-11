@@ -27,32 +27,39 @@ pub fn SummarizationScheduler(children: Element) -> Element {
         async move {
         let mut last_summarized_message_count = 0;
         loop {
-            // Wait for an activity signal, or timeout after 5 seconds of inactivity
-            let timeout_result = tokio::time::timeout(INACTIVITY_DELAY, rx.next()).await;
+            match tokio::time::timeout(INACTIVITY_DELAY, rx.next()).await {
+                Ok(Some(_)) => {
+                    // Activity occurred, loop again to reset the timer.
+                    continue;
+                }
+                Ok(None) => {
+                    // Channel closed, component was dropped.
+                    tracing::info!("Summarization scheduler shutting down.");
+                    break;
+                }
+                Err(_) => {
+                    // Timeout occurred, meaning user is idle. Time to summarize.
+                    let (session, settings_guard) = (session_state.read().clone(), settings.read().clone());
+                    let active_session = if let Some(s) = session.get_active_session() {
+                        s.clone()
+                    } else {
+                        continue; // No active session to summarize
+                    };
 
-            if timeout_result.is_err() {
-                // Timeout occurred, meaning user is idle. Time to summarize.
-                let (session, settings_guard) = (session_state.read().clone(), settings.read().clone());
-                let active_session = if let Some(s) = session.get_active_session() {
-                    s.clone()
-                } else {
-                    continue; // No active session to summarize
-                };
+                    let current_message_count = active_session.messages.len();
 
-                let current_message_count = active_session.messages.len();
-
-                if current_message_count > last_summarized_message_count {
-                    tracing::info!("Inactivity detected. Summarizing conversation.");
-                    let processor_guard = processor.read();
-                    if let Some(summary) = processor_guard.generate_summary(&active_session, &settings_guard).await {
-                        // Write the new summary back to the session
-                        session_state.write().get_active_session_mut().unwrap().active_context.conversation_summary = summary;
-                        last_summarized_message_count = current_message_count;
-                        tracing::info!("Conversation summary updated.");
+                    if current_message_count > last_summarized_message_count {
+                        tracing::info!("Inactivity detected. Summarizing conversation.");
+                        let processor_guard = processor.read();
+                        if let Some(summary) = processor_guard.generate_summary(&active_session, &settings_guard).await {
+                            // Write the new summary back to the session
+                            session_state.write().get_active_session_mut().unwrap().active_context.conversation_summary = summary;
+                            last_summarized_message_count = current_message_count;
+                            tracing::info!("Conversation summary updated.");
+                        }
                     }
                 }
             }
-            // If a message was received, the loop continues, effectively resetting the timer.
         }
         }
     });

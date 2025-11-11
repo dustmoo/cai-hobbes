@@ -1,13 +1,14 @@
 #![allow(non_snake_case)]
 use dioxus::prelude::*;
 use dioxus_free_icons::{Icon, icons::fi_icons};
-use crate::session::SessionState;
+use crate::{session::SessionState, context::permissions::PermissionManager};
 
 #[derive(Props, PartialEq, Clone)]
 pub struct SessionManagerProps {}
 
 pub fn SessionManager(_props: SessionManagerProps) -> Element {
     let mut session_state = consume_context::<Signal<SessionState>>();
+    let mut permission_manager = consume_context::<Signal<PermissionManager>>();
     let mut editing_session_id = use_signal(|| None::<String>);
     let mut temp_session_name = use_signal(String::new);
 
@@ -49,6 +50,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                     onclick: move |_| {
                                         if editing_session_id.read().is_none() {
                                             session_state.write().set_active_session(id_clone_for_click.clone());
+                                            permission_manager.write().reset_turn_count();
                                         }
                                     },
                                     if is_editing {
@@ -108,6 +110,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                     class: "w-full px-4 py-2 bg-purple-600 rounded-md text-white font-semibold hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500",
                     onclick: move |_| {
                         session_state.write().create_session();
+                        permission_manager.write().reset_turn_count();
                     },
                     "✨ New Chat"
                 }

@@ -114,16 +114,28 @@ impl<'a> PromptBuilder<'a> {
             system_context_map = map;
         }
 
-        let user_name = &active_context.conversation_summary.entities.user_name;
-        if user_name.trim().is_empty() {
+        // Determine the user's name, prioritizing settings over conversation summary.
+        let final_user_name = self.settings.user_name.as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                let name_from_summary = &active_context.conversation_summary.entities.user_name;
+                if !name_from_summary.trim().is_empty() {
+                    Some(name_from_summary.as_str())
+                } else {
+                    None
+                }
+            });
+
+        if let Some(name) = final_user_name {
+            // If we have a name, add it to the context and ensure the instruction is removed.
+            system_context_map.insert("user_name".to_string(), json!(name));
+            system_context_map.remove("user_instruction");
+        } else {
+            // If no name is found, add the instruction to ask for it and guide the user to settings.
             system_context_map.insert(
                 "user_instruction".to_string(),
-                serde_json::Value::String(
-                    "Your user's name is not in the current SYSTEM_CONTEXT. Please ask them what they would like to be called.".to_string(),
-                ),
+                json!("Your user's name is not in the current SYSTEM_CONTEXT. Please ask them what they would like to be called. Direct them to set this in the 'Application Behavior' section of the settings."),
             );
-        } else {
-            system_context_map.remove("user_instruction");
         }
 
         system_context_map.insert(
@@ -366,3 +378,4 @@ mod tests {
         assert!(parameters.get("additionalProperties").is_none());
     }
 }
+

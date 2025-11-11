@@ -24,6 +24,7 @@ pub struct StreamManagerContext {
     settings: Signal<Settings>,
     continuation_controller: Signal<ContinuationController>,
     scheduler: Coroutine<SchedulerSignal>,
+    permission_manager: Signal<crate::context::permissions::PermissionManager>,
     pub stream_activity: Signal<u64>,
     pub is_sending: Signal<bool>,
 }
@@ -100,7 +101,7 @@ impl StreamManagerContext {
                         let mut session_state = self.session_state;
                         let document_store = self.document_store;
                         let tool_results_tx_clone = tool_results_tx.clone();
-                        spawn(async move {
+                        let handle = spawn(async move {
                             let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
                             let result_receiver = mcp_manager.read().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, false).await;
 
@@ -156,6 +157,7 @@ impl StreamManagerContext {
                             }
                             let _ = tool_results_tx_clone.send(record);
                         });
+                        let _ = handle; // We don't need to track the handle, just spawn the task.
                         is_first_message = false;
                     }
                 }
@@ -170,6 +172,9 @@ impl StreamManagerContext {
                 }
             }
 
+            // Wait for all tool execution tasks to complete before proceeding to collect results.
+            // This prevents a race condition where the receiver loop closes before all tools are finished.
+
             drop(tool_results_tx);
             let mut collected_records = Vec::new();
             while let Some(record) = tool_results_rx.recv().await {
@@ -179,7 +184,8 @@ impl StreamManagerContext {
             if tool_call_count > 0 {
                 assert_eq!(collected_records.len(), tool_call_count, "Mismatch between tool calls dispatched and results received.");
                 self.session_state.write().tool_call_history.extend(collected_records.clone());
-                // Tools were called in this turn. Trigger a continuation to start the next turn.
+                // Tools were called in this turn. Increment the turn counter and trigger a continuation.
+                self.permission_manager.write().increment_turn_count();
                 self.continuation_controller.read().trigger_continuation();
                 return; // End this stream task. The continuation will start a new one.
             }
@@ -191,6 +197,7 @@ impl StreamManagerContext {
                         *t = t.trim().strip_suffix("<continue />").unwrap_or(t).trim().to_string();
                     }
                 }
+                self.permission_manager.write().increment_turn_count();
                 self.continuation_controller.read().trigger_continuation();
                 return;
             }
@@ -272,6 +279,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
     let settings = consume_context::<Signal<Settings>>();
     let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
+    let permission_manager = consume_context::<Signal<crate::context::permissions::PermissionManager>>();
     let context = use_hook(|| StreamManagerContext {
         stream_receivers: Signal::new(HashMap::new()),
         active_stream_handles: Signal::new(HashMap::new()),
@@ -283,6 +291,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         settings,
         continuation_controller,
         scheduler,
+        permission_manager,
         stream_activity: Signal::new(0),
         is_sending: Signal::new(false),
     });
@@ -323,6 +332,7 @@ mod tests {
                 settings,
                 continuation_controller,
                 scheduler,
+                permission_manager,
                 stream_activity: Signal::new(0),
                 is_sending: Signal::new(false),
             });
@@ -375,6 +385,7 @@ mod tests {
                 settings,
                 continuation_controller,
                 scheduler,
+                permission_manager,
                 stream_activity: Signal::new(0),
                 is_sending: Signal::new(false),
             });

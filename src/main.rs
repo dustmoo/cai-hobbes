@@ -34,9 +34,11 @@ fn main() {
     let initial_width = initial_state.window_width;
     let initial_height = initial_state.window_height;
 
+    let menu = menu::build_menu();
     LaunchBuilder::new()
         .with_cfg(
             Config::new()
+                .with_menu(menu)
                 .with_window(
                     {
                         let mut window = WindowBuilder::new()
@@ -123,6 +125,25 @@ fn app() -> Element {
 
     use_context_provider(|| Signal::new(processing::conversation_processor::ConversationProcessor::new(llm_connector.read().clone())));
 
+    // Asynchronously load the session state
+    let _ = use_resource(move || async move {
+        let mut session_state = session_state.clone();
+        match SessionState::load() {
+            Ok(loaded_state) => {
+                session_state.set(loaded_state);
+                tracing::info!("Session state loaded successfully.");
+            }
+            Err(e) => {
+                tracing::error!("Failed to load session state: {}. Creating a new default session.", e);
+                // If loading fails, create a new session and save it
+                let mut state = session_state.write();
+                if state.sessions.is_empty() {
+                    state.create_session();
+                }
+            }
+        }
+    });
+
     let permission_status_signal = use_context_provider(|| Signal::new(permissions::PermissionStatus::Denied));
 
     let _ = use_resource(move || async move {
@@ -198,12 +219,6 @@ fn app() -> Element {
 
     // One-time setup for the menu
     use_effect(move || {
-        let menu = menu::build_menu();
-        #[cfg(target_os = "macos")]
-        menu.init_for_nsapp();
-        #[cfg(target_os = "windows")]
-        menu.init_for_hwnd(window.hwnd());
-
         let menu_channel = MenuEvent::receiver();
         std::thread::spawn(move || {
             loop {
@@ -216,7 +231,6 @@ fn app() -> Element {
             }
         });
     });
-
     // Effect to manage the tray icon's visibility based on settings
     use_effect(move || {
         let show = settings.read().show_tray_icon;
@@ -285,7 +299,6 @@ fn app() -> Element {
 
 
 
-    let drag_window = window.clone();
     rsx! {
         if matches!(*permission_status_signal.read(), permissions::PermissionStatus::JustGranted) {
             RestartRequired {}
@@ -301,13 +314,7 @@ fn app() -> Element {
                 StreamManager {
                 div {
                     class: "dark flex flex-col h-screen", // Changed to flex-col
-                    // Draggable column area
-                    div {
-                        class: "h-8 bg-transparent",
-                        onmousedown: move |_| {
-                            drag_window.drag();
-                        }
-                    }
+                    // The draggable header has been removed as per user request.
                     // Main content area
                     div {
                         class: "flex flex-row flex-1 min-h-0", // This will contain the sidebars and chat

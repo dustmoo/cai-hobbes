@@ -24,6 +24,7 @@ pub struct Settings {
     pub gemini_config: GeminiConfig,
     pub qdrant_url: Option<String>,
     pub persona: String,
+    pub user_name: Option<String>,
     pub force_tool_use_instruction: Option<String>,
     pub project_folder: Option<String>,
     pub chat_history_length: usize,
@@ -46,7 +47,8 @@ impl Default for Settings {
                 summary_model: "gemini-1.5-flash-latest".to_string(),
             },
             qdrant_url: None,
-            persona: "You are Hobbes, a helpful AI assistant.".to_string(),
+            persona: "You are Hobbes. Be a direct, clear, and radically candid partner. Function as an exocortex, matching the user's communication style. Your default tone is that of a professional friend.".to_string(),
+            user_name: None,
             force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available. When using the fetch tool, you MUST provide markdown links as sources.".to_string()),
             project_folder: None,
             chat_history_length: 8,
@@ -55,8 +57,7 @@ impl Default for Settings {
             permission_settings: PermissionSettings {
                 auto_approval_enabled: true,
                 granular_permissions,
-                max_requests: 25,
-                max_cost: 1.00,
+                max_ai_turns: 25,
             },
         }
     }
@@ -114,6 +115,9 @@ impl SettingsManager {
             }
             if let Some(persona) = value.get("persona").and_then(|v| v.as_str()) {
                 settings.persona = persona.to_string();
+            }
+            if let Some(user_name) = value.get("user_name").and_then(|v| v.as_str()) {
+                settings.user_name = Some(user_name.to_string());
             }
             if let Some(project_folder) = value.get("project_folder").and_then(|v| v.as_str()) {
                 settings.project_folder = Some(project_folder.to_string());

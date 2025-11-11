@@ -72,9 +72,9 @@ pub fn SettingsPanel() -> Element {
                 class: "flex-grow overflow-y-auto pr-2",
                 // LLM Configuration Section
                 div {
-                    class: "mb-4 border border-gray-700 rounded-lg",
+                    class: "border border-gray-700 rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-3 cursor-pointer bg-gray-750 rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-gray-750 rounded-t-lg",
                         onclick: move |_| llm_config_collapsed.set(!llm_config_collapsed()),
                         h3 { class: "text-md font-semibold", "LLM Configuration" }
                         span { if *llm_config_collapsed.read() { "▶" } else { "▼" } }
@@ -132,9 +132,9 @@ pub fn SettingsPanel() -> Element {
 
                 // Application Behavior Section
                 div {
-                    class: "mb-4 border border-gray-700 rounded-lg",
+                    class: "border border-gray-700 rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-3 cursor-pointer bg-gray-750 rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-gray-750 rounded-t-lg",
                         onclick: move |_| app_behavior_collapsed.set(!app_behavior_collapsed()),
                         h3 { class: "text-md font-semibold", "Application Behavior" }
                         span { if *app_behavior_collapsed.read() { "▶" } else { "▼" } }
@@ -185,6 +185,38 @@ pub fn SettingsPanel() -> Element {
                                 }
                             }
                             div {
+                                class: "mt-4 mb-4",
+                                label { class: "block text-sm font-medium text-gray-300", "Max AI Turns" }
+                                input {
+                                    class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm",
+                                    r#type: "number",
+                                    value: "{local_settings.read().permission_settings.max_ai_turns}",
+                                    oninput: move |event| {
+                                        if let Ok(val) = event.value().parse::<u32>() {
+                                            local_settings.write().permission_settings.max_ai_turns = val;
+                                        }
+                                    }
+                                }
+                            }
+                            div {
+                                class: "mt-4 mb-4",
+                                label { class: "block text-sm font-medium text-gray-300", "What should Hobbes call you?" }
+                                input {
+                                    class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
+                                    r#type: "text",
+                                    placeholder: "e.g., Dustin",
+                                    value: "{local_settings.read().user_name.as_deref().unwrap_or(\"\")}",
+                                    oninput: move |event| {
+                                        let value = event.value();
+                                        if value.is_empty() {
+                                            local_settings.write().user_name = None;
+                                        } else {
+                                            local_settings.write().user_name = Some(value);
+                                        }
+                                    }
+                                }
+                            }
+                            div {
                                 class: "mb-4",
                                 label { class: "block text-sm font-medium text-gray-300", "Persona" }
                                 textarea {
@@ -232,9 +264,9 @@ pub fn SettingsPanel() -> Element {
 
                 // Data Management Section
                 div {
-                    class: "mb-4 border border-gray-700 rounded-lg",
+                    class: "border border-gray-700 rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-3 cursor-pointer bg-gray-750 rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-gray-750 rounded-t-lg",
                         onclick: move |_| data_management_collapsed.set(!data_management_collapsed()),
                         h3 { class: "text-md font-semibold", "Data Management" }
                         span { if *data_management_collapsed.read() { "▶" } else { "▼" } }
@@ -403,9 +435,9 @@ pub fn SettingsPanel() -> Element {
 
                 // Permissions Section
                 div {
-                    class: "mb-4 border border-gray-700 rounded-lg",
+                    class: "border border-gray-700 rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-3 cursor-pointer bg-gray-750 rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-gray-750 rounded-t-lg",
                         onclick: move |_| permissions_collapsed.set(!permissions_collapsed()),
                         h3 { class: "text-md font-semibold", "Permissions" }
                         span { if *permissions_collapsed.read() { "▶" } else { "▼" } }
@@ -414,7 +446,7 @@ pub fn SettingsPanel() -> Element {
                         div {
                             class: "p-4",
                             div {
-                                class: "flex items-center justify-between mb-3",
+                                class: "flex items-center justify-between mb-4",
                                 label { class: "block text-sm font-medium text-gray-300", "Enable Auto-Approval" }
                                 label {
                                     class: "relative inline-flex items-center cursor-pointer",
@@ -435,7 +467,7 @@ pub fn SettingsPanel() -> Element {
                                 div {
                                     class: "mb-2 pl-4 border-l-2 border-gray-700",
                                     div {
-                                        class: "flex items-center justify-between mb-2",
+                                        class: "flex items-center justify-between mb-4",
                                         label { "MCP Tools" }
                                         label {
                                             class: "relative inline-flex items-center cursor-pointer",
@@ -450,35 +482,6 @@ pub fn SettingsPanel() -> Element {
                                                 }
                                             }
                                             div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600" }
-                                        }
-                                    }
-                                    div {
-                                        class: "mt-3",
-                                        label { "Max Consecutive Requests" }
-                                        input {
-                                            class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm",
-                                            r#type: "number",
-                                            value: "{local_settings.read().permission_settings.max_requests}",
-                                            oninput: move |event| {
-                                                if let Ok(val) = event.value().parse::<u32>() {
-                                                    local_settings.write().permission_settings.max_requests = val;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    div {
-                                        class: "mt-3",
-                                        label { "Max Session Cost ($)" }
-                                        input {
-                                            class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm",
-                                            r#type: "number",
-                                            step: "0.01",
-                                            value: "{local_settings.read().permission_settings.max_cost}",
-                                            oninput: move |event| {
-                                                if let Ok(val) = event.value().parse::<f64>() {
-                                                    local_settings.write().permission_settings.max_cost = val;
-                                                }
-                                            }
                                         }
                                     }
                                 }

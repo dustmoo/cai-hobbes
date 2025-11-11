@@ -21,6 +21,7 @@ use super::shared::{MessageContent, StreamMessage};
 use super::continuation_controller::ContinuationController;
 use super::chat_input::ChatInput;
 use super::message_list::MessageList;
+use crate::context::permissions::PermissionManager;
 use crate::components::markdown_renderer::MarkdownRenderer;
 
 lazy_static! {
@@ -44,6 +45,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     let settings = use_context::<Signal<Settings>>();
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let permission_manager = use_context::<Signal<PermissionManager>>();
     let draft = use_signal(|| "".to_string());
     use_context_provider(|| draft);
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
@@ -197,6 +199,44 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             let settings = settings.read().clone();
             let mcp_manager = mcp_manager;
             let send_prompt_to_llm = send_prompt_to_llm;
+            let mut permission_manager = permission_manager;
+
+            // Reset the AI turn count every time the user sends a message.
+            permission_manager.write().reset_turn_count();
+
+            // Check if the last message was the turn limit warning.
+            let last_message_was_warning = session_state.read().get_active_session()
+                .and_then(|s| s.messages.last())
+                .map_or(false, |m| {
+                    if let MessageContent::Text(text) = &m.content {
+                        text.starts_with("Pardon, I have reached the 'Max Turn Limit' currently set to X in settings")
+                    } else {
+                        false
+                    }
+                });
+
+            if last_message_was_warning {
+                permission_manager.write().reset_turn_count();
+            }
+
+            if permission_manager.read().is_turn_limit_reached() {
+                let mut state = session_state.write();
+                if let Some(session) = state.get_active_session_mut() {
+                    session.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        author: "User".to_string(),
+                        content: MessageContent::Text(user_message.clone()),
+                        attachments,
+                    });
+                    session.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        author: "Hobbes".to_string(),
+                        content: MessageContent::Text(format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings.permission_settings.max_ai_turns)),
+                        attachments: Vec::new(),
+                    });
+                }
+                return;
+            }
 
             let hobbes_message_id = Uuid::new_v4();
             {
