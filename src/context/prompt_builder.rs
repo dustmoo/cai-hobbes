@@ -67,17 +67,28 @@ impl<'a> PromptBuilder<'a> {
             for server in &mcp_context.servers {
                 for tool in &server.tools {
                     if let Ok(mut tool_value) = serde_json::to_value(tool) {
-                        // This is the critical fix. The rmcp crate generates an "inputSchema" field,
-                        // but the Gemini API expects "parameters". We manually correct it here.
                         if let Some(obj) = tool_value.as_object_mut() {
-                            if let Some(schema) = obj.remove("inputSchema") {
+                            // 1. Remove invalid keys from the top-level of the function declaration itself.
+                            obj.remove("annotations");
+                            obj.remove("outputSchema");
+
+                            // 2. Rename inputSchema to parameters and sanitize it.
+                            if let Some(mut schema) = obj.remove("inputSchema") {
+                                // 3. Sanitize the entire schema recursively.
+                                recursively_sanitize_schema(&mut schema);
+
+                                // 4. Enforce top-level structural requirements after sanitization.
+                                if let Some(schema_obj) = schema.as_object_mut() {
+                                    schema_obj.remove("$schema");
+
+                                    // Gemini requires `type: "object"` if `properties` are present.
+                                    if schema_obj.contains_key("properties") {
+                                        schema_obj.insert("type".to_string(), json!("OBJECT"));
+                                    }
+                                }
                                 obj.insert("parameters".to_string(), schema);
                             }
                         }
-                        
-                        // Next, recursively remove any unsupported keys from the schema.
-                        recursively_remove_keys(&mut tool_value, &["exclusiveMaximum", "exclusiveMinimum", "$schema", "additionalProperties", "outputSchema", "annotations", "ge", "le"]);
-
                         function_declarations.push(tool_value);
                     }
                 }
@@ -229,23 +240,117 @@ impl<'a> PromptBuilder<'a> {
     }
 }
 
-/// Recursively traverses a serde_json::Value and removes specified keys.
-fn recursively_remove_keys(value: &mut serde_json::Value, keys_to_remove: &[&str]) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for key in keys_to_remove {
-                map.remove(*key);
-            }
-            for (_, val) in map.iter_mut() {
-                recursively_remove_keys(val, keys_to_remove);
+/// A comprehensive, recursive sanitizer for Gemini tool schemas.
+fn recursively_sanitize_schema(value: &mut serde_json::Value) {
+    // Pass 1: Simplify complex structures first.
+    simplify_schema(value);
+    // Pass 2: Fix types and remove invalid keys from the simplified structure.
+    fix_and_remove_invalid_fields(value);
+}
+
+/// Pass 1: Recursively simplifies complex schema structures like `oneOf` and `items` arrays.
+fn simplify_schema(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = value {
+        // Simplify `oneOf`, `anyOf`, `allOf` by taking the first element.
+        for key in ["oneOf", "anyOf", "allOf"].iter() {
+            if let Some(arr_val) = map.remove(*key) {
+                if let Some(arr) = arr_val.as_array() {
+                    if let Some(first_item) = arr.get(0) {
+                        // If the first item is an object, merge its properties into the current map.
+                        if let Some(obj) = first_item.as_object() {
+                            for (k, v) in obj {
+                                map.insert(k.clone(), v.clone());
+                            }
+                        }
+                        break;
+                    }
+                }
             }
         }
-        serde_json::Value::Array(arr) => {
-            for val in arr.iter_mut() {
-                recursively_remove_keys(val, keys_to_remove);
+
+        // If `items` is an array, replace it with its first element.
+        if let Some(items_val) = map.get_mut("items") {
+            if let Some(arr) = items_val.as_array() {
+                if let Some(first_item) = arr.get(0) {
+                    *items_val = first_item.clone();
+                } else {
+                    // If the array is empty, replace it with an empty object to satisfy the API.
+                    *items_val = json!({});
+                }
             }
         }
-        _ => {}
+
+        // Recurse into all child values.
+        for (_, val) in map.iter_mut() {
+            simplify_schema(val);
+        }
+    } else if let serde_json::Value::Array(arr) = value {
+        for val in arr.iter_mut() {
+            simplify_schema(val);
+        }
+    }
+}
+
+/// Pass 2: Recursively fixes enums, enforces object types, and removes invalid keys.
+fn fix_and_remove_invalid_fields(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = value {
+        // Rule 1: Convert numeric enums to strings.
+        if let Some(enum_val) = map.get_mut("enum") {
+            if let serde_json::Value::Array(arr) = enum_val {
+                if arr.iter().any(|v| v.is_number() || v.is_null()) {
+                    let new_arr: Vec<serde_json::Value> = arr
+                        .iter()
+                        .map(|v| serde_json::Value::String(v.to_string().replace('\"', "")))
+                        .collect();
+                    *enum_val = serde_json::Value::Array(new_arr);
+                    // If we converted a numeric enum, we must also change the type to STRING.
+                    map.insert("type".to_string(), json!("STRING"));
+                }
+            }
+        }
+
+        // Rule 2: Enforce `type: "object"` if `properties` or `required` exist.
+        if map.contains_key("properties") || map.contains_key("required") {
+            map.insert("type".to_string(), json!("OBJECT"));
+        }
+
+        // Rule 3: Convert type values to uppercase for Gemini compatibility.
+        if let Some(type_val) = map.get_mut("type") {
+            if let serde_json::Value::Array(arr) = type_val {
+                // If type is an array (e.g., ["string", "number"]), take the first type.
+                if let Some(first) = arr.get(0) {
+                    if let Some(s) = first.as_str() {
+                        *type_val = serde_json::Value::String(s.to_string());
+                    }
+                }
+            }
+            if let serde_json::Value::String(s) = type_val {
+                *type_val = serde_json::Value::String(s.to_uppercase());
+            }
+        }
+
+        // Rule 4: Remove globally invalid keys.
+        let keys_to_remove = [
+            "exclusiveMaximum",
+            "exclusiveMinimum",
+            "ge",
+            "le",
+            "additionalProperties",
+            "$ref",
+            // "type" // DO NOT REMOVE: This is required for nested objects and arrays.
+        ];
+        for key in &keys_to_remove {
+            map.remove(*key);
+        }
+
+        // Recurse into all child values after processing the current level.
+        for (_, val) in map.iter_mut() {
+            fix_and_remove_invalid_fields(val);
+        }
+    } else if let serde_json::Value::Array(arr) = value {
+        for val in arr.iter_mut() {
+            fix_and_remove_invalid_fields(val);
+        }
     }
 }
 
@@ -253,7 +358,6 @@ fn recursively_remove_keys(value: &mut serde_json::Value, keys_to_remove: &[&str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::prompt_builder::{recursively_remove_keys, PromptBuilder};
     use crate::mcp::manager::{McpContext, McpServerContext};
     use crate::session::{ActiveContext, ConversationSummary, ConversationSummaryEntities, Session};
     use crate::settings::Settings;
@@ -261,58 +365,116 @@ mod tests {
     use rmcp::model::Tool;
     use serde_json::json;
 
-    #[test]
-    fn test_recursively_remove_keys() {
-        let mut value = json!({
-            "level1": {
-                "exclusiveMaximum": 100,
-                "level2": {
-                    "exclusiveMinimum": 0,
-                    "keep": "this"
-                },
-                "another_key": "value"
-            },
-            "level1_array": [
-                { "exclusiveMaximum": 50, "data": "A" },
-                { "exclusiveMinimum": 5, "data": "B" }
-            ]
-        });
-
-        let keys_to_remove = ["exclusiveMaximum", "exclusiveMinimum"];
-        recursively_remove_keys(&mut value, &keys_to_remove);
-
-        let expected = json!({
-            "level1": {
-                "level2": {
-                    "keep": "this"
-                },
-                "another_key": "value"
-            },
-            "level1_array": [
-                { "data": "A" },
-                { "data": "B" }
-            ]
-        });
-
-        assert_eq!(value, expected);
-    }
-
     fn create_mock_session_with_tools() -> Session {
         let tool1: Tool = serde_json::from_value(json!({
             "name": "get_weather",
             "description": "Get the current weather",
+            "annotations": { "source": "test" },
+            "outputSchema": { "type": "string" },
             "inputSchema": {
                 "$schema": "http://json-schema.org/draft-07/schema#",
-                "type": "object",
+                // "type": "object", // Intentionally missing to test enforcement
                 "additionalProperties": false,
                 "properties": {
                     "location": {
-                        "type": "string",
-                        "description": "The city and state, e.g. San Francisco, CA",
-                        "exclusiveMaximum": 100
+                        "$ref": "#/definitions/location"
+                    },
+                    "options": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "unit": { "type": "string" },
+                            "priority": {
+                                "type": "number",
+                                "enum": [1, 2, 3, 4, null]
+                            }
+                        }
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": { "name": { "type": "string" } }
+                        }
+                    },
+                    "deep_items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "level1": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": { "name": { "type": "string" } }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "complex_items": {
+                        "type": "array",
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": { "name": { "type": "string" } }
+                                }
+                            ]
+                        }
+                    },
+                    "array_items": {
+                        "type": "array",
+                        "items": [
+                            {
+                                "type": "object",
+                                "properties": { "id": { "type": "string" } }
+                            }
+                        ]
                     }
                 },
-                "required": ["location"]
+                "required": ["location"],
+                "definitions": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city and state"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let tool2: Tool = serde_json::from_value(json!({
+            "name": "complex_tool",
+            "description": "A tool with a more complex schema",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "string_array": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "object_array": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": { "key": { "type": "string" } },
+                            "required": ["key"]
+                        }
+                    },
+                    "string_enum": {
+                        "type": "string",
+                        "enum": ["A", "B", "C"]
+                    },
+                    "mixed_enum": {
+                        "type": "string",
+                        "enum": ["A", 1, null, 3.14]
+                    },
+                    "empty_items_array": {
+                        "type": "array",
+                        "items": []
+                    }
+                }
             }
         }))
         .unwrap();
@@ -320,7 +482,7 @@ mod tests {
         let server = McpServerContext {
             name: "weather_server".to_string(),
             description: "Provides weather information".to_string(),
-            tools: vec![tool1],
+            tools: vec![tool1, tool2],
         };
 
         let mcp_context = McpContext {
@@ -360,7 +522,7 @@ mod tests {
 
         let tools = prompt.tools.expect("Should have tools");
         let tool_declarations = &tools[0].function_declarations;
-        assert_eq!(tool_declarations.len(), 1);
+        assert_eq!(tool_declarations.len(), 2);
 
         let tool_json = &tool_declarations[0];
 
@@ -368,14 +530,80 @@ mod tests {
         assert!(tool_json.get("parameters").is_some());
         assert!(tool_json.get("inputSchema").is_none());
 
-        // 2. Verify unsupported keys were removed
+        // 2. Verify invalid top-level tool keys were removed
+        assert!(tool_json.get("annotations").is_none());
+        assert!(tool_json.get("outputSchema").is_none());
+
+        // 3. Verify unsupported keys were removed from the parameters schema
         let parameters = tool_json.get("parameters").unwrap();
+        // Top-level schema keys
+        assert!(parameters.get("$schema").is_none());
+        assert_eq!(parameters.get("type"), Some(&json!("OBJECT"))); // Type is enforced
+        assert!(parameters.get("additionalProperties").is_none()); // Recursive removal
+
         let properties = parameters.get("properties").unwrap();
         let location = properties.get("location").unwrap();
-        assert!(location.get("exclusiveMaximum").is_none());
-        assert!(location.get("type").is_some());
-        assert!(parameters.get("$schema").is_none());
-        assert!(parameters.get("additionalProperties").is_none());
+        assert!(location.get("$ref").is_none()); // Recursive removal of $ref
+
+        let options = properties.get("options").unwrap();
+        assert!(options.get("additionalProperties").is_none()); // Nested removal
+
+        let priority = options.get("properties").unwrap().get("priority").unwrap();
+        let priority_enum = priority.get("enum").unwrap().as_array().unwrap();
+        assert_eq!(priority_enum[0], "1");
+        assert_eq!(priority_enum[4], "null"); // Handles null correctly
+
+        let tags = properties.get("tags").unwrap();
+        let tag_items = tags.get("items").unwrap();
+        assert_eq!(tag_items.get("type"), Some(&json!("OBJECT"))); // Type is NOT removed from items with properties
+        assert!(tag_items.get("properties").is_some());
+
+        let deep_items = properties.get("deep_items").unwrap();
+        let deep_items_level1 = deep_items.get("items").unwrap().get("properties").unwrap().get("level1").unwrap();
+        let deep_items_level2_items = deep_items_level1.get("items").unwrap();
+        assert_eq!(deep_items_level2_items.get("type"), Some(&json!("OBJECT"))); // Verify deeply nested type is NOT removed
+        
+        let complex_items = properties.get("complex_items").unwrap();
+        let complex_items_items = complex_items.get("items").unwrap();
+        assert!(complex_items_items.get("oneOf").is_none()); // oneOf is simplified
+        assert!(complex_items_items.get("properties").is_some());
+        assert_eq!(complex_items_items.get("type"), Some(&json!("OBJECT"))); // type is NOT removed after simplification
+
+        let array_items = properties.get("array_items").unwrap();
+        let array_items_items = array_items.get("items").unwrap();
+        assert!(array_items_items.is_object()); // items array is simplified to its first object
+        assert!(array_items_items.get("properties").is_some());
+
+        // Verify the second, more complex tool
+        let complex_tool_json = &tool_declarations[1];
+        let complex_params = complex_tool_json.get("parameters").unwrap();
+        let complex_props = complex_params.get("properties").unwrap();
+
+        // Check string array
+        let string_array = complex_props.get("string_array").unwrap();
+        assert_eq!(string_array.get("type"), Some(&json!("ARRAY")));
+        assert_eq!(string_array.get("items").unwrap().get("type"), Some(&json!("STRING")));
+
+        // Check object array
+        let object_array = complex_props.get("object_array").unwrap();
+        assert_eq!(object_array.get("type"), Some(&json!("ARRAY")));
+        let object_array_items = object_array.get("items").unwrap();
+        assert_eq!(object_array_items.get("type"), Some(&json!("OBJECT")));
+        assert!(object_array_items.get("properties").is_some());
+
+        // Check mixed enum is converted to strings
+        let mixed_enum = complex_props.get("mixed_enum").unwrap();
+        let enum_values = mixed_enum.get("enum").unwrap().as_array().unwrap();
+        assert_eq!(enum_values[0], "A");
+        assert_eq!(enum_values[1], "1");
+        assert_eq!(enum_values[2], "null");
+        assert_eq!(enum_values[3], "3.14");
+
+        // Check empty items array is converted to an empty object
+        let empty_items_array = complex_props.get("empty_items_array").unwrap();
+        assert_eq!(empty_items_array.get("type"), Some(&json!("ARRAY")));
+        let empty_items = empty_items_array.get("items").unwrap();
+        assert!(empty_items.is_object());
+        assert!(empty_items.as_object().unwrap().is_empty());
     }
 }
-
