@@ -54,7 +54,7 @@ fn main() {
                         window
                     }
                 )
-                .with_custom_head(r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #111827; }</style>"#.to_string() + r#"<style>"# + include_str!("../assets/output.css") + r#"</style>"#)
+                .with_custom_head(r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #111827; }</style>"#.to_string() + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"#)
         )
         .launch(app)
 }
@@ -62,7 +62,15 @@ fn main() {
 use crate::context::permissions::PermissionManager;
 use crate::session::SessionState;
 use crate::settings::SettingsManager;
-use crate::{components::{llm::{GeminiConnector, LlmConnector}, stream_manager::StreamManager}, mcp::manager::McpManager, services::document_store::DocumentStore};
+use crate::{
+    components::{
+        confirm_delete_modal::ConfirmDeleteModal,
+        llm::{GeminiConnector, LlmConnector},
+        stream_manager::StreamManager,
+    },
+    mcp::manager::McpManager,
+    services::document_store::DocumentStore,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -101,11 +109,11 @@ fn RestartRequired() -> Element {
 
 fn app() -> Element {
     let window = use_window();
-    let session_state = use_context_provider(|| Signal::new(SessionState::new()));
+    let mut session_state = use_context_provider(|| Signal::new(SessionState::new()));
     let settings_manager = use_context_provider(|| Signal::new(SettingsManager::new(get_settings_path())));
     let ui_state_manager = use_context_provider(|| Signal::new(settings::UiStateManager::new(get_ui_state_path())));
     let mut ui_state = use_context_provider(|| Signal::new(ui_state_manager.read().load()));
-    let settings = use_context_provider(|| {
+    let mut settings = use_context_provider(|| {
         let mut settings = settings_manager.read().load();
         if let Ok(api_key) = crate::secure_storage::retrieve_secret("api_key") {
             settings.gemini_config.api_key = Some(api_key);
@@ -203,6 +211,8 @@ fn app() -> Element {
     let mut final_width_on_drag_end = use_signal(|| 0.0);
     let mut last_known_size = use_signal(|| PhysicalSize::new(0, 0));
     let mut tray_icon = use_signal::<Option<TrayIcon>>(|| None);
+    let mut show_confirm_modal = use_context_provider(|| Signal::new(false));
+    let session_to_delete = use_context_provider(|| Signal::new(String::new()));
 
     // Unconditionally call the hotkey manager hook, passing in the permission status signal.
     // The hook itself will handle the conditional logic internally.
@@ -312,6 +322,27 @@ fn app() -> Element {
         } else {
             processing::summarization_scheduler::SummarizationScheduler {
                 StreamManager {
+            ConfirmDeleteModal {
+                is_visible: show_confirm_modal,
+                title: "Delete Session".to_string(),
+                message: "Are you sure you want to delete this session? This action cannot be undone.".to_string(),
+                on_cancel: move |_| show_confirm_modal.set(false),
+                on_confirm: move |remember| {
+                    let id_to_delete_str = session_to_delete.read().clone();
+                    if !id_to_delete_str.is_empty() {
+                        session_state.write().delete_session(&id_to_delete_str);
+                    }
+                    if remember {
+                        let mut current_settings = settings.write();
+                        current_settings.confirm_on_delete = false;
+                        let sm = settings_manager.read();
+                        if let Err(e) = sm.save(&current_settings) {
+                            tracing::error!("Failed to save settings: {}", e);
+                        }
+                    }
+                    show_confirm_modal.set(false);
+                },
+            }
                 div {
                     class: "dark flex flex-col h-screen", // Changed to flex-col
                     // The draggable header has been removed as per user request.

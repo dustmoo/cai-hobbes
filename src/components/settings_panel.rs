@@ -4,6 +4,7 @@ use crate::settings::{Settings, SettingsManager};
 use crate::{context::permissions::ToolCategory, secure_storage, session::SessionState};
 use std::io::Write;
 use crate::components::conflict_modal::ConflictModal;
+use crate::components::confirm_save_modal::ConfirmSaveModal;
 use zip::write::{FileOptions, ZipWriter};
 
 #[component]
@@ -11,6 +12,7 @@ pub fn SettingsPanel() -> Element {
     let mut settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
     let mut session_state = use_context::<Signal<SessionState>>();
+    let _permission_manager = use_context::<Signal<crate::context::permissions::PermissionManager>>();
 
     // Create a local copy of the settings for editing.
     let mut local_settings = use_signal(|| settings.read().clone());
@@ -25,11 +27,23 @@ pub fn SettingsPanel() -> Element {
         has_unsaved_changes.set(*global_settings != *local);
     });
 
+    // This effect synchronizes local_settings with global settings when the global state changes.
+    // This is crucial for reflecting changes made elsewhere in the app (e.g., 'remember my choice' in a confirmation modal).
+    // It uses .peek() to avoid creating a dependency on local_settings, preventing an infinite loop.
+    // NOTE: This will discard any unsaved changes in the settings panel when external changes occur.
+    use_effect(move || {
+        let global_settings = settings.read();
+        if *global_settings != *local_settings.peek() {
+            local_settings.set(global_settings.clone());
+        }
+    });
+
     let mut llm_config_collapsed = use_signal(|| false);
     let mut app_behavior_collapsed = use_signal(|| false);
     let mut data_management_collapsed = use_signal(|| false);
     let mut permissions_collapsed = use_signal(|| false);
     let mut show_conflict_modal = use_signal(|| false);
+    let mut show_confirm_save_modal = use_signal(|| false);
     let mut conflicting_sessions = use_signal(|| Vec::<(String, crate::session::Session)>::new());
 
     rsx! {
@@ -65,6 +79,36 @@ pub fn SettingsPanel() -> Element {
                                 }
                             }
                         }
+                    }
+                }
+            }
+            if show_confirm_save_modal() {
+                ConfirmSaveModal {
+                    is_visible: show_confirm_save_modal,
+                    title: "Save Settings".to_string(),
+                    message: "You have unsaved changes. Are you sure you want to save?".to_string(),
+                    on_confirm: move |remember| {
+                        if remember {
+                            local_settings.write().confirm_on_save = false;
+                        }
+                        // 1. Commit the local changes to the global state
+                        let mut global_settings = settings.write();
+                        *global_settings = local_settings.read().clone();
+
+                        // 2. Perform the save operations
+                        let mut settings_to_save = global_settings.clone();
+                        if let Some(api_key) = settings_to_save.gemini_config.api_key.take() {
+                            if let Err(e) = secure_storage::save_secret("api_key", &api_key) {
+                                tracing::error!("Failed to save API key: {}", e);
+                            }
+                        }
+                        if let Err(e) = settings_manager.read().save(&settings_to_save) {
+                            tracing::error!("Failed to save settings: {}", e);
+                        }
+                        show_confirm_save_modal.set(false);
+                    },
+                    on_cancel: move |_| {
+                        show_confirm_save_modal.set(false);
                     }
                 }
             }
@@ -168,6 +212,42 @@ pub fn SettingsPanel() -> Element {
                                         oninput: move |event| {
                                             if let Some(checked) = event.value().parse().ok() {
                                                 local_settings.write().show_tray_icon = checked;
+                                            }
+                                        }
+                                    }
+                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600" }
+                                }
+                            }
+                            div {
+                                class: "mt-4 mb-4 flex items-center justify-between",
+                                label { class: "block text-sm font-medium text-gray-300", "Confirm Before Deleting Sessions" }
+                                label {
+                                    class: "relative inline-flex items-center cursor-pointer",
+                                    input {
+                                        r#type: "checkbox",
+                                        class: "sr-only peer",
+                                        checked: local_settings.read().confirm_on_delete,
+                                        oninput: move |event| {
+                                            if let Some(checked) = event.value().parse().ok() {
+                                                local_settings.write().confirm_on_delete = checked;
+                                            }
+                                        }
+                                    }
+                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600" }
+                                }
+                            }
+                            div {
+                                class: "mt-4 mb-4 flex items-center justify-between",
+                                label { class: "block text-sm font-medium text-gray-300", "Confirm Before Saving Settings" }
+                                label {
+                                    class: "relative inline-flex items-center cursor-pointer",
+                                    input {
+                                        r#type: "checkbox",
+                                        class: "sr-only peer",
+                                        checked: local_settings.read().confirm_on_save,
+                                        oninput: move |event| {
+                                            if let Some(checked) = event.value().parse().ok() {
+                                                local_settings.write().confirm_on_save = checked;
                                             }
                                         }
                                     }
@@ -489,6 +569,7 @@ pub fn SettingsPanel() -> Element {
                         }
                     }
                 }
+
             }
             button {
                 class: if has_unsaved_changes() {
@@ -499,22 +580,24 @@ pub fn SettingsPanel() -> Element {
                 disabled: !has_unsaved_changes(),
                 onclick: move |_| {
                     if has_unsaved_changes() {
-                        // 1. Commit the local changes to the global state
-                        let mut global_settings = settings.write();
-                        *global_settings = local_settings.read().clone();
-
-                        // 2. Perform the save operations
-                        let mut settings_to_save = global_settings.clone();
-                        if let Some(api_key) = settings_to_save.gemini_config.api_key.take() {
-                            if let Err(e) = secure_storage::save_secret("api_key", &api_key) {
-                                tracing::error!("Failed to save API key: {}", e);
+                        if local_settings.read().confirm_on_save {
+                            show_confirm_save_modal.set(true);
+                        } else {
+                            // 1. Commit the local changes to the global state
+                            let mut global_settings = settings.write();
+                            *global_settings = local_settings.read().clone();
+    
+                            // 2. Perform the save operations
+                            let mut settings_to_save = global_settings.clone();
+                            if let Some(api_key) = settings_to_save.gemini_config.api_key.take() {
+                                if let Err(e) = secure_storage::save_secret("api_key", &api_key) {
+                                    tracing::error!("Failed to save API key: {}", e);
+                                }
+                            }
+                            if let Err(e) = settings_manager.read().save(&settings_to_save) {
+                                tracing::error!("Failed to save settings: {}", e);
                             }
                         }
-                        if let Err(e) = settings_manager.read().save(&settings_to_save) {
-                            tracing::error!("Failed to save settings: {}", e);
-                        }
-                        // The `has_unsaved_changes` signal will automatically become false
-                        // because the use_effect hook will see that local and global state are now equal.
                     }
                 },
                 "Save Settings"

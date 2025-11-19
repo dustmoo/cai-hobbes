@@ -157,7 +157,7 @@ impl LlmConnector for GeminiConnector {
         let model = self.config.chat_model.clone();
     const MAX_RETRIES: u32 = 2;
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(600))
         .build()
         .expect("Failed to build reqwest client");
 
@@ -194,7 +194,11 @@ impl LlmConnector for GeminiConnector {
         let response = match client.post(&url).json(&request_body).send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("Error sending request on attempt {}: {}", attempt + 1, e);
+                if e.is_timeout() {
+                    tracing::error!("Gemini API Request TIMED OUT on attempt {}. Duration: 600s", attempt + 1);
+                } else {
+                    tracing::error!("Error sending request on attempt {}: {}", attempt + 1, e);
+                }
                 if attempt + 1 == MAX_RETRIES { return; }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;

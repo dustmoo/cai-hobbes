@@ -31,6 +31,10 @@ pub struct Settings {
     pub show_tray_icon: bool,
     pub global_hotkey: String,
     pub permission_settings: PermissionSettings,
+    #[serde(default = "default_true")]
+    pub confirm_on_delete: bool,
+    #[serde(default = "default_true")]
+    pub confirm_on_save: bool,
 }
 
 
@@ -59,8 +63,14 @@ impl Default for Settings {
                 granular_permissions,
                 max_ai_turns: 25,
             },
+            confirm_on_delete: true,
+            confirm_on_save: true,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub struct SettingsManager {

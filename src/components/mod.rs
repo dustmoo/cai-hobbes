@@ -11,3 +11,5 @@ pub mod tool_call_display;
 pub mod shared;
 pub mod onboarding;
 pub mod continuation_controller;
+pub mod confirm_delete_modal;
+pub mod confirm_save_modal;

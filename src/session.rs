@@ -109,8 +109,14 @@ impl SessionState {
         let data = fs::read_to_string(&path)?;
         
         // Try direct deserialization first
-        if let Ok(state) = serde_json::from_str(&data) {
+        if let Ok(mut state) = serde_json::from_str::<Self>(&data) {
             tracing::info!("Successfully loaded session data.");
+            if !state.sessions.is_empty() {
+                state.active_session_id = state.sessions.values()
+                    .max_by_key(|s| s.last_updated)
+                    .map(|s| s.id.clone())
+                    .unwrap_or_default();
+            }
             return Ok(state);
         }
 
@@ -180,7 +186,10 @@ impl SessionState {
 
         if self.active_session_id == id {
             // The active session was deleted. Find a new one or clear the active id.
-            self.active_session_id = self.sessions.keys().next().cloned().unwrap_or_default();
+            self.active_session_id = self.sessions.values()
+                .max_by_key(|s| s.last_updated)
+                .map(|s| s.id.clone())
+                .unwrap_or_default();
         } else if self.sessions.is_empty() {
             self.active_session_id = String::new();
         }

@@ -1,27 +1,33 @@
 #![allow(non_snake_case)]
 use dioxus::prelude::*;
-use dioxus_free_icons::{Icon, icons::fi_icons};
-use crate::{session::SessionState, context::permissions::PermissionManager};
+use dioxus_free_icons::{icons::fi_icons, Icon};
+use crate::{
+    context::permissions::PermissionManager,
+    session::SessionState,
+    settings::Settings,
+};
 
 #[derive(Props, PartialEq, Clone)]
 pub struct SessionManagerProps {}
 
 pub fn SessionManager(_props: SessionManagerProps) -> Element {
-    let mut session_state = consume_context::<Signal<SessionState>>();
-    let mut permission_manager = consume_context::<Signal<PermissionManager>>();
+    let mut session_state = use_context::<Signal<SessionState>>();
+    let mut permission_manager = use_context::<Signal<PermissionManager>>();
+    let settings = use_context::<Signal<Settings>>();
     let mut editing_session_id = use_signal(|| None::<String>);
     let mut temp_session_name = use_signal(String::new);
+    let mut show_confirm_modal = use_context::<Signal<bool>>();
+    let mut session_to_delete = use_context::<Signal<String>>();
 
     let sessions = session_state.read();
     let active_id = sessions.active_session_id.clone();
 
     rsx! {
         div {
-            class: "flex flex-col bg-gray-800 text-white h-full w-full p-4",
-            h2 {
-                class: "text-lg font-bold mb-4",
-                "Sessions"
-            }
+            // Main content of the session manager
+            div {
+                class: "flex flex-col bg-gray-800 text-white h-full w-full p-4",
+                h2 { class: "text-lg font-bold mb-4", "Sessions" }
             div {
                 class: "flex-1 overflow-y-auto",
                 ul {
@@ -93,7 +99,12 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                             class: "px-2 py-1 rounded-md text-xs font-bold text-gray-400 hover:bg-red-600 hover:text-white",
                                             onclick: move |event| {
                                                 event.stop_propagation();
-                                                session_state.write().delete_session(&id_clone_for_delete);
+                                                if settings.read().confirm_on_delete {
+                                                    session_to_delete.set(id_clone_for_delete.clone());
+                                                    show_confirm_modal.set(true);
+                                                } else {
+                                                    session_state.write().delete_session(&id_clone_for_delete);
+                                                }
                                             },
                                             "X"
                                         }
@@ -114,6 +125,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                     },
                     "✨ New Chat"
                 }
+            }
             }
         }
     }
