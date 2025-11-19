@@ -1,3 +1,4 @@
+
 use crate::components::llm::{Content, FunctionCallPart, FunctionResponsePart, InlineDataPart, Part, SystemInstruction};
 use crate::session::{Session, Tool};
 use crate::settings::Settings;
@@ -103,9 +104,7 @@ impl<'a> PromptBuilder<'a> {
             persona = format!("{}\n\nCRITICAL INSTRUCTION: {}", persona, instruction);
         }
 
-        // Add the hard-coded instruction for continuation.
-        let continuation_instruction = "\n\nCONTINUATION BEHAVIOR: If you determine the conversation should continue without user input, end your response with the exact tag: `<continue />`";
-        persona.push_str(continuation_instruction);
+
 
         if user_message.is_empty() {
             let continuation_instruction = "\n\nCONTINUATION INSTRUCTION: You were the last one to speak. The user has not replied. Continue the conversation based on the existing context. Do not repeat yourself. Provide new information or ask a clarifying question.";
@@ -113,7 +112,7 @@ impl<'a> PromptBuilder<'a> {
         }
 
         if self.session_state.tool_call_history.iter().any(|r| matches!(r.result.status, crate::components::shared::ToolCallStatus::Error)) {
-            let recovery_instruction = "\n\nCRITICAL RECOVERY INSTRUCTION: A previous tool call failed. Analyze the error message in the `<tool_response>` and attempt a different tool call to accomplish the user's goal. Do not repeat the failed tool call.";
+            let recovery_instruction = "\n\nCRITICAL RECOVERY INSTRUCTION: A previous tool call failed. Analyze the error message and attempt a different tool call to accomplish the user's goal. Do not repeat the failed tool call.";
             persona.push_str(recovery_instruction);
         }
         
@@ -186,41 +185,59 @@ impl<'a> PromptBuilder<'a> {
         for message in messages.iter().skip(start_index) {
             // Avoid duplicating the first message if it's within the recent window
             if Some(message.id) != first_message_id {
-                let content: Content = message.clone().into();
-                // Only add messages that have parts. This correctly filters out
-                // the ToolCall and PermissionRequest messages from the base history.
-                if !content.parts.is_empty() {
-                    contents.push(content);
+                match &message.content {
+                    MessageContent::Text(_) => {
+                        let content: Content = message.clone().into();
+                        if !content.parts.is_empty() {
+                            contents.push(content);
+                        }
+                    }
+                    MessageContent::ToolCall(tc) => {
+                        // 1. Add the model's function call
+                        let args_value: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+                        
+                        // Log the thought_signature field for debugging
+                        if let Some(ref thought_sig) = tc.thought_signature {
+                            tracing::info!("Reconstructing function call '{}' with thought_signature: '{}'", 
+                                tc.tool_name, 
+                                if thought_sig.len() > 50 { &thought_sig[..50] } else { thought_sig }
+                            );
+                        } else {
+                            tracing::warn!("Reconstructing function call '{}' WITHOUT thought_signature field - THIS WILL CAUSE API ERROR", tc.tool_name);
+                        }
+                        
+                        contents.push(Content {
+                            role: "model".to_string(),
+                            parts: vec![Part::FunctionCall {
+                                function_call: FunctionCallPart {
+                                    name: tc.tool_name.clone(),
+                                    args: args_value,
+                                },
+                                thought_signature: tc.thought_signature.clone(),
+                            }],
+                        });
+
+                        // 2. Add the user's function response
+                        // If the tool call is not completed/error, we might skip the response or handle it differently.
+                        // But typically PromptBuilder is called when it's done.
+                        let result_value: serde_json::Value = serde_json::from_str(&tc.response)
+                            .unwrap_or_else(|_| json!(tc.response));
+                        
+                        contents.push(Content {
+                            role: "user".to_string(),
+                            parts: vec![Part::FunctionResponse {
+                                function_response: FunctionResponsePart {
+                                    name: tc.tool_name.clone(),
+                                    response: json!({ "result": result_value }),
+                                },
+                            }],
+                        });
+                    }
+                    MessageContent::PermissionRequest(_) => {
+                        // Skip permission requests in the prompt
+                    }
                 }
             }
-        }
-        
-        // 4. Append the tool call history, correctly formatted for the model.
-        for record in &self.session_state.tool_call_history {
-            // First, add the model's tool call request to the history.
-            let args_value: serde_json::Value = serde_json::from_str(&record.call.arguments).unwrap_or_default();
-            contents.push(Content {
-                role: "model".to_string(),
-                parts: vec![Part::FunctionCall {
-                    function_call: FunctionCallPart {
-                        name: record.call.tool_name.clone(),
-                        args: args_value,
-                    },
-                }],
-            });
-
-            // Then, add our response containing the tool's result.
-            let result_value: serde_json::Value = serde_json::from_str(&record.result.response)
-                .unwrap_or_else(|_| json!(record.result.response));
-            contents.push(Content {
-                role: "user".to_string(), // As per docs, the tool response is from the 'user'
-                parts: vec![Part::FunctionResponse {
-                    function_response: FunctionResponsePart {
-                        name: record.call.tool_name.clone(),
-                        response: json!({ "result": result_value }),
-                    },
-                }],
-            });
         }
 
         // 5. Add the current user message, only if it's not empty.

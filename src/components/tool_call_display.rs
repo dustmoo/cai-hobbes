@@ -14,9 +14,11 @@ pub struct ToolCallDisplayProps {
 pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
     let mut show_arguments = use_signal(|| true);
     let mut show_response = use_signal(|| false);
+    let mut show_thought = use_signal(|| false);
 
     let status = props.tool_call.status;
     let response = props.tool_call.response.clone();
+    let thought_signature = props.tool_call.thought_signature.clone().unwrap_or_default();
 
 
     rsx! {
@@ -45,6 +47,37 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                     class: "flex items-center gap-2",
                     span { class: "font-semibold text-gray-300", "Tool:" }
                     span { class: "font-mono text-sm text-gray-300", "{props.tool_call.tool_name}" }
+                }
+
+                // Thought Signature collapsible section (if present)
+                if !thought_signature.is_empty() {
+                    div {
+                        class: "flex flex-col",
+                        button {
+                            class: "flex items-center gap-1 text-sm font-semibold text-gray-400 hover:text-gray-200",
+                            onclick: move |_| show_thought.toggle(),
+                            if *show_thought.read() {
+                                Icon {
+                                    width: 16,
+                                    height: 16,
+                                    icon: fi_icons::FiChevronDown
+                                }
+                            } else {
+                                Icon {
+                                    width: 16,
+                                    height: 16,
+                                    icon: fi_icons::FiChevronRight
+                                }
+                            }
+                            "Thought Signature"
+                        }
+                        if *show_thought.read() {
+                            div {
+                                class: "text-gray-300 text-sm p-2 bg-gray-900 rounded mt-1",
+                                "{thought_signature}"
+                            }
+                        }
+                    }
                 }
 
                 // Arguments collapsible section

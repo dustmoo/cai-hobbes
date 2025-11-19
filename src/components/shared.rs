@@ -15,6 +15,7 @@ pub struct ToolCall {
     pub arguments: String,
     pub status: ToolCallStatus,
     pub response: String,
+    pub thought_signature: Option<String>,
 }
 
 pub enum StreamMessage {
@@ -23,7 +24,7 @@ pub enum StreamMessage {
 }
 
 impl ToolCall {
-    pub fn new(server_name: String, tool_name: String, args: serde_json::Value) -> Self {
+    pub fn new(server_name: String, tool_name: String, args: serde_json::Value, thought_signature: Option<String>) -> Self {
         Self {
             execution_id: uuid::Uuid::new_v4().to_string(),
             server_name,
@@ -31,6 +32,7 @@ impl ToolCall {
             arguments: args.to_string(),
             status: ToolCallStatus::Running,
             response: String::new(),
+            thought_signature,
         }
     }
 }

@@ -19,6 +19,22 @@ pub(crate) struct GeminiRequest {
     tools: Option<Vec<Tool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system_instruction: Option<SystemInstruction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_config: Option<ToolConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolConfig {
+    pub function_calling_config: FunctionCallingConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FunctionCallingConfig {
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_function_names: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -51,6 +67,8 @@ pub enum Part {
     },
     FunctionCall {
         function_call: FunctionCallPart,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         function_response: FunctionResponsePart,
@@ -106,6 +124,7 @@ struct ContentResponse {
 pub struct FunctionCall {
     pub name: String,
     pub args: serde_json::Value,
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -114,6 +133,8 @@ struct PartResponse {
     #[serde(default)]
     text: String,
     function_call: Option<FunctionCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
 }
 
 
@@ -163,8 +184,18 @@ impl LlmConnector for GeminiConnector {
 
     let request_body = GeminiRequest {
         contents: prompt_data.contents,
-        tools: prompt_data.tools,
+        tools: prompt_data.tools.clone(),
         system_instruction: prompt_data.system_instruction,
+        tool_config: if prompt_data.tools.is_some() {
+            Some(ToolConfig {
+                function_calling_config: FunctionCallingConfig {
+                    mode: "AUTO".to_string(),
+                    allowed_function_names: None,
+                },
+            })
+        } else {
+            None
+        },
     };
 
     // --- Synchronous Logging Block ---
@@ -249,6 +280,19 @@ impl LlmConnector for GeminiConnector {
                                         }
                                         if let Some(part) = candidate.content.parts.get(0) {
                                             if let Some(function_call) = &part.function_call {
+                                                // Log raw JSON if it contains a function call
+                                                tracing::info!("Raw JSON with function call: {}", json_str);
+                                                
+                                                // Log the thought_signature field for debugging
+                                                if let Some(ref thought_sig) = part.thought_signature {
+                                                    tracing::info!("Received function call '{}' with thought_signature: '{}'", 
+                                                        function_call.name, 
+                                                        if thought_sig.len() > 50 { &thought_sig[..50] } else { thought_sig }
+                                                    );
+                                                } else {
+                                                    tracing::warn!("Received function call '{}' WITHOUT thought_signature field", function_call.name);
+                                                }
+                                                
                                                 let mut found_tool = false;
                                                 if let Some(context) = &mcp_context {
                                                     for server in &context.servers {
@@ -257,6 +301,7 @@ impl LlmConnector for GeminiConnector {
                                                                 server.name.clone(),
                                                                 function_call.name.clone(),
                                                                 function_call.args.clone(),
+                                                                part.thought_signature.clone(),
                                                             );
                                                             if tx.send(StreamMessage::ToolCall(tool_call)).is_err() {
                                                                 return;
@@ -379,6 +424,7 @@ Recent Messages:
         }],
         tools: None,
         system_instruction: None,
+        tool_config: None,
     };
 
     tracing::info!("Using summary model: {}", model);

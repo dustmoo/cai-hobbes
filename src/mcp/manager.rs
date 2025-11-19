@@ -269,6 +269,7 @@ impl McpManager {
                             server_name.to_string(),
                             tool_name.to_string(),
                             args,
+                            None,
                         );
                         return Err(serde_json::to_string(&tool_call).unwrap_or_default());
                     }

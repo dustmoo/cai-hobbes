@@ -191,17 +191,7 @@ impl StreamManagerContext {
             }
 
             // If we reach here, it means tool_call_count was 0. The turn is over.
-            if final_text_for_this_turn.trim().ends_with("<continue />") {
-                if let Some(msg) = self.session_state.write().get_message_mut(&message_id) {
-                    if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
-                        *t = t.trim().strip_suffix("<continue />").unwrap_or(t).trim().to_string();
-                    }
-                }
-                self.permission_manager.write().increment_turn_count();
-                self.continuation_controller.read().trigger_continuation();
-                return;
-            }
-            
+
             // This block now runs only when the conversation turn is truly complete.
             tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
             {

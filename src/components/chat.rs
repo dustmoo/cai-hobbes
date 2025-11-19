@@ -204,6 +204,9 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             // Reset the AI turn count every time the user sends a message.
             permission_manager.write().reset_turn_count();
 
+            // Clear the tool call history to ensure a fresh start for the new turn.
+            session_state.write().tool_call_history.clear();
+
             // Check if the last message was the turn limit warning.
             let last_message_was_warning = session_state.read().get_active_session()
                 .and_then(|s| s.messages.last())

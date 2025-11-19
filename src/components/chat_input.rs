@@ -6,7 +6,9 @@ use base64::{engine::general_purpose, Engine as _};
 use image::{imageops, ImageFormat, DynamicImage};
 use std::io::Cursor;
 
-use crate::{context::prompt_builder::PromptBuilder, settings::Settings};
+#[cfg(debug_assertions)]
+use crate::context::prompt_builder::PromptBuilder;
+use crate::settings::Settings;
 use hobbes_core::models::Attachment;
 
 use crate::processing::summarization_scheduler::{SchedulerSignal};
@@ -21,8 +23,8 @@ pub fn ChatInput(
     on_toggle_settings: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let settings = use_context::<Signal<Settings>>();
-    let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
+    let _settings = use_context::<Signal<Settings>>();
+    let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut draft = use_context::<Signal<String>>();
     let mut is_dragging = use_signal(|| false);
@@ -290,8 +292,8 @@ pub fn ChatInput(
                                         class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
                                         onclick: move |_| {
                                             let session_state = session_state.clone();
-                                            let settings = settings.clone();
-                                            let mcp_manager = mcp_manager.clone();
+                                            let settings = _settings.clone();
+                                            let mcp_manager = _mcp_manager.clone();
                                             spawn(async move {
                                                 let mcp_context = {
                                                     let mcp_manager_reader = mcp_manager.read();
