@@ -53,16 +53,16 @@ pub fn ChatInput(
     rsx! {
         if !attachments.read().is_empty() {
             div {
-                class: "flex items-center space-x-2 p-2 bg-gray-800 rounded-t-lg",
+                class: "flex items-center space-x-2 p-2 bg-dark-section rounded-t-lg",
                 for (index, attachment) in attachments.read().iter().enumerate() {
                     div {
-                        class: "flex items-center space-x-2 bg-gray-700 p-1 rounded",
+                        class: "flex items-center space-x-2 bg-dark-card p-1 rounded",
                         span {
                             class: "text-sm text-gray-300",
                             "{attachment.file_name}"
                         }
                         button {
-                            class: "p-1 rounded-full text-gray-400 hover:bg-gray-600 hover:text-white",
+                            class: "p-1 rounded-full text-gray-400 hover:bg-dark-input hover:text-white",
                             onclick: move |_| {
                                 attachments.write().remove(index);
                             },
@@ -78,9 +78,9 @@ pub fn ChatInput(
         }
         div {
             class: if *is_dragging.read() {
-                "bg-gray-900 p-4 border-t-2 border-dashed border-purple-500"
+                "bg-dark-bg p-4 border-t-2 border-dashed border-primary-500"
             } else {
-                "bg-gray-900 p-4 border-t border-gray-700"
+                "bg-dark-bg p-4 border-t border-primary-700"
             },
             onmousedown: |e| e.stop_propagation(),
             ondragover: move |event| {
@@ -125,7 +125,7 @@ pub fn ChatInput(
             div {
                 class: "flex items-center space-x-3",
                 button {
-                    class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                    class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
                     onclick: move |_| on_toggle_sessions.call(()),
                     Icon {
                         width: 20,
@@ -134,7 +134,7 @@ pub fn ChatInput(
                     }
                 }
                 button {
-                    class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                    class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
                     onclick: move |_| on_toggle_settings.call(()),
                     Icon {
                         width: 20,
@@ -143,7 +143,7 @@ pub fn ChatInput(
                     }
                 }
                 button {
-                    class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                    class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
                     onclick: move |_| {
                         let mut attachments = attachments;
                         spawn(async move {
@@ -193,7 +193,7 @@ pub fn ChatInput(
                 }
                 textarea {
                     id: "chat-textarea",
-                    class: "flex-1 py-2 px-4 rounded-xl bg-gray-800 border border-gray-700 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none overflow-y-auto",
+                    class: "flex-1 py-2 px-4 rounded-xl bg-dark-input border border-primary-700 text-dark-text placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 resize-none overflow-y-auto",
                     style: "max-height: 50vh;",
                     rows: "1",
                     placeholder: if !mcp_context.read().servers.is_empty() { "Type your message..." } else { "Initializing..." },
@@ -289,7 +289,7 @@ pub fn ChatInput(
                             if #[cfg(debug_assertions)] {
                                 rsx! {
                                     button {
-                                        class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                                        class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
                                         onclick: move |_| {
                                             let session_state = session_state.clone();
                                             let settings = _settings.clone();
@@ -340,7 +340,7 @@ pub fn ChatInput(
                         }
                     }
                     button {
-                        class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                        class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
                         onclick: move |_| {
                             session_state.write().create_session();
                         },
@@ -352,7 +352,7 @@ pub fn ChatInput(
                     }
                     if !*is_sending.read() {
                         button {
-                            class: "px-5 py-2 bg-purple-600 rounded-full text-white font-semibold hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-opacity-50 transition-colors disabled:bg-gray-500",
+                            class: "px-5 py-2 bg-primary-500 rounded-full text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors disabled:bg-gray-500",
                             disabled: mcp_context.read().servers.is_empty() || *is_processing_attachments.read(),
                             onclick: move |_| {
                                 on_interaction.call(());

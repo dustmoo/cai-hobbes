@@ -54,7 +54,7 @@ fn main() {
                         window
                     }
                 )
-                .with_custom_head(r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #111827; }</style>"#.to_string() + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"#)
+                .with_custom_head(r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #1A1A1A; }</style>"#.to_string() + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"#)
         )
         .launch(app)
 }
@@ -314,7 +314,7 @@ fn app() -> Element {
             RestartRequired {}
         } else if *needs_onboarding.read() {
             div {
-                class: "dark flex items-center justify-center h-screen bg-gray-900 text-white",
+                class: "dark flex items-center justify-center h-screen bg-dark-bg text-white",
                 components::onboarding::Onboarding {
                     needs_onboarding: needs_onboarding,
                 }
@@ -391,12 +391,12 @@ fn app() -> Element {
                             div {
                                 id: "session-manager-panel",
                                 style: "width: {settings_panel_width}px;",
-                                class: "bg-gray-800 text-white h-full",
+                                class: "bg-dark-section text-white h-full",
                                 components::session_manager::SessionManager {}
                             }
                             // Draggable Divider
                             div {
-                                class: "w-2 cursor-col-resize bg-gray-700 hover:bg-indigo-500 transition-colors",
+                                class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
                                 onmousedown: move |event| {
                                     drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
                                     is_dragging.set(true);
@@ -413,13 +413,13 @@ fn app() -> Element {
                             div {
                                 id: "settings-panel",
                                 style: "width: {settings_panel_width}px;",
-                                class: "bg-gray-800 text-white h-full",
+                                class: "bg-dark-section text-white h-full",
                                 // This is the correct location for the settings panel component
                                 components::settings_panel::SettingsPanel {}
                             }
                             // Draggable Divider
                             div {
-                                class: "w-2 cursor-col-resize bg-gray-700 hover:bg-indigo-500 transition-colors",
+                                class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
                                 onmousedown: move |event| {
                                     drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
                                     is_dragging.set(true);

@@ -52,7 +52,7 @@ pub fn Onboarding(mut props: OnboardingProps) -> Element {
 
     rsx! {
         div {
-            class: "px-8 py-10 bg-gray-800 rounded-lg shadow-lg max-w-md flex flex-col gap-y-6 min-h-[450px]",
+            class: "px-8 py-10 bg-dark-section rounded-lg shadow-lg max-w-md flex flex-col gap-y-6 min-h-[450px]",
             // Header
             div {
                 class: "text-center",
@@ -80,7 +80,7 @@ pub fn Onboarding(mut props: OnboardingProps) -> Element {
                 div { class: "mb-4",
                     label { class: "block mb-2 text-sm font-medium text-gray-300", "QDrant URI" }
                     input {
-                        class: "w-full p-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500",
+                        class: "w-full p-2 bg-dark-input border border-primary-600 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500",
                         value: "{qdrant_uri}",
                         oninput: move |event| qdrant_uri.set(event.value())
                     }
@@ -89,7 +89,7 @@ pub fn Onboarding(mut props: OnboardingProps) -> Element {
                 div { class: "mb-6",
                     label { class: "block mb-2 text-sm font-medium text-gray-300", "Gemini API Key" }
                     input {
-                        class: "w-full p-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500",
+                        class: "w-full p-2 bg-dark-input border border-primary-600 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500",
                         r#type: "password",
                         value: "{gemini_api_key}",
                         oninput: move |event| gemini_api_key.set(event.value())
@@ -101,7 +101,7 @@ pub fn Onboarding(mut props: OnboardingProps) -> Element {
             div {
                 class: "mt-auto pt-6",
                 button {
-                    class: "w-full py-2 px-4 bg-indigo-600 hover:bg-indigo-700 rounded-md font-bold transition-colors",
+                    class: "w-full py-2 px-4 bg-primary-500 hover:bg-primary-600 rounded-md font-bold transition-colors",
                     onclick: move |_| save_settings(),
                     "Save and Continue"
                 }

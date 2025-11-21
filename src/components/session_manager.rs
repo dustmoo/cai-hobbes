@@ -26,7 +26,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
         div {
             // Main content of the session manager
             div {
-                class: "flex flex-col bg-gray-800 text-white h-full w-full p-4",
+                class: "flex flex-col bg-dark-bg text-white h-full w-full p-4",
                 h2 { class: "text-lg font-bold mb-4", "Sessions" }
             div {
                 class: "flex-1 overflow-y-auto",
@@ -41,7 +41,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                             let is_active = *id == active_id;
                             let is_editing = editing_session_id.read().as_ref() == Some(id);
 
-                            let active_class = if is_active { "bg-purple-600" } else { "" };
+                            let active_class = if is_active { "bg-primary-500" } else { "" };
                             let id_clone_for_click = id.clone();
                             let id_clone_for_delete = id.clone();
                             let id_clone_for_keydown = id.clone();
@@ -51,7 +51,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 
                             rsx! {
                                 li {
-                                    class: "flex items-center justify-between p-2 rounded-md cursor-pointer hover:bg-gray-700 {active_class}",
+                                    class: "flex items-center justify-between p-2 rounded-md cursor-pointer hover:bg-dark-card {active_class}",
                                     key: "{id}",
                                     onclick: move |_| {
                                         if editing_session_id.read().is_none() {
@@ -61,7 +61,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                     },
                                     if is_editing {
                                         input {
-                                            class: "flex-grow bg-gray-700 text-white rounded-md p-1 focus:outline-none focus:ring-2 focus:ring-purple-500",
+                                            class: "flex-grow bg-dark-input text-white rounded-md p-1 focus:outline-none focus:ring-2 focus:ring-primary-500",
                                             value: "{temp_session_name.read()}",
                                             oninput: move |evt| temp_session_name.set(evt.value()),
                                             onkeydown: move |evt| {
@@ -118,7 +118,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
             div {
                 class: "mt-4",
                 button {
-                    class: "w-full px-4 py-2 bg-purple-600 rounded-md text-white font-semibold hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500",
+                    class: "w-full px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500",
                     onclick: move |_| {
                         session_state.write().create_session();
                         permission_manager.write().reset_turn_count();

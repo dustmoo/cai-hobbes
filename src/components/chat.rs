@@ -347,7 +347,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         continuation_controller.write().register_callback(continue_prompt_flow.clone());
     });
     
-    let root_classes = "relative flex flex-col bg-gray-900 text-gray-100 rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
+    let root_classes = "relative flex flex-col bg-dark-bg text-dark-text rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
 
     rsx! {
         div {
@@ -412,9 +412,9 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
 
     rsx! {
         div {
-            class: "code-block-wrapper relative bg-gray-800 rounded-lg my-2",
+            class: "code-block-wrapper relative bg-dark-section rounded-lg my-2",
             button {
-                class: "absolute top-2 right-2 p-1.5 rounded text-gray-400 hover:bg-gray-700 hover:text-white transition-colors",
+                class: "absolute top-2 right-2 p-1.5 rounded text-gray-400 hover:bg-dark-card hover:text-white transition-colors",
                 onclick: copy_onclick,
                 if *copied.read() {
                     Icon {
@@ -476,9 +476,9 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>) -> E
         let is_thinking = !is_user && content.read().is_empty();
 
         let bubble_classes = if is_user {
-            "bg-purple-600 text-white self-end ml-auto"
+            "bg-primary-500 text-white self-end ml-auto"
         } else {
-            "bg-gray-700 text-gray-200 self-start mr-auto"
+            "bg-dark-card text-dark-text self-start mr-auto"
         };
         let container_classes = if is_user { "flex justify-end" } else { "flex justify-start" };
         let author_classes = format!(
@@ -576,14 +576,14 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                 href: "{href}",
                 target: "_blank",
                 rel: "noopener noreferrer",
-                class: "text-purple-400 hover:text-purple-300",
+                class: "text-primary-400 hover:text-primary-300",
                 "{text}"
             }
             span {
                 class: format!("inline-flex items-center absolute left-full ml-1 z-10 {} transition-opacity duration-200 bg-gray-900 bg-opacity-75 border border-gray-700 rounded-full shadow-lg p-0.5 space-x-0.5", if *is_hovered.read() { "opacity-100" } else { "opacity-0" }),
                 
                 button {
-                    class: "p-1.5 rounded text-gray-400 hover:bg-gray-700 hover:text-white transition-colors",
+                    class: "p-1.5 rounded text-gray-400 hover:bg-dark-card hover:text-white transition-colors",
                     onclick: move |_| {
                         let href_clone = href_clone_for_copy.clone();
                         spawn(async move {
@@ -601,7 +601,7 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                     }
                 }
                 button {
-                    class: "p-1.5 rounded text-gray-400 hover:bg-gray-700 hover:text-white transition-colors",
+                    class: "p-1.5 rounded text-gray-400 hover:bg-dark-card hover:text-white transition-colors",
                     onclick: move |_| {
                         let summary_prompt = format!("Please fetch {} and summarize.", href_clone_for_summarize);
                         draft.set(summary_prompt);

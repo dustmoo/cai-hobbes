@@ -23,7 +23,7 @@ pub fn ConfirmSaveModal(props: ConfirmSaveModalProps) -> Element {
 
                 // The modal "card" with distinct styling
                 div {
-                    class: "bg-gray-800 border border-gray-700 rounded-lg shadow-xl p-4 w-sm",
+                    class: "bg-dark-section border border-primary-700 rounded-lg shadow-xl p-4 w-sm",
                     onclick: |event| event.stop_propagation(), // Prevent clicks inside from closing the modal
 
                     h2 { class: "text-xl font-bold text-white m-4", "{props.title}" }
@@ -34,7 +34,7 @@ pub fn ConfirmSaveModal(props: ConfirmSaveModalProps) -> Element {
                         input {
                             id: "remember_choice",
                             "type": "checkbox",
-                            class: "h-4 w-4 text-purple-600 bg-gray-700 border-gray-600 rounded focus:ring-purple-500",
+                            class: "h-4 w-4 text-primary-600 bg-dark-input border-primary-600 rounded focus:ring-primary-500",
                             checked: *remember_choice.read(),
                             onchange: move |evt| remember_choice.set(evt.checked()),
                         }
@@ -49,12 +49,12 @@ pub fn ConfirmSaveModal(props: ConfirmSaveModalProps) -> Element {
                     div {
                         class: "flex justify-end space-x-4",
                         button {
-                            class: "px-4 py-2 bg-gray-700 rounded-md text-white font-semibold hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-500",
+                            class: "px-4 py-2 bg-dark-card rounded-md text-white font-semibold hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-500",
                             onclick: move |_| props.on_cancel.call(()),
                             "Cancel"
                         }
                         button {
-                            class: "px-4 py-2 bg-purple-600 rounded-md text-white font-semibold hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500",
+                            class: "px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500",
                             onclick: move |_| props.on_confirm.call(*remember_choice.read()),
                             "Yes, Save"
                         }

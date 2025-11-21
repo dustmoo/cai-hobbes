@@ -168,7 +168,7 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                 }
                 if *show_scroll_button.read() {
                     button {
-                        class: "absolute bottom-4 right-4 z-10 p-2 bg-purple-600 text-white rounded-full shadow-lg hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 transition-opacity duration-300 ease-in-out",
+                        class: "absolute bottom-4 right-4 z-10 p-2 bg-primary-500 text-white rounded-full shadow-lg hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 transition-opacity duration-300 ease-in-out",
                         onclick: move |_| {
                             let _ = document::eval(r#"
                                 const el = document.getElementById('message-list');

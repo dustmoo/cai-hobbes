@@ -48,7 +48,7 @@ pub fn SettingsPanel() -> Element {
 
     rsx! {
         div {
-            class: "flex flex-col h-full p-4 bg-gray-800 text-white",
+            class: "flex flex-col h-full p-4 bg-dark-bg text-white",
             h2 {
                 class: "text-lg font-bold mb-4",
                 "Settings"
@@ -116,9 +116,9 @@ pub fn SettingsPanel() -> Element {
                 class: "flex-grow overflow-y-auto pr-2",
                 // LLM Configuration Section
                 div {
-                    class: "border border-gray-700 rounded-lg mb-4",
+                    class: "border border-primary-700 rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-4 cursor-pointer bg-gray-750 rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section rounded-t-lg",
                         onclick: move |_| llm_config_collapsed.set(!llm_config_collapsed()),
                         h3 { class: "text-md font-semibold", "LLM Configuration" }
                         span { if *llm_config_collapsed.read() { "▶" } else { "▼" } }
@@ -130,18 +130,18 @@ pub fn SettingsPanel() -> Element {
                                 class: "mb-4",
                                 label { class: "block text-sm font-medium text-gray-300", "LLM Provider" }
                                 select {
-                                    class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
+                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
                                     option { value: "Gemini", "Gemini" }
                                 }
                             }
                             if local_settings.read().active_llm == crate::settings::LlmProvider::Gemini {
                                 div {
-                                    class: "pl-4 border-l-2 border-gray-700",
+                                    class: "pl-4 border-l-2 border-primary-700",
                                     div {
                                         class: "mb-4",
                                         label { class: "block text-sm font-medium text-gray-300", "API Key" }
                                         input {
-                                            class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
+                                            class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
                                             r#type: "password",
                                             placeholder: "Using environment variable",
                                             value: "{local_settings.read().gemini_config.api_key.as_deref().unwrap_or(\"\")}",
@@ -152,7 +152,7 @@ pub fn SettingsPanel() -> Element {
                                         class: "mb-4",
                                         label { class: "block text-sm font-medium text-gray-300", "Chat Model" }
                                         input {
-                                            class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
+                                            class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
                                             r#type: "text",
                                             value: "{local_settings.read().gemini_config.chat_model}",
                                             oninput: move |event| local_settings.write().gemini_config.chat_model = event.value()
@@ -162,7 +162,7 @@ pub fn SettingsPanel() -> Element {
                                         class: "mb-4",
                                         label { class: "block text-sm font-medium text-gray-300", "Summary Model" }
                                         input {
-                                            class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
+                                            class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
                                             r#type: "text",
                                             value: "{local_settings.read().gemini_config.summary_model}",
                                             oninput: move |event| local_settings.write().gemini_config.summary_model = event.value()
@@ -176,9 +176,9 @@ pub fn SettingsPanel() -> Element {
 
                 // Application Behavior Section
                 div {
-                    class: "border border-gray-700 rounded-lg mb-4",
+                    class: "border border-primary-700 rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-4 cursor-pointer bg-gray-750 rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section rounded-t-lg",
                         onclick: move |_| app_behavior_collapsed.set(!app_behavior_collapsed()),
                         h3 { class: "text-md font-semibold", "Application Behavior" }
                         span { if *app_behavior_collapsed.read() { "▶" } else { "▼" } }
@@ -190,7 +190,7 @@ pub fn SettingsPanel() -> Element {
                                 class: "mb-4",
                                 label { class: "block text-sm font-medium text-gray-300", "Chat History Length" }
                                 input {
-                                    class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
+                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
                                     r#type: "number",
                                     value: "{local_settings.read().chat_history_length}",
                                     oninput: move |event| {
@@ -215,7 +215,7 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
-                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600" }
+                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
                                 }
                             }
                             div {
@@ -233,7 +233,7 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
-                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600" }
+                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
                                 }
                             }
                             div {
@@ -251,14 +251,14 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
-                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600" }
+                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
                                 }
                             }
                             div {
                                 class: "mt-4 mb-4",
                                 label { class: "block text-sm font-medium text-gray-300", "Global Hotkey" }
                                 input {
-                                    class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
+                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
                                     r#type: "text",
                                     value: "{local_settings.read().global_hotkey}",
                                     oninput: move |event| local_settings.write().global_hotkey = event.value()
@@ -268,7 +268,7 @@ pub fn SettingsPanel() -> Element {
                                 class: "mt-4 mb-4",
                                 label { class: "block text-sm font-medium text-gray-300", "Max AI Turns" }
                                 input {
-                                    class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm",
+                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm",
                                     r#type: "number",
                                     value: "{local_settings.read().permission_settings.max_ai_turns}",
                                     oninput: move |event| {
@@ -282,7 +282,7 @@ pub fn SettingsPanel() -> Element {
                                 class: "mt-4 mb-4",
                                 label { class: "block text-sm font-medium text-gray-300", "What should Hobbes call you?" }
                                 input {
-                                    class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
+                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
                                     r#type: "text",
                                     placeholder: "e.g., Dustin",
                                     value: "{local_settings.read().user_name.as_deref().unwrap_or(\"\")}",
@@ -300,7 +300,7 @@ pub fn SettingsPanel() -> Element {
                                 class: "mb-4",
                                 label { class: "block text-sm font-medium text-gray-300", "Persona" }
                                 textarea {
-                                    class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
+                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
                                     rows: "4",
                                     value: "{local_settings.read().persona}",
                                     oninput: move |event| local_settings.write().persona = event.value()
@@ -310,7 +310,7 @@ pub fn SettingsPanel() -> Element {
                                 class: "mb-4",
                                 label { class: "block text-sm font-medium text-gray-300", "Force Tool Use Instruction" }
                                 textarea {
-                                    class: "mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
+                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
                                     rows: "4",
                                     value: "{local_settings.read().force_tool_use_instruction.as_deref().unwrap_or(\"\")}",
                                     oninput: move |event| local_settings.write().force_tool_use_instruction = Some(event.value())
@@ -322,11 +322,11 @@ pub fn SettingsPanel() -> Element {
                                 div {
                                     class: "mt-1 flex items-center",
                                     p {
-                                        class: "flex-grow px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-sm shadow-sm",
+                                        class: "flex-grow px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
                                         "{local_settings.read().project_folder.clone().unwrap_or(\"None\".to_string())}"
                                     }
                                     button {
-                                        class: "ml-2 px-4 py-2 bg-indigo-600 rounded-md text-white font-semibold hover:bg-indigo-700",
+                                        class: "ml-2 px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600",
                                         onclick: move |_| {
                                             spawn(async move {
                                                 if let Some(folder_path) = rfd::AsyncFileDialog::new().pick_folder().await {
@@ -344,9 +344,9 @@ pub fn SettingsPanel() -> Element {
 
                 // Data Management Section
                 div {
-                    class: "border border-gray-700 rounded-lg mb-4",
+                    class: "border border-primary-700 rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-4 cursor-pointer bg-gray-750 rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section rounded-t-lg",
                         onclick: move |_| data_management_collapsed.set(!data_management_collapsed()),
                         h3 { class: "text-md font-semibold", "Data Management" }
                         span { if *data_management_collapsed.read() { "▶" } else { "▼" } }
@@ -357,7 +357,7 @@ pub fn SettingsPanel() -> Element {
                             div {
                                 class: "flex space-x-2",
                                 button {
-                                    class: "px-4 py-2 bg-blue-600 rounded-md text-white font-semibold hover:bg-blue-700",
+                                    class: "px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_settings.zip").save_file().await {
@@ -378,7 +378,7 @@ pub fn SettingsPanel() -> Element {
                                     "Export Settings"
                                 }
                                 button {
-                                    class: "px-4 py-2 bg-blue-600 rounded-md text-white font-semibold hover:bg-blue-700",
+                                    class: "px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_settings.zip").pick_file().await {
@@ -426,7 +426,7 @@ pub fn SettingsPanel() -> Element {
                             div {
                                 class: "flex space-x-2 mt-2",
                                 button {
-                                    class: "px-4 py-2 bg-green-600 rounded-md text-white font-semibold hover:bg-green-700",
+                                    class: "px-4 py-2 bg-secondary-500 rounded-md text-white font-semibold hover:bg-secondary-600",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_history.zip").save_file().await {
@@ -447,7 +447,7 @@ pub fn SettingsPanel() -> Element {
                                     "Export History"
                                 }
                                 button {
-                                    class: "px-4 py-2 bg-green-600 rounded-md text-white font-semibold hover:bg-green-700",
+                                    class: "px-4 py-2 bg-secondary-500 rounded-md text-white font-semibold hover:bg-secondary-600",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_history.zip").pick_file().await {
@@ -515,9 +515,9 @@ pub fn SettingsPanel() -> Element {
 
                 // Permissions Section
                 div {
-                    class: "border border-gray-700 rounded-lg mb-4",
+                    class: "border border-primary-700 rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-4 cursor-pointer bg-gray-750 rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section rounded-t-lg",
                         onclick: move |_| permissions_collapsed.set(!permissions_collapsed()),
                         h3 { class: "text-md font-semibold", "Permissions" }
                         span { if *permissions_collapsed.read() { "▶" } else { "▼" } }
@@ -540,12 +540,12 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
-                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600" }
+                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
                                 }
                             }
                             if local_settings.read().permission_settings.auto_approval_enabled {
                                 div {
-                                    class: "mb-2 pl-4 border-l-2 border-gray-700",
+                                    class: "mb-2 pl-4 border-l-2 border-primary-700",
                                     div {
                                         class: "flex items-center justify-between mb-4",
                                         label { "MCP Tools" }
@@ -561,7 +561,7 @@ pub fn SettingsPanel() -> Element {
                                                     }
                                                 }
                                             }
-                                            div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600" }
+                                            div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
                                         }
                                     }
                                 }
@@ -573,7 +573,7 @@ pub fn SettingsPanel() -> Element {
             }
             button {
                 class: if has_unsaved_changes() {
-                    "mt-4 px-4 py-2 bg-purple-600 rounded-md text-white font-semibold hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-opacity-50 transition-colors"
+                    "mt-4 px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors"
                 } else {
                     "mt-4 px-4 py-2 bg-gray-600 rounded-md text-white font-semibold cursor-not-allowed"
                 },
