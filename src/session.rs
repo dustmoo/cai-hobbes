@@ -111,11 +111,18 @@ impl SessionState {
         // Try direct deserialization first
         if let Ok(mut state) = serde_json::from_str::<Self>(&data) {
             tracing::info!("Successfully loaded session data.");
-            if !state.sessions.is_empty() {
-                state.active_session_id = state.sessions.values()
-                    .max_by_key(|s| s.last_updated)
-                    .map(|s| s.id.clone())
-                    .unwrap_or_default();
+            
+            // Validate active_session_id
+            if !state.sessions.contains_key(&state.active_session_id) {
+                tracing::warn!("Loaded active_session_id '{}' not found in sessions. Resetting.", state.active_session_id);
+                if !state.sessions.is_empty() {
+                    state.active_session_id = state.sessions.values()
+                        .max_by_key(|s| s.last_updated)
+                        .map(|s| s.id.clone())
+                        .unwrap_or_default();
+                } else {
+                    state.active_session_id.clear();
+                }
             }
             return Ok(state);
         }

@@ -244,9 +244,14 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             let hobbes_message_id = Uuid::new_v4();
             {
                 let mut state = session_state.write();
-                if state.active_session_id.is_empty() {
+                
+                // Ensure we have a valid active session. 
+                // If active_session_id is set but not found (inconsistent state), or empty, create a new one.
+                if state.get_active_session().is_none() {
+                    tracing::warn!("Active session ID '{}' not found in sessions. Creating new session.", state.active_session_id);
                     state.create_session();
                 }
+
                 if let Some(session) = state.get_active_session_mut() {
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
@@ -266,7 +271,12 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             let prompt_data = {
                 let mcp_context = mcp_manager.read().get_mcp_context().await;
                 let user_prompt = user_message.clone();
-                let conversation_summary = session_state.read().get_active_session().unwrap().active_context.conversation_summary.clone();
+                
+                // Safely get conversation summary
+                let conversation_summary = session_state.read()
+                    .get_active_session()
+                    .map(|s| s.active_context.conversation_summary.clone())
+                    .unwrap_or_default();
 
                 {
                     let mut state = session_state.write();
@@ -279,9 +289,13 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 }
 
                 let state = session_state.read();
-                let session = state.get_active_session().unwrap();
-                let builder = PromptBuilder::new(session, &settings, &state);
-                builder.build_prompt(user_prompt, None)
+                if let Some(session) = state.get_active_session() {
+                    let builder = PromptBuilder::new(session, &settings, &state);
+                    builder.build_prompt(user_prompt, None)
+                } else {
+                    tracing::error!("No active session found when building prompt");
+                    return;
+                }
             };
 
             if let Err(e) = session_state.read().save() {
