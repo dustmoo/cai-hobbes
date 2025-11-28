@@ -143,6 +143,8 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
 }
 
 
+use crate::components::continuation_controller::ContinuationController;
+
 #[derive(Props, Clone, PartialEq)]
 pub struct PermissionPromptProps {
     pub tool_call: ToolCall,
@@ -152,6 +154,7 @@ pub struct PermissionPromptProps {
 pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
     let mut mcp_manager = consume_context::<Signal<McpManager>>();
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let continuation_controller = consume_context::<Signal<ContinuationController>>();
     let tool_call = props.tool_call.clone();
     let tool_call_deny = tool_call.clone();
 
@@ -200,6 +203,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                     onclick: move |_| {
                         spawn({
                             let tool_call = tool_call.clone();
+                            let continuation_controller = continuation_controller;
                             async move {
                                 let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
                                 let result_receiver = mcp_manager.write().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, true).await;
@@ -243,6 +247,8 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                                         msg.content = super::shared::MessageContent::ToolCall(updated_tc);
                                     }
                                 }
+                                // Trigger continuation after successful tool execution
+                                continuation_controller.read().trigger_continuation();
                             }
                         });
                     },

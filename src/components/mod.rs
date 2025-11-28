@@ -1,4 +1,7 @@
 pub mod chat;
+pub mod comment_modal;
+pub mod inline_comment_popover;
+pub mod selection_toolbar;
 pub mod conflict_modal;
 pub mod chat_input;
 pub mod message_list;

@@ -128,7 +128,48 @@ impl SessionState {
         fs::copy(&path, backup_path)?;
 
         let mut state = SessionState::default();
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) {
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&data) {
+            // Migrate MessageContent::Text from old tuple format to new struct format
+            if let Some(sessions_obj) = value.get_mut("sessions").and_then(|v| v.as_object_mut()) {
+                for (_session_id, session_val) in sessions_obj.iter_mut() {
+                    if let Some(messages) = session_val.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                        for message in messages.iter_mut() {
+                            if let Some(content) = message.get_mut("content") {
+                                // Check if this is the old Text format: {"Text": "string"}
+                                if let Some(text_str) = content.get("Text").and_then(|v| v.as_str()) {
+                                    // Convert to new format: {"Text": {"content": "string", "thought_signature": null}}
+                                    *content = serde_json::json!({
+                                        "Text": {
+                                            "content": text_str,
+                                            "thought_signature": null
+                                        }
+                                    });
+                                    tracing::debug!("Migrated MessageContent::Text for message");
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Migrate messages without created_at timestamps
+                    if let Some(messages) = session_val.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                        let base_time = chrono::Utc::now() - chrono::Duration::hours(1); // Start 1 hour ago
+                        for (index, message) in messages.iter_mut().enumerate() {
+                            // Check if created_at field exists
+                            if message.get("created_at").is_none() {
+                                // Assign timestamp: base_time + index milliseconds
+                                let timestamp = base_time + chrono::Duration::milliseconds(index as i64);
+                                message.as_object_mut().unwrap().insert(
+                                    "created_at".to_string(),
+                                    serde_json::json!(timestamp.to_rfc3339())
+                                );
+                                tracing::debug!("Migrated message {} with timestamp", index);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Now deserialize the migrated value
             if let Some(sessions_val) = value.get("sessions") {
                 if let Ok(sessions) = serde_json::from_value(sessions_val.clone()) {
                     state.sessions = sessions;

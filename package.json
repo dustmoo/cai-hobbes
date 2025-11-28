@@ -1,9 +1,10 @@
 {
   "name": "hobbes",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A local-first, hotkey-summoned AI assistant.",
   "scripts": {
-    "build:css": "tailwindcss -i ./tailwind.css -o ./assets/tailwind.css"
+    "build:css": "tailwindcss -i ./tailwind.css -o ./assets/tailwind.css",
+    "watch:css": "tailwindcss -i ./tailwind.css -o ./assets/tailwind.css --watch"
   },
   "devDependencies": {
     "@tailwindcss/typography": "^0.5.16",

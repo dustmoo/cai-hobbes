@@ -16,6 +16,12 @@ pub struct GeminiConfig {
     pub api_key: Option<String>,
     pub chat_model: String,
     pub summary_model: String,
+    #[serde(default)]
+    pub thinking_enabled: bool,
+    #[serde(default = "default_thinking_level")]
+    pub thinking_level: String,
+    #[serde(default)]
+    pub thinking_budget: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -49,6 +55,9 @@ impl Default for Settings {
                 api_key: None,
                 chat_model: "gemini-2.5-pro".to_string(),
                 summary_model: "gemini-1.5-flash-latest".to_string(),
+                thinking_enabled: false,
+                thinking_level: "high".to_string(),
+                thinking_budget: None,
             },
             qdrant_url: None,
             persona: "You are Hobbes. Be a direct, clear, and radically candid partner. Function as an exocortex, matching the user's communication style. Your default tone is that of a professional friend.".to_string(),
@@ -71,6 +80,10 @@ impl Default for Settings {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_thinking_level() -> String {
+    "high".to_string()
 }
 
 pub struct SettingsManager {

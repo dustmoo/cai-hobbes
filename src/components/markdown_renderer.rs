@@ -1,11 +1,10 @@
 use dioxus::prelude::*;
 use pulldown_cmark::{html, Options, Parser, Event, Tag, TagEnd, HeadingLevel};
 use ammonia::clean;
-
-use crate::components::chat::{CodeBlock, LinkWithControls};
+use crate::components::chat::{CodeBlock, LinkWithControls, Comment};
 
 #[component]
-pub fn MarkdownRenderer(content: String) -> Element {
+pub fn MarkdownRenderer(content: String, comments: Option<Vec<Comment>>, pending_highlight: Option<String>) -> Element {
     let elements = {
         let content_reader = &content;
         let mut options = Options::empty();
@@ -65,7 +64,7 @@ pub fn MarkdownRenderer(content: String) -> Element {
         let mut link_text_buffer = String::new();
         let mut in_link = false;
 
-       let mut in_table_header = false;
+        let mut in_table_header = false;
 
         let flush_inlines_to_paragraph = |inlines: &mut Vec<Inline>, blocks: &mut Vec<Block>| {
             if !inlines.is_empty() {
@@ -227,9 +226,62 @@ pub fn MarkdownRenderer(content: String) -> Element {
         flush_inlines_to_paragraph(&mut current_inlines, &mut blocks);
 
         // --- Renderer Logic ---
-        fn render_inline(inline: Inline) -> Element {
+        // We need to capture comments to use in render_inline
+        let comments_ref = comments.as_ref();
+        let pending_highlight_ref = pending_highlight.as_ref();
+
+        fn render_inline(inline: Inline, comments: Option<&Vec<Comment>>, pending_highlight: Option<&String>) -> Element {
             match inline {
-                Inline::Text(text) => rsx!{ span { dangerous_inner_html: "{text}" } },
+                Inline::Text(text) => {
+                    // 1. Check for pending highlight (highest priority for visual feedback during selection)
+                    if let Some(highlight_text) = pending_highlight {
+                        if !highlight_text.is_empty() && text.contains(highlight_text) {
+                             let parts: Vec<&str> = text.split(highlight_text).collect();
+                             if parts.len() >= 2 {
+                                 return rsx! {
+                                     span {
+                                         span { dangerous_inner_html: "{parts[0]}" }
+                                         span {
+                                             class: "bg-primary-500/30 border-b-2 border-primary-500",
+                                             "{highlight_text}"
+                                         }
+                                         span { dangerous_inner_html: "{parts[1]}" }
+                                     }
+                                 };
+                             }
+                        }
+                    }
+
+                    // 2. Check for comments in this text block
+                    if let Some(comments_list) = comments {
+                        for comment in comments_list {
+                            if text.contains(&comment.text_selection) {
+                                let parts: Vec<&str> = text.split(&comment.text_selection).collect();
+                                if parts.len() >= 2 {
+                                    // Found a match! Render with highlight
+                                    // Note: This simple split only handles one occurrence and one comment per text block for now
+                                    // to avoid complex recursion in this iteration.
+                                    return rsx! {
+                                        span {
+                                            span { dangerous_inner_html: "{parts[0]}" }
+                                            span {
+                                                class: "border-b-2 border-primary-500 font-bold cursor-pointer group relative",
+                                                "{comment.text_selection}"
+                                                // Tooltip
+                                                div {
+                                                    class: "absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-10",
+                                                    "{comment.comment}"
+                                                }
+                                            }
+                                            span { dangerous_inner_html: "{parts[1]}" }
+                                        }
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    rsx!{ span { dangerous_inner_html: "{text}" } }
+                },
                 Inline::Code(text) => rsx! {
                     code {
                         class: "bg-gray-800 text-gray-200 font-mono rounded-md px-2 py-1",
@@ -242,24 +294,24 @@ pub fn MarkdownRenderer(content: String) -> Element {
                 Inline::Emphasis(children) => rsx! {
                     em {
                         for child in children {
-                            {render_inline(child)}
+                            {render_inline(child, comments, pending_highlight)}
                         }
                     }
                 },
                 Inline::Strong(children) => rsx! {
                     strong {
                         for child in children {
-                            {render_inline(child)}
+                            {render_inline(child, comments, pending_highlight)}
                         }
                     }
                 },
             }
         }
 
-        fn render_block(block: Block) -> Element {
+        fn render_block(block: Block, comments: Option<&Vec<Comment>>, pending_highlight: Option<&String>) -> Element {
             match block {
                 Block::Header { level, content } => {
-                    let inlines = content.into_iter().map(render_inline);
+                    let inlines = content.into_iter().map(|i| render_inline(i, comments, pending_highlight));
                     match level {
                         HeadingLevel::H1 => rsx!{ h1 { {inlines} } },
                         HeadingLevel::H2 => rsx!{ h2 { {inlines} } },
@@ -272,7 +324,7 @@ pub fn MarkdownRenderer(content: String) -> Element {
                 Block::Paragraph(inlines) => rsx! {
                     p {
                         for inline in inlines {
-                            {render_inline(inline)}
+                            {render_inline(inline, comments, pending_highlight)}
                         }
                     }
                 },
@@ -284,7 +336,7 @@ pub fn MarkdownRenderer(content: String) -> Element {
                                 for item in items {
                                     li {
                                         for block in item.blocks {
-                                            {render_block(block)}
+                                            {render_block(block, comments, pending_highlight)}
                                         }
                                     }
                                 }
@@ -296,7 +348,7 @@ pub fn MarkdownRenderer(content: String) -> Element {
                                 for item in items {
                                     li {
                                         for block in item.blocks {
-                                            {render_block(block)}
+                                            {render_block(block, comments, pending_highlight)}
                                         }
                                     }
                                 }
@@ -319,7 +371,7 @@ pub fn MarkdownRenderer(content: String) -> Element {
                                       th {
                                           class: "px-4 py-2 text-left font-semibold",
                                           for inline in header_cell {
-                                              {render_inline(inline)}
+                                              {render_inline(inline, comments, pending_highlight)}
                                           }
                                       }
                                   }
@@ -333,7 +385,7 @@ pub fn MarkdownRenderer(content: String) -> Element {
                                           td {
                                               class: "px-4 py-2",
                                               for inline in cell {
-                                                  {render_inline(inline)}
+                                                  {render_inline(inline, comments, pending_highlight)}
                                               }
                                           }
                                       }
@@ -346,7 +398,7 @@ pub fn MarkdownRenderer(content: String) -> Element {
            }
        }
 
-       blocks.into_iter().map(render_block).collect::<Vec<_>>()
+       blocks.into_iter().map(|b| render_block(b, comments_ref, pending_highlight_ref)).collect::<Vec<_>>()
     };
 
     rsx! {

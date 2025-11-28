@@ -34,7 +34,7 @@ impl ConversationProcessor {
            .rev()
            .map(|m| {
                let content_str = match &m.content {
-                   MessageContent::Text(text) => text.clone(),
+                   MessageContent::Text { content: text, .. } => text.clone(),
                    MessageContent::ToolCall(tc) => format!("[Tool Call: {}]", tc.tool_name),
                    MessageContent::PermissionRequest(tc) => format!("[Permission Request for Tool: {}]", tc.tool_name),
                };
