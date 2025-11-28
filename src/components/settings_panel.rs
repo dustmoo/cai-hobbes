@@ -168,6 +168,66 @@ pub fn SettingsPanel() -> Element {
                                             oninput: move |event| local_settings.write().gemini_config.summary_model = event.value()
                                         }
                                     }
+                                    
+                                    // Thinking Mode Section
+                                    div {
+                                        class: "mb-4 pt-4 border-t border-primary-700",
+                                        div {
+                                            class: "flex items-center justify-between mb-2",
+                                            label { class: "block text-sm font-medium text-gray-300", "Thinking Mode" }
+                                            input {
+                                                r#type: "checkbox",
+                                                class: "w-4 h-4 text-primary-500 bg-dark-input border-primary-600 rounded focus:ring-primary-500",
+                                                checked: local_settings.read().gemini_config.thinking_enabled,
+                                                onchange: move |event| {
+                                                    local_settings.write().gemini_config.thinking_enabled = event.checked();
+                                                }
+                                            }
+                                        }
+                                        p {
+                                            class: "text-xs text-gray-400 mb-3",
+                                            "Enable extended reasoning for complex tasks. Gemini 3 Pro uses thinking level, Gemini 2.5 uses thinking budget."
+                                        }
+                                        
+                                        if local_settings.read().gemini_config.thinking_enabled {
+                                            div {
+                                                class: "mb-3",
+                                                label { class: "block text-sm font-medium text-gray-300 mb-1", "Thinking Level (Gemini 3 Pro)" }
+                                                select {
+                                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                    value: "{local_settings.read().gemini_config.thinking_level}",
+                                                    onchange: move |event| {
+                                                        local_settings.write().gemini_config.thinking_level = event.value();
+                                                    },
+                                                    option { value: "low", "Low" }
+                                                    option { value: "high", "High (Default)" }
+                                                }
+                                            }
+                                            
+                                            div {
+                                                class: "mb-3",
+                                                label { class: "block text-sm font-medium text-gray-300 mb-1", "Thinking Budget (Gemini 2.5)" }
+                                                input {
+                                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                    r#type: "number",
+                                                    placeholder: "Leave empty for model default",
+                                                    value: "{local_settings.read().gemini_config.thinking_budget.map(|v| v.to_string()).unwrap_or_default()}",
+                                                    oninput: move |event| {
+                                                        let val = event.value();
+                                                        local_settings.write().gemini_config.thinking_budget = if val.is_empty() {
+                                                            None
+                                                        } else {
+                                                            val.parse::<i32>().ok()
+                                                        };
+                                                    }
+                                                }
+                                                p {
+                                                    class: "text-xs text-gray-400 mt-1",
+                                                    "Higher values allow more reasoning tokens (increases cost)"
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

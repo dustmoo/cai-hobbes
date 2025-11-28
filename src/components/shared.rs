@@ -2,7 +2,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum MessageContent {
-    Text(String),
+    Text {
+        content: String,
+        #[serde(default)]
+        thought_signature: Option<String>,
+    },
     ToolCall(ToolCall),
     PermissionRequest(ToolCall),
 }
@@ -19,7 +23,10 @@ pub struct ToolCall {
 }
 
 pub enum StreamMessage {
-    Text(String),
+    Text {
+        content: String,
+        thought_signature: Option<String>,
+    },
     ToolCall(ToolCall),
 }
 

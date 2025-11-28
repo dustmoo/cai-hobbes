@@ -11,7 +11,16 @@ impl From<Message> for Content {
     fn from(msg: Message) -> Self {
         let role = if msg.author == "User" { "user" } else { "model" }.to_string();
         match msg.content {
-            MessageContent::Text(text) => {
+            MessageContent::Text { content: mut text, .. } => {
+                // Append comments to the text if they exist
+                if !msg.comments.is_empty() {
+                    text.push_str("\n\n[User comments on this message:");
+                    for comment in &msg.comments {
+                        text.push_str(&format!("\n- On \"{}\": {}", comment.text_selection, comment.comment));
+                    }
+                    text.push_str("]");
+                }
+                
                 let mut parts = vec![Part::Text { text }];
                 for attachment in msg.attachments {
                     parts.push(Part::InlineData {
@@ -106,9 +115,35 @@ impl<'a> PromptBuilder<'a> {
 
 
 
+        // Check if the last message is an empty placeholder from Hobbes (continuation scenario)
+        let last_message = self.session.messages.last();
+        let is_continuation_placeholder = last_message.map_or(false, |m| {
+            m.author == "Hobbes" && matches!(m.content, MessageContent::Text { ref content, .. } if content.is_empty())
+        });
+
         if user_message.is_empty() {
-            let continuation_instruction = "\n\nCONTINUATION INSTRUCTION: You were the last one to speak. The user has not replied. Continue the conversation based on the existing context. Do not repeat yourself. Provide new information or ask a clarifying question.";
-            persona.push_str(continuation_instruction);
+            // Check if the last message (or the one before placeholder) was a tool call
+            let message_to_check = if is_continuation_placeholder {
+                if self.session.messages.len() >= 2 {
+                    self.session.messages.get(self.session.messages.len() - 2)
+                } else {
+                    None
+                }
+            } else {
+                last_message
+            };
+
+            let last_message_was_tool = message_to_check.map_or(false, |m| {
+                matches!(m.content, MessageContent::ToolCall(_))
+            });
+
+            if last_message_was_tool {
+                let tool_completion_instruction = "\n\nTOOL COMPLETION INSTRUCTION: The tool execution has completed. Use the tool output above to answer the user's request. Do not ask the user for the tool output again.";
+                persona.push_str(tool_completion_instruction);
+            } else {
+                let continuation_instruction = "\n\nCONTINUATION INSTRUCTION: You were the last one to speak. The user has not replied. Continue the conversation based on the existing context. Do not repeat yourself. Provide new information or ask a clarifying question.";
+                persona.push_str(continuation_instruction);
+            }
         }
 
         if self.session_state.tool_call_history.iter().any(|r| matches!(r.result.status, crate::components::shared::ToolCallStatus::Error)) {
@@ -170,10 +205,11 @@ impl<'a> PromptBuilder<'a> {
         let history_len = self.settings.chat_history_length;
         let messages = &self.session.messages;
         let mut first_message_id = None;
+        let mut last_thought_signature: Option<String> = None;
 
         // 1. Add the first user message to preserve the original intent.
         if let Some(first_message) = messages.iter().find(|m| m.author == "User") {
-            if let MessageContent::Text(_) = &first_message.content {
+            if let MessageContent::Text { .. } = &first_message.content {
                  contents.push(first_message.clone().into());
                  first_message_id = Some(first_message.id);
             }
@@ -185,19 +221,33 @@ impl<'a> PromptBuilder<'a> {
         for message in messages.iter().skip(start_index) {
             // Avoid duplicating the first message if it's within the recent window
             if Some(message.id) != first_message_id {
+                // Skip the empty placeholder message if it's the last one
+                if is_continuation_placeholder && message.id == last_message.unwrap().id {
+                    continue;
+                }
+
                 match &message.content {
-                    MessageContent::Text(_) => {
+                    MessageContent::Text { thought_signature, .. } => {
+                        if let Some(sig) = thought_signature {
+                            last_thought_signature = Some(sig.clone());
+                        }
                         let content: Content = message.clone().into();
                         if !content.parts.is_empty() {
                             contents.push(content);
                         }
                     }
                     MessageContent::ToolCall(tc) => {
+                        // Update thought signature if present, or use the last one
+                        let current_thought_signature = tc.thought_signature.clone().or(last_thought_signature.clone());
+                        if let Some(sig) = &tc.thought_signature {
+                            last_thought_signature = Some(sig.clone());
+                        }
+
                         // 1. Add the model's function call
                         let args_value: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
                         
                         // Log the thought_signature field for debugging
-                        if let Some(ref thought_sig) = tc.thought_signature {
+                        if let Some(ref thought_sig) = current_thought_signature {
                             tracing::info!("Reconstructing function call '{}' with thought_signature: '{}'", 
                                 tc.tool_name, 
                                 if thought_sig.len() > 50 { &thought_sig[..50] } else { thought_sig }
@@ -213,7 +263,7 @@ impl<'a> PromptBuilder<'a> {
                                     name: tc.tool_name.clone(),
                                     args: args_value,
                                 },
-                                thought_signature: tc.thought_signature.clone(),
+                                thought_signature: current_thought_signature.clone(),
                             }],
                         });
 
@@ -381,6 +431,9 @@ mod tests {
     use chrono::Utc;
     use rmcp::model::Tool;
     use serde_json::json;
+    use uuid::Uuid;
+    use crate::components::chat::Message;
+    use crate::components::shared::MessageContent;
 
     fn create_mock_session_with_tools() -> Session {
         let tool1: Tool = serde_json::from_value(json!({
@@ -622,5 +675,128 @@ mod tests {
         let empty_items = empty_items_array.get("items").unwrap();
         assert!(empty_items.is_object());
         assert!(empty_items.as_object().unwrap().is_empty());
+    }
+    #[test]
+    fn test_build_prompt_with_continuation_placeholder() {
+        let mut session = create_mock_session_with_tools();
+        let settings = Settings::default();
+        let session_state = crate::session::SessionState::default();
+        
+        // 1. Add a tool call message
+        let tool_call_msg = Message {
+            id: Uuid::new_v4(),
+            author: "Hobbes".to_string(),
+            content: MessageContent::ToolCall(crate::components::shared::ToolCall {
+                execution_id: Uuid::new_v4().to_string(),
+                server_name: "weather_server".to_string(),
+                tool_name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+                status: crate::components::shared::ToolCallStatus::Completed,
+                response: "{\"temp\": 72}".to_string(),
+                thought_signature: Some("Checking weather...".to_string()),
+            }),
+            attachments: vec![],
+            comments: vec![],
+            created_at: Utc::now(),
+        };
+        session.messages.push(tool_call_msg);
+
+        // 2. Add an empty placeholder message (simulating the continuation start)
+        let placeholder_msg = Message {
+            id: Uuid::new_v4(),
+            author: "Hobbes".to_string(),
+            content: MessageContent::Text { content: "".to_string(), thought_signature: None },
+            attachments: vec![],
+            comments: vec![],
+            created_at: Utc::now(),
+        };
+        session.messages.push(placeholder_msg);
+
+        let builder = PromptBuilder::new(&session, &settings, &session_state);
+        let prompt = builder.build_prompt("".to_string(), None);
+
+        // 3. Verify System Instruction contains TOOL COMPLETION INSTRUCTION
+        // The current implementation will likely FAIL this because it looks at the last message (placeholder)
+        let system_instruction = if let Some(crate::components::llm::Part::Text { text }) = prompt.system_instruction.as_ref().unwrap().parts.get(0) {
+            text
+        } else {
+            panic!("System instruction should be text");
+        };
+        assert!(system_instruction.contains("TOOL COMPLETION INSTRUCTION"), "System instruction should contain tool completion instruction");
+
+        // 4. Verify the contents do NOT contain the empty placeholder
+        // The current implementation will likely FAIL this
+        let last_content = prompt.contents.last().unwrap();
+        if let Some(crate::components::llm::Part::Text { text }) = last_content.parts.get(0) {
+             assert!(!text.is_empty(), "Last content should not be empty placeholder");
+        }
+    }
+
+    #[test]
+    fn test_build_prompt_backfills_thought_signature() {
+        let mut session = create_mock_session_with_tools();
+        let settings = Settings::default();
+        let session_state = crate::session::SessionState::default();
+        
+        let signature = "original_signature".to_string();
+
+        // 1. First tool call with signature
+        let tool_call_1 = Message {
+            id: Uuid::new_v4(),
+            author: "Hobbes".to_string(),
+            content: MessageContent::ToolCall(crate::components::shared::ToolCall {
+                execution_id: Uuid::new_v4().to_string(),
+                server_name: "server".to_string(),
+                tool_name: "tool1".to_string(),
+                arguments: "{}".to_string(),
+                status: crate::components::shared::ToolCallStatus::Completed,
+                response: "{}".to_string(),
+                thought_signature: Some(signature.clone()),
+            }),
+            attachments: vec![],
+            comments: vec![],
+            created_at: Utc::now(),
+        };
+        // Clear existing messages to be clean
+        session.messages.clear();
+        session.messages.push(tool_call_1);
+
+        // 2. Second tool call WITHOUT signature
+        let tool_call_2 = Message {
+            id: Uuid::new_v4(),
+            author: "Hobbes".to_string(),
+            content: MessageContent::ToolCall(crate::components::shared::ToolCall {
+                execution_id: Uuid::new_v4().to_string(),
+                server_name: "server".to_string(),
+                tool_name: "tool2".to_string(),
+                arguments: "{}".to_string(),
+                status: crate::components::shared::ToolCallStatus::Completed,
+                response: "{}".to_string(),
+                thought_signature: None,
+            }),
+            attachments: vec![],
+            comments: vec![],
+            created_at: Utc::now(),
+        };
+        session.messages.push(tool_call_2);
+
+        let builder = PromptBuilder::new(&session, &settings, &session_state);
+        let prompt = builder.build_prompt("User message".to_string(), None);
+
+        // Verify contents
+        // Expected: 
+        // 0. Model: Tool Call 1 (with sig)
+        // 1. User: Tool Result 1
+        // 2. Model: Tool Call 2 (with BACKFILLED sig)
+        // 3. User: Tool Result 2
+        // 4. User: "User message"
+
+        let model_msg_2 = &prompt.contents[2];
+        assert_eq!(model_msg_2.role, "model");
+        if let crate::components::llm::Part::FunctionCall { thought_signature, .. } = &model_msg_2.parts[0] {
+            assert_eq!(thought_signature.as_ref().unwrap(), &signature, "Second tool call should have backfilled signature");
+        } else {
+            panic!("Expected FunctionCall part");
+        }
     }
 }

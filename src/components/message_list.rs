@@ -87,7 +87,12 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&state.active_session_id) {
                         let total_messages = session.messages.len();
-                        let messages_to_render = session.messages.iter().skip(total_messages.saturating_sub(*visible_message_count.read())).collect::<Vec<_>>();
+                        
+                        // Sort messages by created_at timestamp to ensure chronological order
+                        let mut sorted_messages = session.messages.clone();
+                        sorted_messages.sort_by_key(|m| m.created_at);
+                        
+                        let messages_to_render = sorted_messages.iter().skip(total_messages.saturating_sub(*visible_message_count.read())).collect::<Vec<_>>();
 
                         if session.messages.is_empty() {
                             rsx! { WelcomeMessage {} }
@@ -108,11 +113,22 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                                 }
                                 for message in messages_to_render {
                                     match &message.content {
-                                        MessageContent::Text(_) => rsx! {
-                                            MessageBubble {
-                                                key: "{message.id}",
-                                                message: message.clone(),
-                                                on_content_update: move |_| stream_update_trigger += 1,
+                                        MessageContent::Text { content: text, .. } => {
+                                            let stream_manager = consume_context::<crate::components::stream_manager::StreamManagerContext>();
+                                            let is_generating = stream_manager.is_generating(&message.id);
+                                            let should_render = !text.is_empty() || is_generating;
+
+                                            if should_render {
+                                                rsx! {
+                                                    MessageBubble {
+                                                        key: "{message.id}",
+                                                        message: message.clone(),
+                                                        on_content_update: move |_| stream_update_trigger += 1,
+                                                        on_selection: move |data| tracing::info!("Selection event: {:?}", data),
+                                                    }
+                                                }
+                                            } else {
+                                                rsx! {}
                                             }
                                         },
                                         MessageContent::ToolCall(tool_call) => {

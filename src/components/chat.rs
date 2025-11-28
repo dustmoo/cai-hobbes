@@ -24,10 +24,26 @@ use super::message_list::MessageList;
 use crate::context::permissions::PermissionManager;
 use crate::components::markdown_renderer::MarkdownRenderer;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SelectionData {
+    text: String,
+    top: f64,
+    left: f64,
+}
+
 lazy_static! {
     static ref SYNTAX_SET: SyntaxSet = SyntaxSet::load_defaults_newlines();
     static ref THEME_SET: ThemeSet = ThemeSet::load_defaults();
     static ref THEME: &'static Theme = &THEME_SET.themes["base16-ocean.dark"];
+}
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Comment {
+    pub id: String,
+    pub text_selection: String,
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub comment: String,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -36,6 +52,10 @@ pub struct Message {
     pub author: String,
     pub content: MessageContent,
     pub attachments: Vec<Attachment>,
+    #[serde(default)]
+    pub comments: Vec<Comment>,
+    #[serde(default = "chrono::Utc::now")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 // The main ChatWindow component
@@ -211,7 +231,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             let last_message_was_warning = session_state.read().get_active_session()
                 .and_then(|s| s.messages.last())
                 .map_or(false, |m| {
-                    if let MessageContent::Text(text) = &m.content {
+                    if let MessageContent::Text { content: text, .. } = &m.content {
                         text.starts_with("Pardon, I have reached the 'Max Turn Limit' currently set to X in settings")
                     } else {
                         false
@@ -228,14 +248,18 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
                         author: "User".to_string(),
-                        content: MessageContent::Text(user_message.clone()),
+                        content: MessageContent::Text { content: user_message.clone(), thought_signature: None },
                         attachments,
+                        comments: Vec::new(),
+                        created_at: chrono::Utc::now(),
                     });
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
                         author: "Hobbes".to_string(),
-                        content: MessageContent::Text(format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings.permission_settings.max_ai_turns)),
+                        content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings.permission_settings.max_ai_turns), thought_signature: None },
                         attachments: Vec::new(),
+                        comments: Vec::new(),
+                        created_at: chrono::Utc::now(),
                     });
                 }
                 return;
@@ -256,14 +280,18 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
                         author: "User".to_string(),
-                        content: MessageContent::Text(user_message.clone()),
+                        content: MessageContent::Text { content: user_message.clone(), thought_signature: None },
                         attachments,
+                        comments: Vec::new(),
+                        created_at: chrono::Utc::now(),
                     });
                     session.messages.push(Message {
                         id: hobbes_message_id,
                         author: "Hobbes".to_string(),
-                        content: MessageContent::Text("".to_string()),
+                        content: MessageContent::Text { content: "".to_string(), thought_signature: None },
                         attachments: Vec::new(),
+                        comments: Vec::new(),
+                        created_at: chrono::Utc::now(),
                     });
                 }
             }
@@ -322,7 +350,9 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         let send_prompt_to_llm = send_prompt_to_llm;
 
         Rc::new(move || {
+            tracing::info!("continue_prompt_flow callback INVOKED.");
             spawn(async move {
+                tracing::info!("continue_prompt_flow task SPAWNED.");
                 let mut session_state = session_state;
                 let settings = settings.read().clone();
                 let send_prompt_to_llm = send_prompt_to_llm;
@@ -334,8 +364,10 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         session.messages.push(Message {
                             id: hobbes_message_id,
                             author: "Hobbes".to_string(),
-                            content: MessageContent::Text("".to_string()),
+                            content: MessageContent::Text { content: "".to_string(), thought_signature: None },
                             attachments: Vec::new(),
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
                         });
                     }
                 }
@@ -352,6 +384,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 }
 
                 let mcp_context = session_state.read().get_active_session().and_then(|s| s.active_context.mcp_tools.clone());
+                tracing::info!("Sending continuation prompt to LLM.");
                 send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
             });
         })
@@ -372,7 +405,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 show_scroll_button: show_scroll_button,
             },
             ChatInput {
-                is_sending: stream_manager.is_sending,
+                is_sending: Signal::new(stream_manager.is_sending.read().clone() || stream_manager.is_any_generating()),
                 on_send: move |(msg, attachments)| send_message((msg, attachments)),
                 on_cancel: move |_| cancel_message(),
                 on_interaction: on_interaction,
@@ -456,45 +489,104 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
 }
 
 // Sub-component for styling individual messages
+use crate::components::selection_toolbar::SelectionToolbar;
+
+#[derive(PartialEq, Clone, Copy)]
+enum SelectionMode {
+    None,
+    Toolbar,
+    CommentInput,
+}
+
 #[component]
-pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>) -> Element {
+pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_selection: EventHandler<(String, f64, f64)>) -> Element {
     let is_user = message.author == "User";
+    
+    // Get necessary contexts
+    let settings = consume_context::<Signal<Settings>>();
+    let stream_manager = consume_context::<StreamManagerContext>();
+    let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
+    
+    let mut is_thinking = false;
+    let mut thought_signature: Option<String> = None;
 
-    // This component now specifically handles Text content.
-    // The parent component (`ChatWindow`) is responsible for matching on `MessageContent`
-    // and rendering the correct component (`MessageBubble` or `ToolCallDisplay`).
-    if let MessageContent::Text(text_content) = &message.content {
-        let stream_manager = consume_context::<StreamManagerContext>();
-        let mut content = use_signal(|| text_content.clone());
-        let mut copied = use_signal(|| false);
+    if let MessageContent::Text { thought_signature: ts, .. } = &message.content {
+        if stream_manager.is_generating(&message.id) {
+             is_thinking = true;
+        }
+        thought_signature = ts.clone();
+    }
 
-        // This effect runs once when the component is created.
-        // If it's a streaming Hobbes message, it takes the stream and updates its local state.
-        use_effect(move || {
-            let _stream_activity = stream_manager.stream_activity;
-            if !is_user && stream_manager.is_streaming(&message.id) {
+    match &message.content {
+        MessageContent::Text { content: text_content, .. } => {
+            let mut content = use_signal(|| text_content.clone());
+            let mut copied = use_signal(|| false);
+            let mut show_thinking = use_signal(|| false);
+            
+            // Inline comment state
+            let mut selection_mode = use_signal(|| SelectionMode::None);
+            let mut selection_data = use_signal(|| (String::new(), 0.0, 0.0)); // text, top, left
+            
+            // Setup eval for text selection
+            let message_id_str = message.id.to_string();
+            
+            use_effect(move || {
+                let message_id_clone = message_id_str.clone();
                 spawn(async move {
-                    if let Some(mut rx) = stream_manager.take_stream(&message.id) {
-                        while let Some(stream_msg) = rx.recv().await {
-                            if let StreamMessage::Text(chunk) = stream_msg {
-                                tracing::debug!("CHUNK RECEIVED: '{}'", &chunk);
-                                content.write().push_str(&chunk);
-                                on_content_update.call(());
+                    let mut eval = document::eval(&format!(r#"
+                        const bubble = document.getElementById('message-bubble-{}');
+                        if (bubble) {{
+                            bubble.addEventListener('mouseup', (e) => {{
+                                const selection = window.getSelection();
+                                if (!selection.isCollapsed && bubble.contains(selection.anchorNode)) {{
+                                    const range = selection.getRangeAt(0);
+                                    const rect = range.getBoundingClientRect();
+                                    const text = selection.toString();
+                                    dioxus.send({{ text: text, top: rect.bottom + window.scrollY, left: rect.left + window.scrollX }});
+                                }}
+                            }});
+                        }}
+                    "#, message_id_clone));
+
+                    while let Ok(msg) = eval.recv().await {
+                        if let Ok(data) = serde_json::from_value::<SelectionData>(msg) {
+                            if !data.text.trim().is_empty() {
+                                selection_data.set((data.text.clone(), data.top, data.left));
+                                selection_mode.set(SelectionMode::Toolbar);
                             }
                         }
                     }
                 });
-            }
-        });
+            });
 
-        let is_thinking = !is_user && content.read().is_empty();
+            // This effect runs once when the component is created.
+            // If it's a streaming Hobbes message, it takes the stream and updates its local state.
+            use_effect(move || {
+                let _stream_activity = stream_manager.stream_activity;
+                if !is_user && stream_manager.is_streaming(&message.id) {
+                    spawn(async move {
+                        if let Some(mut rx) = stream_manager.take_stream(&message.id) {
+                            while let Some(stream_msg) = rx.recv().await {
+                                if let StreamMessage::Text { content: chunk, .. } = stream_msg {
+                                    tracing::debug!("CHUNK RECEIVED: '{}'", &chunk);
+                                    content.write().push_str(&chunk);
+                                    on_content_update.call(());
+                                }
+                            }
+                        }
+                    });
+                }
+            });
 
-        let bubble_classes = if is_user {
-            "bg-primary-500 text-white self-end ml-auto"
-        } else {
-            "bg-dark-card text-dark-text self-start mr-auto"
-        };
-        let container_classes = if is_user { "flex justify-end" } else { "flex justify-start" };
+            let is_thinking = !is_user && content.read().is_empty();
+            let thinking_mode_enabled = settings.read().gemini_config.thinking_enabled;
+
+            let bubble_classes = if is_user {
+                "bg-primary-500 text-white self-end ml-auto"
+            } else {
+                "bg-dark-card text-dark-text self-start mr-auto"
+            };
+            let container_classes = if is_user { "flex justify-end" } else { "flex justify-start" };
         let author_classes = format!(
             "text-xs text-gray-500 mt-1 px-2 {}",
             if is_user { "text-right" } else { "text-left" }
@@ -513,49 +605,143 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>) -> E
                 div {
                     class: "flex flex-col max-w-2/3 min-w-0",
                     div {
-                        class: "relative group px-4 py-2 rounded-2xl message-bubble-{message.author.to_lowercase()} {bubble_classes}",
-                        if is_thinking {
-                            ThinkingIndicator {}
-                        } else {
-                            MarkdownRenderer {
-                                content: content.read().clone()
-                            }
-                        }
-                        if !message.attachments.is_empty() {
-                            div {
-                                class: "mt-2 flex flex-wrap gap-2",
-                                for attachment in &message.attachments {
-                                    if attachment.mime_type.starts_with("image/") {
-                                        img {
-                                            class: "max-w-xs rounded-lg",
-                                            src: "data:{attachment.mime_type};base64,{attachment.data}"
-                                        }
+                        id: "message-bubble-{message.id}",
+                        class: "relative group rounded-2xl {bubble_classes} max-w-full overflow-hidden",
+                        div {
+                            class: "px-4 py-3 text-sm leading-relaxed break-words",
+                            if is_thinking {
+                                ThinkingIndicator { thinking_mode_enabled }
+                            } else {
+                                MarkdownRenderer { 
+                                    content: content(), 
+                                    comments: message.comments.clone(),
+                                    pending_highlight: if *selection_mode.read() != SelectionMode::None {
+                                        Some(selection_data.read().0.clone())
                                     } else {
-                                        div {
-                                            class: "bg-gray-800 p-2 rounded text-sm text-gray-300",
-                                            "{attachment.file_name}"
+                                        None
+                                    }
+                                }
+                                if !message.attachments.is_empty() {
+                                    div {
+                                        class: "flex flex-col space-y-2 mt-2",
+                                        for attachment in &message.attachments {
+                                            img {
+                                                src: format!("data:{};base64,{}", attachment.mime_type, attachment.data),
+                                                class: "max-w-full rounded-lg",
+                                                alt: attachment.file_name.clone(),
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                        if !content.read().is_empty() {
-                            button {
-                                class: "{button_position_classes} p-1 rounded-full text-gray-400 bg-gray-900 bg-opacity-75 hover:bg-gray-700 hover:text-white transition-all opacity-0 group-hover:opacity-100",
-                                onclick: move |_| {
-                                    let content_to_copy = content.read().clone();
+                        
+                        if *selection_mode.read() == SelectionMode::Toolbar {
+                            SelectionToolbar {
+                                position_top: selection_data.read().1,
+                                position_left: selection_data.read().2,
+                                on_copy: move |_| {
+                                    let text = selection_data.read().0.clone();
                                     spawn(async move {
-                                        if copy_to_clipboard(&content_to_copy).is_ok() {
-                                            copied.set(true);
-                                            sleep(Duration::from_secs(2)).await;
-                                            copied.set(false);
-                                        }
+                                        let mut eval = document::eval(&format!("navigator.clipboard.writeText(`{}`);", text));
+                                        let _: Result<serde_json::Value, _> = eval.recv().await;
                                     });
+                                    selection_mode.set(SelectionMode::None);
                                 },
-                                if *copied.read() {
-                                    Icon { width: 14, height: 14, icon: fi_icons::FiCheck }
-                                } else {
-                                    Icon { width: 14, height: 14, icon: fi_icons::FiClipboard }
+                                on_comment: move |_| {
+                                    selection_mode.set(SelectionMode::CommentInput);
+                                    on_selection.call((selection_data.read().0.clone(), selection_data.read().1, selection_data.read().2));
+                                }
+                            }
+                        }
+
+                        if *selection_mode.read() == SelectionMode::CommentInput {
+                            crate::components::inline_comment_popover::InlineCommentPopover {
+                                position_top: selection_data.read().1,
+                                position_left: selection_data.read().2,
+                                on_save: move |comment_text: String| {
+                                    let (text, _, _) = selection_data.read().clone();
+                                    let new_comment = Comment {
+                                        id: Uuid::new_v4().to_string(),
+                                        text_selection: text,
+                                        start_offset: 0, // Not used in this version
+                                        end_offset: 0,   // Not used in this version
+                                        comment: comment_text,
+                                    };
+                                    
+                                    // Update session state
+                                    let mut state = session_state.write();
+                                    if let Some(msg) = state.get_message_mut(&message.id) {
+                                        msg.comments.push(new_comment);
+                                    }
+                                    if let Err(e) = state.save() {
+                                        tracing::error!("Failed to save session after adding comment: {}", e);
+                                    }
+                                    
+                                    selection_mode.set(SelectionMode::None);
+                                },
+                                on_cancel: move |_| {
+                                    selection_mode.set(SelectionMode::None);
+                                }
+                            }
+                        }
+
+                        if !is_user && !is_thinking {
+                            div {
+                                class: "flex items-center justify-end px-2 py-1 space-x-2 opacity-0 group-hover:opacity-100 transition-opacity",
+                                button {
+                                    class: "p-1 text-gray-400 hover:text-white rounded transition-colors",
+                                    onclick: move |_| {
+                                        let text = content();
+                                        spawn(async move {
+                                            let mut eval = document::eval(&format!("navigator.clipboard.writeText(`{}`);", text));
+                                            let _: Result<serde_json::Value, _> = eval.recv().await;
+                                            copied.set(true);
+                                            sleep(std::time::Duration::from_secs(2)).await;
+                                            copied.set(false);
+                                        });
+                                    },
+                                    title: "Copy message",
+                                    if *copied.read() {
+                                        Icon { width: 14, height: 14, icon: fi_icons::FiCheck }
+                                    } else {
+                                        Icon { width: 14, height: 14, icon: fi_icons::FiCopy }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if !is_thinking && thought_signature.is_some() {
+                            div {
+                                class: "mt-3 pt-3 border-t border-gray-600",
+                                button {
+                                    class: "flex items-center text-xs text-gray-400 hover:text-gray-300 focus:outline-none",
+                                    onclick: move |_| {
+                                        let current = *show_thinking.read();
+                                        show_thinking.set(!current);
+                                    },
+                                    if *show_thinking.read() {
+                                        Icon { 
+                                            width: 12, 
+                                            height: 12, 
+                                            icon: fi_icons::FiChevronDown,
+                                            class: "mr-1"
+                                        }
+                                    } else {
+                                        Icon { 
+                                            width: 12, 
+                                            height: 12, 
+                                            icon: fi_icons::FiChevronRight,
+                                            class: "mr-1"
+                                        }
+                                    }
+                                    "Thinking Process"
+                                }
+                                if *show_thinking.read() {
+                                    div {
+                                        class: "mt-2 p-3 bg-dark-bg rounded-lg text-xs text-gray-300 font-mono whitespace-pre-wrap",
+                                        "{thought_signature.as_ref().unwrap()}"
+                                    }
                                 }
                             }
                         }
@@ -566,10 +752,9 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>) -> E
                     }
                 }
             }
+            }
         }
-    } else {
-        // This path should not be taken, but as a fallback, render nothing.
-        rsx! {}
+        _ => rsx! {}
     }
 }
 
@@ -636,13 +821,29 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
 }
 
 #[component]
-fn ThinkingIndicator() -> Element {
+fn ThinkingIndicator(thinking_mode_enabled: bool) -> Element {
     rsx! {
-        div {
-            class: "flex items-center justify-center space-x-1",
-            span { class: "w-2.5 h-2.5 bg-white rounded-full animate-pulse-fast" },
-            span { class: "w-2.5 h-2.5 bg-white rounded-full animate-pulse-medium" },
-            span { class: "w-2.5 h-2.5 bg-white rounded-full animate-pulse-slow" },
+        if thinking_mode_enabled {
+            div {
+                class: "flex items-center space-x-2",
+                Icon {
+                    width: 16,
+                    height: 16,
+                    icon: fi_icons::FiCpu,
+                    class: "text-white animate-pulse"
+                }
+                span {
+                    class: "text-sm text-white",
+                    "Thinking..."
+                }
+            }
+        } else {
+            div {
+                class: "flex items-center space-x-1",
+                span { class: "w-2.5 h-2.5 bg-white rounded-full animate-pulse-fast" },
+                span { class: "w-2.5 h-2.5 bg-white rounded-full animate-pulse-medium" },
+                span { class: "w-2.5 h-2.5 bg-white rounded-full animate-pulse-slow" },
+            }
         }
     }
 }

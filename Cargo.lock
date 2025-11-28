@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "Hobbes"
-version = "0.8.4"
+version = "0.9.1"
 dependencies = [
  "ammonia",
  "arboard",
@@ -2580,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "feature_clipboard"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "tracing",
@@ -3554,7 +3554,7 @@ dependencies = [
 
 [[package]]
 name = "hobbes_core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]
@@ -4492,7 +4492,7 @@ dependencies = [
 
 [[package]]
 name = "macos_app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dioxus",
  "dioxus-desktop",
@@ -9491,7 +9491,7 @@ checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
 
 [[package]]
 name = "windows_app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dioxus",
  "dioxus-desktop",

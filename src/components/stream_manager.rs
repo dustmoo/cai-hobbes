@@ -34,6 +34,14 @@ impl StreamManagerContext {
         self.stream_receivers.read().contains_key(message_id)
     }
 
+    pub fn is_generating(self, message_id: &Uuid) -> bool {
+        self.active_stream_handles.read().contains_key(message_id)
+    }
+
+    pub fn is_any_generating(self) -> bool {
+        !self.active_stream_handles.read().is_empty()
+    }
+
     pub fn start_stream(
         mut self,
         message_id: Uuid,
@@ -64,12 +72,16 @@ impl StreamManagerContext {
             let (tool_results_tx, mut tool_results_rx) = mpsc::unbounded_channel::<crate::components::shared::ToolCallRecord>();
             let mut tool_call_count = 0;
             let mut final_text_for_this_turn = String::new();
+            let mut thought_signature_for_this_turn: Option<String> = None;
 
             while let Some(message) = llm_rx.recv().await {
                 match message {
-                    StreamMessage::Text(chunk) => {
-                        final_text_for_this_turn.push_str(&chunk);
-                        if stream_tx.send(StreamMessage::Text(chunk)).is_err() {
+                    StreamMessage::Text { content, thought_signature } => {
+                        final_text_for_this_turn.push_str(&content);
+                        if thought_signature.is_some() {
+                            thought_signature_for_this_turn = thought_signature.clone();
+                        }
+                        if stream_tx.send(StreamMessage::Text { content, thought_signature }).is_err() {
                             break;
                         }
                         is_first_message = false;
@@ -91,6 +103,8 @@ impl StreamManagerContext {
                                         author: "Hobbes".to_string(),
                                         content: crate::components::shared::MessageContent::ToolCall(tool_call.clone()),
                                         attachments: Vec::new(),
+                                        comments: Vec::new(),
+                                        created_at: chrono::Utc::now(),
                                     });
                                 }
                                 new_id
@@ -166,8 +180,9 @@ impl StreamManagerContext {
             if !final_text_for_this_turn.is_empty() {
                 let mut state = self.session_state.write();
                 if let Some(msg) = state.get_message_mut(&message_id) {
-                    if let crate::components::shared::MessageContent::Text(t) = &mut msg.content {
-                        *t = final_text_for_this_turn.clone();
+                    if let crate::components::shared::MessageContent::Text { content, thought_signature } = &mut msg.content {
+                        *content = final_text_for_this_turn.clone();
+                        *thought_signature = thought_signature_for_this_turn.clone();
                     }
                 }
             }
@@ -186,6 +201,21 @@ impl StreamManagerContext {
                 self.session_state.write().tool_call_history.extend(collected_records.clone());
                 // Tools were called in this turn. Increment the turn counter and trigger a continuation.
                 self.permission_manager.write().increment_turn_count();
+                
+                // CRITICAL FIX: Remove the active stream handle for THIS message before triggering the continuation.
+                // The continuation will spawn a NEW task with a NEW message ID.
+                // If we don't remove this one, is_any_generating() will remain true forever because this task never "completes" normally.
+                self.active_stream_handles.write().remove(&message_id);
+                
+                if let Err(e) = self.session_state.write().save() {
+                    tracing::error!("Failed to save session state before continuation: {}", e);
+                }
+
+                // Clean up the current stream state before triggering the next one
+                on_complete();
+                self.is_sending.set(false);
+                self.scheduler.send(SchedulerSignal::Activity);
+
                 self.continuation_controller.read().trigger_continuation();
                 return; // End this stream task. The continuation will start a new one.
             }

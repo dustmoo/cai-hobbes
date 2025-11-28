@@ -13,6 +13,22 @@ const BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/mod
 use crate::session::Tool;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_config: Option<ThinkingConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct GeminiRequest {
     contents: Vec<Content>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21,6 +37,8 @@ pub(crate) struct GeminiRequest {
     system_instruction: Option<SystemInstruction>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_config: Option<ToolConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GenerationConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -182,6 +200,32 @@ impl LlmConnector for GeminiConnector {
         .build()
         .expect("Failed to build reqwest client");
 
+    // Build thinking config based on model and settings
+    let generation_config = if self.config.thinking_enabled {
+        let thinking_config = if model.starts_with("gemini-3") {
+            // Gemini 3 Pro uses thinkingLevel
+            Some(ThinkingConfig {
+                thinking_level: Some(self.config.thinking_level.clone()),
+                thinking_budget: None,
+            })
+        } else if model.starts_with("gemini-2.5") || model.starts_with("gemini-2.0") {
+            // Gemini 2.5 and 2.0 series use thinkingBudget
+            Some(ThinkingConfig {
+                thinking_level: None,
+                thinking_budget: self.config.thinking_budget,
+            })
+        } else {
+            // Unknown model, skip thinking config
+            None
+        };
+
+        thinking_config.map(|tc| GenerationConfig {
+            thinking_config: Some(tc),
+        })
+    } else {
+        None
+    };
+
     let request_body = GeminiRequest {
         contents: prompt_data.contents,
         tools: prompt_data.tools.clone(),
@@ -196,6 +240,7 @@ impl LlmConnector for GeminiConnector {
         } else {
             None
         },
+        generation_config,
     };
 
     // --- Synchronous Logging Block ---
@@ -301,7 +346,7 @@ impl LlmConnector for GeminiConnector {
                                                                 server.name.clone(),
                                                                 function_call.name.clone(),
                                                                 function_call.args.clone(),
-                                                                part.thought_signature.clone(),
+                                                                part.thought_signature.clone().or(function_call.thought_signature.clone()),
                                                             );
                                                             if tx.send(StreamMessage::ToolCall(tool_call)).is_err() {
                                                                 return;
@@ -316,7 +361,10 @@ impl LlmConnector for GeminiConnector {
                                                     tracing::error!("LLM requested tool '{}' which was not found in the provided context.", function_call.name);
                                                 }
                                             } else if !part.text.is_empty() {
-                                                if tx.send(StreamMessage::Text(part.text.clone())).is_err() {
+                                                if tx.send(StreamMessage::Text {
+                                                    content: part.text.clone(),
+                                                    thought_signature: part.thought_signature.clone(),
+                                                }).is_err() {
                                                     return;
                                                 }
                                                 has_sent_data = true;
@@ -333,7 +381,10 @@ impl LlmConnector for GeminiConnector {
                                         break; // Break from inner while to retry
                                     }
                                     let error_message = "[Hobbes encountered a stream error. Please check the logs for details.]";
-                                    if tx.send(StreamMessage::Text(error_message.to_string())).is_err() {
+                                    if tx.send(StreamMessage::Text {
+                                        content: error_message.to_string(),
+                                        thought_signature: None,
+                                    }).is_err() {
                                         tracing::error!("Failed to send stream error message to UI.");
                                     }
                                     return;
@@ -356,7 +407,10 @@ impl LlmConnector for GeminiConnector {
                 continue; // Go to the next iteration of the for loop
             } else {
                 tracing::error!("Malformed function call persisted after {} retries. Aborting.", MAX_RETRIES);
-                let _ = tx.send(StreamMessage::Text("[Hobbes failed to process a tool call after multiple retries.]".to_string()));
+                let _ = tx.send(StreamMessage::Text {
+                    content: "[Hobbes failed to process a tool call after multiple retries.]".to_string(),
+                    thought_signature: None,
+                });
                 return;
             }
         }
@@ -367,7 +421,10 @@ impl LlmConnector for GeminiConnector {
                 Some(reason) => format!("[Hobbes did not provide a response. Finish Reason: {}]", reason),
                 None => "[Hobbes did not provide a response due to an internal error.]".to_string(),
             };
-            if tx.send(StreamMessage::Text(default_message)).is_err() {
+            if tx.send(StreamMessage::Text {
+                content: default_message,
+                thought_signature: None,
+            }).is_err() {
                 tracing::error!("Failed to send default message to UI.");
             }
         }
@@ -425,6 +482,7 @@ Recent Messages:
         tools: None,
         system_instruction: None,
         tool_config: None,
+        generation_config: None,
     };
 
     tracing::info!("Using summary model: {}", model);
