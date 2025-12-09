@@ -37,6 +37,7 @@ impl ConversationProcessor {
                    MessageContent::Text { content: text, .. } => text.clone(),
                    MessageContent::ToolCall(tc) => format!("[Tool Call: {}]", tc.tool_name),
                    MessageContent::PermissionRequest(tc) => format!("[Permission Request for Tool: {}]", tc.tool_name),
+                   MessageContent::Error { message } => format!("[Error: {}]", message),
                };
                format!("{}: {}", m.author, content_str)
            })

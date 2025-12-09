@@ -20,6 +20,37 @@ pub fn SettingsPanel() -> Element {
     // This signal will track if the local state differs from the global state.
     let mut has_unsaved_changes = use_signal(|| false);
 
+    // Signals for model fetching
+    let mut available_models = use_signal(|| Vec::<crate::services::gemini_models::GeminiModel>::new());
+    let mut models_loading = use_signal(|| false);
+    let mut models_error = use_signal(|| Option::<String>::None);
+    let mut models_fetch_trigger = use_signal(|| 0u32);
+
+    // Effect to fetch models when API key is available or refresh is triggered
+    use_effect(move || {
+        let api_key = local_settings.read().gemini_config.api_key.clone();
+        let _trigger = models_fetch_trigger.read(); // Subscribe to trigger changes
+        
+        if api_key.is_some() {
+            models_loading.set(true);
+            models_error.set(None);
+            
+            spawn(async move {
+                match crate::services::gemini_models::fetch_gemini_models(api_key.as_deref()).await {
+                    Ok(models) => {
+                        available_models.set(models);
+                        models_loading.set(false);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to fetch models: {}", e);
+                        models_error.set(Some(format!("Failed to load models: {}", e)));
+                        models_loading.set(false);
+                    }
+                }
+            });
+        }
+    });
+
     // This effect hook reactively checks for differences between the local and global settings.
     use_effect(move || {
         let global_settings = settings.read();
@@ -102,6 +133,15 @@ pub fn SettingsPanel() -> Element {
                                 tracing::error!("Failed to save API key: {}", e);
                             }
                         }
+                        if let Some(smithery_api_key) = settings_to_save.smithery_api_key.take() {
+                            let trimmed_key = smithery_api_key.trim().to_string();
+                            if let Err(e) = secure_storage::save_secret("smithery_api_key", &trimmed_key) {
+                                tracing::error!("Failed to save Smithery API key: {}", e);
+                            }
+                            // Put the trimmed key back in case we continue using settings_to_save (though we don't here)
+                            // But cleaner to ensure we save the trimmed version if settings_to_save was used later.
+                        }
+
                         if let Err(e) = settings_manager.read().save(&settings_to_save) {
                             tracing::error!("Failed to save settings: {}", e);
                         }
@@ -150,22 +190,98 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     div {
                                         class: "mb-4",
-                                        label { class: "block text-sm font-medium text-gray-300", "Chat Model" }
-                                        input {
-                                            class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                            r#type: "text",
-                                            value: "{local_settings.read().gemini_config.chat_model}",
-                                            oninput: move |event| local_settings.write().gemini_config.chat_model = event.value()
+                                        div {
+                                            class: "flex justify-between items-center mb-1",
+                                            label { class: "block text-sm font-medium text-gray-300", "Chat Model" }
+                                            if local_settings.read().gemini_config.api_key.is_some() {
+                                                button {
+                                                    class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-gray-500 disabled:cursor-not-allowed",
+                                                    disabled: *models_loading.read(),
+                                                    onclick: move |_| {
+                                                        crate::services::gemini_models::clear_models_cache();
+                                                        models_fetch_trigger.set(models_fetch_trigger() + 1);
+                                                    },
+                                                    if *models_loading.read() { "Loading..." } else { "↻ Refresh" }
+                                                }
+                                            }
+                                        }
+                                        if local_settings.read().gemini_config.api_key.is_none() {
+                                            p {
+                                                class: "mt-1 text-sm text-gray-400 italic",
+                                                "Please configure your API key above to load available models"
+                                            }
+                                        } else if *models_loading.read() {
+                                            p {
+                                                class: "mt-1 text-sm text-gray-400 italic",
+                                                "Loading available models..."
+                                            }
+                                        } else if let Some(error) = models_error.read().as_ref() {
+                                            p {
+                                                class: "mt-1 text-sm text-red-400",
+                                                "{error}"
+                                            }
+                                        } else {
+                                            select {
+                                                class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                onchange: move |event| {
+                                                    local_settings.write().gemini_config.chat_model = event.value();
+                                                },
+                                                for model in available_models.read().iter() {
+                                                    option {
+                                                        value: "{model.name}",
+                                                        selected: local_settings.read().gemini_config.chat_model == model.name,
+                                                        "{model.display_name}"
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     div {
                                         class: "mb-4",
-                                        label { class: "block text-sm font-medium text-gray-300", "Summary Model" }
-                                        input {
-                                            class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                            r#type: "text",
-                                            value: "{local_settings.read().gemini_config.summary_model}",
-                                            oninput: move |event| local_settings.write().gemini_config.summary_model = event.value()
+                                        div {
+                                            class: "flex justify-between items-center mb-1",
+                                            label { class: "block text-sm font-medium text-gray-300", "Summary Model" }
+                                            if local_settings.read().gemini_config.api_key.is_some() {
+                                                button {
+                                                    class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-gray-500 disabled:cursor-not-allowed",
+                                                    disabled: *models_loading.read(),
+                                                    onclick: move |_| {
+                                                        crate::services::gemini_models::clear_models_cache();
+                                                        models_fetch_trigger.set(models_fetch_trigger() + 1);
+                                                    },
+                                                    if *models_loading.read() { "Loading..." } else { "↻ Refresh" }
+                                                }
+                                            }
+                                        }
+                                        if local_settings.read().gemini_config.api_key.is_none() {
+                                            p {
+                                                class: "mt-1 text-sm text-gray-400 italic",
+                                                "Please configure your API key above to load available models"
+                                            }
+                                        } else if *models_loading.read() {
+                                            p {
+                                                class: "mt-1 text-sm text-gray-400 italic",
+                                                "Loading available models..."
+                                            }
+                                        } else if let Some(error) = models_error.read().as_ref() {
+                                            p {
+                                                class: "mt-1 text-sm text-red-400",
+                                                "{error}"
+                                            }
+                                        } else {
+                                            select {
+                                                class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                onchange: move |event| {
+                                                    local_settings.write().gemini_config.summary_model = event.value();
+                                                },
+                                                for model in available_models.read().iter() {
+                                                    option {
+                                                        value: "{model.name}",
+                                                        selected: local_settings.read().gemini_config.summary_model == model.name,
+                                                        "{model.display_name}"
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     
@@ -175,13 +291,17 @@ pub fn SettingsPanel() -> Element {
                                         div {
                                             class: "flex items-center justify-between mb-2",
                                             label { class: "block text-sm font-medium text-gray-300", "Thinking Mode" }
-                                            input {
-                                                r#type: "checkbox",
-                                                class: "w-4 h-4 text-primary-500 bg-dark-input border-primary-600 rounded focus:ring-primary-500",
-                                                checked: local_settings.read().gemini_config.thinking_enabled,
-                                                onchange: move |event| {
-                                                    local_settings.write().gemini_config.thinking_enabled = event.checked();
+                                            label {
+                                                class: "relative inline-flex items-center cursor-pointer",
+                                                input {
+                                                    r#type: "checkbox",
+                                                    class: "sr-only peer",
+                                                    checked: local_settings.read().gemini_config.thinking_enabled,
+                                                    onchange: move |event| {
+                                                        local_settings.write().gemini_config.thinking_enabled = event.checked();
+                                                    }
                                                 }
+                                                div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
                                             }
                                         }
                                         p {
@@ -195,12 +315,11 @@ pub fn SettingsPanel() -> Element {
                                                 label { class: "block text-sm font-medium text-gray-300 mb-1", "Thinking Level (Gemini 3 Pro)" }
                                                 select {
                                                     class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                                    value: "{local_settings.read().gemini_config.thinking_level}",
                                                     onchange: move |event| {
                                                         local_settings.write().gemini_config.thinking_level = event.value();
                                                     },
-                                                    option { value: "low", "Low" }
-                                                    option { value: "high", "High (Default)" }
+                                                    option { value: "low", selected: local_settings.read().gemini_config.thinking_level == "low", "Low" }
+                                                    option { value: "high", selected: local_settings.read().gemini_config.thinking_level == "high", "High (Default)" }
                                                 }
                                             }
                                             
@@ -228,6 +347,32 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Smithery API Key Section
+                div {
+                    class: "border border-primary-700 rounded-lg mb-4",
+                    div {
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section rounded-t-lg",
+                        onclick: move |_| llm_config_collapsed.set(!llm_config_collapsed()),
+                        h3 { class: "text-md font-semibold", "Smithery.ai Configuration" }
+                        span { if *llm_config_collapsed.read() { "▶" } else { "▼" } }
+                    }
+                    if !llm_config_collapsed() {
+                        div {
+                            class: "p-4",
+                            div {
+                                class: "mb-4",
+                                label { class: "block text-sm font-medium text-gray-300", "Smithery API Key" }
+                                input {
+                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                    r#type: "password",
+                                    placeholder: "Enter your Smithery.ai API key",
+                                    value: "{local_settings.read().smithery_api_key.as_deref().unwrap_or(\"\")}",
+                                    oninput: move |event| local_settings.write().smithery_api_key = Some(event.value().trim().to_string())
                                 }
                             }
                         }
@@ -308,6 +453,24 @@ pub fn SettingsPanel() -> Element {
                                         oninput: move |event| {
                                             if let Some(checked) = event.value().parse().ok() {
                                                 local_settings.write().confirm_on_save = checked;
+                                            }
+                                        }
+                                    }
+                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
+                                }
+                            }
+                            div {
+                                class: "mt-4 mb-4 flex items-center justify-between",
+                                label { class: "block text-sm font-medium text-gray-300", "Confirm Before Deleting Messages" }
+                                label {
+                                    class: "relative inline-flex items-center cursor-pointer",
+                                    input {
+                                        r#type: "checkbox",
+                                        class: "sr-only peer",
+                                        checked: local_settings.read().confirm_on_message_delete,
+                                        oninput: move |event| {
+                                            if let Some(checked) = event.value().parse().ok() {
+                                                local_settings.write().confirm_on_message_delete = checked;
                                             }
                                         }
                                     }
@@ -654,6 +817,11 @@ pub fn SettingsPanel() -> Element {
                                     tracing::error!("Failed to save API key: {}", e);
                                 }
                             }
+                           if let Some(smithery_api_key) = settings_to_save.smithery_api_key.take() {
+                               if let Err(e) = secure_storage::save_secret("smithery_api_key", &smithery_api_key) {
+                                   tracing::error!("Failed to save Smithery API key: {}", e);
+                               }
+                           }
                             if let Err(e) = settings_manager.read().save(&settings_to_save) {
                                 tracing::error!("Failed to save settings: {}", e);
                             }

@@ -16,11 +16,13 @@ use crate::processing::summarization_scheduler::{SchedulerSignal};
 #[component]
 pub fn ChatInput(
     is_sending: Signal<bool>,
+    has_new_comments: Signal<bool>,
     on_send: EventHandler<(String, Vec<Attachment>)>,
     on_cancel: EventHandler<()>,
     on_interaction: EventHandler<()>,
     on_toggle_sessions: EventHandler<()>,
     on_toggle_settings: EventHandler<()>,
+    on_toggle_mcp_manager: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let _settings = use_context::<Signal<Settings>>();
@@ -38,7 +40,7 @@ pub fn ChatInput(
             return;
         }
         let user_message = draft.read().clone();
-        if user_message.is_empty() && attachments.read().is_empty() {
+        if user_message.is_empty() && attachments.read().is_empty() && !*has_new_comments.read() {
             return;
         }
         on_send.call((user_message, attachments.read().clone()));
@@ -130,7 +132,7 @@ pub fn ChatInput(
                     Icon {
                         width: 20,
                         height: 20,
-                        icon: fi_icons::FiMenu
+                        icon: fi_icons::FiClock
                     }
                 }
                 button {
@@ -140,6 +142,15 @@ pub fn ChatInput(
                         width: 20,
                         height: 20,
                         icon: fi_icons::FiSettings
+                    }
+                }
+                button {
+                    class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                    onclick: move |_| on_toggle_mcp_manager.call(()),
+                    Icon {
+                        width: 20,
+                        height: 20,
+                        icon: fi_icons::FiPackage
                     }
                 }
                 button {
@@ -358,7 +369,7 @@ pub fn ChatInput(
                                 on_interaction.call(());
                                 send_message();
                             },
-                            "Send"
+                            if *has_new_comments.read() { "Submit" } else { "Send" }
                         }
                     } else {
                         button {

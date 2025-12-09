@@ -6,9 +6,14 @@ pub enum MessageContent {
         content: String,
         #[serde(default)]
         thought_signature: Option<String>,
+        #[serde(default)]
+        thought_summary: Option<String>,
     },
     ToolCall(ToolCall),
     PermissionRequest(ToolCall),
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -26,8 +31,12 @@ pub enum StreamMessage {
     Text {
         content: String,
         thought_signature: Option<String>,
+        thought_summary: Option<String>,
     },
     ToolCall(ToolCall),
+    Error {
+        message: String,
+    },
 }
 
 impl ToolCall {

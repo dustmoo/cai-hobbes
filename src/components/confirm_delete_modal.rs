@@ -8,6 +8,10 @@ pub struct ConfirmDeleteModalProps {
     pub on_cancel: EventHandler<()>,
     pub title: String,
     pub message: String,
+    #[props(default = "Yes, Delete".to_string())]
+    pub confirm_button_text: String,
+    #[props(default = true)]
+    pub show_dont_ask_again: bool,
 }
 
 #[component]
@@ -29,19 +33,21 @@ pub fn ConfirmDeleteModal(props: ConfirmDeleteModalProps) -> Element {
                     h2 { class: "text-xl font-bold text-white m-4", "{props.title}" }
                     p { class: "text-gray-300 m-4", "{props.message}" }
 
-                    div {
-                        class: "flex items-center m-4",
-                        input {
-                            id: "remember_choice",
-                            "type": "checkbox",
-                            class: "h-4 w-4 text-purple-600 bg-gray-700 border-gray-600 rounded focus:ring-purple-500",
-                            checked: *remember_choice.read(),
-                            onchange: move |evt| remember_choice.set(evt.checked()),
-                        }
-                        label {
-                            "for": "remember_choice",
-                            class: "ml-2 text-sm font-medium text-gray-400 select-none",
-                            "Remember my choice"
+                    if props.show_dont_ask_again {
+                        div {
+                            class: "flex items-center m-4",
+                            input {
+                                id: "remember_choice",
+                                "type": "checkbox",
+                                class: "h-4 w-4 text-purple-600 bg-gray-700 border-gray-600 rounded focus:ring-purple-500",
+                                checked: *remember_choice.read(),
+                                onchange: move |evt| remember_choice.set(evt.checked()),
+                            }
+                            label {
+                                "for": "remember_choice",
+                                class: "ml-2 text-sm font-medium text-gray-400 select-none",
+                                "Remember my choice"
+                            }
                         }
                     }
 
@@ -56,7 +62,7 @@ pub fn ConfirmDeleteModal(props: ConfirmDeleteModalProps) -> Element {
                         button {
                             class: "px-4 py-2 bg-red-600 rounded-md text-white font-semibold hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500",
                             onclick: move |_| props.on_confirm.call(*remember_choice.read()),
-                            "Yes, Delete"
+                            "{props.confirm_button_text}"
                         }
                     }
                 }

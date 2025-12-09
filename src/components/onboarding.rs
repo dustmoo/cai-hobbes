@@ -2,13 +2,8 @@ use dioxus::prelude::*;
 use crate::settings::{Settings, SettingsManager};
 use crate::secure_storage;
 
-#[derive(Props, Clone, PartialEq)]
-pub struct OnboardingProps {
-    pub needs_onboarding: Signal<bool>,
-}
-
 #[component]
-pub fn Onboarding(mut props: OnboardingProps) -> Element {
+pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
     let mut settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
 
@@ -47,7 +42,7 @@ pub fn Onboarding(mut props: OnboardingProps) -> Element {
         error_message.set("".to_string());
 
         // This will cause the main app to re-render and show the chat window
-        props.needs_onboarding.set(false);
+        // The parent's memo will recalculate when settings change, causing this component to unmount.
     };
 
     rsx! {

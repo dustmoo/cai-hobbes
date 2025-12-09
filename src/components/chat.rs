@@ -23,6 +23,7 @@ use super::chat_input::ChatInput;
 use super::message_list::MessageList;
 use crate::context::permissions::PermissionManager;
 use crate::components::markdown_renderer::MarkdownRenderer;
+use super::confirm_delete_modal::ConfirmDeleteModal;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SelectionData {
@@ -60,9 +61,9 @@ pub struct Message {
 
 // The main ChatWindow component
 #[component]
-pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interaction: EventHandler<()>, on_toggle_sessions: EventHandler<()>, on_toggle_settings: EventHandler<()>) -> Element {
-    let session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let settings = use_context::<Signal<Settings>>();
+pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interaction: EventHandler<()>, on_toggle_sessions: EventHandler<()>, on_toggle_settings: EventHandler<()>, on_toggle_mcp_manager: EventHandler<()>) -> Element {
+    let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let mut settings = use_context::<Signal<Settings>>();
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let permission_manager = use_context::<Signal<PermissionManager>>();
@@ -74,11 +75,18 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     let mut continuation_controller = consume_context::<Signal<ContinuationController>>();
     let mut is_initial_load = use_signal(|| true);
     let mut last_session_id = use_signal(|| session_state.read().active_session_id.clone());
-    let stream_update_trigger = use_signal(|| 0);
+    let mut stream_update_trigger = use_signal(|| 0);
     let mut show_scroll_button = use_signal(|| false);
+    
+    // Delete modal state
+    let mut show_delete_confirm_modal = use_signal(|| false);
+    let mut pending_delete_message_id = use_signal(|| None::<String>);
+    let mut delete_message_count = use_signal(|| 0);
+    let mut has_new_comments = use_signal(|| false);
 
-
-    // Effect to report content size changes, scroll, and attach JS controls
+    let on_interaction = move || {
+        show_scroll_button.set(false);
+    };
     use_effect(move || {
         // By reading the session state here, the effect becomes dependent on it.
         // Any change to messages will cause this to re-run.
@@ -220,6 +228,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             let mcp_manager = mcp_manager;
             let send_prompt_to_llm = send_prompt_to_llm;
             let mut permission_manager = permission_manager;
+            let mut has_new_comments = has_new_comments;
 
             // Reset the AI turn count every time the user sends a message.
             permission_manager.write().reset_turn_count();
@@ -242,13 +251,52 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 permission_manager.write().reset_turn_count();
             }
 
+            if user_message.trim().is_empty() && attachments.is_empty() {
+                if *has_new_comments.read() {
+                     // Submit comments as a turn
+                     has_new_comments.set(false);
+                     
+                     // Trigger LLM generation with empty user message (PromptBuilder will use history + comments)
+                     let hobbes_message_id = Uuid::new_v4();
+                     {
+                        let mut state = session_state.write();
+                        if let Some(session) = state.get_active_session_mut() {
+                            session.messages.push(Message {
+                                id: hobbes_message_id,
+                                author: "Hobbes".to_string(),
+                                content: MessageContent::Text { content: "".to_string(), thought_signature: None, thought_summary: None },
+                                attachments: Vec::new(),
+                                comments: Vec::new(),
+                                created_at: chrono::Utc::now(),
+                            });
+                        }
+                     }
+                     
+                     let prompt_data = {
+                        let state = session_state.read();
+                        if let Some(session) = state.get_active_session() {
+                            let builder = PromptBuilder::new(session, &settings, &state);
+                            builder.build_prompt("".to_string(), None)
+                        } else {
+                            return;
+                        }
+                     };
+                     
+                     let mcp_context = session_state.read().get_active_session().and_then(|s| s.active_context.mcp_tools.clone());
+                     send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
+                }
+                return;
+            }
+            
+            has_new_comments.set(false);
+
             if permission_manager.read().is_turn_limit_reached() {
                 let mut state = session_state.write();
                 if let Some(session) = state.get_active_session_mut() {
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
                         author: "User".to_string(),
-                        content: MessageContent::Text { content: user_message.clone(), thought_signature: None },
+content: MessageContent::Text { content: user_message.clone(), thought_signature: None, thought_summary: None },
                         attachments,
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
@@ -256,7 +304,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
                         author: "Hobbes".to_string(),
-                        content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings.permission_settings.max_ai_turns), thought_signature: None },
+                        content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings.permission_settings.max_ai_turns), thought_signature: None, thought_summary: None },
                         attachments: Vec::new(),
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
@@ -280,7 +328,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
                         author: "User".to_string(),
-                        content: MessageContent::Text { content: user_message.clone(), thought_signature: None },
+                        content: MessageContent::Text { content: user_message.clone(), thought_signature: None, thought_summary: None },
                         attachments,
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
@@ -288,7 +336,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     session.messages.push(Message {
                         id: hobbes_message_id,
                         author: "Hobbes".to_string(),
-                        content: MessageContent::Text { content: "".to_string(), thought_signature: None },
+                        content: MessageContent::Text { content: "".to_string(), thought_signature: None, thought_summary: None },
                         attachments: Vec::new(),
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
@@ -364,7 +412,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         session.messages.push(Message {
                             id: hobbes_message_id,
                             author: "Hobbes".to_string(),
-                            content: MessageContent::Text { content: "".to_string(), thought_signature: None },
+                            content: MessageContent::Text { content: "".to_string(), thought_signature: None, thought_summary: None },
                             attachments: Vec::new(),
                             comments: Vec::new(),
                             created_at: chrono::Utc::now(),
@@ -396,6 +444,29 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     
     let root_classes = "relative flex flex-col bg-dark-bg text-dark-text rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
 
+    let delete_message = move |message_id: Uuid| {
+        let confirm = settings.read().confirm_on_message_delete;
+        if confirm {
+            if let Some(session) = session_state.read().get_active_session() {
+                if let Some(index) = session.messages.iter().position(|m| m.id == message_id) {
+                    let count = session.messages.len() - index;
+                    delete_message_count.set(count);
+                    pending_delete_message_id.set(Some(message_id.to_string()));
+                    show_delete_confirm_modal.set(true);
+                }
+            }
+        } else {
+            // Delete immediately
+            let message_id_str = message_id.to_string();
+            let active_session_id = session_state.read().active_session_id.clone();
+            if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
+                session.delete_message_and_after(&message_id_str);
+                // Trigger update
+                stream_update_trigger.set(stream_update_trigger() + 1);
+            }
+        }
+    };
+
     rsx! {
         div {
             class: "{root_classes}",
@@ -403,14 +474,45 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             MessageList {
                 stream_update_trigger: stream_update_trigger,
                 show_scroll_button: show_scroll_button,
+                on_delete: delete_message,
+                on_comment: move |_| has_new_comments.set(true),
             },
             ChatInput {
                 is_sending: Signal::new(stream_manager.is_sending.read().clone() || stream_manager.is_any_generating()),
+                has_new_comments: has_new_comments,
                 on_send: move |(msg, attachments)| send_message((msg, attachments)),
                 on_cancel: move |_| cancel_message(),
                 on_interaction: on_interaction,
                 on_toggle_sessions: on_toggle_sessions,
                 on_toggle_settings: on_toggle_settings,
+                on_toggle_mcp_manager: on_toggle_mcp_manager,
+            }
+
+            ConfirmDeleteModal {
+                is_visible: show_delete_confirm_modal,
+                title: "Delete Messages",
+                message: format!("Are you sure you want to delete this message and the {} messages that follow? This cannot be undone.", delete_message_count().saturating_sub(1)),
+                confirm_button_text: "Delete",
+                show_dont_ask_again: true,
+                on_confirm: move |dont_ask_again: bool| {
+                    if dont_ask_again {
+                        settings.write().confirm_on_message_delete = false;
+                    }
+                    if let Some(id) = pending_delete_message_id.read().clone() {
+                        let active_session_id = session_state.read().active_session_id.clone();
+                        if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
+                            session.delete_message_and_after(&id);
+                            // Trigger update
+                            stream_update_trigger.set(stream_update_trigger() + 1);
+                        }
+                    }
+                    show_delete_confirm_modal.set(false);
+                    pending_delete_message_id.set(None);
+                },
+                on_cancel: move |_| {
+                    show_delete_confirm_modal.set(false);
+                    pending_delete_message_id.set(None);
+                }
             }
         }
     }
@@ -462,7 +564,10 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
             class: "code-block-wrapper relative bg-dark-section rounded-lg my-2",
             button {
                 class: "absolute top-2 right-2 p-1.5 rounded text-gray-400 hover:bg-dark-card hover:text-white transition-colors",
-                onclick: copy_onclick,
+                onclick: move |evt| {
+                    evt.stop_propagation();
+                    copy_onclick(evt);
+                },
                 if *copied.read() {
                     Icon {
                         width: 16,
@@ -499,7 +604,7 @@ enum SelectionMode {
 }
 
 #[component]
-pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_selection: EventHandler<(String, f64, f64)>) -> Element {
+pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_selection: EventHandler<(String, f64, f64)>, on_delete: EventHandler<()>, on_comment: EventHandler<()>) -> Element {
     let is_user = message.author == "User";
     
     // Get necessary contexts
@@ -507,19 +612,22 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
     let stream_manager = consume_context::<StreamManagerContext>();
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     
-    let mut is_thinking = false;
+    let _is_thinking = false;
     let mut thought_signature: Option<String> = None;
+    let mut thought_summary: Option<String> = None;
 
-    if let MessageContent::Text { thought_signature: ts, .. } = &message.content {
+    if let MessageContent::Text { thought_signature: ts, thought_summary: tsum, .. } = &message.content {
         if stream_manager.is_generating(&message.id) {
-             is_thinking = true;
+             // is_thinking = true;
         }
         thought_signature = ts.clone();
+        thought_summary = tsum.clone();
     }
 
     match &message.content {
         MessageContent::Text { content: text_content, .. } => {
             let mut content = use_signal(|| text_content.clone());
+            let mut local_thought_summary = use_signal(|| thought_summary.clone());
             let mut copied = use_signal(|| false);
             let mut show_thinking = use_signal(|| false);
             
@@ -567,9 +675,19 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                     spawn(async move {
                         if let Some(mut rx) = stream_manager.take_stream(&message.id) {
                             while let Some(stream_msg) = rx.recv().await {
-                                if let StreamMessage::Text { content: chunk, .. } = stream_msg {
+                                if let StreamMessage::Text { content: chunk, thought_summary: summary_chunk, .. } = stream_msg {
                                     tracing::debug!("CHUNK RECEIVED: '{}'", &chunk);
-                                    content.write().push_str(&chunk);
+                                    if !chunk.is_empty() {
+                                       content.write().push_str(&chunk);
+                                    }
+                                    if let Some(summary) = summary_chunk {
+                                       let mut current = local_thought_summary.write();
+                                       if let Some(curr_str) = &mut *current {
+                                           curr_str.push_str(&summary);
+                                       } else {
+                                           *current = Some(summary);
+                                       }
+                                    }
                                     on_content_update.call(());
                                 }
                             }
@@ -578,7 +696,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                 }
             });
 
-            let is_thinking = !is_user && content.read().is_empty();
+            let is_thinking = !is_user && stream_manager.is_generating(&message.id);
             let thinking_mode_enabled = settings.read().gemini_config.thinking_enabled;
 
             let bubble_classes = if is_user {
@@ -593,11 +711,13 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
         );
 
 
-        let button_position_classes = if is_user {
+        let _button_position_classes = if is_user {
             "absolute bottom-[-10px] left-[-10px]"
         } else {
             "absolute bottom-[-10px] right-[-10px]"
         };
+
+        let controls_position_class = if is_user { "bottom-[-25px] left-[-25px]" } else { "bottom-[-25px] right-[-25px]" };
 
         rsx! {
             div {
@@ -606,11 +726,11 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                     class: "flex flex-col max-w-2/3 min-w-0",
                     div {
                         id: "message-bubble-{message.id}",
-                        class: "relative group rounded-2xl {bubble_classes} max-w-full overflow-hidden",
+                        class: "relative group rounded-2xl {bubble_classes} max-w-full",
                         div {
                             class: "px-4 py-3 text-sm leading-relaxed break-words",
                             if is_thinking {
-                                ThinkingIndicator { thinking_mode_enabled }
+                                ThinkingIndicator { thinking_mode_enabled, thought_summary: local_thought_summary.read().clone() }
                             } else {
                                 MarkdownRenderer { 
                                     content: content(), 
@@ -627,7 +747,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                         for attachment in &message.attachments {
                                             img {
                                                 src: format!("data:{};base64,{}", attachment.mime_type, attachment.data),
-                                                class: "max-w-full rounded-lg",
+                                                class: "w-20 h-20 object-cover rounded-lg hover:opacity-80 transition-opacity cursor-pointer border border-gray-700",
                                                 alt: attachment.file_name.clone(),
                                             }
                                         }
@@ -678,6 +798,8 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                         tracing::error!("Failed to save session after adding comment: {}", e);
                                     }
                                     
+                                    on_comment.call(());
+                                    
                                     selection_mode.set(SelectionMode::None);
                                 },
                                 on_cancel: move |_| {
@@ -686,11 +808,11 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                             }
                         }
 
-                        if !is_user && !is_thinking {
+                        if !is_thinking {
                             div {
-                                class: "flex items-center justify-end px-2 py-1 space-x-2 opacity-0 group-hover:opacity-100 transition-opacity",
+                                class: "absolute {controls_position_class} opacity-0 group-hover:opacity-100 transition-opacity flex items-center space-x-2 bg-dark-card rounded-lg p-1 shadow-lg border border-gray-700 z-10",
                                 button {
-                                    class: "p-1 text-gray-400 hover:text-white rounded transition-colors",
+                                    class: "p-1.5 text-gray-400 hover:text-white rounded transition-colors",
                                     onclick: move |_| {
                                         let text = content();
                                         spawn(async move {
@@ -708,10 +830,17 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                         Icon { width: 14, height: 14, icon: fi_icons::FiCopy }
                                     }
                                 }
+                                
+                                button {
+                                    class: "p-1.5 text-gray-400 hover:text-red-400 rounded transition-colors",
+                                    onclick: move |_| on_delete.call(()),
+                                    title: "Delete message",
+                                    Icon { width: 14, height: 14, icon: fi_icons::FiTrash2 }
+                                }
                             }
                         }
                         
-                        if !is_thinking && thought_signature.is_some() {
+                        if !is_thinking && (local_thought_summary.read().is_some() || thought_signature.is_some()) {
                             div {
                                 class: "mt-3 pt-3 border-t border-gray-600",
                                 button {
@@ -740,7 +869,12 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                 if *show_thinking.read() {
                                     div {
                                         class: "mt-2 p-3 bg-dark-bg rounded-lg text-xs text-gray-300 font-mono whitespace-pre-wrap",
-                                        "{thought_signature.as_ref().unwrap()}"
+                                        if let Some(summary) = local_thought_summary.read().as_ref() {
+                                            "{summary}"
+                                        } else if let Some(sig) = &thought_signature {
+                                            div { class: "opacity-50 italic mb-1", "Encrypted Thought Signature:" }
+                                            "{sig}"
+                                        }
                                     }
                                 }
                             }
@@ -754,6 +888,52 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
             }
             }
         }
+        MessageContent::Error { message: error_msg } => {
+            let container_classes = "flex justify-start";
+            let bubble_classes = "bg-red-900 border border-red-700 text-white self-start mr-auto";
+            let author_classes = "text-xs text-gray-500 mt-1 px-2 text-left";
+
+            rsx! {
+                div {
+                    class: "{container_classes}",
+                    div {
+                        class: "relative group",
+                        div {
+                            id: "message-bubble-{message.id}",
+                            class: "rounded-lg p-4 max-w-3xl shadow-md {bubble_classes}",
+                            
+                            div {
+                                class: "flex items-start gap-3",
+                                div {
+                                    class: "flex-shrink-0 mt-1",
+                                    Icon {
+                                        width: 20,
+                                        height: 20,
+                                        icon: fi_icons::FiAlertCircle,
+                                        class: "text-red-400"
+                                    }
+                                }
+                                div {
+                                    class: "flex-grow",
+                                    div {
+                                        class: "font-semibold text-sm mb-2",
+                                        "Error"
+                                    }
+                                    div {
+                                        class: "text-sm whitespace-pre-wrap",
+                                        "{error_msg}"
+                                    }
+                                }
+                            }
+                        }
+                        div {
+                            class: "{author_classes}",
+                            "{message.author}"
+                        }
+                    }
+                }
+            }
+        }
         _ => rsx! {}
     }
 }
@@ -763,13 +943,36 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
     let mut draft = use_context::<Signal<String>>();
     let mut copied = use_signal(|| false);
     let mut is_hovered = use_signal(|| false);
+    let mut pop_left = use_signal(|| false);
     let href_clone_for_copy = href.clone();
     let href_clone_for_summarize = href.clone();
+    let unique_id = Uuid::new_v4().to_string();
+    let unique_id_clone = unique_id.clone();
 
     rsx! {
         span {
+            id: "link-control-{unique_id}",
             class: "relative inline-block",
-            onmouseenter: move |_| is_hovered.set(true),
+            onmouseenter: move |_| {
+                is_hovered.set(true);
+                let unique_id_js = unique_id_clone.clone();
+                spawn(async move {
+                    let mut eval = document::eval(&format!(r#"
+                        const el = document.getElementById('link-control-{}');
+                        if (el) {{
+                            const rect = el.getBoundingClientRect();
+                            const windowWidth = window.innerWidth;
+                            // If the element is within 150px of the right edge, pop left
+                            return rect.right > (windowWidth - 150);
+                        }}
+                        return false;
+                    "#, unique_id_js));
+                    
+                    if let Ok(should_pop_left) = eval.recv::<bool>().await {
+                        pop_left.set(should_pop_left);
+                    }
+                });
+            },
             onmouseleave: move |_| is_hovered.set(false),
             a {
                 href: "{href}",
@@ -779,11 +982,15 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                 "{text}"
             }
             span {
-                class: format!("inline-flex items-center absolute left-full ml-1 z-10 {} transition-opacity duration-200 bg-gray-900 bg-opacity-75 border border-gray-700 rounded-full shadow-lg p-0.5 space-x-0.5", if *is_hovered.read() { "opacity-100" } else { "opacity-0" }),
+                class: format!("inline-flex items-center absolute {} z-10 {} transition-opacity duration-200 bg-dark-card rounded-lg p-1 shadow-lg border border-gray-700 space-x-2", 
+                    if *pop_left.read() { "right-full mr-1" } else { "left-full ml-1" },
+                    if *is_hovered.read() { "opacity-100" } else { "opacity-0" }
+                ),
                 
                 button {
-                    class: "p-1.5 rounded text-gray-400 hover:bg-dark-card hover:text-white transition-colors",
-                    onclick: move |_| {
+                    class: "p-1.5 text-gray-400 hover:text-white rounded transition-colors",
+                    onclick: move |evt| {
+                        evt.stop_propagation();
                         let href_clone = href_clone_for_copy.clone();
                         spawn(async move {
                             if copy_to_clipboard(&href_clone).is_ok() {
@@ -794,14 +1001,15 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                         });
                     },
                     if *copied.read() {
-                        Icon { width: 16, height: 16, icon: fi_icons::FiCheck }
+                        Icon { width: 14, height: 14, icon: fi_icons::FiCheck }
                     } else {
-                        Icon { width: 16, height: 16, icon: fi_icons::FiClipboard }
+                        Icon { width: 14, height: 14, icon: fi_icons::FiCopy }
                     }
                 }
                 button {
-                    class: "p-1.5 rounded text-gray-400 hover:bg-dark-card hover:text-white transition-colors",
-                    onclick: move |_| {
+                    class: "p-1.5 text-gray-400 hover:text-white rounded transition-colors",
+                    onclick: move |evt| {
+                        evt.stop_propagation();
                         let summary_prompt = format!("Please fetch {} and summarize.", href_clone_for_summarize);
                         draft.set(summary_prompt);
                         let _ = document::eval(r#"
@@ -813,7 +1021,7 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                             }
                         "#);
                     },
-                    Icon { width: 16, height: 16, icon: fi_icons::FiFileText }
+                    Icon { width: 14, height: 14, icon: fi_icons::FiFileText }
                 }
             }
         }
@@ -821,20 +1029,29 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
 }
 
 #[component]
-fn ThinkingIndicator(thinking_mode_enabled: bool) -> Element {
+fn ThinkingIndicator(thinking_mode_enabled: bool, thought_summary: Option<String>) -> Element {
     rsx! {
         if thinking_mode_enabled {
             div {
-                class: "flex items-center space-x-2",
-                Icon {
-                    width: 16,
-                    height: 16,
-                    icon: fi_icons::FiCpu,
-                    class: "text-white animate-pulse"
+                class: "flex flex-col space-y-2",
+                div {
+                    class: "flex items-center space-x-2",
+                    Icon {
+                        width: 16,
+                        height: 16,
+                        icon: fi_icons::FiCpu,
+                        class: "text-white animate-pulse"
+                    }
+                    span {
+                        class: "text-sm text-white",
+                        "Thinking..."
+                    }
                 }
-                span {
-                    class: "text-sm text-white",
-                    "Thinking..."
+                if let Some(summary) = thought_summary {
+                    div {
+                        class: "text-xs text-gray-400 ml-6",
+                        "{summary}"
+                    }
                 }
             }
         } else {

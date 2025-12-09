@@ -8,7 +8,7 @@ use crate::components::shared::{StreamMessage, ToolCall};
 use crate::context::prompt_builder::LlmPrompt;
 use crate::mcp::manager::McpContext;
 use crate::settings::GeminiConfig;
-const BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+const BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 use crate::session::Tool;
 
@@ -19,6 +19,8 @@ pub struct ThinkingConfig {
     pub thinking_level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_thoughts: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -82,6 +84,8 @@ pub struct FunctionResponsePart {
 pub enum Part {
     Text {
         text: String,
+        #[serde(default)]
+        thought: Option<bool>,
     },
     FunctionCall {
         function_call: FunctionCallPart,
@@ -153,6 +157,8 @@ struct PartResponse {
     function_call: Option<FunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thought_signature: Option<String>,
+    #[serde(default)]
+    thought: Option<bool>,
 }
 
 
@@ -174,11 +180,21 @@ pub trait LlmConnector: Send + Sync {
 
 pub struct GeminiConnector {
     config: GeminiConfig,
+    base_url: String,
 }
 
 impl GeminiConnector {
     pub fn new(config: GeminiConfig) -> Self {
-        Self { config }
+        Self { 
+            config,
+            base_url: BASE_API_URL.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
     }
 }
 
@@ -207,12 +223,14 @@ impl LlmConnector for GeminiConnector {
             Some(ThinkingConfig {
                 thinking_level: Some(self.config.thinking_level.clone()),
                 thinking_budget: None,
+                include_thoughts: Some(true),
             })
         } else if model.starts_with("gemini-2.5") || model.starts_with("gemini-2.0") {
             // Gemini 2.5 and 2.0 series use thinkingBudget
             Some(ThinkingConfig {
                 thinking_level: None,
                 thinking_budget: self.config.thinking_budget,
+                include_thoughts: Some(true),
             })
         } else {
             // Unknown model, skip thinking config
@@ -264,18 +282,26 @@ impl LlmConnector for GeminiConnector {
     }
     // --- End Synchronous Logging Block ---
 
-    let url = format!("{}/{}:streamGenerateContent?key={}&alt=sse", BASE_API_URL, model, api_key);
+    let url = format!("{}/{}:streamGenerateContent?key={}&alt=sse", self.base_url, model, api_key);
 
     for attempt in 0..MAX_RETRIES {
         let response = match client.post(&url).json(&request_body).send().await {
             Ok(r) => r,
             Err(e) => {
-                if e.is_timeout() {
+                let error_msg = if e.is_timeout() {
                     tracing::error!("Gemini API Request TIMED OUT on attempt {}. Duration: 600s", attempt + 1);
+                    format!("Request timed out after 600 seconds (attempt {}/{})", attempt + 1, MAX_RETRIES)
                 } else {
                     tracing::error!("Error sending request on attempt {}: {}", attempt + 1, e);
+                    format!("Network error: {} (attempt {}/{})", e, attempt + 1, MAX_RETRIES)
+                };
+                
+                if attempt + 1 == MAX_RETRIES {
+                    let _ = tx.send(StreamMessage::Error {
+                        message: format!("Failed to connect to Gemini API after {} attempts. {}", MAX_RETRIES, error_msg),
+                    });
+                    return;
                 }
-                if attempt + 1 == MAX_RETRIES { return; }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
@@ -284,11 +310,15 @@ impl LlmConnector for GeminiConnector {
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
-            if let Ok(error_response) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
+            let error_message = if let Ok(error_response) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
                 tracing::error!("Gemini API Error [{}]: {}", status, error_response.error.message);
+                format!("Gemini API Error [{}]: {}", status, error_response.error.message)
             } else {
                 tracing::error!("Gemini API Error [{}]: {}", status, body_text);
-            }
+                format!("Gemini API Error [{}]: {}", status, body_text)
+            };
+            
+            let _ = tx.send(StreamMessage::Error { message: error_message });
             return;
         }
 
@@ -324,7 +354,18 @@ impl LlmConnector for GeminiConnector {
                                             }
                                         }
                                         if let Some(part) = candidate.content.parts.get(0) {
-                                            if let Some(function_call) = &part.function_call {
+                                            // Check if this is a thought summary part first
+                                            if part.thought.unwrap_or(false) && !part.text.is_empty() {
+                                                // This is a thought summary - send it as thought_summary
+                                                if tx.send(StreamMessage::Text {
+                                                    content: String::new(),
+                                                    thought_signature: None,
+                                                    thought_summary: Some(part.text.clone()),
+                                                }).is_err() {
+                                                    return;
+                                                }
+                                                has_sent_data = true;
+                                            } else if let Some(function_call) = &part.function_call {
                                                 // Log raw JSON if it contains a function call
                                                 tracing::info!("Raw JSON with function call: {}", json_str);
                                                 
@@ -361,9 +402,11 @@ impl LlmConnector for GeminiConnector {
                                                     tracing::error!("LLM requested tool '{}' which was not found in the provided context.", function_call.name);
                                                 }
                                             } else if !part.text.is_empty() {
+                                                // Regular text part
                                                 if tx.send(StreamMessage::Text {
                                                     content: part.text.clone(),
-                                                    thought_signature: part.thought_signature.clone(),
+                                                    thought_signature: None,
+                                                    thought_summary: None,
                                                 }).is_err() {
                                                     return;
                                                 }
@@ -384,6 +427,7 @@ impl LlmConnector for GeminiConnector {
                                     if tx.send(StreamMessage::Text {
                                         content: error_message.to_string(),
                                         thought_signature: None,
+                                        thought_summary: None,
                                     }).is_err() {
                                         tracing::error!("Failed to send stream error message to UI.");
                                     }
@@ -410,12 +454,14 @@ impl LlmConnector for GeminiConnector {
                 let _ = tx.send(StreamMessage::Text {
                     content: "[Hobbes failed to process a tool call after multiple retries.]".to_string(),
                     thought_signature: None,
+                    thought_summary: None,
                 });
                 return;
             }
         }
 
         if !has_sent_data {
+            tracing::error!("Gemini finished without sending data. Finish Reason: {:?}. Request was: {}", finish_reason, serde_json::to_string_pretty(&request_body).unwrap_or_default());
             let default_message = match finish_reason.as_deref() {
                 Some("SAFETY") => "[Hobbes did not provide a response due to the safety filter.]".to_string(),
                 Some(reason) => format!("[Hobbes did not provide a response. Finish Reason: {}]", reason),
@@ -424,6 +470,7 @@ impl LlmConnector for GeminiConnector {
             if tx.send(StreamMessage::Text {
                 content: default_message,
                 thought_signature: None,
+                thought_summary: None,
             }).is_err() {
                 tracing::error!("Failed to send default message to UI.");
             }
@@ -477,7 +524,7 @@ Recent Messages:
     let request_body = GeminiRequest {
         contents: vec![Content {
             role: "user".to_string(),
-            parts: vec![Part::Text { text: full_prompt }],
+            parts: vec![Part::Text { text: full_prompt, thought: None }],
         }],
         tools: None,
         system_instruction: None,
@@ -486,7 +533,7 @@ Recent Messages:
     };
 
     tracing::info!("Using summary model: {}", model);
-    let url = format!("{}/{}:generateContent?key={}", BASE_API_URL, model, api_key);
+    let url = format!("{}/{}:generateContent?key={}", self.base_url, model, api_key);
 
     let response = client
         .post(&url)
@@ -504,11 +551,10 @@ Recent Messages:
             tracing::error!("Gemini API Error [{}]: {}", status, body_text);
         }
         // Return a structured error instead of panicking or returning a generic reqwest::Error
-        return Ok(serde_json::json!({
-            "error": "API request failed",
-            "status": status.as_u16(),
-            "body": body_text
-        }));
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("API request failed with status {}: {}", status, body_text),
+        )) as Box<dyn std::error::Error + Send + Sync>);
     }
 
     let response_json: GeminiResponse = response.json().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -546,4 +592,107 @@ Recent Messages:
 
     Ok(serde_json::Value::Null)
 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::{MockServer, Mock, ResponseTemplate};
+    use wiremock::matchers::{method, path};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_thinking_summary_parsing() {
+        // Start a mock server
+        let mock_server = MockServer::start().await;
+
+        // Define the mock response body (SSE format)
+        let thought_json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "I am thinking about the user's request.",
+                        "thought": true
+                    }]
+                }
+            }]
+        });
+        
+        let content_json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "Here is the answer."
+                    }]
+                }
+            }]
+        });
+
+        let response_body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            thought_json.to_string(),
+            content_json.to_string()
+        );
+
+        // Configure the mock server
+        Mock::given(method("POST"))
+            .and(path("/gemini-2.5-pro:streamGenerateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
+            .mount(&mock_server)
+            .await;
+
+        // Configure GeminiConnector
+        let config = GeminiConfig {
+            api_key: Some("test-key".to_string()),
+            chat_model: "gemini-2.5-pro".to_string(),
+            summary_model: "gemini-1.5-flash-latest".to_string(),
+            thinking_enabled: true,
+            thinking_level: "high".to_string(),
+            thinking_budget: Some(1024),
+        };
+
+        let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
+        
+        // Create prompt data
+        let prompt_data = LlmPrompt {
+            contents: vec![Content {
+                role: "user".to_string(),
+                parts: vec![Part::Text { text: "Hello".to_string(), thought: None }],
+            }],
+            tools: None,
+            system_instruction: None,
+        };
+
+        // Create channel
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // Run generate_content_stream
+        connector.generate_content_stream(prompt_data, tx, None).await;
+
+        // Verify results
+        let mut thought_received = false;
+        let mut content_received = false;
+
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                StreamMessage::Text { content, thought_summary, .. } => {
+                    if let Some(summary) = thought_summary {
+                        assert_eq!(summary, "I am thinking about the user's request.");
+                        thought_received = true;
+                    }
+                    if !content.is_empty() {
+                        assert_eq!(content, "Here is the answer.");
+                        content_received = true;
+                    }
+                }
+                StreamMessage::Error { message } => {
+                    panic!("Received error: {}", message);
+                }
+                _ => {}
+            }
+        }
+
+        assert!(thought_received, "Did not receive thought summary");
+        assert!(content_received, "Did not receive content");
+    }
 }

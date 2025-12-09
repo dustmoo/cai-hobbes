@@ -41,6 +41,10 @@ pub struct Settings {
     pub confirm_on_delete: bool,
     #[serde(default = "default_true")]
     pub confirm_on_save: bool,
+    #[serde(default = "default_true")]
+    pub confirm_on_message_delete: bool,
+    #[serde(skip)]
+    pub smithery_api_key: Option<String>,
 }
 
 
@@ -74,6 +78,8 @@ impl Default for Settings {
             },
             confirm_on_delete: true,
             confirm_on_save: true,
+            confirm_on_message_delete: true,
+            smithery_api_key: None,
         }
     }
 }

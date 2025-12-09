@@ -73,18 +73,67 @@ impl StreamManagerContext {
             let mut tool_call_count = 0;
             let mut final_text_for_this_turn = String::new();
             let mut thought_signature_for_this_turn: Option<String> = None;
+            let mut thought_summary_for_this_turn: Option<String> = None;
 
             while let Some(message) = llm_rx.recv().await {
                 match message {
-                    StreamMessage::Text { content, thought_signature } => {
+                    StreamMessage::Text { content, thought_signature, thought_summary } => {
+                        // Append the content to the buffer
                         final_text_for_this_turn.push_str(&content);
                         if thought_signature.is_some() {
                             thought_signature_for_this_turn = thought_signature.clone();
                         }
-                        if stream_tx.send(StreamMessage::Text { content, thought_signature }).is_err() {
+                        if let Some(summary) = &thought_summary {
+                            if let Some(current) = &mut thought_summary_for_this_turn {
+                                current.push_str(summary);
+                            } else {
+                                thought_summary_for_this_turn = Some(summary.clone());
+                            }
+                        }
+                        if stream_tx.send(StreamMessage::Text { content, thought_signature, thought_summary }).is_err() {
                             break;
                         }
+                        self.scheduler.send(SchedulerSignal::Activity);
                         is_first_message = false;
+                    }
+                    StreamMessage::Error { message: error_msg } => {
+                        tracing::error!("LLM stream error: {}", error_msg);
+                        
+                        // Save error message to session
+                        {
+                            let mut state = self.session_state.write();
+                            if is_first_message {
+                                // Update the placeholder message with the error
+                                if let Some(msg) = state.get_message_mut(&message_id) {
+                                    msg.content = crate::components::shared::MessageContent::Error {
+                                        message: error_msg.clone(),
+                                    };
+                                }
+                            } else {
+                                // Create a new error message
+                                let new_id = Uuid::new_v4();
+                                if let Some(session) = state.get_active_session_mut() {
+                                    session.messages.push(crate::components::chat::Message {
+                                        id: new_id,
+                                        author: "Hobbes".to_string(),
+                                        content: crate::components::shared::MessageContent::Error {
+                                            message: error_msg.clone(),
+                                        },
+                                        attachments: Vec::new(),
+                                        comments: Vec::new(),
+                                        created_at: chrono::Utc::now(),
+                                    });
+                                }
+                            }
+                        }
+                        
+                        // Forward error to UI
+                        if stream_tx.send(StreamMessage::Error { message: error_msg }).is_err() {
+                            break;
+                        }
+                        
+                        // Error ends the stream
+                        break;
                     }
                     StreamMessage::ToolCall(tool_call) => {
                         tool_call_count += 1;
@@ -180,9 +229,10 @@ impl StreamManagerContext {
             if !final_text_for_this_turn.is_empty() {
                 let mut state = self.session_state.write();
                 if let Some(msg) = state.get_message_mut(&message_id) {
-                    if let crate::components::shared::MessageContent::Text { content, thought_signature } = &mut msg.content {
+                    if let crate::components::shared::MessageContent::Text { content, thought_signature, thought_summary } = &mut msg.content {
                         *content = final_text_for_this_turn.clone();
                         *thought_signature = thought_signature_for_this_turn.clone();
+                        *thought_summary = thought_summary_for_this_turn.clone();
                     }
                 }
             }

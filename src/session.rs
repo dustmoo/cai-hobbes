@@ -78,6 +78,23 @@ pub struct Session {
     pub last_updated: DateTime<Utc>,
 }
 
+impl Session {
+    pub fn delete_message_and_after(&mut self, message_id: &str) -> usize {
+        if let Ok(uuid) = uuid::Uuid::parse_str(message_id) {
+            if let Some(index) = self.messages.iter().position(|m| m.id == uuid) {
+                let count = self.messages.len() - index;
+                self.messages.truncate(index);
+                self.last_updated = Utc::now();
+                count
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionState {
     pub sessions: HashMap<String, Session>,
@@ -148,7 +165,8 @@ impl SessionState {
                                     *content = serde_json::json!({
                                         "Text": {
                                             "content": text_str,
-                                            "thought_signature": null
+                                            "thought_signature": null,
+                                            "thought_summary": null
                                         }
                                     });
                                     tracing::debug!("Migrated MessageContent::Text for message");

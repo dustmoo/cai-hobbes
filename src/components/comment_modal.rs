@@ -16,6 +16,7 @@ pub fn CommentModal(
     // Extract text content from message
     let message_text = match &message.content {
         crate::components::shared::MessageContent::Text { content, .. } => content.clone(),
+        crate::components::shared::MessageContent::Error { message } => format!("[Error: {}]", message),
         _ => String::new(),
     };
 

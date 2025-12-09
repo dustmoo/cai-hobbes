@@ -2,7 +2,7 @@
 use crate::components::llm::{Content, FunctionCallPart, FunctionResponsePart, InlineDataPart, Part, SystemInstruction};
 use crate::session::{Session, Tool};
 use crate::settings::Settings;
-use chrono::Utc;
+use chrono::Local;
 use serde_json::{self, json};
 use crate::components::chat::Message;
 use crate::components::shared::MessageContent;
@@ -11,17 +11,8 @@ impl From<Message> for Content {
     fn from(msg: Message) -> Self {
         let role = if msg.author == "User" { "user" } else { "model" }.to_string();
         match msg.content {
-            MessageContent::Text { content: mut text, .. } => {
-                // Append comments to the text if they exist
-                if !msg.comments.is_empty() {
-                    text.push_str("\n\n[User comments on this message:");
-                    for comment in &msg.comments {
-                        text.push_str(&format!("\n- On \"{}\": {}", comment.text_selection, comment.comment));
-                    }
-                    text.push_str("]");
-                }
-                
-                let mut parts = vec![Part::Text { text }];
+            MessageContent::Text { content: text, .. } => {
+                let mut parts = vec![Part::Text { text, thought: None }];
                 for attachment in msg.attachments {
                     parts.push(Part::InlineData {
                         inline_data: InlineDataPart {
@@ -39,6 +30,10 @@ impl From<Message> for Content {
             },
             MessageContent::PermissionRequest(_) => {
                 // Permission requests are UI-only and should not be in the prompt history.
+                Content { role, parts: vec![] }
+            }
+            MessageContent::Error { .. } => {
+                // Error messages are UI-only and should not be in the prompt history.
                 Content { role, parts: vec![] }
             }
         }
@@ -81,6 +76,7 @@ impl<'a> PromptBuilder<'a> {
                             // 1. Remove invalid keys from the top-level of the function declaration itself.
                             obj.remove("annotations");
                             obj.remove("outputSchema");
+                            obj.remove("_meta");
 
                             // 2. Rename inputSchema to parameters and sanitize it.
                             if let Some(mut schema) = obj.remove("inputSchema") {
@@ -99,6 +95,10 @@ impl<'a> PromptBuilder<'a> {
                                 obj.insert("parameters".to_string(), schema);
                             }
                         }
+                        // Finally, remove the 'title' field from the top-level tool declaration, as it's not supported by Gemini.
+                       if let Some(obj) = tool_value.as_object_mut() {
+                           obj.remove("title");
+                       }
                         function_declarations.push(tool_value);
                     }
                 }
@@ -186,15 +186,15 @@ impl<'a> PromptBuilder<'a> {
         system_context_map.insert(
             "current_time".to_string(),
             json!({
-                "iso_8601": Utc::now().to_rfc3339(),
-                "timezone": "UTC"
+                "iso_8601": Local::now().to_rfc3339(),
+                "timezone": "Local"
             }),
         );
 
         let instruction_text = serde_json::to_string(&system_context_map).unwrap_or_default();
         let system_instruction = if !instruction_text.is_empty() && instruction_text != "{}" {
             Some(SystemInstruction {
-                parts: vec![Part::Text { text: instruction_text }],
+                parts: vec![Part::Text { text: instruction_text, thought: None }],
             })
         } else {
             None
@@ -234,6 +234,20 @@ impl<'a> PromptBuilder<'a> {
                         let content: Content = message.clone().into();
                         if !content.parts.is_empty() {
                             contents.push(content);
+                        }
+                        
+                        // Handle comments as separate user messages
+                        if !message.comments.is_empty() {
+                            let mut comment_text = String::from("[User comments on the above message:");
+                            for comment in &message.comments {
+                                comment_text.push_str(&format!("\n- On \"{}\": {}", comment.text_selection, comment.comment));
+                            }
+                            comment_text.push_str("]");
+                            
+                            contents.push(Content {
+                                role: "user".to_string(),
+                                parts: vec![Part::Text { text: comment_text, thought: None }],
+                            });
                         }
                     }
                     MessageContent::ToolCall(tc) => {
@@ -282,9 +296,26 @@ impl<'a> PromptBuilder<'a> {
                                 },
                             }],
                         });
+
+                        // Handle comments as separate user messages
+                        if !message.comments.is_empty() {
+                            let mut comment_text = String::from("[User comments on the above message:");
+                            for comment in &message.comments {
+                                comment_text.push_str(&format!("\n- On \"{}\": {}", comment.text_selection, comment.comment));
+                            }
+                            comment_text.push_str("]");
+                            
+                            contents.push(Content {
+                                role: "user".to_string(),
+                                parts: vec![Part::Text { text: comment_text, thought: None }],
+                            });
+                        }
                     }
                     MessageContent::PermissionRequest(_) => {
                         // Skip permission requests in the prompt
+                    }
+                    MessageContent::Error { .. } => {
+                        // Skip error messages in the prompt
                     }
                 }
             }
@@ -294,7 +325,7 @@ impl<'a> PromptBuilder<'a> {
         if !user_message.is_empty() {
             contents.push(Content {
                 role: "user".to_string(),
-                parts: vec![Part::Text { text: user_message }],
+                parts: vec![Part::Text { text: user_message, thought: None }],
             });
         }
 
@@ -404,6 +435,7 @@ fn fix_and_remove_invalid_fields(value: &mut serde_json::Value) {
             "le",
             "additionalProperties",
             "$ref",
+            "_meta",
             // "type" // DO NOT REMOVE: This is required for nested objects and arrays.
         ];
         for key in &keys_to_remove {
@@ -705,7 +737,7 @@ mod tests {
         let placeholder_msg = Message {
             id: Uuid::new_v4(),
             author: "Hobbes".to_string(),
-            content: MessageContent::Text { content: "".to_string(), thought_signature: None },
+            content: MessageContent::Text { content: "".to_string(), thought_signature: None, thought_summary: None },
             attachments: vec![],
             comments: vec![],
             created_at: Utc::now(),
@@ -717,7 +749,7 @@ mod tests {
 
         // 3. Verify System Instruction contains TOOL COMPLETION INSTRUCTION
         // The current implementation will likely FAIL this because it looks at the last message (placeholder)
-        let system_instruction = if let Some(crate::components::llm::Part::Text { text }) = prompt.system_instruction.as_ref().unwrap().parts.get(0) {
+        let system_instruction = if let Some(crate::components::llm::Part::Text { text, .. }) = prompt.system_instruction.as_ref().unwrap().parts.get(0) {
             text
         } else {
             panic!("System instruction should be text");
@@ -727,9 +759,68 @@ mod tests {
         // 4. Verify the contents do NOT contain the empty placeholder
         // The current implementation will likely FAIL this
         let last_content = prompt.contents.last().unwrap();
-        if let Some(crate::components::llm::Part::Text { text }) = last_content.parts.get(0) {
+        if let Some(crate::components::llm::Part::Text { text, .. }) = last_content.parts.get(0) {
              assert!(!text.is_empty(), "Last content should not be empty placeholder");
         }
+    }
+
+    #[test]
+    fn test_build_prompt_removes_meta_field() {
+        // Define a tool with _meta fields at top level and nested in schema
+        let tool: Tool = serde_json::from_value(json!({
+            "name": "meta_tool",
+            "description": "A tool with _meta fields",
+            "_meta": { "internal_id": 123 },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "field1": {
+                        "type": "string",
+                        "_meta": "nested meta info"
+                    }
+                },
+                "_meta": "schema meta info"
+            }
+        })).unwrap();
+
+        let server = McpServerContext {
+            name: "meta_server".to_string(),
+            description: "Server with meta tools".to_string(),
+            tools: vec![tool],
+        };
+
+        let mcp_context = McpContext { servers: vec![server] };
+        
+        let active_context = ActiveContext {
+            mcp_tools: Some(mcp_context),
+            ..Default::default()
+        };
+
+        let session = Session {
+            id: "test_meta".to_string(),
+            name: "Test Meta".to_string(),
+            messages: vec![],
+            active_context,
+            last_updated: Utc::now(),
+        };
+
+        let settings = Settings::default();
+        let session_state = crate::session::SessionState::default();
+        let builder = PromptBuilder::new(&session, &settings, &session_state);
+
+        let prompt = builder.build_prompt("test".to_string(), None);
+        let tools = prompt.tools.expect("Should have tools");
+        let tool_json = &tools[0].function_declarations[0];
+
+        // Verify top-level _meta is removed
+        assert!(tool_json.get("_meta").is_none(), "Top-level _meta should be removed");
+
+        // Verify nested _meta is removed from parameters
+        let parameters = tool_json.get("parameters").unwrap();
+        assert!(parameters.get("_meta").is_none(), "Schema-level _meta should be removed");
+        
+        let field1 = parameters.get("properties").unwrap().get("field1").unwrap();
+        assert!(field1.get("_meta").is_none(), "Nested _meta should be removed");
     }
 
     #[test]

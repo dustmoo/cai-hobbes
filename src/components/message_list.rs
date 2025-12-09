@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use std::time::Duration;
 use tokio::time::sleep;
+use uuid::Uuid;
 
 use crate::components::tool_call_display::{PermissionPrompt, ToolCallDisplay};
 
@@ -11,7 +12,7 @@ use super::shared::MessageContent;
 const INITIAL_MESSAGES_TO_SHOW: usize = 20;
 
 #[component]
-pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signal<bool>) -> Element {
+pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signal<bool>, on_delete: EventHandler<Uuid>, on_comment: EventHandler<()>) -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
     let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     let _ = stream_update_trigger.read();
@@ -125,6 +126,11 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                                                         message: message.clone(),
                                                         on_content_update: move |_| stream_update_trigger += 1,
                                                         on_selection: move |data| tracing::info!("Selection event: {:?}", data),
+                                                        on_delete: {
+                                                            let msg_id = message.id;
+                                                            move |_| on_delete.call(msg_id)
+                                                        },
+                                                        on_comment: move |_| on_comment.call(()),
                                                     }
                                                 }
                                             } else {
@@ -171,6 +177,21 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                                                             "System"
                                                         }
                                                     }
+                                                }
+                                            }
+                                        }
+                                        MessageContent::Error { .. } => {
+                                            rsx! {
+                                                MessageBubble {
+                                                    key: "{message.id}",
+                                                    message: message.clone(),
+                                                    on_content_update: move |_| stream_update_trigger += 1,
+                                                    on_selection: move |data| tracing::info!("Selection event: {:?}", data),
+                                                    on_delete: {
+                                                        let msg_id = message.id;
+                                                        move |_| on_delete.call(msg_id)
+                                                    },
+                                                    on_comment: move |_| on_comment.call(()),
                                                 }
                                             }
                                         }
