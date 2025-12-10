@@ -381,20 +381,23 @@ impl LlmConnector for GeminiConnector {
                                                 
                                                 let mut found_tool = false;
                                                 if let Some(context) = &mcp_context {
-                                                    for server in &context.servers {
-                                                        if server.tools.iter().any(|t| t.name == function_call.name) {
-                                                            let tool_call = ToolCall::new(
-                                                                server.name.clone(),
-                                                                function_call.name.clone(),
-                                                                function_call.args.clone(),
-                                                                part.thought_signature.clone().or(function_call.thought_signature.clone()),
-                                                            );
-                                                            if tx.send(StreamMessage::ToolCall(tool_call)).is_err() {
-                                                                return;
+                                                    'server_loop: for server in &context.servers {
+                                                        for tool in &server.tools {
+                                                            let prefixed_name = format!("{}_{}", server.name, tool.name);
+                                                            if prefixed_name == function_call.name {
+                                                                let tool_call = ToolCall::new(
+                                                                    server.name.clone(),
+                                                                    tool.name.to_string(), // Use original tool name for execution
+                                                                    function_call.args.clone(),
+                                                                    part.thought_signature.clone().or(function_call.thought_signature.clone()),
+                                                                );
+                                                                if tx.send(StreamMessage::ToolCall(tool_call)).is_err() {
+                                                                    return;
+                                                                }
+                                                                has_sent_data = true;
+                                                                found_tool = true;
+                                                                break 'server_loop;
                                                             }
-                                                            has_sent_data = true;
-                                                            found_tool = true;
-                                                            break;
                                                         }
                                                     }
                                                 }

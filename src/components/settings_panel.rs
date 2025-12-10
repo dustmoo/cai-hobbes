@@ -13,6 +13,8 @@ pub fn SettingsPanel() -> Element {
     let settings_manager = use_context::<Signal<SettingsManager>>();
     let mut session_state = use_context::<Signal<SessionState>>();
     let _permission_manager = use_context::<Signal<crate::context::permissions::PermissionManager>>();
+    let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
+    let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
 
     // Create a local copy of the settings for editing.
     let mut local_settings = use_signal(|| settings.read().clone());
@@ -375,6 +377,101 @@ pub fn SettingsPanel() -> Element {
                                     oninput: move |event| local_settings.write().smithery_api_key = Some(event.value().trim().to_string())
                                 }
                             }
+                            div {
+                                class: "mb-4 pt-4 border-t border-primary-700",
+                                label { class: "block text-sm font-medium text-gray-300 mb-2", "Preferred MCP Source" }
+                                div {
+                                    class: "flex space-x-4",
+                                    button {
+                                        class: if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
+                                            "flex-1 px-4 py-2 rounded-md bg-primary-600 text-white font-medium shadow-sm ring-2 ring-primary-400"
+                                        } else {
+                                            "flex-1 px-4 py-2 rounded-md bg-dark-input text-gray-400 font-medium hover:bg-gray-700 hover:text-white transition-colors"
+                                        },
+                                        onclick: move |_| {
+                                            local_settings.write().preferred_mcp_source = crate::settings::McpSource::Smithery;
+                                        },
+                                        "Smithery.ai"
+                                    }
+                                    button {
+                                        class: if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
+                                            "flex-1 px-4 py-2 rounded-md bg-primary-600 text-white font-medium shadow-sm ring-2 ring-primary-400"
+                                        } else {
+                                            "flex-1 px-4 py-2 rounded-md bg-dark-input text-gray-400 font-medium hover:bg-gray-700 hover:text-white transition-colors"
+                                        },
+                                        onclick: move |_| {
+                                            local_settings.write().preferred_mcp_source = crate::settings::McpSource::Composio;
+                                        },
+                                        "Composio"
+                                    }
+                                }
+                                    p {
+                                    class: "text-xs text-gray-400 mt-2",
+                                    "Choose which registry to use when installing new MCP servers. Smithery uses a hosted proxy (requires API key), while Composio runs locally."
+                                }
+                                
+                                if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
+                                    div {
+                                        class: "mt-4",
+                                        label { class: "block text-sm font-medium text-gray-300", "Composio Server URL" }
+                                        div {
+                                            class: "mt-1 flex items-center",
+                                            input {
+                                                class: "flex-grow px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                value: "{local_settings.read().composio_base_url.clone().unwrap_or_default()}",
+                                                placeholder: "e.g., https://backend.composio.dev/v3/mcp/...",
+                                                oninput: move |event| {
+                                                    let val = event.value();
+                                                    local_settings.write().composio_base_url = if val.is_empty() { None } else { Some(val) };
+                                                }
+                                            }
+                                            button {
+                                                class: "ml-2 px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600",
+                                                onclick: move |_| {
+                                                    let url = local_settings.read().composio_base_url.clone();
+                                                    if let Some(url) = url {
+                                                        if !url.is_empty() {
+                                                            let mcp_manager = mcp_manager.clone();
+                                                            let mcp_context = mcp_context.clone();
+                                                            let settings_val = settings.read().clone();
+                                                            spawn(async move {
+                                                                let config = crate::mcp::manager::McpServerConfig {
+                                                                    name: "composio-server".to_string(),
+                                                                    command: None,
+                                                                    uri: Some(url),
+                                                                    args: None,
+                                                                    description: "Composio Master MCP Server".to_string(),
+                                                                    env: std::collections::HashMap::new(),
+                                                                    disabled: false,
+                                                                    always_allow: vec![],
+                                                                };
+                                                                // Use the same path resolution logic as main.rs
+                                                                let config_path = dirs::config_dir().unwrap_or_default().join("com.hobbes.app").join("mcp_servers.json");
+                                                                
+                                                                if let Err(e) = mcp_manager.read().add_or_update_mcp_server(&config_path, config).await {
+                                                                    tracing::error!("Failed to save Composio server config: {}", e);
+                                                                }
+                                                                
+                                                                // Trigger connection
+                                                                if let Err(e) = mcp_manager.read().retry_server("composio-server", mcp_context, settings_val, None).await {
+                                                                     tracing::error!("Failed to connect to Composio server: {}", e);
+                                                                } else {
+                                                                    tracing::info!("Successfully connected to Composio server");
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                },
+                                                "Connect"
+                                            }
+                                        }
+                                        p {
+                                            class: "text-xs text-gray-400 mt-1",
+                                            "Enter the SSE URL from your Composio Dashboard and click Connect."
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -403,6 +500,42 @@ pub fn SettingsPanel() -> Element {
                                             local_settings.write().chat_history_length = val;
                                         }
                                     }
+                                }
+                            }
+                            div {
+                                class: "mb-4",
+                                label { class: "block text-sm font-medium text-gray-300", "Max Tool Output Length" }
+                                input {
+                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                    r#type: "number",
+                                    value: "{local_settings.read().max_tool_output_length}",
+                                    oninput: move |event| {
+                                        if let Ok(val) = event.value().parse::<usize>() {
+                                            local_settings.write().max_tool_output_length = val;
+                                        }
+                                    }
+                                }
+                                p {
+                                    class: "text-xs text-gray-400 mt-1",
+                                    "Limits the size of tool outputs in history to save tokens. Default is 2000."
+                                }
+                            }
+                            div {
+                                class: "mb-4",
+                                label { class: "block text-sm font-medium text-gray-300", "Max Active Tool Output Length" }
+                                input {
+                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                    r#type: "number",
+                                    value: "{local_settings.read().max_active_tool_output_length}",
+                                    oninput: move |event| {
+                                        if let Ok(val) = event.value().parse::<usize>() {
+                                            local_settings.write().max_active_tool_output_length = val;
+                                        }
+                                    }
+                                }
+                                p {
+                                    class: "text-xs text-gray-400 mt-1",
+                                    "Safety limit for the CURRENT tool response to prevent API errors. Default is 500,000."
                                 }
                             }
                             div {

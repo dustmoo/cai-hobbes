@@ -16,6 +16,15 @@ pub enum MessageContent {
     },
 }
 
+impl MessageContent {
+    pub fn get_text_content(&self) -> Option<String> {
+        match self {
+            MessageContent::Text { content, .. } => Some(content.clone()),
+            _ => None,
+        }
+    }
+}
+ 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct ToolCall {
     pub execution_id: String,

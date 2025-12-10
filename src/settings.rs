@@ -45,6 +45,25 @@ pub struct Settings {
     pub confirm_on_message_delete: bool,
     #[serde(skip)]
     pub smithery_api_key: Option<String>,
+    #[serde(default)]
+    pub preferred_mcp_source: McpSource,
+    pub composio_base_url: Option<String>,
+    #[serde(default = "default_max_tool_output_length")]
+    pub max_tool_output_length: usize,
+    #[serde(default = "default_max_active_tool_output_length")]
+    pub max_active_tool_output_length: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum McpSource {
+    Smithery,
+    Composio,
+}
+
+impl Default for McpSource {
+    fn default() -> Self {
+        Self::Smithery
+    }
 }
 
 
@@ -80,8 +99,20 @@ impl Default for Settings {
             confirm_on_save: true,
             confirm_on_message_delete: true,
             smithery_api_key: None,
+            preferred_mcp_source: McpSource::default(),
+            composio_base_url: None,
+            max_tool_output_length: default_max_tool_output_length(),
+            max_active_tool_output_length: default_max_active_tool_output_length(),
         }
     }
+}
+
+fn default_max_tool_output_length() -> usize {
+    2000
+}
+
+fn default_max_active_tool_output_length() -> usize {
+    500_000 // ~125k tokens, well within 1M limit but high enough for most data
 }
 
 fn default_true() -> bool {
@@ -166,6 +197,20 @@ impl SettingsManager {
                 if let Ok(permission_settings) = serde_json::from_value(perms.clone()) {
                     settings.permission_settings = permission_settings;
                 }
+            }
+            if let Some(source) = value.get("preferred_mcp_source") {
+                if let Ok(source) = serde_json::from_value(source.clone()) {
+                    settings.preferred_mcp_source = source;
+                }
+            }
+            if let Some(url) = value.get("composio_base_url").and_then(|v| v.as_str()) {
+                settings.composio_base_url = Some(url.to_string());
+            }
+            if let Some(len) = value.get("max_tool_output_length").and_then(|v| v.as_u64()) {
+                settings.max_tool_output_length = len as usize;
+            }
+            if let Some(len) = value.get("max_active_tool_output_length").and_then(|v| v.as_u64()) {
+                settings.max_active_tool_output_length = len as usize;
             }
         }
 

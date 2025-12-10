@@ -105,7 +105,7 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
 
 #[component]
 pub fn McpMarketplace() -> Element {
-    let mut active_tab = use_signal(|| ActiveTab::Marketplace);
+    let mut active_tab = use_signal(|| ActiveTab::Status);
     let search_query = use_signal(|| "".to_string());
     let mut trigger_search = use_signal(|| 0);
     let mut config_content = use_signal(|| "".to_string());
@@ -217,47 +217,57 @@ pub fn McpMarketplace() -> Element {
         spawn(async move {
             tracing::info!("Attempting to add MCP server: {}", mcp.name);
             
-            // Since we're not an official Smithery client yet, we don't get configs from the API
-            // Instead, we construct the config based on the standard Smithery CLI pattern
-            // Pattern from smithery.ai website: npx -y @smithery/cli@latest run {server} --key {apikey}
+            let current_config_str = config_content.read().clone();
             
-            if let Some(api_key) = current_settings.smithery_api_key.clone() {
-                let current_config_str = config_content.read().clone();
-                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&current_config_str) {
-                    if let Some(servers) = json.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
-                        // Extract short server name (e.g., "@smithery/googlecalendar" -> "googlecalendar")
-                        let server_name = mcp.name.split('/').last().unwrap_or(&mcp.name).replace("-mcp", "");
-                        
-                        // Use standard Smithery CLI pattern
-                        let new_server = serde_json::json!({
-                            "command": "npx",
-                            "args": [
-                                "-y",
-                                "@smithery/cli@latest",
-                                "run",
-                                server_name,
-                                "--key",
-                                api_key
-                            ],
-                            "description": mcp.description
-                        });
-                        
-                        servers.insert(server_name.clone(), new_server);
-                        if let Ok(new_content) = serde_json::to_string_pretty(&json) {
-                            save_config_coroutine.send(new_content);
+            // Extract short server name (e.g., "@smithery/googlecalendar" -> "googlecalendar")
+            // This is a rough heuristic, might need refinement for composio mapping
+            let short_name = mcp.name.split('/').last().unwrap_or(&mcp.name).replace("-mcp", "");
+            
+            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&current_config_str) {
+                if let Some(servers) = json.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+                    
+                    match current_settings.preferred_mcp_source {
+                        crate::settings::McpSource::Smithery => {
+                             if let Some(api_key) = current_settings.smithery_api_key.clone() {
+                                // Use standard Smithery CLI pattern
+                                let new_server = serde_json::json!({
+                                    "command": "npx",
+                                    "args": [
+                                        "-y",
+                                        "@smithery/cli@latest",
+                                        "run",
+                                        short_name,
+                                        "--key",
+                                        api_key
+                                    ],
+                                    "description": mcp.description
+                                });
+                                servers.insert(short_name.clone(), new_server);
+                             } else {
+                                tracing::warn!("No Smithery API key configured");
+                                error_msg.set(Some("Please set your Smithery API key in Settings first".to_string()));
+                                return;
+                             }
+                        },
+                        crate::settings::McpSource::Composio => {
+                            // Composio integration is now handled via SSE in Settings
+                            tracing::warn!("Attempted to add Composio tool via legacy path");
+                            error_msg.set(Some("Please manage Composio tools via your Composio Dashboard.".to_string()));
+                            return;
                         }
-                        active_tab.set(ActiveTab::Installed);
-                    } else {
-                        tracing::error!("'mcpServers' key missing or invalid in config");
-                        error_msg.set(Some("Invalid MCP config structure.".to_string()));
                     }
+
+                    if let Ok(new_content) = serde_json::to_string_pretty(&json) {
+                        save_config_coroutine.send(new_content);
+                    }
+                    active_tab.set(ActiveTab::Installed);
                 } else {
-                    tracing::error!("Failed to parse current config JSON");
-                    error_msg.set(Some("Failed to parse current configuration.".to_string()));
+                    tracing::error!("'mcpServers' key missing or invalid in config");
+                    error_msg.set(Some("Invalid MCP config structure.".to_string()));
                 }
             } else {
-                tracing::warn!("No Smithery API key configured");
-                error_msg.set(Some("Please set your Smithery API key in Settings first".to_string()));
+                tracing::error!("Failed to parse current config JSON");
+                error_msg.set(Some("Failed to parse current configuration.".to_string()));
             }
         });
     };
@@ -287,6 +297,15 @@ pub fn McpMarketplace() -> Element {
                         } else {
                             "px-3 py-1 text-sm font-medium text-gray-400 hover:text-white"
                         },
+                        onclick: move |_| active_tab.set(ActiveTab::Status),
+                        "Status"
+                    }
+                    button {
+                        class: if *active_tab.read() == ActiveTab::Marketplace {
+                            "px-3 py-1 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
+                        } else {
+                            "px-3 py-1 text-sm font-medium text-gray-400 hover:text-white"
+                        },
                         onclick: move |_| active_tab.set(ActiveTab::Marketplace),
                         "Marketplace"
                     }
@@ -298,15 +317,6 @@ pub fn McpMarketplace() -> Element {
                         },
                         onclick: move |_| active_tab.set(ActiveTab::Installed),
                         "Installed / Config"
-                    }
-                    button {
-                        class: if *active_tab.read() == ActiveTab::Status {
-                            "px-3 py-1 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
-                        } else {
-                            "px-3 py-1 text-sm font-medium text-gray-400 hover:text-white"
-                        },
-                        onclick: move |_| active_tab.set(ActiveTab::Status),
-                        "Status"
                     }
                 }
             }
@@ -455,7 +465,9 @@ fn StatusView() -> Element {
     let mut server_statuses = use_resource(move || {
         let mcp_manager = mcp_manager.clone();
         async move {
-            mcp_manager.read().get_all_server_statuses().await
+            let mut statuses = mcp_manager.read().get_all_server_statuses().await;
+            statuses.sort_by(|a, b| a.name.cmp(&b.name));
+            statuses
         }
     });
 
@@ -712,6 +724,7 @@ fn McpServerCard(
 ) -> Element {
     let mcp_clone_for_add = mcp.clone();
     let mcp_manager = use_context::<Signal<McpManager>>();
+    let settings = use_context::<Signal<Settings>>();
 
     // Check if installed and get status
     let install_status = use_resource({
@@ -769,10 +782,19 @@ fn McpServerCard(
                             "Installed"
                         }
                     } else {
-                        button {
-                            class: "px-3 py-1 bg-primary-600 hover:bg-primary-500 rounded text-sm font-medium transition-colors",
-                            onclick: move |_| add_mcp.call(mcp_clone_for_add.clone()),
-                            "Add"
+                        if settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
+                            button {
+                                class: "px-3 py-1 bg-gray-600 rounded text-sm font-medium cursor-not-allowed",
+                                disabled: true,
+                                title: "Configure this tool in your Composio Dashboard",
+                                "Manage in Dashboard"
+                            }
+                        } else {
+                            button {
+                                class: "px-3 py-1 bg-primary-600 hover:bg-primary-500 rounded text-sm font-medium transition-colors",
+                                onclick: move |_| add_mcp.call(mcp_clone_for_add.clone()),
+                                "Add"
+                            }
                         }
                     }
                 } else {

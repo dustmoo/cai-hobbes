@@ -814,10 +814,13 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                 button {
                                     class: "p-1.5 text-gray-400 hover:text-white rounded transition-colors",
                                     onclick: move |_| {
-                                        let text = content();
+                                        let raw_markdown = message.content.get_text_content().unwrap_or_default();
                                         spawn(async move {
-                                            let mut eval = document::eval(&format!("navigator.clipboard.writeText(`{}`);", text));
-                                            let _: Result<serde_json::Value, _> = eval.recv().await;
+                                            if copy_to_clipboard(&raw_markdown).is_ok() {
+                                                // The copy_to_clipboard function now handles the OS-level interaction.
+                                            } else {
+                                                tracing::error!("Failed to copy raw markdown to clipboard.");
+                                            }
                                             copied.set(true);
                                             sleep(std::time::Duration::from_secs(2)).await;
                                             copied.set(false);

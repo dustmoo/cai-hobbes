@@ -1,7 +1,6 @@
-
 use dioxus::prelude::spawn;
 use dioxus_signals::{Readable, Writable};
-use rmcp::model::{CallToolRequestParam, Tool, CallToolResult};
+use rmcp::model::{CallToolRequestParam, Tool, CallToolResult, PaginatedRequestParam};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::child_process::TokioChildProcess;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
@@ -265,36 +264,61 @@ impl McpManager {
                 match service_result {
                     Ok(service) => {
                         tracing::info!("Connected to MCP server: {}", server_name);
-                        match service.list_tools(Default::default()).await {
-                            Ok(result) => {
-                                tracing::info!("Discovered capabilities for MCP server: {}", server_name);
-                                let active_client = ActiveMcpClient {
-                                    config: server_config_clone.clone(),
-                                    service: Arc::new(service),
-                                    tools: result.tools,
-                                };
-                                if tx_clone.send(active_client).is_err() {
-                                    tracing::error!("Failed to send initialized MCP client for '{}' to receiver task.", server_name);
-                                }
-                            }
-                            Err(e) => {
-                                let error_msg = format!("Failed to list tools: {}", e);
-                                tracing::error!("Failed to list tools for '{}': {}", server_name, e);
-                                // Check if this is an auth error
-                                if Self::is_auth_error(&error_msg) {
-                                    tracing::info!("Server '{}' requires authentication", server_name);
-                                    auth_required_servers_clone.lock().await.insert(
-                                        server_name.clone(),
-                                        AuthRequiredInfo {
-                                            config: server_config_clone,
-                                            auth_url: None, // TODO: Extract from error if available
-                                            error_message: error_msg,
+                        
+                        // Fetch all pages of tools
+                        let mut all_tools = Vec::new();
+                        let mut next_cursor: Option<String> = None;
+                        
+                        loop {
+                            let cursor = next_cursor.clone();
+                            // We need to use ListToolsRequest, but construct it correctly for the rmcp crate version
+                            // The service.list_tools expects Option<PaginatedRequestParam>
+                            let request_param = cursor.map(|c| PaginatedRequestParam {
+                                cursor: Some(c),
+                            });
+
+                            match service.list_tools(request_param).await {
+                                Ok(result) => {
+                                    all_tools.extend(result.tools);
+                                    
+                                    if let Some(cursor) = result.next_cursor {
+                                        if !cursor.is_empty() {
+                                            next_cursor = Some(cursor);
+                                            continue;
                                         }
-                                    );
-                                } else {
-                                    failed_servers_clone.lock().await.insert(server_name.clone(), (server_config_clone, error_msg));
+                                    }
+                                    break;
+                                }
+                                Err(e) => {
+                                    let error_msg = format!("Failed to list tools: {}", e);
+                                    tracing::error!("Failed to list tools for '{}': {}", server_name, e);
+                                    // Check if this is an auth error
+                                    if Self::is_auth_error(&error_msg) {
+                                        tracing::info!("Server '{}' requires authentication", server_name);
+                                        auth_required_servers_clone.lock().await.insert(
+                                            server_name.clone(),
+                                            AuthRequiredInfo {
+                                                config: server_config_clone,
+                                                auth_url: None, // TODO: Extract from error if available
+                                                error_message: error_msg,
+                                            }
+                                        );
+                                    } else {
+                                        failed_servers_clone.lock().await.insert(server_name.clone(), (server_config_clone, error_msg));
+                                    }
+                                    return;
                                 }
                             }
+                        }
+
+                        tracing::info!("Discovered {} capabilities for MCP server: {}", all_tools.len(), server_name);
+                        let active_client = ActiveMcpClient {
+                            config: server_config_clone.clone(),
+                            service: Arc::new(service),
+                            tools: all_tools,
+                        };
+                        if tx_clone.send(active_client).is_err() {
+                            tracing::error!("Failed to send initialized MCP client for '{}' to receiver task.", server_name);
                         }
                     }
                     Err(e) => {
@@ -362,7 +386,7 @@ impl McpManager {
             }
         }
     }
-    async fn add_or_update_mcp_server(&self, config_path: &PathBuf, new_config: McpServerConfig) -> Result<(), String> {
+    pub async fn add_or_update_mcp_server(&self, config_path: &PathBuf, new_config: McpServerConfig) -> Result<(), String> {
         let mut configs = self.load_configs(config_path.clone()).await;
 
         if let Some(existing_config) = configs.iter_mut().find(|c| c.name == new_config.name) {
@@ -842,39 +866,64 @@ impl McpManager {
             match service_result {
                 Ok(service) => {
                     tracing::info!("Connected to MCP server: {}", server_name);
-                    match service.list_tools(Default::default()).await {
-                        Ok(result) => {
-                            tracing::info!("Discovered capabilities for MCP server: {}", server_name);
-                            let active_client = ActiveMcpClient {
-                                config: server_config_clone.clone(),
-                                service: Arc::new(service),
-                                tools: result.tools,
-                            };
-                            servers_clone.lock().await.insert(server_name.clone(), active_client);
-                            
-                            // Update context
-                            let new_context = self_clone.get_mcp_context().await;
-                            mcp_context_signal_clone.set(new_context);
-                            tracing::info!("Successfully reconnected '{}'", server_name);
-                        }
-                        Err(e) => {
-                            let error_msg = format!("Failed to list tools: {}", e);
-                            tracing::error!("Failed to list tools for '{}': {}", server_name, e);
-                            if Self::is_auth_error(&error_msg) {
-                                tracing::info!("Server '{}' requires authentication", server_name);
-                                auth_required_servers_clone.lock().await.insert(
-                                    server_name.clone(),
-                                    AuthRequiredInfo {
-                                        config: server_config_clone,
-                                        auth_url: None,
-                                        error_message: error_msg,
+                    
+                    // Fetch all pages of tools
+                    let mut all_tools = Vec::new();
+                    let mut next_cursor: Option<String> = None;
+                    
+                    loop {
+                        let cursor = next_cursor.clone();
+                        // Same here for the retry_server function
+                        let request_param = cursor.map(|c| PaginatedRequestParam {
+                            cursor: Some(c),
+                        });
+
+                        match service.list_tools(request_param).await {
+                            Ok(result) => {
+                                all_tools.extend(result.tools);
+                                
+                                if let Some(cursor) = result.next_cursor {
+                                    if !cursor.is_empty() {
+                                        next_cursor = Some(cursor);
+                                        continue;
                                     }
-                                );
-                            } else {
-                                failed_servers_clone.lock().await.insert(server_name.clone(), (server_config_clone, error_msg));
+                                }
+                                break;
+                            }
+                            Err(e) => {
+                                let error_msg = format!("Failed to list tools: {}", e);
+                                tracing::error!("Failed to list tools for '{}': {}", server_name, e);
+                                // Check if this is an auth error
+                                if Self::is_auth_error(&error_msg) {
+                                    tracing::info!("Server '{}' requires authentication", server_name);
+                                    auth_required_servers_clone.lock().await.insert(
+                                        server_name.clone(),
+                                        AuthRequiredInfo {
+                                            config: server_config_clone,
+                                            auth_url: None, // TODO: Extract from error if available
+                                            error_message: error_msg,
+                                        }
+                                    );
+                                } else {
+                                    failed_servers_clone.lock().await.insert(server_name.clone(), (server_config_clone, error_msg));
+                                }
+                                return;
                             }
                         }
                     }
+
+                    tracing::info!("Discovered {} capabilities for MCP server: {}", all_tools.len(), server_name);
+                    let active_client = ActiveMcpClient {
+                        config: server_config_clone.clone(),
+                        service: Arc::new(service),
+                        tools: all_tools,
+                    };
+                    servers_clone.lock().await.insert(server_name.clone(), active_client);
+                    
+                    // Update context
+                    let new_context = self_clone.get_mcp_context().await;
+                    mcp_context_signal_clone.set(new_context);
+                    tracing::info!("Successfully reconnected '{}'", server_name);
                 }
                 Err(e) => {
                     let error_msg = format!("Failed to serve: {}", e);

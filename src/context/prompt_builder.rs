@@ -96,9 +96,15 @@ impl<'a> PromptBuilder<'a> {
                             }
                         }
                         // Finally, remove the 'title' field from the top-level tool declaration, as it's not supported by Gemini.
-                       if let Some(obj) = tool_value.as_object_mut() {
-                           obj.remove("title");
-                       }
+                        if let Some(obj) = tool_value.as_object_mut() {
+                            obj.remove("title");
+                            
+                            // Prefix the tool name with the server name to avoid collisions
+                            if let Some(name_val) = obj.get("name").and_then(|v| v.as_str()) {
+                                let new_name = format!("{}_{}", server.name, name_val);
+                                obj.insert("name".to_string(), json!(new_name));
+                            }
+                        }
                         function_declarations.push(tool_value);
                     }
                 }
@@ -274,7 +280,7 @@ impl<'a> PromptBuilder<'a> {
                             role: "model".to_string(),
                             parts: vec![Part::FunctionCall {
                                 function_call: FunctionCallPart {
-                                    name: tc.tool_name.clone(),
+                                    name: format!("{}_{}", tc.server_name, tc.tool_name),
                                     args: args_value,
                                 },
                                 thought_signature: current_thought_signature.clone(),
@@ -282,16 +288,49 @@ impl<'a> PromptBuilder<'a> {
                         });
 
                         // 2. Add the user's function response
-                        // If the tool call is not completed/error, we might skip the response or handle it differently.
-                        // But typically PromptBuilder is called when it's done.
-                        let result_value: serde_json::Value = serde_json::from_str(&tc.response)
-                            .unwrap_or_else(|_| json!(tc.response));
+                        // Truncation logic: If this is a historical tool call (not the most recent message),
+                        // and it exceeds the max length, truncate it to save context.
+                        // We check against last_message_id (ignoring placeholder) to determine if it's historical.
+                        let _is_historical = Some(message.id) != first_message_id && // Safety check, though first msg is usually User
+                                          Some(message.id) != last_message.map(|m| m.id) &&
+                                          (!is_continuation_placeholder ||
+                                           Some(message.id) != self.session.messages.get(self.session.messages.len().saturating_sub(2)).map(|m| m.id));
+
+                        // Better historical check:
+                        // The last "meaningful" message is either the last message, or the one before the placeholder.
+                        let last_meaningful_id = if is_continuation_placeholder {
+                            if self.session.messages.len() >= 2 {
+                                self.session.messages.get(self.session.messages.len() - 2).map(|m| m.id)
+                            } else {
+                                None
+                            }
+                        } else {
+                            last_message.map(|m| m.id)
+                        };
+
+                        let is_active_tool_call = Some(message.id) == last_meaningful_id;
+                        
+                        let mut result_string = tc.response.clone();
+                        let max_len = if is_active_tool_call {
+                            self.settings.max_active_tool_output_length
+                        } else {
+                            self.settings.max_tool_output_length
+                        };
+
+                        if result_string.len() > max_len {
+                            let original_len = result_string.len();
+                            result_string.truncate(max_len);
+                            result_string.push_str(&format!("... [Output truncated from {} chars - excessive size]", original_len));
+                        }
+
+                        let result_value: serde_json::Value = serde_json::from_str(&result_string)
+                            .unwrap_or_else(|_| json!(result_string));
                         
                         contents.push(Content {
                             role: "user".to_string(),
                             parts: vec![Part::FunctionResponse {
                                 function_response: FunctionResponsePart {
-                                    name: tc.tool_name.clone(),
+                                    name: format!("{}_{}", tc.server_name, tc.tool_name),
                                     response: json!({ "result": result_value }),
                                 },
                             }],
@@ -889,5 +928,31 @@ mod tests {
         } else {
             panic!("Expected FunctionCall part");
         }
+    }
+
+    #[test]
+    fn test_build_prompt_prefixes_tool_names() {
+        let session = create_mock_session_with_tools();
+        let settings = Settings::default();
+        let session_state = crate::session::SessionState::default();
+        let builder = PromptBuilder::new(&session, &settings, &session_state);
+
+        let prompt = builder.build_prompt("Verify tool prefixing".to_string(), None);
+        let tools = prompt.tools.expect("Should have tools");
+        let tool_declarations = &tools[0].function_declarations;
+
+        // "weather_server" is the server name in mock
+        // "get_weather" is the tool name
+        
+        let found_names: Vec<String> = tool_declarations.iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+            .collect();
+        println!("Found tool names: {:?}", found_names);
+
+        let weather_tool = tool_declarations.iter().find(|t| {
+            t.get("name").and_then(|n| n.as_str()) == Some("weather_server_get_weather")
+        });
+        
+        assert!(weather_tool.is_some(), "Tool name should be prefixed with server name. Found: {:?}", found_names);
     }
 }
