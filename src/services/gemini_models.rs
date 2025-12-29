@@ -39,8 +39,36 @@ pub enum ModelFetchError {
     RequestFailed(#[from] reqwest::Error),
     #[error("No API key provided")]
     NoApiKey,
+    #[error("Invalid API key")]
+    InvalidApiKey,
     #[error("Failed to parse response: {0}")]
     ParseError(String),
+}
+
+/// Validate a Gemini API key by making a lightweight API call
+/// Returns Ok(()) if valid, Err with message if invalid
+pub async fn validate_gemini_api_key(api_key: &str) -> Result<(), String> {
+    if api_key.trim().is_empty() {
+        return Err("API key cannot be empty".to_string());
+    }
+
+    let client = Client::new();
+    let url = format!("{}?key={}&pageSize=1", MODELS_API_URL, api_key);
+    
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                Ok(())
+            } else if status.as_u16() == 400 || status.as_u16() == 401 || status.as_u16() == 403 {
+                Err("Invalid API key".to_string())
+            } else {
+                let error_text = response.text().await.unwrap_or_default();
+                Err(format!("API error ({}): {}", status, error_text))
+            }
+        }
+        Err(e) => Err(format!("Network error: {}", e)),
+    }
 }
 
 /// Fetch available Gemini models from the API
@@ -60,7 +88,7 @@ pub async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<GeminiMode
     // Require API key for fetching
     let api_key = api_key.ok_or(ModelFetchError::NoApiKey)?;
 
-    tracing::info!("Fetching Gemini models from API");
+    tracing::debug!("Fetching Gemini models from API");
     
     let client = Client::new();
     let mut all_models = Vec::new();
@@ -102,7 +130,7 @@ pub async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<GeminiMode
         })
         .collect();
 
-    tracing::info!("Fetched {} models supporting generateContent", filtered_models.len());
+    tracing::debug!("Fetched {} models supporting generateContent", filtered_models.len());
 
     // Update cache
     {

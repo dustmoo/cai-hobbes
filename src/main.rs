@@ -9,6 +9,7 @@ use tracing;
 use dotenvy::dotenv;
 
 mod components;
+mod constants;
 mod hotkey;
 mod permissions;
 mod menu;
@@ -17,16 +18,23 @@ mod session;
 mod settings;
 mod context;
 mod processing;
-mod secure_storage;
+mod secret_manager;
+mod biometric_auth;
+mod keychain_ffi;
 mod mcp;
 mod services;
+mod gemini;
+mod repro_keychain;
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 use tray_icon::TrayIcon;
 
 fn main() {
     // Try to load .env file for developer convenience.
     dotenv().ok();
-    tracing::info!("Attempted to load .env file from the environment.");
+    tracing::debug!("Attempted to load .env file from the environment.");
+    #[cfg(debug_assertions)]
+    dioxus_logger::init(tracing::Level::DEBUG).expect("failed to init logger");
+    #[cfg(not(debug_assertions))]
     dioxus_logger::init(tracing::Level::INFO).expect("failed to init logger");
 
     // Load session state to get window size
@@ -109,20 +117,127 @@ fn RestartRequired() -> Element {
 
 fn app() -> Element {
     let window = use_window();
-    let mut session_state = use_context_provider(|| Signal::new(SessionState::new()));
+    let mut session_state = use_context_provider(|| Signal::new(SessionState::load().unwrap_or_default()));
     let settings_manager = use_context_provider(|| Signal::new(SettingsManager::new(get_settings_path())));
     let ui_state_manager = use_context_provider(|| Signal::new(settings::UiStateManager::new(get_ui_state_path())));
     let mut ui_state = use_context_provider(|| Signal::new(ui_state_manager.read().load()));
+    
+    // Initialize SecretManager without loading (loading happens async below)
+    let mut secret_manager = use_context_provider(|| Signal::new(secret_manager::SecretManager::new()));
+    
+    // Track whether secrets have been loaded (None = loading, Some = done)
+    let mut secrets_loaded = use_signal(|| false);
+    
+    // Load settings initially (without API keys - they'll be added after keychain loads)
     let mut settings = use_context_provider(|| {
-        let mut settings = settings_manager.read().load();
-        if let Ok(api_key) = crate::secure_storage::retrieve_secret("api_key") {
-            settings.gemini_config.api_key = Some(api_key);
-        }
-        if let Ok(smithery_api_key) = crate::secure_storage::retrieve_secret("smithery_api_key") {
-            settings.smithery_api_key = Some(smithery_api_key);
-        }
+        let settings = settings_manager.read().load();
         Signal::new(settings)
     });
+
+    // Asynchronously load secrets from keychain using biometric authentication
+    // This prompts once for Touch ID/password, then uses that context for all secrets
+    use_effect(move || {
+        if !secrets_loaded() {
+            // Capture profile names before entering the blocking task
+            let profile_names: Vec<String> = settings.read().composio_profiles.iter().map(|p| p.name.clone()).collect();
+            
+            spawn(async move {
+                // Use spawn_blocking to run keychain operations off the main thread
+                let loaded_secrets = tokio::task::spawn_blocking(move || {
+                    let mut sm = secret_manager::SecretManager::new();
+                    
+                    // Step 1: Attempt biometric authentication (single prompt)
+                    let auth_context = match biometric_auth::AuthContext::authenticate(
+                        "Hobbes needs access to your saved credentials"
+                    ) {
+                        biometric_auth::AuthResult::Success(ctx) => {
+                            tracing::info!("Biometric authentication successful, loading secrets with context");
+                            Some(ctx)
+                        }
+                        biometric_auth::AuthResult::Cancelled => {
+                            tracing::info!("User cancelled biometric auth, falling back to regular keychain access");
+                            None
+                        }
+                        biometric_auth::AuthResult::NotAvailable(reason) => {
+                            tracing::info!("Biometric auth not available ({}), using regular keychain access", reason);
+                            None
+                        }
+                        biometric_auth::AuthResult::Failed(error) => {
+                            tracing::warn!("Biometric auth failed: {}, using regular keychain access", error);
+                            None
+                        }
+                    };
+                    
+                    // Step 2: Load secrets with or without the authenticated context
+                    if let Some(ref ctx) = auth_context {
+                        // Use the authenticated context for all keychain operations
+                        sm.load_all_with_context(ctx);
+                        
+                        // Also load Composio API keys for each known profile
+                        for profile_name in &profile_names {
+                            sm.load_composio_key_with_context(profile_name, Some(ctx));
+                        }
+                    } else {
+                        // Fall back to regular keychain access (may prompt multiple times)
+                        sm.load_all_from_keychain();
+                        
+                        for profile_name in &profile_names {
+                            sm.load_composio_key(profile_name);
+                        }
+                    }
+                    
+                    sm
+                }).await;
+                
+                if let Ok(sm) = loaded_secrets {
+                    // Update secret manager with loaded secrets
+                    secret_manager.set(sm);
+                    
+                    // Now update settings with loaded API keys
+                    let sm_read = secret_manager.read();
+                    let mut current_settings = settings.write();
+                    
+                    if let Some(api_key) = sm_read.get("api_key") {
+                        current_settings.gemini_config.api_key = Some(api_key.clone());
+                    }
+                    if let Some(smithery_api_key) = sm_read.get("smithery_api_key") {
+                        current_settings.smithery_api_key = Some(smithery_api_key.clone());
+                    }
+                    // Load Composio API key for active profile (or legacy key)
+                    if let Some(composio_api_key) = sm_read.get("composio_api_key") {
+                        current_settings.composio_api_key = Some(composio_api_key.clone());
+                    }
+                    
+                    // Load Composio API keys for each profile from the cache
+                    for profile in &mut current_settings.composio_profiles {
+                        if let Some(api_key) = sm_read.get_composio_key(&profile.name) {
+                            profile.api_key = Some(api_key.clone());
+                            tracing::debug!("Loaded API key for Composio profile: {}", profile.name);
+                        }
+                    }
+                    
+                    tracing::debug!("Secrets loaded from keychain successfully");
+                } else {
+                    tracing::error!("Failed to load secrets from keychain");
+                }
+                secrets_loaded.set(true);
+            });
+        }
+    });
+
+    // Show loading screen while waiting for keychain secrets
+    if !secrets_loaded() {
+        return rsx! {
+            div {
+                class: "dark flex flex-col items-center justify-center h-screen bg-gray-900 text-white text-center p-8",
+                div {
+                    class: "animate-spin rounded-full h-12 w-12 border-b-2 border-white mb-4"
+                }
+                h1 { class: "text-xl font-semibold mb-2", "Loading..." }
+                p { class: "text-sm text-gray-400", "Authenticate to access your saved credentials..." }
+            }
+        };
+    }
 
     let mut llm_connector = use_context_provider(|| {
         let settings = settings.read();
@@ -136,16 +251,22 @@ fn app() -> Element {
 
     // Reactively update llm_connector when gemini_config changes
     use_effect(move || {
-        let current_settings = settings.read();
-        let new_connector: Arc<dyn LlmConnector> = match current_settings.active_llm {
+        // Use read() to subscribe to settings changes so this effect re-runs 
+        // when the API key is loaded from biometrics
+        let (active_llm, gemini_config) = {
+            let current_settings = settings.read();
+            (current_settings.active_llm.clone(), current_settings.gemini_config.clone())
+        };
+        // Now the read borrow is dropped, safe to set the connector
+        let new_connector: Arc<dyn LlmConnector> = match active_llm {
             crate::settings::LlmProvider::Gemini => {
-                Arc::new(GeminiConnector::new(current_settings.gemini_config.clone()))
+                Arc::new(GeminiConnector::new(gemini_config))
             }
         };
         llm_connector.set(new_connector);
     });
 
-    use_context_provider(|| Signal::new(processing::conversation_processor::ConversationProcessor::new(llm_connector.read().clone())));
+    use_context_provider(|| Signal::new(processing::conversation_processor::ConversationProcessor::new(llm_connector)));
 
     // Asynchronously load the session state
     let _ = use_resource(move || async move {
@@ -153,7 +274,7 @@ fn app() -> Element {
         match SessionState::load() {
             Ok(loaded_state) => {
                 session_state.set(loaded_state);
-                tracing::info!("Session state loaded successfully.");
+                tracing::debug!("Session state loaded successfully.");
             }
             Err(e) => {
                 tracing::error!("Failed to load session state: {}. Creating a new default session.", e);
@@ -202,7 +323,7 @@ fn app() -> Element {
                 match DocumentStore::new(&qdrant_url).await {
                     Ok(store) => {
                         document_store.set(Some(std::sync::Arc::new(store)));
-                        tracing::info!("DocumentStore initialized successfully.");
+                        tracing::debug!("DocumentStore initialized successfully.");
                     }
                     Err(e) => {
                         tracing::error!("Failed to initialize DocumentStore: {}", e);
@@ -263,12 +384,12 @@ fn app() -> Element {
         if show {
             if tray_icon.peek().is_none() {
                 tray_icon.set(Some(tray::init_tray()));
-                tracing::info!("Tray icon has been created.");
+                tracing::debug!("Tray icon has been created.");
             }
         } else {
             if tray_icon.peek().is_some() {
                 tray_icon.set(None);
-                tracing::info!("Tray icon has been removed.");
+                tracing::debug!("Tray icon has been removed.");
             }
         }
     });
@@ -286,7 +407,7 @@ fn app() -> Element {
 
         window_clone.set_visible(visible);
         if visible {
-            tracing::info!("Window is visible, centering on current monitor.");
+            tracing::debug!("Window is visible, centering on current monitor.");
             let main_window = &window_clone.window;
             if let Some(monitor) = main_window.current_monitor() {
                 let monitor_size = monitor.size();
@@ -299,7 +420,7 @@ fn app() -> Element {
                 main_window.set_outer_position(dioxus::desktop::tao::dpi::PhysicalPosition::new(x, y));
             }
         } else {
-            tracing::info!("Window is hidden.");
+            tracing::debug!("Window is hidden.");
         }
     });
 
@@ -354,6 +475,8 @@ fn app() -> Element {
                 let content_width = logical_size.width - sidebar_width;
         
                 session_state.write().update_window_size(content_width, logical_size.height);
+                // Save asynchronously on a background thread to avoid blocking the UI
+                SessionState::save_async(session_state.read().clone());
             });
         }
     });

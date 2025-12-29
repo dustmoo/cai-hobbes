@@ -190,8 +190,25 @@ impl StreamManagerContext {
                                     if final_status == ToolCallStatus::Error {
                                         (final_status, error_string.unwrap_or_default())
                                     } else {
-                                        let final_json = serde_json::to_value(aggregated_content).unwrap_or(serde_json::Value::Null);
-                                        (final_status, serde_json::to_string_pretty(&final_json).unwrap_or_default())
+                                        // Check for auth requirement
+                                        let mut auth_url = None;
+                                        for content in &aggregated_content {
+                                            let json_content = serde_json::to_value(content).unwrap_or(serde_json::Value::Null);
+                                            if let Some(text) = json_content.get("text").and_then(|t| t.as_str()) {
+                                                if text.contains("Authentication required") && text.contains("connect your account") {
+                                                    if let Some(start) = text.find("http") {
+                                                        auth_url = Some(text[start..].trim().to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if let Some(url) = auth_url {
+                                            (ToolCallStatus::AuthRequired, url)
+                                        } else {
+                                            let final_json = serde_json::to_value(aggregated_content).unwrap_or(serde_json::Value::Null);
+                                            (final_status, serde_json::to_string_pretty(&final_json).unwrap_or_default())
+                                        }
                                     }
                                 }
                                 Err(e) => (ToolCallStatus::Error, e),

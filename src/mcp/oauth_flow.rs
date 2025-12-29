@@ -197,7 +197,7 @@ pub async fn discover_oauth_metadata(server_url: &str, api_token: Option<&str>) 
     // Determine potential authorization server URL
     let mut authorization_server_url = trimmed_server_url.to_string();
 
-    tracing::info!("Attempting to discover protected resource metadata at: {}", pr_url);
+    tracing::debug!("Attempting to discover protected resource metadata at: {}", pr_url);
     
     // Prepare request with optional auth token
     let mut request = client.get(&pr_url);
@@ -215,7 +215,7 @@ pub async fn discover_oauth_metadata(server_url: &str, api_token: Option<&str>) 
                  if let Ok(meta) = resp.json::<OAuthProtectedResourceMetadata>().await {
                      if let Some(servers) = meta.authorization_servers {
                          if let Some(first) = servers.first() {
-                             tracing::info!("Discovered authorization server via resource metadata: {}", first);
+                             tracing::debug!("Discovered authorization server via resource metadata: {}", first);
                              authorization_server_url = first.trim_end_matches('/').to_string();
                              found_metadata = true;
                          }
@@ -226,12 +226,12 @@ pub async fn discover_oauth_metadata(server_url: &str, api_token: Option<&str>) 
                 // Header format: Bearer ..., resource_metadata="https://..."
                 if let Some(auth_val) = resp.headers().get("www-authenticate") {
                     if let Ok(auth_str) = auth_val.to_str() {
-                        tracing::info!("Received 401 with WWW-Authenticate: {}", auth_str);
+                        tracing::debug!("Received 401 with WWW-Authenticate: {}", auth_str);
                         if let Some(idx) = auth_str.find("resource_metadata=\"") {
                             let start = idx + "resource_metadata=\"".len();
                             if let Some(end) = auth_str[start..].find('"') {
                                 let metadata_url = &auth_str[start..start+end];
-                                tracing::info!("Found resource metadata URL from header: {}", metadata_url);
+                                tracing::debug!("Found resource metadata URL from header: {}", metadata_url);
                                 
                                 // Fetch from the discovered metadata URL
                                 if let Ok(meta_resp) = client.get(metadata_url).send().await {
@@ -239,7 +239,7 @@ pub async fn discover_oauth_metadata(server_url: &str, api_token: Option<&str>) 
                                          if let Ok(meta) = meta_resp.json::<OAuthProtectedResourceMetadata>().await {
                                              if let Some(servers) = meta.authorization_servers {
                                                  if let Some(first) = servers.first() {
-                                                     tracing::info!("Discovered authorization server via header metadata: {}", first);
+                                                     tracing::debug!("Discovered authorization server via header metadata: {}", first);
                                                      authorization_server_url = first.trim_end_matches('/').to_string();
                                                      found_metadata = true;
                                                  }
@@ -265,13 +265,13 @@ pub async fn discover_oauth_metadata(server_url: &str, api_token: Option<&str>) 
              let pr_root_url = format!("{}/.well-known/oauth-protected-resource", origin_url.trim_end_matches('/'));
              
              if pr_root_url != pr_url { // Don't retry if it's same url
-                 tracing::info!("Attempting to discover protected resource metadata at root: {}", pr_root_url);
+                 tracing::debug!("Attempting to discover protected resource metadata at root: {}", pr_root_url);
                  if let Ok(resp) = client.get(&pr_root_url).send().await {
                     if resp.status().is_success() {
                          if let Ok(meta) = resp.json::<OAuthProtectedResourceMetadata>().await {
                              if let Some(servers) = meta.authorization_servers {
                                  if let Some(first) = servers.first() {
-                                     tracing::info!("Discovered authorization server at root: {}", first);
+                                     tracing::debug!("Discovered authorization server at root: {}", first);
                                      authorization_server_url = first.trim_end_matches('/').to_string();
                                  }
                              }
@@ -283,7 +283,7 @@ pub async fn discover_oauth_metadata(server_url: &str, api_token: Option<&str>) 
     }
     
     // Step 2: Fetch Authorization Server Metadata
-    tracing::info!("Fetching OAuth authorization server metadata from: {}", authorization_server_url);
+    tracing::debug!("Fetching OAuth authorization server metadata from: {}", authorization_server_url);
     
     // Try standard OAuth 2.0 well-known endpoint
     let well_known_url = format!("{}/.well-known/oauth-authorization-server", authorization_server_url);
@@ -361,6 +361,8 @@ pub struct OAuthResult {
     pub success: bool,
     pub auth_code: Option<String>,
     pub error: Option<String>,
+    /// Capture all query parameters for generic handling (e.g. connectedAccountId)
+    pub params: std::collections::HashMap<String, String>,
 }
 
 /// Find an available port for the callback server
@@ -387,6 +389,7 @@ pub fn start_callback_server(port: u16) -> mpsc::UnboundedReceiver<OAuthResult> 
                     success: false,
                     auth_code: None,
                     error: Some(format!("Failed to bind callback server: {}", e)),
+                    params: std::collections::HashMap::new(),
                 });
                 return;
             }
@@ -395,36 +398,54 @@ pub fn start_callback_server(port: u16) -> mpsc::UnboundedReceiver<OAuthResult> 
         // Set timeout for the server
         listener.set_nonblocking(false).ok();
         
-        tracing::info!("OAuth callback server started on port {}", port);
+        tracing::debug!("OAuth callback server started on port {}", port);
         
         // Accept only one connection
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buffer = [0u8; 4096];
             if let Ok(n) = stream.read(&mut buffer) {
                 let request = String::from_utf8_lossy(&buffer[..n]);
-                tracing::info!("Received callback request");
+                tracing::debug!("Received callback request");
+                
+                let params = extract_query_params(&request);
                 
                 // Parse the request to extract the auth code
-                if let Some(code) = extract_auth_code(&request) {
+                if let Some(code) = params.get("code") {
                     // Send success response
                     let response = build_success_response();
                     let _ = stream.write_all(response.as_bytes());
                     
                     let _ = tx.send(OAuthResult {
                         success: true,
-                        auth_code: Some(code),
+                        auth_code: Some(code.clone()),
                         error: None,
+                        params,
                     });
-                } else if let Some(error) = extract_error(&request) {
+                } else if let Some(error) = params.get("error").or_else(|| params.get("error_description")) {
                     // Send error response
-                    let response = build_error_response(&error);
+                    let response = build_error_response(error);
                     let _ = stream.write_all(response.as_bytes());
                     
                     let _ = tx.send(OAuthResult {
                         success: false,
                         auth_code: None,
-                        error: Some(error),
+                        error: Some(error.clone()),
+                        params,
                     });
+                } else if params.get("connectedAccountId").is_some() 
+                       || params.get("connected_account_id").is_some() 
+                       || params.get("status").map(|s| s == "success").unwrap_or(false) {
+                    // Specific handling for Composio success which might not have 'code'
+                    // Composio can return: connectedAccountId (camelCase), connected_account_id (snake_case), or status=success
+                     let response = build_success_response();
+                     let _ = stream.write_all(response.as_bytes());
+                     
+                     let _ = tx.send(OAuthResult {
+                         success: true,
+                         auth_code: None,
+                         error: None,
+                         params,
+                     });
                 } else {
                     // Unknown request
                     let response = build_error_response("Invalid callback request");
@@ -433,57 +454,39 @@ pub fn start_callback_server(port: u16) -> mpsc::UnboundedReceiver<OAuthResult> 
                     let _ = tx.send(OAuthResult {
                         success: false,
                         auth_code: None,
-                        error: Some("No auth code found in callback".to_string()),
+                        error: Some("No auth code or known success param found in callback".to_string()),
+                        params,
                     });
                 }
             }
         }
         
-        tracing::info!("OAuth callback server shutting down");
+        tracing::debug!("OAuth callback server shutting down");
     });
     
     rx
 }
 
-/// Extract authorization code from OAuth callback URL
-fn extract_auth_code(request: &str) -> Option<String> {
-    // Look for "code=" in the request
-    // Request format: GET /callback?code=4/0AXXXxxx... HTTP/1.1
-    let first_line = request.lines().next()?;
-    let path = first_line.split_whitespace().nth(1)?;
+/// Extract all query parameters from the request
+fn extract_query_params(request: &str) -> std::collections::HashMap<String, String> {
+    let mut params = std::collections::HashMap::new();
     
-    // Parse query parameters
-    let query_start = path.find('?')?;
-    let query = &path[query_start + 1..];
-    
-    for param in query.split('&') {
-        if let Some((key, value)) = param.split_once('=') {
-            if key == "code" {
-                return Some(urlencoding::decode(value).unwrap_or_default().into_owned());
-            }
+    if let Some(first_line) = request.lines().next() {
+        if let Some(path) = first_line.split_whitespace().nth(1) {
+             if let Some(query_start) = path.find('?') {
+                 let query = &path[query_start + 1..];
+                 for param in query.split('&') {
+                     if let Some((key, value)) = param.split_once('=') {
+                         let decoded_key = urlencoding::decode(key).unwrap_or_default().into_owned();
+                         let decoded_value = urlencoding::decode(value).unwrap_or_default().into_owned();
+                         params.insert(decoded_key, decoded_value);
+                     }
+                 }
+             }
         }
     }
     
-    None
-}
-
-/// Extract error from OAuth callback URL
-fn extract_error(request: &str) -> Option<String> {
-    let first_line = request.lines().next()?;
-    let path = first_line.split_whitespace().nth(1)?;
-    
-    let query_start = path.find('?')?;
-    let query = &path[query_start + 1..];
-    
-    for param in query.split('&') {
-        if let Some((key, value)) = param.split_once('=') {
-            if key == "error" || key == "error_description" {
-                return Some(urlencoding::decode(value).unwrap_or_default().into_owned());
-            }
-        }
-    }
-    
-    None
+    params
 }
 
 /// Build HTML response for successful OAuth

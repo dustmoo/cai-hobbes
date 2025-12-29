@@ -84,7 +84,7 @@ pub struct FunctionResponsePart {
 pub enum Part {
     Text {
         text: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         thought: Option<bool>,
     },
     FunctionCall {
@@ -196,6 +196,18 @@ impl GeminiConnector {
         self.base_url = base_url;
         self
     }
+
+    /// Helper to build the correct API endpoint for a given model.
+    /// If model name already includes "models/" prefix (from API), use it directly.
+    /// Otherwise, prepend "models/" for backward compatibility.
+    fn build_model_endpoint(&self, model: &str, action: &str, api_key: &str) -> String {
+        let model_path = if model.starts_with("models/") {
+            model.to_string()
+        } else {
+            format!("models/{}", model)
+        };
+        format!("{}/{}:{}?key={}", self.base_url, model_path, action, api_key)
+    }
 }
 
 #[async_trait]
@@ -206,10 +218,26 @@ impl LlmConnector for GeminiConnector {
         tx: mpsc::UnboundedSender<StreamMessage>,
         mcp_context: Option<McpContext>,
     ) {
-        let api_key = self.config.api_key.clone().unwrap_or_else(|| {
-            std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
-        });
-        let model = self.config.chat_model.clone();
+        let api_key = match self.config.api_key.clone() {
+            Some(key) => key,
+            None => match std::env::var("GEMINI_API_KEY") {
+                Ok(key) => key,
+                Err(_) => {
+                    tracing::error!("GEMINI_API_KEY not set in settings or environment");
+                    let _ = tx.send(StreamMessage::Error {
+                        message: "⚠️ **API Key Not Configured**\n\nPlease set your Gemini API key in Settings → AI Model to use Hobbes.".to_string(),
+                    });
+                    return;
+                }
+            }
+        };
+        let mut model = self.config.chat_model.clone();
+        if model.starts_with("models/") {
+            model = model.strip_prefix("models/").unwrap().to_string();
+        }
+        
+        tracing::info!(model = %model, "LLM: Generating content stream");
+
     const MAX_RETRIES: u32 = 2;
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(600))
@@ -277,12 +305,38 @@ impl LlmConnector for GeminiConnector {
             }
         }
         tracing::debug!("Sending Gemini request: {:?}", sanitized_request);
+        
+        // Write the full request (with tools) to debug file for diagnosis
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if let Ok(request_json) = serde_json::to_string_pretty(&request_body) {
+                if let Ok(exe_dir) = std::env::current_dir() {
+                    let debug_dir = exe_dir.join("debug_logs");
+                    if std::fs::create_dir_all(&debug_dir).is_ok() {
+                        let file_path = debug_dir.join("gemini_request.json");
+                        if let Err(e) = std::fs::write(&file_path, &request_json) {
+                            tracing::warn!("Failed to write Gemini debug file: {}", e);
+                        } else {
+                            tracing::info!("Wrote Gemini request to debug_logs/gemini_request.json");
+                        }
+                    }
+                }
+            }
+        }
+        
         tracing::debug!("SERIALIZED REQUEST: {}", serde_json::to_string_pretty(&request_body).unwrap_or_else(|e| format!("Serialization failed: {}", e)));
         tracing::info!("Using chat model: {}", model);
     }
     // --- End Synchronous Logging Block ---
 
-    let url = format!("{}/{}:streamGenerateContent?key={}&alt=sse", self.base_url, model, api_key);
+    // --- End Synchronous Logging Block ---
+
+    let url = if self.config.chat_model.starts_with("models/") || !self.base_url.contains("generativelanguage.googleapis.com") {
+         // Use the helper for standardizing
+         self.build_model_endpoint(&self.config.chat_model, "streamGenerateContent", &api_key) + "&alt=sse"
+    } else {
+        // Fallback or explicit full path logic if ever needed, but standardizing is safer
+         self.build_model_endpoint(&self.config.chat_model, "streamGenerateContent", &api_key) + "&alt=sse"
+    };
 
     for attempt in 0..MAX_RETRIES {
         let response = match client.post(&url).json(&request_body).send().await {
@@ -353,7 +407,9 @@ impl LlmConnector for GeminiConnector {
                                                 tracing::warn!("Gemini stream finished with reason: {}", reason);
                                             }
                                         }
-                                        if let Some(part) = candidate.content.parts.get(0) {
+                                        // Process ALL parts - Gemini with thinking returns multiple parts
+                                        // (thought parts AND content parts) in a single response
+                                        for part in &candidate.content.parts {
                                             // Check if this is a thought summary part first
                                             if part.thought.unwrap_or(false) && !part.text.is_empty() {
                                                 // This is a thought summary - send it as thought_summary
@@ -380,11 +436,13 @@ impl LlmConnector for GeminiConnector {
                                                 }
                                                 
                                                 let mut found_tool = false;
+                                                
+                                                // Note: composio_meta routing removed - Tool Router handles on-demand tools
                                                 if let Some(context) = &mcp_context {
                                                     'server_loop: for server in &context.servers {
                                                         for tool in &server.tools {
-                                                            let prefixed_name = format!("{}_{}", server.name, tool.name);
-                                                            if prefixed_name == function_call.name {
+                                                            let sanitized_tool_name = crate::gemini::convert::sanitize_function_name(&format!("{}_{}", server.name, tool.name));
+                                                            if sanitized_tool_name == function_call.name {
                                                                 let tool_call = ToolCall::new(
                                                                     server.name.clone(),
                                                                     tool.name.to_string(), // Use original tool name for execution
@@ -403,17 +461,43 @@ impl LlmConnector for GeminiConnector {
                                                 }
                                                 if !found_tool {
                                                     tracing::error!("LLM requested tool '{}' which was not found in the provided context.", function_call.name);
+                                                    // Send a user-friendly message about the missing tool
+                                                    let tool_error_msg = format!(
+                                                        "⚠️ **Tool Not Available: `{}`**\n\n\
+                                                        Hobbes tried to use a tool that isn't currently loaded. This can happen if:\n\n\
+                                                        • The MCP server providing this tool is not running\n\
+                                                        • The tool requires authentication that hasn't been set up\n\
+                                                        • The tool list needs to be refreshed\n\n\
+                                                        Please check your MCP Integration settings.",
+                                                        function_call.name
+                                                    );
+                                                    if tx.send(StreamMessage::Text {
+                                                        content: tool_error_msg,
+                                                        thought_signature: None,
+                                                        thought_summary: None,
+                                                    }).is_err() {
+                                                        return;
+                                                    }
+                                                    has_sent_data = true;
                                                 }
                                             } else if !part.text.is_empty() {
-                                                // Regular text part
-                                                if tx.send(StreamMessage::Text {
-                                                    content: part.text.clone(),
-                                                    thought_signature: None,
-                                                    thought_summary: None,
-                                                }).is_err() {
-                                                    return;
+                                                // Check if the text is structured JSON that needs unwrapping
+                                                let (content, thought_summary) = if part.text.trim().starts_with('{') && part.text.trim().ends_with('}') {
+                                                    unparse_json_response(&part.text)
+                                                } else {
+                                                    (part.text.clone(), None)
+                                                };
+
+                                                if !content.is_empty() || thought_summary.is_some() {
+                                                    if tx.send(StreamMessage::Text {
+                                                        content,
+                                                        thought_signature: None,
+                                                        thought_summary: thought_summary,
+                                                    }).is_err() {
+                                                        return;
+                                                    }
+                                                    has_sent_data = true;
                                                 }
-                                                has_sent_data = true;
                                             }
                                         }
                                     }
@@ -467,7 +551,26 @@ impl LlmConnector for GeminiConnector {
             tracing::error!("Gemini finished without sending data. Finish Reason: {:?}. Request was: {}", finish_reason, serde_json::to_string_pretty(&request_body).unwrap_or_default());
             let default_message = match finish_reason.as_deref() {
                 Some("SAFETY") => "[Hobbes did not provide a response due to the safety filter.]".to_string(),
-                Some(reason) => format!("[Hobbes did not provide a response. Finish Reason: {}]", reason),
+                Some("UNEXPECTED_TOOL_CALL") => {
+                    "⚠️ **Tool Connection Issue**\n\n\
+                    Hobbes tried to use a tool that isn't currently available. Please check:\n\n\
+                    1. **Is the MCP server running?** Open Settings → MCP Integration and verify the server status.\n\
+                    2. **Is the tool connected?** For Composio tools, ensure the profile is active and connected.\n\
+                    3. **Try refreshing** the tool list by toggling the MCP server off and on.\n\n\
+                    If the issue persists, the tool may need to be re-authorized or the server restarted.".to_string()
+                },
+                Some("MALFORMED_FUNCTION_CALL") => {
+                    "⚠️ **Tool Call Error**\n\n\
+                    Hobbes encountered an issue formatting a tool request. This is usually temporary.\n\
+                    Please try your request again.".to_string()
+                },
+                Some(reason) => format!(
+                    "⚠️ **Response Issue**\n\n\
+                    Hobbes could not complete the response.\n\
+                    **Reason:** {}\n\n\
+                    If this persists, try simplifying your request or checking your tool connections.",
+                    reason
+                ),
                 None => "[Hobbes did not provide a response due to an internal error.]".to_string(),
             };
             if tx.send(StreamMessage::Text {
@@ -488,11 +591,23 @@ impl LlmConnector for GeminiConnector {
         previous_summary: String,
         recent_messages: String,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let api_key = self.config.api_key.clone().unwrap_or_else(|| {
-            std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
-        });
-        let model = self.config.summary_model.clone();
-    let client = Client::builder()
+        tracing::info!(model = %self.config.summary_model, "LLM: Summarizing conversation");
+        
+        let api_key = match self.config.api_key.clone() {
+
+            Some(key) => key,
+            None => match std::env::var("GEMINI_API_KEY") {
+                Ok(key) => key,
+                Err(_) => {
+                    tracing::warn!("Skipping summarization: GEMINI_API_KEY not set in settings or environment");
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "GEMINI_API_KEY not configured",
+                    )) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+        };
+        let client = Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .expect("Failed to build reqwest client");
@@ -535,8 +650,8 @@ Recent Messages:
         generation_config: None,
     };
 
-    tracing::info!("Using summary model: {}", model);
-    let url = format!("{}/{}:generateContent?key={}", self.base_url, model, api_key);
+    tracing::info!("Using summary model: {}", self.config.summary_model);
+    let url = self.build_model_endpoint(&self.config.summary_model, "generateContent", &api_key);
 
     let response = client
         .post(&url)
@@ -597,12 +712,66 @@ Recent Messages:
 }
 }
 
+fn unparse_json_response(text: &str) -> (String, Option<String>) {
+    // Attempt to parse the text directly as JSON.
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(obj) = json.as_object() {
+            // Check for common fields in the model's structured output
+            let reply_text = obj.get("reply_text")
+                .or_else(|| obj.get("content"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            
+            let thought = obj.get("thought")
+                .or_else(|| obj.get("thought_summary"))
+                .or_else(|| obj.get("action_name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            
+            // If we found either a reply or a thought, consider it a successful unwrap
+            if reply_text.is_some() || thought.is_some() {
+                return (reply_text.unwrap_or_default(), thought);
+            }
+        }
+    }
+    
+    // If not valid JSON or doesn't have the expected fields, return as-is
+    (text.to_string(), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wiremock::{MockServer, Mock, ResponseTemplate};
     use wiremock::matchers::{method, path};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn test_unparse_json_response() {
+        // Test with reply_text and thought
+        let text = r#"{"reply_text": "Hello world", "thought": "The user said hello"}"#;
+        let (content, thought) = unparse_json_response(text);
+        assert_eq!(content, "Hello world");
+        assert_eq!(thought, Some("The user said hello".to_string()));
+
+        // Test with content and action_name
+        let text = r#"{"content": "Checking status", "action_name": "Checking system health"}"#;
+        let (content, thought) = unparse_json_response(text);
+        assert_eq!(content, "Checking status");
+        assert_eq!(thought, Some("Checking system health".to_string()));
+
+        // Test with invalid JSON
+        let text = "Just some plain text";
+        let (content, thought) = unparse_json_response(text);
+        assert_eq!(content, "Just some plain text");
+        assert!(thought.is_none());
+
+        // Test with JSON but missing expected fields
+        let text = r#"{"other_field": "some value"}"#;
+        let (content, thought) = unparse_json_response(text);
+        assert_eq!(content, text);
+        assert!(thought.is_none());
+    }
 
     #[tokio::test]
     async fn test_thinking_summary_parsing() {
@@ -697,5 +866,183 @@ mod tests {
 
         assert!(thought_received, "Did not receive thought summary");
         assert!(content_received, "Did not receive content");
+    }
+
+    #[tokio::test]
+    async fn test_unexpected_tool_call_error_message() {
+        let mock_server = MockServer::start().await;
+
+        // Simulate a response with UNEXPECTED_TOOL_CALL finish reason and no content
+        let response_json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": []
+                },
+                "finishReason": "UNEXPECTED_TOOL_CALL"
+            }]
+        });
+
+        let response_body = format!("data: {}\n\n", response_json.to_string());
+
+        Mock::given(method("POST"))
+            .and(path("/gemini-2.5-pro:streamGenerateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
+            .mount(&mock_server)
+            .await;
+
+        let config = GeminiConfig {
+            api_key: Some("test-key".to_string()),
+            chat_model: "gemini-2.5-pro".to_string(),
+            summary_model: "gemini-1.5-flash-latest".to_string(),
+            thinking_enabled: false,
+            thinking_level: "high".to_string(),
+            thinking_budget: None,
+        };
+
+        let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
+        
+        let prompt_data = LlmPrompt {
+            contents: vec![Content {
+                role: "user".to_string(),
+                parts: vec![Part::Text { text: "Use a tool".to_string(), thought: None }],
+            }],
+            tools: None,
+            system_instruction: None,
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        connector.generate_content_stream(prompt_data, tx, None).await;
+
+        let mut received_error_guidance = false;
+        while let Some(msg) = rx.recv().await {
+            if let StreamMessage::Text { content, .. } = msg {
+                if content.contains("Tool Connection Issue") && content.contains("MCP server running") {
+                    received_error_guidance = true;
+                }
+            }
+        }
+
+        assert!(received_error_guidance, "Should receive user-friendly error guidance for UNEXPECTED_TOOL_CALL");
+    }
+
+    #[tokio::test]
+    async fn test_safety_filter_error_message() {
+        let mock_server = MockServer::start().await;
+
+        let response_json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": []
+                },
+                "finishReason": "SAFETY"
+            }]
+        });
+
+        let response_body = format!("data: {}\n\n", response_json.to_string());
+
+        Mock::given(method("POST"))
+            .and(path("/gemini-2.5-pro:streamGenerateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
+            .mount(&mock_server)
+            .await;
+
+        let config = GeminiConfig {
+            api_key: Some("test-key".to_string()),
+            chat_model: "gemini-2.5-pro".to_string(),
+            summary_model: "gemini-1.5-flash-latest".to_string(),
+            thinking_enabled: false,
+            thinking_level: "high".to_string(),
+            thinking_budget: None,
+        };
+
+        let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
+        
+        let prompt_data = LlmPrompt {
+            contents: vec![Content {
+                role: "user".to_string(),
+                parts: vec![Part::Text { text: "Test".to_string(), thought: None }],
+            }],
+            tools: None,
+            system_instruction: None,
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        connector.generate_content_stream(prompt_data, tx, None).await;
+
+        let mut received_safety_message = false;
+        while let Some(msg) = rx.recv().await {
+            if let StreamMessage::Text { content, .. } = msg {
+                if content.contains("safety filter") {
+                    received_safety_message = true;
+                }
+            }
+        }
+
+        assert!(received_safety_message, "Should receive safety filter message");
+    }
+
+    #[tokio::test]
+    async fn test_tool_not_found_sends_user_message() {
+        let mock_server = MockServer::start().await;
+
+        // Response with a function call for a tool that won't be in the context
+        let response_json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "unknown_server_nonexistent_tool",
+                            "args": {}
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+
+        let response_body = format!("data: {}\n\n", response_json.to_string());
+
+        Mock::given(method("POST"))
+            .and(path("/gemini-2.5-pro:streamGenerateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
+            .mount(&mock_server)
+            .await;
+
+        let config = GeminiConfig {
+            api_key: Some("test-key".to_string()),
+            chat_model: "gemini-2.5-pro".to_string(),
+            summary_model: "gemini-1.5-flash-latest".to_string(),
+            thinking_enabled: false,
+            thinking_level: "high".to_string(),
+            thinking_budget: None,
+        };
+
+        let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
+        
+        let prompt_data = LlmPrompt {
+            contents: vec![Content {
+                role: "user".to_string(),
+                parts: vec![Part::Text { text: "Use a tool".to_string(), thought: None }],
+            }],
+            tools: None,
+            system_instruction: None,
+        };
+
+        // Pass an empty MCP context so the tool won't be found
+        let mcp_context = Some(crate::mcp::manager::McpContext { servers: vec![] });
+        
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        connector.generate_content_stream(prompt_data, tx, mcp_context).await;
+
+        let mut received_tool_error = false;
+        while let Some(msg) = rx.recv().await {
+            if let StreamMessage::Text { content, .. } = msg {
+                if content.contains("Tool Not Available") && content.contains("unknown_server_nonexistent_tool") {
+                    received_tool_error = true;
+                }
+            }
+        }
+
+        assert!(received_tool_error, "Should receive tool not available error with tool name");
     }
 }

@@ -91,6 +91,15 @@ module.exports = {
             h3: { color: theme('colors.primary.300') },
             h4: { color: theme('colors.primary.300') },
             p: { color: theme('colors.dark-text') },
+            // Remove hr styling for cleaner bubble display
+            hr: { 
+              display: 'none',
+            },
+            // Adjust link spacing
+            'a': {
+              padding: '0',
+              margin: '0',
+            },
           },
         },
       }),

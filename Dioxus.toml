@@ -21,5 +21,9 @@ script = []
 script = []
 
 [bundle]
-identifier = "ai.clearmirror"
+identifier = "ai.clearmirror.cai-hobbes"
 publisher = "clearmirror.ai"
+icon = ["assets/icon.icns"]
+
+[bundle.info]
+NSFaceIDUsageDescription = "Hobbes uses Touch ID to securely access your API keys in the Keychain."

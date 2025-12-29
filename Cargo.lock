@@ -4,14 +4,16 @@ version = 4
 
 [[package]]
 name = "Hobbes"
-version = "0.9.3"
+version = "0.9.4-rc"
 dependencies = [
  "ammonia",
  "arboard",
  "async-trait",
  "base64 0.22.1",
+ "block2 0.6.2",
  "cfg-if",
  "chrono",
+ "core-foundation 0.10.1",
  "dioxus",
  "dioxus-desktop",
  "dioxus-free-icons",
@@ -30,6 +32,10 @@ dependencies = [
  "image",
  "lazy_static",
  "macos-accessibility-client",
+ "objc2 0.6.3",
+ "objc2-foundation 0.3.2",
+ "objc2-local-authentication",
+ "objc2-security",
  "open",
  "pulldown-cmark 0.11.3",
  "qdrant-client",
@@ -38,6 +44,7 @@ dependencies = [
  "rfd 0.15.4",
  "rmcp",
  "security-framework 2.11.1",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2",
@@ -5404,6 +5411,7 @@ checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.10.0",
  "block2 0.6.2",
+ "libc",
  "objc2 0.6.3",
  "objc2-core-foundation",
 ]
@@ -5417,6 +5425,18 @@ dependencies = [
  "bitflags 2.10.0",
  "objc2 0.6.3",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-local-authentication"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48e0b8b339e0d9d2ed4416b7f93f9d4daadff7d4dd797f89867cde11aeac607"
+dependencies = [
+ "block2 0.6.2",
+ "objc2 0.6.3",
+ "objc2-foundation 0.3.2",
+ "objc2-security",
 ]
 
 [[package]]
@@ -5442,6 +5462,19 @@ dependencies = [
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
  "objc2-metal",
+]
+
+[[package]]
+name = "objc2-security"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "709fe137109bd1e8b5a99390f77a7d8b2961dafc1a1c5db8f2e60329ad6d895a"
+dependencies = [
+ "bitflags 2.10.0",
+ "block2 0.6.2",
+ "libc",
+ "objc2 0.6.3",
+ "objc2-core-foundation",
 ]
 
 [[package]]

@@ -289,9 +289,18 @@ impl SessionState {
         tracing::debug!("Updating window size in state to: {}x{}", width, height);
         self.window_width = width;
         self.window_height = height;
-        if let Err(e) = self.save() {
-            tracing::error!("Failed to save session state after updating window size: {}", e);
-        }
+        // Note: Save is now handled asynchronously by the caller to avoid UI hang.
+        // The caller should invoke save_async() after updating window size.
+    }
+
+    /// Saves the session state to disk on a background thread.
+    /// This prevents blocking the main UI thread during file I/O.
+    pub fn save_async(state: SessionState) {
+        std::thread::spawn(move || {
+            if let Err(e) = state.save() {
+                tracing::error!("Failed to save session state async: {}", e);
+            }
+        });
     }
 
     pub fn update_session_name(&mut self, id: &str, new_name: String) {

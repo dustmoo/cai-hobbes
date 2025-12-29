@@ -15,14 +15,41 @@ This project is built with Dioxus and Rust.
 ### Prerequisites
 - Rust toolchain
 - Dioxus CLI (`dx`)
+- For production builds: Apple Developer certificate and provisioning profile
 
-### Serving Your App
+### Development
 
 Run the following command in the root of your project to start developing:
 
 ```bash
 dx serve --platform desktop
 ```
+
+### Release Build
+
+To build an unsigned release:
+
+```bash
+dx build --release
+```
+
+The app will be at `target/dx/Hobbes/release/macos/Hobbes.app`
+
+### Production Build (Code Signed)
+
+For production builds with biometric keychain access, use the build script:
+
+```bash
+./scripts/build_release.sh
+```
+
+This script:
+1. Builds the release binary
+2. Patches `Info.plist` with `NSFaceIDUsageDescription` for Touch ID
+3. Embeds the provisioning profile
+4. Code signs with your Developer certificate
+
+> **Note:** Edit `scripts/build_release.sh` to set your own `IDENTITY` (signing certificate) before running.
 
 ## Architecture
 

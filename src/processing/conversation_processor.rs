@@ -4,14 +4,16 @@ use crate::settings::Settings;
 use crate::components::shared::{MessageContent};
 use std::sync::Arc;
 
+use dioxus::prelude::*;
+
 /// Processes conversation history to extract and update short-term context.
 pub struct ConversationProcessor {
-    llm_connector: Arc<dyn LlmConnector>,
+    llm_connector: Signal<Arc<dyn LlmConnector>>,
 }
 
 impl ConversationProcessor {
     /// Creates a new `ConversationProcessor`.
-    pub fn new(llm_connector: Arc<dyn LlmConnector>) -> Self {
+    pub fn new(llm_connector: Signal<Arc<dyn LlmConnector>>) -> Self {
         Self { llm_connector }
     }
 
@@ -49,7 +51,7 @@ impl ConversationProcessor {
         }
 
         // 3. Call the LLM to refine the summary
-        match self.llm_connector.summarize_conversation(
+        match self.llm_connector.read().summarize_conversation(
             previous_summary,
             recent_history,
         )

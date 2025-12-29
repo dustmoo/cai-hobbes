@@ -336,7 +336,7 @@ pub fn ChatInput(
                                                 if let Err(e) = std::fs::write(&file_name, &context_string) {
                                                     tracing::error!("Failed to write debug prompt to file: {}", e);
                                                 } else {
-                                                    tracing::info!("Debug prompt written to {}", &file_name);
+                                                    tracing::debug!("Debug prompt written to {}", &file_name);
                                                 }
                                             });
                                         },

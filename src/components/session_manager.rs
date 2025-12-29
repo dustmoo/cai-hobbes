@@ -22,7 +22,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
     // Pagination and Filtering State
     let mut filter_query = use_signal(String::new);
     let mut current_page = use_signal(|| 0);
-    let items_per_page = 10;
+    let mut items_per_page = use_signal(|| 10);
 
     let sessions = session_state.read();
     let active_id = sessions.active_session_id.clone();
@@ -38,7 +38,8 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
         .collect();
 
     let total_items = filtered_sessions.len();
-    let total_pages = (total_items as f64 / items_per_page as f64).ceil() as usize;
+    let limit = *items_per_page.read();
+    let total_pages = (total_items as f64 / limit as f64).ceil() as usize;
     let total_pages = if total_pages == 0 { 1 } else { total_pages };
 
     // Ensure current page is valid
@@ -46,8 +47,8 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
         current_page.set(total_pages.saturating_sub(1));
     }
 
-    let start_index = *current_page.read() * items_per_page;
-    let end_index = (start_index + items_per_page).min(total_items);
+    let start_index = *current_page.read() * limit;
+    let end_index = (start_index + limit).min(total_items);
     
     let paginated_sessions = if start_index < total_items {
         &filtered_sessions[start_index..end_index]
@@ -56,10 +57,9 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
     };
 
     rsx! {
+        // Main content of the session manager
         div {
-            // Main content of the session manager
-            div {
-                class: "flex flex-col bg-dark-bg text-white h-full w-full p-4",
+            class: "flex flex-col bg-dark-bg text-white h-full w-full p-4",
                 h2 { class: "text-lg font-bold mb-4", "Sessions" }
                 
                 // Search Input
@@ -169,10 +169,13 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                 div {
                     class: "mt-auto pt-4 border-t border-gray-700",
                     
-                    // Pagination Controls
-                    if total_pages > 1 {
+                    // Controls Container
+                    div {
+                        class: "flex flex-col gap-3 mb-4",
+                        
+                        // Pagination Controls
                         div {
-                            class: "flex justify-between items-center mb-4 px-2 text-sm text-gray-400",
+                            class: "flex justify-between items-center px-2 text-sm text-gray-400",
                             button {
                                 class: "p-2 rounded hover:bg-dark-card disabled:opacity-50 disabled:cursor-not-allowed transition-colors",
                                 disabled: *current_page.read() == 0,
@@ -183,7 +186,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                 Icon { icon: fi_icons::FiChevronLeft, width: 18, height: 18 }
                             }
                             span {
-                                class: "font-medium",
+                                class: "font-medium select-none",
                                 "Page {*current_page.read() + 1} of {total_pages}"
                             }
                             button {
@@ -194,6 +197,26 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                     current_page.set(p + 1);
                                 },
                                 Icon { icon: fi_icons::FiChevronRight, width: 18, height: 18 }
+                            }
+                        }
+
+                        // Items Per Page Selector
+                        div {
+                            class: "flex justify-between items-center px-2 text-xs text-gray-400",
+                            span { "Sessions per page:" }
+                            select {
+                                class: "bg-dark-input border border-primary-600 rounded px-2 py-1 text-white text-xs focus:outline-none focus:ring-1 focus:ring-primary-500 cursor-pointer",
+                                value: "{items_per_page.read()}",
+                                onchange: move |evt| {
+                                    if let Ok(val) = evt.value().parse::<usize>() {
+                                        items_per_page.set(val);
+                                        current_page.set(0);
+                                    }
+                                },
+                                option { value: "10", "10" }
+                                option { value: "20", "20" }
+                                option { value: "50", "50" }
+                                option { value: "100", "100" }
                             }
                         }
                     }
@@ -210,4 +233,3 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
             }
         }
     }
-}

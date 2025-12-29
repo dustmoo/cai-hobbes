@@ -1,6 +1,6 @@
 [package]
 name = "Hobbes"
-version = "0.9.3"
+version = "0.9.4-rc"
 authors = ["Dustin Moore <dustin@clearmirror.ai>", "Gemini 2.5/3 Pro and Flash (and a touch of Claude 3.7/4.5 Sonnet)"]
 edition = "2024"
 
@@ -82,6 +82,16 @@ open = "5.3.3"
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = { workspace = true }
 security-framework = "2.11.0"
+# Biometric authentication (Touch ID) support via LAContext
+objc2 = "0.6"
+objc2-local-authentication = "0.3"
+objc2-foundation = "0.3"
+block2 = "0.6"
+# Low-level FFI for keychain operations with auth context
+core-foundation = "0.10"
+security-framework-sys = "2.11.0"
+# Official Apple Security.framework bindings for SecAccessControl
+objc2-security = { version = "0.3", features = ["SecAccessControl", "SecItem"] }
 [package.metadata.bundle]
 name = "Hobbes"
 identifier = "ai.clearmirror.cai-hobbes"

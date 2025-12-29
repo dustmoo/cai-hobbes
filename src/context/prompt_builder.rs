@@ -7,6 +7,13 @@ use serde_json::{self, json};
 use crate::components::chat::Message;
 use crate::components::shared::MessageContent;
 
+/// Gemini API has a limit of 128 function declarations per request.
+/// See: https://ai.google.dev/gemini-api/docs/function-calling#best-practices
+const GEMINI_TOOL_LIMIT: usize = 128;
+
+#[cfg(test)]
+mod prompt_builder_tests;
+
 impl From<Message> for Content {
     fn from(msg: Message) -> Self {
         let role = if msg.author == "User" { "user" } else { "model" }.to_string();
@@ -66,55 +73,70 @@ impl<'a> PromptBuilder<'a> {
         user_message: String,
         _last_agent_message: Option<String>,
     ) -> LlmPrompt {
-        // 1. Extract and format tools from the session context.
+        // Note: Tool Router handles on-demand tools via search→execute pattern.
+        // Force-loaded toolkits (force_load: true) have their tools included below.
+        // No filtering needed here - all tools from the MCP context are included.
+        
+        // 1. Extract and format tools from the session context using TYPE-SAFE conversion.
+        // Tools that fail conversion (incompatible with Gemini) are logged and skipped.
+        let mut tools_truncated_count = 0usize;
         let tools = self.session.active_context.mcp_tools.as_ref().map(|mcp_context| {
             let mut function_declarations = Vec::new();
             for server in &mcp_context.servers {
                 for tool in &server.tools {
-                    if let Ok(mut tool_value) = serde_json::to_value(tool) {
-                        if let Some(obj) = tool_value.as_object_mut() {
-                            // 1. Remove invalid keys from the top-level of the function declaration itself.
-                            obj.remove("annotations");
-                            obj.remove("outputSchema");
-                            obj.remove("_meta");
-
-                            // 2. Rename inputSchema to parameters and sanitize it.
-                            if let Some(mut schema) = obj.remove("inputSchema") {
-                                // 3. Sanitize the entire schema recursively.
-                                recursively_sanitize_schema(&mut schema);
-
-                                // 4. Enforce top-level structural requirements after sanitization.
-                                if let Some(schema_obj) = schema.as_object_mut() {
-                                    schema_obj.remove("$schema");
-
-                                    // Gemini requires `type: "object"` if `properties` are present.
-                                    if schema_obj.contains_key("properties") {
-                                        schema_obj.insert("type".to_string(), json!("OBJECT"));
-                                    }
+                    // Use type-safe conversion - if it fails, skip the tool
+                    match crate::gemini::convert::mcp_tool_to_gemini(tool, &server.name) {
+                        Ok(gemini_decl) => {
+                            // Convert the type-safe struct to JSON Value for the existing API
+                            match serde_json::to_value(&gemini_decl) {
+                                Ok(tool_value) => {
+                                    function_declarations.push(tool_value);
                                 }
-                                obj.insert("parameters".to_string(), schema);
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Tool '{}' serialization failed: {}. Skipping.",
+                                        tool.name, e
+                                    );
+                                }
                             }
                         }
-                        // Finally, remove the 'title' field from the top-level tool declaration, as it's not supported by Gemini.
-                        if let Some(obj) = tool_value.as_object_mut() {
-                            obj.remove("title");
-                            
-                            // Prefix the tool name with the server name to avoid collisions
-                            if let Some(name_val) = obj.get("name").and_then(|v| v.as_str()) {
-                                let new_name = format!("{}_{}", server.name, name_val);
-                                obj.insert("name".to_string(), json!(new_name));
-                            }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Tool '{}:{}' incompatible with Gemini: {}. Skipping.",
+                                server.name, tool.name, e
+                            );
                         }
-                        function_declarations.push(tool_value);
                     }
                 }
             }
+            
+            // Enforce Gemini's 128-tool limit to prevent 400 errors
+            if function_declarations.len() > GEMINI_TOOL_LIMIT {
+                let original_count = function_declarations.len();
+                tools_truncated_count = original_count - GEMINI_TOOL_LIMIT;
+                function_declarations.truncate(GEMINI_TOOL_LIMIT);
+                tracing::warn!(
+                    "Tool count ({}) exceeds Gemini limit ({}). Truncated {} tools.",
+                    original_count, GEMINI_TOOL_LIMIT, tools_truncated_count
+                );
+            }
+            
             vec![Tool { function_declarations }]
         });
+
 
         // 2. Build the system instruction from the remaining context.
         let mut active_context = self.session.active_context.clone();
         let mut persona = self.settings.persona.clone();
+        
+        // Inject warning if tools were truncated to fit Gemini limits
+        if tools_truncated_count > 0 {
+            persona = format!(
+                "{}\n\nSYSTEM WARNING: {} tools were temporarily disabled because the total tool count exceeded the API limit of {}. Please inform the user that some tools might be unavailable and suggest using a specific toolkit or disabling unused ones.",
+                persona, tools_truncated_count, GEMINI_TOOL_LIMIT
+            );
+        }
+
         if let Some(instruction) = &self.settings.force_tool_use_instruction {
             persona = format!("{}\n\nCRITICAL INSTRUCTION: {}", persona, instruction);
         }
@@ -197,14 +219,21 @@ impl<'a> PromptBuilder<'a> {
             }),
         );
 
-        let instruction_text = serde_json::to_string(&system_context_map).unwrap_or_default();
-        let system_instruction = if !instruction_text.is_empty() && instruction_text != "{}" {
-            Some(SystemInstruction {
-                parts: vec![Part::Text { text: instruction_text, thought: None }],
-            })
-        } else {
-            None
-        };
+        let persona = system_context_map.remove("system_persona")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+
+        let context_json = serde_json::to_string_pretty(&system_context_map).unwrap_or_default();
+        
+        let mut parts = vec![Part::Text { text: persona, thought: None }];
+        if !context_json.is_empty() && context_json != "{}" {
+            parts.push(Part::Text { 
+                text: format!("\n\n<SYSTEM_CONTEXT>\n{}\n</SYSTEM_CONTEXT>", context_json),
+                thought: None 
+            });
+        }
+
+        let system_instruction = Some(SystemInstruction { parts });
 
         // 3. Construct the conversational contents.
         let mut contents = Vec::new();
@@ -319,8 +348,12 @@ impl<'a> PromptBuilder<'a> {
 
                         if result_string.len() > max_len {
                             let original_len = result_string.len();
-                            result_string.truncate(max_len);
-                            result_string.push_str(&format!("... [Output truncated from {} chars - excessive size]", original_len));
+                            let mut truncated_len = max_len;
+                            while truncated_len > 0 && !result_string.is_char_boundary(truncated_len) {
+                                truncated_len -= 1;
+                            }
+                            result_string.truncate(truncated_len);
+                            result_string.push_str(&format!("... [Output truncated from {} bytes - excessive size]", original_len));
                         }
 
                         let result_value: serde_json::Value = serde_json::from_str(&result_string)
@@ -377,7 +410,47 @@ impl<'a> PromptBuilder<'a> {
     }
 }
 
-/// A comprehensive, recursive sanitizer for Gemini tool schemas.
+/// Recursively traverses a serde_json::Value and removes specified keys.
+fn recursively_remove_keys(value: &mut serde_json::Value, keys_to_remove: &[&str]) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in keys_to_remove {
+                map.remove(*key);
+            }
+            
+            // Check properties for string values and remove them
+            // This catches the 'value': 'OBJECT' case specifically requested by the user logic
+            if let Some(props_val) = map.get_mut("properties") {
+                if let Some(props_map) = props_val.as_object_mut() {
+                     let keys_to_strip: Vec<String> = props_map.iter()
+                        .filter_map(|(k, v)| {
+                            if v.as_str().is_some() {
+                                return Some(k.clone());
+                            }
+                            None
+                        })
+                        .collect();
+                     for k in keys_to_strip {
+                         props_map.remove(&k);
+                     }
+                }
+            }
+
+            for (_, val) in map.iter_mut() {
+                recursively_remove_keys(val, keys_to_remove);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for val in arr.iter_mut() {
+                recursively_remove_keys(val, keys_to_remove);
+            }
+        }
+        _ => {}
+    }
+}
+
+
+
 fn recursively_sanitize_schema(value: &mut serde_json::Value) {
     // Pass 1: Simplify complex structures first.
     simplify_schema(value);
@@ -475,10 +548,34 @@ fn fix_and_remove_invalid_fields(value: &mut serde_json::Value) {
             "additionalProperties",
             "$ref",
             "_meta",
-            // "type" // DO NOT REMOVE: This is required for nested objects and arrays.
+            "minimum",
+            "maximum",
+            "title",
+            "default",
         ];
         for key in &keys_to_remove {
             map.remove(*key);
+        }
+
+        // Rule 5: Remove any property inside `properties` that is a string value.
+        // This catches malformed schemas like {"properties": {"type": "OBJECT", ...}}
+        // where "type" is incorrectly a property name instead of a schema field.
+        if let Some(props_val) = map.get_mut("properties") {
+            if let Some(props_map) = props_val.as_object_mut() {
+                let keys_to_strip: Vec<String> = props_map
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if v.as_str().is_some() {
+                            Some(k.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for k in keys_to_strip {
+                    props_map.remove(&k);
+                }
+            }
         }
 
         // Recurse into all child values after processing the current level.
@@ -740,12 +837,13 @@ mod tests {
         assert_eq!(enum_values[2], "null");
         assert_eq!(enum_values[3], "3.14");
 
-        // Check empty items array is converted to an empty object
+        // Check empty items array is converted to a default STRING schema by simplify_compound_types
         let empty_items_array = complex_props.get("empty_items_array").unwrap();
         assert_eq!(empty_items_array.get("type"), Some(&json!("ARRAY")));
         let empty_items = empty_items_array.get("items").unwrap();
         assert!(empty_items.is_object());
-        assert!(empty_items.as_object().unwrap().is_empty());
+        // Empty items array defaults to STRING type in simplify_compound_types
+        assert_eq!(empty_items.get("type"), Some(&json!("STRING")));
     }
     #[test]
     fn test_build_prompt_with_continuation_placeholder() {
@@ -954,5 +1052,103 @@ mod tests {
         });
         
         assert!(weather_tool.is_some(), "Tool name should be prefixed with server name. Found: {:?}", found_names);
+    }
+
+    #[test]
+    fn test_sanitize_array_with_missing_items() {
+        // Test tool with array properties missing the `items` field
+        let tool: Tool = serde_json::from_value(json!({
+            "name": "test_tool",
+            "description": "A tool to test missing items handling",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "array_no_items": {
+                        "type": "array"
+                        // `items` is completely missing
+                    },
+                    "array_null_items": {
+                        "type": "array",
+                        "items": null
+                    },
+                    "nested_object_with_array_no_items": {
+                        "type": "object",
+                        "properties": {
+                            "inner_array": {
+                                "type": "array"
+                                // `items` is missing in nested array
+                            }
+                        }
+                    },
+                    "array_type_in_union": {
+                        "type": ["array", "null"]
+                        // `items` is missing for union type with array
+                    },
+                    "normal_array": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let server = McpServerContext {
+            name: "test_server".to_string(),
+            description: "Test server".to_string(),
+            tools: vec![tool],
+        };
+
+        let mcp_context = McpContext {
+            servers: vec![server],
+        };
+
+        let active_context = ActiveContext {
+            mcp_tools: Some(mcp_context),
+            conversation_summary: ConversationSummary::default(),
+            ..Default::default()
+        };
+
+        let session = Session {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            messages: vec![],
+            active_context,
+            last_updated: Utc::now(),
+        };
+
+        let settings = Settings::default();
+        let session_state = crate::session::SessionState::default();
+        let builder = PromptBuilder::new(&session, &settings, &session_state);
+
+        let prompt = builder.build_prompt("Test".to_string(), None);
+        let tools = prompt.tools.expect("Should have tools");
+        let tool_json = &tools[0].function_declarations[0];
+        let properties = tool_json.get("parameters").unwrap().get("properties").unwrap();
+
+        // Test 1: Array with no items should now have items: {}
+        let array_no_items = properties.get("array_no_items").unwrap();
+        assert_eq!(array_no_items.get("type"), Some(&json!("ARRAY")));
+        assert!(array_no_items.get("items").is_some(), "Missing items should be added");
+        assert!(array_no_items.get("items").unwrap().is_object(), "Items should be an object");
+
+        // Test 2: Array with null items should now have items: {}
+        let array_null_items = properties.get("array_null_items").unwrap();
+        assert_eq!(array_null_items.get("type"), Some(&json!("ARRAY")));
+        assert!(array_null_items.get("items").is_some(), "Null items should be replaced");
+        assert!(array_null_items.get("items").unwrap().is_object(), "Items should be an object");
+
+        // Test 3: Nested array should also have items added
+        let nested = properties.get("nested_object_with_array_no_items").unwrap();
+        let inner_array = nested.get("properties").unwrap().get("inner_array").unwrap();
+        assert!(inner_array.get("items").is_some(), "Nested array should have items added");
+
+        // Test 4: Array type in union should also have items added
+        let array_union = properties.get("array_type_in_union").unwrap();
+        assert!(array_union.get("items").is_some(), "Union with array type should have items added");
+
+        // Test 5: Normal array should keep its existing items
+        let normal_array = properties.get("normal_array").unwrap();
+        assert_eq!(normal_array.get("items").unwrap().get("type"), Some(&json!("STRING")));
     }
 }

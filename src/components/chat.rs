@@ -22,14 +22,18 @@ use super::continuation_controller::ContinuationController;
 use super::chat_input::ChatInput;
 use super::message_list::MessageList;
 use crate::context::permissions::PermissionManager;
-use crate::components::markdown_renderer::MarkdownRenderer;
+use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRenderer};
 use super::confirm_delete_modal::ConfirmDeleteModal;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SelectionData {
     text: String,
+    #[serde(default)]
     top: f64,
+    #[serde(default)]
     left: f64,
+    #[serde(default)]
+    hide: bool,
 }
 
 lazy_static! {
@@ -194,7 +198,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 let mut active_message_id = active_message_id;
 
                 active_message_id.set(Some(hobbes_message_id));
-                tracing::info!("Lock ACQUIRED.");
+                tracing::debug!("Lock ACQUIRED.");
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<()>();
 
@@ -214,9 +218,9 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 );
 
                 rx.recv().await;
-                tracing::info!(message_id = %hobbes_message_id, "Stream completion signal RECEIVED.");
+                tracing::debug!(message_id = %hobbes_message_id, "Stream completion signal RECEIVED.");
 
-                tracing::info!("Lock RELEASED.");
+                tracing::debug!("Lock RELEASED.");
             });
         }
     };
@@ -398,9 +402,9 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
         let send_prompt_to_llm = send_prompt_to_llm;
 
         Rc::new(move || {
-            tracing::info!("continue_prompt_flow callback INVOKED.");
+            tracing::debug!("continue_prompt_flow callback INVOKED.");
             spawn(async move {
-                tracing::info!("continue_prompt_flow task SPAWNED.");
+                tracing::debug!("continue_prompt_flow task SPAWNED.");
                 let mut session_state = session_state;
                 let settings = settings.read().clone();
                 let send_prompt_to_llm = send_prompt_to_llm;
@@ -432,7 +436,7 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                 }
 
                 let mcp_context = session_state.read().get_active_session().and_then(|s| s.active_context.mcp_tools.clone());
-                tracing::info!("Sending continuation prompt to LLM.");
+                tracing::debug!("Sending continuation prompt to LLM.");
                 send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
             });
         })
@@ -561,9 +565,9 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
 
     rsx! {
         div {
-            class: "code-block-wrapper relative bg-dark-section rounded-lg my-2",
+            class: "code-block-wrapper relative bg-dark-section rounded-lg my-2 overflow-hidden min-w-0",
             button {
-                class: "absolute top-2 right-2 p-1.5 rounded text-gray-400 hover:bg-dark-card hover:text-white transition-colors",
+                class: "absolute top-2 right-2 p-1.5 rounded text-gray-400 hover:bg-dark-card hover:text-white transition-colors z-10",
                 onclick: move |evt| {
                     evt.stop_propagation();
                     copy_onclick(evt);
@@ -583,7 +587,7 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
                 }
             }
             pre {
-                class: "w-full max-w-none p-4 text-sm whitespace-pre-wrap break-words overflow-x-auto",
+                class: "w-full p-4 text-sm whitespace-pre-wrap break-all overflow-x-auto min-w-0",
                 code {
                     class: "language-{lang}",
                     dangerous_inner_html: "{highlighted_html}"
@@ -601,6 +605,7 @@ enum SelectionMode {
     None,
     Toolbar,
     CommentInput,
+    CommentEdit,
 }
 
 #[component]
@@ -634,6 +639,8 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
             // Inline comment state
             let mut selection_mode = use_signal(|| SelectionMode::None);
             let mut selection_data = use_signal(|| (String::new(), 0.0, 0.0)); // text, top, left
+            let mut editing_comment_id = use_signal(|| None::<String>);
+            let mut is_mouse_over_toolbar = use_signal(|| false);
             
             // Setup eval for text selection
             let message_id_str = message.id.to_string();
@@ -650,15 +657,35 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                     const range = selection.getRangeAt(0);
                                     const rect = range.getBoundingClientRect();
                                     const text = selection.toString();
-                                    dioxus.send({{ text: text, top: rect.bottom + window.scrollY, left: rect.left + window.scrollX }});
+                                    dioxus.send({{ text: text, top: rect.bottom + window.scrollY, left: rect.left + window.scrollX, hide: false }});
                                 }}
                             }});
                         }}
+
+                        // Global listener to hide toolbar when selection is cleared or user clicks out
+                        document.addEventListener('selectionchange', () => {{
+                            const selection = window.getSelection();
+                            if (selection.isCollapsed) {{
+                                dioxus.send({{ text: "", top: 0, left: 0, hide: true }});
+                            }}
+                        }});
+
+                        document.addEventListener('mousedown', (e) => {{
+                            const selection = window.getSelection();
+                            const toolbar = document.getElementById('selection-toolbar');
+                            if (bubble && !bubble.contains(e.target) && (!toolbar || !toolbar.contains(e.target))) {{
+                                dioxus.send({{ text: "", top: 0, left: 0, hide: true }});
+                            }}
+                        }});
                     "#, message_id_clone));
 
                     while let Ok(msg) = eval.recv().await {
                         if let Ok(data) = serde_json::from_value::<SelectionData>(msg) {
-                            if !data.text.trim().is_empty() {
+                            if data.hide {
+                                if !*is_mouse_over_toolbar.read() {
+                                    selection_mode.set(SelectionMode::None);
+                                }
+                            } else if !data.text.trim().is_empty() {
                                 selection_data.set((data.text.clone(), data.top, data.left));
                                 selection_mode.set(SelectionMode::Toolbar);
                             }
@@ -735,10 +762,34 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                 MarkdownRenderer { 
                                     content: content(), 
                                     comments: message.comments.clone(),
-                                    pending_highlight: if *selection_mode.read() != SelectionMode::None {
+                                    pending_highlight: if *selection_mode.read() != SelectionMode::None && *selection_mode.read() != SelectionMode::CommentEdit {
                                         Some(selection_data.read().0.clone())
                                     } else {
                                         None
+                                    },
+                                    on_comment_edit: {
+                                        let message_comments = message.comments.clone();
+                                        move |comment_id: String| {
+                                            // Find the comment to get its current text
+                                            if let Some(comment) = message_comments.iter().find(|c| c.id == comment_id) {
+                                                editing_comment_id.set(Some(comment_id));
+                                                selection_data.set((comment.text_selection.clone(), 100.0, 100.0));
+                                                selection_mode.set(SelectionMode::CommentEdit);
+                                            }
+                                        }
+                                    },
+                                    on_comment_delete: {
+                                        let message_id = message.id;
+                                        move |comment_id: String| {
+                                            // Delete the comment from session state
+                                            let mut state = session_state.write();
+                                            if let Some(msg) = state.get_message_mut(&message_id) {
+                                                msg.comments.retain(|c| c.id != comment_id);
+                                            }
+                                            if let Err(e) = state.save() {
+                                                tracing::error!("Failed to save after deleting comment: {}", e);
+                                            }
+                                        }
                                     }
                                 }
                                 if !message.attachments.is_empty() {
@@ -760,6 +811,8 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                             SelectionToolbar {
                                 position_top: selection_data.read().1,
                                 position_left: selection_data.read().2,
+                                on_mouseenter: move |_| is_mouse_over_toolbar.set(true),
+                                on_mouseleave: move |_| is_mouse_over_toolbar.set(false),
                                 on_copy: move |_| {
                                     let text = selection_data.read().0.clone();
                                     spawn(async move {
@@ -807,6 +860,45 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                 }
                             }
                         }
+                        
+                        if *selection_mode.read() == SelectionMode::CommentEdit {
+                            // Get the comment being edited
+                            {{
+                                let current_comment_text = editing_comment_id.read().as_ref().and_then(|comment_id| {
+                                    message.comments.iter()
+                                        .find(|c| &c.id == comment_id)
+                                        .map(|c| c.comment.clone())
+                                });
+                                
+                                rsx! {
+                                    crate::components::inline_comment_popover::InlineCommentPopover {
+                                        position_top: 150.0,
+                                        position_left: 150.0,
+                                        initial_value: current_comment_text,
+                                        on_save: move |new_comment_text: String| {
+                                            if let Some(comment_id) = editing_comment_id.read().clone() {
+                                                // Update the comment in session state
+                                                let mut state = session_state.write();
+                                                if let Some(msg) = state.get_message_mut(&message.id) {
+                                                    if let Some(comment) = msg.comments.iter_mut().find(|c| c.id == comment_id) {
+                                                        comment.comment = new_comment_text;
+                                                    }
+                                                }
+                                                if let Err(e) = state.save() {
+                                                    tracing::error!("Failed to save session after editing comment: {}", e);
+                                                }
+                                            }
+                                            editing_comment_id.set(None);
+                                            selection_mode.set(SelectionMode::None);
+                                        },
+                                        on_cancel: move |_| {
+                                            editing_comment_id.set(None);
+                                            selection_mode.set(SelectionMode::None);
+                                        }
+                                    }
+                                }
+                            }}
+                        }
 
                         if !is_thinking {
                             div {
@@ -845,38 +937,38 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                         
                         if !is_thinking && (local_thought_summary.read().is_some() || thought_signature.is_some()) {
                             div {
-                                class: "mt-3 pt-3 border-t border-gray-600",
+                                class: "ml-16 mb-5",
                                 button {
-                                    class: "flex items-center text-xs text-gray-400 hover:text-gray-300 focus:outline-none",
+                                    class: "flex items-center text-xs text-gray-500 hover:text-gray-300 focus:outline-none transition-colors",
                                     onclick: move |_| {
                                         let current = *show_thinking.read();
                                         show_thinking.set(!current);
                                     },
                                     if *show_thinking.read() {
                                         Icon { 
-                                            width: 12, 
-                                            height: 12, 
+                                            width: 10, 
+                                            height: 10, 
                                             icon: fi_icons::FiChevronDown,
                                             class: "mr-1"
                                         }
                                     } else {
                                         Icon { 
-                                            width: 12, 
-                                            height: 12, 
+                                            width: 10, 
+                                            height: 10, 
                                             icon: fi_icons::FiChevronRight,
                                             class: "mr-1"
                                         }
                                     }
-                                    "Thinking Process"
+                                    span { class: "opacity-70", "Thinking Process" }
                                 }
                                 if *show_thinking.read() {
                                     div {
-                                        class: "mt-2 p-3 bg-dark-bg rounded-lg text-xs text-gray-300 font-mono whitespace-pre-wrap",
+                                        class: "mt-2 p-3 bg-dark-bg rounded-lg text-xs text-gray-300",
                                         if let Some(summary) = local_thought_summary.read().as_ref() {
-                                            "{summary}"
+                                            ThinkingMarkdownRenderer { content: summary.clone(), compact: false }
                                         } else if let Some(sig) = &thought_signature {
-                                            div { class: "opacity-50 italic mb-1", "Encrypted Thought Signature:" }
-                                            "{sig}"
+                                            div { class: "opacity-50 italic mb-1 font-mono whitespace-pre-wrap", "Encrypted Thought Signature:" }
+                                            span { class: "font-mono whitespace-pre-wrap", "{sig}" }
                                         }
                                     }
                                 }
@@ -1053,7 +1145,7 @@ fn ThinkingIndicator(thinking_mode_enabled: bool, thought_summary: Option<String
                 if let Some(summary) = thought_summary {
                     div {
                         class: "text-xs text-gray-400 ml-6",
-                        "{summary}"
+                        ThinkingMarkdownRenderer { content: summary, compact: true }
                     }
                 }
             }

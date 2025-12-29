@@ -11,7 +11,7 @@ pub mod llm;
 pub mod settings_panel;
 pub mod stream_manager;
 pub mod tool_call_display;
-pub mod smithery_client;
+pub mod smithery_registry;
 pub mod shared;
 pub mod onboarding;
 pub mod mcp_marketplace;

@@ -2,9 +2,16 @@ use dioxus::prelude::*;
 use pulldown_cmark::{html, Options, Parser, Event, Tag, TagEnd, HeadingLevel};
 use ammonia::clean;
 use crate::components::chat::{CodeBlock, LinkWithControls, Comment};
+use dioxus_free_icons::{Icon, icons::fi_icons};
 
 #[component]
-pub fn MarkdownRenderer(content: String, comments: Option<Vec<Comment>>, pending_highlight: Option<String>) -> Element {
+pub fn MarkdownRenderer(
+    content: String, 
+    comments: Option<Vec<Comment>>, 
+    pending_highlight: Option<String>,
+    #[props(default)] on_comment_edit: Option<EventHandler<String>>,
+    #[props(default)] on_comment_delete: Option<EventHandler<String>>,
+) -> Element {
     let elements = {
         let content_reader = &content;
         let mut options = Options::empty();
@@ -504,18 +511,49 @@ pub fn MarkdownRenderer(content: String, comments: Option<Vec<Comment>>, pending
                     }
                 },
                 RenderNode::CommentWrapped { children, comment } => {
+                    // Render children to Elements first
+                    let rendered_children: Vec<Element> = children.into_iter()
+                        .map(|child| render_node(child, comments, pending_highlight))
+                        .collect();
+                    
                     rsx! {
                         span {
-                            class: "border-b-2 border-primary-500 font-bold cursor-pointer relative inline-block",
-                            // Tooltip
-                            div {
-                                class: "absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded shadow-lg opacity-0 hover:opacity-100 peer-hover:opacity-100 transition-opacity whitespace-nowrap z-10 pointer-events-auto",
-                                "{comment.comment}"
-                            }
+                            class: "border-b-2 border-primary-500 font-bold cursor-pointer relative inline-block group/comment",
+                            // Highlighted content
                             span {
                                 class: "peer",
-                                for child in children {
-                                    {render_node(child, comments, pending_highlight)}
+                                for child_el in rendered_children {
+                                    {child_el}
+                                }
+                            }
+                            // Tooltip - hidden and non-interactive by default
+                            // Becomes visible and interactive only when the group (parent) is hovered
+                            div {
+                                class: "absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded shadow-lg opacity-0 pointer-events-none group-hover/comment:opacity-100 group-hover/comment:pointer-events-auto transition-opacity z-50 min-w-max",
+                                div {
+                                    class: "flex flex-col gap-1",
+                                    // Comment text
+                                    div {
+                                        class: "whitespace-normal max-w-xs",
+                                        "{comment.comment}"
+                                    }
+                                    // Controls row
+                                    div {
+                                        class: "flex justify-end gap-2 mt-1 pt-1 border-t border-gray-700",
+                                        "data-comment-id": "{comment.id}",
+                                        span {
+                                            class: "p-1 hover:bg-gray-700 rounded cursor-pointer text-gray-400 hover:text-white transition-colors",
+                                            title: "Edit comment",
+                                            "data-action": "edit",
+                                            Icon { width: 12, height: 12, icon: fi_icons::FiEdit2 }
+                                        }
+                                        span {
+                                            class: "p-1 hover:bg-gray-700 rounded cursor-pointer text-gray-400 hover:text-red-400 transition-colors",
+                                            title: "Delete comment",
+                                            "data-action": "delete",
+                                            Icon { width: 12, height: 12, icon: fi_icons::FiTrash2 }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -618,11 +656,268 @@ pub fn MarkdownRenderer(content: String, comments: Option<Vec<Comment>>, pending
        blocks.into_iter().map(|b| render_block(b, comments_ref, pending_highlight_ref)).collect::<Vec<_>>()
     };
 
+    // Generate a unique ID for this renderer instance
+    let container_id = use_signal(|| format!("markdown-renderer-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("x")));
+    
+    // Set up event delegation for comment actions
+    use_effect(move || {
+        let id = container_id();
+        let on_edit = on_comment_edit.clone();
+        let on_delete = on_comment_delete.clone();
+        
+        spawn(async move {
+            let mut eval = document::eval(&format!(r#"
+                const container = document.getElementById('{}');
+                if (container) {{
+                    container.addEventListener('click', (e) => {{
+                        const target = e.target.closest('[data-action]');
+                        if (target) {{
+                            const action = target.getAttribute('data-action');
+                            const commentIdEl = target.closest('[data-comment-id]');
+                            const commentId = commentIdEl ? commentIdEl.getAttribute('data-comment-id') : null;
+                            if (commentId) {{
+                                dioxus.send({{ action: action, comment_id: commentId }});
+                            }}
+                        }}
+                    }});
+                }}
+            "#, id));
+            
+            #[derive(serde::Deserialize)]
+            struct CommentAction {
+                action: String,
+                comment_id: String,
+            }
+            
+            while let Ok(msg) = eval.recv().await {
+                if let Ok(action) = serde_json::from_value::<CommentAction>(msg) {
+                    match action.action.as_str() {
+                        "edit" => {
+                            if let Some(handler) = &on_edit {
+                                handler.call(action.comment_id);
+                            }
+                        }
+                        "delete" => {
+                            if let Some(handler) = &on_delete {
+                                handler.call(action.comment_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+    });
+
     rsx! {
         div {
-            class: "prose prose-sm dark:prose-invert max-w-none break-words",
+            id: "{container_id}",
+            class: "prose prose-sm dark:prose-invert w-full max-w-full break-words overflow-hidden",
+            style: "word-wrap: break-word; overflow-wrap: anywhere;",
             for el in elements.iter() {
                 {el.clone()}
+            }
+        }
+    }
+}
+
+/// A lightweight markdown renderer for thinking/reasoning content.
+/// 
+/// - `compact: true` - Inline formatting only, no paragraph spacing (for streaming bubble)
+/// - `compact: false` - Full markdown rendering (for Thinking Process section)
+#[component]
+pub fn ThinkingMarkdownRenderer(content: String, #[props(default = false)] compact: bool) -> Element {
+    let elements = {
+        let content_reader = &content;
+        let mut options = pulldown_cmark::Options::empty();
+        options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
+
+        let parser = pulldown_cmark::Parser::new_ext(&content_reader, options);
+
+        // Simplified IR for thinking content
+        #[derive(Debug, Clone)]
+        enum Inline {
+            Text(String),
+            Code(String),
+            SoftBreak,
+            HardBreak,
+            Emphasis(Vec<Inline>),
+            Strong(Vec<Inline>),
+        }
+
+        #[derive(Debug, Clone)]
+        enum Block {
+            Paragraph(Vec<Inline>),
+            CodeBlock { lang: String, code: String },
+        }
+
+        #[derive(Debug, Clone, PartialEq)]
+        enum InlineTag {
+            Emphasis,
+            Strong,
+        }
+
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut current_inlines: Vec<Inline> = Vec::new();
+        let mut inline_stack: Vec<(InlineTag, Vec<Inline>)> = Vec::new();
+
+        let mut code_lang = String::new();
+        let mut code_buffer = String::new();
+        let mut in_code_block = false;
+
+        let flush_inlines = |inlines: &mut Vec<Inline>, blocks: &mut Vec<Block>| {
+            if !inlines.is_empty() {
+                blocks.push(Block::Paragraph(std::mem::take(inlines)));
+            }
+        };
+
+        for event in parser {
+            match event {
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::Paragraph) => {
+                    flush_inlines(&mut current_inlines, &mut blocks);
+                }
+                pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Paragraph) => {
+                    flush_inlines(&mut current_inlines, &mut blocks);
+                }
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(kind)) => {
+                    flush_inlines(&mut current_inlines, &mut blocks);
+                    in_code_block = true;
+                    code_lang = match kind {
+                        pulldown_cmark::CodeBlockKind::Fenced(l) => l.into_string(),
+                        _ => String::new(),
+                    };
+                    code_buffer.clear();
+                }
+                pulldown_cmark::Event::End(pulldown_cmark::TagEnd::CodeBlock) => {
+                    in_code_block = false;
+                    blocks.push(Block::CodeBlock { lang: code_lang.clone(), code: code_buffer.clone() });
+                }
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::Emphasis) => {
+                    inline_stack.push((InlineTag::Emphasis, Vec::new()));
+                }
+                pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Emphasis) => {
+                    if let Some((InlineTag::Emphasis, inlines)) = inline_stack.pop() {
+                        let target = if let Some((_, parent)) = inline_stack.last_mut() { parent } else { &mut current_inlines };
+                        target.push(Inline::Emphasis(inlines));
+                    }
+                }
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::Strong) => {
+                    inline_stack.push((InlineTag::Strong, Vec::new()));
+                }
+                pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Strong) => {
+                    if let Some((InlineTag::Strong, inlines)) = inline_stack.pop() {
+                        let target = if let Some((_, parent)) = inline_stack.last_mut() { parent } else { &mut current_inlines };
+                        target.push(Inline::Strong(inlines));
+                    }
+                }
+                pulldown_cmark::Event::Text(text) => {
+                    if in_code_block {
+                        code_buffer.push_str(&text);
+                    } else {
+                        let target = if let Some((_, inlines)) = inline_stack.last_mut() { inlines } else { &mut current_inlines };
+                        let mut raw_html = String::new();
+                        pulldown_cmark::html::push_html(&mut raw_html, std::iter::once(pulldown_cmark::Event::Text(text.clone())));
+                        let sanitized = clean(&raw_html);
+                        target.push(Inline::Text(sanitized));
+                    }
+                }
+                pulldown_cmark::Event::Code(text) => {
+                    let target = if let Some((_, inlines)) = inline_stack.last_mut() { inlines } else { &mut current_inlines };
+                    target.push(Inline::Code(text.to_string()));
+                }
+                pulldown_cmark::Event::SoftBreak => {
+                    let target = if let Some((_, inlines)) = inline_stack.last_mut() { inlines } else { &mut current_inlines };
+                    target.push(Inline::SoftBreak);
+                }
+                pulldown_cmark::Event::HardBreak => {
+                    let target = if let Some((_, inlines)) = inline_stack.last_mut() { inlines } else { &mut current_inlines };
+                    target.push(Inline::HardBreak);
+                }
+                _ => {}
+            }
+        }
+        flush_inlines(&mut current_inlines, &mut blocks);
+
+        // Render functions
+        fn render_inline(inline: Inline) -> Element {
+            match inline {
+                Inline::Text(text) => rsx! { span { dangerous_inner_html: "{text}" } },
+                Inline::Code(text) => rsx! {
+                    code {
+                        class: "bg-gray-800 text-gray-200 font-mono rounded px-1",
+                        "{text}"
+                    }
+                },
+                Inline::SoftBreak => rsx! { " " },
+                Inline::HardBreak => rsx! { br {} },
+                Inline::Emphasis(children) => rsx! {
+                    em {
+                        for child in children { {render_inline(child)} }
+                    }
+                },
+                Inline::Strong(children) => rsx! {
+                    strong {
+                        for child in children { {render_inline(child)} }
+                    }
+                },
+            }
+        }
+
+        fn render_block(block: Block, compact: bool) -> Element {
+            match block {
+                Block::Paragraph(inlines) => {
+                    if compact {
+                        // Compact: inline span with trailing line break
+                        rsx! {
+                            span {
+                                for inline in inlines { {render_inline(inline)} }
+                            }
+                            br {}
+                        }
+                    } else {
+                        // Full: proper paragraph with spacing
+                        rsx! {
+                            p {
+                                class: "mb-2",
+                                for inline in inlines { {render_inline(inline)} }
+                            }
+                        }
+                    }
+                }
+                Block::CodeBlock { lang, code } => {
+                    if compact {
+                        // Compact: simple inline code styling
+                        rsx! {
+                            code {
+                                class: "bg-gray-800 text-gray-200 font-mono text-xs px-1 rounded",
+                                "{code}"
+                            }
+                        }
+                    } else {
+                        // Full: use proper CodeBlock component
+                        rsx! {
+                            CodeBlock { lang: lang, code: code }
+                        }
+                    }
+                }
+            }
+        }
+
+        blocks.into_iter().map(|b| render_block(b, compact)).collect::<Vec<_>>()
+    };
+
+    if compact {
+        rsx! {
+            span {
+                class: "thinking-content-compact",
+                for el in elements.iter() { {el.clone()} }
+            }
+        }
+    } else {
+        rsx! {
+            div {
+                class: "thinking-content-full text-gray-300",
+                for el in elements.iter() { {el.clone()} }
             }
         }
     }

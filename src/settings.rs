@@ -47,11 +47,23 @@ pub struct Settings {
     pub smithery_api_key: Option<String>,
     #[serde(default)]
     pub preferred_mcp_source: McpSource,
-    pub composio_base_url: Option<String>,
     #[serde(default = "default_max_tool_output_length")]
     pub max_tool_output_length: usize,
     #[serde(default = "default_max_active_tool_output_length")]
     pub max_active_tool_output_length: usize,
+    // Composio profiles
+    #[serde(default)]
+    pub composio_profiles: Vec<ComposioProfile>,
+    pub active_composio_profile: Option<String>,
+    // Legacy fields for migration (will be removed in future)
+    #[serde(skip_serializing)]
+    pub composio_base_url: Option<String>,
+    #[serde(skip_serializing)]
+    pub composio_entity_id: Option<String>,
+    #[serde(skip)]
+    pub composio_api_key: Option<String>,
+    #[serde(skip_serializing)]
+    pub composio_user_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -66,6 +78,87 @@ impl Default for McpSource {
     }
 }
 
+/// Configuration for a single Composio toolkit's loading behavior
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ComposioToolkitConfig {
+    /// Toolkit slug (e.g., "gmail", "clickup", "github")
+    pub slug: String,
+    /// Human-readable display name
+    pub display_name: String,
+    /// Number of tools in this toolkit (cached for UI display)
+    #[serde(default)]
+    pub tool_count: usize,
+    /// If true, all tools are loaded upfront instead of on-demand via Tool Router
+    /// Default is false (on-demand via Tool Router)
+    #[serde(default)]
+    pub force_load: bool,
+}
+
+/// A Composio profile containing connection settings for one Composio account
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ComposioProfile {
+    pub name: String,
+    pub base_url: Option<String>,
+    pub entity_id: Option<String>,
+    pub user_id: Option<String>,
+    // API key is stored in SecretManager, not serialized
+    #[serde(skip)]
+    pub api_key: Option<String>,
+    /// Per-toolkit loading configuration (upfront vs lazy/on-demand)
+    #[serde(default)]
+    pub toolkit_configs: Vec<ComposioToolkitConfig>,
+}
+
+impl Default for ComposioProfile {
+    fn default() -> Self {
+        Self {
+            name: "Default".to_string(),
+            base_url: None,
+            entity_id: None,
+            user_id: None,
+            api_key: None,
+            toolkit_configs: Vec::new(),
+        }
+    }
+}
+
+impl ComposioProfile {
+    /// Get slugs of toolkits configured for force loading (upfront)
+    pub fn get_force_load_toolkit_slugs(&self) -> Vec<String> {
+        self.toolkit_configs
+            .iter()
+            .filter(|c| c.force_load)
+            .map(|c| c.slug.clone())
+            .collect()
+    }
+
+    /// Get slugs of toolkits configured for on-demand loading (default)
+    pub fn get_on_demand_toolkit_slugs(&self) -> Vec<String> {
+        self.toolkit_configs
+            .iter()
+            .filter(|c| !c.force_load)
+            .map(|c| c.slug.clone())
+            .collect()
+    }
+
+    /// Check if a toolkit is configured for force loading
+    pub fn is_toolkit_force_load(&self, slug: &str) -> bool {
+        self.toolkit_configs
+            .iter()
+            .find(|c| c.slug.eq_ignore_ascii_case(slug))
+            .map(|c| c.force_load)
+            .unwrap_or(false) // Default to on-demand if not configured
+    }
+
+    /// Update or add a toolkit configuration
+    pub fn set_toolkit_config(&mut self, config: ComposioToolkitConfig) {
+        if let Some(existing) = self.toolkit_configs.iter_mut().find(|c| c.slug == config.slug) {
+            *existing = config;
+        } else {
+            self.toolkit_configs.push(config);
+        }
+    }
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -100,13 +193,93 @@ impl Default for Settings {
             confirm_on_message_delete: true,
             smithery_api_key: None,
             preferred_mcp_source: McpSource::default(),
-            composio_base_url: None,
             max_tool_output_length: default_max_tool_output_length(),
             max_active_tool_output_length: default_max_active_tool_output_length(),
+            composio_profiles: Vec::new(),
+            active_composio_profile: None,
+            // Legacy fields for migration
+            composio_base_url: None,
+            composio_entity_id: None,
+            composio_api_key: None,
+            composio_user_id: None,
         }
     }
 }
 
+impl Settings {
+    /// Get the currently active Composio profile
+    pub fn get_active_profile(&self) -> Option<&ComposioProfile> {
+        if let Some(active_name) = &self.active_composio_profile {
+            self.composio_profiles.iter().find(|p| &p.name == active_name)
+        } else {
+            self.composio_profiles.first()
+        }
+    }
+
+    /// Get a mutable reference to the active Composio profile
+    pub fn get_active_profile_mut(&mut self) -> Option<&mut ComposioProfile> {
+        if let Some(active_name) = &self.active_composio_profile {
+            let name = active_name.clone();
+            self.composio_profiles.iter_mut().find(|p| p.name == name)
+        } else {
+            self.composio_profiles.first_mut()
+        }
+    }
+
+    /// Add a new Composio profile
+    pub fn add_profile(&mut self, profile: ComposioProfile) {
+        // Ensure unique name
+        let existing_names: Vec<_> = self.composio_profiles.iter().map(|p| &p.name).collect();
+        let mut name = profile.name.clone();
+        let mut counter = 1;
+        while existing_names.contains(&&name) {
+            name = format!("{} ({})", profile.name, counter);
+            counter += 1;
+        }
+        
+        let mut new_profile = profile;
+        new_profile.name = name;
+        self.composio_profiles.push(new_profile);
+        
+        // If this is the first profile, make it active
+        if self.active_composio_profile.is_none() && self.composio_profiles.len() == 1 {
+            self.active_composio_profile = Some(self.composio_profiles[0].name.clone());
+        }
+    }
+
+    /// Remove a Composio profile by name
+    pub fn remove_profile(&mut self, name: &str) {
+        self.composio_profiles.retain(|p| p.name != name);
+        
+        // If we removed the active profile, reset to first available
+        if self.active_composio_profile.as_deref() == Some(name) {
+            self.active_composio_profile = self.composio_profiles.first().map(|p| p.name.clone());
+        }
+    }
+
+    /// Migrate legacy single Composio settings to a profile
+    pub fn migrate_legacy_composio_settings(&mut self) {
+        // Only migrate if we have legacy settings and no profiles yet
+        let has_legacy = self.composio_base_url.is_some() 
+            || self.composio_entity_id.is_some() 
+            || self.composio_user_id.is_some()
+            || self.composio_api_key.is_some();
+            
+        if has_legacy && self.composio_profiles.is_empty() {
+            tracing::info!("Migrating legacy Composio settings to profile...");
+            let profile = ComposioProfile {
+                name: "Default".to_string(),
+                base_url: self.composio_base_url.take(),
+                entity_id: self.composio_entity_id.take(),
+                user_id: self.composio_user_id.take(),
+                api_key: self.composio_api_key.take(),
+                toolkit_configs: Vec::new(),
+            };
+            self.composio_profiles.push(profile);
+            self.active_composio_profile = Some("Default".to_string());
+        }
+    }
+}
 fn default_max_tool_output_length() -> usize {
     2000
 }
@@ -206,11 +379,17 @@ impl SettingsManager {
             if let Some(url) = value.get("composio_base_url").and_then(|v| v.as_str()) {
                 settings.composio_base_url = Some(url.to_string());
             }
+            if let Some(entity_id) = value.get("composio_entity_id").and_then(|v| v.as_str()) {
+                settings.composio_entity_id = Some(entity_id.to_string());
+            }
             if let Some(len) = value.get("max_tool_output_length").and_then(|v| v.as_u64()) {
                 settings.max_tool_output_length = len as usize;
             }
             if let Some(len) = value.get("max_active_tool_output_length").and_then(|v| v.as_u64()) {
                 settings.max_active_tool_output_length = len as usize;
+            }
+            if let Some(uid) = value.get("composio_user_id").and_then(|v| v.as_str()) {
+                settings.composio_user_id = Some(uid.to_string());
             }
         }
 

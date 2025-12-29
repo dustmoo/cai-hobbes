@@ -13,7 +13,8 @@ pub struct ToolCallDisplayProps {
 #[component]
 pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
     let mut show_arguments = use_signal(|| true);
-    let mut show_response = use_signal(|| false);
+    // Auto-expand response section for auth-required tools so user sees the connect button
+    let mut show_response = use_signal(|| props.tool_call.status == ToolCallStatus::AuthRequired);
     let mut show_thought = use_signal(|| false);
 
     let status = props.tool_call.status;
@@ -23,7 +24,7 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
 
     rsx! {
         div {
-            class: "flex flex-col p-4 border rounded-lg shadow-sm bg-gray-800", // Adjusted background
+            class: "flex flex-col p-4 border rounded-lg shadow-sm bg-gray-800 overflow-hidden", // overflow-hidden prevents stretching
             div {
                 class: "flex items-center gap-2 text-lg font-semibold text-gray-100", // Adjusted text color
                 Icon {
@@ -37,6 +38,7 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                         ToolCallStatus::Running => "bg-blue-200 text-blue-800",
                         ToolCallStatus::Completed => "bg-green-200 text-green-800",
                         ToolCallStatus::Error => "bg-red-200 text-red-800",
+                        ToolCallStatus::AuthRequired => "bg-yellow-200 text-yellow-800",
                     }),
                     "{status}"
                 }
@@ -102,9 +104,12 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                         "Arguments"
                     }
                     if *show_arguments.read() {
-                        CodeBlock {
-                            code: props.tool_call.arguments.clone(),
-                            lang: "json".to_string()
+                        div {
+                            class: "overflow-x-auto max-w-full", // Prevent horizontal overflow
+                            CodeBlock {
+                                code: props.tool_call.arguments.clone(),
+                                lang: "json".to_string()
+                            }
                         }
                     }
                 }
@@ -130,10 +135,40 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                         }
                         "Response"
                     }
-                    if *show_response.read() && !response.is_empty() {
-                        CodeBlock {
-                            code: response,
-                            lang: "markdown".to_string()
+                    if *show_response.read() {
+                         if status == ToolCallStatus::AuthRequired {
+                            div {
+                                class: "flex flex-col gap-3 p-3 bg-gray-900 rounded mt-2 border border-yellow-700/50",
+                                div {
+                                    class: "flex items-center gap-2 text-yellow-500",
+                                    Icon {
+                                        width: 18,
+                                        height: 18,
+                                        icon: fi_icons::FiLock
+                                    }
+                                    span { class: "font-medium", "Authentication Required" }
+                                }
+                                p { class: "text-sm text-gray-300", "Please connect your account to proceed with this tool." }
+                                a {
+                                    class: "px-4 py-2 bg-yellow-600 text-white rounded hover:bg-yellow-500 text-center text-sm font-medium transition-colors w-fit flex items-center gap-2",
+                                    href: "{response}",
+                                    target: "_blank",
+                                    "Connect Account"
+                                    Icon {
+                                        width: 14,
+                                        height: 14,
+                                        icon: fi_icons::FiExternalLink
+                                    }
+                                }
+                            }
+                        } else if !response.is_empty() {
+                            div {
+                                class: "overflow-x-auto max-w-full",
+                                CodeBlock {
+                                    code: response,
+                                    lang: "json".to_string()
+                                }
+                            }
                         }
                     }
                 }
@@ -233,11 +268,29 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
 
                                                 updated_tc.status = final_status;
                                                 if final_status == ToolCallStatus::Error {
-                                                    updated_tc.response = error_string.unwrap_or_default();
+                                                updated_tc.response = error_string.unwrap_or_default();
+                                            } else {
+                                                 // Check for auth requirement (duplicated from stream_manager.rs - TODO: refactor)
+                                                let mut auth_url = None;
+                                                for content in &aggregated_content {
+                                                    let json_content = serde_json::to_value(content).unwrap_or(serde_json::Value::Null);
+                                                    if let Some(text) = json_content.get("text").and_then(|t| t.as_str()) {
+                                                        if text.contains("Authentication required") && text.contains("connect your account") {
+                                                            if let Some(start) = text.find("http") {
+                                                                auth_url = Some(text[start..].trim().to_string());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                if let Some(url) = auth_url {
+                                                    updated_tc.status = ToolCallStatus::AuthRequired;
+                                                    updated_tc.response = url;
                                                 } else {
                                                     let final_json = serde_json::to_value(aggregated_content).unwrap_or(serde_json::Value::Null);
                                                     updated_tc.response = serde_json::to_string_pretty(&final_json).unwrap_or_default();
                                                 }
+                                            }
                                             },
                                             Err(e) => {
                                                 updated_tc.status = ToolCallStatus::Error;

@@ -68,6 +68,7 @@ pub enum ToolCallStatus {
     Running,
     Completed,
     Error,
+    AuthRequired,
 }
 
 impl std::fmt::Display for ToolCallStatus {
@@ -76,6 +77,7 @@ impl std::fmt::Display for ToolCallStatus {
             ToolCallStatus::Running => write!(f, "Running"),
             ToolCallStatus::Completed => write!(f, "Completed"),
             ToolCallStatus::Error => write!(f, "Error"),
+            ToolCallStatus::AuthRequired => write!(f, "Auth Required"),
         }
     }
 }

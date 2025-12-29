@@ -125,7 +125,7 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                                                         key: "{message.id}",
                                                         message: message.clone(),
                                                         on_content_update: move |_| stream_update_trigger += 1,
-                                                        on_selection: move |data| tracing::info!("Selection event: {:?}", data),
+                                                        on_selection: move |data| tracing::debug!("Selection event: {:?}", data),
                                                         on_delete: {
                                                             let msg_id = message.id;
                                                             move |_| on_delete.call(msg_id)
@@ -186,7 +186,7 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                                                     key: "{message.id}",
                                                     message: message.clone(),
                                                     on_content_update: move |_| stream_update_trigger += 1,
-                                                    on_selection: move |data| tracing::info!("Selection event: {:?}", data),
+                                                    on_selection: move |data| tracing::debug!("Selection event: {:?}", data),
                                                     on_delete: {
                                                         let msg_id = message.id;
                                                         move |_| on_delete.call(msg_id)
