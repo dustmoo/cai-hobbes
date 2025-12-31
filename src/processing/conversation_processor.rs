@@ -51,7 +51,8 @@ impl ConversationProcessor {
         }
 
         // 3. Call the LLM to refine the summary
-        match self.llm_connector.read().summarize_conversation(
+        let connector = self.llm_connector.read().clone();
+        match connector.summarize_conversation(
             previous_summary,
             recent_history,
         )

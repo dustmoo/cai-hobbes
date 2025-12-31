@@ -124,7 +124,10 @@ impl SessionState {
 
     pub fn load() -> Result<Self, std::io::Error> {
         let path = get_sessions_path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find sessions path"))?;
-        let data = fs::read_to_string(&path)?;
+        let data = fs::read_to_string(&path).map_err(|e| {
+            tracing::error!("Failed to read session file at {:?}: {}", path, e);
+            e
+        })?;
         
         // Try direct deserialization first
         if let Ok(mut state) = serde_json::from_str::<Self>(&data) {

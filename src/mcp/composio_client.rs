@@ -642,15 +642,14 @@ impl ComposioClient {
         
         tracing::debug!("Got response with status: {}", response.status());
         
-        // Get the response body as text to log it
+        // Get the response body as text for file logging
         let response_text = response.text().await?;
-        tracing::info!("Raw response body: {}", response_text);
         
         // Write the response to a file for detailed analysis
         if let Err(e) = write_to_debug_file("composio_response.json", &response_text) {
             tracing::error!("Failed to write response to debug file: {}", e);
         } else {
-            tracing::info!("Wrote response to debug_logs/composio_response.json");
+            tracing::debug!("Wrote response to debug_logs/composio_response.json");
         }
         
         // Parse tool response and cache
@@ -1636,12 +1635,13 @@ impl ComposioClient {
         // Log the request for debugging
         tracing::debug!("Executing tool {} at {}", slug, url);
         let request_body_str = serde_json::to_string_pretty(&body).unwrap_or_default();
-        tracing::debug!("Request body: {}", request_body_str);
         
         // Write request to debug file
         let req_filename = format!("composio_exec_req_{}.json", slug);
         if let Err(e) = write_to_debug_file(&req_filename, &request_body_str) {
              tracing::warn!("Failed to write request debug file: {}", e);
+        } else {
+             tracing::debug!("Wrote request to debug_logs/{}", req_filename);
         }
 
         let response = self

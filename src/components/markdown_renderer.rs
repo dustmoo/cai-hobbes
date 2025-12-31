@@ -860,7 +860,7 @@ pub fn ThinkingMarkdownRenderer(content: String, #[props(default = false)] compa
                         "{text}"
                     }
                 },
-                Inline::SoftBreak => rsx! { " " },
+                Inline::SoftBreak => rsx! { br {} },
                 Inline::HardBreak => rsx! { br {} },
                 Inline::Emphasis(children) => rsx! {
                     em {
@@ -887,12 +887,12 @@ pub fn ThinkingMarkdownRenderer(content: String, #[props(default = false)] compa
                             br {}
                         }
                     } else {
-                        // Full: proper paragraph with spacing
+                        // Full: span with a single line break (no margin spacing)
                         rsx! {
-                            p {
-                                class: "mb-2",
+                            span {
                                 for inline in inlines { {render_inline(inline)} }
                             }
+                            br {}
                         }
                     }
                 }

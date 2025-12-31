@@ -116,7 +116,17 @@ fn RestartRequired() -> Element {
 
 fn app() -> Element {
     let window = use_window();
-    let mut session_state = use_context_provider(|| Signal::new(SessionState::load().unwrap_or_default()));
+    let mut session_state = use_context_provider(|| {
+        let mut state = SessionState::load().unwrap_or_else(|e| {
+            tracing::error!("Failed to load session state during startup: {}", e);
+            SessionState::default()
+        });
+        if state.sessions.is_empty() {
+            tracing::info!("No sessions found, creating new default session.");
+            state.create_session();
+        }
+        Signal::new(state)
+    });
     let settings_manager = use_context_provider(|| Signal::new(SettingsManager::new(get_settings_path())));
     let ui_state_manager = use_context_provider(|| Signal::new(settings::UiStateManager::new(get_ui_state_path())));
     let mut ui_state = use_context_provider(|| Signal::new(ui_state_manager.read().load()));
@@ -268,23 +278,7 @@ fn app() -> Element {
     use_context_provider(|| Signal::new(processing::conversation_processor::ConversationProcessor::new(llm_connector)));
 
     // Asynchronously load the session state
-    let _ = use_resource(move || async move {
-        let mut session_state = session_state.clone();
-        match SessionState::load() {
-            Ok(loaded_state) => {
-                session_state.set(loaded_state);
-                tracing::debug!("Session state loaded successfully.");
-            }
-            Err(e) => {
-                tracing::error!("Failed to load session state: {}. Creating a new default session.", e);
-                // If loading fails, create a new session and save it
-                let mut state = session_state.write();
-                if state.sessions.is_empty() {
-                    state.create_session();
-                }
-            }
-        }
-    });
+    // Async session loading removed to prevent race condition. State is loaded synchronously above.
 
     let permission_status_signal = use_context_provider(|| Signal::new(permissions::PermissionStatus::Denied));
 

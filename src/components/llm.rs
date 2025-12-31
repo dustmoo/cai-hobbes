@@ -316,14 +316,12 @@ impl LlmConnector for GeminiConnector {
                         if let Err(e) = std::fs::write(&file_path, &request_json) {
                             tracing::warn!("Failed to write Gemini debug file: {}", e);
                         } else {
-                            tracing::info!("Wrote Gemini request to debug_logs/gemini_request.json");
+                            tracing::debug!("Wrote Gemini request to debug_logs/gemini_request.json");
                         }
                     }
                 }
             }
         }
-        
-        tracing::debug!("SERIALIZED REQUEST: {}", serde_json::to_string_pretty(&request_body).unwrap_or_else(|e| format!("Serialization failed: {}", e)));
         tracing::info!("Using chat model: {}", model);
     }
     // --- End Synchronous Logging Block ---
@@ -423,7 +421,7 @@ impl LlmConnector for GeminiConnector {
                                                 has_sent_data = true;
                                             } else if let Some(function_call) = &part.function_call {
                                                 // Log raw JSON if it contains a function call
-                                                tracing::info!("Raw JSON with function call: {}", json_str);
+                                                tracing::debug!("Raw JSON with function call: {}", json_str);
                                                 
                                                 // Log the thought_signature field for debugging
                                                 if let Some(ref thought_sig) = part.thought_signature {
