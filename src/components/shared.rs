@@ -34,6 +34,9 @@ pub struct ToolCall {
     pub status: ToolCallStatus,
     pub response: String,
     pub thought_signature: Option<String>,
+    /// The actual thinking content (human-readable), separate from the encrypted signature
+    #[serde(default)]
+    pub thought_summary: Option<String>,
 }
 
 pub enum StreamMessage {
@@ -49,7 +52,7 @@ pub enum StreamMessage {
 }
 
 impl ToolCall {
-    pub fn new(server_name: String, tool_name: String, args: serde_json::Value, thought_signature: Option<String>) -> Self {
+    pub fn new(server_name: String, tool_name: String, args: serde_json::Value, thought_signature: Option<String>, thought_summary: Option<String>) -> Self {
         Self {
             execution_id: uuid::Uuid::new_v4().to_string(),
             server_name,
@@ -58,6 +61,7 @@ impl ToolCall {
             status: ToolCallStatus::Running,
             response: String::new(),
             thought_signature,
+            thought_summary,
         }
     }
 }

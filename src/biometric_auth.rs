@@ -56,6 +56,7 @@ impl AuthContext {
     /// Check if biometric authentication is available on this device.
     /// 
     /// Returns true if Touch ID or Face ID is available and configured.
+    #[allow(dead_code)]
     pub fn is_biometrics_available() -> bool {
         // SAFETY: LAContext::new() is safe to call during normal operation
         let context = unsafe { LAContext::new() };
@@ -181,6 +182,7 @@ impl AuthContext {
     /// Get a reference to the underlying LAContext.
     /// 
     /// This can be used to pass the context to keychain operations.
+    #[allow(dead_code)]
     pub fn context(&self) -> &LAContext {
         &self.inner
     }
@@ -200,6 +202,7 @@ impl AuthContext {
     /// 
     /// After calling this, the context can no longer be used for keychain operations
     /// and any in-progress operations will be cancelled.
+    #[allow(dead_code)]
     pub fn invalidate(&self) {
         // SAFETY: invalidate() is safe to call on a valid context
         unsafe {

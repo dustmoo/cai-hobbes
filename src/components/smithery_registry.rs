@@ -38,6 +38,7 @@ pub struct SmitheryResponse {
     pub pagination: Pagination,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct SmitheryServerDetail {
     #[serde(rename = "qualifiedName")]
@@ -46,6 +47,7 @@ pub struct SmitheryServerDetail {
     pub configs: Option<Vec<SmitheryConfig>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct SmitheryConfig {
     pub platform: String,
@@ -93,6 +95,7 @@ impl SmitheryClient {
         Ok(smithery_response)
     }
 
+    #[allow(dead_code)]
     pub async fn fetch_server_details(&self, server_id: &str) -> Result<SmitheryServerDetail, String> {
         let url = format!("https://registry.smithery.ai/servers/{}", server_id);
         

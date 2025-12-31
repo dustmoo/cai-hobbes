@@ -145,6 +145,7 @@ pub async fn exchange_code_for_tokens(
 }
 
 /// Refresh an access token using a refresh token
+#[allow(dead_code)]
 pub async fn refresh_access_token(
     token_endpoint: &str,
     refresh_token: &str,

@@ -411,6 +411,7 @@ impl<'a> PromptBuilder<'a> {
 }
 
 /// Recursively traverses a serde_json::Value and removes specified keys.
+#[allow(dead_code)]
 fn recursively_remove_keys(value: &mut serde_json::Value, keys_to_remove: &[&str]) {
     match value {
         serde_json::Value::Object(map) => {
@@ -451,6 +452,7 @@ fn recursively_remove_keys(value: &mut serde_json::Value, keys_to_remove: &[&str
 
 
 
+#[allow(dead_code)]
 fn recursively_sanitize_schema(value: &mut serde_json::Value) {
     // Pass 1: Simplify complex structures first.
     simplify_schema(value);
@@ -863,6 +865,7 @@ mod tests {
                 status: crate::components::shared::ToolCallStatus::Completed,
                 response: "{\"temp\": 72}".to_string(),
                 thought_signature: Some("Checking weather...".to_string()),
+                thought_summary: None,
             }),
             attachments: vec![],
             comments: vec![],
@@ -980,6 +983,7 @@ mod tests {
                 status: crate::components::shared::ToolCallStatus::Completed,
                 response: "{}".to_string(),
                 thought_signature: Some(signature.clone()),
+                thought_summary: None,
             }),
             attachments: vec![],
             comments: vec![],
@@ -1001,6 +1005,7 @@ mod tests {
                 status: crate::components::shared::ToolCallStatus::Completed,
                 response: "{}".to_string(),
                 thought_signature: None,
+                thought_summary: None,
             }),
             attachments: vec![],
             comments: vec![],

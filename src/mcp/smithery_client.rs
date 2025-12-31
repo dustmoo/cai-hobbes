@@ -28,6 +28,7 @@ pub enum OAuthState {
         code_verifier: String,
     },
     /// Authorization code received, ready to exchange for tokens
+    #[allow(dead_code)]
     AwaitingTokenExchange {
         code: String,
         code_verifier: String,
@@ -35,6 +36,7 @@ pub enum OAuthState {
     /// Connected with valid tokens
     Connected,
     /// Error state
+    #[allow(dead_code)]
     Error(String),
 }
 
@@ -238,6 +240,7 @@ impl SmitheryOAuthClient {
     }
     
     /// Refresh the access token using the refresh token
+    #[allow(dead_code)]
     pub async fn refresh(&self) -> Result<(), SmitheryOAuthError> {
         let tokens = self.tokens.read().await.clone()
             .ok_or_else(|| SmitheryOAuthError::InvalidState("No tokens to refresh".to_string()))?;
@@ -266,11 +269,13 @@ impl SmitheryOAuthClient {
     }
     
     /// Get the current state
+    #[allow(dead_code)]
     pub async fn state(&self) -> OAuthState {
         self.state.read().await.clone()
     }
     
     /// Check if connected
+    #[allow(dead_code)]
     pub async fn is_connected(&self) -> bool {
         matches!(*self.state.read().await, OAuthState::Connected)
     }
@@ -281,11 +286,13 @@ impl SmitheryOAuthClient {
     }
     
     /// Get the server URL
+    #[allow(dead_code)]
     pub fn server_url(&self) -> &str {
         &self.config.server_url
     }
     
     /// Get the callback URL
+    #[allow(dead_code)]
     pub fn callback_url(&self) -> String {
         self.config.callback_url()
     }
@@ -296,6 +303,7 @@ impl SmitheryOAuthClient {
 // ============================================================================
 
 /// Create a Smithery OAuth client for a specific server
+#[allow(dead_code)]
 pub fn create_smithery_client(server_name: &str) -> SmitheryOAuthClient {
     let server_url = format!("https://server.smithery.ai/{}/mcp", server_name);
     let config = SmitheryOAuthConfig::new(&server_url);

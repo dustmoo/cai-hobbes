@@ -94,6 +94,7 @@ pub struct ActiveMcpClient {
 /// Information about a server that requires authentication
 #[derive(Clone)]
 pub struct AuthRequiredInfo {
+    #[allow(dead_code)]
     pub config: McpServerConfig,
     pub auth_url: Option<String>,
     pub error_message: String,
@@ -132,6 +133,62 @@ impl McpManager {
             || lower_msg.contains("invalid_token")
             || lower_msg.contains("authentication required")
             || lower_msg.contains("not authenticated")
+    }
+
+    /// Construct a sane PATH for child processes, including common dev directories
+    fn get_sane_path() -> String {
+        let mut paths = vec![
+            "/usr/local/bin".to_string(),
+            "/opt/homebrew/bin".to_string(),
+            "/usr/bin".to_string(),
+            "/bin".to_string(),
+            "/usr/sbin".to_string(),
+            "/sbin".to_string(),
+        ];
+        
+        // Add cargo bin and local bin if they exist
+        if let Some(home) = dirs::home_dir() {
+            paths.push(home.join(".cargo/bin").to_string_lossy().to_string());
+            paths.push(home.join(".local/bin").to_string_lossy().to_string());
+        }
+
+        paths.join(":")
+    }
+
+    /// Get critical environment variables needed for child processes.
+    /// When launched from Finder/open, the app gets a minimal environment from launchd
+    /// that's missing HOME, USER, SHELL, etc. which tools like `uvx` require.
+    fn get_critical_env_vars() -> HashMap<String, String> {
+        let mut vars = HashMap::new();
+        
+        // HOME is critical for uvx/uv to find its cache
+        if let Some(home) = dirs::home_dir() {
+            vars.insert("HOME".to_string(), home.to_string_lossy().to_string());
+        }
+        
+        // USER is needed by some tools
+        if let Ok(user) = std::env::var("USER") {
+            vars.insert("USER".to_string(), user);
+        } else if let Some(home) = dirs::home_dir() {
+            // Fallback: extract username from home path
+            if let Some(username) = home.file_name() {
+                vars.insert("USER".to_string(), username.to_string_lossy().to_string());
+            }
+        }
+        
+        // SHELL - default to zsh on macOS if not set
+        if let Ok(shell) = std::env::var("SHELL") {
+            vars.insert("SHELL".to_string(), shell);
+        } else {
+            vars.insert("SHELL".to_string(), "/bin/zsh".to_string());
+        }
+        
+        // TMPDIR - some tools need this
+        if let Ok(tmpdir) = std::env::var("TMPDIR") {
+            vars.insert("TMPDIR".to_string(), tmpdir);
+        }
+        
+        vars
     }
 
     pub async fn launch_servers(&self, mcp_context_signal: dioxus::prelude::Signal<McpContext>, settings: crate::settings::Settings) {
@@ -304,14 +361,31 @@ impl McpManager {
                         let server_name_clone = server_name.clone();
                         let server_config_clone_for_spawn = server_config_clone.clone();
                         spawn(async move {
-                            let mut cmd = Command::new("sh");
-                            let mut full_command = command_string;
+                            let mut cmd = Command::new(&command_string);
                             if let Some(args) = server_config_clone_for_spawn.args {
-                                full_command.push(' ');
-                                full_command.push_str(&args.join(" "));
+                                for arg in args {
+                                    cmd.arg(arg);
+                                }
                             }
-                            cmd.arg("-c").arg(&full_command);
-                            cmd.envs(&server_config_clone_for_spawn.env);
+                            
+                            // Inject sane PATH and critical environment variables
+                            let mut envs = server_config_clone_for_spawn.env.clone();
+                            
+                            // Add critical env vars first (HOME, USER, SHELL, TMPDIR)
+                            for (key, value) in Self::get_critical_env_vars() {
+                                envs.entry(key).or_insert(value);
+                            }
+                            
+                            let current_path = std::env::var("PATH").unwrap_or_default();
+                            let sane_path = Self::get_sane_path();
+                            let final_path = if current_path.is_empty() {
+                                sane_path
+                            } else {
+                                format!("{}:{}", sane_path, current_path)
+                            };
+                            envs.insert("PATH".to_string(), final_path);
+                            
+                            cmd.envs(&envs);
                             // We run this as a detached process. We don't care if it fails,
                             // as the connection logic will handle that.
                             if let Err(e) = cmd.status().await {
@@ -392,24 +466,42 @@ impl McpManager {
                 } else {
                     // Stdio-based server
                     tracing::info!("Launching stdio MCP server: {}", server_name);
-                    let mut cmd = Command::new("sh");
-                    let mut command_string = server_config_clone.command.clone().unwrap_or_default();
-
+                    
+                    let command_base = server_config_clone.command.clone().unwrap_or_default();
+                    let mut cmd = Command::new(&command_base);
+                    
                     if let Some(ref args) = server_config_clone.args {
-                        command_string.push(' ');
-                        command_string.push_str(&args.join(" "));
+                        for arg in args {
+                            cmd.arg(arg);
+                        }
                     }
 
                     if server_name == "filesystem" {
                         if let Some(project_folder) = &settings_clone.project_folder {
-                            command_string.push_str(&format!(" \"{}\"", project_folder));
-                            tracing::info!("Appending project folder to filesystem MCP command: {}", command_string);
+                            cmd.arg(project_folder);
+                            tracing::info!("Adding project folder to filesystem MCP command: {}", project_folder);
                         }
                     }
+                    
+                    // Inject sane PATH and critical environment variables
+                    let mut envs = server_config_clone.env.clone();
+                    
+                    // Add critical env vars first (HOME, USER, SHELL, TMPDIR)
+                    // These may be missing when launched from Finder/open
+                    for (key, value) in Self::get_critical_env_vars() {
+                        envs.entry(key).or_insert(value);
+                    }
+                    
+                    let current_path = std::env::var("PATH").unwrap_or_default();
+                    let sane_path = Self::get_sane_path();
+                    let final_path = if current_path.is_empty() {
+                        sane_path
+                    } else {
+                        format!("{}:{}", sane_path, current_path)
+                    };
+                    envs.insert("PATH".to_string(), final_path);
 
-                    cmd.arg("-c")
-                        .arg(&command_string)
-                        .envs(&server_config_clone.env)
+                    cmd.envs(&envs)
                         .stdin(std::process::Stdio::piped())
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped());
@@ -546,6 +638,7 @@ impl McpManager {
             }
         }
     }
+    #[allow(dead_code)]
     pub async fn add_or_update_mcp_server(&self, config_path: &PathBuf, new_config: McpServerConfig) -> Result<(), String> {
         let mut configs = self.load_configs(config_path.clone()).await;
 
@@ -558,6 +651,7 @@ impl McpManager {
         self.save_configs(config_path, configs).await
     }
 
+    #[allow(dead_code)]
     async fn save_configs(&self, config_path: &PathBuf, configs: Vec<McpServerConfig>) -> Result<(), String> {
         let mcp_servers_map: HashMap<String, McpServerConfig> = configs.into_iter()
             .map(|c| (c.name.clone(), c))
@@ -605,6 +699,7 @@ impl McpManager {
                         tool_name.to_string(),
                         args,
                         None,
+                        None, // thought_summary not available in permission check context
                     );
                     return Err(serde_json::to_string(&tool_call).unwrap_or_default());
                 }
@@ -811,6 +906,7 @@ impl McpManager {
 
     /// Start OAuth flow for a server that requires authentication
     /// This calls the generate_oauth_url tool and opens the browser
+    #[allow(dead_code)]
     pub async fn start_oauth_flow(&self, server_name: &str) -> Result<String, String> {
         // First, check if the server has a generate_oauth_url tool
         let servers = self.servers.lock().await;
@@ -889,6 +985,7 @@ impl McpManager {
     }
 
     /// Complete OAuth flow by exchanging auth code for tokens
+    #[allow(dead_code)]
     pub async fn complete_oauth_flow(&self, server_name: &str, auth_code: &str) -> Result<String, String> {
         let servers = self.servers.lock().await;
         
@@ -981,6 +1078,7 @@ impl McpManager {
     }
 
     /// Check if a server's tools are currently visible to the AI
+    #[allow(dead_code)]
     pub async fn is_server_loaded(&self, server_name: &str) -> bool {
         let unloaded = self.unloaded_servers.lock().await;
         !unloaded.contains(server_name)
@@ -1265,13 +1363,12 @@ impl McpManager {
                     let server_name_clone = server_name.clone();
                     let server_config_clone_for_spawn = effective_config.clone();
                     spawn(async move {
-                        let mut cmd = Command::new("sh");
-                        let mut full_command = command_string;
+                        let mut cmd = Command::new(&command_string);
                         if let Some(args) = server_config_clone_for_spawn.args {
-                            full_command.push(' ');
-                            full_command.push_str(&args.join(" "));
+                            for arg in args {
+                                cmd.arg(arg);
+                            }
                         }
-                        cmd.arg("-c").arg(&full_command);
                         cmd.envs(&server_config_clone_for_spawn.env);
                         if let Err(e) = cmd.status().await {
                             tracing::error!("Failed to launch command for MCP server '{}': {}", server_name_clone, e);
@@ -1468,6 +1565,7 @@ impl McpManager {
 
         Ok(())
     }
+    #[allow(dead_code)]
     pub async fn install_mcp_server(&self, server_config: &SmitheryServerDetail) -> Result<(), String> {
         let config_path = self.config_path.as_ref().ok_or("Config path not set")?.clone();
 

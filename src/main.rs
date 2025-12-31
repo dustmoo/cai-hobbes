@@ -77,7 +77,6 @@ use crate::{
         stream_manager::StreamManager,
     },
     mcp::manager::McpManager,
-    services::document_store::DocumentStore,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -308,29 +307,11 @@ fn app() -> Element {
     let needs_onboarding = use_memo(move || {
         let settings = settings.read();
         let key_present = settings.gemini_config.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok();
-        let qdrant_present = settings.qdrant_url.is_some() || std::env::var("QDRANT_URL").is_ok();
-        !key_present || !qdrant_present
+        !key_present
     });
     let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
     let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(get_mcp_config_path(), permission_manager.clone())));
     let mcp_context = use_context_provider(|| Signal::new(mcp::manager::McpContext { servers: Vec::new() }));
-        let document_store = use_context_provider(|| Signal::new(None));
-    
-        use_effect(move || {
-            let mut document_store = document_store.clone();
-            spawn(async move {
-                let qdrant_url = settings.read().qdrant_url.clone().unwrap_or_else(|| std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string()));
-                match DocumentStore::new(&qdrant_url).await {
-                    Ok(store) => {
-                        document_store.set(Some(std::sync::Arc::new(store)));
-                        tracing::debug!("DocumentStore initialized successfully.");
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to initialize DocumentStore: {}", e);
-                    }
-                }
-            });
-        });
 
     let _ = use_resource(move || async move {
         let manager = mcp_manager.read().clone();

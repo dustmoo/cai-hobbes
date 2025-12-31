@@ -75,12 +75,14 @@ impl SecretManager {
     }
 
     /// Get a cloned secret value
+    #[allow(dead_code)]
     pub fn get_cloned(&self, key: &str) -> Option<String> {
         self.secrets.get(key).cloned()
     }
 
     /// Set a secret (updates cache and saves to keychain with biometric protection)
     /// Falls back to regular keychain save if biometric protection fails (e.g., missing entitlements)
+    #[allow(dead_code)]
     pub fn set(&mut self, key: &str, value: String) -> Result<(), String> {
         // Try to save with biometric protection first
         match keychain_ffi::set_generic_password_with_biometric_protection(key, &value) {
@@ -107,6 +109,7 @@ impl SecretManager {
     }
 
     /// Delete a secret (removes from cache and keychain)
+    #[allow(dead_code)]
     pub fn delete(&mut self, key: &str) -> Result<(), String> {
         let keychain = SecKeychain::default().map_err(|e| e.to_string())?;
         
@@ -126,12 +129,14 @@ impl SecretManager {
     }
 
     /// Set the Composio API key for a specific profile
+    #[allow(dead_code)]
     pub fn set_composio_key(&mut self, profile_name: &str, value: String) -> Result<(), String> {
         let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
         self.set(&key, value)
     }
 
     /// Delete the Composio API key for a specific profile
+    #[allow(dead_code)]
     pub fn delete_composio_key(&mut self, profile_name: &str) -> Result<(), String> {
         let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
         self.delete(&key)

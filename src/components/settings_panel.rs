@@ -14,8 +14,8 @@ pub fn SettingsPanel() -> Element {
     let settings_manager = use_context::<Signal<SettingsManager>>();
     let mut session_state = use_context::<Signal<SessionState>>();
     let _permission_manager = use_context::<Signal<crate::context::permissions::PermissionManager>>();
-    let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
-    let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
+    let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut secret_manager = use_context::<Signal<crate::secret_manager::SecretManager>>();
 
     // Create a local copy of the settings for editing.

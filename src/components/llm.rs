@@ -448,6 +448,7 @@ impl LlmConnector for GeminiConnector {
                                                                     tool.name.to_string(), // Use original tool name for execution
                                                                     function_call.args.clone(),
                                                                     part.thought_signature.clone().or(function_call.thought_signature.clone()),
+                                                                    None, // thought_summary will be populated by stream_manager
                                                                 );
                                                                 if tx.send(StreamMessage::ToolCall(tool_call)).is_err() {
                                                                     return;
@@ -808,7 +809,7 @@ mod tests {
 
         // Configure the mock server
         Mock::given(method("POST"))
-            .and(path("/gemini-2.5-pro:streamGenerateContent"))
+            .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
             .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
             .mount(&mock_server)
             .await;
@@ -885,7 +886,7 @@ mod tests {
         let response_body = format!("data: {}\n\n", response_json.to_string());
 
         Mock::given(method("POST"))
-            .and(path("/gemini-2.5-pro:streamGenerateContent"))
+            .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
             .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
             .mount(&mock_server)
             .await;
@@ -941,7 +942,7 @@ mod tests {
         let response_body = format!("data: {}\n\n", response_json.to_string());
 
         Mock::given(method("POST"))
-            .and(path("/gemini-2.5-pro:streamGenerateContent"))
+            .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
             .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
             .mount(&mock_server)
             .await;
@@ -1003,7 +1004,7 @@ mod tests {
         let response_body = format!("data: {}\n\n", response_json.to_string());
 
         Mock::given(method("POST"))
-            .and(path("/gemini-2.5-pro:streamGenerateContent"))
+            .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
             .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
             .mount(&mock_server)
             .await;

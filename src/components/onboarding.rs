@@ -7,7 +7,6 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
     let mut settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
 
-    let mut qdrant_uri = use_signal(|| settings.read().qdrant_url.clone().unwrap_or_else(|| "http://localhost:6333".to_string()));
     let mut gemini_api_key = use_signal(|| String::new());
     let mut error_message = use_signal(|| String::new());
     let mut success_message = use_signal(|| String::new());
@@ -21,7 +20,6 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
 
         // Clone values for async block
         let api_key = gemini_api_key.read().clone();
-        let qdrant_url = qdrant_uri.read().clone();
 
         spawn(async move {
             is_validating.set(true);
@@ -53,7 +51,6 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
 
                     // Update settings signal
                     let mut current_settings = settings.read().clone();
-                    current_settings.qdrant_url = Some(qdrant_url);
                     current_settings.gemini_config.api_key = Some(api_key);
                     
                     // Save settings to file
@@ -102,15 +99,6 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                     }
                 }
 
-                div { class: "mb-4",
-                    label { class: "block mb-2 text-sm font-medium text-gray-300", "QDrant URI" }
-                    input {
-                        class: "w-full p-2 bg-dark-input border border-primary-600 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500",
-                        value: "{qdrant_uri}",
-                        oninput: move |event| qdrant_uri.set(event.value())
-                    }
-                }
-
                 div { class: "mb-6",
                     label { class: "block mb-2 text-sm font-medium text-gray-300", "Gemini API Key" }
                     input {
@@ -118,6 +106,16 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                         r#type: "password",
                         value: "{gemini_api_key}",
                         oninput: move |event| gemini_api_key.set(event.value())
+                    }
+                    p {
+                        class: "mt-2 text-xs text-gray-500",
+                        "Get your API key from "
+                        a {
+                            class: "text-primary-400 hover:underline",
+                            href: "https://aistudio.google.com/app/apikey",
+                            target: "_blank",
+                            "Google AI Studio"
+                        }
                     }
                 }
             }

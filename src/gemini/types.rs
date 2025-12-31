@@ -71,6 +71,7 @@ pub struct GeminiFunctionDeclaration {
 /// A Gemini tool container.
 /// This wraps function declarations for the Gemini API request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(dead_code)]
 pub struct GeminiTool {
     pub function_declarations: Vec<GeminiFunctionDeclaration>,
 }

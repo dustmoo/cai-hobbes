@@ -554,7 +554,11 @@ pub fn McpMarketplace() -> Element {
             }
 
             div {
-                class: "flex-1 overflow-y-auto p-4",
+                class: if *active_tab.read() == ActiveTab::Installed {
+                    "flex-1 flex flex-col p-4 overflow-hidden"
+                } else {
+                    "flex-1 overflow-y-auto p-4"
+                },
                 if let Some(msg) = success_message.read().as_ref() {
                     div { class: "mb-4 p-2 bg-green-900 text-green-200 rounded text-sm", "{msg}" }
                 }
@@ -650,7 +654,7 @@ pub fn McpMarketplace() -> Element {
                     },
                     ActiveTab::Installed => rsx! {
                         div {
-                            class: "h-full flex flex-col",
+                            class: "flex-1 flex flex-col min-h-0",
                             p { class: "text-sm text-gray-400 mb-2", "Directly edit the JSON configuration for your MCP servers." }
                             
                             // Syntax highlighted editor
@@ -693,7 +697,26 @@ pub fn McpMarketplace() -> Element {
                             }
                             
                             div {
-                                class: "mt-4 flex justify-end",
+                                class: "mt-4 flex justify-end gap-2",
+                                button {
+                                    class: "px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded font-medium transition-colors",
+                                    onclick: move |_| {
+                                        let content = config_content.read().clone();
+                                        match serde_json::from_str::<serde_json::Value>(&content) {
+                                            Ok(parsed) => {
+                                                if let Ok(formatted) = serde_json::to_string_pretty(&parsed) {
+                                                    config_content.set(formatted);
+                                                    error_message.set(None);
+                                                    success_message.set(Some("JSON formatted.".to_string()));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error_message.set(Some(format!("Cannot format - Invalid JSON: {}", e)));
+                                            }
+                                        }
+                                    },
+                                    "Format JSON"
+                                }
                                 button {
                                     class: "px-4 py-2 bg-primary-600 hover:bg-primary-500 rounded font-medium transition-colors",
                                     onclick: move |_| {

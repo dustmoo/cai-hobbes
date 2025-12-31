@@ -796,10 +796,21 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                     div {
                                         class: "flex flex-col space-y-2 mt-2",
                                         for attachment in &message.attachments {
-                                            img {
-                                                src: format!("data:{};base64,{}", attachment.mime_type, attachment.data),
-                                                class: "w-20 h-20 object-cover rounded-lg hover:opacity-80 transition-opacity cursor-pointer border border-gray-700",
-                                                alt: attachment.file_name.clone(),
+                                            {
+                                                // Security: Sanitize mime_type to prevent XSS via attribute injection
+                                                let safe_mime = if attachment.mime_type.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '+' || c == '.') {
+                                                    &attachment.mime_type
+                                                } else {
+                                                    "application/octet-stream"
+                                                };
+
+                                                rsx! {
+                                                    img {
+                                                        src: format!("data:{};base64,{}", safe_mime, attachment.data),
+                                                        class: "w-20 h-20 object-cover rounded-lg hover:opacity-80 transition-opacity cursor-pointer border border-gray-700",
+                                                        alt: attachment.file_name.clone(),
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -816,7 +827,9 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                 on_copy: move |_| {
                                     let text = selection_data.read().0.clone();
                                     spawn(async move {
-                                        let mut eval = document::eval(&format!("navigator.clipboard.writeText(`{}`);", text));
+                                        // Security: Use serde_json::to_string to safely escape the string for JS
+                                        let json_text = serde_json::to_string(&text).unwrap_or_else(|_| "null".to_string());
+                                        let mut eval = document::eval(&format!("navigator.clipboard.writeText({});", json_text));
                                         let _: Result<serde_json::Value, _> = eval.recv().await;
                                     });
                                     selection_mode.set(SelectionMode::None);
@@ -937,9 +950,10 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                         
                         if !is_thinking && (local_thought_summary.read().is_some() || thought_signature.is_some()) {
                             div {
-                                class: "ml-16 mb-5",
+                                class: "m-4 mb-2",
                                 button {
                                     class: "flex items-center text-xs text-gray-500 hover:text-gray-300 focus:outline-none transition-colors",
+
                                     onclick: move |_| {
                                         let current = *show_thinking.read();
                                         show_thinking.set(!current);

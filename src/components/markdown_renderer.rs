@@ -168,7 +168,19 @@ pub fn MarkdownRenderer(
             let nodes: Vec<RenderNode> = inlines.into_iter().map(|inline| match inline {
                 Inline::Text(t) => RenderNode::Text(t),
                 Inline::Code(c) => RenderNode::Code(c),
-                Inline::Link { href, text } => RenderNode::Link { href, text },
+                Inline::Link { href, text } => {
+                    let lower = href.to_lowercase();
+                    // Security: Prevent XSS via javascript: and vbscript: protocols
+                    // Also maintain caution with data: URIs in links (though less critical than scripts)
+                    let safe_href = if lower.starts_with("javascript:") 
+                        || lower.starts_with("vbscript:") 
+                        || (lower.starts_with("data:") && !lower.starts_with("data:image/")) {
+                        format!("unsafe:{}", href)
+                    } else {
+                        href
+                    };
+                    RenderNode::Link { href: safe_href, text }
+                },
                 Inline::SoftBreak => RenderNode::SoftBreak,
                 Inline::HardBreak => RenderNode::HardBreak,
                 Inline::Emphasis(children) => RenderNode::Emphasis(process_inlines(children, comments)),

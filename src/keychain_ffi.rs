@@ -30,6 +30,7 @@ unsafe extern "C" {
     static kSecValueData: CFTypeRef;
     static kSecUseAuthenticationContext: CFTypeRef;
     static kSecAttrAccessControl: CFTypeRef;
+    #[allow(dead_code)]
     static kSecAttrAccessible: CFTypeRef;
     static kSecAttrAccessibleWhenUnlockedThisDeviceOnly: CFTypeRef;
 
@@ -90,7 +91,9 @@ impl std::error::Error for KeychainError {}
 
 // Helper to set values in dictionary without trait ambiguity issues
 unsafe fn dict_set(dict: &CFMutableDictionary, key: CFTypeRef, value: CFTypeRef) {
-    CFDictionarySetValue(dict.as_concrete_TypeRef() as CFTypeRef, key, value);
+    unsafe {
+        CFDictionarySetValue(dict.as_concrete_TypeRef() as CFTypeRef, key, value);
+    }
 }
 
 /// Query a generic password from the keychain using an authenticated context.

@@ -5,7 +5,6 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use uuid::Uuid;
 use crate::session::SessionState;
 use crate::components::shared::{StreamMessage, ToolCallStatus};
-use crate::services::document_store::DocumentStore;
 use std::sync::Arc;
 use crate::settings::Settings;
 use super::continuation_controller::ContinuationController;
@@ -19,7 +18,6 @@ pub struct StreamManagerContext {
     llm_connector: Signal<std::sync::Arc<dyn crate::components::llm::LlmConnector>>,
     session_state: Signal<SessionState>,
     mcp_manager: Signal<crate::mcp::manager::McpManager>,
-    document_store: Signal<Option<Arc<DocumentStore>>>,
     tool_call_summarizer: Signal<ToolCallSummarizer>,
     settings: Signal<Settings>,
     continuation_controller: Signal<ContinuationController>,
@@ -135,7 +133,12 @@ impl StreamManagerContext {
                         // Error ends the stream
                         break;
                     }
-                    StreamMessage::ToolCall(tool_call) => {
+                    StreamMessage::ToolCall(mut tool_call) => {
+                        // Attach any accumulated thinking summary to this tool call
+                        if tool_call.thought_summary.is_none() && thought_summary_for_this_turn.is_some() {
+                            tool_call.thought_summary = thought_summary_for_this_turn.take();
+                        }
+                        
                         tool_call_count += 1;
                         let tool_call_message_id = {
                             let mut state = self.session_state.write();
@@ -162,7 +165,6 @@ impl StreamManagerContext {
 
                         let mcp_manager = self.mcp_manager;
                         let mut session_state = self.session_state;
-                        let document_store = self.document_store;
                         let tool_results_tx_clone = tool_results_tx.clone();
                         let handle = spawn(async move {
                             let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
@@ -227,14 +229,6 @@ impl StreamManagerContext {
                                 call: tool_call.clone(),
                                 result: crate::components::shared::ToolResult { status, response: response_str },
                             };
-                            if let Some(store) = document_store.read().as_ref().cloned() {
-                                let record_for_store = record.clone();
-                                spawn(async move {
-                                    if let Err(e) = store.upsert_tool_result(&record_for_store).await {
-                                        tracing::error!("Failed to upsert tool result: {}", e);
-                                    }
-                                });
-                            }
                             let _ = tool_results_tx_clone.send(record);
                         });
                         let _ = handle; // We don't need to track the handle, just spawn the task.
@@ -362,7 +356,6 @@ pub struct StreamManagerProps {
 pub fn StreamManager(props: StreamManagerProps) -> Element {
     let session_state = consume_context::<Signal<SessionState>>();
     let mcp_manager = consume_context::<Signal<crate::mcp::manager::McpManager>>();
-    let document_store = use_context_provider(|| Signal::new(None));
     let settings = consume_context::<Signal<Settings>>();
     let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
@@ -373,7 +366,6 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         llm_connector: consume_context::<Signal<Arc<dyn crate::components::llm::LlmConnector>>>(),
         session_state,
         mcp_manager,
-        document_store,
         tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
         settings,
         continuation_controller,
@@ -404,7 +396,6 @@ mod tests {
             let settings = use_context_provider(|| Signal::new(Settings::default()));
             let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
             let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
-            let document_store = use_context_provider(|| Signal::new(None));
             let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
             let llm_connector = use_context_provider(|| Signal::new(Arc::new(crate::components::llm::GeminiConnector::new(settings.read().gemini_config.clone())) as Arc<dyn crate::components::llm::LlmConnector>));
             let scheduler = use_coroutine(|_| async {});
@@ -414,7 +405,6 @@ mod tests {
                 llm_connector,
                 session_state,
                 mcp_manager,
-                document_store,
                 tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
                 settings,
                 continuation_controller,
@@ -457,7 +447,6 @@ mod tests {
             let settings = use_context_provider(|| Signal::new(Settings::default()));
             let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
             let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
-            let document_store = use_context_provider(|| Signal::new(None));
             let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
             let llm_connector = use_context_provider(|| Signal::new(Arc::new(crate::components::llm::GeminiConnector::new(settings.read().gemini_config.clone())) as Arc<dyn crate::components::llm::LlmConnector>));
             let scheduler = use_coroutine(|_| async {});
@@ -467,7 +456,6 @@ mod tests {
                 llm_connector,
                 session_state,
                 mcp_manager,
-                document_store,
                 tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
                 settings,
                 continuation_controller,

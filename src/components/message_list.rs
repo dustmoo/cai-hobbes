@@ -117,7 +117,7 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                                         MessageContent::Text { content: text, .. } => {
                                             let stream_manager = consume_context::<crate::components::stream_manager::StreamManagerContext>();
                                             let is_generating = stream_manager.is_generating(&message.id);
-                                            let should_render = !text.is_empty() || is_generating;
+                                            let should_render = !text.is_empty() || is_generating || !message.attachments.is_empty();
 
                                             if should_render {
                                                 rsx! {

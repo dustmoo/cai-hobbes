@@ -20,3 +20,14 @@ mcp_servers/
 # Ignore third party and tools
 third_party/
 tools/
+
+# MacOS Signing and Certificates
+*.cer
+*.provisionprofile
+
+# Temporary Directories and Logs
+debug_logs/
+temp_*/
+
+# Scratch files
+src/repro_*.rs

@@ -26,7 +26,6 @@ impl ToolCallSummarizer {
                     "tool_name": record.call.tool_name,
                     "arguments": record.call.arguments,
                     "result_summary": summary,
-                    "full_result_ref": format!("qdrant_vector_id:{}", record.call.execution_id)
                 });
                 session.active_context.extra.insert(
                     format!("tool_snapshot_{}", record.call.execution_id),

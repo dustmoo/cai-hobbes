@@ -63,41 +63,38 @@ graph TD
         C[Filesystem MCP] -- "Provides workspace data" --> L;
     end
 
-    subgraph "Long-Term Vector Storage"
-        V[DocumentStore]
-        style V fill:#008080,stroke:#333,stroke-width:2px
-    end
-
     subgraph "Internal Short-Term Memory & Core Logic"
         subgraph "Core Application"
             M[main.rs] -->|Spawns on startup| L[McpManager];
+            M -->|Initializes| SS[SummarizationScheduler];
             L -->|Updates available tools via Signal| F[SessionState];
             
             G[ChatWindow] -->|Reads from Active Session| F;
-            G -->|Triggers| J[ConversationProcessor];
+            G -->|Sends Activity Signal| SS;
+
+            SS -->|On Inactivity Timeout, Triggers| J[ConversationProcessor];
             J -->|"Updates Active Session (Dialogue Summary)"| F;
 
             G -->|Builds Prompt| H[PromptBuilder];
             H -->|Gets Active Context, Tools & Tool History| F;
-            H -->|Formats Prompt| I["Chat LLM (e.g., Gemini Pro)"];
-            G -- "Sends Message" --> I;
+            M -->|Initializes| I[LlmConnector];
+            H -->|Formats Prompt| I;
 
             J -- "Generates Summary" --> I2["Summary LLM (e.g., Gemini Flash)"];
 
-            subgraph "NEW Tool Call Feedback Loop"
-                I -- "Responds with Tool Call" --> K[StreamManager];
-                K -- "Updates Message State" --> F;
+            subgraph "Tool Call Feedback Loop"
+                I -- "Responds with Full Stream" --> K[StreamManager];
                 K -- "Executes Tool(s) via" --> L;
                 L -- "Returns Result(s)" --> K;
-                K -- "Collects all results" --> K;
+                K -- "Sends Buffered Text to UI" --> G;
+                K -- "Updates Message State" --> F;
+                K -- "Sends Activity Signal" --> SS;
                 K -- "Stores (Call, Result) pairs in" --> TCH[ToolCallHistory];
-                K -- "Async write of full results to" --> V;
                 K -- "Builds new prompt via" --> H;
-                H -- "Gets context & history from" --> F;
                 K -- "Sends feedback to" --> I;
 
                 I -- "Responds with Final Text" --> K;
-                K -- "Triggers" --> TCS[ToolCallSummarizer];
+                K -- "Triggers at end of turn" --> TCS[ToolCallSummarizer];
                 TCS -- "Summarizes pairs from" --> TCH;
                 TCS -- "Writes 'Snapshot' to" --> F;
                 TCS -- "Clears" --> TCH;
@@ -106,20 +103,20 @@ graph TD
     end
 
     F -.-> TCH;
-    style TCH fill:#ffb703,stroke:#333,stroke-width:2px
-    style TCS fill:#fb8500,stroke:#333,stroke-width:2px
-    style J fill:#c77dff,stroke:#333,stroke-width:2px
-    style F fill:#f4a261,stroke:#333,stroke-width:2px
-    style I fill:#e76f51,stroke:#333,stroke-width:2px
-    style I2 fill:#f77f00,stroke:#333,stroke-width:2px
-    style L fill:#457b9d,stroke:#333,stroke-width:2px
+    style TCH fill:#2d3748,stroke:#a0aec0,stroke-width:2px,color:#fff
+    style TCS fill:#4a5568,stroke:#a0aec0,stroke-width:2px,color:#fff
+    style SS fill:#2b6cb0,stroke:#90cdf4,stroke-width:2px,color:#fff
+    style J fill:#805ad5,stroke:#d6bcfa,stroke-width:2px,color:#fff
+    style F fill:#2c7a7b,stroke:#81e6d9,stroke-width:2px,color:#fff
+    style I fill:#c53030,stroke:#fc8181,stroke-width:2px,color:#fff
+    style I2 fill:#9c4221,stroke:#fbd38d,stroke-width:2px,color:#fff
+    style L fill:#2b6cb0,stroke:#90cdf4,stroke-width:2px,color:#fff
 ```
 
 ### Core Components
 
 -   **Memory & State**:
     -   **Local Long-Term Memory (ConPort):** A local MCP providing access to the project's strategic memory (goals, decisions, etc.).
-    -   **Vector Storage (`DocumentStore`):** A long-term vector store (e.g., Qdrant) for indexing verbose tool results and documents for future Retrieval Augmented Generation (RAG).
     -   **Short-Term Memory (`SessionState`):** The core of the "live" context, managed internally and stored securely in `sessions.json`. It holds messages, tool call history, and the active context for each conversation.
 -   **Services & Processors**:
     -   **`McpManager`**: Manages the lifecycle of all MCP servers, launching them as child processes and discovering their available tools.

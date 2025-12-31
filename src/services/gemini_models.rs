@@ -40,6 +40,7 @@ pub enum ModelFetchError {
     #[error("No API key provided")]
     NoApiKey,
     #[error("Invalid API key")]
+    #[allow(dead_code)]
     InvalidApiKey,
     #[error("Failed to parse response: {0}")]
     ParseError(String),

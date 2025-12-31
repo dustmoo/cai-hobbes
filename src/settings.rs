@@ -28,7 +28,6 @@ pub struct GeminiConfig {
 pub struct Settings {
     pub active_llm: LlmProvider,
     pub gemini_config: GeminiConfig,
-    pub qdrant_url: Option<String>,
     pub persona: String,
     pub user_name: Option<String>,
     pub force_tool_use_instruction: Option<String>,
@@ -133,6 +132,7 @@ impl ComposioProfile {
     }
 
     /// Get slugs of toolkits configured for on-demand loading (default)
+    #[allow(dead_code)]
     pub fn get_on_demand_toolkit_slugs(&self) -> Vec<String> {
         self.toolkit_configs
             .iter()
@@ -142,6 +142,7 @@ impl ComposioProfile {
     }
 
     /// Check if a toolkit is configured for force loading
+    #[allow(dead_code)]
     pub fn is_toolkit_force_load(&self, slug: &str) -> bool {
         self.toolkit_configs
             .iter()
@@ -151,6 +152,7 @@ impl ComposioProfile {
     }
 
     /// Update or add a toolkit configuration
+    #[allow(dead_code)]
     pub fn set_toolkit_config(&mut self, config: ComposioToolkitConfig) {
         if let Some(existing) = self.toolkit_configs.iter_mut().find(|c| c.slug == config.slug) {
             *existing = config;
@@ -175,7 +177,6 @@ impl Default for Settings {
                 thinking_level: "high".to_string(),
                 thinking_budget: None,
             },
-            qdrant_url: None,
             persona: "You are Hobbes. Be a direct, clear, and radically candid partner. Function as an exocortex, matching the user's communication style. Your default tone is that of a professional friend.".to_string(),
             user_name: None,
             force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available. When using the fetch tool, you MUST provide markdown links as sources.".to_string()),
@@ -258,6 +259,7 @@ impl Settings {
     }
 
     /// Migrate legacy single Composio settings to a profile
+    #[allow(dead_code)]
     pub fn migrate_legacy_composio_settings(&mut self) {
         // Only migrate if we have legacy settings and no profiles yet
         let has_legacy = self.composio_base_url.is_some() 
@@ -329,9 +331,6 @@ impl SettingsManager {
         tracing::warn!("Failed to deserialize settings directly, attempting migration...");
         let mut settings = Settings::default();
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(qdrant_url) = value.get("qdrant_url").and_then(|v| v.as_str()) {
-                settings.qdrant_url = Some(qdrant_url.to_string());
-            }
             if let Some(gemini_config_val) = value.get("gemini_config") {
                 if let Ok(gemini_config) = serde_json::from_value(gemini_config_val.clone()) {
                     settings.gemini_config = gemini_config;

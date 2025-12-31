@@ -4,7 +4,6 @@ use rmcp::model::Tool;
 use std::sync::Arc;
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -118,6 +117,7 @@ impl ComposioToolkitListing {
     }
     
     /// Get the logo URL from meta
+    #[allow(dead_code)]
     pub fn logo(&self) -> Option<String> {
         self.meta.as_ref().and_then(|m| m.logo.clone())
     }
@@ -162,6 +162,7 @@ pub struct ComposioCategory {
 
 impl ComposioCategory {
     /// Get the display-friendly name for this category
+    #[allow(dead_code)]
     pub fn display(&self) -> String {
         self.display_name.clone()
             .or_else(|| self.name.clone())
@@ -984,6 +985,7 @@ impl ComposioClient {
 
     /// Search for tools matching a natural language query within specified toolkits
     /// Uses Composio's MCP server with JSON-RPC (same as list_tools)
+    #[allow(dead_code)]
     pub async fn search_tools(&self, query: &str, toolkit_slugs: &[String]) -> Result<Vec<ComposioTool>, String> {
         let url = self.build_mcp_url("");
         

@@ -3,6 +3,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use super::chat::CodeBlock;
 use super::shared::{ToolCall, ToolCallStatus};
+use super::markdown_renderer::ThinkingMarkdownRenderer;
 use crate::mcp::manager::McpManager;
 
 #[derive(Props, Clone, PartialEq)]
@@ -19,7 +20,8 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
 
     let status = props.tool_call.status;
     let response = props.tool_call.response.clone();
-    let thought_signature = props.tool_call.thought_signature.clone().unwrap_or_default();
+    // Use thought_summary (actual thinking content) not thought_signature (encrypted)
+    let thought_content = props.tool_call.thought_summary.clone().unwrap_or_default();
 
 
     rsx! {
@@ -51,8 +53,8 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                     span { class: "font-mono text-sm text-gray-300", "{props.tool_call.tool_name}" }
                 }
 
-                // Thought Signature collapsible section (if present)
-                if !thought_signature.is_empty() {
+                // Thinking Process collapsible section (if present)
+                if !thought_content.is_empty() {
                     div {
                         class: "flex flex-col",
                         button {
@@ -71,12 +73,15 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                                     icon: fi_icons::FiChevronRight
                                 }
                             }
-                            "Thought Signature"
+                            "Thinking Process"
                         }
                         if *show_thought.read() {
                             div {
-                                class: "text-gray-300 text-sm p-2 bg-gray-900 rounded mt-1",
-                                "{thought_signature}"
+                                class: "text-sm p-2 bg-gray-900 rounded mt-1",
+                                ThinkingMarkdownRenderer {
+                                    content: thought_content.clone(),
+                                    compact: false,
+                                }
                             }
                         }
                     }
