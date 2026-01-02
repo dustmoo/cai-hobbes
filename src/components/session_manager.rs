@@ -222,7 +222,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                     }
 
                     button {
-                        class: "w-full px-4 py-3 bg-primary-500 rounded-lg text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 shadow-lg transition-all transform hover:scale-[1.02]",
+                        class: "w-full px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 transition-colors",
                         onclick: move |_| {
                             session_state.write().create_session();
                             permission_manager.write().reset_turn_count();
