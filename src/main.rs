@@ -24,7 +24,7 @@ mod keychain_ffi;
 mod mcp;
 mod services;
 mod gemini;
-mod repro_keychain;
+
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 use tray_icon::TrayIcon;
 
