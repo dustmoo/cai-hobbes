@@ -1,6 +1,7 @@
 # Hobbes
 
 ![Version](https://img.shields.io/github/v/tag/dustmoo/cai-hobbes?label=version)
+![Build Status](https://github.com/dustmoo/cai-hobbes/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/github/license/dustmoo/cai-hobbes)
 
 

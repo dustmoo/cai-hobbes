@@ -55,7 +55,9 @@ fi
 echo ""
 echo "=== Embedding Provisioning Profile ==="
 PROVISIONING_PROFILE="./embedded.provisionprofile"
-if [ -f "$PROVISIONING_PROFILE" ]; then
+if [ "$CI" = "true" ]; then
+    echo "  ⚠️  CI Mode: Skipping Provisioning Profile embedding."
+elif [ -f "$PROVISIONING_PROFILE" ]; then
     cp "$PROVISIONING_PROFILE" "$APP_PATH/Contents/embedded.provisionprofile"
     echo "  ✅ Embedded provisioning profile"
 else
@@ -70,13 +72,25 @@ xattr -cr "$APP_PATH"
 echo "  ✅ Cleaned xattrs"
 
 echo ""
-echo "=== Code Signing with Developer Certificate ==="
-codesign --force --deep --sign "$IDENTITY" --entitlements "$ENTITLEMENTS" "$APP_PATH"
-echo "  ✅ Signed with: $IDENTITY"
+echo "=== Code Signing ==="
+if [ "$CI" = "true" ]; then
+    echo "  ⚠️  CI Mode: Performing ad-hoc signing (no identity)..."
+    codesign --force --deep --sign - --entitlements "$ENTITLEMENTS" "$APP_PATH"
+    echo "  ✅ Ad-hoc signed"
+else
+    echo "  🔐 Signing with Developer Certificate..."
+    codesign --force --deep --sign "$IDENTITY" --entitlements "$ENTITLEMENTS" "$APP_PATH"
+    echo "  ✅ Signed with: $IDENTITY"
+fi
 
 echo ""
 echo "=== Verification ==="
-codesign -dvvv "$APP_PATH" 2>&1 | grep -E "(TeamIdentifier|Authority|Identifier=)" | head -5
+if [ "$CI" = "true" ]; then
+    echo "  ⚠️  CI Mode: Skipping strict verification."
+    codesign -dvvv "$APP_PATH" 2>&1 | grep -E "(Identifier=)"
+else
+    codesign -dvvv "$APP_PATH" 2>&1 | grep -E "(TeamIdentifier|Authority|Identifier=)" | head -5
+fi
 
 echo ""
 echo "=== Verifying Info.plist ===" 
