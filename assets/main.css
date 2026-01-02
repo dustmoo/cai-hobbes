@@ -133,7 +133,7 @@ body {
 }
 
 .toggle-switch.active {
-    background-color: #8b5cf6;
+    background-color: #3B5998;
     /* primary-500 */
 }
 
@@ -170,7 +170,7 @@ body {
 }
 
 .toggle-switch-sm.active {
-    background-color: #a78bfa;
+    background-color: #5B86C1;
     /* primary-400 */
 }
 
