@@ -283,11 +283,8 @@ fn write_to_debug_file(filename: &str, content: &str) -> std::io::Result<()> {
         return Ok(());
     }
     
-    // Use current working directory matching the project root
-    let exe_dir = std::env::current_dir()?;
-    
-    // Create a debug_logs directory in the same directory as the executable
-    let debug_dir = exe_dir.join("debug_logs");
+    // Use system temp directory for logs to avoid triggering hot-reload watchers
+    let debug_dir = std::env::temp_dir().join("hobbes_debug_logs");
     if !debug_dir.exists() {
         std::fs::create_dir_all(&debug_dir)?;
     }

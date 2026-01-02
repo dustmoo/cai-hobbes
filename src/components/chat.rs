@@ -87,6 +87,8 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     let mut pending_delete_message_id = use_signal(|| None::<String>);
     let mut delete_message_count = use_signal(|| 0);
     let mut has_new_comments = use_signal(|| false);
+    let mut has_pending_approvals = use_signal(|| false);
+    use_context_provider(|| has_pending_approvals);
 
     let on_interaction = move || {
         show_scroll_button.set(false);
@@ -96,6 +98,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         // Any change to messages will cause this to re-run.
         let _ = stream_update_trigger.read();
         let current_session_id = session_state.read().active_session_id.clone();
+
         let mut is_session_switch = false;
         last_session_id.with_mut(|last_id| {
             if current_session_id != *last_id {
@@ -158,7 +161,82 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 }
             });
         }
+    });
 
+    use_effect(move || {
+        if *has_pending_approvals.read() {
+            spawn(async move {
+                let mut session_state = session_state;
+                let mcp_manager = mcp_manager;
+                let active_session_id = session_state.read().active_session_id.clone();
+                let mut tools_to_run = Vec::new();
+                let mut stream_manager_is_sending = stream_manager.is_sending;
+
+                // Indicate activity immediately
+                stream_manager_is_sending.set(true);
+                // Clear the signal so we don't re-trigger loop
+                has_pending_approvals.set(false);
+
+                // 1. Identify tools that need to be run
+                {
+                    let state = session_state.read();
+                    if let Some(session) = state.sessions.get(&active_session_id) {
+                        for msg in &session.messages {
+                            if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
+                                if tc.status == crate::components::shared::ToolCallStatus::Running {
+                                    tools_to_run.push((msg.id, tc.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if tools_to_run.is_empty() {
+                     stream_manager_is_sending.set(false);
+                     return;
+                }
+
+                // 2. Execute tools
+                for (msg_id, tool_call) in tools_to_run {
+                    let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
+                    // Bypass permission check since user explicitly approved this instance
+                    let manager = mcp_manager.read().clone();
+                    let result_receiver = manager.use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, true).await;
+
+                    let (status, response_str, _) = match result_receiver {
+                        Ok(receiver) => {
+                            crate::mcp::manager::McpManager::process_tool_output(receiver).await
+                        }
+                        Err(e) => (crate::components::shared::ToolCallStatus::Error, e, false),
+                    };
+
+                    // Update session state with result
+                    {
+                        let mut state = session_state.write();
+                        
+                        // Update message status
+                        if let Some(msg) = state.get_message_mut(&msg_id) {
+                            if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                                tc.status = status;
+                                tc.response = response_str.clone();
+                            }
+                        }
+
+                        // Add to history for context
+                        state.tool_call_history.push(crate::components::shared::ToolCallRecord {
+                            call: tool_call.clone(),
+                            result: crate::components::shared::ToolResult {
+                                status,
+                                response: response_str,
+                            },
+                        });
+                    }
+                }
+                
+                // 3. Trigger continuation to send results back to LLM
+                continuation_controller.read().trigger_continuation();
+            });
+        }
     });
 
 
@@ -256,6 +334,9 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             }
 
             if user_message.trim().is_empty() && attachments.is_empty() {
+                // Auto-resume handled by use_effect now.
+
+                
                 if *has_new_comments.read() {
                      // Submit comments as a turn
                      has_new_comments.set(false);
@@ -484,6 +565,7 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
             ChatInput {
                 is_sending: Signal::new(stream_manager.is_sending.read().clone() || stream_manager.is_any_generating()),
                 has_new_comments: has_new_comments,
+                has_pending_approvals: has_pending_approvals,
                 on_send: move |(msg, attachments)| send_message((msg, attachments)),
                 on_cancel: move |_| cancel_message(),
                 on_interaction: on_interaction,

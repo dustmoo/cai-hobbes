@@ -57,3 +57,27 @@ To learn more about rebasing and merging, check out this guide on [syncing a for
 ## How to get in touch
 
 You can chat with us on [Discord](https://discord.gg/Uy9Euhgp)).
+
+## Development Workflow
+
+We use [Dioxus](https://dioxuslabs.com) for the UI.
+
+### UI Development (Fastest)
+
+For working on the UI, layout, or basic logic, we recommend using `dx serve`. It offers incredible hot-reloading capabilities that make frontend work a breeze.
+
+```sh
+dx serve
+```
+
+### Systems & Permissions Development (Robust)
+
+If you are working on features that require deeper macOS integration (Touch ID, Keychain, local MCP tools requiring Terminal permissions), `dx serve`'s development environment may run into sandbox/entitlement issues.
+
+For this, use our custom dev launcher which simulates a signed application bundle:
+
+```sh
+./scripts/dev_launcher.sh
+```
+
+This script handles packaging, entitlement signing, and running the app in a way that satisfies macOS security policies while still allowing debug builds.

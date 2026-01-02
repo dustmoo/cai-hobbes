@@ -309,15 +309,13 @@ impl LlmConnector for GeminiConnector {
         // Write the full request (with tools) to debug file for diagnosis
         if tracing::enabled!(tracing::Level::DEBUG) {
             if let Ok(request_json) = serde_json::to_string_pretty(&request_body) {
-                if let Ok(exe_dir) = std::env::current_dir() {
-                    let debug_dir = exe_dir.join("debug_logs");
-                    if std::fs::create_dir_all(&debug_dir).is_ok() {
-                        let file_path = debug_dir.join("gemini_request.json");
-                        if let Err(e) = std::fs::write(&file_path, &request_json) {
-                            tracing::warn!("Failed to write Gemini debug file: {}", e);
-                        } else {
-                            tracing::debug!("Wrote Gemini request to debug_logs/gemini_request.json");
-                        }
+                let debug_dir = std::env::temp_dir().join("hobbes_debug_logs");
+                if std::fs::create_dir_all(&debug_dir).is_ok() {
+                    let file_path = debug_dir.join("gemini_request.json");
+                    if let Err(e) = std::fs::write(&file_path, &request_json) {
+                        tracing::warn!("Failed to write Gemini debug file: {}", e);
+                    } else {
+                        tracing::debug!("Wrote Gemini request to {:?}", file_path);
                     }
                 }
             }

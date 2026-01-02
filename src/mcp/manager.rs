@@ -13,10 +13,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::process::Command;
-use crate::context::permissions::{PermissionManager, PermissionStatus, ToolCategory};
+use crate::context::permissions::{PermissionManager, PermissionStatus};
 use crate::mcp::composio_client::{composio_to_rmcp_tool, ComposioClient};
 use dioxus::prelude::Signal;
 use tokio::sync::Mutex;
+use crate::components::shared::ToolCallStatus;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct McpServerConfig {
@@ -668,9 +669,6 @@ impl McpManager {
             .map_err(|e| format!("Failed to write to mcp_servers.json: {}", e))
     }
 
-    fn map_tool_to_category(_tool_name: &str) -> ToolCategory {
-        ToolCategory::Mcp
-    }
 
     pub async fn use_mcp_tool(
         &self,
@@ -689,9 +687,8 @@ impl McpManager {
         // Permission Check
         if !bypass_permission_check && !client.config.always_allow.contains(&tool_name.to_string())
         {
-            let category = Self::map_tool_to_category(tool_name);
             let pm = self.permission_manager.read();
-            match pm.check_permission(&category) {
+            match pm.check_mcp_permission(server_name) {
                 PermissionStatus::Allowed => {}
                 PermissionStatus::RequiresPrompt => {
                     let tool_call = crate::components::shared::ToolCall::new(
@@ -1602,6 +1599,59 @@ impl McpManager {
             self.add_or_update_mcp_server(&config_path, new_config).await
         } else {
             Err(format!("No compatible configuration found for platform '{}'", platform))
+        }
+    }
+
+    /// Helper to process the output stream from a tool call into a final status and response string.
+    /// Returns (Status, ResponseString, IsPermissionRequest)
+    pub async fn process_tool_output(
+        mut receiver: UnboundedReceiver<Result<CallToolResult, String>>,
+    ) -> (ToolCallStatus, String, bool) {
+        let mut aggregated_content: Vec<rmcp::model::Content> = Vec::new();
+        let mut final_status = ToolCallStatus::Completed;
+        let mut error_string = None;
+
+        while let Some(result) = receiver.recv().await {
+            match result {
+                Ok(call_tool_result) => {
+                    aggregated_content.extend(call_tool_result.content);
+                }
+                Err(e) => {
+                    final_status = ToolCallStatus::Error;
+                    error_string = Some(e);
+                    break;
+                }
+            }
+        }
+
+        if final_status == ToolCallStatus::Error {
+            let err = error_string.unwrap_or_default();
+            // Check if this error is actually a serialized ToolCall indicating a permission request
+            if let Ok(_tc) = serde_json::from_str::<crate::components::shared::ToolCall>(&err) {
+                (ToolCallStatus::Error, err, true)
+            } else {
+                (final_status, err, false)
+            }
+        } else {
+            // Check for auth requirement
+            let mut auth_url = None;
+            for content in &aggregated_content {
+                let json_content = serde_json::to_value(content).unwrap_or(serde_json::Value::Null);
+                if let Some(text) = json_content.get("text").and_then(|t| t.as_str()) {
+                    if text.contains("Authentication required") && text.contains("connect your account") {
+                        if let Some(start) = text.find("http") {
+                            auth_url = Some(text[start..].trim().to_string());
+                        }
+                    }
+                }
+            }
+
+            if let Some(url) = auth_url {
+                (ToolCallStatus::AuthRequired, url, false)
+            } else {
+                let final_json = serde_json::to_value(aggregated_content).unwrap_or(serde_json::Value::Null);
+                (final_status, serde_json::to_string_pretty(&final_json).unwrap_or_default(), false)
+            }
         }
     }
 }

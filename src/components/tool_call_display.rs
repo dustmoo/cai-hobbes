@@ -4,7 +4,6 @@ use dioxus_free_icons::{icons::fi_icons, Icon};
 use super::chat::CodeBlock;
 use super::shared::{ToolCall, ToolCallStatus};
 use super::markdown_renderer::ThinkingMarkdownRenderer;
-use crate::mcp::manager::McpManager;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct ToolCallDisplayProps {
@@ -183,7 +182,7 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
 }
 
 
-use crate::components::continuation_controller::ContinuationController;
+
 
 #[derive(Props, Clone, PartialEq)]
 pub struct PermissionPromptProps {
@@ -192,9 +191,8 @@ pub struct PermissionPromptProps {
 
 #[component]
 pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
-    let mut mcp_manager = consume_context::<Signal<McpManager>>();
-    let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let continuation_controller = consume_context::<Signal<ContinuationController>>();
+    let session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let has_pending_approvals = consume_context::<Signal<bool>>();
     let tool_call = props.tool_call.clone();
     let tool_call_deny = tool_call.clone();
 
@@ -226,87 +224,49 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 button {
                     class: "px-4 py-2 rounded-md bg-gray-600 text-white hover:bg-gray-500",
                     onclick: move |_| {
-                        let mut state = session_state.write();
-                        if let Some(msg) = state.get_message_mut_by_execution_id(&tool_call_deny.execution_id) {
-                            if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
-                                tc.status = ToolCallStatus::Error;
-                                tc.response = "Denied by user.".to_string();
-                                // We need to convert it back to a ToolCall to be displayed correctly
-                                msg.content = super::shared::MessageContent::ToolCall(tc.clone());
+                        // Deny: Convert to error/skipped state so UI can clean up
+                        spawn({
+                            let tool_call_deny = tool_call_deny.clone();
+                            let mut session_state = session_state;
+                            async move {
+                                {
+                                    let mut state = session_state.write();
+                                    if let Some(msg) = state.get_message_mut_by_execution_id(&tool_call_deny.execution_id) {
+                                        if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
+                                            let mut denied_tc = tc.clone();
+                                            denied_tc.status = ToolCallStatus::Error;
+                                            denied_tc.response = "Denied by user.".to_string();
+                                            msg.content = super::shared::MessageContent::ToolCall(denied_tc);
+                                        }
+                                    }
+                                }
                             }
-                        }
+                        });
                     },
                     "Deny"
                 }
                 button {
                     class: "px-4 py-2 rounded-md bg-green-600 text-white hover:bg-green-500",
                     onclick: move |_| {
+                        // Approve: Mark as ready for execution, signal pending approvals
+                        // The lifecycle (Submit button) will handle actual execution
                         spawn({
                             let tool_call = tool_call.clone();
-                            let continuation_controller = continuation_controller;
+                            let mut session_state = session_state;
+                            let mut has_pending_approvals = has_pending_approvals;
                             async move {
-                                let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
-                                let result_receiver = mcp_manager.write().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, true).await;
-
-                                let mut state = session_state.write();
-                                if let Some(msg) = state.get_message_mut_by_execution_id(&tool_call.execution_id) {
-                                     if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
-                                        let mut updated_tc = tc.clone();
-                                        match result_receiver {
-                                            Ok(mut receiver) => {
-                                                let mut aggregated_content: Vec<rmcp::model::Content> = Vec::new();
-                                                let mut final_status = ToolCallStatus::Completed;
-                                                let mut error_string = None;
-
-                                                while let Some(result) = receiver.recv().await {
-                                                    match result {
-                                                        Ok(call_tool_result) => {
-                                                            aggregated_content.extend(call_tool_result.content);
-                                                        }
-                                                        Err(e) => {
-                                                            final_status = ToolCallStatus::Error;
-                                                            error_string = Some(e);
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-
-                                                updated_tc.status = final_status;
-                                                if final_status == ToolCallStatus::Error {
-                                                updated_tc.response = error_string.unwrap_or_default();
-                                            } else {
-                                                 // Check for auth requirement (duplicated from stream_manager.rs - TODO: refactor)
-                                                let mut auth_url = None;
-                                                for content in &aggregated_content {
-                                                    let json_content = serde_json::to_value(content).unwrap_or(serde_json::Value::Null);
-                                                    if let Some(text) = json_content.get("text").and_then(|t| t.as_str()) {
-                                                        if text.contains("Authentication required") && text.contains("connect your account") {
-                                                            if let Some(start) = text.find("http") {
-                                                                auth_url = Some(text[start..].trim().to_string());
-                                                            }
-                                                        }
-                                                    }
-                                                }
-
-                                                if let Some(url) = auth_url {
-                                                    updated_tc.status = ToolCallStatus::AuthRequired;
-                                                    updated_tc.response = url;
-                                                } else {
-                                                    let final_json = serde_json::to_value(aggregated_content).unwrap_or(serde_json::Value::Null);
-                                                    updated_tc.response = serde_json::to_string_pretty(&final_json).unwrap_or_default();
-                                                }
-                                            }
-                                            },
-                                            Err(e) => {
-                                                updated_tc.status = ToolCallStatus::Error;
-                                                updated_tc.response = e;
-                                            }
+                                {
+                                    let mut state = session_state.write();
+                                    if let Some(msg) = state.get_message_mut_by_execution_id(&tool_call.execution_id) {
+                                        if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
+                                            let mut approved_tc = tc.clone();
+                                            approved_tc.status = ToolCallStatus::Running;
+                                            msg.content = super::shared::MessageContent::ToolCall(approved_tc);
                                         }
-                                        msg.content = super::shared::MessageContent::ToolCall(updated_tc);
                                     }
                                 }
-                                // Trigger continuation after successful tool execution
-                                continuation_controller.read().trigger_continuation();
+                                // Signal that there are approved tools ready for execution
+                                has_pending_approvals.set(true);
                             }
                         });
                     },

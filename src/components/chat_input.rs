@@ -17,6 +17,7 @@ use crate::processing::summarization_scheduler::{SchedulerSignal};
 pub fn ChatInput(
     is_sending: Signal<bool>,
     has_new_comments: Signal<bool>,
+    has_pending_approvals: Signal<bool>,
     on_send: EventHandler<(String, Vec<Attachment>)>,
     on_cancel: EventHandler<()>,
     on_interaction: EventHandler<()>,
@@ -40,7 +41,7 @@ pub fn ChatInput(
             return;
         }
         let user_message = draft.read().clone();
-        if user_message.is_empty() && attachments.read().is_empty() && !*has_new_comments.read() {
+        if user_message.is_empty() && attachments.read().is_empty() && !*has_new_comments.read() && !*has_pending_approvals.read() {
             return;
         }
         on_send.call((user_message, attachments.read().clone()));
@@ -332,11 +333,14 @@ pub fn ChatInput(
                                                     .duration_since(SystemTime::UNIX_EPOCH)
                                                     .unwrap()
                                                     .as_secs();
-                                                let file_name = format!("prompt_{}.log", timestamp);
-                                                if let Err(e) = std::fs::write(&file_name, &context_string) {
-                                                    tracing::error!("Failed to write debug prompt to file: {}", e);
-                                                } else {
-                                                    tracing::debug!("Debug prompt written to {}", &file_name);
+                                                let debug_dir = std::env::temp_dir().join("hobbes_debug_logs");
+                                                if let Ok(_) = std::fs::create_dir_all(&debug_dir) {
+                                                    let file_path = debug_dir.join(format!("prompt_{}.log", timestamp));
+                                                    if let Err(e) = std::fs::write(&file_path, &context_string) {
+                                                        tracing::error!("Failed to write debug prompt to file: {}", e);
+                                                    } else {
+                                                        tracing::debug!("Debug prompt written to {:?}", file_path);
+                                                    }
                                                 }
                                             });
                                         },
@@ -369,7 +373,7 @@ pub fn ChatInput(
                                 on_interaction.call(());
                                 send_message();
                             },
-                            if *has_new_comments.read() { "Submit" } else { "Send" }
+                            if *has_new_comments.read() || *has_pending_approvals.read() { "Submit" } else { "Send" }
                         }
                     } else {
                         button {
