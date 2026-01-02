@@ -27,9 +27,8 @@ jobs:
       uses: Swatinem/rust-cache@v2
 
     - name: Install Dioxus CLI
-      run: |
-        curl -L --proto '=https' --tlsv1.2 -s https://raw.githubusercontent.com/DioxusLabs/dioxus/master/install.sh | bash
-        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      run: cargo install dioxus-cli
+
 
     - name: Security Audit
       run: |
