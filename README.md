@@ -13,7 +13,7 @@ I started playing around with Google Gemini Pro 2.5 last year and was amazed at 
 -   **Private & Local-First:** Hobbes is a FOSS chatbot built in **Rust** and **Tailwind**, designed to be **more private** than standard web interfaces. Conversations are stored securely on your Mac, and it uses Google's Generative API to access models directly.
 -   **Context Composition Experiment:** Tired of hitting "New Chat" when the AI gets confused by too much context? Hobbes combines a set limit for past conversation (defaults to 75 messages) with a **Summary Model** that maintains an up-to-date "Memory Object". This passive summarization keeps the AI on track, allowing you to chat all day in a single session.
 -   **Educational Project:** I built Hobbes to dust off my dev hat and learn Rust (loving it!). While I haven't used Dioxus to its absolute theoretical limit, the app is functional and fast. It is currently highly optimized for **macOS**, but Windows and Linux are on the roadmap. (Have ideas? [Contribute!](CONTRIBUTING.md))
--   **For AI Enthusiasts:** Hobbes integrates local **MCP (Model Context Protocol)** execution and features integration with **Composio** (via OAuth) for extended capabilities.
+-   **For AI Enthusiasts:** Hobbes integrates local **MCP (Model Context Protocol)** execution and features integration with [**Composio**](https://composio.dev/) (via OAuth) for extended capabilities.
     > **Note:** The Composio integration is currently tightly coupled to Hobbes and is custom-built.
 
 ![Hobbes Interface](assets/hobbes-mcp.png)
