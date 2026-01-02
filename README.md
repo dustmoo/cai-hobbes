@@ -1,6 +1,6 @@
 # Hobbes
 
-Hobbes is an AI agent designed to assist the user, Dustin. It features a clear separation between long-term strategic memory (ConPort) and short-term conversational context.
+Hobbes is a personal AI agent designed to assist its user. It features a clear separation between long-term strategic memory (ConPort) and short-term conversational context.
 
 ## Key Features
 
