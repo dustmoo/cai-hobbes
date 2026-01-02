@@ -24,6 +24,8 @@ mod keychain_ffi;
 mod mcp;
 mod services;
 mod gemini;
+#[cfg(test)]
+mod keychain_tests;
 
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 use tray_icon::TrayIcon;
