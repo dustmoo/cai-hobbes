@@ -115,7 +115,8 @@ inherits = "dev"
 inherits = "dev"
 
 [dev-dependencies]
-wiremock = { version = "0.6.5", features = ["regex"] }
+wiremock = "0.6.5"
+
 
 
 
