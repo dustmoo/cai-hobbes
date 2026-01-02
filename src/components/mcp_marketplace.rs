@@ -555,9 +555,9 @@ pub fn McpMarketplace() -> Element {
 
             div {
                 class: if *active_tab.read() == ActiveTab::Installed {
-                    "flex-1 flex flex-col overflow-hidden"
+                    "flex-1 flex flex-col overflow-hidden p-4"
                 } else {
-                    "flex-1 overflow-y-auto"
+                    "flex-1 overflow-y-auto p-4"
                 },
                 if let Some(msg) = success_message.read().as_ref() {
                     div { class: "mb-4 p-2 bg-green-900 text-green-200 rounded text-sm", "{msg}" }
