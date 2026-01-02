@@ -7,7 +7,7 @@ APP_PATH="target/dx/Hobbes/release/macos/Hobbes.app"
 BINARY="$APP_PATH/Contents/MacOS/Hobbes"
 PLIST="$APP_PATH/Contents/Info.plist"
 ENTITLEMENTS="Hobbes.entitlements"
-IDENTITY="Apple Development: dustin@tulipvalleytech.com (4753E57CRM)"
+IDENTITY="${HOBBES_SIGNING_ID:-Apple Development: dustin@tulipvalleytech.com (4753E57CRM)}"
 
 echo "=== Building Release ==="
 dx build --release

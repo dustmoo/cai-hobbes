@@ -24,7 +24,7 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
 ENTITLEMENTS="Hobbes.entitlements"
 PROVISIONING_PROFILE="embedded.provisionprofile"
-IDENTITY="Apple Development: dustin@tulipvalleytech.com (4753E57CRM)"
+IDENTITY="${HOBBES_SIGNING_ID:-Apple Development: dustin@tulipvalleytech.com (4753E57CRM)}"
 
 TAILWIND_INPUT="tailwind.css"
 TAILWIND_OUTPUT="assets/tailwind.css"

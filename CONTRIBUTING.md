@@ -81,3 +81,12 @@ For this, use our custom dev launcher which simulates a signed application bundl
 ```
 
 This script handles packaging, entitlement signing, and running the app in a way that satisfies macOS security policies while still allowing debug builds.
+
+### Custom Signing Identity
+
+If you want to use your own signing certificate (defaults to the maintainer's), you can set the `HOBBES_SIGNING_ID` environment variable:
+
+```bash
+export HOBBES_SIGNING_ID="Apple Development: Your Name (TEAMDID)"
+./scripts/dev_launcher.sh
+```
