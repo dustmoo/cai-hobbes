@@ -62,7 +62,7 @@ fn main() {
                         window
                     }
                 )
-                .with_custom_head(r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #1A1A1A; }</style>"#.to_string() + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"#)
+                .with_custom_head(r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #1A1A1A; }</style>"#.to_string() + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"# + r#"<style>"# + include_str!("../assets/main.css") + r#"</style>"#)
         )
         .launch(app)
 }

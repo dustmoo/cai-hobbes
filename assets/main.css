@@ -3,7 +3,6 @@ body {
     background-color: #0f1116;
     color: #ffffff;
     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    margin: 20px;
 }
 
 #hero {
@@ -46,8 +45,8 @@ body {
 #navbar {
     display: flex;
     flex-direction: row;
-  }
-  
+}
+
 #navbar a {
     color: #ffffff;
     margin-right: 20px;
@@ -63,8 +62,8 @@ body {
 /* Blog page */
 #blog {
     margin-top: 50px;
-  }
-  
+}
+
 #blog a {
     color: #ffffff;
     margin-top: 50px;
@@ -104,4 +103,79 @@ body {
 
 #echo>p {
     margin: 20px 0px 0px auto;
+}
+
+/* Toggle Switch Component */
+.toggle-switch {
+    width: 2.75rem;
+    /* 44px = w-11 */
+    height: 1.5rem;
+    /* 24px = h-6 */
+    background-color: #4b5563;
+    /* bg-gray-600 */
+    border-radius: 9999px;
+    position: relative;
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.toggle-switch::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 1.25rem;
+    /* 20px = h-5 w-5 */
+    height: 1.25rem;
+    background-color: white;
+    border: 1px solid #d1d5db;
+    border-radius: 9999px;
+    transition: transform 0.2s;
+}
+
+.toggle-switch.active {
+    background-color: #8b5cf6;
+    /* primary-500 */
+}
+
+.toggle-switch.active::after {
+    transform: translateX(100%);
+    border-color: white;
+}
+
+/* Small toggle variant for granular settings */
+.toggle-switch-sm {
+    width: 2.25rem;
+    /* 36px = w-9 */
+    height: 1.25rem;
+    /* 20px = h-5 */
+    background-color: #4b5563;
+    border-radius: 9999px;
+    position: relative;
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.toggle-switch-sm::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 1rem;
+    /* 16px = h-4 w-4 */
+    height: 1rem;
+    background-color: white;
+    border: 1px solid #d1d5db;
+    border-radius: 9999px;
+    transition: transform 0.2s;
+}
+
+.toggle-switch-sm.active {
+    background-color: #a78bfa;
+    /* primary-400 */
+}
+
+.toggle-switch-sm.active::after {
+    transform: translateX(100%);
+    border-color: white;
 }

@@ -1121,10 +1121,10 @@ pub fn SettingsPanel() -> Element {
                             }
                             if local_settings.read().permission_settings.auto_approval_enabled {
                                 div {
-                                    class: "mb-2 pl-4 border-l-2 border-primary-700",
+                                    class: "pl-4 border-l-2 border-primary-700 space-y-2",
                                     div {
-                                        class: "flex items-center justify-between mb-4",
-                                        label { "MCP Tools" }
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm font-medium text-gray-300", "MCP Tools (Global)" }
                                         label {
                                             class: "relative inline-flex items-center cursor-pointer",
                                             input {
@@ -1137,7 +1137,51 @@ pub fn SettingsPanel() -> Element {
                                                     }
                                                 }
                                             }
-                                            div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
+                                            div { class: if local_settings.read().permission_settings.granular_permissions.get(&ToolCategory::Mcp).copied().unwrap_or(false) { "toggle-switch active" } else { "toggle-switch" } }
+                                        }
+                                    }
+                                    
+                                    if local_settings.read().permission_settings.granular_permissions.get(&ToolCategory::Mcp).copied().unwrap_or(false) {
+                                        div {
+                                            class: "mt-2 pl-4 border-l border-gray-700 space-y-2",
+                                            h4 { class: "text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2", "Granular MCP Permissions" }
+                                            for server in _mcp_context.read().servers.iter() {
+                                                {
+                                                    let server_name = server.name.clone();
+                                                    let is_allowed = local_settings.read().permission_settings.mcp_server_permissions.get(&server_name).copied().unwrap_or(true);
+                                                    
+                                                    rsx! {
+                                                        div {
+                                                            key: "{server_name}",
+                                                            class: "flex items-center justify-between",
+                                                            div {
+                                                                class: "flex flex-col",
+                                                                span { class: "text-sm text-gray-300", "{server_name}" }
+                                                                if !server.description.is_empty() {
+                                                                    span { class: "text-[10px] text-gray-500", "{server.description}" }
+                                                                }
+                                                            }
+                                                            label {
+                                                                class: "relative inline-flex items-center cursor-pointer",
+                                                                input {
+                                                                    r#type: "checkbox",
+                                                                    class: "sr-only peer",
+                                                                    checked: is_allowed,
+                                                                    oninput: {
+                                                                        let server_name = server_name.clone();
+                                                                        move |event: Event<FormData>| {
+                                                                            if let Some(checked) = event.value().parse().ok() {
+                                                                                local_settings.write().permission_settings.mcp_server_permissions.insert(server_name.clone(), checked);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                div { class: if is_allowed { "toggle-switch-sm active" } else { "toggle-switch-sm" } }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

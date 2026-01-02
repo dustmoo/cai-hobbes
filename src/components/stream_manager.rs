@@ -69,6 +69,7 @@ impl StreamManagerContext {
             let mut is_first_message = true;
             let (tool_results_tx, mut tool_results_rx) = mpsc::unbounded_channel::<crate::components::shared::ToolCallRecord>();
             let mut tool_call_count = 0;
+            let completed_tool_tasks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut final_text_for_this_turn = String::new();
             let mut thought_signature_for_this_turn: Option<String> = None;
             let mut thought_summary_for_this_turn: Option<String> = None;
@@ -166,11 +167,12 @@ impl StreamManagerContext {
                         let mcp_manager = self.mcp_manager;
                         let mut session_state = self.session_state;
                         let tool_results_tx_clone = tool_results_tx.clone();
-                        let handle = spawn(async move {
+                        let completed_tool_tasks_clone = completed_tool_tasks.clone();
+                        let _handle = spawn(async move {
                             let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
                             let result_receiver = mcp_manager.read().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, false).await;
 
-                            let (status, response_str) = match result_receiver {
+                            let (status, response_str, is_permission_request) = match result_receiver {
                                 Ok(mut receiver) => {
                                     let mut aggregated_content: Vec<rmcp::model::Content> = Vec::new();
                                     let mut final_status = ToolCallStatus::Completed;
@@ -190,7 +192,7 @@ impl StreamManagerContext {
                                     }
 
                                     if final_status == ToolCallStatus::Error {
-                                        (final_status, error_string.unwrap_or_default())
+                                        (final_status, error_string.unwrap_or_default(), false)
                                     } else {
                                         // Check for auth requirement
                                         let mut auth_url = None;
@@ -206,32 +208,46 @@ impl StreamManagerContext {
                                         }
 
                                         if let Some(url) = auth_url {
-                                            (ToolCallStatus::AuthRequired, url)
+                                            (ToolCallStatus::AuthRequired, url, false)
                                         } else {
                                             let final_json = serde_json::to_value(aggregated_content).unwrap_or(serde_json::Value::Null);
-                                            (final_status, serde_json::to_string_pretty(&final_json).unwrap_or_default())
+                                            (final_status, serde_json::to_string_pretty(&final_json).unwrap_or_default(), false)
                                         }
                                     }
                                 }
-                                Err(e) => (ToolCallStatus::Error, e),
+                                Err(e) => {
+                                    // Check if this error is actually a serialized ToolCall indicating a permission request
+                                    if let Ok(_tc) = serde_json::from_str::<crate::components::shared::ToolCall>(&e) {
+                                        (ToolCallStatus::Error, e, true)
+                                    } else {
+                                        (ToolCallStatus::Error, e, false)
+                                    }
+                                }
                             };
                             
                             let mut state = session_state.write();
 
                             if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
-                                if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                                if is_permission_request {
+                                    if let Ok(tc) = serde_json::from_str::<crate::components::shared::ToolCall>(&response_str) {
+                                        msg.content = crate::components::shared::MessageContent::PermissionRequest(tc);
+                                    }
+                                } else if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
                                     tc.status = status;
                                     tc.response = response_str.clone();
                                 }
                             }
 
-                            let record = crate::components::shared::ToolCallRecord {
-                                call: tool_call.clone(),
-                                result: crate::components::shared::ToolResult { status, response: response_str },
-                            };
-                            let _ = tool_results_tx_clone.send(record);
+                            if !is_permission_request {
+                                let record = crate::components::shared::ToolCallRecord {
+                                    call: tool_call.clone(),
+                                    result: crate::components::shared::ToolResult { status, response: response_str },
+                                };
+                                let _ = tool_results_tx_clone.send(record);
+                            }
+                            // Signal completion regardless of permission status
+                            completed_tool_tasks_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         });
-                        let _ = handle; // We don't need to track the handle, just spawn the task.
                         is_first_message = false;
                     }
                 }
@@ -250,6 +266,9 @@ impl StreamManagerContext {
 
             // Wait for all tool execution tasks to complete before proceeding to collect results.
             // This prevents a race condition where the receiver loop closes before all tools are finished.
+            while completed_tool_tasks.load(std::sync::atomic::Ordering::SeqCst) < tool_call_count {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
 
             drop(tool_results_tx);
             let mut collected_records = Vec::new();
@@ -258,7 +277,28 @@ impl StreamManagerContext {
             }
 
             if tool_call_count > 0 {
-                assert_eq!(collected_records.len(), tool_call_count, "Mismatch between tool calls dispatched and results received.");
+                let permission_requests_detected = collected_records.len() < tool_call_count;
+                if permission_requests_detected {
+                    tracing::info!(
+                        "Permission requests detected: {} tool calls dispatched, {} results received. Pausing for user approval.",
+                        tool_call_count,
+                        collected_records.len()
+                    );
+                    // Don't trigger continuation; user needs to approve the permission request(s).
+                    // Save and clean up.
+                    if !collected_records.is_empty() {
+                        self.session_state.write().tool_call_history.extend(collected_records.clone());
+                    }
+                    self.active_stream_handles.write().remove(&message_id);
+                    if let Err(e) = self.session_state.write().save() {
+                        tracing::error!("Failed to save session state after permission request: {}", e);
+                    }
+                    on_complete();
+                    self.is_sending.set(false);
+                    self.scheduler.send(SchedulerSignal::Activity);
+                    return; // Wait for user to approve
+                }
+
                 self.session_state.write().tool_call_history.extend(collected_records.clone());
                 // Tools were called in this turn. Increment the turn counter and trigger a continuation.
                 self.permission_manager.write().increment_turn_count();

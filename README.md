@@ -12,18 +12,33 @@ Hobbes is an AI agent designed to assist the user, Dustin. It features a clear s
 
 This project is built with Dioxus and Rust.
 
+> **Note on Porting:** This codebase is heavily optimized for macOS (using native APIs for Biometrics and Accessibility). While porting is encouraged, standard `cargo run` will likely fail without OS-specific adaptation or stripping of these features. Use the provided build scripts for the intended experience.
+
 ### Prerequisites
 - Rust toolchain
 - Dioxus CLI (`dx`)
 - For production builds: Apple Developer certificate and provisioning profile
 
-### Development
+### Development Workflows
 
-Run the following command in the root of your project to start developing:
+Hobbes has two primary development modes depending on what you are working on.
 
+#### 1. UI & Frontend (Fast)
+For iterating on the Dioxus UI, layout, and reactive state:
 ```bash
 dx serve --platform desktop
 ```
+*Note: Some system features (Touch ID, Keychain) may crash or fail in this mode due to missing entitlements.*
+
+#### 2. Full System & Permissions (Robust)
+**⚠️ The "Auth Black Hole" Warning:**
+Hobbes uses advanced macOS features (Biometrics, Keychain, Local Entitlements) that are strictly sandboxed by the OS. Running via standard `cargo run` often results in **immediate crashes (`Killed: 9`)** because the binary lacks the necessary entitlements and embedded provisioning profile.
+
+To run the full app with working permissions (Touch ID, Terminal, MCPs):
+```bash
+./scripts/dev_launcher.sh
+```
+This script packages a valid `.app` bundle, embeds your provisioning profile, and signs it, preventing the "Auth Black Hole" issues.
 
 ### Release Build
 

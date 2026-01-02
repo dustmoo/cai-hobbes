@@ -13,7 +13,7 @@ If this is something you think you can fix, then [fork Hobbes](https://github.co
 A good branch name would be (where issue #33 is the ticket you're working on):
 
 ```sh
-git checkout -b 33-add-japanese-localization
+git checkout -b feat33-add-japanese-localization
 ```
 
 ### Get the test suite running

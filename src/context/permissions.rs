@@ -16,6 +16,7 @@ pub enum ToolCategory {
 pub enum PermissionStatus {
     Allowed,
     RequiresPrompt,
+    #[allow(dead_code)]
     Denied(String),
 }
 
@@ -23,6 +24,8 @@ pub enum PermissionStatus {
 pub struct PermissionSettings {
     pub auto_approval_enabled: bool,
     pub granular_permissions: HashMap<ToolCategory, bool>,
+    #[serde(default)]
+    pub mcp_server_permissions: HashMap<String, bool>,
     pub max_ai_turns: u32,
 }
 
@@ -31,6 +34,7 @@ impl Default for PermissionSettings {
         Self {
             auto_approval_enabled: false,
             granular_permissions: HashMap::new(),
+            mcp_server_permissions: HashMap::new(),
             max_ai_turns: 10,
         }
     }
@@ -50,29 +54,38 @@ impl PermissionManager {
         }
     }
 
-    pub fn check_permission(&self, category: &ToolCategory) -> PermissionStatus {
-        let settings = self.settings.read();
-        // Note: The turn limit is checked separately now. This check is for MCP requests.
 
-        if settings.permission_settings.auto_approval_enabled {
-            // If auto-approval is on, check the granular permission for the specific category
-            if settings
-                .permission_settings
-                .granular_permissions
-                .get(category)
-                .copied()
-                .unwrap_or(false)
-            {
+    pub fn check_mcp_permission(&self, server_name: &str) -> PermissionStatus {
+        let settings = self.settings.read();
+        
+        // 1. Global Auto-Approval Check
+        if !settings.permission_settings.auto_approval_enabled {
+            return PermissionStatus::RequiresPrompt;
+        }
+
+        // 2. ToolCategory::Mcp Global Toggle
+        if !settings
+            .permission_settings
+            .granular_permissions
+            .get(&ToolCategory::Mcp)
+            .copied()
+            .unwrap_or(false)
+        {
+            // If global MCP tools are disabled, we return RequiresPrompt instead of Denied
+            // to allow manual overrides for individual tool calls.
+            return PermissionStatus::RequiresPrompt;
+        }
+
+        // 3. Per-Server Toggle
+        if let Some(&allowed) = settings.permission_settings.mcp_server_permissions.get(server_name) {
+            if allowed {
                 PermissionStatus::Allowed
             } else {
-                PermissionStatus::Denied(format!(
-                    "Auto-approval is on, but permission is denied for category: {:?}",
-                    category
-                ))
+                PermissionStatus::RequiresPrompt
             }
         } else {
-            // If auto-approval is off, always prompt
-            PermissionStatus::RequiresPrompt
+            // Default to Allowed if no specific server setting exists (but global is on)
+            PermissionStatus::Allowed
         }
     }
 

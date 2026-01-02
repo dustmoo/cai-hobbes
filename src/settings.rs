@@ -187,6 +187,7 @@ impl Default for Settings {
             permission_settings: PermissionSettings {
                 auto_approval_enabled: true,
                 granular_permissions,
+                mcp_server_permissions: HashMap::new(),
                 max_ai_turns: 25,
             },
             confirm_on_delete: true,
@@ -366,7 +367,15 @@ impl SettingsManager {
             // Note: Complex nested structs like permission_settings are harder to migrate
             // field-by-field and will fall back to default if they fail to parse.
             if let Some(perms) = value.get("permission_settings") {
-                if let Ok(permission_settings) = serde_json::from_value(perms.clone()) {
+                if let Ok(mut permission_settings) = serde_json::from_value::<PermissionSettings>(perms.clone()) {
+                    // Manual migration for mcp_server_permissions if it was somehow skipped by serde default
+                    if permission_settings.mcp_server_permissions.is_empty() {
+                         if let Some(mcp_perms) = perms.get("mcp_server_permissions") {
+                             if let Ok(map) = serde_json::from_value(mcp_perms.clone()) {
+                                 permission_settings.mcp_server_permissions = map;
+                             }
+                         }
+                    }
                     settings.permission_settings = permission_settings;
                 }
             }
