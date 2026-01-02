@@ -1,5 +1,9 @@
 # Hobbes
 
+![Version](https://img.shields.io/github/v/tag/dustmoo/cai-hobbes?label=version)
+![License](https://img.shields.io/github/license/dustmoo/cai-hobbes)
+
+
 Hobbes is a personal AI agent designed to assist its user. It features a clear separation between long-term strategic memory (ConPort) and short-term conversational context.
 
 ## Key Features
