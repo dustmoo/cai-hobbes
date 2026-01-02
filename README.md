@@ -4,14 +4,29 @@
 ![Build Status](https://github.com/dustmoo/cai-hobbes/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/github/license/dustmoo/cai-hobbes)
 
+## Welcome to Hobbes!
 
-Hobbes is a personal AI agent designed to assist its user. It features a clear separation between long-term strategic memory (MCP) and short-term conversational context.
+I started playing around with Google Gemini Pro 2.5 last year and was amazed at how _smart_ it was. Being a long-time Claude user, I missed the "personability" of the model, even though 2.5 was a fantastic writer, coder, and assistant (approaching Sonnet performance for a fraction of the price 😅). So, as part of my 2025 journey, I decided to use [Dioxus 0.6.3](https://dioxuslabs.com/) to create my very own useful assistant.
+
+### What is Hobbes?
+
+-   **Private & Local-First:** Hobbes is a FOSS chatbot built in **Rust** and **Tailwind**, designed to be **more private** than standard web interfaces. Conversations are stored securely on your Mac, and it uses Google's Generative API to access models directly.
+-   **Context Composition Experiment:** Tired of hitting "New Chat" when the AI gets confused by too much context? Hobbes combines a set limit for past conversation (defaults to 75 messages) with a **Summary Model** that maintains an up-to-date "Memory Object". This passive summarization keeps the AI on track, allowing you to chat all day in a single session.
+-   **Educational Project:** I built Hobbes to dust off my dev hat and learn Rust (loving it!). While I haven't used Dioxus to its absolute theoretical limit, the app is functional and fast. It is currently highly optimized for **macOS**, but Windows and Linux are on the roadmap. (Have ideas? [Contribute!](CONTRIBUTING.md))
+-   **For AI Enthusiasts:** Hobbes integrates local **MCP (Model Context Protocol)** execution and features integration with **Composio** (via OAuth) for extended capabilities.
+    > **Note:** The Composio integration is currently tightly coupled to Hobbes and is custom-built.
+
+![Hobbes Interface](assets/hobbes-mcp.png)
+
+**Note:** Hobbes needs some setup. You will need to obtain your own API keys. If you prefer a zero-setup experience, web-based options might be better for now.
+
+---
 
 ## Key Features
 
 - **Local-First:** All user data, including chat history and context, is stored locally and securely on the user's machine.
-- **Clear Memory Separation:** The system maintains a clear distinction between long-term strategic memory (managed by external MCPs like ConPort) and short-term, session-specific active context (managed internally).
-- **Reactive State Management:** Internal, short-term context is managed via Dioxus Signals, a reactive state management library. This allows for efficient, declarative updates to the UI and application state.
+- **Clear Memory Separation:** The system maintains a clear distinction between long-term strategic memory (managed by external MCPs) and short-term, session-specific active context (managed internally).
+- **Reactive State Management:** Internal, short-term context is managed via Dioxus Signals, allowing for efficient, declarative updates to the UI.
 
 ## Getting Started
 
@@ -78,7 +93,7 @@ The architecture is designed to integrate both external long-term memory and int
 ```mermaid
 graph TD
     subgraph "MCP Servers (Launched as Child Processes)"
-        A[ConPort MCP] -- "Provides strategic context" --> L;
+        A[Memory MCP] -- "Provides strategic context" --> L;
         B[GitHub MCP] -- "Provides PR/Issue data" --> L;
         C[Filesystem MCP] -- "Provides workspace data" --> L;
     end
@@ -136,7 +151,7 @@ graph TD
 ### Core Components
 
 -   **Memory & State**:
-    -   **Local Long-Term Memory (ConPort):** A local MCP providing access to the project's strategic memory (goals, decisions, etc.).
+    -   **Local Long-Term Memory:** A local MCP providing access to the project's strategic memory (goals, decisions, etc.).
     -   **Short-Term Memory (`SessionState`):** The core of the "live" context, managed internally and stored securely in `sessions.json`. It holds messages, tool call history, and the active context for each conversation.
 -   **Services & Processors**:
     -   **`McpManager`**: Manages the lifecycle of all MCP servers, launching them as child processes and discovering their available tools.
