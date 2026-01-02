@@ -59,6 +59,7 @@ module.exports = {
       },
       fontFamily: {
         'inter-logo': ['"Inter"', 'sans-serif'],
+        'sans': ['"Inter"', 'system-ui', 'sans-serif'],
       },
       typography: ({ theme }) => ({
         DEFAULT: {
@@ -92,7 +93,7 @@ module.exports = {
             h4: { color: theme('colors.primary.300') },
             p: { color: theme('colors.dark-text') },
             // Remove hr styling for cleaner bubble display
-            hr: { 
+            hr: {
               display: 'none',
             },
             // Adjust link spacing

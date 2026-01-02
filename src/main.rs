@@ -64,7 +64,15 @@ fn main() {
                         window
                     }
                 )
-                .with_custom_head(r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #1A1A1A; }</style>"#.to_string() + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"# + r#"<style>"# + include_str!("../assets/main.css") + r#"</style>"#)
+                .with_custom_head(
+                    r#"<script src="https://cdn.tailwindcss.com"></script>"#.to_string() 
+                    + r#"<link rel="preconnect" href="https://fonts.googleapis.com">"#
+                    + r#"<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>"#
+                    + r#"<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">"#
+                    + r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #1A1A1A; font-family: 'Inter', system-ui, sans-serif; }</style>"# 
+                    + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"# 
+                    + r#"<style>"# + include_str!("../assets/main.css") + r#"</style>"#
+                )
         )
         .launch(app)
 }
