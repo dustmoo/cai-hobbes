@@ -4,6 +4,7 @@ use dioxus_free_icons::{icons::fi_icons, Icon};
 use super::chat::CodeBlock;
 use super::shared::{ToolCall, ToolCallStatus};
 use super::markdown_renderer::ThinkingMarkdownRenderer;
+use crate::settings::{UiState, UiStateManager};
 
 #[derive(Props, Clone, PartialEq)]
 pub struct ToolCallDisplayProps {
@@ -12,10 +13,31 @@ pub struct ToolCallDisplayProps {
 
 #[component]
 pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
-    let mut show_arguments = use_signal(|| true);
+    // Consume global UI state for default preferences
+    let mut ui_state = consume_context::<Signal<UiState>>();
+    let ui_state_manager = consume_context::<Signal<UiStateManager>>();
+    
+    // Initialize from global state
+    let mut show_arguments = use_signal(|| ui_state.read().show_tool_arguments);
     // Auto-expand response section for auth-required tools so user sees the connect button
-    let mut show_response = use_signal(|| props.tool_call.status == ToolCallStatus::AuthRequired);
-    let mut show_thought = use_signal(|| false);
+    let mut show_response = use_signal(|| {
+        if props.tool_call.status == ToolCallStatus::AuthRequired {
+            true
+        } else {
+            ui_state.read().show_tool_response
+        }
+    });
+    let mut show_thought = use_signal(|| ui_state.read().show_tool_thought);
+
+    // Helper to save UI state changes
+    let save_ui_state = move |updated_state: UiState| {
+        spawn(async move {
+            let uism = ui_state_manager.read();
+            if let Err(e) = uism.save(&updated_state) {
+                tracing::error!("Failed to save UI state after chevron toggle: {}", e);
+            }
+        });
+    };
 
     let status = props.tool_call.status;
     let response = props.tool_call.response.clone();
@@ -58,7 +80,12 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                         class: "flex flex-col",
                         button {
                             class: "flex items-center gap-1 text-sm font-semibold text-gray-400 hover:text-gray-200",
-                            onclick: move |_| show_thought.toggle(),
+                            onclick: move |_| {
+                                show_thought.toggle();
+                                let new_val = *show_thought.read();
+                                ui_state.write().show_tool_thought = new_val;
+                                save_ui_state(ui_state.read().clone());
+                            },
                             if *show_thought.read() {
                                 Icon {
                                     width: 16,
@@ -91,7 +118,12 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                     class: "flex flex-col",
                     button {
                         class: "flex items-center gap-1 text-sm font-semibold text-gray-400 hover:text-gray-200",
-                        onclick: move |_| show_arguments.toggle(),
+                        onclick: move |_| {
+                            show_arguments.toggle();
+                            let new_val = *show_arguments.read();
+                            ui_state.write().show_tool_arguments = new_val;
+                            save_ui_state(ui_state.read().clone());
+                        },
                         if *show_arguments.read() {
                             Icon {
                                 width: 16,
@@ -123,7 +155,12 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                     class: "flex flex-col",
                     button {
                         class: "flex items-center gap-1 text-sm font-semibold text-gray-400 hover:text-gray-200",
-                        onclick: move |_| show_response.toggle(),
+                        onclick: move |_| {
+                            show_response.toggle();
+                            let new_val = *show_response.read();
+                            ui_state.write().show_tool_response = new_val;
+                            save_ui_state(ui_state.read().clone());
+                        },
                         if *show_response.read() {
                             Icon {
                                 width: 16,

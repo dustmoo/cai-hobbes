@@ -8,9 +8,25 @@ BINARY="$APP_PATH/Contents/MacOS/Hobbes"
 PLIST="$APP_PATH/Contents/Info.plist"
 ENTITLEMENTS="Hobbes.entitlements"
 IDENTITY="${HOBBES_SIGNING_ID:-Apple Development: dustin@tulipvalleytech.com (4753E57CRM)}"
+export MACOSX_DEPLOYMENT_TARGET=12.0
 
-echo "=== Building Release ==="
-dx build --release
+echo "=== Building Release Bundle ==="
+dx bundle --release
+
+# Fail-safe: Ensure binary exists in bundle
+if [ ! -f "$BINARY" ]; then
+    echo "⚠️  Binary missing in bundle! Attempting manual copy..."
+    # Fallback path for the raw binary
+    RAW_BINARY="target/release/Hobbes"
+    if [ -f "$RAW_BINARY" ]; then
+        cp "$RAW_BINARY" "$BINARY"
+        chmod +x "$BINARY"
+        echo "✅ Manually copied binary to bundle."
+    else
+        echo "❌ Critical Error: Could not find compiled binary at $RAW_BINARY"
+        exit 1
+    fi
+fi
 
 echo ""
 echo "=== Installing Icon (Dioxus 0.6 workaround) ==="
@@ -51,6 +67,11 @@ if ! /usr/libexec/PlistBuddy -c "Print :NSFaceIDUsageDescription" "$PLIST" 2>/de
 else
     echo "  ⏭️ NSFaceIDUsageDescription already present"
 fi
+
+# Set LSMinimumSystemVersion to match MACOSX_DEPLOYMENT_TARGET (required for arm64-only builds)
+/usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion 12.0" "$PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 12.0" "$PLIST"
+echo "  ✅ Set LSMinimumSystemVersion to 12.0"
 
 echo ""
 echo "=== Embedding Provisioning Profile ==="

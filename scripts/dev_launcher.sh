@@ -22,7 +22,7 @@ CONTENTS_DIR="$APP_STAGING_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
-ENTITLEMENTS="Hobbes.entitlements"
+ENTITLEMENTS="Hobbes.dev.entitlements"
 PROVISIONING_PROFILE="embedded.provisionprofile"
 IDENTITY="${HOBBES_SIGNING_ID:-Apple Development: dustin@tulipvalleytech.com (4753E57CRM)}"
 

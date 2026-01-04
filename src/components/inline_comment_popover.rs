@@ -23,6 +23,19 @@ pub fn InlineCommentPopover(
                 placeholder: "Add a comment...",
                 value: "{comment_text}",
                 oninput: move |e| comment_text.set(e.value()),
+                onkeydown: move |evt: KeyboardEvent| {
+                    if evt.key() == Key::Enter {
+                        let modifiers = evt.modifiers();
+                        if modifiers.contains(Modifiers::SHIFT) {
+                            return;
+                        }
+                        // Allow CMD+Enter or just Enter (without shift) to submit
+                        if !comment_text().trim().is_empty() {
+                            evt.prevent_default();
+                            on_save.call(comment_text());
+                        }
+                    }
+                },
                 autofocus: true,
             }
             

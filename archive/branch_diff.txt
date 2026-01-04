@@ -1,0 +1,1932 @@
+diff --git a/.roo/mcp.json b/.roo/mcp.json
+index f87d08f..015a9b3 100644
+--- a/.roo/mcp.json
++++ b/.roo/mcp.json
+@@ -24,7 +24,8 @@
+         "get_progress",
+         "get_product_context",
+         "get_custom_data",
+-        "update_progress"
++        "update_progress",
++        "get_decisions"
+       ]
+     }
+   }
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index b1c883c..323e2e4 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -14,16 +14,17 @@ The architecture is designed to integrate both external long-term memory and int
+ 
+ ```mermaid
+ graph TD
+-    subgraph "External Long-Term Memory"
+-        A[ConPort MCP] -- "Provides strategic context" --> I[LLM Service];
++    subgraph "External MCPs (Examples)"
++        Ext1[GitHub MCP] -- "Provides PR/Issue data" --> H[PromptBuilder];
+     end
+ 
+-    subgraph "Internal Short-Term Memory"
+-        subgraph "Local Context Producers"
+-            B[WorkspaceMcp] -->|Publishes ContextUpdateEvent| C(EventBus);
+-            D(Future: GitMcp, etc.) -->|Publishes ContextUpdateEvent| C;
+-        end
++    subgraph "Local Context Providers"
++        A[ConPort MCP] -- "Provides strategic context" --> H;
++        B[WorkspaceMcp] -->|Publishes ContextUpdateEvent| C(EventBus);
++        D(Future: GitMcp, etc.) -->|Publishes ContextUpdateEvent| C;
++    end
+ 
++    subgraph "Internal Short-Term Memory & Core Logic"
+         subgraph "Core Application"
+             C -->|Subscribes to Events| E[main.rs Effect Hook];
+             E -->|Updates Active Session| F[SessionState];
+@@ -32,10 +33,21 @@ graph TD
+             G -->|Triggers| J[ConversationProcessor];
+             J -->|Updates Active Session| F;
+ 
+-            G -->|Builds Prompt| H[PromptBuilder];
++            G -->|Builds Prompt| H;
+             H -->|Gets Active Context| F;
+-            H -->|Formats Context| I;
+-            G -->|Sends Message| I;
++            H -->|Formats Context| I["Chat LLM (e.g., Gemini Pro)"];
++            G -- "Sends Message" --> I;
++
++            J -- "Generates Summary" --> I2["Summary LLM (e.g., Gemini Flash)"];
++
++            subgraph "Tool Call Feedback Loop"
++                I -- "Responds with Tool Call" --> K[StreamManager];
++                K -- "Updates Message State" --> F;
++                G -- "Executes Tool" --> L[McpManager];
++                L -- "Returns Result" --> G;
++                G -- "Formats Result" --> H;
++                H -- "Sends Result to LLM" --> I;
++            end
+         end
+     end
+ 
+@@ -45,17 +57,19 @@ graph TD
+     style J fill:#c77dff,stroke:#333,stroke-width:2px
+     style F fill:#f4a261,stroke:#333,stroke-width:2px
+     style I fill:#e76f51,stroke:#333,stroke-width:2px
++    style I2 fill:#f77f00,stroke:#333,stroke-width:2px
++    style L fill:#457b9d,stroke:#333,stroke-width:2px
+ ```
+ 
+ ### 1. Memory Systems
+ 
+--   **Long-Term Memory (ConPort):** An external MCP that provides access to the project's strategic memory, including goals, architectural decisions, and user preferences. This is analogous to a project's knowledge base.
++-   **Local Long-Term Memory (ConPort):** A local MCP that provides access to the project's strategic memory, including goals, architectural decisions, and user preferences. This is analogous to a project's knowledge base.
+ -   **Short-Term Memory (`SessionState`):** The core of the "live" context. This is managed internally and stored securely in `sessions.json`. Each `Session` object within the state contains its own `active_context` map, ensuring that short-term memory is scoped to a specific conversation.
+ 
+ ### 2. Local Context Producers & Processors
+ 
+ -   **`WorkspaceMcp`**: A provider that emits data about the user's local workspace (active file, open tabs). This is a key source for short-term memory, pushed via the Event Bus.
+--   **`ConversationProcessor`**: An internal service triggered *after* a message is sent. It reads the recent conversation history, uses a fast LLM (e.g., Gemini Flash) to extract entities and summaries, and writes this data directly to the active session's `active_context`. This is the primary mechanism for conversational memory.
++-   **`ConversationProcessor`**: An internal service triggered *after* a message is sent. It reads the recent conversation history, uses a fast, dedicated **Summary LLM** (e.g., Gemini Flash) to extract entities and summaries, and writes this data directly to the active session's `active_context`. This is the primary mechanism for conversational memory, distinct from the main **Chat LLM**.
+ -   **(Future) `GitMcp`**: Will provide short-term context about the current Git branch and status.
+ 
+ ### 3. Event Bus
+@@ -86,9 +100,16 @@ The system uses two parallel flows to update short-term context:
+ 1.  The user sends a message from the `ChatWindow`.
+ 2.  The message is immediately added to the current `Session`'s message list.
+ 3.  A single async task is spawned to handle the entire message processing flow sequentially, preventing race conditions:
+-    a. The `ConversationProcessor` is triggered. It reads the latest conversation history (including the new message) and generates an updated summary.
++    a. The `ConversationProcessor` is triggered. It reads the latest conversation history and uses the **Summary LLM** to generate an updated summary.
+     b. The processor's summary is written back into the `active_context` map in the `SessionState`.
+     c. **Only after the context is updated**, the `PromptBuilder` reads the fresh `active_context`.
+     d. The builder formats the context and combines it with the user's message to create the final prompt, which is then sent to the LLM. This ensures the AI always has the most current context for every message.
+ 
+-This revised architecture correctly separates concerns and provides a robust mechanism for both ambient and conversational short-term memory.
+\ No newline at end of file
++This revised architecture correctly separates concerns and provides a robust mechanism for both ambient and conversational short-term memory, while clearly distinguishing between local and external context sources and the different LLM roles.
++
++**C) Tool-Calling Context (The Inner Loop):**
++1.  The `LLM Service`, having been provided a list of available tools by the `PromptBuilder`, responds with a structured request to call a tool.
++2.  The `StreamManager` detects this request, updates the message in `SessionState` to a `ToolCall` type (triggering the UI to show a "using tool" state), and signals completion to the `chat_coroutine`.
++3.  The `chat_coroutine` in `ChatWindow` receives the signal and executes the tool via the `McpManager`.
++4.  Upon receiving the result, the coroutine uses the `PromptBuilder` to format the tool's output into a new `<SYSTEM_CONTEXT>` block.
++5.  This new context is sent back to the `LLM Service` as a new message (which is hidden from the UI). This creates an inner loop, allowing the LLM to process the tool's result and continue its reasoning, potentially calling more tools if necessary.
+\ No newline at end of file
+diff --git a/Cargo.lock b/Cargo.lock
+index 4fee734..16db8e2 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -372,6 +372,7 @@ dependencies = [
+  "macos-accessibility-client",
+  "pulldown-cmark",
+  "reqwest",
++ "rmcp",
+  "security-framework",
+  "serde",
+  "serde_json",
+@@ -450,6 +451,12 @@ version = "1.0.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9555578bc9e57714c812a1f84e4fc5b4d21fcb063490c624de019f7464c91268"
+ 
++[[package]]
++name = "cfg_aliases"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
++
+ [[package]]
+ name = "chrono"
+ version = "0.4.41"
+@@ -815,6 +822,7 @@ dependencies = [
+  "ident_case",
+  "proc-macro2",
+  "quote",
++ "strsim",
+  "syn 2.0.106",
+ ]
+ 
+@@ -1477,6 +1485,12 @@ version = "1.0.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+ 
++[[package]]
++name = "dyn-clone"
++version = "1.0.20"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
++
+ [[package]]
+ name = "encoding_rs"
+ version = "0.8.35"
+@@ -2409,7 +2423,7 @@ dependencies = [
+  "js-sys",
+  "log",
+  "wasm-bindgen",
+- "windows-core",
++ "windows-core 0.58.0",
+ ]
+ 
+ [[package]]
+@@ -3101,6 +3115,18 @@ dependencies = [
+  "memoffset",
+ ]
+ 
++[[package]]
++name = "nix"
++version = "0.30.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
++dependencies = [
++ "bitflags 2.9.2",
++ "cfg-if",
++ "cfg_aliases",
++ "libc",
++]
++
+ [[package]]
+ name = "nodrop"
+ version = "0.1.14"
+@@ -3502,6 +3528,12 @@ dependencies = [
+  "windows-targets 0.52.6",
+ ]
+ 
++[[package]]
++name = "paste"
++version = "1.0.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
++
+ [[package]]
+ name = "percent-encoding"
+ version = "2.3.1"
+@@ -3815,6 +3847,20 @@ dependencies = [
+  "version_check",
+ ]
+ 
++[[package]]
++name = "process-wrap"
++version = "8.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a3ef4f2f0422f23a82ec9f628ea2acd12871c81a9362b02c43c1aa86acfc3ba1"
++dependencies = [
++ "futures",
++ "indexmap 2.10.0",
++ "nix 0.30.1",
++ "tokio",
++ "tracing",
++ "windows 0.61.3",
++]
++
+ [[package]]
+ name = "pulldown-cmark"
+ version = "0.11.3"
+@@ -3982,6 +4028,26 @@ dependencies = [
+  "thiserror 2.0.15",
+ ]
+ 
++[[package]]
++name = "ref-cast"
++version = "1.0.24"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4a0ae411dbe946a674d89546582cea4ba2bb8defac896622d6496f14c23ba5cf"
++dependencies = [
++ "ref-cast-impl",
++]
++
++[[package]]
++name = "ref-cast-impl"
++version = "1.0.24"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1165225c21bff1f3bbce98f5a1f889949bc902d3575308cc7b0de30b4f6d27c7"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.106",
++]
++
+ [[package]]
+ name = "regex"
+ version = "1.11.1"
+@@ -4092,6 +4158,42 @@ dependencies = [
+  "windows-sys 0.52.0",
+ ]
+ 
++[[package]]
++name = "rmcp"
++version = "0.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1f521fbd040eba82684b17d787d423f43afb6e97974029b51f679157a589592a"
++dependencies = [
++ "base64",
++ "chrono",
++ "futures",
++ "paste",
++ "pin-project-lite",
++ "process-wrap",
++ "rmcp-macros",
++ "schemars",
++ "serde",
++ "serde_json",
++ "thiserror 2.0.15",
++ "tokio",
++ "tokio-stream",
++ "tokio-util",
++ "tracing",
++]
++
++[[package]]
++name = "rmcp-macros"
++version = "0.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c162bf8a2846f70464ded6dda6430b60d1e2fb4b0e371f0906e39f63916641b9"
++dependencies = [
++ "darling",
++ "proc-macro2",
++ "quote",
++ "serde_json",
++ "syn 2.0.106",
++]
++
+ [[package]]
+ name = "rustc-demangle"
+ version = "0.1.26"
+@@ -4202,6 +4304,32 @@ dependencies = [
+  "windows-sys 0.59.0",
+ ]
+ 
++[[package]]
++name = "schemars"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "82d20c4491bc164fa2f6c5d44565947a52ad80b9505d8e36f8d54c27c739fcd0"
++dependencies = [
++ "chrono",
++ "dyn-clone",
++ "ref-cast",
++ "schemars_derive",
++ "serde",
++ "serde_json",
++]
++
++[[package]]
++name = "schemars_derive"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "33d020396d1d138dc19f1165df7545479dcd58d93810dc5d646a16e55abefa80"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "serde_derive_internals",
++ "syn 2.0.106",
++]
++
+ [[package]]
+ name = "scopeguard"
+ version = "1.2.0"
+@@ -4297,6 +4425,17 @@ dependencies = [
+  "syn 2.0.106",
+ ]
+ 
++[[package]]
++name = "serde_derive_internals"
++version = "0.29.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.106",
++]
++
+ [[package]]
+ name = "serde_json"
+ version = "1.0.142"
+@@ -4613,6 +4752,12 @@ dependencies = [
+  "quote",
+ ]
+ 
++[[package]]
++name = "strsim"
++version = "0.11.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
++
+ [[package]]
+ name = "subtle"
+ version = "2.6.1"
+@@ -4751,8 +4896,8 @@ dependencies = [
+  "tao-macros",
+  "unicode-segmentation",
+  "url",
+- "windows",
+- "windows-core",
++ "windows 0.58.0",
++ "windows-core 0.58.0",
+  "windows-version",
+  "x11-dl",
+ ]
+@@ -4956,6 +5101,17 @@ dependencies = [
+  "tokio",
+ ]
+ 
++[[package]]
++name = "tokio-stream"
++version = "0.1.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "eca58d7bba4a75707817a2c44174253f9236b2d5fbd055602e9d5c07c139a047"
++dependencies = [
++ "futures-core",
++ "pin-project-lite",
++ "tokio",
++]
++
+ [[package]]
+ name = "tokio-util"
+ version = "0.7.16"
+@@ -5495,10 +5651,10 @@ checksum = "6f61ff3d9d0ee4efcb461b14eb3acfda2702d10dc329f339303fc3e57215ae2c"
+ dependencies = [
+  "webview2-com-macros",
+  "webview2-com-sys",
+- "windows",
+- "windows-core",
+- "windows-implement",
+- "windows-interface",
++ "windows 0.58.0",
++ "windows-core 0.58.0",
++ "windows-implement 0.58.0",
++ "windows-interface 0.58.0",
+ ]
+ 
+ [[package]]
+@@ -5519,8 +5675,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a3a3e2eeb58f82361c93f9777014668eb3d07e7d174ee4c819575a9208011886"
+ dependencies = [
+  "thiserror 1.0.69",
+- "windows",
+- "windows-core",
++ "windows 0.58.0",
++ "windows-core 0.58.0",
+ ]
+ 
+ [[package]]
+@@ -5566,23 +5722,69 @@ version = "0.58.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "dd04d41d93c4992d421894c18c8b43496aa748dd4c081bac0dc93eb0489272b6"
+ dependencies = [
+- "windows-core",
++ "windows-core 0.58.0",
+  "windows-targets 0.52.6",
+ ]
+ 
++[[package]]
++name = "windows"
++version = "0.61.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9babd3a767a4c1aef6900409f85f5d53ce2544ccdfaa86dad48c91782c6d6893"
++dependencies = [
++ "windows-collections",
++ "windows-core 0.61.2",
++ "windows-future",
++ "windows-link",
++ "windows-numerics",
++]
++
++[[package]]
++name = "windows-collections"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3beeceb5e5cfd9eb1d76b381630e82c4241ccd0d27f1a39ed41b2760b255c5e8"
++dependencies = [
++ "windows-core 0.61.2",
++]
++
+ [[package]]
+ name = "windows-core"
+ version = "0.58.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "6ba6d44ec8c2591c134257ce647b7ea6b20335bf6379a27dac5f1641fcf59f99"
+ dependencies = [
+- "windows-implement",
+- "windows-interface",
++ "windows-implement 0.58.0",
++ "windows-interface 0.58.0",
+  "windows-result 0.2.0",
+  "windows-strings 0.1.0",
+  "windows-targets 0.52.6",
+ ]
+ 
++[[package]]
++name = "windows-core"
++version = "0.61.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c0fdd3ddb90610c7638aa2b3a3ab2904fb9e5cdbecc643ddb3647212781c4ae3"
++dependencies = [
++ "windows-implement 0.60.0",
++ "windows-interface 0.59.1",
++ "windows-link",
++ "windows-result 0.3.4",
++ "windows-strings 0.4.2",
++]
++
++[[package]]
++name = "windows-future"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fc6a41e98427b19fe4b73c550f060b59fa592d7d686537eebf9385621bfbad8e"
++dependencies = [
++ "windows-core 0.61.2",
++ "windows-link",
++ "windows-threading",
++]
++
+ [[package]]
+ name = "windows-implement"
+ version = "0.58.0"
+@@ -5594,6 +5796,17 @@ dependencies = [
+  "syn 2.0.106",
+ ]
+ 
++[[package]]
++name = "windows-implement"
++version = "0.60.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a47fddd13af08290e67f4acabf4b459f647552718f683a7b415d290ac744a836"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.106",
++]
++
+ [[package]]
+ name = "windows-interface"
+ version = "0.58.0"
+@@ -5605,12 +5818,33 @@ dependencies = [
+  "syn 2.0.106",
+ ]
+ 
++[[package]]
++name = "windows-interface"
++version = "0.59.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bd9211b69f8dcdfa817bfd14bf1c97c9188afa36f4750130fcdf3f400eca9fa8"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.106",
++]
++
+ [[package]]
+ name = "windows-link"
+ version = "0.1.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "5e6ad25900d524eaabdbbb96d20b4311e1e7ae1699af4fb28c17ae66c80d798a"
+ 
++[[package]]
++name = "windows-numerics"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9150af68066c4c5c07ddc0ce30421554771e528bde427614c61038bc2c92c2b1"
++dependencies = [
++ "windows-core 0.61.2",
++ "windows-link",
++]
++
+ [[package]]
+ name = "windows-registry"
+ version = "0.5.3"
+@@ -5767,6 +6001,15 @@ dependencies = [
+  "windows_x86_64_msvc 0.53.0",
+ ]
+ 
++[[package]]
++name = "windows-threading"
++version = "0.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b66463ad2e0ea3bbf808b7f1d371311c80e115c0b71d60efc142cafbcfb057a6"
++dependencies = [
++ "windows-link",
++]
++
+ [[package]]
+ name = "windows-version"
+ version = "0.1.4"
+@@ -6033,8 +6276,8 @@ dependencies = [
+  "webkit2gtk",
+  "webkit2gtk-sys",
+  "webview2-com",
+- "windows",
+- "windows-core",
++ "windows 0.58.0",
++ "windows-core 0.58.0",
+  "windows-version",
+  "x11-dl",
+ ]
+@@ -6143,7 +6386,7 @@ dependencies = [
+  "futures-sink",
+  "futures-util",
+  "hex",
+- "nix",
++ "nix 0.27.1",
+  "ordered-stream",
+  "rand 0.8.5",
+  "serde",
+diff --git a/Cargo.toml b/Cargo.toml
+index 6bc8758..1ae06f9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,6 +38,7 @@ dotenvy = "0.15.7"
+ pulldown-cmark = "0.11.0"
+ syntect = "5.2.0"
+ lazy_static = "1.4.0"
++rmcp = { version = "0.6.1", features = ["client", "transport-child-process", "transport-io"] }
+ [dependencies]
+ dioxus = { version = "0.6.3", features = ["router", "fullstack", "desktop"] }
+ dioxus-desktop = "0.6.3"
+@@ -64,7 +65,7 @@ feature_clipboard = { workspace = true }
+ thiserror = "1.0"
+ futures = "0.3.31"
+ chrono = { version = "0.4.41", features = ["serde"] }
+-
++rmcp = { workspace = true }
+ [target.'cfg(target_os = "macos")'.dependencies]
+ macos-accessibility-client = { workspace = true }
+ security-framework = "2.11.0"
+diff --git a/assets/output.css b/assets/output.css
+index 98af246..6a29cde 100644
+--- a/assets/output.css
++++ b/assets/output.css
+@@ -2,4 +2,4 @@
+ 
+ /*
+ ! tailwindcss v3.4.17 | MIT License | https://tailwindcss.com
+-*/*,:after,:before{box-sizing:border-box;border:0 solid #e5e7eb}:after,:before{--tw-content:""}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;-o-tab-size:4;tab-size:4;font-family:ui-sans-serif,system-ui,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{opacity:1;color:#9ca3af}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.container{width:100%}@media (min-width:640px){.container{max-width:640px}}@media (min-width:768px){.container{max-width:768px}}@media (min-width:1024px){.container{max-width:1024px}}@media (min-width:1280px){.container{max-width:1280px}}@media (min-width:1536px){.container{max-width:1536px}}.prose{color:var(--tw-prose-body);max-width:65ch}.prose :where(p):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.25em;margin-bottom:1.25em}.prose :where([class~=lead]):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-lead);font-size:1.25em;line-height:1.6;margin-top:1.2em;margin-bottom:1.2em}.prose :where(a):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-links);text-decoration:underline;font-weight:500}.prose :where(strong):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-bold);font-weight:600}.prose :where(a strong):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(blockquote strong):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(thead th strong):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(ol):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:decimal;margin-top:1.25em;margin-bottom:1.25em;padding-inline-start:1.625em}.prose :where(ol[type=A]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:upper-alpha}.prose :where(ol[type=a]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:lower-alpha}.prose :where(ol[type=A s]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:upper-alpha}.prose :where(ol[type=a s]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:lower-alpha}.prose :where(ol[type=I]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:upper-roman}.prose :where(ol[type=i]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:lower-roman}.prose :where(ol[type=I s]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:upper-roman}.prose :where(ol[type=i s]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:lower-roman}.prose :where(ol[type="1"]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:decimal}.prose :where(ul):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:disc;margin-top:1.25em;margin-bottom:1.25em;padding-inline-start:1.625em}.prose :where(ol>li):not(:where([class~=not-prose],[class~=not-prose] *))::marker{font-weight:400;color:var(--tw-prose-counters)}.prose :where(ul>li):not(:where([class~=not-prose],[class~=not-prose] *))::marker{color:var(--tw-prose-bullets)}.prose :where(dt):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:600;margin-top:1.25em}.prose :where(hr):not(:where([class~=not-prose],[class~=not-prose] *)){border-color:var(--tw-prose-hr);border-top-width:1px;margin-top:3em;margin-bottom:3em}.prose :where(blockquote):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:500;font-style:italic;color:var(--tw-prose-quotes);border-inline-start-width:.25rem;border-inline-start-color:var(--tw-prose-quote-borders);quotes:"\201C""\201D""\2018""\2019";margin-top:1.6em;margin-bottom:1.6em;padding-inline-start:1em}.prose :where(blockquote p:first-of-type):not(:where([class~=not-prose],[class~=not-prose] *)):before{content:open-quote}.prose :where(blockquote p:last-of-type):not(:where([class~=not-prose],[class~=not-prose] *)):after{content:close-quote}.prose :where(h1):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:800;font-size:2.25em;margin-top:0;margin-bottom:.8888889em;line-height:1.1111111}.prose :where(h1 strong):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:900;color:inherit}.prose :where(h2):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:700;font-size:1.5em;margin-top:2em;margin-bottom:1em;line-height:1.3333333}.prose :where(h2 strong):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:800;color:inherit}.prose :where(h3):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:600;font-size:1.25em;margin-top:1.6em;margin-bottom:.6em;line-height:1.6}.prose :where(h3 strong):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:700;color:inherit}.prose :where(h4):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:600;margin-top:1.5em;margin-bottom:.5em;line-height:1.5}.prose :where(h4 strong):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:700;color:inherit}.prose :where(img):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:2em;margin-bottom:2em}.prose :where(picture):not(:where([class~=not-prose],[class~=not-prose] *)){display:block;margin-top:2em;margin-bottom:2em}.prose :where(video):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:2em;margin-bottom:2em}.prose :where(kbd):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:500;font-family:inherit;color:var(--tw-prose-kbd);box-shadow:0 0 0 1px rgb(var(--tw-prose-kbd-shadows)/10%),0 3px 0 rgb(var(--tw-prose-kbd-shadows)/10%);font-size:.875em;border-radius:.3125rem;padding-top:.1875em;padding-inline-end:.375em;padding-bottom:.1875em;padding-inline-start:.375em}.prose :where(code):not(:where([class~=not-prose],[class~=not-prose] *)){color:#c0c5ce;font-weight:600;font-size:.875em;font-family:Fira Code,Courier New,monospace}.prose :where(code):not(:where([class~=not-prose],[class~=not-prose] *)):before{content:"`"}.prose :where(code):not(:where([class~=not-prose],[class~=not-prose] *)):after{content:"`"}.prose :where(a code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(h1 code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(h2 code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit;font-size:.875em}.prose :where(h3 code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit;font-size:.9em}.prose :where(h4 code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(blockquote code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(thead th code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(pre):not(:where([class~=not-prose],[class~=not-prose] *)){color:#c0c5ce;background-color:#2b303b;overflow-x:auto;font-weight:400;font-size:.875em;line-height:1.7142857;margin-top:1.7142857em;margin-bottom:1.7142857em;border-radius:.375rem;padding-top:.8571429em;padding-inline-end:1.1428571em;padding-bottom:.8571429em;padding-inline-start:1.1428571em}.prose :where(pre code):not(:where([class~=not-prose],[class~=not-prose] *)){background-color:transparent;border-width:0;border-radius:0;padding:0;font-weight:inherit;color:inherit;font-size:inherit;font-family:inherit;line-height:inherit}.prose :where(pre code):not(:where([class~=not-prose],[class~=not-prose] *)):before{content:none}.prose :where(pre code):not(:where([class~=not-prose],[class~=not-prose] *)):after{content:none}.prose :where(table):not(:where([class~=not-prose],[class~=not-prose] *)){width:100%;table-layout:auto;margin-top:2em;margin-bottom:2em;font-size:.875em;line-height:1.7142857}.prose :where(thead):not(:where([class~=not-prose],[class~=not-prose] *)){border-bottom-width:1px;border-bottom-color:var(--tw-prose-th-borders)}.prose :where(thead th):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:600;vertical-align:bottom;padding-inline-end:.5714286em;padding-bottom:.5714286em;padding-inline-start:.5714286em}.prose :where(tbody tr):not(:where([class~=not-prose],[class~=not-prose] *)){border-bottom-width:1px;border-bottom-color:var(--tw-prose-td-borders)}.prose :where(tbody tr:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){border-bottom-width:0}.prose :where(tbody td):not(:where([class~=not-prose],[class~=not-prose] *)){vertical-align:baseline}.prose :where(tfoot):not(:where([class~=not-prose],[class~=not-prose] *)){border-top-width:1px;border-top-color:var(--tw-prose-th-borders)}.prose :where(tfoot td):not(:where([class~=not-prose],[class~=not-prose] *)){vertical-align:top}.prose :where(th,td):not(:where([class~=not-prose],[class~=not-prose] *)){text-align:start}.prose :where(figure>*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0;margin-bottom:0}.prose :where(figcaption):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-captions);font-size:.875em;line-height:1.4285714;margin-top:.8571429em}.prose{--tw-prose-body:#374151;--tw-prose-headings:#111827;--tw-prose-lead:#4b5563;--tw-prose-links:#111827;--tw-prose-bold:#111827;--tw-prose-counters:#6b7280;--tw-prose-bullets:#d1d5db;--tw-prose-hr:#e5e7eb;--tw-prose-quotes:#111827;--tw-prose-quote-borders:#e5e7eb;--tw-prose-captions:#6b7280;--tw-prose-kbd:#111827;--tw-prose-kbd-shadows:17 24 39;--tw-prose-code:#f472b6;--tw-prose-pre-code:#e5e7eb;--tw-prose-pre-bg:#1f2937;--tw-prose-th-borders:#d1d5db;--tw-prose-td-borders:#e5e7eb;--tw-prose-invert-body:#d1d5db;--tw-prose-invert-headings:#fff;--tw-prose-invert-lead:#9ca3af;--tw-prose-invert-links:#fff;--tw-prose-invert-bold:#fff;--tw-prose-invert-counters:#9ca3af;--tw-prose-invert-bullets:#4b5563;--tw-prose-invert-hr:#374151;--tw-prose-invert-quotes:#f3f4f6;--tw-prose-invert-quote-borders:#374151;--tw-prose-invert-captions:#9ca3af;--tw-prose-invert-kbd:#fff;--tw-prose-invert-kbd-shadows:255 255 255;--tw-prose-invert-code:#fff;--tw-prose-invert-pre-code:#d1d5db;--tw-prose-invert-pre-bg:rgba(0,0,0,.5);--tw-prose-invert-th-borders:#4b5563;--tw-prose-invert-td-borders:#374151;font-size:1rem;line-height:1.75}.prose :where(picture>img):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0;margin-bottom:0}.prose :where(li):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.5em;margin-bottom:.5em}.prose :where(ol>li):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:.375em}.prose :where(ul>li):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:.375em}.prose :where(.prose>ul>li p):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.75em;margin-bottom:.75em}.prose :where(.prose>ul>li>p:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.25em}.prose :where(.prose>ul>li>p:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:1.25em}.prose :where(.prose>ol>li>p:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.25em}.prose :where(.prose>ol>li>p:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:1.25em}.prose :where(ul ul,ul ol,ol ul,ol ol):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.75em;margin-bottom:.75em}.prose :where(dl):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.25em;margin-bottom:1.25em}.prose :where(dd):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.5em;padding-inline-start:1.625em}.prose :where(hr+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose :where(h2+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose :where(h3+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose :where(h4+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose :where(thead th:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:0}.prose :where(thead th:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-end:0}.prose :where(tbody td,tfoot td):not(:where([class~=not-prose],[class~=not-prose] *)){padding-top:.5714286em;padding-inline-end:.5714286em;padding-bottom:.5714286em;padding-inline-start:.5714286em}.prose :where(tbody td:first-child,tfoot td:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:0}.prose :where(tbody td:last-child,tfoot td:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-end:0}.prose :where(figure):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:2em;margin-bottom:2em}.prose :where(.prose>:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose :where(.prose>:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:0}.prose-sm{font-size:.875rem;line-height:1.7142857}.prose-sm :where(p):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em;margin-bottom:1.1428571em}.prose-sm :where([class~=lead]):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:1.2857143em;line-height:1.5555556;margin-top:.8888889em;margin-bottom:.8888889em}.prose-sm :where(blockquote):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.3333333em;margin-bottom:1.3333333em;padding-inline-start:1.1111111em}.prose-sm :where(h1):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:2.1428571em;margin-top:0;margin-bottom:.8em;line-height:1.2}.prose-sm :where(h2):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:1.4285714em;margin-top:1.6em;margin-bottom:.8em;line-height:1.4}.prose-sm :where(h3):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:1.2857143em;margin-top:1.5555556em;margin-bottom:.4444444em;line-height:1.5555556}.prose-sm :where(h4):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.4285714em;margin-bottom:.5714286em;line-height:1.4285714}.prose-sm :where(img):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.7142857em;margin-bottom:1.7142857em}.prose-sm :where(picture):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.7142857em;margin-bottom:1.7142857em}.prose-sm :where(picture>img):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0;margin-bottom:0}.prose-sm :where(video):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.7142857em;margin-bottom:1.7142857em}.prose-sm :where(kbd):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8571429em;border-radius:.3125rem;padding-top:.1428571em;padding-inline-end:.3571429em;padding-bottom:.1428571em;padding-inline-start:.3571429em}.prose-sm :where(code):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8571429em}.prose-sm :where(h2 code):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.9em}.prose-sm :where(h3 code):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8888889em}.prose-sm :where(pre):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8571429em;line-height:1.6666667;margin-top:1.6666667em;margin-bottom:1.6666667em;border-radius:.25rem;padding-top:.6666667em;padding-inline-end:1em;padding-bottom:.6666667em;padding-inline-start:1em}.prose-sm :where(ol):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em;margin-bottom:1.1428571em;padding-inline-start:1.5714286em}.prose-sm :where(ul):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em;margin-bottom:1.1428571em;padding-inline-start:1.5714286em}.prose-sm :where(li):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.2857143em;margin-bottom:.2857143em}.prose-sm :where(ol>li):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:.4285714em}.prose-sm :where(ul>li):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:.4285714em}.prose-sm :where(.prose-sm>ul>li p):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.5714286em;margin-bottom:.5714286em}.prose-sm :where(.prose-sm>ul>li>p:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em}.prose-sm :where(.prose-sm>ul>li>p:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:1.1428571em}.prose-sm :where(.prose-sm>ol>li>p:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em}.prose-sm :where(.prose-sm>ol>li>p:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:1.1428571em}.prose-sm :where(ul ul,ul ol,ol ul,ol ol):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.5714286em;margin-bottom:.5714286em}.prose-sm :where(dl):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em;margin-bottom:1.1428571em}.prose-sm :where(dt):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em}.prose-sm :where(dd):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.2857143em;padding-inline-start:1.5714286em}.prose-sm :where(hr):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:2.8571429em;margin-bottom:2.8571429em}.prose-sm :where(hr+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose-sm :where(h2+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose-sm :where(h3+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose-sm :where(h4+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose-sm :where(table):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8571429em;line-height:1.5}.prose-sm :where(thead th):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-end:1em;padding-bottom:.6666667em;padding-inline-start:1em}.prose-sm :where(thead th:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:0}.prose-sm :where(thead th:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-end:0}.prose-sm :where(tbody td,tfoot td):not(:where([class~=not-prose],[class~=not-prose] *)){padding-top:.6666667em;padding-inline-end:1em;padding-bottom:.6666667em;padding-inline-start:1em}.prose-sm :where(tbody td:first-child,tfoot td:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:0}.prose-sm :where(tbody td:last-child,tfoot td:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-end:0}.prose-sm :where(figure):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.7142857em;margin-bottom:1.7142857em}.prose-sm :where(figure>*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0;margin-bottom:0}.prose-sm :where(figcaption):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8571429em;line-height:1.3333333;margin-top:.6666667em}.prose-sm :where(.prose-sm>:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose-sm :where(.prose-sm>:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:0}.visible{visibility:visible}.static{position:static}.absolute{position:absolute}.relative{position:relative}.bottom-\[-10px\]{bottom:-10px}.left-\[-10px\]{left:-10px}.right-2{right:.5rem}.right-\[-10px\]{right:-10px}.top-2{top:.5rem}.bottom-4{bottom:1rem}.right-4{right:1rem}.z-10{z-index:10}.my-2{margin-top:.5rem;margin-bottom:.5rem}.mb-4{margin-bottom:1rem}.ml-auto{margin-left:auto}.mr-auto{margin-right:auto}.mt-1{margin-top:.25rem}.mt-4{margin-top:1rem}.block{display:block}.flex{display:flex}.contents{display:contents}.hidden{display:none}.h-2\.5{height:.625rem}.h-24{height:6rem}.h-full{height:100%}.h-screen{height:100vh}.min-h-0{min-height:0}.w-2\.5{width:.625rem}.w-24{width:6rem}.w-64{width:16rem}.w-full{width:100%}.max-w-none{max-width:none}.max-w-xs{max-width:20rem}.flex-1{flex:1 1 0%}.flex-shrink-0{flex-shrink:0}.flex-grow{flex-grow:1}@keyframes pulse-fast{0%,to{opacity:1}50%{opacity:.5}}.animate-pulse-fast{animation:pulse-fast 1.2s cubic-bezier(.4,0,.6,1) infinite}@keyframes pulse-medium{0%,to{opacity:1}50%{opacity:.5}}.animate-pulse-medium{animation:pulse-medium 1.2s cubic-bezier(.4,0,.6,1) .15s infinite}@keyframes pulse-slow{0%,to{opacity:1}50%{opacity:.5}}.animate-pulse-slow{animation:pulse-slow 1.2s cubic-bezier(.4,0,.6,1) .3s infinite}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.resize-none{resize:none}.resize{resize:both}.flex-row{flex-direction:row}.flex-col{flex-direction:column}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.space-x-1>:not([hidden])~:not([hidden]){--tw-space-x-reverse:0;margin-right:calc(.25rem*var(--tw-space-x-reverse));margin-left:calc(.25rem*(1 - var(--tw-space-x-reverse)))}.space-x-3>:not([hidden])~:not([hidden]){--tw-space-x-reverse:0;margin-right:calc(.75rem*var(--tw-space-x-reverse));margin-left:calc(.75rem*(1 - var(--tw-space-x-reverse)))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5rem*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5rem*var(--tw-space-y-reverse))}.space-y-4>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1rem*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1rem*var(--tw-space-y-reverse))}.self-start{align-self:flex-start}.self-end{align-self:flex-end}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.overflow-y-hidden{overflow-y:hidden}.rounded{border-radius:.25rem}.rounded-2xl{border-radius:1rem}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5rem}.rounded-md{border-radius:.375rem}.rounded-xl{border-radius:.75rem}.border{border-width:1px}.border-t{border-top-width:1px}.border-gray-700{--tw-border-opacity:1;border-color:rgb(55 65 81/var(--tw-border-opacity,1))}.border-gray-600{--tw-border-opacity:1;border-color:rgb(75 85 99/var(--tw-border-opacity,1))}.bg-gray-700{--tw-bg-opacity:1;background-color:rgb(55 65 81/var(--tw-bg-opacity,1))}.bg-gray-800{--tw-bg-opacity:1;background-color:rgb(31 41 55/var(--tw-bg-opacity,1))}.bg-gray-900{--tw-bg-opacity:1;background-color:rgb(17 24 39/var(--tw-bg-opacity,1))}.bg-purple-600{--tw-bg-opacity:1;background-color:rgb(147 51 234/var(--tw-bg-opacity,1))}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-opacity-75{--tw-bg-opacity:0.75}.p-1{padding:.25rem}.p-1\.5{padding:.375rem}.p-2{padding:.5rem}.p-4{padding:1rem}.px-2{padding-left:.5rem;padding-right:.5rem}.px-4{padding-left:1rem;padding-right:1rem}.px-5{padding-left:1.25rem;padding-right:1.25rem}.py-1{padding-top:.25rem;padding-bottom:.25rem}.py-2{padding-top:.5rem;padding-bottom:.5rem}.px-3{padding-left:.75rem;padding-right:.75rem}.text-left{text-align:left}.text-right{text-align:right}.text-lg{font-size:1.125rem;line-height:1.75rem}.text-sm{font-size:.875rem;line-height:1.25rem}.text-xs{font-size:.75rem;line-height:1rem}.font-bold{font-weight:700}.font-semibold{font-weight:600}.font-medium{font-weight:500}.text-gray-100{--tw-text-opacity:1;color:rgb(243 244 246/var(--tw-text-opacity,1))}.text-gray-200{--tw-text-opacity:1;color:rgb(229 231 235/var(--tw-text-opacity,1))}.text-gray-400{--tw-text-opacity:1;color:rgb(156 163 175/var(--tw-text-opacity,1))}.text-gray-500{--tw-text-opacity:1;color:rgb(107 114 128/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-purple-400{--tw-text-opacity:1;color:rgb(192 132 252/var(--tw-text-opacity,1))}.text-gray-300{--tw-text-opacity:1;color:rgb(209 213 219/var(--tw-text-opacity,1))}.placeholder-gray-500::-moz-placeholder{--tw-placeholder-opacity:1;color:rgb(107 114 128/var(--tw-placeholder-opacity,1))}.placeholder-gray-500::placeholder{--tw-placeholder-opacity:1;color:rgb(107 114 128/var(--tw-placeholder-opacity,1))}.placeholder-gray-400::-moz-placeholder{--tw-placeholder-opacity:1;color:rgb(156 163 175/var(--tw-placeholder-opacity,1))}.placeholder-gray-400::placeholder{--tw-placeholder-opacity:1;color:rgb(156 163 175/var(--tw-placeholder-opacity,1))}.opacity-0{opacity:0}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-2xl,.shadow-lg{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-sm{--tw-shadow:0 1px 2px 0 rgba(0,0,0,.05);--tw-shadow-colored:0 1px 2px 0 var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition-all{transition-property:all;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.transition-colors{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.transition-opacity{transition-property:opacity;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.duration-300{transition-duration:.3s}.ease-in-out{transition-timing-function:cubic-bezier(.4,0,.2,1)}.dark\:prose-invert:is(.dark *){--tw-prose-body:var(--tw-prose-invert-body);--tw-prose-headings:var(--tw-prose-invert-headings);--tw-prose-lead:var(--tw-prose-invert-lead);--tw-prose-links:var(--tw-prose-invert-links);--tw-prose-bold:var(--tw-prose-invert-bold);--tw-prose-counters:var(--tw-prose-invert-counters);--tw-prose-bullets:var(--tw-prose-invert-bullets);--tw-prose-hr:var(--tw-prose-invert-hr);--tw-prose-quotes:var(--tw-prose-invert-quotes);--tw-prose-quote-borders:var(--tw-prose-invert-quote-borders);--tw-prose-captions:var(--tw-prose-invert-captions);--tw-prose-kbd:var(--tw-prose-invert-kbd);--tw-prose-kbd-shadows:var(--tw-prose-invert-kbd-shadows);--tw-prose-code:var(--tw-prose-invert-code);--tw-prose-pre-code:var(--tw-prose-invert-pre-code);--tw-prose-pre-bg:var(--tw-prose-invert-pre-bg);--tw-prose-th-borders:var(--tw-prose-invert-th-borders);--tw-prose-td-borders:var(--tw-prose-invert-td-borders)}.hover\:bg-gray-700:hover{--tw-bg-opacity:1;background-color:rgb(55 65 81/var(--tw-bg-opacity,1))}.hover\:bg-purple-700:hover{--tw-bg-opacity:1;background-color:rgb(126 34 206/var(--tw-bg-opacity,1))}.hover\:bg-red-600:hover{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.hover\:bg-gray-600:hover{--tw-bg-opacity:1;background-color:rgb(75 85 99/var(--tw-bg-opacity,1))}.hover\:text-white:hover{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.hover\:text-purple-300:hover{--tw-text-opacity:1;color:rgb(216 180 254/var(--tw-text-opacity,1))}.focus\:border-indigo-500:focus{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.focus\:outline-none:focus{outline:2px solid transparent;outline-offset:2px}.focus\:ring-2:focus{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(2px + var(--tw-ring-offset-width)) var(--tw-ring-color)}.focus\:ring-1:focus,.focus\:ring-2:focus{box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.focus\:ring-1:focus{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(1px + var(--tw-ring-offset-width)) var(--tw-ring-color)}.focus\:ring-gray-600:focus{--tw-ring-opacity:1;--tw-ring-color:rgb(75 85 99/var(--tw-ring-opacity,1))}.focus\:ring-purple-500:focus{--tw-ring-opacity:1;--tw-ring-color:rgb(168 85 247/var(--tw-ring-opacity,1))}.focus\:ring-indigo-500:focus{--tw-ring-opacity:1;--tw-ring-color:rgb(99 102 241/var(--tw-ring-opacity,1))}.focus\:ring-opacity-50:focus{--tw-ring-opacity:0.5}.group:hover .group-hover\:opacity-100{opacity:1}@media (min-width:768px){.md\:max-w-md{max-width:28rem}}
+\ No newline at end of file
++*/*,:after,:before{box-sizing:border-box;border:0 solid #e5e7eb}:after,:before{--tw-content:""}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;-o-tab-size:4;tab-size:4;font-family:ui-sans-serif,system-ui,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{opacity:1;color:#9ca3af}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.container{width:100%}@media (min-width:640px){.container{max-width:640px}}@media (min-width:768px){.container{max-width:768px}}@media (min-width:1024px){.container{max-width:1024px}}@media (min-width:1280px){.container{max-width:1280px}}@media (min-width:1536px){.container{max-width:1536px}}.prose{color:var(--tw-prose-body);max-width:65ch}.prose :where(p):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.25em;margin-bottom:1.25em}.prose :where([class~=lead]):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-lead);font-size:1.25em;line-height:1.6;margin-top:1.2em;margin-bottom:1.2em}.prose :where(a):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-links);text-decoration:underline;font-weight:500}.prose :where(strong):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-bold);font-weight:600}.prose :where(a strong):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(blockquote strong):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(thead th strong):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(ol):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:decimal;margin-top:1.25em;margin-bottom:1.25em;padding-inline-start:1.625em}.prose :where(ol[type=A]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:upper-alpha}.prose :where(ol[type=a]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:lower-alpha}.prose :where(ol[type=A s]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:upper-alpha}.prose :where(ol[type=a s]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:lower-alpha}.prose :where(ol[type=I]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:upper-roman}.prose :where(ol[type=i]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:lower-roman}.prose :where(ol[type=I s]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:upper-roman}.prose :where(ol[type=i s]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:lower-roman}.prose :where(ol[type="1"]):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:decimal}.prose :where(ul):not(:where([class~=not-prose],[class~=not-prose] *)){list-style-type:disc;margin-top:1.25em;margin-bottom:1.25em;padding-inline-start:1.625em}.prose :where(ol>li):not(:where([class~=not-prose],[class~=not-prose] *))::marker{font-weight:400;color:var(--tw-prose-counters)}.prose :where(ul>li):not(:where([class~=not-prose],[class~=not-prose] *))::marker{color:var(--tw-prose-bullets)}.prose :where(dt):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:600;margin-top:1.25em}.prose :where(hr):not(:where([class~=not-prose],[class~=not-prose] *)){border-color:var(--tw-prose-hr);border-top-width:1px;margin-top:3em;margin-bottom:3em}.prose :where(blockquote):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:500;font-style:italic;color:var(--tw-prose-quotes);border-inline-start-width:.25rem;border-inline-start-color:var(--tw-prose-quote-borders);quotes:"\201C""\201D""\2018""\2019";margin-top:1.6em;margin-bottom:1.6em;padding-inline-start:1em}.prose :where(blockquote p:first-of-type):not(:where([class~=not-prose],[class~=not-prose] *)):before{content:open-quote}.prose :where(blockquote p:last-of-type):not(:where([class~=not-prose],[class~=not-prose] *)):after{content:close-quote}.prose :where(h1):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:800;font-size:2.25em;margin-top:0;margin-bottom:.8888889em;line-height:1.1111111}.prose :where(h1 strong):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:900;color:inherit}.prose :where(h2):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:700;font-size:1.5em;margin-top:2em;margin-bottom:1em;line-height:1.3333333}.prose :where(h2 strong):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:800;color:inherit}.prose :where(h3):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:600;font-size:1.25em;margin-top:1.6em;margin-bottom:.6em;line-height:1.6}.prose :where(h3 strong):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:700;color:inherit}.prose :where(h4):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:600;margin-top:1.5em;margin-bottom:.5em;line-height:1.5}.prose :where(h4 strong):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:700;color:inherit}.prose :where(img):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:2em;margin-bottom:2em}.prose :where(picture):not(:where([class~=not-prose],[class~=not-prose] *)){display:block;margin-top:2em;margin-bottom:2em}.prose :where(video):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:2em;margin-bottom:2em}.prose :where(kbd):not(:where([class~=not-prose],[class~=not-prose] *)){font-weight:500;font-family:inherit;color:var(--tw-prose-kbd);box-shadow:0 0 0 1px rgb(var(--tw-prose-kbd-shadows)/10%),0 3px 0 rgb(var(--tw-prose-kbd-shadows)/10%);font-size:.875em;border-radius:.3125rem;padding-top:.1875em;padding-inline-end:.375em;padding-bottom:.1875em;padding-inline-start:.375em}.prose :where(code):not(:where([class~=not-prose],[class~=not-prose] *)){color:#c0c5ce;font-weight:600;font-size:.875em;font-family:Fira Code,Courier New,monospace}.prose :where(code):not(:where([class~=not-prose],[class~=not-prose] *)):before{content:"`"}.prose :where(code):not(:where([class~=not-prose],[class~=not-prose] *)):after{content:"`"}.prose :where(a code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(h1 code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(h2 code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit;font-size:.875em}.prose :where(h3 code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit;font-size:.9em}.prose :where(h4 code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(blockquote code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(thead th code):not(:where([class~=not-prose],[class~=not-prose] *)){color:inherit}.prose :where(pre):not(:where([class~=not-prose],[class~=not-prose] *)){color:#c0c5ce;background-color:#2b303b;overflow-x:auto;font-weight:400;font-size:.875em;line-height:1.7142857;margin-top:1.7142857em;margin-bottom:1.7142857em;border-radius:.375rem;padding-top:.8571429em;padding-inline-end:1.1428571em;padding-bottom:.8571429em;padding-inline-start:1.1428571em}.prose :where(pre code):not(:where([class~=not-prose],[class~=not-prose] *)){background-color:transparent;border-width:0;border-radius:0;padding:0;font-weight:inherit;color:inherit;font-size:inherit;font-family:inherit;line-height:inherit}.prose :where(pre code):not(:where([class~=not-prose],[class~=not-prose] *)):before{content:none}.prose :where(pre code):not(:where([class~=not-prose],[class~=not-prose] *)):after{content:none}.prose :where(table):not(:where([class~=not-prose],[class~=not-prose] *)){width:100%;table-layout:auto;margin-top:2em;margin-bottom:2em;font-size:.875em;line-height:1.7142857}.prose :where(thead):not(:where([class~=not-prose],[class~=not-prose] *)){border-bottom-width:1px;border-bottom-color:var(--tw-prose-th-borders)}.prose :where(thead th):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-headings);font-weight:600;vertical-align:bottom;padding-inline-end:.5714286em;padding-bottom:.5714286em;padding-inline-start:.5714286em}.prose :where(tbody tr):not(:where([class~=not-prose],[class~=not-prose] *)){border-bottom-width:1px;border-bottom-color:var(--tw-prose-td-borders)}.prose :where(tbody tr:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){border-bottom-width:0}.prose :where(tbody td):not(:where([class~=not-prose],[class~=not-prose] *)){vertical-align:baseline}.prose :where(tfoot):not(:where([class~=not-prose],[class~=not-prose] *)){border-top-width:1px;border-top-color:var(--tw-prose-th-borders)}.prose :where(tfoot td):not(:where([class~=not-prose],[class~=not-prose] *)){vertical-align:top}.prose :where(th,td):not(:where([class~=not-prose],[class~=not-prose] *)){text-align:start}.prose :where(figure>*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0;margin-bottom:0}.prose :where(figcaption):not(:where([class~=not-prose],[class~=not-prose] *)){color:var(--tw-prose-captions);font-size:.875em;line-height:1.4285714;margin-top:.8571429em}.prose{--tw-prose-body:#374151;--tw-prose-headings:#111827;--tw-prose-lead:#4b5563;--tw-prose-links:#111827;--tw-prose-bold:#111827;--tw-prose-counters:#6b7280;--tw-prose-bullets:#d1d5db;--tw-prose-hr:#e5e7eb;--tw-prose-quotes:#111827;--tw-prose-quote-borders:#e5e7eb;--tw-prose-captions:#6b7280;--tw-prose-kbd:#111827;--tw-prose-kbd-shadows:17 24 39;--tw-prose-code:#f472b6;--tw-prose-pre-code:#e5e7eb;--tw-prose-pre-bg:#1f2937;--tw-prose-th-borders:#d1d5db;--tw-prose-td-borders:#e5e7eb;--tw-prose-invert-body:#d1d5db;--tw-prose-invert-headings:#fff;--tw-prose-invert-lead:#9ca3af;--tw-prose-invert-links:#fff;--tw-prose-invert-bold:#fff;--tw-prose-invert-counters:#9ca3af;--tw-prose-invert-bullets:#4b5563;--tw-prose-invert-hr:#374151;--tw-prose-invert-quotes:#f3f4f6;--tw-prose-invert-quote-borders:#374151;--tw-prose-invert-captions:#9ca3af;--tw-prose-invert-kbd:#fff;--tw-prose-invert-kbd-shadows:255 255 255;--tw-prose-invert-code:#fff;--tw-prose-invert-pre-code:#d1d5db;--tw-prose-invert-pre-bg:rgba(0,0,0,.5);--tw-prose-invert-th-borders:#4b5563;--tw-prose-invert-td-borders:#374151;font-size:1rem;line-height:1.75}.prose :where(picture>img):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0;margin-bottom:0}.prose :where(li):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.5em;margin-bottom:.5em}.prose :where(ol>li):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:.375em}.prose :where(ul>li):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:.375em}.prose :where(.prose>ul>li p):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.75em;margin-bottom:.75em}.prose :where(.prose>ul>li>p:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.25em}.prose :where(.prose>ul>li>p:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:1.25em}.prose :where(.prose>ol>li>p:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.25em}.prose :where(.prose>ol>li>p:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:1.25em}.prose :where(ul ul,ul ol,ol ul,ol ol):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.75em;margin-bottom:.75em}.prose :where(dl):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.25em;margin-bottom:1.25em}.prose :where(dd):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.5em;padding-inline-start:1.625em}.prose :where(hr+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose :where(h2+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose :where(h3+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose :where(h4+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose :where(thead th:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:0}.prose :where(thead th:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-end:0}.prose :where(tbody td,tfoot td):not(:where([class~=not-prose],[class~=not-prose] *)){padding-top:.5714286em;padding-inline-end:.5714286em;padding-bottom:.5714286em;padding-inline-start:.5714286em}.prose :where(tbody td:first-child,tfoot td:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:0}.prose :where(tbody td:last-child,tfoot td:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-end:0}.prose :where(figure):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:2em;margin-bottom:2em}.prose :where(.prose>:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose :where(.prose>:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:0}.prose-sm{font-size:.875rem;line-height:1.7142857}.prose-sm :where(p):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em;margin-bottom:1.1428571em}.prose-sm :where([class~=lead]):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:1.2857143em;line-height:1.5555556;margin-top:.8888889em;margin-bottom:.8888889em}.prose-sm :where(blockquote):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.3333333em;margin-bottom:1.3333333em;padding-inline-start:1.1111111em}.prose-sm :where(h1):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:2.1428571em;margin-top:0;margin-bottom:.8em;line-height:1.2}.prose-sm :where(h2):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:1.4285714em;margin-top:1.6em;margin-bottom:.8em;line-height:1.4}.prose-sm :where(h3):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:1.2857143em;margin-top:1.5555556em;margin-bottom:.4444444em;line-height:1.5555556}.prose-sm :where(h4):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.4285714em;margin-bottom:.5714286em;line-height:1.4285714}.prose-sm :where(img):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.7142857em;margin-bottom:1.7142857em}.prose-sm :where(picture):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.7142857em;margin-bottom:1.7142857em}.prose-sm :where(picture>img):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0;margin-bottom:0}.prose-sm :where(video):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.7142857em;margin-bottom:1.7142857em}.prose-sm :where(kbd):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8571429em;border-radius:.3125rem;padding-top:.1428571em;padding-inline-end:.3571429em;padding-bottom:.1428571em;padding-inline-start:.3571429em}.prose-sm :where(code):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8571429em}.prose-sm :where(h2 code):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.9em}.prose-sm :where(h3 code):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8888889em}.prose-sm :where(pre):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8571429em;line-height:1.6666667;margin-top:1.6666667em;margin-bottom:1.6666667em;border-radius:.25rem;padding-top:.6666667em;padding-inline-end:1em;padding-bottom:.6666667em;padding-inline-start:1em}.prose-sm :where(ol):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em;margin-bottom:1.1428571em;padding-inline-start:1.5714286em}.prose-sm :where(ul):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em;margin-bottom:1.1428571em;padding-inline-start:1.5714286em}.prose-sm :where(li):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.2857143em;margin-bottom:.2857143em}.prose-sm :where(ol>li):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:.4285714em}.prose-sm :where(ul>li):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:.4285714em}.prose-sm :where(.prose-sm>ul>li p):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.5714286em;margin-bottom:.5714286em}.prose-sm :where(.prose-sm>ul>li>p:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em}.prose-sm :where(.prose-sm>ul>li>p:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:1.1428571em}.prose-sm :where(.prose-sm>ol>li>p:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em}.prose-sm :where(.prose-sm>ol>li>p:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:1.1428571em}.prose-sm :where(ul ul,ul ol,ol ul,ol ol):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.5714286em;margin-bottom:.5714286em}.prose-sm :where(dl):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em;margin-bottom:1.1428571em}.prose-sm :where(dt):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.1428571em}.prose-sm :where(dd):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:.2857143em;padding-inline-start:1.5714286em}.prose-sm :where(hr):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:2.8571429em;margin-bottom:2.8571429em}.prose-sm :where(hr+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose-sm :where(h2+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose-sm :where(h3+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose-sm :where(h4+*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose-sm :where(table):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8571429em;line-height:1.5}.prose-sm :where(thead th):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-end:1em;padding-bottom:.6666667em;padding-inline-start:1em}.prose-sm :where(thead th:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:0}.prose-sm :where(thead th:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-end:0}.prose-sm :where(tbody td,tfoot td):not(:where([class~=not-prose],[class~=not-prose] *)){padding-top:.6666667em;padding-inline-end:1em;padding-bottom:.6666667em;padding-inline-start:1em}.prose-sm :where(tbody td:first-child,tfoot td:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-start:0}.prose-sm :where(tbody td:last-child,tfoot td:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){padding-inline-end:0}.prose-sm :where(figure):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:1.7142857em;margin-bottom:1.7142857em}.prose-sm :where(figure>*):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0;margin-bottom:0}.prose-sm :where(figcaption):not(:where([class~=not-prose],[class~=not-prose] *)){font-size:.8571429em;line-height:1.3333333;margin-top:.6666667em}.prose-sm :where(.prose-sm>:first-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-top:0}.prose-sm :where(.prose-sm>:last-child):not(:where([class~=not-prose],[class~=not-prose] *)){margin-bottom:0}.visible{visibility:visible}.static{position:static}.absolute{position:absolute}.relative{position:relative}.bottom-\[-10px\]{bottom:-10px}.left-\[-10px\]{left:-10px}.right-2{right:.5rem}.right-\[-10px\]{right:-10px}.top-2{top:.5rem}.bottom-4{bottom:1rem}.right-4{right:1rem}.z-10{z-index:10}.my-2{margin-top:.5rem;margin-bottom:.5rem}.mb-4{margin-bottom:1rem}.ml-auto{margin-left:auto}.mr-auto{margin-right:auto}.mt-1{margin-top:.25rem}.mt-4{margin-top:1rem}.block{display:block}.flex{display:flex}.contents{display:contents}.hidden{display:none}.h-2\.5{height:.625rem}.h-24{height:6rem}.h-full{height:100%}.h-screen{height:100vh}.min-h-0{min-height:0}.w-2\.5{width:.625rem}.w-24{width:6rem}.w-64{width:16rem}.w-full{width:100%}.max-w-none{max-width:none}.max-w-xs{max-width:20rem}.flex-1{flex:1 1 0%}.flex-shrink-0{flex-shrink:0}.flex-grow{flex-grow:1}@keyframes pulse-fast{0%,to{opacity:1}50%{opacity:.5}}.animate-pulse-fast{animation:pulse-fast 1.2s cubic-bezier(.4,0,.6,1) infinite}@keyframes pulse-medium{0%,to{opacity:1}50%{opacity:.5}}.animate-pulse-medium{animation:pulse-medium 1.2s cubic-bezier(.4,0,.6,1) .15s infinite}@keyframes pulse-slow{0%,to{opacity:1}50%{opacity:.5}}.animate-pulse-slow{animation:pulse-slow 1.2s cubic-bezier(.4,0,.6,1) .3s infinite}@keyframes spin{to{transform:rotate(1turn)}}.animate-spin{animation:spin 1s linear infinite}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.resize-none{resize:none}.resize{resize:both}.flex-row{flex-direction:row}.flex-col{flex-direction:column}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.gap-3{gap:.75rem}.space-x-1>:not([hidden])~:not([hidden]){--tw-space-x-reverse:0;margin-right:calc(.25rem*var(--tw-space-x-reverse));margin-left:calc(.25rem*(1 - var(--tw-space-x-reverse)))}.space-x-3>:not([hidden])~:not([hidden]){--tw-space-x-reverse:0;margin-right:calc(.75rem*var(--tw-space-x-reverse));margin-left:calc(.75rem*(1 - var(--tw-space-x-reverse)))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5rem*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5rem*var(--tw-space-y-reverse))}.space-y-4>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1rem*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1rem*var(--tw-space-y-reverse))}.self-start{align-self:flex-start}.self-end{align-self:flex-end}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.overflow-y-hidden{overflow-y:hidden}.rounded{border-radius:.25rem}.rounded-2xl{border-radius:1rem}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5rem}.rounded-md{border-radius:.375rem}.rounded-xl{border-radius:.75rem}.border{border-width:1px}.border-t{border-top-width:1px}.border-gray-700{--tw-border-opacity:1;border-color:rgb(55 65 81/var(--tw-border-opacity,1))}.border-gray-600{--tw-border-opacity:1;border-color:rgb(75 85 99/var(--tw-border-opacity,1))}.bg-gray-700{--tw-bg-opacity:1;background-color:rgb(55 65 81/var(--tw-bg-opacity,1))}.bg-gray-800{--tw-bg-opacity:1;background-color:rgb(31 41 55/var(--tw-bg-opacity,1))}.bg-gray-900{--tw-bg-opacity:1;background-color:rgb(17 24 39/var(--tw-bg-opacity,1))}.bg-purple-600{--tw-bg-opacity:1;background-color:rgb(147 51 234/var(--tw-bg-opacity,1))}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-opacity-75{--tw-bg-opacity:0.75}.p-1{padding:.25rem}.p-1\.5{padding:.375rem}.p-2{padding:.5rem}.p-4{padding:1rem}.p-3{padding:.75rem}.px-2{padding-left:.5rem;padding-right:.5rem}.px-4{padding-left:1rem;padding-right:1rem}.px-5{padding-left:1.25rem;padding-right:1.25rem}.py-1{padding-top:.25rem;padding-bottom:.25rem}.py-2{padding-top:.5rem;padding-bottom:.5rem}.px-3{padding-left:.75rem;padding-right:.75rem}.text-left{text-align:left}.text-right{text-align:right}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace}.text-lg{font-size:1.125rem;line-height:1.75rem}.text-sm{font-size:.875rem;line-height:1.25rem}.text-xs{font-size:.75rem;line-height:1rem}.font-bold{font-weight:700}.font-semibold{font-weight:600}.font-medium{font-weight:500}.text-gray-100{--tw-text-opacity:1;color:rgb(243 244 246/var(--tw-text-opacity,1))}.text-gray-200{--tw-text-opacity:1;color:rgb(229 231 235/var(--tw-text-opacity,1))}.text-gray-400{--tw-text-opacity:1;color:rgb(156 163 175/var(--tw-text-opacity,1))}.text-gray-500{--tw-text-opacity:1;color:rgb(107 114 128/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-purple-400{--tw-text-opacity:1;color:rgb(192 132 252/var(--tw-text-opacity,1))}.text-gray-300{--tw-text-opacity:1;color:rgb(209 213 219/var(--tw-text-opacity,1))}.placeholder-gray-500::-moz-placeholder{--tw-placeholder-opacity:1;color:rgb(107 114 128/var(--tw-placeholder-opacity,1))}.placeholder-gray-500::placeholder{--tw-placeholder-opacity:1;color:rgb(107 114 128/var(--tw-placeholder-opacity,1))}.placeholder-gray-400::-moz-placeholder{--tw-placeholder-opacity:1;color:rgb(156 163 175/var(--tw-placeholder-opacity,1))}.placeholder-gray-400::placeholder{--tw-placeholder-opacity:1;color:rgb(156 163 175/var(--tw-placeholder-opacity,1))}.opacity-0{opacity:0}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-2xl,.shadow-lg{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-sm{--tw-shadow:0 1px 2px 0 rgba(0,0,0,.05);--tw-shadow-colored:0 1px 2px 0 var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition-all{transition-property:all;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.transition-colors{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.transition-opacity{transition-property:opacity;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.duration-300{transition-duration:.3s}.ease-in-out{transition-timing-function:cubic-bezier(.4,0,.2,1)}.dark\:prose-invert:is(.dark *){--tw-prose-body:var(--tw-prose-invert-body);--tw-prose-headings:var(--tw-prose-invert-headings);--tw-prose-lead:var(--tw-prose-invert-lead);--tw-prose-links:var(--tw-prose-invert-links);--tw-prose-bold:var(--tw-prose-invert-bold);--tw-prose-counters:var(--tw-prose-invert-counters);--tw-prose-bullets:var(--tw-prose-invert-bullets);--tw-prose-hr:var(--tw-prose-invert-hr);--tw-prose-quotes:var(--tw-prose-invert-quotes);--tw-prose-quote-borders:var(--tw-prose-invert-quote-borders);--tw-prose-captions:var(--tw-prose-invert-captions);--tw-prose-kbd:var(--tw-prose-invert-kbd);--tw-prose-kbd-shadows:var(--tw-prose-invert-kbd-shadows);--tw-prose-code:var(--tw-prose-invert-code);--tw-prose-pre-code:var(--tw-prose-invert-pre-code);--tw-prose-pre-bg:var(--tw-prose-invert-pre-bg);--tw-prose-th-borders:var(--tw-prose-invert-th-borders);--tw-prose-td-borders:var(--tw-prose-invert-td-borders)}.hover\:bg-gray-700:hover{--tw-bg-opacity:1;background-color:rgb(55 65 81/var(--tw-bg-opacity,1))}.hover\:bg-purple-700:hover{--tw-bg-opacity:1;background-color:rgb(126 34 206/var(--tw-bg-opacity,1))}.hover\:bg-red-600:hover{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.hover\:bg-gray-600:hover{--tw-bg-opacity:1;background-color:rgb(75 85 99/var(--tw-bg-opacity,1))}.hover\:text-white:hover{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.hover\:text-purple-300:hover{--tw-text-opacity:1;color:rgb(216 180 254/var(--tw-text-opacity,1))}.focus\:border-indigo-500:focus{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.focus\:outline-none:focus{outline:2px solid transparent;outline-offset:2px}.focus\:ring-2:focus{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(2px + var(--tw-ring-offset-width)) var(--tw-ring-color)}.focus\:ring-1:focus,.focus\:ring-2:focus{box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.focus\:ring-1:focus{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(1px + var(--tw-ring-offset-width)) var(--tw-ring-color)}.focus\:ring-gray-600:focus{--tw-ring-opacity:1;--tw-ring-color:rgb(75 85 99/var(--tw-ring-opacity,1))}.focus\:ring-purple-500:focus{--tw-ring-opacity:1;--tw-ring-color:rgb(168 85 247/var(--tw-ring-opacity,1))}.focus\:ring-indigo-500:focus{--tw-ring-opacity:1;--tw-ring-color:rgb(99 102 241/var(--tw-ring-opacity,1))}.focus\:ring-opacity-50:focus{--tw-ring-opacity:0.5}.group:hover .group-hover\:opacity-100{opacity:1}@media (min-width:768px){.md\:max-w-md{max-width:28rem}}
+\ No newline at end of file
+diff --git a/assets/tailwind.css b/assets/tailwind.css
+index 191b111..4b5c82a 100644
+--- a/assets/tailwind.css
++++ b/assets/tailwind.css
+@@ -1528,6 +1528,16 @@ video {
+   animation: pulse-slow 1.2s cubic-bezier(0.4, 0, 0.6, 1) infinite 0.3s;
+ }
+ 
++@keyframes spin {
++  to {
++    transform: rotate(360deg);
++  }
++}
++
++.animate-spin {
++  animation: spin 1s linear infinite;
++}
++
+ .cursor-pointer {
+   cursor: pointer;
+ }
+@@ -1574,6 +1584,10 @@ video {
+   justify-content: space-between;
+ }
+ 
++.gap-3 {
++  gap: 0.75rem;
++}
++
+ .space-x-1 > :not([hidden]) ~ :not([hidden]) {
+   --tw-space-x-reverse: 0;
+   margin-right: calc(0.25rem * var(--tw-space-x-reverse));
+@@ -1705,6 +1719,10 @@ video {
+   padding: 1rem;
+ }
+ 
++.p-3 {
++  padding: 0.75rem;
++}
++
+ .px-2 {
+   padding-left: 0.5rem;
+   padding-right: 0.5rem;
+@@ -1743,6 +1761,10 @@ video {
+   text-align: right;
+ }
+ 
++.font-mono {
++  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
++}
++
+ .text-lg {
+   font-size: 1.125rem;
+   line-height: 1.75rem;
+diff --git a/mcp_servers.json b/mcp_servers.json
+new file mode 100644
+index 0000000..ca3d5f5
+--- /dev/null
++++ b/mcp_servers.json
+@@ -0,0 +1,7 @@
++[
++  {
++    "name": "example-server",
++    "command": "echo 'MCP server starting...'",
++    "description": "An example server that does nothing."
++  }
++]
+\ No newline at end of file
+diff --git a/src/components/chat.rs b/src/components/chat.rs
+index ed6d5dd..f72c84a 100644
+--- a/src/components/chat.rs
++++ b/src/components/chat.rs
+@@ -1,4 +1,5 @@
+ use dioxus::prelude::*;
++use futures_util::StreamExt;
+ use tokio::sync::mpsc;
+ use uuid::Uuid;
+ use dioxus_free_icons::{Icon, icons::fi_icons};
+@@ -6,7 +7,6 @@ use std::rc::Rc;
+ use dioxus::html::geometry::euclid::Rect;
+ use std::time::Duration;
+ use tokio::time::sleep;
+-use pulldown_cmark::{html, Options, Parser, Event, Tag, TagEnd};
+ use crate::components::stream_manager::StreamManagerContext;
+ use lazy_static::lazy_static;
+ use syntect::easy::HighlightLines;
+@@ -17,8 +17,12 @@ use feature_clipboard::copy_to_clipboard;
+ use crate::context::prompt_builder::PromptBuilder;
+ use crate::processing::conversation_processor::ConversationProcessor;
+ // Define a simple `Message` struct
++use pulldown_cmark::{Options, Parser, Event as CmarkEvent, Tag, TagEnd, html};
+ use serde::{Deserialize, Serialize};
++use serde_json::Value;
+ use crate::settings::Settings;
++use crate::mcp::manager::McpManager;
++use crate::components::tool_call_display::{ToolCallDisplay, ToolCallStatus};
+ 
+ 
+ lazy_static! {
+@@ -27,11 +31,46 @@ lazy_static! {
+     static ref THEME: &'static Theme = &THEME_SET.themes["base16-ocean.dark"];
+ }
+ 
++#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
++pub struct ToolCall {
++    pub name: String,
++    pub args: Value,
++    pub result: Option<Value>,
++    #[serde(default)]
++    pub status: ToolCallStatus,
++}
++
++#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
++#[serde(tag = "type")]
++pub enum MessageContent {
++    Text { content: String },
++    ToolCall { call: ToolCall },
++}
++
++impl Default for MessageContent {
++    fn default() -> Self {
++        MessageContent::Text { content: "".to_string() }
++    }
++}
++
++
+ #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+ pub struct Message {
+     pub id: uuid::Uuid,
+     pub author: String,
+-    pub content: String,
++    #[serde(flatten)]
++    pub content: MessageContent,
++    #[serde(default = "default_visible")]
++    pub visible: bool,
++}
++
++fn default_visible() -> bool {
++    true
++}
++
++#[derive(Clone)]
++enum ChatAction {
++    SendMessage(Message),
+ }
+ 
+ // The main ChatWindow component
+@@ -39,6 +78,7 @@ pub struct Message {
+ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interaction: EventHandler<()>, on_toggle_sessions: EventHandler<()>, on_toggle_settings: EventHandler<()>) -> Element {
+     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
+     let settings = use_context::<Signal<Settings>>();
++    let mcp_manager = use_context::<Signal<McpManager>>();
+     let mut draft = use_signal(|| "".to_string());
+     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
+     let mut has_interacted = use_signal(|| false);
+@@ -47,7 +87,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
+     const INITIAL_MESSAGES_TO_SHOW: usize = 20;
+     let mut show_scroll_button = use_signal(|| false);
+     let mut is_initial_load = use_signal(|| true);
+-    let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
++    let visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
+     // Effect to report content size changes and conditionally scroll to bottom
+     use_effect(move || {
+         // By reading the session state here, the effect becomes dependent on it.
+@@ -97,124 +137,125 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
+         }
+     });
+ 
+-    // Reusable closure for sending a message
+-    let mut send_message = move || {
+-        tracing::info!("'send_message' entered.");
+-        // Prevent concurrent message sends.
+-        if *is_sending.read() {
+-            tracing::warn!("'send_message' blocked: already sending.");
+-            return;
+-        }
+-        let user_message = draft.read().clone();
+-        if user_message.is_empty() {
+-            return;
+-        }
++    let mcp_manager_for_debug = mcp_manager;
++    let chat_coroutine = use_coroutine(
++        move |mut rx: UnboundedReceiver<ChatAction>| {
++            let mut session_state = session_state.clone();
++            let settings = settings.clone();
++            let mcp_manager = mcp_manager.clone();
++            let stream_manager = stream_manager.clone();
++            let mut is_sending = is_sending.clone();
++
++            async move {
++                while let Some(action) = rx.next().await {
++                    match action {
++                        ChatAction::SendMessage(mut message) => {
++                            if *is_sending.read() {
++                                tracing::warn!("'send_message' blocked: already sending.");
++                                continue;
++                            }
++                            is_sending.set(true);
++
++                            // This loop allows us to feed tool results back into the LLM without exiting the coroutine task
++                            'action_loop: loop {
++                                let hobbes_message_id = Uuid::new_v4();
++                                
++                                {
++                                    let mut state = session_state.write();
++                                    if state.active_session_id.is_empty() {
++                                        state.create_session();
++                                    }
++                                    let session = state.get_active_session_mut().unwrap();
++                                    session.messages.push(message.clone());
++                                    session.messages.push(Message {
++                                        id: hobbes_message_id,
++                                        author: "Hobbes".to_string(),
++                                        content: MessageContent::Text { content: "".to_string() },
++                                        visible: true,
++                                    });
++                                }
+ 
+-        // Clear the draft immediately for a responsive UI
+-        draft.set("".to_string());
+-        // Reset textarea height
+-        let _ = document::eval(r#"
+-            const el = document.getElementById('chat-textarea');
+-            if (el) { el.style.height = 'auto'; }
+-        "#);
+-
+-        // Clone necessary signals and data for the async task
+-        let mut session_state_clone = session_state.clone();
+-        let stream_manager_clone = stream_manager.clone();
+-        let mut is_sending_clone = is_sending.clone();
+-        let settings_clone = settings.read().clone();
+- 
+-        // Spawn a single async task to handle all state mutations and side effects
+-        spawn(async move {
+-            // Set the lock.
+-            is_sending_clone.set(true);
+-            tracing::info!("Lock ACQUIRED.");
+-
+-            // Create a channel to signal completion from the stream manager.
+-            let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+-            // 1. Prepare message and context
+-            let hobbes_message_id = Uuid::new_v4();
+-            // 2. Perform initial state mutations
+-            {
+-                let mut state = session_state_clone.write();
+-                if state.active_session_id.is_empty() {
+-                    state.create_session();
+-                }
+-                let active_id = state.active_session_id.clone();
+-                let session = state.sessions.get_mut(&active_id).unwrap();
+-
+-                // Add user message
+-                session.messages.push(Message {
+-                    id: Uuid::new_v4(),
+-                    author: "User".to_string(),
+-                    content: user_message.clone(),
+-                });
+-
+-                // Add bot placeholder
+-                session.messages.push(Message {
+-                    id: hobbes_message_id,
+-                    author: "Hobbes".to_string(),
+-                    content: "".to_string(),
+-                });
+-            } // Write lock is released here
+-
+-            // 3. Process context and build the final prompt
+-            let final_message = {
+-                // Get a read lock to clone the session for processing
+-                let session_for_processing = session_state_clone.read().get_active_session().cloned().unwrap();
+-                
+-                // Generate the summary asynchronously without holding any locks
+-                let processor = ConversationProcessor::new();
+-                if let Some(summary) = processor.generate_summary(&session_for_processing, &settings_clone).await {
+-                    // Re-acquire the write lock to update the context
+-                    let mut state = session_state_clone.write();
+-                    if let Some(session) = state.get_active_session_mut() {
+-                        session.active_context.conversation_summary = summary;
+-                    }
+-                }
++                                let session_for_processing = session_state.read().get_active_session().cloned().unwrap();
++                                let settings_clone = settings.read().clone();
++                                let processor = ConversationProcessor::new();
++                                if let Some(summary) = processor.generate_summary(&session_for_processing, &settings_clone).await {
++                                    let mut state = session_state.write();
++                                    if let Some(session) = state.get_active_session_mut() {
++                                        session.active_context.conversation_summary = summary;
++                                    }
++                                }
+ 
+-                // Get a final read lock to build the prompt with the *updated* context
+-                let state = session_state_clone.read();
+-                let session = state.get_active_session().unwrap();
+-                let builder = PromptBuilder::new(session, &settings_clone);
+-                let context_string = builder.build_context_string();
+-                format!("{}{}", context_string, user_message)
+-            };
+-
+-            // 4. Save state after mutations
+-            if let Err(e) = session_state_clone.read().save() {
+-                tracing::error!("Failed to save session state: {}", e);
+-            }
++                                let final_message = {
++                                    let state = session_state.read();
++                                    let session = state.get_active_session().unwrap();
++                                    let builder = PromptBuilder::new();
++                                    builder.build_context_string(session, &settings_clone, &mcp_manager.read()).await
++                                };
+ 
+-            // 5. Get API key, prioritizing settings, then environment variable
+-            let api_key = settings_clone.api_key.clone().unwrap_or_else(|| {
+-                std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
+-            });
++                                if let Err(e) = session_state.read().save() {
++                                    tracing::error!("Failed to save session state: {}", e);
++                                }
+ 
+-            // 6. Start the stream using the manager
+-            let on_complete = move || {
+-                // This closure is now Send-able as it only moves the sender.
+-                let _ = tx.send(());
+-            };
+-            tracing::info!(message_id = %hobbes_message_id, "'send_message' calling 'start_stream'.");
+-            stream_manager_clone.start_stream(
+-                api_key,
+-                settings_clone.chat_model,
+-                hobbes_message_id,
+-                final_message,
+-                on_complete,
+-            );
+-
+-            // 6. Wait for the stream to complete
+-            // This will pause the execution of this task until the on_complete callback is called.
+-            rx.recv().await;
+-            tracing::info!(message_id = %hobbes_message_id, "Stream completion signal RECEIVED.");
+-
+-            // 7. Release the lock
+-            is_sending_clone.set(false);
+-            tracing::info!("Lock RELEASED.");
+-        });
+-    };
++                                let api_key = settings_clone.api_key.clone().unwrap_or_else(|| {
++                                    std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in settings or environment")
++                                });
++
++                                let (tx, mut rx_signal) = mpsc::unbounded_channel::<()>();
++                                let on_complete = move || { let _ = tx.send(()); };
++                                stream_manager.start_stream(
++                                    api_key,
++                                    settings_clone.chat_model,
++                                    hobbes_message_id,
++                                    final_message,
++                                    on_complete,
++                                );
++
++                                rx_signal.recv().await;
++
++                                let message_content = {
++                                    let mut state = session_state.write();
++                                    state.get_active_session_mut()
++                                        .and_then(|s| s.messages.iter_mut().find(|m| m.id == hobbes_message_id))
++                                        .map(|m| m.content.clone())
++                                };
++
++                                if let Some(MessageContent::ToolCall { call }) = message_content.clone() {
++                                    let mcp_manager_clone = mcp_manager.read().clone();
++                                    let mut call_clone = call.clone();
++                                    
++                                    let server_name = call_clone.name.split_once("::").map(|(s, _)| s).unwrap_or_default();
++                                    let result = mcp_manager_clone.use_mcp_tool(server_name, &call_clone.name, call_clone.args.clone()).await;
++                                    let result_value = serde_json::to_value(result).unwrap();
++                                    call_clone.result = Some(result_value.clone());
++                                    call_clone.status = ToolCallStatus::Completed;
++
++                                    if let Some(msg_to_update) = session_state.write().get_active_session_mut().and_then(|s| s.messages.iter_mut().find(|m| m.id == hobbes_message_id)) {
++                                        msg_to_update.content = MessageContent::ToolCall { call: call_clone.clone() };
++                                    }
++                                    
++                                    let builder = PromptBuilder::new();
++                                    let tool_result_context = builder.build_tool_result_context(&call_clone.name, &result_value);
++                                    
++                                    message = Message {
++                                        id: Uuid::new_v4(),
++                                        author: "User".to_string(),
++                                        content: MessageContent::Text { content: tool_result_context },
++                                        visible: false,
++                                    };
++                                    
++                                    continue 'action_loop;
++                                } else {
++                                    break 'action_loop;
++                                }
++                            }
++                            
++                            is_sending.set(false);
++                        }
++                    }
++                }
++            }
++        },
++    );
+ 
+ 
+     let root_classes = "flex flex-col bg-gray-900 text-gray-100 rounded-lg shadow-2xl h-full w-full";
+@@ -293,29 +334,16 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
+                     {
+                         let state = session_state.read();
+                         if let Some(session) = state.sessions.get(&state.active_session_id) {
+-                            let total_messages = session.messages.len();
+-                            let messages_to_render = session.messages.iter().skip(total_messages.saturating_sub(*visible_message_count.read())).collect::<Vec<_>>();
+-
+                             if session.messages.is_empty() {
+                                 rsx! { WelcomeMessage {} }
+                             } else {
+                                 rsx! {
+-                                    if total_messages > *visible_message_count.read() {
+-                                        div {
+-                                            class: "flex justify-center",
+-                                            button {
+-                                                class: "text-sm text-purple-400 hover:text-purple-300 focus:outline-none",
+-                                                onclick: move |_| {
+-                                                    let current_count = *visible_message_count.read();
+-                                                    visible_message_count.set(current_count + INITIAL_MESSAGES_TO_SHOW);
+-                                                },
+-                                                "Load More"
+-                                            }
++                                    for message in session.messages.iter().filter(|m| m.visible) {
++                                        MessageBubble {
++                                            key: "{message.id}",
++                                            message: message.clone()
+                                         }
+                                     }
+-                                    for message in messages_to_render {
+-                                        MessageBubble { key: "{message.id}", message: message.clone() }
+-                                    }
+                                 }
+                             }
+                         } else {
+@@ -394,7 +422,21 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
+                                     on_interaction.call(());
+                                     has_interacted.set(true);
+                                 }
+-                                send_message();
++                                let user_message = draft.read().clone();
++                                if !user_message.is_empty() {
++                                    draft.set("".to_string());
++                                    let _ = document::eval(r#"
++                                        const el = document.getElementById('chat-textarea');
++                                        if (el) { el.style.height = 'auto'; }
++                                    "#);
++                                    let message = Message {
++                                        id: Uuid::new_v4(),
++                                        author: "User".to_string(),
++                                        content: MessageContent::Text { content: user_message },
++                                        visible: true,
++                                    };
++                                    chat_coroutine.send(ChatAction::SendMessage(message));
++                                }
+                             }
+                         },
+                     }
+@@ -402,14 +444,15 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
+                         class: "p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                         onclick: move |_| {
+                             let state = session_state.read();
+-                            let context_string = if let Some(session) = state.sessions.get(&state.active_session_id) {
+-                                let settings = settings.read();
+-                                let builder = PromptBuilder::new(session, &settings);
+-                                builder.build_context_string()
++                            let settings = settings.read().clone();
++                            let mcp_manager = mcp_manager_for_debug.clone();
++                            if let Some(session) = state.sessions.get(&state.active_session_id).cloned() {
++                                spawn(async move {
++                                    let builder = PromptBuilder::new();
++                                    let _context_string = builder.build_context_string(&session, &settings, &mcp_manager.read()).await;
++                                });
+                             } else {
+-                                "[No active session]".to_string()
+-                            };
+-                            tracing::info!("---\n[DEBUG] Current Context:\n{}---", context_string);
++                            }
+                         },
+                         Icon {
+                             width: 20,
+@@ -435,7 +478,21 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
+                                 on_interaction.call(());
+                                 has_interacted.set(true);
+                             }
+-                            send_message()
++                            let user_message = draft.read().clone();
++                            if !user_message.is_empty() {
++                                draft.set("".to_string());
++                                let _ = document::eval(r#"
++                                    const el = document.getElementById('chat-textarea');
++                                    if (el) { el.style.height = 'auto'; }
++                                "#);
++                                let message = Message {
++                                    id: Uuid::new_v4(),
++                                    author: "User".to_string(),
++                                    content: MessageContent::Text { content: user_message },
++                                    visible: true,
++                                };
++                                chat_coroutine.send(ChatAction::SendMessage(message));
++                            }
+                         },
+                         "Send"
+                     }
+@@ -521,30 +578,33 @@ fn CodeBlock(code: String, lang: String) -> Element {
+ #[component]
+ fn MessageBubble(message: Message) -> Element {
+     let stream_manager = consume_context::<StreamManagerContext>();
+-    // This is currently unused after the refactor, but we'll keep it for potential future use.
+-    let _session_state = consume_context::<Signal<crate::session::SessionState>>();
+     let mut content = use_signal(|| message.content.clone());
+     let is_user = message.author == "User";
+     let mut is_hovered = use_signal(|| false);
+     let mut copied = use_signal(|| false);
+ 
+-    // This effect runs once when the component is created.
+-    // If it's a streaming Hobbes message, it takes the stream and updates its local state.
+-    use_effect(move || {
+-        if !is_user && stream_manager.is_streaming(&message.id) {
+-            spawn(async move {
+-                if let Some(mut rx) = stream_manager.take_stream(&message.id) {
+-                    // This component now ONLY updates its local content for display.
+-                    // The StreamManager is responsible for the final state update and save.
+-                    while let Some(chunk) = rx.recv().await {
+-                        content.write().push_str(&chunk);
++    use_effect({
++        let message_id = message.id;
++        let mut content = content.clone();
++        let stream_manager = stream_manager.clone();
++
++        move || {
++            if !is_user {
++                let mut rx = stream_manager.subscribe(message_id);
++                let fut = async move {
++                    while let Some(new_content) = rx.recv().await {
++                        content.set(new_content);
+                     }
+-                }
+-            });
++                };
++                spawn(fut);
++            }
+         }
+     });
+ 
+-    let is_thinking = !is_user && content.read().is_empty();
++    let is_thinking = !is_user && match &*content.read() {
++        MessageContent::Text { content } => content.is_empty(),
++        _ => false,
++    };
+ 
+     let bubble_classes = if is_user {
+         "bg-purple-600 text-white self-end ml-auto"
+@@ -557,84 +617,6 @@ fn MessageBubble(message: Message) -> Element {
+         if is_user { "text-right" } else { "text-left" }
+     );
+ 
+-    let elements = use_memo(move || {
+-        let content_reader = content.read();
+-        let mut options = Options::empty();
+-        options.insert(Options::ENABLE_STRIKETHROUGH);
+-
+-        let parser = Parser::new_ext(&content_reader, options);
+-        
+-        let mut elements: Vec<Element> = Vec::new();
+-        let mut current_events: Vec<Event> = Vec::new();
+-        let mut in_code_block = false;
+-        let mut code_buffer = String::new();
+-        let mut lang = String::new();
+-
+-        let flush_events = |events: &mut Vec<Event>, elements: &mut Vec<Element>| {
+-            if !events.is_empty() {
+-                let mut html_output = String::new();
+-                html::push_html(&mut html_output, events.drain(..));
+-                if !html_output.trim().is_empty() {
+-                    elements.push(rsx! {
+-                        div {
+-                            class: "prose prose-sm dark:prose-invert max-w-none",
+-                            dangerous_inner_html: "{html_output}"
+-                        }
+-                    });
+-                }
+-            }
+-        };
+-
+-        for event in parser {
+-            match event {
+-                Event::Start(Tag::CodeBlock(kind)) => {
+-                    flush_events(&mut current_events, &mut elements);
+-                    in_code_block = true;
+-                    lang = match kind {
+-                        pulldown_cmark::CodeBlockKind::Fenced(l) => l.into_string(),
+-                        _ => String::new(),
+-                    };
+-                }
+-                Event::End(TagEnd::CodeBlock) => {
+-                    in_code_block = false;
+-                    elements.push(rsx! {
+-                        CodeBlock {
+-                            code: code_buffer.clone(),
+-                            lang: lang.clone()
+-                        }
+-                    });
+-                    code_buffer.clear();
+-                    lang.clear();
+-                }
+-                Event::Text(text) => {
+-                    if in_code_block {
+-                        code_buffer.push_str(&text);
+-                    } else {
+-                        current_events.push(Event::Text(text));
+-                    }
+-                }
+-                // Handle newlines inside code blocks, which pulldown-cmark
+-                // sends as SoftBreak or HardBreak events.
+-                Event::SoftBreak | Event::HardBreak => {
+-                    if in_code_block {
+-                        code_buffer.push('\n');
+-                    } else {
+-                        current_events.push(event);
+-                    }
+-                }
+-                e => {
+-                    // For any other event, only process it if we're outside a code block.
+-                    if !in_code_block {
+-                        current_events.push(e);
+-                    }
+-                }
+-            }
+-        }
+-        flush_events(&mut current_events, &mut elements);
+-
+-        elements
+-    });
+-
+     let button_position_classes = if is_user {
+         "absolute bottom-[-10px] left-[-10px]"
+     } else {
+@@ -653,28 +635,134 @@ fn MessageBubble(message: Message) -> Element {
+                     if is_thinking {
+                         ThinkingIndicator {}
+                     } else {
+-                        for el in elements.read().iter() {
+-                            {el}
++                        {
++                            let is_streaming = stream_manager.is_streaming(&message.id);
++                            match content.read().clone() {
++                                MessageContent::Text{ content } => {
++                                    if is_streaming {
++                                        // While streaming, render raw text to avoid parsing incomplete markdown
++                                        rsx! {
++                                            div {
++                                                class: "prose prose-sm dark:prose-invert max-w-none",
++                                                "{content}"
++                                            }
++                                        }
++                                    } else {
++                                        // When not streaming, parse the complete markdown
++                                        let elements = use_memo(move || {
++                                            let mut options = Options::empty();
++                                            options.insert(Options::ENABLE_STRIKETHROUGH);
++        
++                                            let parser = Parser::new_ext(&content, options);
++                                            
++                                            let mut elements: Vec<Element> = Vec::new();
++                                            let mut current_events: Vec<CmarkEvent> = Vec::new();
++                                            let mut in_code_block = false;
++                                            let mut code_buffer = String::new();
++                                            let mut lang = String::new();
++            
++                                            let flush_events = |events: &mut Vec<CmarkEvent>, elements: &mut Vec<Element>| {
++                                                if !events.is_empty() {
++                                                    let mut html_output = String::new();
++                                                    html::push_html(&mut html_output, events.drain(..));
++                                                    if !html_output.trim().is_empty() {
++                                                        elements.push(rsx! {
++                                                            div {
++                                                                class: "prose prose-sm dark:prose-invert max-w-none",
++                                                                dangerous_inner_html: "{html_output}"
++                                                            }
++                                                        });
++                                                    }
++                                                }
++                                            };
++            
++                                            for event in parser {
++                                                match event {
++                                                    CmarkEvent::Start(Tag::CodeBlock(kind)) => {
++                                                        flush_events(&mut current_events, &mut elements);
++                                                        in_code_block = true;
++                                                        lang = match kind {
++                                                            pulldown_cmark::CodeBlockKind::Fenced(l) => l.into_string(),
++                                                            _ => String::new(),
++                                                        };
++                                                    }
++                                                    CmarkEvent::End(TagEnd::CodeBlock) => {
++                                                        in_code_block = false;
++                                                        elements.push(rsx! {
++                                                            CodeBlock {
++                                                                code: code_buffer.clone(),
++                                                                lang: lang.clone()
++                                                            }
++                                                        });
++                                                        code_buffer.clear();
++                                                        lang.clear();
++                                                    }
++                                                    CmarkEvent::Text(text) => {
++                                                        if in_code_block {
++                                                            code_buffer.push_str(&text);
++                                                        } else {
++                                                            current_events.push(CmarkEvent::Text(text));
++                                                        }
++                                                    }
++                                                    CmarkEvent::SoftBreak | CmarkEvent::HardBreak => {
++                                                        if in_code_block {
++                                                            code_buffer.push('\n');
++                                                        } else {
++                                                            current_events.push(event);
++                                                        }
++                                                    }
++                                                    e => {
++                                                        if !in_code_block {
++                                                            current_events.push(e);
++                                                        }
++                                                    }
++                                                }
++                                            }
++                                            flush_events(&mut current_events, &mut elements);
++        
++                                            elements
++                                        });
++                                        rsx!{ for el in elements.read().iter() { {el} } }
++                                    }
++                                },
++                                MessageContent::ToolCall{ call } => rsx! {
++                                    ToolCallDisplay {
++                                        tool_name: call.name.clone(),
++                                        tool_arguments: call.args.clone(),
++                                        status: call.status.clone(),
++                                        result: call.result.clone(),
++                                    }
++                                }
++                            }
+                         }
+                     }
+-                    if *is_hovered.read() && !content.read().is_empty() {
+-                        button {
+-                            class: "{button_position_classes} p-1 rounded-full text-gray-400 bg-gray-900 bg-opacity-75 hover:bg-gray-700 hover:text-white transition-all opacity-0 group-hover:opacity-100",
+-                            onclick: move |_| {
+-                                let content_to_copy = content.read().clone();
+-                                spawn(async move {
+-                                    if copy_to_clipboard(&content_to_copy).is_ok() {
+-                                        copied.set(true);
+-                                        sleep(Duration::from_secs(2)).await;
+-                                        copied.set(false);
++                    if *is_hovered.read() {
++                        if let MessageContent::Text { content: message_text } = &*content.read() {
++                            if !message_text.is_empty() {
++                                {
++                                    let content_for_copy = message_text.clone();
++                                    rsx! {
++                                        button {
++                                            class: "{button_position_classes} p-1 rounded-full text-gray-400 bg-gray-900 bg-opacity-75 hover:bg-gray-700 hover:text-white transition-all opacity-0 group-hover:opacity-100",
++                                            onclick: move |_| {
++                                                let content_to_copy = content_for_copy.clone();
++                                                spawn(async move {
++                                                    if copy_to_clipboard(&content_to_copy).is_ok() {
++                                                        copied.set(true);
++                                                        sleep(Duration::from_secs(2)).await;
++                                                        copied.set(false);
++                                                    }
++                                                });
++                                            },
++                                            if *copied.read() {
++                                                Icon { width: 14, height: 14, icon: fi_icons::FiCheck }
++                                            } else {
++                                                Icon { width: 14, height: 14, icon: fi_icons::FiClipboard }
++                                            }
++                                        }
+                                     }
+-                                });
+-                            },
+-                            if *copied.read() {
+-                                Icon { width: 14, height: 14, icon: fi_icons::FiCheck }
+-                            } else {
+-                                Icon { width: 14, height: 14, icon: fi_icons::FiClipboard }
+-                            }
++                                    }
++                                }
+                         }
+                     }
+                 }
+diff --git a/src/components/mod.rs b/src/components/mod.rs
+index b5bb37a..bb12c66 100644
+--- a/src/components/mod.rs
++++ b/src/components/mod.rs
+@@ -2,4 +2,5 @@ pub mod chat;
+ pub mod session_manager;
+ pub mod llm;
+ pub mod settings_panel;
+-pub mod stream_manager;
+\ No newline at end of file
++pub mod stream_manager;
++pub mod tool_call_display;
+\ No newline at end of file
+diff --git a/src/components/stream_manager.rs b/src/components/stream_manager.rs
+index aa3c002..55b166f 100644
+--- a/src/components/stream_manager.rs
++++ b/src/components/stream_manager.rs
+@@ -24,7 +24,6 @@ impl StreamManagerContext {
+         final_prompt: String,
+         on_complete: impl FnOnce() + Send + 'static,
+     ) {
+-        tracing::info!(message_id = %message_id, "'start_stream' entered.");
+         // Create a channel for the UI to receive chunks.
+         let (ui_tx, ui_rx) = mpsc::unbounded_channel::<String>();
+         
+@@ -33,7 +32,6 @@ impl StreamManagerContext {
+ 
+         // Spawn a master task to manage the LLM call and state updates.
+         spawn(async move {
+-            tracing::info!(message_id = %message_id, "Stream master task SPAWNED.");
+             // Create the channel for the LLM to send chunks to.
+             let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<String>();
+ 
+@@ -45,7 +43,6 @@ impl StreamManagerContext {
+             // This part of the task listens for chunks from the LLM,
+             // forwards them to the UI, and builds the final response.
+             let mut full_response = String::new();
+-            tracing::info!(message_id = %message_id, "Waiting for LLM chunks...");
+             while let Some(chunk) = llm_rx.recv().await {
+                 // Forward the chunk to the UI. If it fails, the UI component
+                 // has probably been dropped, so we can stop.
+@@ -55,17 +52,26 @@ impl StreamManagerContext {
+                 full_response.push_str(&chunk);
+             }
+ 
+-            tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
+             // Stream is complete. Now, write the final content to the session state.
+             // This is the single source of truth for the final state update.
+-            tracing::info!(message_id = %message_id, "Acquiring session state WRITE lock...");
+             let mut state = self.session_state.write();
+-            tracing::info!(message_id = %message_id, "Session state WRITE lock ACQUIRED.");
+             state.touch_active_session();
+             if let Some(session) = state.get_active_session_mut() {
+                 if let Some(message) = session.messages.iter_mut().find(|m| m.id == message_id) {
+-                    message.content = full_response;
+-                    tracing::info!(message_id = %message_id, "Message content updated in state.");
++                    // Attempt to parse the full_response as a tool call
++                    let new_content = if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&full_response) {
++                        if let Some(tool_call_value) = json_value.get("tool_call") {
++                            match serde_json::from_value(tool_call_value.clone()) {
++                                Ok(tool_call) => crate::components::chat::MessageContent::ToolCall { call: tool_call },
++                                Err(_) => crate::components::chat::MessageContent::Text { content: full_response },
++                            }
++                        } else {
++                            crate::components::chat::MessageContent::Text { content: full_response }
++                        }
++                    } else {
++                        crate::components::chat::MessageContent::Text { content: full_response }
++                    };
++                    message.content = new_content;
+                 }
+             }
+             
+@@ -73,12 +79,10 @@ impl StreamManagerContext {
+             if let Err(e) = state.save() {
+                 tracing::error!("Failed to save session state after stream: {}", e);
+             } else {
+-                tracing::info!(message_id = %message_id, "Session state SAVED successfully.");
+             }
+ 
+             // Signal completion.
+             on_complete();
+-            tracing::info!(message_id = %message_id, "Completion signal SENT.");
+         });
+     }
+ 
+diff --git a/src/components/tool_call_display.rs b/src/components/tool_call_display.rs
+new file mode 100644
+index 0000000..5bf1a49
+--- /dev/null
++++ b/src/components/tool_call_display.rs
+@@ -0,0 +1,94 @@
++#![allow(non_snake_case)]
++use dioxus::prelude::*;
++use dioxus_free_icons::{icons::fi_icons::{FiCpu, FiLoader, FiChevronDown, FiChevronRight}, Icon as DioxusIcon};
++use serde_json::Value;
++
++use serde::{Deserialize, Serialize};
++#[derive(PartialEq, Clone, Default, Debug, Serialize, Deserialize)]
++pub enum ToolCallStatus {
++    #[default]
++    InProgress,
++    Completed,
++    Failed,
++}
++
++#[derive(Props, PartialEq, Clone)]
++pub struct ToolCallDisplayProps {
++    pub tool_name: String,
++    pub tool_arguments: Value,
++    #[props(default)]
++    pub status: ToolCallStatus,
++    pub result: Option<Value>,
++}
++
++pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
++    let mut is_open = use_signal(|| false);
++
++    rsx! {
++        div {
++            class: "flex flex-col p-4 my-2 rounded-lg bg-gray-800 text-white border border-gray-700",
++            div {
++                class: "flex items-center gap-3",
++                DioxusIcon {
++                    width: 20,
++                    height: 20,
++                    icon: FiCpu,
++                }
++                span {
++                    class: "font-bold text-lg",
++                    "{props.tool_name}"
++                }
++                div {
++                    class: "flex-grow"
++                }
++                match props.status {
++                    ToolCallStatus::InProgress => rsx!{
++                        DioxusIcon {
++                            width: 20,
++                            height: 20,
++                            class: "animate-spin",
++                            icon: FiLoader,
++                        }
++                    },
++                    _ => rsx!{
++                        button {
++                            class: "p-1 rounded-md hover:bg-gray-700",
++                            onclick: move |_| is_open.toggle(),
++                            if is_open() {
++                                DioxusIcon {
++                                    width: 20,
++                                    height: 20,
++                                    icon: FiChevronDown,
++                                }
++                            } else {
++                                DioxusIcon {
++                                    width: 20,
++                                    height: 20,
++                                    icon: FiChevronRight,
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++            if is_open() {
++                div {
++                    class: "mt-4 p-3 bg-gray-900 rounded",
++                    pre {
++                        code {
++                            class: "text-sm font-mono",
++                            if let Some(result) = &props.result {
++                                "{serde_json::to_string_pretty(result).unwrap_or_default()}"
++                            } else if props.status == ToolCallStatus::Failed {
++                                "Tool execution failed."
++                            }
++                             else {
++                                "No result available."
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/src/context/prompt_builder.rs b/src/context/prompt_builder.rs
+index 2d078c7..e9a4e57 100644
+--- a/src/context/prompt_builder.rs
++++ b/src/context/prompt_builder.rs
+@@ -1,22 +1,39 @@
++use crate::mcp::manager::{McpContext, McpManager, McpServerContext};
+ use crate::session::Session;
+ use crate::settings::Settings;
+-use serde_json::{self};
++use serde_json::{self, json};
++pub struct PromptBuilder;
+ 
+-/// A simple builder to format dynamic context for the LLM prompt.
+-pub struct PromptBuilder<'a> {
+-    session: &'a Session,
+-    settings: &'a Settings,
+-}
+-
+-impl<'a> PromptBuilder<'a> {
+-    pub fn new(session: &'a Session, settings: &'a Settings) -> Self {
+-        Self { session, settings }
++impl PromptBuilder {
++    pub fn new() -> Self {
++        Self {}
+     }
+ 
+     /// Builds a context string from the active session's context.
+-    pub fn build_context_string(&self) -> String {
+-        let mut active_context = self.session.active_context.clone();
+-        active_context.system_persona = Some(self.settings.persona.clone());
++    pub async fn build_context_string(
++        &self,
++        session: &Session,
++        settings: &Settings,
++        mcp_manager: &McpManager,
++    ) -> String {
++        let servers = mcp_manager.servers.lock().await;
++        let mut mcp_servers = Vec::new();
++
++        for (_, server) in servers.iter() {
++            mcp_servers.push(McpServerContext {
++                name: server.config.name.clone(),
++                description: server.config.description.clone(),
++                tools: server.tools.clone(),
++            });
++        }
++
++        let mcp_context = McpContext {
++            servers: mcp_servers,
++        };
++
++        let mut active_context = session.active_context.clone();
++        active_context.system_persona = Some(settings.persona.clone());
++        active_context.mcp_tools = Some(mcp_context);
+ 
+         // Check for user_name directly via the typed struct.
+         let user_name = &active_context.conversation_summary.entities.user_name;
+@@ -31,4 +48,14 @@ impl<'a> PromptBuilder<'a> {
+         let context_json = serde_json::to_string_pretty(&active_context).unwrap_or_default();
+         format!("<SYSTEM_CONTEXT>\n{}\n</SYSTEM_CONTEXT>\n", context_json)
+     }
++    pub fn build_tool_result_context(&self, tool_name: &str, result: &serde_json::Value) -> String {
++        let tool_result = json!({
++            "tool_result": {
++                "tool_name": tool_name,
++                "result": result
++            }
++        });
++        let context_json = serde_json::to_string_pretty(&tool_result).unwrap_or_default();
++        format!("<SYSTEM_CONTEXT>\n{}\n</SYSTEM_CONTEXT>\n", context_json)
++    }
+ }
+\ No newline at end of file
+diff --git a/src/main.rs b/src/main.rs
+index cceaf7f..42158f2 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -19,6 +19,7 @@ mod settings;
+ mod context;
+ mod processing;
+ mod secure_storage;
++mod mcp;
+ use tray::{APP_QUIT, WINDOW_VISIBLE};
+ 
+ static TRAY_INITIALIZED: AtomicBool = AtomicBool::new(false);
+@@ -52,7 +53,7 @@ fn main() {
+ 
+ use crate::session::SessionState;
+ use crate::settings::SettingsManager;
+-use crate::components::stream_manager::StreamManager;
++use crate::{components::stream_manager::StreamManager, mcp::manager::McpManager};
+ use std::path::PathBuf;
+ 
+ fn get_settings_path() -> PathBuf {
+@@ -62,11 +63,26 @@ fn get_settings_path() -> PathBuf {
+         .join("settings.json")
+ }
+ 
++fn get_mcp_config_path() -> PathBuf {
++    dirs::config_dir()
++        .unwrap_or_default()
++        .join("com.hobbes.app")
++        .join("mcp_servers.json")
++}
++
+ fn app() -> Element {
+     let window = use_window();
+     let session_state = use_context_provider(|| Signal::new(SessionState::new()));
+     let settings_manager = use_context_provider(|| Signal::new(SettingsManager::new(get_settings_path())));
+-    let _settings = use_context_provider(|| {
++        let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(get_mcp_config_path())));
++    
++        use_effect(move || {
++            let manager = mcp_manager.read().clone();
++            tokio::spawn(async move {
++                manager.launch_servers().await;
++            });
++        });
++        let _settings = use_context_provider(|| {
+         let mut settings = settings_manager.read().load();
+         if let Ok(api_key) = crate::secure_storage::retrieve_secret("api_key") {
+             settings.api_key = Some(api_key);
+diff --git a/src/mcp/manager.rs b/src/mcp/manager.rs
+new file mode 100644
+index 0000000..fec8128
+--- /dev/null
++++ b/src/mcp/manager.rs
+@@ -0,0 +1,165 @@
++use rmcp::model::{CallToolRequestParam, Tool};
++use rmcp::service::{RoleClient, RunningService, ServiceExt};
++use rmcp::transport::child_process::TokioChildProcess;
++use serde::{Deserialize, Serialize};
++use std::collections::HashMap;
++use std::fs;
++use std::path::PathBuf;
++use std::sync::Arc;
++use tokio::process::Command;
++use tokio::sync::Mutex;
++
++#[derive(Deserialize, Debug, Clone)]
++pub struct McpServerConfig {
++    pub name: String,
++    pub command: String,
++    pub description: String,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
++pub struct McpContext {
++    pub servers: Vec<McpServerContext>,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
++pub struct McpServerContext {
++    pub name: String,
++    pub description: String,
++    pub tools: Vec<Tool>,
++}
++
++pub struct ActiveMcpClient {
++    pub config: McpServerConfig,
++    pub service: RunningService<RoleClient, ()>,
++    pub tools: Vec<Tool>,
++}
++
++#[derive(Clone)]
++pub struct McpManager {
++    configs: Vec<McpServerConfig>,
++    pub servers: Arc<Mutex<HashMap<String, ActiveMcpClient>>>,
++}
++
++impl McpManager {
++    pub fn new(config_path: PathBuf) -> Self {
++        if !config_path.exists() {
++            if let Some(parent) = config_path.parent() {
++                if !parent.exists() {
++                    if let Err(e) = fs::create_dir_all(parent) {
++                        tracing::error!("Failed to create config directory: {}", e);
++                    }
++                }
++            }
++            if let Err(e) = fs::write(&config_path, "[]") {
++                tracing::error!("Failed to write default mcp_servers.json: {}", e);
++            }
++        }
++
++        let configs = match fs::read_to_string(config_path) {
++            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
++                tracing::error!("Failed to parse mcp_servers.json: {}", e);
++                Vec::new()
++            }),
++            Err(e) => {
++                tracing::error!("Failed to read mcp_servers.json: {}", e);
++                Vec::new()
++            }
++        };
++
++        Self {
++            configs,
++            servers: Arc::new(Mutex::new(HashMap::new())),
++        }
++    }
++
++    pub async fn launch_servers(&self) {
++        for server_config in self.configs.iter() {
++            let server_name = server_config.name.clone();
++            tracing::info!("Launching MCP server: {}", server_name);
++            let mut parts = server_config.command.split_whitespace();
++            let program = if let Some(p) = parts.next() {
++                p
++            } else {
++                tracing::error!("Empty command for server: {}", server_name);
++                continue;
++            };
++            let args = parts;
++
++            let mut cmd = Command::new(program);
++            cmd.args(args)
++                .stdin(std::process::Stdio::piped())
++                .stdout(std::process::Stdio::piped())
++                .stderr(std::process::Stdio::piped());
++
++            let servers_map = self.servers.clone();
++            let server_config_clone = server_config.clone();
++
++            tokio::spawn(async move {
++                match TokioChildProcess::new(cmd) {
++                    Ok(transport) => match ().serve(transport).await {
++                        Ok(service) => {
++                            tracing::info!("Connected to MCP server: {}", server_name);
++                            match service.list_tools(Default::default()).await {
++                                Ok(result) => {
++                                    tracing::info!(
++                                        "Discovered capabilities for MCP server: {}",
++                                        server_name
++                                    );
++                                    let active_client = ActiveMcpClient {
++                                        config: server_config_clone,
++                                        service,
++                                        tools: result.tools,
++                                    };
++                                    let mut servers = servers_map.lock().await;
++                                    servers.insert(server_name.clone(), active_client);
++                                }
++                                Err(e) => {
++                                    tracing::error!(
++                                        "Failed to discover capabilities for MCP server '{}': {}",
++                                        server_name,
++                                        e
++                                    );
++                                }
++                            }
++                        }
++                        Err(e) => {
++                            tracing::error!("Failed to connect to MCP server '{}': {}", server_name, e);
++                        }
++                    },
++                    Err(e) => {
++                        tracing::error!("Failed to launch MCP server '{}': {}", server_name, e);
++                    }
++                }
++            });
++        }
++    }
++    pub async fn use_mcp_tool(
++        &self,
++        server_name: &str,
++        tool_name: &str,
++        args: serde_json::Value,
++    ) -> Result<serde_json::Value, String> {
++        let servers = self.servers.lock().await;
++        if let Some(client) = servers.get(server_name) {
++            if let Some(tool) = client.tools.iter().find(|t| t.name == tool_name) {
++                let arguments = if let serde_json::Value::Object(map) = args {
++                    map
++                } else {
++                    return Err("Tool arguments must be a JSON object".to_string());
++                };
++                let request = CallToolRequestParam {
++                    name: tool.name.clone(),
++                    arguments: Some(arguments),
++                };
++                match client.service.call_tool(request).await {
++                    Ok(result) => Ok(serde_json::to_value(result.content).unwrap()),
++                    Err(e) => Err(format!("Failed to use tool: {}", e)),
++                }
++            } else {
++                Err(format!("Tool not found: {}", tool_name))
++            }
++        } else {
++            Err(format!("Server not found: {}", server_name))
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/src/mcp/mod.rs b/src/mcp/mod.rs
+new file mode 100644
+index 0000000..f1de882
+--- /dev/null
++++ b/src/mcp/mod.rs
+@@ -0,0 +1,2 @@
++// This module will contain all MCP-related logic.
++pub mod manager;
+\ No newline at end of file
+diff --git a/src/processing/conversation_processor.rs b/src/processing/conversation_processor.rs
+index 725d0bb..81d5052 100644
+--- a/src/processing/conversation_processor.rs
++++ b/src/processing/conversation_processor.rs
+@@ -28,7 +28,10 @@ impl ConversationProcessor {
+             .rev()
+             .take(5)
+             .rev()
+-            .map(|m| format!("{}: {}", m.author, m.content))
++            .map(|m| format!("{}: {}", m.author, match &m.content {
++                crate::components::chat::MessageContent::Text { content } => content.clone(),
++                crate::components::chat::MessageContent::ToolCall { call } => serde_json::to_string(&call).unwrap_or_default(),
++            }))
+             .collect::<Vec<String>>()
+             .join("\n");
+ 
+diff --git a/src/session.rs b/src/session.rs
+index 3f29947..6652946 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -7,6 +7,7 @@ use uuid;
+ use dirs;
+ 
+ use serde_json::Value;
++use crate::mcp::manager::McpContext;
+ 
+ #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+ pub struct ConversationSummaryEntities {
+@@ -34,6 +35,8 @@ pub struct ActiveContext {
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub user_instruction: Option<String>,
+     pub conversation_summary: ConversationSummary,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub mcp_tools: Option<McpContext>,
+     #[serde(flatten)]
+     pub extra: HashMap<String, Value>,
+ }
+@@ -44,6 +47,7 @@ impl Default for ActiveContext {
+             system_persona: None,
+             user_instruction: None,
+             conversation_summary: ConversationSummary::default(),
++            mcp_tools: None,
+             extra: HashMap::new(),
+         }
+     }

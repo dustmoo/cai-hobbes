@@ -321,6 +321,11 @@ fn app() -> Element {
         let manager = mcp_manager.read().clone();
         let mcp_context_signal = mcp_context.clone();
         let settings_clone = settings.read().clone();
+        
+        // Restore persisted unloaded servers state before launching
+        let persisted_unloaded = ui_state.read().unloaded_mcp_servers.clone();
+        manager.set_initial_unloaded_servers(persisted_unloaded).await;
+        
         manager.launch_servers(mcp_context_signal, settings_clone).await;
     });
 
@@ -619,30 +624,12 @@ fn app() -> Element {
                             components::chat::ChatWindow {
                                 on_content_resize: move |_| {},
                                 on_interaction: move |_| {},
-                                on_toggle_sessions: {
-                                    let window = window.clone();
-                                    move |_| {
-                                        let new_show_state = !*show_session_manager.read();
-                                        show_session_manager.set(new_show_state);
-                                        if new_show_state {
-                                            show_settings_panel.set(false); // Hide settings if showing sessions
-                                            show_mcp_manager.set(false); // Hide MCP manager if showing sessions
-                                        }
-
-                                        // Adjust the window size based on the sidebar's visibility
-                                        let session_state = session_state.clone();
-                                        let sidebar_width = settings_panel_width();
-                                        let _current_size = window.inner_size();
-                                        let persisted_width = session_state.read().window_width;
-                                        let persisted_height = session_state.read().window_height;
-
-                                        let new_width = if new_show_state {
-                                            persisted_width + sidebar_width
-                                        } else {
-                                            persisted_width
-                                        };
-
-                                        window.set_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(new_width, persisted_height as f64));
+                                on_toggle_sessions: move |_| {
+                                    let new_show_state = !*show_session_manager.read();
+                                    show_session_manager.set(new_show_state);
+                                    if new_show_state {
+                                        show_settings_panel.set(false); // Hide settings if showing sessions
+                                        show_mcp_manager.set(false); // Hide MCP manager if showing sessions
                                     }
                                 },
                                 on_toggle_settings: move |_| {
@@ -653,30 +640,12 @@ fn app() -> Element {
                                         show_mcp_manager.set(false); // Hide MCP manager if showing settings
                                     }
                                 },
-                                on_toggle_mcp_manager: {
-                                    let window = window.clone();
-                                    move |_| {
-                                        let new_show_state = !*show_mcp_manager.read();
-                                        show_mcp_manager.set(new_show_state);
-                                        if new_show_state {
-                                            show_session_manager.set(false); // Hide sessions if showing MCP manager
-                                            show_settings_panel.set(false); // Hide settings if showing MCP manager
-                                        }
-
-                                        // Adjust the window size based on the sidebar's visibility
-                                        let session_state = session_state.clone();
-                                        let sidebar_width = settings_panel_width();
-                                        let _current_size = window.inner_size();
-                                        let persisted_width = session_state.read().window_width;
-                                        let persisted_height = session_state.read().window_height;
-
-                                        let new_width = if new_show_state {
-                                            persisted_width + sidebar_width
-                                        } else {
-                                            persisted_width
-                                        };
-
-                                        window.set_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(new_width, persisted_height as f64));
+                                on_toggle_mcp_manager: move |_| {
+                                    let new_show_state = !*show_mcp_manager.read();
+                                    show_mcp_manager.set(new_show_state);
+                                    if new_show_state {
+                                        show_session_manager.set(false); // Hide sessions if showing MCP manager
+                                        show_settings_panel.set(false); // Hide settings if showing MCP manager
                                     }
                                 },
                                 }

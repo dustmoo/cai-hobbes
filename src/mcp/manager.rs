@@ -126,6 +126,15 @@ impl McpManager {
         }
     }
 
+    /// Initialize unloaded servers from persisted state
+    pub async fn set_initial_unloaded_servers(&self, servers: Vec<String>) {
+        let mut unloaded = self.unloaded_servers.lock().await;
+        for server in servers {
+            unloaded.insert(server);
+        }
+        tracing::debug!("Restored {} unloaded servers from persisted state", unloaded.len());
+    }
+
     /// Check if an error message indicates authentication is required
     fn is_auth_error(error_msg: &str) -> bool {
         let lower_msg = error_msg.to_lowercase();

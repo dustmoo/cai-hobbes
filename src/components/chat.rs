@@ -832,10 +832,10 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
             div {
                 class: "{container_classes} w-full",
                 div {
-                    class: "flex flex-col max-w-2/3 min-w-0",
+                    class: "flex flex-col max-w-2/3 min-w-0 group",
                     div {
                         id: "message-bubble-{message.id}",
-                        class: "relative group rounded-2xl {bubble_classes} max-w-full",
+                        class: "relative rounded-2xl {bubble_classes} max-w-full",
                         div {
                             class: "px-4 py-3 text-sm leading-relaxed break-words",
                             if is_thinking {

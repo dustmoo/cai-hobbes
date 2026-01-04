@@ -1,0 +1,78 @@
+   Compiling Hobbes v0.9.0 (/Users/dustmoo/Sites/cai-hobbes)
+error[E0063]: missing fields `execution_id`, `response` and `status` in initializer of `ToolCall`
+   --> src/context/prompt_builder.rs:659:23
+    |
+659 |                 call: crate::components::shared::ToolCall {
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `execution_id`, `response` and `status`
+
+error[E0308]: mismatched types
+   --> src/context/prompt_builder.rs:658:47
+    |
+658 |               content: MessageContent::ToolCall(crate::components::shared::ToolCallRecord {
+    |  ______________________------------------------_^
+    | |                      |
+    | |                      arguments to this enum variant are incorrect
+659 | |                 call: crate::components::shared::ToolCall {
+660 | |                     server_name: "weather_server".to_string(),
+661 | |                     tool_name: "get_weather".to_string(),
+...   |
+668 | |                 },
+669 | |             }),
+    | |_____________^ expected `ToolCall`, found `ToolCallRecord`
+    |
+note: tuple variant defined here
+   --> src/components/shared.rs:10:5
+    |
+ 10 |     ToolCall(ToolCall),
+    |     ^^^^^^^^
+
+error[E0599]: no method named `as_text` found for enum `llm::Part` in the current scope
+   --> src/context/prompt_builder.rs:692:87
+    |
+692 |         let system_instruction = prompt.system_instruction.as_ref().unwrap().parts[0].as_text().unwrap();
+    |                                                                                       ^^^^^^^ method not found in `llm::Part`
+    |
+   ::: src/components/llm.rs:82:1
+    |
+ 82 | pub enum Part {
+    | ------------- method `as_text` not found for this enum
+
+error[E0599]: no method named `as_text` found for enum `llm::Part` in the current scope
+   --> src/context/prompt_builder.rs:698:51
+    |
+698 |         if let Some(text) = last_content.parts[0].as_text() {
+    |                                                   ^^^^^^^ method not found in `llm::Part`
+    |
+   ::: src/components/llm.rs:82:1
+    |
+ 82 | pub enum Part {
+    | ------------- method `as_text` not found for this enum
+
+warning: variable `is_thinking` is assigned to, but never used
+   --> src/components/chat.rs:496:13
+    |
+496 |     let mut is_thinking = false;
+    |             ^^^^^^^^^^^
+    |
+    = note: consider using `_is_thinking` instead
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: value assigned to `is_thinking` is never read
+   --> src/components/chat.rs:501:14
+    |
+501 |              is_thinking = true;
+    |              ^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: unused variable: `button_position_classes`
+   --> src/components/chat.rs:582:13
+    |
+582 |         let button_position_classes = if is_user {
+    |             ^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_button_position_classes`
+
+Some errors have detailed explanations: E0063, E0308, E0599.
+For more information about an error, try `rustc --explain E0063`.
+warning: `Hobbes` (bin "Hobbes" test) generated 3 warnings
+error: could not compile `Hobbes` (bin "Hobbes" test) due to 4 previous errors; 3 warnings emitted

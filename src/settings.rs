@@ -421,12 +421,28 @@ impl SettingsManager {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UiState {
     pub settings_panel_width: f64,
+    /// Whether to show tool call Arguments section by default
+    #[serde(default = "default_true")]
+    pub show_tool_arguments: bool,
+    /// Whether to show tool call Response section by default
+    #[serde(default)]
+    pub show_tool_response: bool,
+    /// Whether to show tool call Thinking Process section by default
+    #[serde(default)]
+    pub show_tool_thought: bool,
+    /// MCP servers that are unloaded (tools hidden from AI)
+    #[serde(default)]
+    pub unloaded_mcp_servers: Vec<String>,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
             settings_panel_width: 256.0,
+            show_tool_arguments: true,
+            show_tool_response: false,
+            show_tool_thought: false,
+            unloaded_mcp_servers: Vec::new(),
         }
     }
 }

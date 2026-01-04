@@ -512,12 +512,14 @@ pub fn McpMarketplace() -> Element {
                 div {
                     class: "flex items-center justify-between mb-2",
                     h2 { class: "text-xl font-bold", "MCP Servers" }
-                    div {
-                        class: "text-xs px-2 py-1 rounded bg-gray-700 text-gray-300",
-                        if is_loading {
-                            "Loading..."
-                        } else {
-                            "Source: {data_source}"
+                    if *active_tab.read() == ActiveTab::Marketplace {
+                        div {
+                            class: "text-xs px-2 py-1 rounded bg-gray-700 text-gray-300",
+                            if is_loading {
+                                "Loading..."
+                            } else {
+                                "Source: {data_source}"
+                            }
                         }
                     }
                 }
@@ -865,6 +867,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
+    let ui_state = use_context::<Signal<crate::settings::UiState>>();
+    let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
     let mut local_settings = use_signal(|| settings.read().clone());
     let mut is_retrying = use_signal(|| false);
     
@@ -989,6 +993,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     let mcp_manager = mcp_manager.clone();
                                     let mcp_context = mcp_context.clone();
                                     let refresh_trigger = refresh_trigger.clone();
+                                    let ui_state = ui_state.clone();
+                                    let ui_state_manager = ui_state_manager.clone();
                                     rsx! {
                                         button {
                                             class: if current_is_loaded {
@@ -1001,6 +1007,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                 let mcp_manager = mcp_manager.clone();
                                                 let mut mcp_context = mcp_context.clone();
                                                 let mut refresh_trigger = refresh_trigger.clone();
+                                                let mut ui_state = ui_state.clone();
+                                                let ui_state_manager = ui_state_manager.clone();
                                                 let should_load = !current_is_loaded;
                                                 spawn(async move {
                                                     if should_load {
@@ -1008,6 +1016,24 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                     } else {
                                                         mcp_manager.read().unload_server(&server_name).await;
                                                     }
+                                                    
+                                                    // Persist unloaded state to UiState
+                                                    {
+                                                        let mut state = ui_state.write();
+                                                        if should_load {
+                                                            state.unloaded_mcp_servers.retain(|s| s != &server_name);
+                                                        } else {
+                                                            if !state.unloaded_mcp_servers.contains(&server_name) {
+                                                                state.unloaded_mcp_servers.push(server_name.clone());
+                                                            }
+                                                        }
+                                                        // Save to disk
+                                                        let uism = ui_state_manager.read();
+                                                        if let Err(e) = uism.save(&state) {
+                                                            tracing::error!("Failed to save UI state after load/unload toggle: {}", e);
+                                                        }
+                                                    }
+                                                    
                                                     // Update mcp_context with filtered tools
                                                     let new_context = mcp_manager.read().get_mcp_context().await;
                                                     mcp_context.set(new_context);
