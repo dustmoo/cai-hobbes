@@ -22,12 +22,24 @@ I started playing around with Google Gemini Pro 2.5 last year and was amazed at 
 
 ---
 
-## Key Features
+## Hobbes Features
 
 - **Local-First:** All user data, including chat history and context, is stored locally and securely on the user's machine.
-- **Clear Memory Separation:** The system maintains a clear distinction between long-term strategic memory (managed by external MCPs) and short-term, session-specific active context (managed internally).
+- **Clear Memory Separation:** The system maintains a clear distinction between long-term strategic memory and short-term, session-specific active context.
+    - **Strategic Memory:** Hobbes creates a local semantic graph. I personally use [ConPort (Context Portal)](https://github.com/GreatScottyMac/context-portal) from the Roo Code community for task-specific memory, combined with [Zep's Graphiti](https://github.com/getzep/graphiti) for long-term knowledge graphs.
+- **Native Composio Integration:** Features a custom, native integration with [Composio](https://composio.dev/), allowing for OAuth-based connection to hundreds of external tools (GitHub, Slack, Maps, etc.) without exposing your keys to a third-party wrapper.
+    - *See the in-app onboarding for setup instructions.*
 - **Advanced Reasoning Engine:** Built-in support for Gemini 2.5/3.0 "Thinking" models, with robust thought signature persistence ("The Baton Pattern") and automatic error correction for tool hallucinations.
 - **Reactive State Management:** Internal, short-term context is managed via Dioxus Signals, allowing for efficient, declarative updates to the UI.
+
+### For Power Users: A "Safe" Agent
+
+Hobbes is designed for enthusiasts who want to learn AI at all levels. It is **not** trying to compete directly with ChatGPT, Claude, or Gemini's web interfaces. Instead, it offers a **"Safe" Agent experience**:
+- **You control the prompt lifecycle:** See exactly what system prompt is sent.
+- **You control the tools:** Tools run locally or via direct API connections you approve.
+- **You own the data:** No chat history is sent to a cloud SaaS database (other than the LLM provider for inference).
+
+Clearmirror.ai is about teaching the humans. I hope Hobbes helps you understand the *composition* of modern AI agents.
 
 ## Getting Started
 
