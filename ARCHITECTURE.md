@@ -40,16 +40,21 @@ graph TD
             J -- "Generates Summary" --> I2["Summary LLM (e.g., Gemini Flash)"];
 
             subgraph "Tool Call Feedback Loop"
-                I -- "Responds with Full Stream" --> K[StreamManager];
+                I -- "Responds with Stream (Thinking + Tool Calls)" --> K[StreamManager];
+                K -- "Captures thought_signature" --> K;
                 K -- "Executes Tool(s) via" --> L;
                 L -- "Returns Result(s)" --> K;
                 K -- "Sends Buffered Text to UI" --> G;
-                K -- "Updates Message State" --> F;
+                K -- "Updates Message State (Atomically)" --> F;
                 K -- "Sends Activity Signal" --> SS;
                 K -- "Stores (Call, Result) pairs in" --> TCH[ToolCallHistory];
                 K -- "Builds new prompt via" --> H;
+                H -- "Re-inverts Turn (Thinking + FunctionCall Parts)" --> H;
                 H -- "Gets context & history from" --> F;
                 K -- "Sends feedback to" --> I;
+
+                I -- "Error: UNEXPECTED_TOOL_CALL" --> I;
+                I -- "Retries with Tool List Guidance" --> I;
 
                 I -- "Responds with Final Text" --> K;
                 K -- "Triggers at end of turn" --> TCS[ToolCallSummarizer];
@@ -158,21 +163,27 @@ sequenceDiagram
 
     loop Tool Call & Feedback Loop
         StreamManager->>LlmConnector: Send prompt
-        LlmConnector-->>StreamManager: Respond with Full Stream (Text + Tool Calls)
-        StreamManager->>StreamManager: Buffer Text & Collect Tool Calls
+        LlmConnector-->>StreamManager: Stream (Thinking Text + Tool Calls + thought_signature)
+        StreamManager->>StreamManager: Buffer Text, Capture thought_signature
+        
+        alt Error: UNEXPECTED_TOOL_CALL
+            LlmConnector->>LlmConnector: Inject available tool list into retry
+            LlmConnector-->>StreamManager: Corrected response
+        end
         
         par Concurrent Tool Execution
-            StreamManager->>McpManager: Execute tool 1
+            StreamManager->>McpManager: Execute tool 1 (with signature)
             McpManager-->>StreamManager: Return result 1
         and
-            StreamManager->>McpManager: Execute tool 2
+            StreamManager->>McpManager: Execute tool 2 (propagated signature)
             McpManager-->>StreamManager: Return result 2
         end
         
         StreamManager->>StreamManager: Collect all tool results
-        StreamManager->>SessionState: Store all (call, result) pairs in ToolCallHistory
+        StreamManager->>SessionState: Store all (call, result, signature) in ToolCallHistory
         
         StreamManager->>PromptBuilder: Build feedback prompt
+        PromptBuilder->>PromptBuilder: Re-invert: Split unified bubble into Thinking + FunctionCall Parts
         PromptBuilder->>SessionState: Get context & updated ToolCallHistory
         
         note right of StreamManager: The loop continues if the LLM responds with another tool call.
