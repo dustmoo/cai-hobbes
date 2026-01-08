@@ -183,6 +183,21 @@ I built Hobbes to help my AI expertise, and it has been fruitful for that. I am 
 
 I designed Hobbes to be quick, private, and secure. I hope you like it.
 
+## FAQ
+
+### Did you "Vibe Code" this?
+Depends on what you mean. If you mean "Did I use AI to code this?", absolutely. Here was my toolkit:
+- **VS Code**
+- **Roo Code**
+- **Roo Flow + Conport**
+- **Gemini + Claude models** (Mainly because I paid for enterprise models for privacy)
+
+### Did you review the code?
+Yes. I picked Rust precisely because I didn't know it. I knew TypeScript (but clearly was rusty when I tried to interview and forgot a simple `=>` map pattern, those poor interviewees haha). I wanted to lean on AI but not have to learn from scratch, so I used **Dioxus 0.6** (React patterns in Rust) and **Tailwind**. AI is so well-trained on this stack that it's literally killing their training business. Full disclosure: I already knew Tailwind and you can see that I didn't modify it much (mainly because I want to pay for Pro rather than layer in another UX framework—I gotcha [Tailwind UI](https://tailwindui.com/)).
+
+### Will there be a Free Version of Hobbes?
+You're looking at it. For now, I'm grappling with the ethical implications of using LLMs trained on humanity's work on the internet to build my product, combined with the fact that I *paid* enterprise models (Google, AWS) to build this code. On one hand, I don't think it should always be free. I have code ready to start on a "Pro" build of Hobbes, but most of this stuff is still new. Composio has competitors for "MCP OAUTH BRIDGE". I fully expect this stack to change a lot this year. Time will tell, but for now, I'm recouping costs via the App Store and my Pro build. Since this is a combination of my experience AND the collective experience included in Google's and other LLM trainers' datasets, I'm releasing under MIT. Enjoy and please contribute if you like what we are doing here.
+
 — @dustmoo
 
 ## Contributing
