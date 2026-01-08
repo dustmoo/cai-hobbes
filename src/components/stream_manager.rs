@@ -160,12 +160,12 @@ impl StreamManagerContext {
                     StreamMessage::ToolCall(mut tool_call) => {
                         // Attach any accumulated thinking summary to this tool call
                         if tool_call.thought_summary.is_none() && thought_summary_for_this_turn.is_some() {
-                            tool_call.thought_summary = thought_summary_for_this_turn.take();
+                            tool_call.thought_summary = thought_summary_for_this_turn.clone();
                         }
                         
                         // Also propagate the thought signature if it was received in a previous Text part of this turn
                         if tool_call.thought_signature.is_none() && thought_signature_for_this_turn.is_some() {
-                            tool_call.thought_signature = thought_signature_for_this_turn.take();
+                            tool_call.thought_signature = thought_signature_for_this_turn.clone();
                         }
                         
                         tool_call_count += 1;
