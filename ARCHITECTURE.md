@@ -204,3 +204,10 @@ sequenceDiagram
         LlmConnector-->>ConversationProcessor: Return new summary
         ConversationProcessor->>SessionState: Updates dialogue summary
     end
+```
+
+## External References
+
+- [Composio MCP Documentation](https://docs.composio.dev/docs/welcome)
+- [Composio MCP Server Dynamic Creation API](https://docs.composio.dev/rest-api/mcp/get-mcp-servers)
+- **Composio Connection Endpoint Pattern:** `https://backend.composio.dev/v3/mcp/SERVERID/mcp?user_id=IDFROMHOBBESNOTCOMPOSIO`
