@@ -24,6 +24,8 @@ use super::message_list::MessageList;
 use crate::context::permissions::PermissionManager;
 use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRenderer};
 use super::confirm_delete_modal::ConfirmDeleteModal;
+use super::quick_fix::QuickFix;
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SelectionData {
@@ -240,26 +242,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     });
 
 
-    // Effect to restore cursor position after re-renders
-    use_effect(move || {
-        // Read the draft to create a dependency on it
-        let _ = draft.read();
 
-        spawn(async move {
-            // A minimal delay to allow Dioxus to commit the new value to the DOM
-            sleep(Duration::from_millis(1)).await;
-            let _ = document::eval(r#"
-                const el = document.getElementById('chat-textarea');
-                // Check for the global cursor variable and that the element is focused
-                // to avoid moving cursor on background updates.
-                if (el && window.dioxusCursorPos && document.activeElement === el) {
-                    el.setSelectionRange(window.dioxusCursorPos[0], window.dioxusCursorPos[1]);
-                    // Clean up the global variable to prevent stale positions
-                    delete window.dioxusCursorPos;
-                }
-            "#).await;
-        });
-    });
 
     // Reusable closure for sending a message
     let send_prompt_to_llm = {
@@ -698,6 +681,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
     let settings = consume_context::<Signal<Settings>>();
     let stream_manager = consume_context::<StreamManagerContext>();
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let mut chat_input_draft = consume_context::<Signal<String>>();
     
     let _is_thinking = false;
     let mut thought_signature: Option<String> = None;
@@ -871,6 +855,32 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                             if let Err(e) = state.save() {
                                                 tracing::error!("Failed to save after deleting comment: {}", e);
                                             }
+                                        }
+                                    }
+                                }
+
+                                if content().starts_with("[Hobbes encountered a persistent error") {
+                                    QuickFix {
+                                        suggestions: vec![
+                                            "Pardon, reloaded clickup tools please try again.".to_string(),
+                                            "Please try that again.".to_string(),
+                                        ],
+                                        on_select: move |suggestion: String| {
+                                            chat_input_draft.set(suggestion);
+                                            spawn(async move {
+                                                let _ = document::eval(r#"
+                                                    const el = document.getElementById('chat-textarea');
+                                                    if (el) {
+                                                        el.focus();
+                                                        // Don't dispatch input event as it might race with the value update
+                                                        // Just handle the resize explicitly
+                                                        requestAnimationFrame(() => {
+                                                            el.style.height = 'auto';
+                                                            el.style.height = (el.scrollHeight) + 'px';
+                                                        });
+                                                    }
+                                                "#);
+                                            });
                                         }
                                     }
                                 }

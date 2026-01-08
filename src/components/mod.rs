@@ -20,3 +20,4 @@ pub mod continuation_controller;
 pub mod confirm_delete_modal;
 pub mod confirm_save_modal;
 pub mod hotkey_recorder;
+pub mod quick_fix;

@@ -383,14 +383,16 @@ pub fn ChatInput(
                     value: "{draft}",
                     oninput: move |event| {
                         scheduler.send(SchedulerSignal::Activity);
+                        
+                        // Auto-resize logic
                         let _ = document::eval(r#"
                             const el = document.getElementById('chat-textarea');
                             if (el) {
-                                window.dioxusCursorPos = [el.selectionStart, el.selectionEnd];
                                 el.style.height = 'auto';
                                 el.style.height = (el.scrollHeight) + 'px';
                             }
                         "#);
+                        
                         draft.set(event.value());
                     },
                     onkeydown: move |event| {

@@ -1098,13 +1098,13 @@ mod tests {
         let mut received_error_guidance = false;
         while let Some(msg) = rx.recv().await {
             if let StreamMessage::Text { content, .. } = msg {
-                if content.contains("Tool Connection Issue") && content.contains("MCP server running") {
+                if content.contains("[Hobbes encountered a persistent error") && content.contains("UNEXPECTED_TOOL_CALL") {
                     received_error_guidance = true;
                 }
             }
         }
 
-        assert!(received_error_guidance, "Should receive user-friendly error guidance for UNEXPECTED_TOOL_CALL");
+        assert!(received_error_guidance, "Should receive persistent error message for UNEXPECTED_TOOL_CALL");
     }
 
     #[tokio::test]
