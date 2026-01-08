@@ -163,9 +163,24 @@ impl StreamManagerContext {
                             tool_call.thought_summary = thought_summary_for_this_turn.clone();
                         }
                         
-                        // Also propagate the thought signature if it was received in a previous Text part of this turn
-                        if tool_call.thought_signature.is_none() && thought_signature_for_this_turn.is_some() {
+                        // Thought Signature Handling (per Gemini API requirements):
+                        // 1. If this tool call HAS a signature, capture it for subsequent calls
+                        // 2. If this tool call LACKS a signature, use the captured one from earlier in this turn
+                        // Gemini only sends thought_signature with the FIRST functionCall in parallel batches.
+                        if tool_call.thought_signature.is_some() {
+                            // Capture signature from this tool call for potential reuse
+                            if thought_signature_for_this_turn.is_none() {
+                                thought_signature_for_this_turn = tool_call.thought_signature.clone();
+                                tracing::info!("Captured thought_signature from tool call '{}': '{}'", 
+                                    tool_call.tool_name,
+                                    tool_call.thought_signature.as_ref().map(|s| if s.len() > 30 { &s[..30] } else { s }).unwrap_or("None"));
+                            }
+                        } else if thought_signature_for_this_turn.is_some() {
+                            // Propagate captured signature to this tool call
                             tool_call.thought_signature = thought_signature_for_this_turn.clone();
+                            tracing::info!("Propagated thought_signature to tool call '{}' from earlier in turn", tool_call.tool_name);
+                        } else {
+                            tracing::warn!("Tool call '{}' has NO thought_signature and none available to propagate!", tool_call.tool_name);
                         }
                         
                         tool_call_count += 1;
