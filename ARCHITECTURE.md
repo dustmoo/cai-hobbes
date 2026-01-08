@@ -86,9 +86,11 @@ graph TD
 -   **`StreamManager`**: The central orchestrator for the entire LLM interaction. It implements an **Atomic Execution Model** for tool calls:
     1.  It receives the *entire* raw stream from the `LlmConnector`.
     2.  It buffers all text chunks and collects all tool call requests.
-    3.  If tool calls are present, it executes them via the `McpManager` and waits for their completion.
-    4.  Only after the tools have finished does it send the buffered text to the UI, ensuring that the AI's conversational response does not appear before the action is complete.
-    5.  It is also responsible for managing the feedback loop, sending tool results back to the LLM in a subsequent turn.
+    3.  **Atomic State Sync:** It implements a "Two-Phase Flush" strategy. It updates the UI stream immediately for responsiveness (populating the bubble) but performs a synchronized, atomic update to the main `SessionState` for metadata (thought signatures, summaries) to prevent "disappearing bubbles" during state transitions.
+    4.  If tool calls are present, it executes them via the `McpManager` and waits for their completion.
+    5.  Only after the tools have finished does it send the buffered text to the UI, ensuring that the AI's conversational response does not appear before the action is complete.
+    6.  It is also responsible for managing the feedback loop, sending tool results back to the LLM in a subsequent turn.
+    7.  **Dynamic Message Upgrading:** It handles the complex UI state transitions for "Thinking" models. Initially, a message might appear as "Thinking...", then dynamically upgrade to "Calling Tool X...", and finally display the LLM's full response. This involves managing multiple `MessagePart` types within a single UI bubble.
 -   **`SummarizationScheduler`**: A background coroutine that automatically triggers **conversation dialogue** summarization. It listens for user activity (e.g., typing, receiving a message) and, after a period of inactivity (e.g., 5 seconds), it invokes the `ConversationProcessor` to update the short-term memory. This ensures the conversational context is always fresh without interrupting the user.
 -   **`ConversationProcessor`**: An internal service responsible for generating a stateful, iterative summary of the conversation. It is triggered by the `SummarizationScheduler` and takes the last few messages and the *previous* summary, using a fast LLM (e.g., Gemini Flash) to refine and update the `active_context`.
 -   **`ToolCallSummarizer`**: A dedicated service triggered by the `StreamManager` when a conversational turn concludes. It reads the `tool_call_history`, generates a concise "snapshot" for each **tool interaction**, writes these snapshots to the main `active_context` in `SessionState`, and then clears the `tool_call_history`. This is distinct from the dialogue summary.
@@ -96,13 +98,22 @@ graph TD
 -   **`SmitheryClient`**: A dedicated client for interacting with the Smithery Registry API. It handles fetching and searching for MCP servers, including authentication and pagination.
 -   **`SecretManager`**: A centralized service for managing secure credentials (API keys). It interfaces with the macOS Keychain (via `security-framework`) and implements **Biometric Authentication (Touch ID)**. It uses `LAContext` to manage authentication sessions, reducing password prompts while maintaining high security.
 
-### 3. Native UI Components
+### 3. Robustness & Recovery
+
+Hobbes implements several advanced patterns to ensure stability with "Thinking" models and massive tool contexts:
+
+- **History-Grounded Error Correction:** When the LLM hallucinates a tool name (resulting in `UNEXPECTED_TOOL_CALL`), the `LlmConnector` doesn't just fail. It catches the error, inspects the active `McpManager`, generates a list of *valid* available tools, and re-prompts the model with this grounded context in a "System Note". This turns a crash into a learning moment for the model.
+- **Thought Signature Persistence ("The Baton"):** Gemini Thinking models require a cryptographic `thought_signature` to be passed between turns to maintain the reasoning chain. Hobbes treats this as a "Baton" that must be captured from the model's output and strictly returned in the exact history position.
+    - **Parallel Call handling:** For parallel tool calls where only the first call receives a signature, Hobbes explicitly **captures** and **propagates** the signature to all subsequent calls in the turn, preventing API Error 400.
+- **Turn Re-Inversion:** While the UI unifies "Thinking" and "Tool Use" into a single bubble for user clarity (see Dynamic Message Upgrading), the `PromptBuilder` intelligently "re-inverts" this into separate protocol parts (Thinking Part + Function Call Part) when communicating with the API, satisfying strict structural requirements.
+
+### 4. Native UI Components
 
 -   **Native Menu (`menu.rs`):** To ensure standard hotkeys (e.g., Copy, Paste, Quit) work as expected, the application initializes a native OS menu bar at startup. This is built using the `muda` crate and configured in `main.rs`.
 -   **System Tray Icon (`tray.rs`):** The application features a system tray icon that allows the user to toggle the main window's visibility. The icon's presence is reactive and can be enabled or disabled in real-time from the settings panel.
 -   **Dynamic App Icons:** The application correctly bundles macOS `.icns` files and handles Dioxus 0.6 bundle metadata requirements to ensure the correct app icon appears in the Dock and About screens.
 
-### 4. Multimodal Input Flow
+### 5. Multimodal Input Flow
 
 -   **`ChatInput` Component:** This component is enhanced with drag-and-drop event handlers (`ondragover`, `ondragleave`, `ondrop`) and a file picker button. It manages a list of pending attachments, displaying previews and allowing users to remove them before sending.
 -   **`Attachment` Data Structure:** A new `Attachment` struct in `packages/hobbes_core/src/models.rs` supports extensible file attachments. It contains `file_name`, `mime_type`, and `data` (a base64 data URI). The `Message` struct is modified to include a `Vec<Attachment>`.

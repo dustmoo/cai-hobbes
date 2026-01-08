@@ -26,6 +26,7 @@ I started playing around with Google Gemini Pro 2.5 last year and was amazed at 
 
 - **Local-First:** All user data, including chat history and context, is stored locally and securely on the user's machine.
 - **Clear Memory Separation:** The system maintains a clear distinction between long-term strategic memory (managed by external MCPs) and short-term, session-specific active context (managed internally).
+- **Advanced Reasoning Engine:** Built-in support for Gemini 2.5/3.0 "Thinking" models, with robust thought signature persistence ("The Baton Pattern") and automatic error correction for tool hallucinations.
 - **Reactive State Management:** Internal, short-term context is managed via Dioxus Signals, allowing for efficient, declarative updates to the UI.
 
 ## Getting Started
