@@ -14,8 +14,22 @@ const INITIAL_MESSAGES_TO_SHOW: usize = 20;
 #[component]
 pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signal<bool>, on_delete: EventHandler<Uuid>, on_comment: EventHandler<()>) -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
     let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     let _ = stream_update_trigger.read();
+
+    use_effect(move || {
+        if let Some(cmd) = chat_command.read().clone() {
+            if matches!(cmd, crate::components::chat_input::ChatCommand::ScrollToBottom) {
+                 spawn(async move {
+                    let _ = document::eval(r#"
+                        const el = document.getElementById('message-list');
+                        if (el) { el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }); }
+                    "#).await;
+                 });
+            }
+        }
+    });
 
     rsx! {
         div {
@@ -114,10 +128,10 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                                 }
                                 for message in messages_to_render {
                                     match &message.content {
-                                        MessageContent::Text { content: text, .. } => {
+                                        MessageContent::Text { content: text, thought_signature, thought_summary } => {
                                             let stream_manager = consume_context::<crate::components::stream_manager::StreamManagerContext>();
                                             let is_generating = stream_manager.is_generating(&message.id);
-                                            let should_render = !text.is_empty() || is_generating || !message.attachments.is_empty();
+                                            let should_render = !text.is_empty() || is_generating || !message.attachments.is_empty() || thought_summary.is_some() || thought_signature.is_some();
 
                                             if should_render {
                                                 rsx! {

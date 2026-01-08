@@ -1,17 +1,23 @@
 use dioxus::prelude::*;
+use dioxus_free_icons::{Icon, icons::fi_icons};
 use rfd;
-use crate::settings::{Settings, SettingsManager};
+use crate::settings::{Settings, SettingsManager, is_sandboxed};
 use crate::{context::permissions::ToolCategory, session::SessionState};
 use crate::mcp::composio_client::validate_composio_api_key;
 use std::io::Write;
 use crate::components::conflict_modal::ConflictModal;
 use crate::components::confirm_save_modal::ConfirmSaveModal;
 use zip::write::{FileOptions, ZipWriter};
+use crate::components::hotkey_recorder::HotkeyRecorder;
 
 #[component]
 pub fn SettingsPanel() -> Element {
+    let app_name = crate::settings::get_app_name();
+    let app_version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let mut settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
+    let mut ui_state = use_context::<Signal<crate::settings::UiState>>();
+    let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
     let mut session_state = use_context::<Signal<SessionState>>();
     let _permission_manager = use_context::<Signal<crate::context::permissions::PermissionManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
@@ -73,21 +79,48 @@ pub fn SettingsPanel() -> Element {
         }
     });
 
-    let mut llm_config_collapsed = use_signal(|| false);
     let mut app_behavior_collapsed = use_signal(|| false);
     let mut data_management_collapsed = use_signal(|| false);
     let mut permissions_collapsed = use_signal(|| false);
     let mut show_conflict_modal = use_signal(|| false);
     let mut show_confirm_save_modal = use_signal(|| false);
     let mut conflicting_sessions = use_signal(|| Vec::<(String, crate::session::Session)>::new());
+    
+    // UI Persistence Helpers
+    let toggle_llm_collapsed = move |_| {
+        {
+            let mut state = ui_state.write();
+            state.llm_config_collapsed = !state.llm_config_collapsed;
+        }
+        let state = (*ui_state.read()).clone();
+        let manager = (*ui_state_manager.read()).clone();
+        spawn(async move {
+             let _ = manager.save(&state);
+        });
+    };
+
+    let toggle_mcp_instructions_collapsed = move |_| {
+        {
+            let mut state = ui_state.write();
+            state.mcp_instructions_collapsed = !state.mcp_instructions_collapsed;
+        }
+        let state = (*ui_state.read()).clone();
+        let manager = (*ui_state_manager.read()).clone();
+        spawn(async move {
+             let _ = manager.save(&state);
+        });
+    };
+
+    // Keychain mode switch confirmation
+    let mut show_keychain_mode_confirm = use_signal(|| false);
+    let mut pending_keychain_mode = use_signal(|| None::<crate::settings::KeychainStorageMode>);
+
+    // Composio URL warning
+    let mut composio_url_warning = use_signal(|| Option::<String>::None);
 
     rsx! {
         div {
-            class: "flex flex-col h-full p-4 bg-dark-bg text-white",
-            h2 {
-                class: "text-lg font-bold mb-4",
-                "Settings"
-            }
+            class: "flex h-full bg-dark-bg text-white",
             if show_conflict_modal() {
                 if let Some((id, _)) = conflicting_sessions.read().first() {
                     ConflictModal {
@@ -112,6 +145,65 @@ pub fn SettingsPanel() -> Element {
                                 if let Err(e) = session_state.write().save() {
                                     tracing::error!("Failed to save session state after conflict resolution: {}", e);
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+            // Keychain mode switch confirmation modal
+            if show_keychain_mode_confirm() {
+                div {
+                    class: "fixed inset-0 bg-black/70 flex items-center justify-center z-50",
+                    onclick: move |_| show_keychain_mode_confirm.set(false),
+                    div {
+                        class: "bg-dark-section border border-primary-700 rounded-lg p-6 max-w-md mx-4",
+                        onclick: move |e| e.stop_propagation(),
+                        h3 { class: "text-lg font-bold text-white mb-3", "⚠️ Change API Key Storage?" }
+                        p { class: "text-gray-300 mb-4",
+                            "Switching storage modes will "
+                            strong { class: "text-red-400", "clear all your saved API keys" }
+                            ". You'll need to re-enter them after switching."
+                        }
+                        p { class: "text-sm text-gray-400 mb-4",
+                            if pending_keychain_mode.read().as_ref() == Some(&crate::settings::KeychainStorageMode::Biometric) {
+                                "Biometric mode stores keys on this device only, protected by Touch ID/passcode."
+                            } else {
+                                "iCloud Sync mode stores keys in your iCloud Keychain, accessible across all your devices."
+                            }
+                        }
+                        div { class: "flex gap-3 justify-end",
+                            button {
+                                class: "px-4 py-2 rounded-md text-gray-400 hover:text-white",
+                                onclick: move |_| {
+                                    pending_keychain_mode.set(None);
+                                    show_keychain_mode_confirm.set(false);
+                                },
+                                "Cancel"
+                            }
+                            button {
+                                class: "px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-md font-semibold",
+                                onclick: move |_| {
+                                    if let Some(new_mode) = pending_keychain_mode.read().clone() {
+                                        // Clear all keychain secrets
+                                        let deleted = secret_manager.write().delete_all();
+                                        tracing::info!("Cleared {} keychain items for mode switch", deleted.len());
+                                        
+                                        // Clear API keys from local settings
+                                        {
+                                            let mut ls = local_settings.write();
+                                            ls.gemini_config.api_key = None;
+                                            ls.smithery_api_key = None;
+                                            for profile in ls.composio_profiles.iter_mut() {
+                                                profile.api_key = None;
+                                            }
+                                            // Set the new mode
+                                            ls.keychain_storage_mode = new_mode;
+                                        }
+                                    }
+                                    pending_keychain_mode.set(None);
+                                    show_keychain_mode_confirm.set(false);
+                                },
+                                "Clear Keys & Switch"
                             }
                         }
                     }
@@ -170,6 +262,10 @@ pub fn SettingsPanel() -> Element {
                         // Strategy: We can't easily call `settings_manager.save` in background without cloning it. 
                         // Let's assume for now we keep `settings_manager.save` on main thread (file IO is fast-ish) 
                         // BUT definitely move Keychain IO (Composio/Smithery keys) to background.
+
+                        // Critical: Update the global settings signal so the app (menus, hotkeys) reacts immediately
+                        *global_settings = settings_to_save.clone();
+                        has_unsaved_changes.set(false);
                         
                         let mut secret_updates = Vec::new();
                         if let Some(k) = gemini_key_opt { secret_updates.push(("api_key".to_string(), k)); }
@@ -203,17 +299,35 @@ pub fn SettingsPanel() -> Element {
                             tracing::debug!("Total validated secret updates: {}", final_secret_updates.len());
 
                             // Run Keychain operations in blocking task
+                            // Capture the storage mode preference, BUT override for Pro builds
+                            // Pro builds (no provisioning profile) can't use Biometric keychain access groups
+                            let effective_mode = if crate::settings::is_sandboxed() {
+                                settings_to_save.keychain_storage_mode.clone()
+                            } else {
+                                // Pro/Developer ID: always use LocalKeychain
+                                crate::settings::KeychainStorageMode::LocalKeychain
+                            };
+                            let use_biometric = effective_mode == crate::settings::KeychainStorageMode::Biometric;
+                            
                             let results = tokio::task::spawn_blocking(move || {
                                 let mut saved = Vec::new();
                                 for (key_name, key_value) in final_secret_updates {
-                                    let save_result = crate::keychain_ffi::set_generic_password_with_biometric_protection(&key_name, &key_value)
-                                        .or_else(|e| {
-                                            if let crate::keychain_ffi::KeychainError::SecurityError(-34018) = e {
-                                                crate::keychain_ffi::set_generic_password(&key_name, &key_value)
-                                            } else {
-                                                Err(e)
-                                            }
-                                        });
+                                    let save_result = if use_biometric {
+                                        // Biometric mode: device-only, Touch ID protected
+                                        crate::keychain_ffi::set_generic_password_with_biometric_protection(&key_name, &key_value)
+                                            .or_else(|e| {
+                                                if let crate::keychain_ffi::KeychainError::SecurityError(-34018) = e {
+                                                    // Fall back to regular save if entitlements missing
+                                                    crate::keychain_ffi::set_generic_password(&key_name, &key_value)
+                                                } else {
+                                                    Err(e)
+                                                }
+                                            })
+                                    } else {
+                                        // iCloud sync mode: syncs across devices, no biometric
+                                        crate::keychain_ffi::set_generic_password(&key_name, &key_value)
+                                    };
+                                    
                                     if let Err(e) = save_result {
                                         tracing::error!("Failed to save secret {}: {}", key_name, e);
                                     } else {
@@ -250,18 +364,108 @@ pub fn SettingsPanel() -> Element {
                     }
                 }
             }
+            // Sidebar (shrink-0 to not affect content width)
             div {
-                class: "flex-grow overflow-y-auto pr-2",
+                class: "w-48 shrink-0 flex flex-col border-r border-primary-700 bg-dark-section",
+                h2 { class: "text-lg font-bold p-4 border-b border-primary-700", "Settings" }
+                // Tabs
+                button { 
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::General { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    onclick: move |_| {
+                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::General;
+                        let state = (*ui_state.read()).clone();
+                        let manager = (*ui_state_manager.read()).clone();
+                        spawn(async move { let _ = manager.save(&state); });
+                    },
+                    Icon { width: 18, height: 18, icon: fi_icons::FiSettings }
+                    "General"
+                }
+                button { 
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Mcp { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    onclick: move |_| {
+                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Mcp;
+                        let state = (*ui_state.read()).clone();
+                        let manager = (*ui_state_manager.read()).clone();
+                        spawn(async move { let _ = manager.save(&state); });
+                    },
+                    Icon { width: 18, height: 18, icon: fi_icons::FiCpu }
+                    "MCP Tools"
+                }
+                button { 
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Behavior { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    onclick: move |_| {
+                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Behavior;
+                        let state = (*ui_state.read()).clone();
+                        let manager = (*ui_state_manager.read()).clone();
+                        spawn(async move { let _ = manager.save(&state); });
+                    },
+                    Icon { width: 18, height: 18, icon: fi_icons::FiSliders }
+                    "Behavior"
+                }
+                button { 
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Data { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    onclick: move |_| {
+                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Data;
+                        let state = (*ui_state.read()).clone();
+                        let manager = (*ui_state_manager.read()).clone();
+                        spawn(async move { let _ = manager.save(&state); });
+                    },
+                    Icon { width: 18, height: 18, icon: fi_icons::FiDatabase }
+                    "Data"
+                }
+                button { 
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Permissions { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    onclick: move |_| {
+                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Permissions;
+                        let state = (*ui_state.read()).clone();
+                        let manager = (*ui_state_manager.read()).clone();
+                        spawn(async move { let _ = manager.save(&state); });
+                    },
+                    Icon { width: 18, height: 18, icon: fi_icons::FiLock }
+                    "Permissions"
+                }
+                button { 
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Hotkeys { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    onclick: move |_| {
+                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Hotkeys;
+                        let state = (*ui_state.read()).clone();
+                        let manager = (*ui_state_manager.read()).clone();
+                        spawn(async move { let _ = manager.save(&state); });
+                    },
+                    Icon { width: 18, height: 18, icon: fi_icons::FiCommand }
+                    "Hotkeys"
+                }
+                button { 
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::About { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    onclick: move |_| {
+                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::About;
+                        let state = (*ui_state.read()).clone();
+                        let manager = (*ui_state_manager.read()).clone();
+                        spawn(async move { let _ = manager.save(&state); });
+                    },
+                    Icon { width: 18, height: 18, icon: fi_icons::FiInfo }
+                    "About"
+                }
+            }
+
+            // Content Area (maintains original settings pane width)
+            div {
+                class: "flex-1 flex flex-col min-w-0 p-4",
+                div {
+                   class: "flex-1 overflow-y-auto pr-2",
+                   match ui_state.read().active_settings_tab {
+                       crate::settings::SettingsTab::General => rsx! {
+
                 // LLM Configuration Section
                 div {
                     class: "border border-primary-700 rounded-lg mb-4",
                     div {
                         class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section rounded-t-lg",
-                        onclick: move |_| llm_config_collapsed.set(!llm_config_collapsed()),
+                        onclick: toggle_llm_collapsed,
                         h3 { class: "text-md font-semibold", "LLM Configuration" }
-                        span { if *llm_config_collapsed.read() { "▶" } else { "▼" } }
+                        span { if ui_state.read().llm_config_collapsed { "▶" } else { "▼" } }
                     }
-                    if !llm_config_collapsed() {
+                    if !ui_state.read().llm_config_collapsed {
                         div {
                             class: "p-4",
                             div {
@@ -281,9 +485,70 @@ pub fn SettingsPanel() -> Element {
                                         input {
                                             class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
                                             r#type: "password",
-                                            placeholder: "Using environment variable",
+                                            placeholder: "Enter your Gemini API key",
                                             value: "{local_settings.read().gemini_config.api_key.as_deref().unwrap_or(\"\")}",
                                             oninput: move |event| local_settings.write().gemini_config.api_key = Some(event.value())
+                                        }
+                                    }
+                                    // Keychain Storage Mode - conditional based on environment
+                                    div {
+                                        class: "mb-4 p-3 bg-dark-bg rounded-lg border border-primary-700",
+                                        label { class: "block text-sm font-medium text-gray-300 mb-2", "API Key Storage" }
+                                        
+                                        if is_sandboxed() {
+                                            // App Store/TestFlight: Show Biometric and iCloud options
+                                            div {
+                                                class: "flex gap-2",
+                                                button {
+                                                    class: if local_settings.read().keychain_storage_mode == crate::settings::KeychainStorageMode::Biometric {
+                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white"
+                                                    } else {
+                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-dark-input text-gray-400 hover:text-white"
+                                                    },
+                                                    onclick: move |_| {
+                                                        if local_settings.read().keychain_storage_mode != crate::settings::KeychainStorageMode::Biometric {
+                                                            pending_keychain_mode.set(Some(crate::settings::KeychainStorageMode::Biometric));
+                                                            show_keychain_mode_confirm.set(true);
+                                                        }
+                                                    },
+                                                    "🔐 Biometric"
+                                                }
+                                                button {
+                                                    class: if local_settings.read().keychain_storage_mode == crate::settings::KeychainStorageMode::ICloudSync {
+                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white"
+                                                    } else {
+                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-dark-input text-gray-400 hover:text-white"
+                                                    },
+                                                    onclick: move |_| {
+                                                        if local_settings.read().keychain_storage_mode != crate::settings::KeychainStorageMode::ICloudSync {
+                                                            pending_keychain_mode.set(Some(crate::settings::KeychainStorageMode::ICloudSync));
+                                                            show_keychain_mode_confirm.set(true);
+                                                        }
+                                                    },
+                                                    "☁️ iCloud Sync"
+                                                }
+                                            }
+                                            p {
+                                                class: "text-xs text-gray-400 mt-2",
+                                                if local_settings.read().keychain_storage_mode == crate::settings::KeychainStorageMode::Biometric {
+                                                    "Keys require Touch ID/passcode. Device-only, more secure."
+                                                } else {
+                                                    "Keys sync across your devices via iCloud. No biometric lock."
+                                                }
+                                            }
+                                        } else {
+                                            // PRO/Developer ID: Local keychain only (read-only display)
+                                            div {
+                                                class: "flex gap-2",
+                                                div {
+                                                    class: "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white text-center",
+                                                    "🔑 Local Keychain"
+                                                }
+                                            }
+                                            p {
+                                                class: "text-xs text-gray-400 mt-2",
+                                                "API keys stored securely in your local keychain. (PRO build)"
+                                            }
                                         }
                                     }
                                     div {
@@ -450,73 +715,121 @@ pub fn SettingsPanel() -> Element {
                         }
                     }
                 }
-                // Smithery API Key Section
+                   }, // End General
+                   crate::settings::SettingsTab::Mcp => rsx! {
                 div {
                     class: "border border-primary-700 rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section rounded-t-lg",
-                        onclick: move |_| llm_config_collapsed.set(!llm_config_collapsed()),
-                        h3 { class: "text-md font-semibold", "MCP Configuration" }
-                        span { if *llm_config_collapsed.read() { "▶" } else { "▼" } }
-                    }
-                    if !llm_config_collapsed() {
+                        class: "p-4",
                         div {
-                            class: "p-4",
+                            class: "mb-4",
+                            label { class: "block text-sm font-medium text-gray-300 mb-2", "Preferred MCP Source" }
                             div {
-                                class: "mb-4 pt-4 border-t border-primary-700",
-                                label { class: "block text-sm font-medium text-gray-300 mb-2", "Preferred MCP Source" }
+                                class: "flex space-x-4",
+                                button {
+                                    class: if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
+                                        "flex-1 px-4 py-2 rounded-md bg-primary-600 text-white font-medium shadow-sm ring-2 ring-primary-400"
+                                    } else {
+                                        "flex-1 px-4 py-2 rounded-md bg-dark-input text-gray-400 font-medium hover:bg-gray-700 hover:text-white transition-colors"
+                                    },
+                                    onclick: move |_| {
+                                        local_settings.write().preferred_mcp_source = crate::settings::McpSource::Composio;
+                                    },
+                                    "Composio"
+                                }
+                                button {
+                                    class: if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
+                                        "flex-1 px-4 py-2 rounded-md bg-red-900/50 text-red-200 font-medium shadow-sm ring-2 ring-red-700 border border-red-700"
+                                    } else {
+                                        "flex-1 px-4 py-2 rounded-md bg-dark-input text-gray-400 font-medium hover:bg-gray-700 hover:text-white transition-colors"
+                                    },
+                                    onclick: move |_| {
+                                        local_settings.write().preferred_mcp_source = crate::settings::McpSource::Smithery;
+                                    },
+                                    "Smithery.ai (Deprecated)"
+                                }
+                            }
+                            
+                            if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
                                 div {
-                                    class: "flex space-x-4",
-                                    button {
-                                        class: if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
-                                            "flex-1 px-4 py-2 rounded-md bg-primary-600 text-white font-medium shadow-sm ring-2 ring-primary-400"
-                                        } else {
-                                            "flex-1 px-4 py-2 rounded-md bg-dark-input text-gray-400 font-medium hover:bg-gray-700 hover:text-white transition-colors"
-                                        },
-                                        onclick: move |_| {
-                                            local_settings.write().preferred_mcp_source = crate::settings::McpSource::Smithery;
-                                        },
-                                        "Smithery.ai"
-                                    }
-                                    button {
-                                        class: if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
-                                            "flex-1 px-4 py-2 rounded-md bg-primary-600 text-white font-medium shadow-sm ring-2 ring-primary-400"
-                                        } else {
-                                            "flex-1 px-4 py-2 rounded-md bg-dark-input text-gray-400 font-medium hover:bg-gray-700 hover:text-white transition-colors"
-                                        },
-                                        onclick: move |_| {
-                                            local_settings.write().preferred_mcp_source = crate::settings::McpSource::Composio;
-                                        },
-                                        "Composio"
-                                    }
-                                }
+                                    class: "mt-3 p-3 bg-red-900/30 border border-red-700 rounded-lg",
                                     p {
-                                    class: "text-xs text-gray-400 mt-2",
-                                    "Choose which registry to use when installing new MCP servers. Smithery uses a hosted proxy (requires API key), while Composio runs locally."
-                                }
-                                
-                                // Smithery API Key - shown when Smithery is selected
-                                if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
-                                    div {
-                                        class: "mt-4 pt-4 border-t border-primary-700",
-                                        label { class: "block text-sm font-medium text-gray-300 mb-1", "Smithery API Key" }
-                                        input {
-                                            class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                            r#type: "password",
-                                            placeholder: "Enter your Smithery.ai API key",
-                                            value: "{local_settings.read().smithery_api_key.as_deref().unwrap_or(\"\")}",
-                                            oninput: move |event| local_settings.write().smithery_api_key = Some(event.value().trim().to_string())
-                                        }
-                                        p {
-                                            class: "text-xs text-gray-400 mt-1",
-                                            "Required for Smithery.ai marketplace access"
-                                        }
+                                        class: "text-red-200 text-sm flex items-center gap-2",
+                                        Icon { width: 16, height: 16, icon: fi_icons::FiAlertTriangle }
+                                        "This integration is deprecated. We recommend using Composio directly."
                                     }
                                 }
-                                
-                                if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
+                            }
+                                p {
+                                class: "text-xs text-gray-400 mt-2",
+                                "Choose which registry to use when installing new MCP servers. Smithery uses a hosted proxy (requires API key), while Composio runs locally."
+                            }
+                            
+                            // Smithery API Key - shown when Smithery is selected
+                            if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
+                                div {
+                                    class: "mt-4 pt-4 border-t border-primary-700",
+                                    label { class: "block text-sm font-medium text-gray-300 mb-1", "Smithery API Key" }
+                                    input {
+                                        class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                        r#type: "password",
+                                        placeholder: "Enter your Smithery.ai API key",
+                                        value: "{local_settings.read().smithery_api_key.as_deref().unwrap_or(\"\")}",
+                                        oninput: move |event| local_settings.write().smithery_api_key = Some(event.value().trim().to_string())
+                                    }
+                                    p {
+                                        class: "text-xs text-gray-400 mt-1",
+                                        "Required for Smithery.ai marketplace access"
+                                    }
+                                }
+                            }
+                            
+                            if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
+                                div {
+                                    class: "mt-4 pt-4 border-t border-primary-700",
+                                    // Instructions
                                     div {
-                                        class: "mt-4 pt-4 border-t border-primary-700",
+                                        class: "mb-6 bg-dark-bg/50 rounded-lg border border-primary-700/50 overflow-hidden",
+                                        div {
+                                            class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section/50 hover:bg-dark-section transition-colors",
+                                            onclick: toggle_mcp_instructions_collapsed,
+                                            h4 { class: "text-sm font-semibold text-white", "Setup Instructions" }
+                                            span { if ui_state.read().mcp_instructions_collapsed { "▶" } else { "▼" } }
+                                        }
+                                        if !ui_state.read().mcp_instructions_collapsed {
+                                            div {
+                                                class: "p-4 border-t border-primary-700/30",
+                                                ol {
+                                                    class: "list-decimal list-inside text-sm text-gray-300 space-y-1.5",
+                                                    li {
+                                                        "Create an account at "
+                                                        a { class: "text-primary-400 hover:text-primary-300 underline", href: "https://platform.composio.dev", target: "_blank", "platform.composio.dev" }
+                                                        " (Google SSO recommended)"
+                                                    }
+                                                    li { "Create a new MCP Config" }
+                                                    li { "Click \"+ Add Profile\" below to create a local profile" }
+                                                    li { "Copy your User ID (UUID) and add it to your MCP config setup" }
+                                                    li { "Name, save our MCP config, then use the Install button to get your Link, User ID (part of the URL) and the API Key." }
+                                                    li { "Connect your desired accounts (Gmail, GitHub, etc.) [It's easier to add them through the MCP Marketplace, but the admin is best for managing available tools.]" }
+                                                    li { "Add the URL and API Key to your Composio Native profile." }
+                                                    li { "Save your Settings. You should be able to use Composio Native."}
+                                                    li { "Check the MCP Status window for connection status and Toolkit availability."}
+                                                    li { "If you can't use Composio Native, try restarting the app. If that doesn't work check your user id and server URLs"}
+                                                }
+                                                div {
+                                                    class: "mt-3 pt-3 border-t border-primary-700/30",
+                                                    a { 
+                                                        class: "text-xs text-primary-400 hover:text-primary-300 flex items-center gap-1",
+                                                        href: "https://docs.composio.dev/docs/welcome",
+                                                        target: "_blank",
+                                                        Icon { width: 12, height: 12, icon: fi_icons::FiExternalLink }
+                                                        "View Documentation"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                         // Profile list header
                                         div {
                                             class: "flex justify-between items-center mb-3",
@@ -613,6 +926,85 @@ pub fn SettingsPanel() -> Element {
                                                     }
                                                 }
                                                 
+                                                // Profile Color
+                                                div {
+                                                    class: "mb-3",
+                                                    label { class: "block text-xs font-medium text-gray-400 mb-1", "Profile Color" }
+                                                    div {
+                                                        class: "flex gap-2 flex-wrap",
+                                                        for color in ["bg-blue-600", "bg-purple-600", "bg-green-600", "bg-red-600", "bg-orange-600", "bg-pink-600", "bg-teal-600", "bg-gray-600"] {
+                                                            button {
+                                                                class: format!("w-6 h-6 rounded-full cursor-pointer transition-transform hover:scale-110 {} {}", 
+                                                                    color,
+                                                                    if local_settings.read().get_active_profile().map(|p| p.color.as_str()) == Some(color) { "ring-2 ring-white scale-110 border border-transparent shadow-md" } else { "border border-gray-600 hover:border-white" }
+                                                                ),
+                                                                onclick: {
+                                                                    let color = color.to_string();
+                                                                    move |_| {
+                                                                        let mut settings = local_settings.write();
+                                                                        if let Some(profile) = settings.get_active_profile_mut() {
+                                                                            profile.color = color.clone();
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                // User ID (Read-only + Copy/Regenerate)
+                                                div {
+                                                    class: "mb-3",
+                                                    label { class: "block text-xs font-medium text-gray-400 mb-1", "User ID" }
+                                                    div {
+                                                        class: "flex gap-2",
+                                                        input {
+                                                            class: "flex-1 px-3 py-2 bg-dark-bg border border-primary-700 rounded-md text-sm text-gray-400 cursor-not-allowed",
+                                                            readonly: true,
+                                                            value: "{local_settings.read().get_active_profile().and_then(|p| p.user_id.clone()).unwrap_or_else(|| \"Not Generated\".to_string())}"
+                                                        }
+                                                        // Copy Button
+                                                        button {
+                                                            class: "px-3 py-2 bg-dark-input hover:bg-white/10 border border-primary-600 rounded-md text-gray-300 transition-colors",
+                                                            title: "Copy User ID",
+                                                            onclick: {
+                                                                let user_id = local_settings.read().get_active_profile().and_then(|p| p.user_id.clone()).unwrap_or_default();
+                                                                move |_| {
+                                                                    if !user_id.is_empty() {
+                                                                        use std::process::Command;
+                                                                        let _ = Command::new("pbcopy")
+                                                                            .stdin(std::process::Stdio::piped())
+                                                                            .spawn()
+                                                                            .and_then(|mut child| {
+                                                                                use std::io::Write;
+                                                                                if let Some(mut stdin) = child.stdin.take() {
+                                                                                    let _ = stdin.write_all(user_id.as_bytes());
+                                                                                }
+                                                                                Ok(())
+                                                                            });
+                                                                    }
+                                                                }
+                                                            },
+                                                            Icon { width: 16, height: 16, icon: fi_icons::FiCopy }
+                                                        }
+                                                        // Regenerate Button
+                                                        button {
+                                                            class: "px-3 py-2 bg-dark-input hover:bg-white/10 border border-primary-600 rounded-md text-gray-300 transition-colors",
+                                                            title: "Regenerate User ID",
+                                                            onclick: {
+                                                                let name = active_name.clone();
+                                                                move |_| {
+                                                                    let mut settings = local_settings.write();
+                                                                    if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                        profile.user_id = Some(uuid::Uuid::new_v4().to_string().to_lowercase());
+                                                                    }
+                                                                }
+                                                            },
+                                                            Icon { width: 16, height: 16, icon: fi_icons::FiRefreshCw }
+                                                        }
+                                                    }
+                                                }
+
                                                 // Server URL
                                                 div {
                                                     class: "mb-3",
@@ -625,11 +1017,45 @@ pub fn SettingsPanel() -> Element {
                                                             let name = active_name.clone();
                                                             move |event: Event<FormData>| {
                                                                 let val = event.value();
+                                                                let mut clean_val = val.clone();
+                                                                let mut warning = None;
+
+                                                                // Sanitize URL if it contains user_id
+                                                                if let Ok(mut url) = url::Url::parse(&val) {
+                                                                    if url.query_pairs().any(|(k, _)| k == "user_id") {
+                                                                        let pairs: Vec<(String, String)> = url.query_pairs()
+                                                                            .filter(|(k, _)| k != "user_id")
+                                                                            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                                                                            .collect();
+                                                                        
+                                                                        url.query_pairs_mut().clear();
+                                                                        for (k, v) in pairs {
+                                                                            url.query_pairs_mut().append_pair(&k, &v);
+                                                                        }
+                                                                        
+                                                                        // Clean up if query is empty (Url::to_string might leave ?)
+                                                                        if url.query() == Some("") {
+                                                                            url.set_query(None);
+                                                                        }
+
+                                                                        clean_val = url.to_string();
+                                                                        warning = Some("Note: Embedded User ID removed. Using the app-generated User ID below.".to_string());
+                                                                    }
+                                                                }
+                                                                
+                                                                composio_url_warning.set(warning);
+
                                                                 let mut settings = local_settings.write();
                                                                 if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
-                                                                    profile.base_url = if val.is_empty() { None } else { Some(val) };
+                                                                    profile.base_url = if clean_val.is_empty() { None } else { Some(clean_val) };
                                                                 }
                                                             }
+                                                        }
+                                                    }
+                                                    if let Some(msg) = composio_url_warning.read().as_ref() {
+                                                        p { class: "text-xs text-yellow-400 mt-1 flex items-center gap-1", 
+                                                            Icon { width: 12, height: 12, icon: fi_icons::FiAlertCircle }
+                                                            "{msg}" 
                                                         }
                                                     }
                                                 }
@@ -656,24 +1082,67 @@ pub fn SettingsPanel() -> Element {
                                                     }
                                                 }
                                                 
-                                                // User ID
+                                                // User ID (read-only, auto-generated)
                                                 div {
                                                     class: "mb-3",
                                                     label { class: "block text-xs font-medium text-gray-400 mb-1", "User ID" }
-                                                    input {
-                                                        class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm",
-                                                        placeholder: "bb98696d-d833-4953-8857-...",
-                                                        value: "{local_settings.read().get_active_profile().and_then(|p| p.user_id.clone()).unwrap_or_default()}",
-                                                        oninput: {
-                                                            let name = active_name.clone();
-                                                            move |event: Event<FormData>| {
-                                                                let val = event.value();
-                                                                let mut settings = local_settings.write();
-                                                                if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
-                                                                    profile.user_id = if val.is_empty() { None } else { Some(val) };
+                                                    div {
+                                                        class: "flex gap-2",
+                                                        input {
+                                                            class: "flex-1 px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm text-gray-400",
+                                                            readonly: true,
+                                                            value: "{local_settings.read().get_active_profile().and_then(|p| p.user_id.clone()).unwrap_or_default()}",
+                                                        }
+                                                        {
+                                                            let user_id_for_copy = local_settings.read()
+                                                                .get_active_profile()
+                                                                .and_then(|p| p.user_id.clone())
+                                                                .unwrap_or_default();
+                                                            rsx! {
+                                                                // Copy button
+                                                                button {
+                                                                    class: "px-2 py-2 bg-primary-600 hover:bg-primary-500 rounded-md text-white",
+                                                                    title: "Copy User ID",
+                                                                    onclick: move |_| {
+                                                                        #[cfg(target_os = "macos")]
+                                                                        {
+                                                                            use std::process::Command;
+                                                                            let id_to_copy = user_id_for_copy.clone();
+                                                                            let _ = Command::new("pbcopy")
+                                                                                .stdin(std::process::Stdio::piped())
+                                                                                .spawn()
+                                                                                .and_then(|mut child| {
+                                                                                    if let Some(stdin) = child.stdin.as_mut() {
+                                                                                        stdin.write_all(id_to_copy.as_bytes())?;
+                                                                                    }
+                                                                                    child.wait()
+                                                                                });
+                                                                        }
+                                                                    },
+                                                                    Icon { width: 14, height: 14, icon: fi_icons::FiCopy }
+                                                                }
+                                                                // Regenerate button
+                                                                button {
+                                                                    class: "px-2 py-2 bg-gray-600 hover:bg-gray-500 rounded-md text-white",
+                                                                    title: "Regenerate User ID (Warning: will break existing connections)",
+                                                                    onclick: {
+                                                                        let name = active_name.clone();
+                                                                        move |_| {
+                                                                            let new_id = uuid::Uuid::new_v4().to_string().to_lowercase();
+                                                                            let mut settings = local_settings.write();
+                                                                            if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                                profile.user_id = Some(new_id);
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    Icon { width: 14, height: 14, icon: fi_icons::FiRefreshCw }
                                                                 }
                                                             }
                                                         }
+                                                    }
+                                                    p {
+                                                        class: "text-xs text-gray-500 mt-1",
+                                                        "Auto-generated. Regenerating will break existing toolkit connections."
                                                     }
                                                 }
                                                 
@@ -694,8 +1163,9 @@ pub fn SettingsPanel() -> Element {
                             }
                         }
                     }
-                }
 
+                   }, // End Mcp
+                   crate::settings::SettingsTab::Behavior => rsx! {
                 // Application Behavior Section
                 div {
                     class: "border border-primary-700 rounded-lg mb-4",
@@ -830,16 +1300,7 @@ pub fn SettingsPanel() -> Element {
                                     div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
                                 }
                             }
-                            div {
-                                class: "mt-4 mb-4",
-                                label { class: "block text-sm font-medium text-gray-300", "Global Hotkey" }
-                                input {
-                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                    r#type: "text",
-                                    value: "{local_settings.read().global_hotkey}",
-                                    oninput: move |event| local_settings.write().global_hotkey = event.value()
-                                }
-                            }
+
                             div {
                                 class: "mt-4 mb-4",
                                 label { class: "block text-sm font-medium text-gray-300", "Max AI Turns" }
@@ -918,6 +1379,8 @@ pub fn SettingsPanel() -> Element {
                     }
                 }
 
+                   }, // End Behavior
+                   crate::settings::SettingsTab::Data => rsx! {
                 // Data Management Section
                 div {
                     class: "border border-primary-700 rounded-lg mb-4",
@@ -1085,10 +1548,38 @@ pub fn SettingsPanel() -> Element {
                                     "Import History"
                                 }
                             }
+                            // Keychain Management
+                            div {
+                                class: "mt-4 pt-4 border-t border-primary-700",
+                                h4 { class: "text-sm font-medium text-gray-300 mb-2", "Keychain Management" }
+                                p {
+                                    class: "text-xs text-gray-400 mb-3",
+                                    "Manually reset all stored API keys. You'll need to re-enter them after resetting."
+                                }
+                                button {
+                                    class: "px-4 py-2 bg-red-600 rounded-md text-white font-semibold hover:bg-red-700",
+                                    onclick: move |_| {
+                                        // Delete all keychain items
+                                        let deleted_keys = secret_manager.write().delete_all();
+                                        tracing::info!("Reset {} keychain items.", deleted_keys.len());
+                                        
+                                        // Clear API keys from local settings
+                                        let mut ls = local_settings.write();
+                                        ls.gemini_config.api_key = None;
+                                        ls.smithery_api_key = None;
+                                        for profile in ls.composio_profiles.iter_mut() {
+                                            profile.api_key = None;
+                                        }
+                                    },
+                                    "Reset Keychain Secrets"
+                                }
+                            }
                         }
                     }
                 }
 
+                   }, // End Data
+                   crate::settings::SettingsTab::Permissions => rsx! {
                 // Permissions Section
                 div {
                     class: "border border-primary-700 rounded-lg mb-4",
@@ -1190,8 +1681,155 @@ pub fn SettingsPanel() -> Element {
                     }
                 }
 
-            }
-            button {
+                   }, // End Permissions
+                    crate::settings::SettingsTab::Hotkeys => rsx! {
+                        div {
+                            class: "border border-primary-700 rounded-lg mb-4",
+                            div {
+                                class: "p-4 bg-dark-section rounded-lg",
+                                h3 { class: "text-md font-semibold mb-4", "Keyboard Shortcuts" }
+                                p { class: "text-xs text-gray-400 mb-4", 
+                                    "Customize global shortcuts using the format: " 
+                                    code { class: "bg-black/30 px-1 rounded", "CmdOrCtrl+Shift+Key" }
+                                ". Changes apply immediately after saving."
+                                }
+                                if local_settings.read().hotkeys != settings.read().hotkeys {
+                                    div {
+                                        class: "mb-4 p-3 bg-yellow-900/30 border border-yellow-700/50 rounded-md flex items-center gap-3",
+                                        Icon {
+                                            width: 18,
+                                            height: 18,
+                                            fill: "none",
+                                            class: "text-yellow-500 min-w-[18px]",
+                                            icon: fi_icons::FiAlertTriangle,
+                                        }
+                                        span { class: "text-xs text-yellow-200", "Restart required to apply changes." }
+                                    }
+                                }
+
+                                div {
+                                    class: "space-y-4",
+                                    
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-gray-300", "Toggle Settings" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_settings.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_settings = v,
+                                        }
+                                    }
+                                    
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-gray-300", "Toggle History" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_history.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_history = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-gray-300", "Toggle MCP Config" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_mcp.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_mcp = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-gray-300", "Open Profile Selector" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_profile.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_profile = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-gray-300", "Add Attachments" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_attachments.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_attachments = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-gray-300", "Global Toggle (Show/Hide)" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_tray.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_tray = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "pt-4 border-t border-gray-800",
+                                        div {
+                                            class: "flex justify-between items-center text-sm",
+                                            span { class: "text-gray-400", "Switch Profile (1-9)" }
+                                            span { class: "font-mono text-gray-500", "CmdOrCtrl + [1-9]" }
+                                        }
+                                        p { class: "text-[10px] text-gray-500 mt-1", "Profile switching hotkeys are currently fixed." }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                   crate::settings::SettingsTab::About => rsx! {
+                // About & Legal Section
+                div {
+                    class: "border border-primary-700 rounded-lg mb-4",
+                    div {
+                        class: "p-4 bg-dark-section rounded-lg",
+                        h3 { class: "text-md font-semibold mb-3", "About & Legal" }
+                        
+                        // Version and app name
+                        div {
+                            class: "flex items-center gap-2 mb-3",
+                            span { class: "text-sm text-gray-300", "{app_name}" }
+                            span { class: "text-xs text-gray-500", "{app_version}" }
+                        }
+                        
+                        // Privacy statement
+                        p {
+                            class: "text-sm text-green-400 mb-3",
+                            "🔒 Built without telemetry for your privacy."
+                        }
+                        
+                        // Attribution
+                        p {
+                            class: "text-xs text-gray-400 mb-4",
+                            "{crate::settings::APP_ATTRIBUTION}"
+                        }
+                        
+                        // Legal links
+                        div {
+                            class: "flex gap-4",
+                            a {
+                                class: "text-sm text-primary-400 hover:text-primary-300 underline",
+                                href: "https://clearmirror.ai/terms-of-service",
+                                target: "_blank",
+                                "Terms of Service"
+                            }
+                            a {
+                                class: "text-sm text-primary-400 hover:text-primary-300 underline",
+                                href: "https://clearmirror.ai/privacy-policy",
+                                target: "_blank",
+                                "Privacy Policy"
+                            }
+                        }
+                    }
+                }
+                   } // End About
+                   } // End Match
+                } // End Scrollable Content
+                
+                // Footer (Sticky)
+                div {
+                    class: "p-4 border-t border-primary-700 bg-dark-section",
+                    button {
                 class: if has_unsaved_changes() {
                     "mt-4 px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors"
                 } else {
@@ -1290,6 +1928,8 @@ pub fn SettingsPanel() -> Element {
                     }
                 },
                 "Save Settings"
+            }
+                }
             }
         }
     }

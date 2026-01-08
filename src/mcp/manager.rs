@@ -230,22 +230,20 @@ impl McpManager {
             tracing::info!("MCP context update receiver task finished.");
         });
 
-        // Check if we need to initialize the Composio client
-        let has_composio_config = configs.iter().any(|c| c.name == "composio");
-        
-        // If Composio has an active profile configured but no config exists, create a virtual one
-        if !has_composio_config && settings.get_active_profile().is_some() {
+        // Initialize the native Composio client if an active profile is configured.
+        // This is decoupled from mcp_servers.json - the native client is ephemeral.
+        if settings.get_active_profile().is_some() {
             let tx_clone = tx.clone();
             let settings_clone = settings.clone();
             let failed_servers_clone = self.failed_servers.clone();
             
             // Create a virtual config for Composio
             let composio_config = McpServerConfig {
-                name: "composio".to_string(),
+                name: "composio-native".to_string(),
                 command: None,
                 uri: None,
                 args: None,
-                description: "Native Composio API client".to_string(),
+                description: "Composio Integration Hub - provides access to 100+ external apps (Gmail, GitHub, Slack, etc.) via a Tool Router workflow. Use COMPOSIO_DISCOVER_APPS to search for apps, then COMPOSIO_GET_APP_TOOLS to list that app's tools, then COMPOSIO_EXECUTE_TOOL to run a specific action. Force-loaded toolkits have their tools available directly.".to_string(),
                 env: HashMap::new(),
                 disabled: false,
                 always_allow: Vec::new(),
@@ -265,7 +263,10 @@ impl McpManager {
                         let composio_client = Arc::new(ComposioClient::new(api_key.clone(), base_url, entity_id, user_id));
                         let client_for_tools = composio_client.clone();
 
-                        match client_for_tools.list_tools().await {
+                        // Tool Router pattern: only load force-loaded toolkit tools + meta-tools
+                        let force_load_slugs = profile.get_force_load_toolkit_slugs();
+
+                        match client_for_tools.list_tools_for_session(&force_load_slugs).await {
                             Ok(composio_tools) => {
                                 let tools = composio_tools.iter().map(composio_to_rmcp_tool).collect();
                                 let active_client = ActiveMcpClient {
@@ -276,22 +277,26 @@ impl McpManager {
                                 if tx_clone.send(active_client).is_err() {
                                     tracing::error!("Failed to send initialized virtual Composio client");
                                 }
+                                
+                                if !force_load_slugs.is_empty() {
+                                    tracing::info!("Force-loaded toolkits for virtual Composio: {:?}", force_load_slugs);
+                                }
                             }
                             Err(e) => {
                                 let error_msg = format!("Failed to list Composio tools: {}", e);
                                 tracing::error!("{}", error_msg);
-                                failed_servers_clone.lock().await.insert("composio".to_string(), (composio_config, error_msg));
+                                failed_servers_clone.lock().await.insert("composio-native".to_string(), (composio_config, error_msg));
                             }
                         }
                     } else {
                         let error_msg = "Composio API key not configured for active profile".to_string();
                         tracing::error!("{}", error_msg);
-                        failed_servers_clone.lock().await.insert("composio".to_string(), (composio_config, error_msg));
+                        failed_servers_clone.lock().await.insert("composio-native".to_string(), (composio_config, error_msg));
                     }
                 } else {
                     let error_msg = "No active Composio profile found".to_string();
                     tracing::error!("{}", error_msg);
-                    failed_servers_clone.lock().await.insert("composio".to_string(), (composio_config, error_msg));
+                    failed_servers_clone.lock().await.insert("composio-native".to_string(), (composio_config, error_msg));
                 }
             });
         }
@@ -314,7 +319,7 @@ impl McpManager {
                 let server_name = server_config_clone.name.clone();
                 tracing::info!("Initializing MCP server: {}", server_name);
 
-                if server_name == "composio" {
+                if server_name == "composio-native" {
                     if let Some(profile) = settings_clone.get_active_profile() {
                         if let Some(api_key) = &profile.api_key {
                             let base_url = profile.base_url
@@ -472,7 +477,21 @@ impl McpManager {
                             return;
                         }
                     };
-                    ().serve(transport).await
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), ().serve(transport)).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::error!("Timeout waiting for MCP server '{}' to initialize", server_name);
+                             // Return a compatible error type or handle failure. 
+                             // Since serve returns Result<RunningService, InitializeError>, we need to match that.
+                             // initialize error for RoleClient is likely ServiceError or similar.
+                             // We'll return Err(rmcp::service::ServiceError::Timeout { timeout: std::time::Duration::from_secs(300) }.into()) if convertible,
+                             // or just log and essentially fail.
+                             // actually 'serve' returns Result<RunningService<RoleClient, ()>, ...>
+                             // RoleClient::InitializeError is likely Infallible or ServiceError.
+                             // Let's check matching. For now, assuming standard error flow.
+                             return;
+                        }
+                    }
                 } else {
                     // Stdio-based server
                     tracing::info!("Launching stdio MCP server: {}", server_name);
@@ -517,7 +536,15 @@ impl McpManager {
                         .stderr(std::process::Stdio::piped());
 
                     match TokioChildProcess::new(cmd) {
-                        Ok(transport) => ().serve(transport).await,
+                        Ok(transport) => {
+                             match tokio::time::timeout(std::time::Duration::from_secs(300), ().serve(transport)).await {
+                                 Ok(result) => result,
+                                 Err(_) => {
+                                     tracing::error!("Timeout waiting for stdio MCP server '{}' to initialize", server_name);
+                                     return;
+                                 }
+                             }
+                        },
                         Err(e) => {
                             tracing::error!("Failed to launch stdio MCP server '{}': {}", server_name, e);
                             return;
@@ -621,14 +648,25 @@ impl McpManager {
             }
         }
 
-        match fs::read_to_string(config_path) {
+        match fs::read_to_string(&config_path) {
             Ok(content) => {
-                let wrapper: McpServersWrapper = serde_json::from_str(&content).unwrap_or_else(|e| {
+                let mut wrapper: McpServersWrapper = serde_json::from_str(&content).unwrap_or_else(|e| {
                     tracing::error!("Failed to parse mcp_servers.json: {}", e);
                     McpServersWrapper {
                         mcp_servers: HashMap::new(),
                     }
                 });
+
+                // MIGRATION: Check for stale "composio" native config (no command) and remove it.
+                // This prevents conflicts with the new "composio-native" virtual client.
+                let mut needs_save = false;
+                if let Some(config) = wrapper.mcp_servers.get("composio") {
+                    if config.command.is_none() {
+                        tracing::info!("Migrating: Removing stale 'composio' native config from persistence.");
+                        wrapper.mcp_servers.remove("composio");
+                        needs_save = true;
+                    }
+                }
 
                 let configs_vec: Vec<McpServerConfig> =
                     wrapper.mcp_servers.into_iter().map(|(name, mut config)| {
@@ -640,6 +678,13 @@ impl McpManager {
                     "Successfully parsed {} MCP server configs.",
                     configs_vec.len()
                 );
+
+                if needs_save {
+                    if let Err(e) = self.save_configs(&config_path, configs_vec.clone()).await {
+                        tracing::error!("Failed to save migrated configs: {}", e);
+                    }
+                }
+
                 configs_vec
             }
             Err(e) => {
@@ -664,6 +709,7 @@ impl McpManager {
     #[allow(dead_code)]
     async fn save_configs(&self, config_path: &PathBuf, configs: Vec<McpServerConfig>) -> Result<(), String> {
         let mcp_servers_map: HashMap<String, McpServerConfig> = configs.into_iter()
+            .filter(|c| c.name != "composio-native") // Never persist the virtual native client
             .map(|c| (c.name.clone(), c))
             .collect();
 
@@ -1038,7 +1084,7 @@ impl McpManager {
 
     pub async fn get_composio_toolkits(&self) -> Result<Vec<crate::mcp::composio_client::ToolkitInfo>, String> {
         let servers = self.servers.lock().await;
-        if let Some(client) = servers.get("composio") {
+        if let Some(client) = servers.get("composio-native") {
             if let McpClientType::NativeComposio(composio_client) = &client.service {
                 return composio_client.list_connected_toolkits().await;
             }
@@ -1095,7 +1141,7 @@ impl McpManager {
     pub async fn reload_composio_tools(&self, settings: &crate::settings::Settings) -> Result<(), String> {
         let mut servers = self.servers.lock().await;
         
-        if let Some(active_client) = servers.get_mut("composio") {
+        if let Some(active_client) = servers.get_mut("composio-native") {
             if let McpClientType::NativeComposio(composio_client) = &active_client.service {
                 // Get current force_load slugs from settings
                 let force_load_slugs = settings
@@ -1139,14 +1185,26 @@ impl McpManager {
         let auth_required = self.auth_required_servers.lock().await;
         let unloaded = self.unloaded_servers.lock().await;
         
-        // Check for Composio before iterating through configs
-        let composio_name = "composio".to_string();
-        let configs_has_composio = configs.iter().any(|c| c.name == composio_name);
         
         // First, process all configs from the JSON file
         for config in configs {
             let is_loaded = !unloaded.contains(&config.name);
-            let status = if config.disabled {
+            let status = if !is_loaded {
+                // User has manually unloaded/disabled this server
+                McpServerStatus {
+                    name: config.name.clone(),
+                    display_name: config.name.clone(),
+                    description: config.description.clone(),
+                    status: ServerStatus::Disabled,
+                    error_message: None,
+                    tools: 0,
+                    resources: 0,
+                    prompts: 0,
+                    is_loaded: false,
+                    auth_url: None,
+                    uri: config.uri.clone(),
+                }
+            } else if config.disabled {
                 McpServerStatus {
                     name: config.name.clone(),
                     display_name: config.name.clone(),
@@ -1171,7 +1229,7 @@ impl McpManager {
                     tools: client.tools.len(),
                     resources: 0, // TODO: Implement resources tracking
                     prompts: 0,   // TODO: Implement prompts tracking
-                    is_loaded,
+                    is_loaded: true,
                     auth_url: None,
                     uri: config.uri.clone(),
                 }
@@ -1223,16 +1281,18 @@ impl McpManager {
             statuses.push(status);
         }
         
-        // Special handling for the Composio client - it might not be in the configs
-        // but could still be active or failed
-        if !configs_has_composio {
-            let composio_is_loaded = !unloaded.contains(&composio_name);
-            // Check if we have an active Composio client
-            if servers.contains_key(&composio_name) {
-                let client = servers.get(&composio_name).unwrap();
+        // Special handling for the native Composio client - it's not in configs
+        // but could still be active or failed. Now uses "composio-native" so it can
+        // coexist with an official "composio" MCP server.
+        {
+            let native_composio_name = "composio-native".to_string();
+            let composio_is_loaded = !unloaded.contains(&native_composio_name);
+            // Check if we have an active native Composio client
+            if servers.contains_key(&native_composio_name) {
+                let client = servers.get(&native_composio_name).unwrap();
                 statuses.push(McpServerStatus {
-                    name: composio_name.clone(),
-                    display_name: "Composio".to_string(),
+                    name: native_composio_name.clone(),
+                    display_name: "Composio (Native)".to_string(),
                     description: "Native Composio API client".to_string(),
                     status: ServerStatus::Loaded,
                     error_message: None,
@@ -1244,11 +1304,11 @@ impl McpManager {
                     uri: None,
                 });
             }
-            // Check if Composio failed to initialize
-            else if let Some((_, error)) = failed.get(&composio_name) {
+            // Check if native Composio failed to initialize
+            else if let Some((_, error)) = failed.get(&native_composio_name) {
                 statuses.push(McpServerStatus {
-                    name: composio_name.clone(),
-                    display_name: "Composio".to_string(),
+                    name: native_composio_name.clone(),
+                    display_name: "Composio (Native)".to_string(),
                     description: "Native Composio API client".to_string(),
                     status: ServerStatus::Error,
                     error_message: Some(error.clone()),

@@ -78,6 +78,7 @@ impl StreamManagerContext {
                 match message {
                     StreamMessage::Text { content, thought_signature, thought_summary } => {
                         // Append the content to the buffer
+                        let was_empty = final_text_for_this_turn.is_empty();
                         final_text_for_this_turn.push_str(&content);
                         if thought_signature.is_some() {
                             thought_signature_for_this_turn = thought_signature.clone();
@@ -89,10 +90,32 @@ impl StreamManagerContext {
                                 thought_summary_for_this_turn = Some(summary.clone());
                             }
                         }
-                        if stream_tx.send(StreamMessage::Text { content, thought_signature, thought_summary }).is_err() {
+                        if stream_tx.send(StreamMessage::Text { content: content.clone(), thought_signature: thought_signature.clone(), thought_summary: thought_summary.clone() }).is_err() {
                             break;
                         }
                         self.scheduler.send(SchedulerSignal::Activity);
+                        
+                        // Critical Fix: Update session state immediately on the first chunk.
+                        // This ensures that the parent `MessageList` sees that the message has content
+                        // and continues to render the `MessageBubble` even if `is_generating` momentarily flips to false
+                        // or if the stream ends abruptly. Solving the "disappearing bubble" regression.
+                        // IMPORTANT: We must also flush thought_signature/thought_summary, otherwise when the stream
+                        // ends (e.g., UNEXPECTED_TOOL_CALL), the message has no content AND no thoughts => pruned.
+                        if was_empty {
+                             let mut state = self.session_state.write();
+                             if let Some(msg) = state.get_message_mut(&message_id) {
+                                 if let crate::components::shared::MessageContent::Text { 
+                                     content: msg_content, 
+                                     thought_signature: msg_thought_sig, 
+                                     thought_summary: msg_thought_sum 
+                                 } = &mut msg.content {
+                                     *msg_content = final_text_for_this_turn.clone();
+                                     *msg_thought_sig = thought_signature_for_this_turn.clone();
+                                     *msg_thought_sum = thought_summary_for_this_turn.clone();
+                                 }
+                             }
+                        }
+
                         is_first_message = false;
                     }
                     StreamMessage::Error { message: error_msg } => {
@@ -140,10 +163,18 @@ impl StreamManagerContext {
                             tool_call.thought_summary = thought_summary_for_this_turn.take();
                         }
                         
+                        // Also propagate the thought signature if it was received in a previous Text part of this turn
+                        if tool_call.thought_signature.is_none() && thought_signature_for_this_turn.is_some() {
+                            tool_call.thought_signature = thought_signature_for_this_turn.take();
+                        }
+                        
                         tool_call_count += 1;
                         let tool_call_message_id = {
                             let mut state = self.session_state.write();
-                            if is_first_message {
+                            // Message Upgrading: If this is the "first" content of the turn, OR if we have only 
+                            // received thinking data so far (final_text is empty), we upgrade the existing 
+                            // placeholder message to a ToolCall instead of splitting into two bubbles.
+                            if is_first_message || final_text_for_this_turn.is_empty() {
                                 if let Some(msg) = state.get_message_mut(&message_id) {
                                     msg.content = crate::components::shared::MessageContent::ToolCall(tool_call.clone());
                                 }

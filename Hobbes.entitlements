@@ -2,13 +2,32 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <!-- App Sandbox (Required for App Store) -->
     <key>com.apple.security.app-sandbox</key>
     <true/>
+
+    <!-- App Identification -->
     <key>com.apple.application-identifier</key>
     <string>ABXVW6PWCW.ai.clearmirror.cai-hobbes</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>ABXVW6PWCW</string>
+
+    <!-- Network Access (Required for Dioxus fullstack + API calls) -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- Keychain Access -->
     <key>keychain-access-groups</key>
     <array>
         <string>ABXVW6PWCW.ai.clearmirror.cai-hobbes</string>
     </array>
+
+    <!-- File Access -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
 </dict>
 </plist>

@@ -149,7 +149,7 @@ pub struct FunctionCall {
     pub thought_signature: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PartResponse {
     #[serde(default)]
@@ -159,6 +159,25 @@ struct PartResponse {
     thought_signature: Option<String>,
     #[serde(default)]
     thought: Option<bool>,
+}
+
+impl From<PartResponse> for Part {
+    fn from(resp: PartResponse) -> Self {
+        if let Some(fc) = resp.function_call {
+            Part::FunctionCall {
+                function_call: FunctionCallPart {
+                    name: fc.name,
+                    args: fc.args,
+                },
+                thought_signature: fc.thought_signature.or(resp.thought_signature),
+            }
+        } else {
+            Part::Text {
+                text: resp.text,
+                thought: resp.thought,
+            }
+        }
+    }
 }
 
 
@@ -207,6 +226,105 @@ impl GeminiConnector {
             format!("models/{}", model)
         };
         format!("{}/{}:{}?key={}", self.base_url, model_path, action, api_key)
+    }
+
+    /// Select the most useful tools from a large toolkit using LLM
+    pub async fn select_tools_for_toolkit(
+        &self,
+        request: &crate::mcp::tool_selection::ToolSelectionRequest,
+    ) -> Result<crate::mcp::tool_selection::ToolSelectionResponse, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::mcp::tool_selection::{build_selection_prompt, parse_selection_response};
+        
+        tracing::info!(
+            model = %self.config.summary_model,
+            toolkit = %request.toolkit_name,
+            tool_count = %request.available_tools.len(),
+            max_tools = %request.max_tools,
+            "LLM: Selecting tools for toolkit"
+        );
+        
+        let api_key = match self.config.api_key.clone() {
+            Some(key) => key,
+            None => match std::env::var("GEMINI_API_KEY") {
+                Ok(key) => key,
+                Err(_) => {
+                    tracing::warn!("Skipping tool selection: GEMINI_API_KEY not set");
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "GEMINI_API_KEY not configured",
+                    )) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+        };
+        
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("Failed to build reqwest client");
+        
+        let prompt = build_selection_prompt(request);
+        
+        let request_body = GeminiRequest {
+            contents: vec![Content {
+                role: "user".to_string(),
+                parts: vec![Part::Text { text: prompt, thought: None }],
+            }],
+            tools: None,
+            system_instruction: None,
+            tool_config: None,
+            generation_config: None,
+        };
+        
+        let url = self.build_model_endpoint(&self.config.summary_model, "generateContent", &api_key);
+        
+        let response = client
+            .post(&url)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
+            tracing::error!("Gemini API Error [{}]: {}", status, body_text);
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("API request failed with status {}: {}", status, body_text),
+            )) as Box<dyn std::error::Error + Send + Sync>);
+        }
+        
+        let response_json: GeminiResponse = response.json().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        if let Some(candidate) = response_json.candidates.get(0) {
+            if let Some(part) = candidate.content.parts.get(0) {
+                tracing::debug!("Raw LLM tool selection response: {}", part.text);
+                
+                match parse_selection_response(&part.text) {
+                    Ok(selection) => {
+                        tracing::info!(
+                            "Tool selection complete: {} tools selected - {}",
+                            selection.selected_tools.len(),
+                            selection.reasoning
+                        );
+                        return Ok(selection);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to parse tool selection response: {}", e);
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            e,
+                        )) as Box<dyn std::error::Error + Send + Sync>);
+                    }
+                }
+            }
+        }
+        
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "No response from LLM for tool selection",
+        )) as Box<dyn std::error::Error + Send + Sync>)
     }
 }
 
@@ -272,7 +390,7 @@ impl LlmConnector for GeminiConnector {
         None
     };
 
-    let request_body = GeminiRequest {
+    let mut request_body = GeminiRequest {
         contents: prompt_data.contents,
         tools: prompt_data.tools.clone(),
         system_instruction: prompt_data.system_instruction,
@@ -377,6 +495,8 @@ impl LlmConnector for GeminiConnector {
         let mut finish_reason: Option<String> = None;
         let mut buffer = Vec::<u8>::new();
         let mut malformed_call_detected = false;
+        let mut unexpected_tool_call_detected = false;
+        let mut current_attempt_parts = Vec::<Part>::new();
 
         while let Some(item) = stream.next().await {
             match item {
@@ -399,6 +519,11 @@ impl LlmConnector for GeminiConnector {
                                                 malformed_call_detected = true;
                                                 break; // Break from inner while to retry
                                             }
+                                            if reason == "UNEXPECTED_TOOL_CALL" {
+                                                tracing::warn!("Unexpected tool call detected on attempt {}. Retrying with correction...", attempt + 1);
+                                                unexpected_tool_call_detected = true;
+                                                break; // Break from inner while to retry
+                                            }
                                             if reason != "STOP" {
                                                 tracing::warn!("Gemini stream finished with reason: {}", reason);
                                             }
@@ -406,6 +531,7 @@ impl LlmConnector for GeminiConnector {
                                         // Process ALL parts - Gemini with thinking returns multiple parts
                                         // (thought parts AND content parts) in a single response
                                         for part in &candidate.content.parts {
+                                            current_attempt_parts.push(Part::from(part.clone()));
                                             // Check if this is a thought summary part first
                                             if part.thought.unwrap_or(false) && !part.text.is_empty() {
                                                 // This is a thought summary - send it as thought_summary
@@ -501,10 +627,16 @@ impl LlmConnector for GeminiConnector {
                                 }
                                 Err(e) => {
                                     tracing::error!("Failed to parse JSON chunk from stream: {}. Chunk: '{}'", e, json_str);
-                                    // Check if this error is due to a malformed call finish reason
+                                    // Check if this is a malformed call finish reason
                                     if json_str.contains("MALFORMED_FUNCTION_CALL") {
                                         tracing::warn!("Malformed function call detected via string search on attempt {}. Retrying...", attempt + 1);
                                         malformed_call_detected = true;
+                                        break; // Break from inner while to retry
+                                    }
+                                    // Check if this is an unexpected tool call finish reason
+                                    if json_str.contains("UNEXPECTED_TOOL_CALL") {
+                                        tracing::warn!("Unexpected tool call detected via string search on attempt {}. Retrying with correction...", attempt + 1);
+                                        unexpected_tool_call_detected = true;
                                         break; // Break from inner while to retry
                                     }
                                     let error_message = "[Hobbes encountered a stream error. Please check the logs for details.]";
@@ -520,7 +652,7 @@ impl LlmConnector for GeminiConnector {
                             }
                         }
                     }
-                    if malformed_call_detected { break; }
+                    if malformed_call_detected || unexpected_tool_call_detected { break; }
                 }
                 Err(e) => {
                     tracing::error!("Error in stream: {}", e);
@@ -529,17 +661,70 @@ impl LlmConnector for GeminiConnector {
             }
         }
 
-        if malformed_call_detected {
+
+        if malformed_call_detected || unexpected_tool_call_detected {
             if attempt + 1 < MAX_RETRIES {
+                tracing::warn!("Retry triggered for stream error (attempt {}/{}). Sleeping 1s...", attempt + 1, MAX_RETRIES);
+                
+                // Ground the model by adding its failed attempt and a correction to the context history
+                // This prevents "model myopia" where the model repeats the same hallucination.
+                if !current_attempt_parts.is_empty() {
+                    request_body.contents.push(Content {
+                        role: "model".to_string(),
+                        parts: current_attempt_parts,
+                    });
+                    
+                    let correction_text = if unexpected_tool_call_detected {
+                        // Generate a list of available tools to help the model correct itself
+                        let available_tools_str = if let Some(context) = &mcp_context {
+                            let mut tools = Vec::new();
+                            for server in &context.servers {
+                                for tool in &server.tools {
+                                     let sanitized_name = crate::gemini::convert::sanitize_function_name(&format!("{}_{}", server.name, tool.name));
+                                     tools.push(format!("- {}", sanitized_name));
+                                }
+                            }
+                            if tools.is_empty() {
+                                "No tools are currently available.".to_string()
+                            } else {
+                                format!("Available tools:\n{}", tools.join("\n"))
+                            }
+                        } else {
+                            "No tools context available.".to_string()
+                        };
+
+                        format!("[System Note]: The previous generation failed because you attempted to call a tool that is not in the `tools` list. \n\n{}\n\nPlease verify the `tools` list and try again. Do not hallucinate function names. If you cannot perform the action with available tools, explain why.", available_tools_str)
+                    } else {
+                        "[System Note]: The previous generation failed because the function call was malformed. Please ensure your tool call matches the defined schema exactly.".to_string()
+                    };
+                    
+                    request_body.contents.push(Content {
+                        role: "user".to_string(),
+                        parts: vec![Part::Text {
+                            text: correction_text,
+                            thought: None,
+                        }],
+                    });
+                }
+                
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue; // Go to the next iteration of the for loop
             } else {
-                tracing::error!("Malformed function call persisted after {} retries. Aborting.", MAX_RETRIES);
-                let _ = tx.send(StreamMessage::Text {
-                    content: "[Hobbes failed to process a tool call after multiple retries.]".to_string(),
+                tracing::error!("Stream error persisted after {} retries. Aborting.", MAX_RETRIES);
+                // Send an explicit failure message to the UI
+                if tx.send(StreamMessage::Text {
+                    content: format!("[Hobbes encountered a persistent error ('{}') after multiple retries. The model may be hallucinating a tool that does not exist.]", 
+                        if unexpected_tool_call_detected { "UNEXPECTED_TOOL_CALL" } else { "MALFORMED_FUNCTION_CALL" }),
                     thought_signature: None,
                     thought_summary: None,
-                });
+                }).is_err() {
+                    tracing::error!("Failed to send final error message to UI.");
+                }
+                // We return here to stop the stream.
+                // The outer 'if !has_sent_data' check might fire too if we didn't send anything earlier, 
+                // but we just sent a message, so we should be good? 
+                // Wait, 'has_sent_data' is local to the attempt loop? No, it's defined inside 'attempt' loop.
+                // So if we 'return', the task ends.
                 return;
             }
         }

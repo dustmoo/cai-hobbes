@@ -7,11 +7,13 @@ APP_PATH="target/dx/Hobbes/release/macos/Hobbes.app"
 BINARY="$APP_PATH/Contents/MacOS/Hobbes"
 PLIST="$APP_PATH/Contents/Info.plist"
 ENTITLEMENTS="Hobbes.entitlements"
-IDENTITY="${HOBBES_SIGNING_ID:-Apple Development: dustin@tulipvalleytech.com (4753E57CRM)}"
+# For App Store distribution, use "3rd Party Mac Developer Application" or "Apple Distribution"
+# For local development/testing, use "Apple Development"
+IDENTITY="${HOBBES_SIGNING_ID:-Apple Distribution: DUSTIN ALAN MOORE (ABXVW6PWCW)}"
 export MACOSX_DEPLOYMENT_TARGET=12.0
 
-echo "=== Building Release Bundle ==="
-dx bundle --release
+echo "=== Building Release App Package ==="
+dx build --release
 
 # Fail-safe: Ensure binary exists in bundle
 if [ ! -f "$BINARY" ]; then
@@ -29,8 +31,26 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 echo ""
-echo "=== Installing Icon (Dioxus 0.6 workaround) ==="
-./scripts/install_icon.sh
+echo "=== Installing Icon (Standard) ==="
+ICON_SOURCE="assets/icon.icns"
+if [ -f "$ICON_SOURCE" ]; then
+    cp "$ICON_SOURCE" "$APP_PATH/Contents/Resources/icon.icns"
+    echo "  ✅ Copied standard icon to bundle"
+else
+    echo "  ⚠️  Standard icon missing at $ICON_SOURCE"
+fi
+
+# Patch version in plist (Dioxus 0.6 workaround)
+VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+if [ -f "$PLIST" ]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$PLIST"
+    
+    BUILD_VERSION=$(echo "$VERSION" | sed 's/-.*//') 
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_VERSION" "$PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_VERSION" "$PLIST"
+    echo "  ✅ Patched version to $VERSION"
+fi
 
 # Wait for the binary to be fully written (dx build may return before linking completes)
 echo "=== Waiting for binary to stabilize ==="
@@ -73,17 +93,30 @@ fi
     /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 12.0" "$PLIST"
 echo "  ✅ Set LSMinimumSystemVersion to 12.0"
 
+# Add attribution/copyright (applies to both Store and Pro)
+/usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright Made w/ ❤️ by Clear Mirror LLC, Gemini 2.5, 3 and Claude model families." "$PLIST" 2>/dev/null || \
+/usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string Made w/ ❤️ by Clear Mirror LLC, Gemini 2.5, 3 and Claude model families." "$PLIST"
+echo "  ✅ Added attribution/copyright"
+
 echo ""
 echo "=== Embedding Provisioning Profile ==="
-PROVISIONING_PROFILE="./embedded.provisionprofile"
+# For Store builds, automatically use dist.provisionprofile
+# This eliminates the need to manually run switch_profile.sh before building
+DIST_PROFILE="./dist.provisionprofile"
+PROVISIONING_PROFILE="${HOBBES_PROVISION_PROFILE:-$DIST_PROFILE}"
+
 if [ "$CI" = "true" ]; then
     echo "  ⚠️  CI Mode: Skipping Provisioning Profile embedding."
 elif [ -f "$PROVISIONING_PROFILE" ]; then
     cp "$PROVISIONING_PROFILE" "$APP_PATH/Contents/embedded.provisionprofile"
-    echo "  ✅ Embedded provisioning profile"
+    echo "  ✅ Embedded provisioning profile from: $PROVISIONING_PROFILE"
+elif [ -f "./embedded.provisionprofile" ]; then
+    # Fallback to existing embedded profile if dist.provisionprofile doesn't exist
+    cp "./embedded.provisionprofile" "$APP_PATH/Contents/embedded.provisionprofile"
+    echo "  ✅ Embedded provisioning profile from: ./embedded.provisionprofile"
 else
-    echo "  ❌ Error: Provisioning profile not found at $PROVISIONING_PROFILE"
-    echo "     Please ensure 'embedded.provisionprofile' is in the project root."
+    echo "  ❌ Error: No provisioning profile found!"
+    echo "     Please ensure 'dist.provisionprofile' is in the project root."
     exit 1
 fi
 

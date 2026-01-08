@@ -12,16 +12,15 @@ INSTALL_LOC="/Applications"
 # Code Signing Identity (for the .app) - Used in build_release.sh
 # Installer Identity (for the .pkg)
 # Note: Installer certs are NOT shown by `-p codesigning`, use `security find-identity -v` without policy filter
-# Fallback order: Env Var -> "3rd Party Mac Developer Installer" -> "Mac Installer Distribution"
 if [ -n "$HOBBES_INSTALLER_SIGNING_ID" ]; then
     INSTALLER_IDENTITY="$HOBBES_INSTALLER_SIGNING_ID"
-elif security find-identity -v | grep -q "3rd Party Mac Developer Installer"; then
-    INSTALLER_IDENTITY=$(security find-identity -v | grep "3rd Party Mac Developer Installer" | head -1 | sed 's/.*"\(.*\)".*/\1/')
 elif security find-identity -v | grep -q "Mac Installer Distribution"; then
     INSTALLER_IDENTITY=$(security find-identity -v | grep "Mac Installer Distribution" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+elif security find-identity -v | grep -q "3rd Party Mac Developer Installer"; then
+    INSTALLER_IDENTITY=$(security find-identity -v | grep "3rd Party Mac Developer Installer" | head -1 | sed 's/.*"\(.*\)".*/\1/')
 else
     echo -e "${RED}❌ No installer signing identity found.${NC}"
-    echo "   Please install a '3rd Party Mac Developer Installer' or 'Mac Installer Distribution' certificate."
+    echo "   Please install a 'Mac Installer Distribution' or '3rd Party Mac Developer Installer' certificate."
     exit 1
 fi
 

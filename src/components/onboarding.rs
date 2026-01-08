@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use crate::settings::{Settings, SettingsManager};
+use crate::settings::{Settings, SettingsManager, KeychainStorageMode, is_sandboxed};
 use crate::services::gemini_models::validate_gemini_api_key;
 
 #[component]
@@ -8,9 +8,14 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
     let settings_manager = use_context::<Signal<SettingsManager>>();
 
     let mut gemini_api_key = use_signal(|| String::new());
+    // Default based on environment
+    let mut keychain_mode = use_signal(|| KeychainStorageMode::default());
     let mut error_message = use_signal(|| String::new());
     let mut success_message = use_signal(|| String::new());
     let mut is_validating = use_signal(|| false);
+    
+    // Detect if we're in a sandboxed environment (App Store/TestFlight)
+    let sandboxed = is_sandboxed();
 
     let save_settings = move |_| {
         if gemini_api_key.read().is_empty() {
@@ -20,6 +25,13 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
 
         // Clone values for async block
         let api_key = gemini_api_key.read().clone();
+        // Defensive check: Pro builds can't use biometric even if setting says so
+        let use_biometric = is_sandboxed() && *keychain_mode.read() == KeychainStorageMode::Biometric;
+        let selected_mode = if is_sandboxed() {
+            keychain_mode.read().clone()
+        } else {
+            KeychainStorageMode::LocalKeychain
+        };
 
         spawn(async move {
             is_validating.set(true);
@@ -28,18 +40,24 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
             // Validate API key before saving
             match validate_gemini_api_key(&api_key).await {
                 Ok(()) => {
-                    // Save API key to keychain with biometric protection if available
+                    // Save API key to keychain based on user's preference
                     let save_result = tokio::task::spawn_blocking({
                         let api_key = api_key.clone();
                         move || {
-                            crate::keychain_ffi::set_generic_password_with_biometric_protection("api_key", &api_key)
-                                .or_else(|e| {
-                                    if let crate::keychain_ffi::KeychainError::SecurityError(-34018) = e {
-                                        crate::keychain_ffi::set_generic_password("api_key", &api_key)
-                                    } else {
-                                        Err(e)
-                                    }
-                                })
+                            if use_biometric {
+                                // Biometric: device-only, Touch ID protected
+                                crate::keychain_ffi::set_generic_password_with_biometric_protection("api_key", &api_key)
+                                    .or_else(|e| {
+                                        if let crate::keychain_ffi::KeychainError::SecurityError(-34018) = e {
+                                            crate::keychain_ffi::set_generic_password("api_key", &api_key)
+                                        } else {
+                                            Err(e)
+                                        }
+                                    })
+                            } else {
+                                // iCloud sync or Local Keychain: regular keychain save
+                                crate::keychain_ffi::set_generic_password("api_key", &api_key)
+                            }
                         }
                     }).await;
                     
@@ -52,6 +70,7 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                     // Update settings signal
                     let mut current_settings = settings.read().clone();
                     current_settings.gemini_config.api_key = Some(api_key);
+                    current_settings.keychain_storage_mode = selected_mode;
                     
                     // Save settings to file
                     if let Err(e) = settings_manager.read().save(&current_settings) {
@@ -115,6 +134,58 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                             href: "https://aistudio.google.com/app/apikey",
                             target: "_blank",
                             "Google AI Studio"
+                        }
+                    }
+                }
+
+                // Keychain Storage Mode - conditional based on environment
+                div {
+                    class: "mb-6 p-3 bg-dark-bg rounded-lg border border-primary-700",
+                    label { class: "block text-sm font-medium text-gray-300 mb-2", "API Key Storage" }
+                    
+                    if sandboxed {
+                        // App Store/TestFlight: Show Biometric and iCloud options
+                        div {
+                            class: "flex gap-2",
+                            button {
+                                class: if *keychain_mode.read() == KeychainStorageMode::Biometric {
+                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white"
+                                } else {
+                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-dark-input text-gray-400 hover:text-white"
+                                },
+                                onclick: move |_| keychain_mode.set(KeychainStorageMode::Biometric),
+                                "🔐 Biometric"
+                            }
+                            button {
+                                class: if *keychain_mode.read() == KeychainStorageMode::ICloudSync {
+                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white"
+                                } else {
+                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-dark-input text-gray-400 hover:text-white"
+                                },
+                                onclick: move |_| keychain_mode.set(KeychainStorageMode::ICloudSync),
+                                "☁️ iCloud Sync"
+                            }
+                        }
+                        p {
+                            class: "text-xs text-gray-400 mt-2",
+                            if *keychain_mode.read() == KeychainStorageMode::Biometric {
+                                "Keys require Touch ID/passcode. Device-only, more secure."
+                            } else {
+                                "Keys sync across your devices via iCloud. No biometric lock."
+                            }
+                        }
+                    } else {
+                        // PRO/Developer ID: Local keychain only (no toggle needed)
+                        div {
+                            class: "flex gap-2",
+                            div {
+                                class: "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white text-center",
+                                "🔑 Local Keychain"
+                            }
+                        }
+                        p {
+                            class: "text-xs text-gray-400 mt-2",
+                            "API key stored securely in your local keychain."
                         }
                     }
                 }

@@ -495,6 +495,7 @@ fn build_success_response() -> String {
     let html = r#"<!DOCTYPE html>
 <html>
 <head>
+    <meta charset="utf-8">
     <title>Authorization Successful</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: white; }
@@ -514,9 +515,12 @@ fn build_success_response() -> String {
 </body>
 </html>"#;
     
+    // Calculate length specifically for UTF-8 bytes to ensure correct Content-Length
+    let html_bytes = html.as_bytes();
+    
     format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        html.len(),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        html_bytes.len(),
         html
     )
 }
@@ -526,6 +530,7 @@ fn build_error_response(error: &str) -> String {
     let html = format!(r#"<!DOCTYPE html>
 <html>
 <head>
+    <meta charset="utf-8">
     <title>Authorization Failed</title>
     <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: white; }}
@@ -546,9 +551,11 @@ fn build_error_response(error: &str) -> String {
 </body>
 </html>"#, error);
     
+    let html_bytes = html.as_bytes();
+
     format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        html.len(),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        html_bytes.len(),
         html
     )
 }

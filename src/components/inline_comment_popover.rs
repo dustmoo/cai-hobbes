@@ -26,10 +26,11 @@ pub fn InlineCommentPopover(
                 onkeydown: move |evt: KeyboardEvent| {
                     if evt.key() == Key::Enter {
                         let modifiers = evt.modifiers();
-                        if modifiers.contains(Modifiers::SHIFT) {
+                        // CMD+Enter or Shift+Enter = newline (don't submit)
+                        if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::SHIFT) {
                             return;
                         }
-                        // Allow CMD+Enter or just Enter (without shift) to submit
+                        // Plain Enter = submit
                         if !comment_text().trim().is_empty() {
                             evt.prevent_default();
                             on_save.call(comment_text());

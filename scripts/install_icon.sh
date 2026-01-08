@@ -6,8 +6,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-# Source icon
-ICON_SOURCE="$PROJECT_ROOT/assets/icon.icns"
+# Select icon based on variant (default: standard)
+if [ "$HOBBES_VARIANT" = "pro" ]; then
+    ICON_SOURCE="$PROJECT_ROOT/assets/icon-pro.icns"
+    echo "Using Pro icon variant"
+else
+    ICON_SOURCE="$PROJECT_ROOT/assets/icon.icns"
+    echo "Using Standard icon variant"
+fi
 
 # Extract version from Cargo.toml
 VERSION=$(grep '^version' "$PROJECT_ROOT/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')

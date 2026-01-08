@@ -28,21 +28,29 @@ impl ConversationProcessor {
             });
 
         // 2. Get the last 5 messages and format them
-        let recent_history: String = session
+        let messages_vec: Vec<String> = session
             .messages
             .iter()
-           .rev()
-           .take(5)
-           .rev()
-           .map(|m| {
-               let content_str = match &m.content {
-                   MessageContent::Text { content: text, .. } => text.clone(),
-                   MessageContent::ToolCall(tc) => format!("[Tool Call: {}]", tc.tool_name),
-                   MessageContent::PermissionRequest(tc) => format!("[Permission Request for Tool: {}]", tc.tool_name),
-                   MessageContent::Error { message } => format!("[Error: {}]", message),
-               };
-               format!("{}: {}", m.author, content_str)
-           })
+            .rev()
+            .take(5)
+            .rev()
+            .map(|m| {
+                let content_str = match &m.content {
+                    MessageContent::Text { content: text, .. } => text.clone(),
+                    MessageContent::ToolCall(tc) => format!("[Tool Call: {}]", tc.tool_name),
+                    MessageContent::PermissionRequest(tc) => format!("[Permission Request for Tool: {}]", tc.tool_name),
+                    MessageContent::Error { message } => format!("[Error: {}]", message),
+                };
+                format!("{}: {}", m.author, content_str)
+            })
+            .collect();
+
+        // Inject active profile context to help the summarizer detect profile switches
+        let active_profile_name = _settings.active_composio_profile.clone().unwrap_or_else(|| "None".to_string());
+        let system_note = format!("[System Note: Current Active Composio Profile is '{}'. If this differs from the previous summary, update the summary to reflect the new profile.]", active_profile_name);
+        
+        let recent_history = std::iter::once(system_note)
+            .chain(messages_vec.into_iter())
             .collect::<Vec<String>>()
             .join("\n");
 

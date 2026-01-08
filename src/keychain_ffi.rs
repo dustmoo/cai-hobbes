@@ -16,6 +16,7 @@ use core_foundation::string::CFString;
 use std::ptr;
 
 use crate::constants::SERVICE_NAME;
+use crate::settings::is_sandboxed;
 
 // Import the Security framework constants we need
 // Note: extern blocks must be unsafe in edition 2024
@@ -32,7 +33,11 @@ unsafe extern "C" {
     static kSecAttrAccessControl: CFTypeRef;
     #[allow(dead_code)]
     static kSecAttrAccessible: CFTypeRef;
+    static kSecAttrAccessibleWhenUnlocked: CFTypeRef;
     static kSecAttrAccessibleWhenUnlockedThisDeviceOnly: CFTypeRef;
+    static kSecAttrAccessGroup: CFTypeRef;
+    static kSecAttrSynchronizable: CFTypeRef;
+    static kSecAttrSynchronizableAny: CFTypeRef;
 
     fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTypeRef) -> i32;
     fn SecItemAdd(attributes: CFTypeRef, result: *mut CFTypeRef) -> i32;
@@ -59,6 +64,22 @@ const ERR_SEC_SUCCESS: i32 = 0;
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 const ERR_SEC_USER_CANCELED: i32 = -128;
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
+
+/// The keychain access group - must match the keychain-access-groups in entitlements.
+/// Format: <TeamID>.<BundleID>
+/// Only used for sandboxed (App Store/TestFlight) builds - PRO builds use default access.
+const KEYCHAIN_ACCESS_GROUP: &str = "ABXVW6PWCW.ai.clearmirror.cai-hobbes";
+
+/// Helper to conditionally set access group (only for sandboxed builds)
+unsafe fn set_access_group_if_sandboxed(query: &CFMutableDictionary) {
+    if is_sandboxed() {
+        let access_group = CFString::new(KEYCHAIN_ACCESS_GROUP);
+        unsafe {
+            dict_set(query, kSecAttrAccessGroup, access_group.as_concrete_TypeRef() as CFTypeRef);
+        }
+    }
+    // For PRO/Developer ID builds, omit access group to use default keychain access
+}
 
 /// Error types for keychain operations
 #[derive(Debug, Clone)]
@@ -123,8 +144,12 @@ pub fn find_generic_password_with_context(
         dict_set(&query, kSecClass, kSecClassGenericPassword);
         dict_set(&query, kSecAttrService, service_name.as_concrete_TypeRef() as CFTypeRef);
         dict_set(&query, kSecAttrAccount, account_name.as_concrete_TypeRef() as CFTypeRef);
+        set_access_group_if_sandboxed(&query);
         dict_set(&query, kSecMatchLimit, kSecMatchLimitOne);
         dict_set(&query, kSecReturnData, CFBoolean::true_value().as_concrete_TypeRef() as CFTypeRef);
+        
+        // Search for both local and synchronizable items
+        dict_set(&query, kSecAttrSynchronizable, kSecAttrSynchronizableAny);
 
         // Set the authentication context - this is the key to avoiding repeated prompts!
         // The LAContext from biometric auth will be used for this keychain access.
@@ -185,8 +210,12 @@ pub fn find_generic_password(account: &str) -> Result<String, KeychainError> {
         dict_set(&query, kSecClass, kSecClassGenericPassword);
         dict_set(&query, kSecAttrService, service_name.as_concrete_TypeRef() as CFTypeRef);
         dict_set(&query, kSecAttrAccount, account_name.as_concrete_TypeRef() as CFTypeRef);
+        set_access_group_if_sandboxed(&query);
         dict_set(&query, kSecMatchLimit, kSecMatchLimitOne);
         dict_set(&query, kSecReturnData, CFBoolean::true_value().as_concrete_TypeRef() as CFTypeRef);
+        
+        // Search for both local and synchronizable items
+        dict_set(&query, kSecAttrSynchronizable, kSecAttrSynchronizableAny);
     }
 
     let mut result: CFTypeRef = ptr::null();
@@ -242,7 +271,17 @@ pub fn set_generic_password(account: &str, password: &str) -> Result<(), Keychai
         dict_set(&query, kSecClass, kSecClassGenericPassword);
         dict_set(&query, kSecAttrService, service_name.as_concrete_TypeRef() as CFTypeRef);
         dict_set(&query, kSecAttrAccount, account_name.as_concrete_TypeRef() as CFTypeRef);
+        set_access_group_if_sandboxed(&query);
         dict_set(&query, kSecValueData, password_data.as_concrete_TypeRef() as CFTypeRef);
+        
+        // Make the item synchronizable (syncs via iCloud) ONLY if sandboxed (provisioned)
+        // PRO builds without provisioning profiles cannot use iCloud Keychain
+        if is_sandboxed() {
+            dict_set(&query, kSecAttrSynchronizable, CFBoolean::true_value().as_concrete_TypeRef() as CFTypeRef);
+        }
+        
+        // Use standard "WhenUnlocked" protection (required for sync, "ThisDeviceOnly" prevents it)
+        dict_set(&query, kSecAttrAccessible, kSecAttrAccessibleWhenUnlocked);
     }
 
     let status = unsafe { SecItemAdd(query.as_concrete_TypeRef() as CFTypeRef, ptr::null_mut()) };
@@ -271,6 +310,10 @@ pub fn delete_generic_password(account: &str) -> Result<(), KeychainError> {
         dict_set(&query, kSecClass, kSecClassGenericPassword);
         dict_set(&query, kSecAttrService, service_name.as_concrete_TypeRef() as CFTypeRef);
         dict_set(&query, kSecAttrAccount, account_name.as_concrete_TypeRef() as CFTypeRef);
+        set_access_group_if_sandboxed(&query);
+        
+        // Ensure we find synchronizable items to delete them
+        dict_set(&query, kSecAttrSynchronizable, kSecAttrSynchronizableAny);
     }
 
     let status = unsafe { SecItemDelete(query.as_concrete_TypeRef() as CFTypeRef) };
@@ -309,7 +352,7 @@ pub fn set_generic_password_with_biometric_protection(
         let mut error: CFTypeRef = ptr::null();
         let ac = SecAccessControlCreateWithFlags(
             ptr::null(),  // Use default allocator
-            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,  // Protection class
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,  // Device-only (biometrics can't sync)
             SEC_ACCESS_CONTROL_USER_PRESENCE,  // Requires biometric OR passcode
             &mut error,
         );
@@ -334,7 +377,12 @@ pub fn set_generic_password_with_biometric_protection(
         dict_set(&query, kSecClass, kSecClassGenericPassword);
         dict_set(&query, kSecAttrService, service_name.as_concrete_TypeRef() as CFTypeRef);
         dict_set(&query, kSecAttrAccount, account_name.as_concrete_TypeRef() as CFTypeRef);
+        set_access_group_if_sandboxed(&query);
         dict_set(&query, kSecValueData, password_data.as_concrete_TypeRef() as CFTypeRef);
+        
+        // NOTE: Biometric items (kSecAttrAccessControl with userPresence) CANNOT be synchronizable.
+        // The Secure Enclave binds them to this device. Do NOT set kSecAttrSynchronizable here.
+        
         // This is the key: set the access control to require user presence!
         dict_set(&query, kSecAttrAccessControl, access_control);
     }

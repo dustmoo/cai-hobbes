@@ -38,6 +38,12 @@ struct FeaturedMcp {
     args: Vec<String>,
     env_vars: Vec<String>,
     homepage: String,
+    /// Primary auth scheme for this toolkit (e.g., "OAUTH2", "API_KEY")
+    #[serde(default)]
+    auth_scheme: Option<String>,
+    /// Whether Composio managed auth is available (true for OAuth apps Composio supports)
+    #[serde(default)]
+    use_managed_auth: bool,
 }
 
 impl From<SmitheryServer> for FeaturedMcp {
@@ -50,6 +56,8 @@ impl From<SmitheryServer> for FeaturedMcp {
             args: vec!["-y".to_string(), "@smithery/cli@latest".to_string(), "run".to_string(), server.qualified_name],
             env_vars: vec![], // This will be populated by the detailed fetch
             homepage: server.homepage,
+            auth_scheme: None, // Not applicable for Smithery
+            use_managed_auth: false,
         }
     }
 }
@@ -58,6 +66,8 @@ impl From<ComposioToolkitListing> for FeaturedMcp {
     fn from(toolkit: ComposioToolkitListing) -> Self {
         let description = toolkit.description().unwrap_or_default();
         let homepage = toolkit.app_url().unwrap_or_else(|| format!("https://app.composio.dev/app/{}", toolkit.slug));
+        let use_managed_auth = toolkit.supports_managed_auth();
+        let auth_scheme = toolkit.primary_auth_scheme();
         FeaturedMcp {
             name: toolkit.slug,
             display_name: toolkit.name,
@@ -66,6 +76,8 @@ impl From<ComposioToolkitListing> for FeaturedMcp {
             args: vec![],
             env_vars: vec![],
             homepage,
+            auth_scheme,
+            use_managed_auth,
         }
     }
 }
@@ -80,6 +92,8 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             args: vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string(), "/path/to/allowed/dir".to_string()],
             env_vars: vec![],
             homepage: "".to_string(),
+            auth_scheme: None,
+            use_managed_auth: false,
         },
         FeaturedMcp {
             name: "brave-search".to_string(),
@@ -89,6 +103,8 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             args: vec!["-y".to_string(), "@modelcontextprotocol/server-brave-search".to_string()],
             env_vars: vec!["BRAVE_API_KEY".to_string()],
             homepage: "".to_string(),
+            auth_scheme: None,
+            use_managed_auth: false,
         },
         FeaturedMcp {
             name: "github".to_string(),
@@ -98,6 +114,8 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             args: vec!["-y".to_string(), "@modelcontextprotocol/server-github".to_string()],
             env_vars: vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()],
             homepage: "".to_string(),
+            auth_scheme: None,
+            use_managed_auth: false,
         },
         FeaturedMcp {
             name: "postgres".to_string(),
@@ -107,6 +125,8 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             args: vec!["-y".to_string(), "@modelcontextprotocol/server-postgres".to_string(), "<YOUR_POSTGRES_CONNECTION_STRING>".to_string()],
             env_vars: vec![],
             homepage: "".to_string(),
+            auth_scheme: None,
+            use_managed_auth: false,
         },
         FeaturedMcp {
             name: "google-maps".to_string(),
@@ -116,6 +136,8 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             args: vec!["-y".to_string(), "@modelcontextprotocol/server-google-maps".to_string()],
             env_vars: vec!["GOOGLE_MAPS_API_KEY".to_string()],
             homepage: "".to_string(),
+            auth_scheme: None,
+            use_managed_auth: false,
         },
     ]
 }
@@ -873,7 +895,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let mut is_retrying = use_signal(|| false);
     
     // Toolkit management state (only relevant for Composio)
-    let is_composio = status.name == "composio";
+    let is_composio = status.name == "composio-native";
     let mut show_toolkits = use_signal(|| false);
     let mut toolkits: Signal<Vec<crate::mcp::composio_client::ToolkitInfo>> = use_signal(|| Vec::new());
     let mut toolkits_loading = use_signal(|| false);
@@ -938,6 +960,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                 Ok(_) => tracing::debug!("Retry initiated for {}", server_name),
                 Err(e) => tracing::error!("Failed to retry {}: {}", server_name, e),
             }
+            // Reset retrying state after operation completes
+            is_retrying.set(false);
         });
     };
 
@@ -985,8 +1009,9 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     "{status.tools} tools"
                                 }
                             }
-                            // Load/Unload toggle for local MCPs (not Composio, not error/disabled)
-                            if !is_composio && status.status == ServerStatus::Loaded {
+                            // Load/Unload toggle for local MCPs (not Composio, not error (unless retriable? no, error handles retry separately))
+                            // We now allow Disabled status because user-unloaded servers are reported as Disabled.
+                            if !is_composio && (status.status == ServerStatus::Loaded || status.status == ServerStatus::Disabled) {
                                 {
                                     let server_name = status.name.clone();
                                     let current_is_loaded = status.is_loaded;
@@ -1333,6 +1358,7 @@ fn McpServerCard(
     
     // Connection state for Composio Connect button
     let mut is_connecting = use_signal(|| false);
+    let mut connection_status: Signal<String> = use_signal(|| "Connect".to_string());
     let mut connection_error: Signal<Option<String>> = use_signal(|| None);
     
     // Source-aware install detection:
@@ -1414,16 +1440,28 @@ fn McpServerCard(
                                     },
                                     disabled: *is_connecting.read(),
                                     onclick: {
+                                        if mcp.name == "news_api" {
+                                            tracing::error!("DEBUG: Rendering Connect button for news_api. Auth: {:?}, Managed: {}", mcp.auth_scheme, mcp.use_managed_auth);
+                                        }
                                         let toolkit_slug = mcp.name.clone();
+                                        let auth_scheme = mcp.auth_scheme.clone();
+                                        let use_managed_auth = mcp.use_managed_auth;
                                         let settings = settings.clone();
+                                        let mcp_manager = mcp_manager.clone();
+                                        let trigger_search = trigger_search.clone();
                                         move |_| {
                                             let toolkit_slug = toolkit_slug.clone();
+                                            let auth_scheme = auth_scheme.clone();
                                             let settings = settings.clone();
+                                            let mcp_manager = mcp_manager.clone();
+                                            let mut trigger_search = trigger_search.clone();
                                             is_connecting.set(true);
+                                            connection_status.set("Connecting...".to_string());
                                             connection_error.set(None);
                                             
                                             spawn(async move {
-                                                tracing::info!("Initiating Composio connection for toolkit: {}", toolkit_slug);
+                                                tracing::info!("Initiating Composio connection for toolkit: {} (auth_scheme: {:?}, managed: {})", 
+                                                    toolkit_slug, auth_scheme, use_managed_auth);
                                                 
                                                 let settings_snapshot = settings.peek().clone();
                                                 if let Some(profile) = settings_snapshot.get_active_profile() {
@@ -1441,21 +1479,106 @@ fn McpServerCard(
                                                             profile.user_id.clone(),
                                                         );
                                                         
-                                                        // Step 1: Add toolkit to MCP server via PATCH API
-                                                        if let Err(e) = client.add_toolkit_to_server(&toolkit_slug).await {
+                                                        // Step 1: Create auth config with correct auth scheme
+                                                        let auth_config_id = match client.create_auth_config(
+                                                            &toolkit_slug,
+                                                            auth_scheme.as_deref(),
+                                                            use_managed_auth,
+                                                        ).await {
+                                                            Ok(id) => {
+                                                                tracing::info!("Created auth config '{}' for toolkit '{}'", id, toolkit_slug);
+                                                                id
+                                                            }
+                                                            Err(e) => {
+                                                                connection_error.set(Some(format!("Failed to create auth config: {}", e)));
+                                                                tracing::error!("Failed to create auth config for {}: {}", toolkit_slug, e);
+                                                                is_connecting.set(false);
+                                                                return;
+                                                            }
+                                                        };
+                                                        
+                                                        // Step 2: Smart tool selection for large toolkits
+                                                        // Get tool details and use LLM to select if > threshold
+                                                        use crate::mcp::tool_selection::{TOOL_SELECTION_THRESHOLD, ToolSelectionRequest, ToolCandidate};
+                                                        
+                                                        let selected_tools: Option<Vec<String>> = match client.get_toolkit_tools_detailed(&toolkit_slug).await {
+                                                            Ok(tools) if tools.len() > TOOL_SELECTION_THRESHOLD => {
+                                                                // Update status with tool count so user understands the wait
+                                                                connection_status.set(format!("Selecting from {} tools...", tools.len()));
+                                                                
+                                                                tracing::info!("Toolkit '{}' has {} tools (> {}), using smart selection", 
+                                                                    toolkit_slug, tools.len(), TOOL_SELECTION_THRESHOLD);
+                                                                
+                                                                // Build tool candidates for LLM
+                                                                let candidates: Vec<ToolCandidate> = tools.into_iter()
+                                                                    .map(|(name, desc)| ToolCandidate { name, description: desc })
+                                                                    .collect();
+                                                                
+                                                                let request = ToolSelectionRequest::new(
+                                                                    toolkit_slug.clone(),
+                                                                    None, // No toolkit description available here
+                                                                    candidates,
+                                                                );
+                                                                
+                                                                // Call LLM for tool selection
+                                                                let settings_snap = settings.peek().clone();
+                                                                let llm_connector = crate::components::llm::GeminiConnector::new(
+                                                                    settings_snap.gemini_config.clone()
+                                                                );
+                                                                
+                                                                match llm_connector.select_tools_for_toolkit(&request).await {
+                                                                    Ok(selection) => {
+                                                                        tracing::info!("Smart selection for '{}': {} tools - {}", 
+                                                                            toolkit_slug, selection.selected_tools.len(), selection.reasoning);
+                                                                        Some(selection.selected_tools)
+                                                                    }
+                                                                    Err(e) => {
+                                                                        tracing::warn!("LLM tool selection failed for '{}': {}. Falling back to first {} tools.", 
+                                                                            toolkit_slug, e, TOOL_SELECTION_THRESHOLD);
+                                                                        // Fallback: use first N tools alphabetically
+                                                                        None
+                                                                    }
+                                                                }
+                                                            }
+                                                            Ok(_) => {
+                                                                // Small toolkit - enable all tools
+                                                                tracing::debug!("Toolkit '{}' has <= {} tools, enabling all", toolkit_slug, TOOL_SELECTION_THRESHOLD);
+                                                                None
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!("Failed to get toolkit tools for '{}': {}. Will use default behavior.", toolkit_slug, e);
+                                                                None
+                                                            }
+                                                        };
+                                                        
+                                                        // Step 3: Add toolkit to MCP server with optional pre-selected tools
+                                                        if let Err(e) = client.add_toolkit_to_server(&toolkit_slug, &auth_config_id, selected_tools).await {
                                                             tracing::error!("Failed to add toolkit to MCP server: {}", e);
-                                                            // Continue anyway - OAuth might still work if toolkit exists
+                                                            // Continue anyway - OAuth might still work if server already has it
                                                         }
                                                         
-                                                        // Step 2: Initiate OAuth connection
+                                                        // Step 4: Initiate OAuth/connection flow
+                                                        connection_status.set("Authenticating...".to_string());
                                                         match client.initiate_connection(&toolkit_slug, &user_id).await {
-                                                            Ok(auth_url) => {
-                                                                tracing::info!("Opening OAuth URL for {}: {}", toolkit_slug, auth_url);
-                                                                if let Err(e) = open::that(&auth_url) {
-                                                                    connection_error.set(Some(format!("Failed to open browser: {}", e)));
-                                                                    tracing::error!("Failed to open browser: {}", e);
+                                                            Ok(result_msg) => {
+                                                                tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
+                                                                
+                                                                // Reload Composio tools to pick up newly enabled tools
+                                                                let updated_settings = settings.peek().clone();
+                                                                if let Err(e) = mcp_manager.read().reload_composio_tools(&updated_settings).await {
+                                                                    tracing::warn!("Failed to reload Composio tools after connection: {}", e);
                                                                 }
-                                                                // Keep spinner briefly, then reset
+                                                                
+                                                                // Trigger UI refresh
+                                                                let current = *trigger_search.peek();
+                                                                trigger_search.set(current + 1);
+                                                                
+                                                                // Update connected_slugs immediately so button shows "Connected"
+                                                                {
+                                                                    let mut slugs = connected_slugs.write();
+                                                                    slugs.insert(toolkit_slug.to_lowercase());
+                                                                }
+                                                                
                                                                 is_connecting.set(false);
                                                             }
                                                             Err(e) => {
@@ -1477,12 +1600,13 @@ fn McpServerCard(
                                             });
                                         }
                                     },
+
                                     if *is_connecting.read() {
                                         // Spinner icon (CSS animation)
                                         span {
                                             class: "inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"
                                         }
-                                        "Connecting..."
+                                        "{connection_status}"
                                     } else {
                                         "Connect"
                                     }

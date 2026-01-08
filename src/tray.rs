@@ -11,7 +11,13 @@ pub static WINDOW_VISIBLE: GlobalSignal<bool> = Signal::global(|| true);
 pub static APP_QUIT: GlobalSignal<bool> = Signal::global(|| false);
 
 pub fn init_tray() -> TrayIcon {
-    let image_bytes = include_bytes!("../assets/favicon.png");
+    // Runtime Branding: Select tray icon based on distribution variant.
+    // Sandboxed (App Store) = standard favicon, Unsandboxed (Pro) = pro icon.
+    let image_bytes: &[u8] = if crate::settings::is_sandboxed() {
+        include_bytes!("../assets/favicon.png")
+    } else {
+        include_bytes!("../assets/icon-pro-tray.png")
+    };
     let image = image::load_from_memory(image_bytes)
         .expect("Failed to load icon from memory")
         .to_rgba8();

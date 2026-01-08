@@ -180,11 +180,28 @@ impl<'a> PromptBuilder<'a> {
         }
         
         active_context.system_persona = Some(persona);
-        active_context.mcp_tools = None; // Exclude tools from the instruction text.
+        
+        // Extract MCP server info BEFORE nulling mcp_tools - so LLM knows what each server is
+        let mcp_servers_info: Option<Vec<serde_json::Value>> = active_context.mcp_tools.as_ref().map(|ctx| {
+            ctx.servers.iter().map(|server| {
+                serde_json::json!({
+                    "name": server.name,
+                    "description": server.description,
+                    "tools_count": server.tools.len()
+                })
+            }).collect()
+        });
+        
+        active_context.mcp_tools = None; // Exclude full tool definitions from the instruction text.
 
         let mut system_context_map = serde_json::Map::new();
         if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(&active_context) {
             system_context_map = map;
+        }
+        
+        // Re-add summarized MCP server info so LLM understands available servers
+        if let Some(servers) = mcp_servers_info {
+            system_context_map.insert("mcp_servers".to_string(), serde_json::Value::Array(servers));
         }
 
         // Determine the user's name, prioritizing settings over conversation summary.
@@ -218,6 +235,22 @@ impl<'a> PromptBuilder<'a> {
                 "timezone": "Local"
             }),
         );
+
+        // Check for fully configured Composio profiles and inject context
+        if self.settings.composio_profiles.iter().any(|p| p.is_fully_configured()) {
+            let active_profile_name = self.settings.get_active_profile()
+                .map(|p| p.name.as_str())
+                .unwrap_or("Default");
+            
+            system_context_map.insert(
+                "composio_context".to_string(),
+                json!({
+                    "info": "You have access to external tools via Composio. Integrations are managed through 'Profiles'.",
+                    "active_profile": active_profile_name,
+                    "instruction": format!("The currently active profile determining your available tool connections is: '{}'.", active_profile_name)
+                })
+            );
+        }
 
         let persona = system_context_map.remove("system_persona")
             .and_then(|v| v.as_str().map(|s| s.to_string()))

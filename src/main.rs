@@ -7,6 +7,7 @@ use dioxus::desktop::tao::event::{Event, WindowEvent};
 use dioxus_logger;
 use tracing;
 use dotenvy::dotenv;
+use futures_util::StreamExt;
 
 mod components;
 mod constants;
@@ -44,7 +45,11 @@ fn main() {
     let initial_width = initial_state.window_width;
     let initial_height = initial_state.window_height;
 
-    let menu = menu::build_menu();
+    // Load settings for menu
+    let settings_manager = settings::SettingsManager::new(get_settings_path());
+    let initial_settings = settings_manager.load();
+
+    let menu = menu::build_menu(&initial_settings);
     LaunchBuilder::new()
         .with_cfg(
             Config::new()
@@ -52,7 +57,7 @@ fn main() {
                 .with_window(
                     {
                         let mut window = WindowBuilder::new()
-                            .with_title(env!("APP_NAME"))
+                            .with_title(settings::get_app_name())
                             .with_visible(true)
                             .with_resizable(true)
                             .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(initial_width, initial_height));
@@ -112,6 +117,18 @@ fn get_ui_state_path() -> PathBuf {
         .join("ui_state.json")
 }
 
+#[derive(Clone, Debug)]
+pub enum MenuAction {
+    Quit,
+    Settings,
+    History,
+    Mcp,
+    Profile,
+    Attachments,
+}
+
+use crate::components::chat_input::ChatCommand;
+
 #[component]
 fn RestartRequired() -> Element {
     rsx! {
@@ -165,26 +182,34 @@ fn app() -> Element {
                 let loaded_secrets = tokio::task::spawn_blocking(move || {
                     let mut sm = secret_manager::SecretManager::new();
                     
+                // Check if Provisioning Profile exists (required for Biometric Keychain Access Groups)
+                let biometrics_enabled = crate::settings::is_sandboxed();
+
                     // Step 1: Attempt biometric authentication (single prompt)
-                    let auth_context = match biometric_auth::AuthContext::authenticate(
-                        "Hobbes needs access to your saved credentials"
-                    ) {
-                        biometric_auth::AuthResult::Success(ctx) => {
-                            tracing::info!("Biometric authentication successful, loading secrets with context");
-                            Some(ctx)
-                        }
-                        biometric_auth::AuthResult::Cancelled => {
-                            tracing::info!("User cancelled biometric auth, falling back to regular keychain access");
-                            None
-                        }
-                        biometric_auth::AuthResult::NotAvailable(reason) => {
-                            tracing::info!("Biometric auth not available ({}), using regular keychain access", reason);
-                            None
-                        }
-                        biometric_auth::AuthResult::Failed(error) => {
-                            tracing::warn!("Biometric auth failed: {}, using regular keychain access", error);
-                            None
-                        }
+                    let auth_context = if biometrics_enabled {
+                        match biometric_auth::AuthContext::authenticate(
+                            "Hobbes needs access to your saved credentials"
+                        ) {
+                            biometric_auth::AuthResult::Success(ctx) => {
+                                tracing::info!("Biometric authentication successful, loading secrets with context");
+                                Some(ctx)
+                            }
+                            biometric_auth::AuthResult::Cancelled => {
+                                tracing::info!("User cancelled biometric auth, falling back to regular keychain access");
+                                None
+                            }
+                            biometric_auth::AuthResult::NotAvailable(reason) => {
+                                tracing::info!("Biometric auth not available ({}), using regular keychain access", reason);
+                                None
+                            }
+                            biometric_auth::AuthResult::Failed(error) => {
+                                tracing::warn!("Biometric auth failed: {}, using regular keychain access", error);
+                                None
+                            }
+                        } 
+                    } else {
+                        tracing::info!("Provisioning profile missing (Pro/Direct Mode). Skipping biometric auth to prevent keychain hang.");
+                        None
                     };
                     
                     // Step 2: Load secrets with or without the authenticated context
@@ -341,9 +366,16 @@ fn app() -> Element {
     let mut show_confirm_modal = use_context_provider(|| Signal::new(false));
     let session_to_delete = use_context_provider(|| Signal::new(String::new()));
 
+    let mut chat_command = use_context_provider(|| Signal::new(None::<ChatCommand>));
+
+    // Call the summarization scheduler hook BEFORE the hotkey manager
+    // This provides the SchedulerSignal context needed by use_profile_hotkeys
+    processing::summarization_scheduler::use_summarization_scheduler();
+
     // Unconditionally call the hotkey manager hook, passing in the permission status signal.
     // The hook itself will handle the conditional logic internally.
     hotkey::use_hotkey_manager(permission_status_signal);
+    hotkey::use_profile_hotkeys();
 
     // This handler continuously updates the last known size during a resize.
     use_wry_event_handler(move |event, _| {
@@ -354,20 +386,68 @@ fn app() -> Element {
         }
     });
 
-    // One-time setup for the menu
-    use_effect(move || {
+    let menu_handler = use_coroutine(move |mut rx: UnboundedReceiver<MenuAction>| async move {
+        while let Some(action) = rx.next().await {
+            tracing::info!("MenuHandler received action: {:?}", action);
+            match action {
+                MenuAction::Quit => {
+                    let mut app_quit = APP_QUIT.write();
+                    *app_quit = true;
+                }
+                MenuAction::Settings => {
+                    tracing::info!("MenuAction::Settings triggered");
+                    chat_command.set(Some(ChatCommand::ToggleSettings));
+                }
+                MenuAction::History => {
+                    tracing::info!("MenuAction::History triggered");
+                    chat_command.set(Some(ChatCommand::ToggleHistory));
+                }
+                MenuAction::Mcp => {
+                     tracing::info!("MenuAction::Mcp triggered");
+                     chat_command.set(Some(ChatCommand::ToggleMcp));
+                }
+                MenuAction::Profile => {
+                    tracing::info!("MenuAction::Profile triggered");
+                    chat_command.set(Some(ChatCommand::ToggleProfile));
+                }
+                MenuAction::Attachments => {
+                    tracing::info!("MenuAction::Attachments triggered");
+                    chat_command.set(Some(ChatCommand::OpenAttachments));
+                }
+            }
+        }
+    });
+
+    // One-time setup for the menu event loop
+    // We use use_hook to ensure the thread is only spawned once.
+    use_hook(move || {
         let menu_channel = MenuEvent::receiver();
+        let tx = menu_handler.tx();
         std::thread::spawn(move || {
+            tracing::info!("Menu event loop started");
             loop {
                 if let Ok(event) = menu_channel.recv() {
-                    if event.id.0 == "quit" {
-                        let mut app_quit = APP_QUIT.write();
-                        *app_quit = true;
+                    tracing::info!("Native MenuEvent received: {:?}", event.id);
+                    let action = match event.id.0.as_str() {
+                        "quit" => Some(MenuAction::Quit),
+                        "settings" => Some(MenuAction::Settings),
+                        "view_history" => Some(MenuAction::History),
+                        "view_mcp" => Some(MenuAction::Mcp),
+                        "view_profile" => Some(MenuAction::Profile),
+                        "view_attachments" => Some(MenuAction::Attachments),
+                        _ => None,
+                    };
+
+                    if let Some(action) = action {
+                         tracing::info!("Dispatching menu action: {:?}", action);
+                         let _ = tx.unbounded_send(action);
                     }
                 }
             }
         });
     });
+
+
     // Effect to manage the tray icon's visibility based on settings
     use_effect(move || {
         let show = settings.read().show_tray_icon;
@@ -397,6 +477,7 @@ fn app() -> Element {
 
         window_clone.set_visible(visible);
         if visible {
+            window_clone.set_focus();
             tracing::debug!("Window is visible, centering on current monitor.");
             let main_window = &window_clone.window;
             if let Some(monitor) = main_window.current_monitor() {
@@ -482,29 +563,29 @@ fn app() -> Element {
                 }
             }
         } else {
-            processing::summarization_scheduler::SummarizationScheduler {
-                StreamManager {
-                    ConfirmDeleteModal {
-                        is_visible: show_confirm_modal,
-                        title: "Delete Session".to_string(),
-                        message: "Are you sure you want to delete this session? This action cannot be undone.".to_string(),
-                        on_cancel: move |_| show_confirm_modal.set(false),
-                        on_confirm: move |remember| {
-                            let id_to_delete_str = session_to_delete.read().clone();
-                            if !id_to_delete_str.is_empty() {
-                                session_state.write().delete_session(&id_to_delete_str);
+            // SummarizationScheduler component removed; hook called above.
+            StreamManager {
+                ConfirmDeleteModal {
+                    is_visible: show_confirm_modal,
+                    title: "Delete Session".to_string(),
+                    message: "Are you sure you want to delete this session? This action cannot be undone.".to_string(),
+                    on_cancel: move |_| show_confirm_modal.set(false),
+                    on_confirm: move |remember| {
+                        let id_to_delete_str = session_to_delete.read().clone();
+                        if !id_to_delete_str.is_empty() {
+                            session_state.write().delete_session(&id_to_delete_str);
+                        }
+                        if remember {
+                            let mut current_settings = settings.write();
+                            current_settings.confirm_on_delete = false;
+                            let sm = settings_manager.read();
+                            if let Err(e) = sm.save(&current_settings) {
+                                tracing::error!("Failed to save settings: {}", e);
                             }
-                            if remember {
-                                let mut current_settings = settings.write();
-                                current_settings.confirm_on_delete = false;
-                                let sm = settings_manager.read();
-                                if let Err(e) = sm.save(&current_settings) {
-                                    tracing::error!("Failed to save settings: {}", e);
-                                }
-                            }
-                            show_confirm_modal.set(false);
-                        },
-                    }
+                        }
+                        show_confirm_modal.set(false);
+                    },
+                }
                     div {
                         class: "dark flex flex-col h-screen", // Changed to flex-col
                         // The draggable header has been removed as per user request.
@@ -653,7 +734,7 @@ fn app() -> Element {
                         }
                     }
                 }
-            }
+
         }
     }
 }

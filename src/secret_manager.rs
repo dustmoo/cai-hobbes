@@ -2,10 +2,7 @@
 
 use crate::biometric_auth::AuthContext;
 use crate::keychain_ffi;
-use security_framework::os::macos::keychain::SecKeychain;
 use std::collections::HashMap;
-
-use crate::constants::SERVICE_NAME;
 
 /// Known secret keys used by the application
 pub const KNOWN_KEYS: &[&str] = &[
@@ -38,35 +35,37 @@ impl SecretManager {
     }
 
     /// Load all known secrets from the Keychain in a single session.
-    /// Also discovers and loads any Composio profile keys.
+    /// Uses our custom FFI that includes the proper access group for sandboxed apps.
     pub fn load_all_from_keychain(&mut self) {
-        let keychain = match SecKeychain::default() {
-            Ok(kc) => kc,
-            Err(e) => {
-                tracing::error!("Failed to open keychain: {}", e);
-                return;
-            }
-        };
-
-        // Load known static keys
+        // Load known static keys using our FFI (includes access group)
         for key in KNOWN_KEYS {
-            if let Ok((password, _)) = keychain.find_generic_password(SERVICE_NAME, key) {
-                if let Ok(value) = String::from_utf8(password.to_vec()) {
+            match keychain_ffi::find_generic_password(key) {
+                Ok(value) => {
                     self.secrets.insert(key.to_string(), value);
                     tracing::debug!("Loaded secret: {}", key);
+                }
+                Err(keychain_ffi::KeychainError::NotFound) => {
+                    tracing::debug!("Secret not found: {}", key);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load secret '{}': {}", key, e);
                 }
             }
         }
 
         // Load legacy composio_api_key if it exists (for migration)
-        if let Ok((password, _)) = keychain.find_generic_password(SERVICE_NAME, "composio_api_key") {
-            if let Ok(value) = String::from_utf8(password.to_vec()) {
+        match keychain_ffi::find_generic_password("composio_api_key") {
+            Ok(value) => {
                 self.secrets.insert("composio_api_key".to_string(), value);
                 tracing::debug!("Loaded legacy composio_api_key");
             }
+            Err(keychain_ffi::KeychainError::NotFound) => {}
+            Err(e) => {
+                tracing::warn!("Failed to load legacy composio_api_key: {}", e);
+            }
         }
 
-        tracing::debug!("SecretManager loaded {} secrets from keychain", self.secrets.len());
+        tracing::info!("SecretManager loaded {} secrets from keychain", self.secrets.len());
     }
 
     /// Get a secret by key
@@ -111,15 +110,20 @@ impl SecretManager {
     /// Delete a secret (removes from cache and keychain)
     #[allow(dead_code)]
     pub fn delete(&mut self, key: &str) -> Result<(), String> {
-        let keychain = SecKeychain::default().map_err(|e| e.to_string())?;
-        
-        if let Ok((_, item)) = keychain.find_generic_password(SERVICE_NAME, key) {
-            item.delete();
+        // Use our FFI to delete (includes access group)
+        match keychain_ffi::delete_generic_password(key) {
+            Ok(()) => {
+                self.secrets.remove(key);
+                tracing::debug!("Deleted secret: {}", key);
+                Ok(())
+            }
+            Err(keychain_ffi::KeychainError::NotFound) => {
+                // Already doesn't exist, just remove from cache
+                self.secrets.remove(key);
+                Ok(())
+            }
+            Err(e) => Err(format!("Failed to delete secret: {}", e)),
         }
-
-        self.secrets.remove(key);
-        tracing::debug!("Deleted secret: {}", key);
-        Ok(())
     }
 
     /// Get the Composio API key for a specific profile
@@ -145,14 +149,16 @@ impl SecretManager {
     /// Load a Composio profile key from keychain (for dynamically discovered profiles)
     pub fn load_composio_key(&mut self, profile_name: &str) {
         let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
-        let keychain = match SecKeychain::default() {
-            Ok(kc) => kc,
-            Err(_) => return,
-        };
-
-        if let Ok((password, _)) = keychain.find_generic_password(SERVICE_NAME, &key) {
-            if let Ok(value) = String::from_utf8(password.to_vec()) {
+        
+        // Use our FFI to load (includes access group)
+        match keychain_ffi::find_generic_password(&key) {
+            Ok(value) => {
                 self.secrets.insert(key, value);
+                tracing::debug!("Loaded Composio key for profile: {}", profile_name);
+            }
+            Err(keychain_ffi::KeychainError::NotFound) => {}
+            Err(e) => {
+                tracing::warn!("Failed to load Composio key for '{}': {}", profile_name, e);
             }
         }
     }
@@ -242,5 +248,37 @@ impl SecretManager {
     /// Useful when the keychain has been updated via a background task.
     pub fn update_cache(&mut self, key: String, value: String) {
         self.secrets.insert(key, value);
+    }
+
+    /// Delete all cached secrets from keychain.
+    /// This is useful for resetting keychain items so they can be re-saved
+    /// with biometric protection (when upgrading from non-biometric items).
+    /// 
+    /// Returns the list of keys that were deleted.
+    pub fn delete_all(&mut self) -> Vec<String> {
+        let keys: Vec<String> = self.secrets.keys().cloned().collect();
+        let mut deleted = Vec::new();
+        
+        for key in &keys {
+            match keychain_ffi::delete_generic_password(key) {
+                Ok(()) => {
+                    tracing::info!("Deleted keychain item: {}", key);
+                    deleted.push(key.clone());
+                }
+                Err(keychain_ffi::KeychainError::NotFound) => {
+                    tracing::debug!("Keychain item already gone: {}", key);
+                    deleted.push(key.clone());
+                }
+                Err(e) => {
+                    tracing::error!("Failed to delete keychain item '{}': {}", key, e);
+                }
+            }
+        }
+        
+        // Clear the cache
+        self.secrets.clear();
+        
+        tracing::info!("Cleared {} secrets from keychain and cache", deleted.len());
+        deleted
     }
 }

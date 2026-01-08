@@ -8,10 +8,23 @@ use std::io::Cursor;
 
 #[cfg(debug_assertions)]
 use crate::context::prompt_builder::PromptBuilder;
-use crate::settings::Settings;
+use crate::settings::{Settings, SettingsManager};
 use hobbes_core::models::Attachment;
 
 use crate::processing::summarization_scheduler::{SchedulerSignal};
+
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChatCommand {
+    ToggleProfile,
+    OpenAttachments,
+    ToggleSettings,
+    ToggleHistory,
+    ToggleMcp,
+    NewChat,
+    ScrollToBottom,
+    FocusChat,
+}
 
 #[component]
 pub fn ChatInput(
@@ -27,13 +40,97 @@ pub fn ChatInput(
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let _settings = use_context::<Signal<Settings>>();
+    let settings_manager = use_context::<Signal<SettingsManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
-    let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut draft = use_context::<Signal<String>>();
     let mut is_dragging = use_signal(|| false);
     let mut attachments = use_signal(Vec::<Attachment>::new);
     let mut is_processing_attachments = use_signal(|| false);
+    let mut show_profile_selector = use_signal(|| false);
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
+    
+    // Listen for global chat commands (from menu hotkeys)
+    let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
+    use_effect(move || {
+        if let Some(cmd) = chat_command.read().clone() {
+            tracing::debug!("ChatInput received ChatCommand: {:?}", cmd);
+            match cmd {
+                ChatCommand::ToggleProfile => {
+                    show_profile_selector.set(!show_profile_selector());
+                }
+                ChatCommand::ToggleSettings => {
+                    on_toggle_settings.call(());
+                }
+                ChatCommand::ToggleHistory => {
+                    on_toggle_sessions.call(());
+                }
+                ChatCommand::ToggleMcp => {
+                     on_toggle_mcp_manager.call(());
+                }
+                ChatCommand::NewChat => {
+                    tracing::info!("ChatCommand::NewChat triggered");
+                    session_state.write().create_session();
+                }
+                ChatCommand::OpenAttachments => {
+                    // Trigger attachment dialog
+                    let mut attachments = attachments;
+                    let mut is_processing_attachments = is_processing_attachments;
+                    spawn(async move {
+                        is_processing_attachments.set(true);
+                        if let Some(files) = FileDialog::new()
+                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
+                            .pick_files()
+                        {
+                            for file_path in files {
+                                if let Ok(file_data) = tokio::fs::read(&file_path).await {
+                                    let file_name = file_path
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string();
+                                    let extension = file_path
+                                        .extension()
+                                        .and_then(std::ffi::OsStr::to_str)
+                                        .unwrap_or("");
+                                    if let Some(mime_type) = get_mime_type(extension) {
+                                        if let Some(attachment) = process_image_data(
+                                            file_name,
+                                            mime_type.to_string(),
+                                            file_data,
+                                        )
+                                        .await
+                                        {
+                                            attachments.write().push(attachment);
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            "Unsupported file type selected: {:?}",
+                                            file_path
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        is_processing_attachments.set(false);
+                    });
+                }
+                ChatCommand::ScrollToBottom => {
+                    // Handled by MessageList
+                }
+                ChatCommand::FocusChat => {
+                     let _ = document::eval(r#"
+                        const el = document.getElementById('chat-textarea');
+                        if (el) { el.focus(); }
+                    "#);
+                }
+            }
+            // Reset command to avoid re-triggering
+            spawn(async move {
+                chat_command.set(None);
+            });
+        }
+    });
 
     let mut send_message = move || {
         if *is_sending.read() || *is_processing_attachments.read() {
@@ -129,15 +226,6 @@ pub fn ChatInput(
                 class: "flex items-center space-x-3",
                 button {
                     class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
-                    onclick: move |_| on_toggle_sessions.call(()),
-                    Icon {
-                        width: 20,
-                        height: 20,
-                        icon: fi_icons::FiClock
-                    }
-                }
-                button {
-                    class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
                     onclick: move |_| on_toggle_settings.call(()),
                     Icon {
                         width: 20,
@@ -147,11 +235,94 @@ pub fn ChatInput(
                 }
                 button {
                     class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                    onclick: move |_| on_toggle_sessions.call(()),
+                    Icon {
+                        width: 20,
+                        height: 20,
+                        icon: fi_icons::FiClock
+                    }
+                }
+                button {
+                    class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
                     onclick: move |_| on_toggle_mcp_manager.call(()),
                     Icon {
                         width: 20,
                         height: 20,
                         icon: fi_icons::FiPackage
+                    }
+                }
+                // Composio Profile Selector
+                {
+                    let settings_read = _settings.read();
+                    let profiles = &settings_read.composio_profiles;
+                    
+                    if profiles.len() > 1 {
+                        let active_profile = settings_read.get_active_profile().cloned().unwrap_or_default();
+                        let active_initial = active_profile.name.chars().next().unwrap_or('?').to_uppercase();
+                        
+                        rsx! {
+                            div {
+                                class: "relative",
+                                button {
+                                    class: format!("w-8 h-8 rounded-full {} border border-primary-700 flex items-center justify-center text-xs font-bold text-white hover:brightness-110 hover:border-primary-500 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600 shadow-md", active_profile.color),
+                                    onclick: move |_| show_profile_selector.set(!show_profile_selector()),
+                                    "{active_initial}"
+                                }
+                                
+                                if show_profile_selector() {
+                                    div {
+                                        class: "absolute bottom-10 left-0 w-56 bg-dark-card border border-primary-700 rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                                        for (index, profile) in profiles.iter().enumerate() {
+                                            if profile.name != active_profile.name {
+                                                button {
+                                                    class: "w-full text-left px-4 py-2 text-sm text-gray-300 hover:bg-primary-900/50 hover:text-white transition-colors flex items-center justify-between",
+                                                    onclick: {
+                                                        let new_profile_name = profile.name.clone();
+                                                        let mut settings = _settings;
+                                                        let settings_manager = settings_manager;
+                                                        let scheduler = scheduler.clone();
+                                                        move |_| {
+                                                            settings.write().active_composio_profile = Some(new_profile_name.clone());
+                                                            // Auto-save changes
+                                                            if let Err(e) = settings_manager.read().save(&settings.read()) {
+                                                                tracing::error!("Failed to save profile change: {}", e);
+                                                            }
+                                                            // Trigger summary refresh
+                                                            scheduler.send(SchedulerSignal::ForceRefresh);
+                                                            show_profile_selector.set(false);
+                                                        }
+                                                    },
+                                                    div {
+                                                        class: "flex items-center space-x-2",
+                                                        span {
+                                                            class: format!("w-6 h-6 rounded-full {} border border-gray-700 flex items-center justify-center text-[10px] text-white font-bold shadow-sm", profile.color),
+                                                            "{profile.name.chars().next().unwrap_or('?').to_uppercase()}"
+                                                        }
+                                                        span { class: "truncate", "{profile.name}" }
+                                                    }
+                                                    // Hotkey hint (1-indexed)
+                                                    if index < 9 {
+                                                        span {
+                                                            class: "text-xs text-gray-500 font-mono",
+                                                            "⌘{index + 1}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Click outside handler to close dropdown
+                                if show_profile_selector() {
+                                    div {
+                                        class: "fixed inset-0 z-40",
+                                        onclick: move |_| show_profile_selector.set(false)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        rsx!({})
                     }
                 }
                 button {
@@ -208,8 +379,7 @@ pub fn ChatInput(
                     class: "flex-1 py-2 px-4 rounded-xl bg-dark-input border border-primary-700 text-dark-text placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 resize-none overflow-y-auto",
                     style: "max-height: 50vh;",
                     rows: "1",
-                    placeholder: if !mcp_context.read().servers.is_empty() { "Type your message..." } else { "Initializing..." },
-                    disabled: mcp_context.read().servers.is_empty(),
+                    placeholder: "Type your message...",
                     value: "{draft}",
                     oninput: move |event| {
                         scheduler.send(SchedulerSignal::Activity);
@@ -368,7 +538,7 @@ pub fn ChatInput(
                     if !*is_sending.read() {
                         button {
                             class: "px-5 py-2 bg-primary-500 rounded-full text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors disabled:bg-gray-500",
-                            disabled: mcp_context.read().servers.is_empty() || *is_processing_attachments.read(),
+                            disabled: *is_processing_attachments.read(),
                             onclick: move |_| {
                                 on_interaction.call(());
                                 send_message();

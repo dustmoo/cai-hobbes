@@ -107,7 +107,7 @@ pub struct SessionState {
 
 fn get_sessions_path() -> Option<PathBuf> {
     dirs::config_dir().map(|mut path| {
-        path.push("cai-hobbes");
+        path.push("com.hobbes.app");
         fs::create_dir_all(&path).ok()?;
         path.push("sessions.json");
         Some(path)
@@ -371,8 +371,8 @@ impl Default for SessionState {
         Self {
             sessions: HashMap::new(),
             active_session_id: String::new(),
-            window_width: 675.0,
-            window_height: 750.0,
+            window_width: 1440.0,  // 16:9 ratio default
+            window_height: 810.0,
             tool_call_history: Vec::new(),
         }
     }

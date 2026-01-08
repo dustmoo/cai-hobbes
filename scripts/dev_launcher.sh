@@ -24,7 +24,7 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
 ENTITLEMENTS="Hobbes.dev.entitlements"
 PROVISIONING_PROFILE="embedded.provisionprofile"
-IDENTITY="${HOBBES_SIGNING_ID:-Apple Development: dustin@tulipvalleytech.com (4753E57CRM)}"
+IDENTITY="${HOBBES_SIGNING_ID:-Developer ID Application: DUSTIN ALAN MOORE (ABXVW6PWCW)}"
 
 TAILWIND_INPUT="tailwind.css"
 TAILWIND_OUTPUT="assets/tailwind.css"
@@ -103,6 +103,13 @@ while true; do
 </plist>
 EOF
 
+        # Personal signing fix: Skip entitlements if using personal cert to avoid Killed: 9
+        if [[ "$IDENTITY" == *"4753E57CRM"* ]]; then
+             echo "⚠️  Personal Team ID detected. Skipping Entitlements/Provisioning to prevent crash."
+             ENTITLEMENTS=""
+             PROVISIONING_PROFILE=""
+        fi
+
         # Embed Provisioning Profile (Critical for entitlements)
         if [ -f "$PROVISIONING_PROFILE" ]; then
             cp "$PROVISIONING_PROFILE" "$CONTENTS_DIR/embedded.provisionprofile"
@@ -121,6 +128,38 @@ EOF
         else
             echo "   ⚠️  WARNING: Entitlements file not found at $ENTITLEMENTS"
             codesign --force --deep --sign "$IDENTITY" "$APP_STAGING_DIR"
+        fi
+
+        # Notarization (Required for Developer ID certs to pass Gatekeeper)
+        # Skip automatically for Apple Development certs
+        if [[ "$IDENTITY" == *"Apple Development"* ]]; then
+             echo "🛡️  Skipping notarization (Apple Development certificate detected)"
+             SKIP_NOTARIZE="true"
+        fi
+
+        if [ "$SKIP_NOTARIZE" != "true" ]; then
+            echo ""
+            echo "🛡️  Notarizing (Required for Developer ID)..."
+            NOTARY_PROFILE="${NOTARY_PROFILE:-AC_PASSWORD_PROFILE}"
+            ZIP_PATH="$BUILD_DIR/Hobbes-Dev.zip"
+            
+            # Zip for upload
+            rm -f "$ZIP_PATH"
+            ditto -c -k --keepParent "$APP_STAGING_DIR" "$ZIP_PATH"
+            
+            echo "   Submitting to Apple (Profile: $NOTARY_PROFILE)..."
+            echo "   (This takes 1-3 minutes...)"
+            
+            if xcrun notarytool submit "$ZIP_PATH" --keychain-profile "$NOTARY_PROFILE" --wait; then
+                echo "   ✅ Notarized successfully"
+                echo "   Stapling ticket..."
+                xcrun stapler staple "$APP_STAGING_DIR"
+                echo "   ✅ Stapled"
+            else
+                echo "   ❌ Notarization failed. Launch may fail due to Gatekeeper." 
+                echo "   Set SKIP_NOTARIZE=true to skip this step."
+                # We don't exit here, we let it try to run anyway
+            fi
         fi
         
         echo ""
