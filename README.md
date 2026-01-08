@@ -160,6 +160,18 @@ graph TD
     -   **`ConversationProcessor`**: Summarizes dialogue using a dedicated Summary LLM to maintain conversational memory.
     -   **`ToolCallSummarizer`**: A dedicated service that creates concise "snapshots" of tool interactions for the active context after a tool loop concludes.
 
+## Using Hobbes for your Projects
+
+I plan on keeping Hobbes under the MIT license for the foreseeable future. I built Hobbes "clean" to control and minimize my frameworks in Rust. Shoutout to [Dioxus](https://dioxuslabs.com/) and the Rust community for all the packages I'm using (check the `Cargo.toml` file for the latest)—they all deserve our support (I will be sponsoring downstream!).
+
+However, I actually recommend that you use [Goose](https://github.com/block/goose), a proper open-source Rust project for multi-app development. They are set up for sustainability.
+
+I built Hobbes to help my AI expertise, and it has been fruitful for that. I am now a beginner in Rust (great stack team!) and have the agent I've always wanted, allowing me to fully control what I refer to as the **"Prompt Composition Lifecycle"**—from system prompt through chat flow and execution. This was an experiment in _context composition_, not just another wrapper. Try it, and I would LOVE to see different approaches to our short-term memory usages.
+
+I designed Hobbes to be quick, private, and secure. I hope you like it.
+
+— @dustmoo
+
 ## Contributing
 
 Please see [`CONTRIBUTING.md`](CONTRIBUTING.md) for details on how to contribute to the project.
