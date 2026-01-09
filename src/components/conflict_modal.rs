@@ -12,8 +12,45 @@ pub fn ConflictModal(props: ConflictModalProps) -> Element {
     rsx! {
         div {
             class: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center",
+            tabindex: "0",
+            autofocus: true,
+            onmounted: move |evt| {
+                let mounted = evt.data();
+                spawn(async move {
+                    let _ = mounted.set_focus(true).await;
+                });
+            },
+            onkeydown: {
+                let on_resolve = props.on_resolve.clone();
+                move |evt: KeyboardEvent| {
+                    if evt.key() == Key::Escape {
+                        on_resolve.call((false, *apply_to_all.read()));
+                    } else if evt.key() == Key::Enter {
+                        let modifiers = evt.modifiers();
+                        if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
+                            evt.prevent_default();
+                            on_resolve.call((true, *apply_to_all.read()));
+                        }
+                    }
+                }
+            },
             div {
                 class: "bg-gray-800 rounded-lg p-6 max-w-sm w-full",
+                tabindex: "0",
+                onkeydown: {
+                    let on_resolve = props.on_resolve.clone();
+                    move |evt: KeyboardEvent| {
+                        if evt.key() == Key::Escape {
+                            on_resolve.call((false, *apply_to_all.read()));
+                        } else if evt.key() == Key::Enter {
+                            let modifiers = evt.modifiers();
+                            if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
+                                evt.prevent_default();
+                                on_resolve.call((true, *apply_to_all.read()));
+                            }
+                        }
+                    }
+                },
                 h2 {
                     class: "text-lg font-bold mb-4",
                     "Conflict Detected"

@@ -261,7 +261,7 @@ impl SessionState {
         Ok(())
     }
 
-    pub fn create_session(&mut self) {
+    pub fn create_session(&mut self) -> String {
         let new_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Local::now();
         let new_session = Session {
@@ -272,10 +272,11 @@ impl SessionState {
             last_updated: Utc::now(),
         };
         self.sessions.insert(new_id.clone(), new_session);
-        self.active_session_id = new_id;
+        self.active_session_id = new_id.clone();
         if let Err(e) = self.save() {
             tracing::error!("Failed to save session state after creating session: {}", e);
         }
+        new_id
     }
 
     pub fn delete_session(&mut self, id: &str) {

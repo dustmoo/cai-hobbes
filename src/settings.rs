@@ -39,6 +39,8 @@ pub struct HotkeySettings {
     pub toggle_tray: String,
     #[serde(default = "default_toggle_new_chat")]
     pub toggle_new_chat: String,
+    #[serde(default = "default_toggle_new_chat_with_memory")]
+    pub toggle_new_chat_with_memory: String,
     #[serde(default = "default_toggle_scroll_to_bottom")]
     pub toggle_scroll_to_bottom: String,
     #[serde(default = "default_toggle_focus_chat")]
@@ -55,6 +57,7 @@ impl Default for HotkeySettings {
             toggle_attachments: default_toggle_attachments(),
             toggle_tray: default_toggle_tray(),
             toggle_new_chat: default_toggle_new_chat(),
+            toggle_new_chat_with_memory: default_toggle_new_chat_with_memory(),
             toggle_scroll_to_bottom: default_toggle_scroll_to_bottom(),
             toggle_focus_chat: default_toggle_focus_chat(),
         }
@@ -68,7 +71,8 @@ fn default_toggle_profile() -> String { "CmdOrCtrl+Shift+P".to_string() }
 fn default_toggle_attachments() -> String { "CmdOrCtrl+Shift+A".to_string() }
 fn default_toggle_tray() -> String { "CmdOrCtrl+Shift+Space".to_string() }
 fn default_toggle_new_chat() -> String { "CmdOrCtrl+Shift+N".to_string() }
-fn default_toggle_focus_chat() -> String { "CmdOrCtrl+N".to_string() }
+fn default_toggle_new_chat_with_memory() -> String { "CmdOrCtrl+Alt+N".to_string() }
+fn default_toggle_focus_chat() -> String { "CmdOrCtrl+/".to_string() }
 fn default_toggle_scroll_to_bottom() -> String { "CmdOrCtrl+Shift+ArrowDown".to_string() }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

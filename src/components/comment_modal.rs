@@ -23,10 +23,51 @@ pub fn CommentModal(
     rsx! {
         div {
             class: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50",
+            tabindex: "0",
+            autofocus: true,
+            onmounted: move |evt| {
+                let mounted = evt.data();
+                spawn(async move {
+                    let _ = mounted.set_focus(true).await;
+                });
+            },
             onclick: move |_| on_close.call(()),
+            onkeydown: {
+                let on_close = on_close.clone();
+                let on_save = on_save.clone();
+                move |evt: KeyboardEvent| {
+                    if evt.key() == Key::Escape {
+                        on_close.call(());
+                    } else if evt.key() == Key::Enter {
+                        let modifiers = evt.modifiers();
+                        if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
+                            evt.prevent_default();
+                            on_save.call(comments());
+                            on_close.call(());
+                        }
+                    }
+                }
+            },
             div {
                 class: "bg-dark-card rounded-lg p-6 max-w-2xl w-full mx-4 max-h-[80vh] overflow-y-auto",
+                tabindex: "0",
                 onclick: move |e| e.stop_propagation(),
+                onkeydown: {
+                    let on_close = on_close.clone();
+                    let on_save = on_save.clone();
+                    move |evt: KeyboardEvent| {
+                        if evt.key() == Key::Escape {
+                            on_close.call(());
+                        } else if evt.key() == Key::Enter {
+                            let modifiers = evt.modifiers();
+                            if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
+                                evt.prevent_default();
+                                on_save.call(comments());
+                                on_close.call(());
+                            }
+                        }
+                    }
+                },
                 
                 // Header
                 div {

@@ -23,12 +23,51 @@ pub fn ConfirmDeleteModal(props: ConfirmDeleteModalProps) -> Element {
             // Full-screen overlay with a dark, semi-transparent background
             div {
                 class: "fixed inset-0 flex items-center justify-center z-50",
+                tabindex: "0",
+                autofocus: true,
+                onmounted: move |evt| {
+                    let mounted = evt.data();
+                    spawn(async move {
+                        let _ = mounted.set_focus(true).await;
+                    });
+                },
                 onclick: move |_| props.on_cancel.call(()),
+                onkeydown: {
+                    let on_cancel = props.on_cancel.clone();
+                    let on_confirm = props.on_confirm.clone();
+                    move |evt: KeyboardEvent| {
+                        if evt.key() == Key::Escape {
+                            on_cancel.call(());
+                        } else if evt.key() == Key::Enter {
+                            let modifiers = evt.modifiers();
+                            if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
+                                evt.prevent_default();
+                                on_confirm.call(*remember_choice.read());
+                            }
+                        }
+                    }
+                },
 
                 // The modal "card" with distinct styling
                 div {
                     class: "bg-gray-800 border border-gray-700 rounded-lg shadow-xl p-4 w-sm",
+                    tabindex: "0",
                     onclick: |event| event.stop_propagation(), // Prevent clicks inside from closing the modal
+                    onkeydown: {
+                        let on_cancel = props.on_cancel.clone();
+                        let on_confirm = props.on_confirm.clone();
+                        move |evt: KeyboardEvent| {
+                            if evt.key() == Key::Escape {
+                                on_cancel.call(());
+                            } else if evt.key() == Key::Enter {
+                                let modifiers = evt.modifiers();
+                                if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
+                                    evt.prevent_default();
+                                    on_confirm.call(*remember_choice.read());
+                                }
+                            }
+                        }
+                    },
 
                     h2 { class: "text-xl font-bold text-white m-4", "{props.title}" }
                     p { class: "text-gray-300 m-4", "{props.message}" }

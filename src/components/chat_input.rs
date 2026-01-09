@@ -22,6 +22,7 @@ pub enum ChatCommand {
     ToggleHistory,
     ToggleMcp,
     NewChat,
+    NewChatWithMemory,
     ScrollToBottom,
     FocusChat,
 }
@@ -37,6 +38,7 @@ pub fn ChatInput(
     on_toggle_sessions: EventHandler<()>,
     on_toggle_settings: EventHandler<()>,
     on_toggle_mcp_manager: EventHandler<()>,
+    on_new_chat_with_memory: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let _settings = use_context::<Signal<Settings>>();
@@ -48,6 +50,7 @@ pub fn ChatInput(
     let mut attachments = use_signal(Vec::<Attachment>::new);
     let mut is_processing_attachments = use_signal(|| false);
     let mut show_profile_selector = use_signal(|| false);
+    let mut show_new_chat_menu = use_signal(|| false);
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
     
     // Listen for global chat commands (from menu hotkeys)
@@ -71,6 +74,10 @@ pub fn ChatInput(
                 ChatCommand::NewChat => {
                     tracing::info!("ChatCommand::NewChat triggered");
                     session_state.write().create_session();
+                }
+                ChatCommand::NewChatWithMemory => {
+                    tracing::info!("ChatCommand::NewChatWithMemory triggered");
+                    on_new_chat_with_memory.call(());
                 }
                 ChatCommand::OpenAttachments => {
                     // Trigger attachment dialog
@@ -526,15 +533,75 @@ pub fn ChatInput(
                             }
                         }
                     }
-                    button {
-                        class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
-                        onclick: move |_| {
-                            session_state.write().create_session();
-                        },
-                        Icon {
-                            width: 20,
-                            height: 20,
-                            icon: fi_icons::FiPlus
+                    // New Chat Menu (Popup)
+                    div {
+                        class: "relative",
+                        button {
+                            class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                            title: "New Chat",
+                            onclick: move |_| show_new_chat_menu.set(!show_new_chat_menu()),
+                            Icon {
+                                width: 20,
+                                height: 20,
+                                icon: fi_icons::FiPlus
+                            }
+                        }
+                        
+                        if show_new_chat_menu() {
+                            div {
+                                class: "absolute bottom-10 right-0 w-64 bg-dark-card border border-primary-700 rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                                // New Chat (No Memory)
+                                button {
+                                    class: "w-full text-left px-4 py-2 text-sm text-gray-300 hover:bg-primary-900/50 hover:text-white transition-colors flex items-center justify-between",
+                                    onclick: move |_| {
+                                        session_state.write().create_session();
+                                        show_new_chat_menu.set(false);
+                                    },
+                                    div {
+                                        class: "flex items-center space-x-2",
+                                        Icon {
+                                            width: 16,
+                                            height: 16,
+                                            icon: fi_icons::FiPlus,
+                                            class: "text-gray-400"
+                                        }
+                                        span { "New Chat" }
+                                    }
+                                    span {
+                                        class: "text-xs text-gray-500 font-mono",
+                                        "{format_hotkey(&_settings.read().hotkeys.toggle_new_chat)}"
+                                    }
+                                }
+                                // New Chat with Memory
+                                button {
+                                    class: "w-full text-left px-4 py-2 text-sm text-gray-300 hover:bg-primary-900/50 hover:text-white transition-colors flex items-center justify-between",
+                                    onclick: move |_| {
+                                        on_new_chat_with_memory.call(());
+                                        show_new_chat_menu.set(false);
+                                    },
+                                    div {
+                                        class: "flex items-center space-x-2",
+                                        Icon {
+                                            width: 16,
+                                            height: 16,
+                                            icon: fi_icons::FiCpu,
+                                            class: "text-primary-400"
+                                        }
+                                        span { "New Chat with Memory" }
+                                    }
+                                    span {
+                                        class: "text-xs text-gray-500 font-mono",
+                                        "{format_hotkey(&_settings.read().hotkeys.toggle_new_chat_with_memory)}"
+                                    }
+                                }
+                            }
+                        }
+                        // Click outside handler to close dropdown
+                        if show_new_chat_menu() {
+                            div {
+                                class: "fixed inset-0 z-40",
+                                onclick: move |_| show_new_chat_menu.set(false)
+                            }
                         }
                     }
                     if !*is_sending.read() {
@@ -648,4 +715,14 @@ fn get_mime_type(extension: &str) -> Option<&'static str> {
         "webp" => Some("image/webp"),
         _ => None,
     }
+}
+
+/// Formats a hotkey string for display (e.g., "CmdOrCtrl+Shift+N" -> "⌘⇧N")
+fn format_hotkey(hotkey: &str) -> String {
+    hotkey
+        .replace("CmdOrCtrl", "⌘")
+        .replace("Ctrl", "⌃")
+        .replace("Alt", "⌥")
+        .replace("Shift", "⇧")
+        .replace("+", "")
 }

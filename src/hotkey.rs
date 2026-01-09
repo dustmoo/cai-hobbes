@@ -125,18 +125,58 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
 
             // 6. New Chat
             let new_chat_hotkey_str = settings_read.hotkeys.toggle_new_chat.clone();
-             if let Ok(hotkey) = HotKey::from_str(&new_chat_hotkey_str) {
-                let mut cmd = chat_command.clone();
-                let check_debounce = should_trigger.clone();
-                if let Ok(handle) = desktop.create_shortcut(hotkey, move || {
-                    if check_debounce() {
-                        cmd.set(Some(crate::components::chat_input::ChatCommand::NewChat));
+            if !new_chat_hotkey_str.is_empty() {
+                match HotKey::from_str(&new_chat_hotkey_str) {
+                    Ok(hotkey) => {
+                        let mut cmd = chat_command.clone();
+                        let check_debounce = should_trigger.clone();
+                        match desktop.create_shortcut(hotkey, move || {
+                            if check_debounce() {
+                                cmd.set(Some(crate::components::chat_input::ChatCommand::NewChat));
+                            }
+                        }) {
+                            Ok(handle) => {
+                                handles.push(handle);
+                                tracing::info!("Registered global hotkey (New Chat): {}", &new_chat_hotkey_str);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to create shortcut for New Chat '{}': {:?}", &new_chat_hotkey_str, e);
+                            }
+                        }
                     }
-                }) {
-                     handles.push(handle);
-                     tracing::info!("Registered global hotkey (New Chat): {}", &new_chat_hotkey_str);
+                    Err(e) => {
+                        tracing::error!("Failed to parse hotkey for New Chat '{}': {:?}", &new_chat_hotkey_str, e);
+                    }
                 }
             }
+            
+            // 7. New Chat with Memory
+            let new_chat_memory_hotkey_str = settings_read.hotkeys.toggle_new_chat_with_memory.clone();
+            if !new_chat_memory_hotkey_str.is_empty() {
+                match HotKey::from_str(&new_chat_memory_hotkey_str) {
+                    Ok(hotkey) => {
+                        let mut cmd = chat_command.clone();
+                        let check_debounce = should_trigger.clone();
+                        match desktop.create_shortcut(hotkey, move || {
+                            if check_debounce() {
+                                cmd.set(Some(crate::components::chat_input::ChatCommand::NewChatWithMemory));
+                            }
+                        }) {
+                            Ok(handle) => {
+                                handles.push(handle);
+                                tracing::info!("Registered global hotkey (New Chat with Memory): {}", &new_chat_memory_hotkey_str);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to create shortcut for New Chat with Memory '{}': {:?}", &new_chat_memory_hotkey_str, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to parse hotkey for New Chat with Memory '{}': {:?}", &new_chat_memory_hotkey_str, e);
+                    }
+                }
+            }
+
             // 7. Scroll to Bottom
             let scroll_bottom_hotkey_str = settings_read.hotkeys.toggle_scroll_to_bottom.clone();
             if let Ok(hotkey) = HotKey::from_str(&scroll_bottom_hotkey_str) {

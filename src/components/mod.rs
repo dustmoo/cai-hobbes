@@ -11,6 +11,10 @@ pub mod llm;
 pub mod settings_panel;
 pub mod stream_manager;
 pub mod tool_call_display;
+pub mod syntax_highlighter;
+pub mod new_chat_memory_modal;
+
+
 pub mod smithery_registry;
 pub mod shared;
 pub mod onboarding;

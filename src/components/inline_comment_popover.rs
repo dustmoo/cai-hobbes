@@ -15,7 +15,13 @@ pub fn InlineCommentPopover(
         div {
             class: "fixed z-50 bg-dark-card border border-gray-700 rounded-lg shadow-xl p-3 w-72",
             style: "top: {position_top}px; left: {position_left}px;",
+            tabindex: "0",
             onclick: move |e| e.stop_propagation(),
+            onkeydown: move |evt: KeyboardEvent| {
+                if evt.key() == Key::Escape {
+                    on_cancel.call(());
+                }
+            },
             
             textarea {
                 class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm mb-2 text-gray-200 focus:outline-none focus:ring-1 focus:ring-primary-500",

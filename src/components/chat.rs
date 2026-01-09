@@ -25,6 +25,8 @@ use crate::context::permissions::PermissionManager;
 use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRenderer};
 use super::confirm_delete_modal::ConfirmDeleteModal;
 use super::quick_fix::QuickFix;
+use super::new_chat_memory_modal::NewChatMemoryModal;
+use crate::session::ActiveContext;
 
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -91,6 +93,10 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     let mut has_new_comments = use_signal(|| false);
     let mut has_pending_approvals = use_signal(|| false);
     use_context_provider(|| has_pending_approvals);
+
+    // New Chat with Memory Modal State
+    let mut show_new_chat_memory_modal = use_signal(|| false);
+    let mut modal_initial_context = use_signal(|| ActiveContext::default());
 
     let on_interaction = move || {
         show_scroll_button.set(false);
@@ -555,6 +561,27 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                 on_toggle_sessions: on_toggle_sessions,
                 on_toggle_settings: on_toggle_settings,
                 on_toggle_mcp_manager: on_toggle_mcp_manager,
+                on_new_chat_with_memory: move |_| {
+                    if let Some(session) = session_state.read().get_active_session() {
+                        modal_initial_context.set(session.active_context.clone());
+                        show_new_chat_memory_modal.set(true);
+                    }
+                },
+            }
+
+            NewChatMemoryModal {
+                is_visible: show_new_chat_memory_modal,
+                initial_context: modal_initial_context.read().clone(),
+                on_start_chat: move |new_context: ActiveContext| {
+                     // Create new session
+                     let new_session_id = session_state.write().create_session();
+                     // Update context of the new session
+                     if let Some(session) = session_state.write().sessions.get_mut(&new_session_id) {
+                         session.active_context = new_context;
+                     }
+                     show_new_chat_memory_modal.set(false);
+                },
+                on_cancel: move |_| show_new_chat_memory_modal.set(false),
             }
 
             ConfirmDeleteModal {

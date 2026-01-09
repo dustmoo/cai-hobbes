@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use dioxus_free_icons::{Icon, icons::fi_icons};
 use rfd;
-use crate::settings::{Settings, SettingsManager, is_sandboxed};
+use crate::settings::{Settings, SettingsManager, HotkeySettings, is_sandboxed};
 use crate::{context::permissions::ToolCategory, session::SessionState};
 use crate::mcp::composio_client::validate_composio_api_key;
 use std::io::Write;
@@ -154,7 +154,21 @@ pub fn SettingsPanel() -> Element {
             if show_keychain_mode_confirm() {
                 div {
                     class: "fixed inset-0 bg-black/70 flex items-center justify-center z-50",
+                    tabindex: "0",
+                    autofocus: true,
+                    onmounted: move |evt| {
+                        let mounted = evt.data();
+                        spawn(async move {
+                            let _ = mounted.set_focus(true).await;
+                        });
+                    },
                     onclick: move |_| show_keychain_mode_confirm.set(false),
+                    onkeydown: move |evt: KeyboardEvent| {
+                        if evt.key() == Key::Escape {
+                            show_keychain_mode_confirm.set(false);
+                            pending_keychain_mode.set(None);
+                        }
+                    },
                     div {
                         class: "bg-dark-section border border-primary-700 rounded-lg p-6 max-w-md mx-4",
                         onclick: move |e| e.stop_propagation(),
@@ -1765,7 +1779,38 @@ pub fn SettingsPanel() -> Element {
                                     }
 
                                     div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-gray-300", "New Chat (No Memory)" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_new_chat.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_new_chat = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-gray-300", "New Chat with Memory" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_new_chat_with_memory.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_new_chat_with_memory = v,
+                                        }
+                                    }
+
+                                    // Reset to Defaults button
+                                    div {
                                         class: "pt-4 border-t border-gray-800",
+                                        button {
+                                            class: "px-4 py-2 bg-gray-700 rounded-md text-sm text-gray-300 hover:bg-gray-600 hover:text-white transition-colors",
+                                            onclick: move |_| {
+                                                local_settings.write().hotkeys = HotkeySettings::default();
+                                            },
+                                            "Reset to Defaults"
+                                        }
+                                    }
+
+                                    div {
+                                        class: "pt-4 border-t border-gray-800",
+
                                         div {
                                             class: "flex justify-between items-center text-sm",
                                             span { class: "text-gray-400", "Switch Profile (1-9)" }
