@@ -356,21 +356,28 @@ impl ComposioClient {
     }
 
     /// Build MCP endpoint URL with user_id query parameter.
-    /// Per Composio docs, the MCP URL must include user_id as a query param
-    /// for the server to resolve connected accounts correctly.
+    /// Strictly follows the "Double-MCP" pattern:
+    /// Profile stores: https://backend.composio.dev/v3/mcp/{server_id}/mcp
+    /// Output: https://backend.composio.dev/v3/mcp/{server_id}/mcp{path}?user_id={uid}
     fn build_mcp_url(&self, path: &str) -> String {
-        let base = format!("{}{}", self.base_url.trim_end_matches('/'), path);
-        if let Some(uid) = self.user_id.as_ref().or(self.entity_id.as_ref()) {
-            let separator = if base.contains('?') { "&" } else { "?" };
-            format!("{}{}user_id={}", base, separator, uid)
+        let base = self.base_url.trim_end_matches('/');
+        let full_base = if base.ends_with("/mcp") {
+            format!("{}{}", base, path)
         } else {
-            base
+            format!("{}/mcp{}", base, path)
+        };
+        
+        if let Some(uid) = self.user_id.as_ref().or(self.entity_id.as_ref()) {
+            let separator = if full_base.contains('?') { "&" } else { "?" };
+            format!("{}{}user_id={}", full_base, separator, uid)
+        } else {
+            full_base
         }
     }
 
     async fn list_connected_accounts(&self) -> Result<Vec<ConnectedAccount>, String> {
         let user_uuid = self.user_id.clone().or(self.entity_id.clone());
-        tracing::info!("Listing connected accounts for user_uuid: {:?}", user_uuid);
+        tracing::trace!("Listing connected accounts for user_uuid: {:?}", user_uuid);
         
         let base_url = format!("{}/connected_accounts", self.get_api_base_url());
         let mut all_accounts: Vec<ConnectedAccount> = Vec::new();
@@ -453,7 +460,7 @@ impl ComposioClient {
             }
         }
         
-        tracing::info!("Found {} connected accounts across {} pages", all_accounts.len(), page_count);
+        tracing::trace!("Found {} connected accounts across {} pages", all_accounts.len(), page_count);
         
         // Debug: Log all accounts after pagination
         let all_slugs: Vec<String> = all_accounts.iter()
@@ -752,7 +759,7 @@ impl ComposioClient {
         // Parse tool response and cache - parse_tools_response handles SSE format
         match self.parse_tools_response(&response_text) {
             Ok(tools) => {
-                tracing::info!("Loaded {} tools from MCP Protocol", tools.len());
+                tracing::trace!("Loaded {} tools from MCP Protocol", tools.len());
                 self.cache_tools(&tools);
                 Ok(tools)
             },
@@ -762,6 +769,7 @@ impl ComposioClient {
 
     /// Get information about connected toolkits for UI display
     /// Returns toolkit slugs with their tool counts
+    #[allow(dead_code)]
     pub async fn list_connected_toolkits(&self) -> Result<Vec<ToolkitInfo>, String> {
         // First get all connected accounts to know which toolkits are connected
         let accounts = self.list_connected_accounts().await?;
@@ -905,7 +913,7 @@ impl ComposioClient {
         let total_pages = parsed.total_pages.unwrap_or(1);
         let current_page = parsed.current_page.unwrap_or(1);
         
-        tracing::info!("Fetched {} toolkits (page {} of {}, next_cursor: {:?})", 
+        tracing::trace!("Fetched {} toolkits (page {} of {}, next_cursor: {:?})", 
             parsed.items.len(), 
             current_page,
             total_pages,
@@ -1322,9 +1330,11 @@ impl ComposioClient {
             params.insert("toolkits".to_string(), serde_json::Value::Array(uppercase_slugs));
         }
         
-        if let Some(entity_id) = &self.entity_id {
-            params.insert("user_id".to_string(), serde_json::Value::String(entity_id.clone()));
-        }
+        // REMOVED: user_id injection in body. 
+        // Proxy resolves routing via ?user_id=... in the URL (from build_mcp_url).
+        // if let Some(entity_id) = &self.entity_id {
+        //    params.insert("user_id".to_string(), serde_json::Value::String(entity_id.clone()));
+        // }
         
         // Use JSON-RPC like list_tools
         let json_rpc_request = serde_json::json!({
@@ -1338,7 +1348,6 @@ impl ComposioClient {
         
         let response = self.client
             .post(&url)
-            .header("x-api-key", &self.api_key)
             .header("Accept", "application/json, text/event-stream")
             .header("Content-Type", "application/json")
             .json(&json_rpc_request)
@@ -1378,15 +1387,15 @@ impl ComposioClient {
         
         // 2. Only add tools from force-loaded toolkits
         if !force_load_slugs.is_empty() {
-            tracing::info!("Loading tools from force-loaded toolkits: {:?}", force_load_slugs);
+            tracing::trace!("Loading tools from force-loaded toolkits: {:?}", force_load_slugs);
             let force_loaded = self.list_tools_filtered(Some(force_load_slugs)).await?;
-            tracing::info!("Loaded {} tools from force-loaded toolkits", force_loaded.len());
+            tracing::trace!("Loaded {} tools from force-loaded toolkits", force_loaded.len());
             tools.extend(force_loaded);
         } else {
             tracing::info!("No force-loaded toolkits configured - only meta-tools available");
         }
         
-        tracing::info!("Total tools for session: {} (including {} meta-tools)", tools.len(), 2);
+        tracing::trace!("Total tools for session: {} (including {} meta-tools)", tools.len(), 2);
         Ok(tools)
     }
 
@@ -1767,226 +1776,114 @@ impl ComposioClient {
         }
     }
 
+    /// Execute a Composio tool via the MCP server.
+    /// This implementation strictly follows the "Meta Flow":
+    /// 1. Resolve toolkit slug and associated connected_account_id/user_id from cache.
+    /// 2. Construct the MCP URL *after* resolution to include the correct user_id query param.
+    /// 3. Inspect the response for deterministic auth error codes (AUTH_018, 401, 403).
+    /// 4. Relay to manual connection flow if authentication is missing.
     pub async fn execute_tool(&self, slug: &str, args: serde_json::Value) -> Result<ToolExecuteResponse, String> {
-        // Use the MCP endpoint with user_id in URL for proper account resolution
-        let url = self.build_mcp_url("");
-        
-        // Ensure arguments are wrapped in an object if they aren't already
+        // Ensure arguments are wrapped in an object
         let arguments = if args.is_object() {
             args
         } else {
             serde_json::json!({ "value": args })
         };
 
-        // Resolve connected_account_id if entity_id is not set
-        let mut connected_account_id: Option<String> = None;
-        // Determine the effective user_id or entity_id to use
-        let mut user_id = self.user_id.clone()
+        // Determine the target user_id (prioritize Settings/Profile ID)
+        let profile_user_id = self.user_id.clone()
             .or(self.entity_id.clone())
             .unwrap_or_else(|| "default".to_string());
             
-        tracing::info!("Execute Tool: tool={}, internal_user_id={:?}, internal_entity_id={:?}, resolved_target={}", 
-            slug, self.user_id, self.entity_id, user_id);
-            
-        tracing::info!("DEBUG: execute_tool start. Slug: {}, UserID: {}", 
-            slug, user_id);
+        let user_id = profile_user_id.clone();
 
-        // Try to find the toolkit for this tool
+        // 1. Resolve toolkit slug (needed for manual connection initiation)
         let toolkit_slug = {
             let map = self.tool_toolkit_map.read().unwrap();
-            let result = map.get(slug).cloned();
-            tracing::info!("[TRACE] Toolkit mapping for tool '{}': {:?}", slug, result);
-            result
+            map.get(slug).cloned()
         };
 
-        // If we don't have the toolkit mapping, try refreshing tools
-        let toolkit_slug = if toolkit_slug.is_none() {
-            if let Ok(_) = self.list_tools().await {
-                // cache_tools is called inside list_tools refactor
-                let map = self.tool_toolkit_map.read().unwrap();
-                match map.get(slug).cloned() {
-                    Some(s) => Some(s),
-                    None => {
-                        // ANTI-PATTERN FIX: Don't use split('_')[0] for multi-word toolkit slugs
-                        // e.g., NEWS_API_GET_HEADLINES should match "news_api", not "news"
-                        // Use prefix matching against known connected toolkit slugs
-                        let tool_upper = slug.to_uppercase();
-                        let connected_slugs: Vec<String> = {
-                            let account_map = self.toolkit_account_map.read().unwrap();
-                            account_map.keys().cloned().collect()
-                        };
-                        
-                        let matched = connected_slugs.iter().find(|tk_slug| {
-                            let prefix = format!("{}_", tk_slug.to_uppercase().replace("-", "_"));
-                            tool_upper.starts_with(&prefix)
-                        }).cloned();
-                        
-                        if matched.is_some() {
-                            tracing::debug!("Matched toolkit slug '{:?}' for tool '{}' via prefix", matched, slug);
-                            matched
-                        } else {
-                            // Fallback to first segment only if no prefix match
-                            let parts: Vec<&str> = slug.split('_').collect();
-                            if !parts.is_empty() {
-                                let guessed = parts[0].to_lowercase();
-                                tracing::debug!("Fallback: guessed toolkit slug '{}' from tool '{}'", guessed, slug);
-                                Some(guessed)
-                            } else {
-                                None
-                            }
-                        }
-                    }
-                }
-            } else {
-                 // Even if list_tools failed, try prefix matching against cached accounts
-                 let tool_upper = slug.to_uppercase();
-                 let connected_slugs: Vec<String> = {
-                     let account_map = self.toolkit_account_map.read().unwrap();
-                     account_map.keys().cloned().collect()
-                 };
-                 
-                 let matched = connected_slugs.iter().find(|tk_slug| {
-                     let prefix = format!("{}_", tk_slug.to_uppercase().replace("-", "_"));
-                     tool_upper.starts_with(&prefix)
-                 }).cloned();
-                 
-                 if matched.is_some() {
-                     tracing::debug!("Matched toolkit slug '{:?}' for tool '{}' via prefix (fallback path)", matched, slug);
-                     matched
-                 } else {
-                     // Ultimate fallback to first segment
-                     let parts: Vec<&str> = slug.split('_').collect();
-                     if !parts.is_empty() {
-                         Some(parts[0].to_lowercase())
-                     } else {
-                         None
-                     }
-                 }
-            }
-        } else {
-            toolkit_slug
-        };
+        // If no mapping, try to infer (heuristic)
+        let _tk_slug = toolkit_slug.clone().or_else(|| {
+            let guessed = slug.split('_').next()?.to_lowercase();
+            tracing::debug!("Guessed toolkit '{}' for tool '{}'", guessed, slug);
+            Some(guessed)
+        });
 
-        if let Some(raw_slug) = &toolkit_slug {
-            let slug = raw_slug.clone();
-            tracing::debug!("DEBUG: Found toolkit slug: {}", slug);
-            
-            // Determine if we need to fetch accounts.
-            // We fetch if:
-            // 1. It's not in the cache.
-            // 2. It IS in the cache, but we have a specific entity_id and the cached one doesn't match.
-            //    (Since our new cache_accounts logic helps us find the right one, refreshing gives it a chance to do so).
-            let needs_refresh = {
-                let map = self.toolkit_account_map.read().unwrap();
-                tracing::info!("[TRACE] Cached toolkit→account map: {:?}", map);
-                if let Some((_, uid)) = map.get(&slug) {
-                     let target_id = self.entity_id.as_deref().or(self.user_id.as_deref());
-                     if let Some(target) = target_id {
-                        let needs = uid != target;
-                        tracing::info!("[TRACE] Toolkit '{}' found in cache with user '{}', target '{}', needs_refresh: {}", 
-                            slug, uid, target, needs);
-                        needs
-                    } else {
-                        tracing::info!("[TRACE] Toolkit '{}' found in cache, no target configured, no refresh needed", slug);
-                        false
-                    }
-                } else {
-                    tracing::info!("[TRACE] Toolkit '{}' NOT in cache, needs_refresh: true", slug);
-                    true
-                }
-            };
+        // 2. Build URL AFTER resolving the correct user_id
+        // Uses the standardized build_mcp_url which handles Double-MCP and user_id mapping
+        let url = self.build_mcp_url("");
 
-            if needs_refresh {
-                // Fetch connected accounts and populate cache
-                tracing::info!("[TRACE] Fetching connected accounts to resolve ID for toolkit '{}'", slug);
-                if let Ok(accounts) = self.list_connected_accounts().await {
-                    tracing::info!("[TRACE] Fetched {} accounts", accounts.len());
-                    for acc in &accounts {
-                        tracing::debug!("[TRACE] Account: id={}, status={}, toolkit={:?}, app_name={:?}", 
-                            acc.id, acc.status, acc.toolkit.as_ref().map(|t| &t.slug), acc.app_name);
-                    }
-                    // list_connected_accounts updates the cache
-                } else {
-                    tracing::warn!("[TRACE] Failed to fetch connected accounts");
-                }
-            }
-            
-            // Check cache for the result - use case-insensitive lookup
-            let map = self.toolkit_account_map.read().unwrap();
-            // Try exact match first, then case-insensitive
-            let account_info = map.get(&slug)
-                .or_else(|| {
-                    // Try case-insensitive match
-                    map.iter().find(|(k, _)| k.eq_ignore_ascii_case(&slug)).map(|(_, v)| v)
-                });
-            
-            if let Some((acc_id, uid)) = account_info {
-                tracing::info!("Resolved connected_account_id: {} for toolkit: {} (user: {})", acc_id, slug, uid);
-                connected_account_id = Some(acc_id.clone());
-                user_id = uid.clone();
-            } else {
-                tracing::warn!("No account found in cache for toolkit: {}. Available toolkits: {:?}", 
-                    slug, map.keys().collect::<Vec<_>>());
-            }
-        }
-
-        // NOTE: MCP protocol resolves auth via user_id in URL query param (set by build_mcp_url).
-        // connected_account_id is optional - we should NOT trigger auth preemptively here.
-        // If auth is actually needed, the tool call response will indicate it and we handle it post-execution.
-        // This fixes the reconnection loop for Custom Auth (API_KEY) toolkits like news_api,
-        // where the REST API /connected_accounts doesn't return API_KEY accounts but MCP works fine.
-        if connected_account_id.is_none() {
-            tracing::debug!("[AUTH] No connected_account_id found for toolkit '{:?}', proceeding with user_id '{}' in URL", 
-                toolkit_slug, user_id);
-        }
-
-        let mut params_obj = serde_json::Map::new();
-        params_obj.insert("name".to_string(), serde_json::Value::String(slug.to_string()));
-        params_obj.insert("arguments".to_string(), arguments);
-        
-
-        if let Some(id) = connected_account_id {
-            // If we have a specific connected account, use it and do NOT send the user_id.
-            // The connected_account_id is the primary identifier for execution.
-            params_obj.insert("connected_account_id".to_string(), serde_json::Value::String(id));
-        } else {
-            // No connected account - use user_id as fallback for the API to determine account
-            // Note: auth_config_id is dynamically looked up per toolkit during initiate_connection
-            params_obj.insert("user_id".to_string(), serde_json::Value::String(user_id.clone()));
-        }
-
-        let params = serde_json::Value::Object(params_obj);
-
+        // 3. Prepare Request Properties (STRICT MCP PROXY payload)
+        // We rely exclusively on the URL query string for user_id routing.
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "tools/call",
             "id": "1", 
-            "params": params
+            "params": {
+                "name": slug,
+                "arguments": arguments
+            }
         });
 
         // Log the request for debugging
         tracing::debug!("Executing tool {} at {}", slug, url);
         let request_body_str = serde_json::to_string_pretty(&body).unwrap_or_default();
+        tracing::debug!("Request body: {}", request_body_str);
         
         // Write request to debug file
         let req_filename = format!("composio_exec_req_{}.json", slug);
         if let Err(e) = write_to_debug_file(&req_filename, &request_body_str) {
              tracing::warn!("Failed to write request debug file: {}", e);
-        } else {
-             tracing::debug!("Wrote request to debug_logs/{}", req_filename);
         }
 
         let response = self
             .client
             .post(&url)
-            .header("x-api-key", &self.api_key)
             .header("Accept", "application/json, text/event-stream")
             .header("Content-Type", "application/json")
+            .query(&[("user_id", &user_id)]) // Keep query param for Proxy routing
             .json(&body)
             .send()
             .await.map_err(|e| e.to_string())?;
             
         let status = response.status();
+        
+        // Handle 401/403 at the HTTP level immediately
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+             // HTTP 401/403 = deterministic auth failure - trigger managed flow
+             if let Some(tk_slug) = &toolkit_slug {
+                 tracing::info!("[AUTH] HTTP {} for toolkit '{}', triggering connection flow", status.as_u16(), tk_slug);
+                 match self.initiate_connection(tk_slug, &user_id).await {
+                     Ok(result_msg) => {
+                         if result_msg.contains("Authentication successful") {
+                             return Ok(ToolExecuteResponse {
+                                 data: serde_json::Value::Null,
+                                 error: Some("Authentication successful! Please try the tool again.".to_string()),
+                                 successful: false,
+                                 log_id: None,
+                                 session_info: None,
+                             });
+                         } else {
+                             let url_candidate = result_msg.split_whitespace().last().unwrap_or(&result_msg).to_string();
+                             let redirect_url = if url_candidate.starts_with("http") { url_candidate } else { result_msg.clone() };
+                             return Ok(ToolExecuteResponse {
+                                 data: serde_json::json!({ "redirectUrl": redirect_url }),
+                                 error: Some(format!("Authentication required. {}", result_msg)),
+                                 successful: false,
+                                 log_id: None,
+                                 session_info: None,
+                             });
+                         }
+                     },
+                     Err(e) => {
+                         tracing::error!("Failed to initiate connection: {}", e);
+                         return Err(format!("Authentication required but connection failed: {}", e));
+                     }
+                 }
+             }
+        }
+
         if !status.is_success() {
              match response.error_for_status() {
                  Ok(_) => unreachable!(),
@@ -1995,158 +1892,225 @@ impl ComposioClient {
         }
 
         let response_text = response.text().await.map_err(|e| e.to_string())?;
-        tracing::info!("Raw tool execution response body len: {}", response_text.len());
+        tracing::trace!("Raw tool execution response body len: {}", response_text.len());
         
-        // Write response to debug file
         let resp_filename = format!("composio_exec_resp_{}.txt", slug);
-        if let Err(e) = write_to_debug_file(&resp_filename, &response_text) {
-             tracing::warn!("Failed to write response debug file: {}", e);
-        }
+        let _ = write_to_debug_file(&resp_filename, &response_text);
 
-        // Handle SSE response
+        // Handle SSE response - Simple stripping
         let trimmed_response = response_text.trim();
-        let json_text = if trimmed_response.starts_with("event:") || trimmed_response.starts_with("data:") {
-            tracing::debug!("Detected SSE format response for tool execution");
-            let data_start = response_text.find("data:").unwrap_or(0) + "data:".len();
-            response_text[data_start..].trim()
+        let json_text = if trimmed_response.contains("data:") {
+            tracing::debug!("Detected SSE format response");
+            // Simple heuristic to grab the payload after the first data: marker
+            // This is safer than the complex multi-line parsing we tried earlier
+            let parts: Vec<&str> = response_text.split("data:").collect();
+            if parts.len() > 1 {
+                parts.last().unwrap_or(&"").trim()
+            } else {
+                trimmed_response
+            }
         } else {
             &response_text
         };
 
-        // Try to parse as ToolExecuteResponse directly first
-        if let Ok(result) = serde_json::from_str::<ToolExecuteResponse>(json_text) {
-            tracing::debug!("Successfully parsed ToolExecuteResponse");
-            return Ok(result);
-        }
-
-        // If direct parsing fails, try to handle other formats (like error-wrapped or raw data)
-        let json_value: Value = match serde_json::from_str(json_text) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("Failed to parse response as JSON: {}", e);
-                // Return a synthetic error response
-                return Ok(ToolExecuteResponse {
-                    data: Value::Null,
-                    error: Some(format!("Failed to parse response body: {}. Raw body: {}", e, response_text)),
-                    successful: false,
-                    log_id: None,
-                    session_info: None,
-                });
+        // 1. Try to parse as ToolExecuteResponse directly (The Simple Path)
+        let json_value: Value = match serde_json::from_str::<ToolExecuteResponse>(json_text) {
+            Ok(result) => {
+                tracing::debug!("Successfully parsed ToolExecuteResponse directly");
+                // Convert back to Value for unified auth checking, or just use it
+                // We'll hydrate a Value from it to reuse the auth logic below
+                serde_json::to_value(result).unwrap_or(Value::Null)
+            },
+            Err(_) => {
+                // 2. Fallback: Parse as generic JSON
+                match serde_json::from_str::<Value>(json_text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("Failed to parse response as JSON: {}", e);
+                        return Ok(ToolExecuteResponse {
+                            data: Value::String(response_text), // Return raw text as data
+                            error: Some(format!("Failed to parse JSON response: {}", e)),
+                            successful: false,
+                            log_id: None,
+                            session_info: None,
+                        });
+                    }
+                }
             }
         };
 
-        // Check for "error" field in the root
-        if let Some(error) = json_value.get("error") {
-            let error_msg = if let Some(msg) = error.as_str() {
-                msg.to_string()
-            } else {
-                error.to_string()
-            };
-            
-            // Check if this is an auth-related error - if so, trigger connection flow
-            let error_lower = error_msg.to_lowercase();
-            let needs_auth = error_lower.contains("authentication") 
-                || error_lower.contains("unauthorized")
-                || error_lower.contains("not authorized")
-                || error_lower.contains("connection required")
-                || error_lower.contains("not connected")
-                || error_lower.contains("auth required");
-            
-            if needs_auth {
-                if let Some(tk_slug) = toolkit_slug {
-                    tracing::info!("[POST-EXEC AUTH] Tool returned auth error for toolkit '{}', triggering connection flow", tk_slug);
-                    
-                    match self.initiate_connection(&tk_slug, &user_id).await {
-                        Ok(result_msg) => {
-                            if result_msg.contains("Authentication successful") {
-                                // Auth succeeded - tell user to retry
-                                return Ok(ToolExecuteResponse {
-                                    data: serde_json::Value::Null,
-                                    error: Some("Authentication successful! Please try the tool again.".to_string()),
-                                    successful: false,
-                                    log_id: None,
-                                    session_info: None,
-                                });
-                            } else {
-                                // Browser opened but waiting for user
-                                let url_candidate = result_msg.split_whitespace().last().unwrap_or(&result_msg).to_string();
-                                let redirect_url = if url_candidate.starts_with("http") { url_candidate } else { result_msg.clone() };
-                                return Ok(ToolExecuteResponse {
-                                    data: serde_json::json!({ "redirectUrl": redirect_url }),
-                                    error: Some(format!("Authentication required. {}", result_msg)),
-                                    successful: false,
-                                    log_id: None,
-                                    session_info: None,
-                                });
+        // Compatibility Normalization:
+        // If the parsed value IS a ToolExecuteResponse structure (has "successful" and "data" fields),
+        // we use it. If not (it's just a raw result object), we wrap it.
+        // This handles cases where the API returns the result directly vs wrapped.
+        let (mut successful, data, mut error_msg) = if let Some(success) = json_value.get("successful").and_then(|b| b.as_bool()) {
+             let d = json_value.get("data").cloned().unwrap_or(Value::Null);
+             let e = json_value.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
+             (success, d, e)
+        } else {
+             // Assume success if no explicit error field, wrap the whole things as data
+             let e = json_value.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
+             (e.is_empty(), json_value.clone(), e)
+        };
+
+        // ----------------------------------------------------------------
+        // ROBUST AUTH DETECTION (Preserved from recent improvements)
+        // ----------------------------------------------------------------
+        let mut needs_auth = false;
+        
+        // Check data.status_code
+        if let Some(status_code) = data.get("status_code") {
+            let code = status_code.as_u64()
+                .or_else(|| status_code.as_i64().map(|i| i as u64));
+            if code == Some(401) || code == Some(403) {
+                tracing::info!("[AUTH] Detected status_code {} in data", code.unwrap());
+                needs_auth = true;
+            }
+        }
+        
+        // Check ECODEs
+        if !needs_auth {
+            if let Some(ecode) = data.get("ECODE").and_then(|v| v.as_str()) {
+                if ecode.starts_with("AUTH_") || ecode.starts_with("OAUTH_") {
+                    tracing::info!("[AUTH] Detected ECODE {}", ecode);
+                    needs_auth = true;
+                }
+            }
+        }
+        
+        // Check http_error
+        if !needs_auth {
+             if let Some(http_error) = data.get("http_error").and_then(|v| v.as_str()) {
+                 if http_error.contains("401") || http_error.contains("403") {
+                     tracing::info!("[AUTH] Detected http_error {}", http_error);
+                     needs_auth = true;
+                 }
+             }
+        }
+
+        // Check MCP-protocol Level Error (Double-MCP Pattern)
+        // Format: { "result": { "content": [{ "type": "text", "text": "No connected account found..." }], "isError": true } }
+        if !needs_auth {
+            if let Some(result) = json_value.get("result") {
+                if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+                    // Extract error message from content array
+                    if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
+                        for item in content {
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                if text.contains("No connected account") || text.contains("valid connection not found") {
+                                    tracing::info!("[AUTH] Detected MCP Protocol error: {}", text);
+                                    needs_auth = true;
+                                    error_msg = text.to_string();
+                                    successful = false;
+                                    break;
+                                }
                             }
-                        },
-                        Err(e) => {
-                            tracing::error!("Failed to initiate connection after auth error: {}", e);
-                            // Fall through to return the original error
                         }
                     }
                 }
             }
-            
-            return Ok(ToolExecuteResponse {
-                data: Value::Null,
-                error: Some(error_msg),
-                successful: false,
-                log_id: None,
-                session_info: None,
-            });
+        }
+
+        // Check auth_refresh_required (Critical for avoiding loops)
+        if needs_auth {
+            let auth_refresh = data.get("auth_refresh_required")
+                .or_else(|| json_value.get("auth_refresh_required"));
+            if let Some(refresh) = auth_refresh.and_then(|v| v.as_bool()) {
+                if !refresh {
+                    tracing::info!("[AUTH] auth_refresh_required=false, ignoring auth error");
+                    needs_auth = false;
+                }
+            }
         }
         
-        // Use the whole JSON as data if it doesn't match the specific structure
-        // This is a fallback for when the API might return just the result
+        // Trigger managed flow if needed
+        if needs_auth {
+            if let Some(tk_slug) = &toolkit_slug {
+                 tracing::info!("[AUTH] Triggering connection flow for toolkit '{}'", tk_slug);
+                 match self.initiate_connection(tk_slug, &user_id).await {
+                     Ok(res) => {
+                         if res.contains("Authentication successful") {
+                             return Ok(ToolExecuteResponse {
+                                 data: Value::Null,
+                                 error: Some("Authentication successful! Please retry.".to_string()),
+                                 successful: false,
+                                 log_id: None,
+                                 session_info: None
+                             });
+                         }
+                         let url = res.split_whitespace().last().unwrap_or(&res).to_string();
+                         let redirect = if url.starts_with("http") { url } else { res.clone() };
+                         
+                         return Ok(ToolExecuteResponse {
+                             data: serde_json::json!({ "redirectUrl": redirect }),
+                             error: Some(format!("Authentication required. {}", res)),
+                             successful: false,
+                             log_id: None,
+                             session_info: None
+                         });
+                     },
+                     Err(e) => {
+                         tracing::error!("Auth trigger failed: {}", e);
+                     }
+                 }
+            }
+        }
+
         Ok(ToolExecuteResponse {
-            data: json_value,
-            error: None,
-            successful: status.is_success(),
+            data,
+            error: if error_msg.is_empty() { None } else { Some(error_msg) },
+            successful,
             log_id: None,
             session_info: None,
         })
     }
+
     pub async fn initiate_connection(&self, toolkit_slug: &str, user_id: &str) -> Result<String, String> {
+        // Use the internal Proxy Link endpoint (original working pattern from 889718d)
+        // This is different from the public /api/v3/connected_accounts endpoint.
         let url = format!("{}/connected_accounts/link", self.get_api_base_url());
         
-        // Use configured user_id if available, otherwise fall back to argument
         let final_user_id = self.user_id.clone().unwrap_or_else(|| user_id.to_string());
         
-        // Always dynamically look up the auth config ID for this specific toolkit
-        // This ensures each toolkit (Gmail, Google Docs, etc.) uses its own auth config
+        // We need the auth_config_id to tell the API WHICH toolkit to link.
         let auth_config_id = self.get_auth_config_id(toolkit_slug).await?;
 
         // Find a random port for the callback
         let port = find_available_port().ok_or_else(|| "Failed to find available port for callback".to_string())?;
         let callback_url = format!("http://localhost:{}/callback", port);
 
-        // Helper to log if write fails
-        let _ = write_to_debug_file("composio_auth_req_payload.json", &format!("AuthConfig: {}, User: {}, Callback: {}", auth_config_id, final_user_id, callback_url));
-        
-        // Payload to create a connected account request
+        // Payload for the link endpoint (original keys: user_id, callback_url)
         let payload = serde_json::json!({
             "auth_config_id": auth_config_id, 
             "user_id": final_user_id,
             "callback_url": callback_url
         });
         
+        tracing::info!("[REST] Initiating connection via {}: {:?}", url, payload);
+
         let response = self.client.post(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", &self.api_key) // REST API requires x-api-key
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Connection initiation error: {}", e))?;
 
+        let status = response.status();
         let response_text = response.text().await.map_err(|e| e.to_string())?;
         
-        let _ = write_to_debug_file("composio_auth_resp.json", &response_text);
+        // Debug log the response
+        let _ = write_to_debug_file("composio_initiate_resp.json", &response_text);
         
+        if !status.is_success() {
+             return Err(format!("Failed to initiate connection ({}): {}", status, response_text));
+        }
+
         // Parse response to find redirect URL
         let json: Value = serde_json::from_str(&response_text).map_err(|e| e.to_string())?;
         
         // Check for redirectUrl at various locations in response structure
+        // REST API typically returns it in 'redirectUrl' or 'connectionRequest.redirectUrl'
         let redirect_url = if let Some(url) = json.get("redirectUrl").and_then(|v| v.as_str()) {
             Some(url.to_string())
         } else if let Some(url) = json.get("redirect_url").and_then(|v| v.as_str()) {
@@ -2178,12 +2142,21 @@ impl ComposioClient {
                         tracing::info!("Authentication successful!");
                         
                         // Check for connectedAccountId in params (both camelCase and snake_case)
+                        // CRITICAL FIX: Immediately cache the ID so the next tool call can use it
                         if let Some(acc_id) = result.params.get("connectedAccountId")
                             .or_else(|| result.params.get("connected_account_id")) {
-                            tracing::info!("Received connectedAccountId: {}", acc_id);
+                            tracing::info!("Received connectedAccountId: {} for toolkit: {}", acc_id, toolkit_slug);
+                            
+                            // Immediately update the toolkit_account_map cache
+                            {
+                                let mut map = self.toolkit_account_map.write().unwrap();
+                                map.insert(toolkit_slug.to_lowercase(), (acc_id.clone(), final_user_id.clone()));
+                                tracing::info!("[HANDOFF] Cached connected_account_id '{}' for toolkit '{}' (user: {})", 
+                                    acc_id, toolkit_slug, final_user_id);
+                            }
                         }
                         
-                        // Trigger a refresh of connected accounts to update our local state
+                        // Also refresh from REST API as a backup (may catch additional accounts)
                         let _ = self.list_connected_accounts().await;
                         
                         return Ok("Authentication successful! You can now use the tool.".to_string());

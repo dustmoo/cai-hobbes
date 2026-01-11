@@ -238,7 +238,23 @@ impl StreamManagerContext {
                                     }
 
                                     if final_status == ToolCallStatus::Error {
-                                        (final_status, error_string.unwrap_or_default(), false)
+                                        let err_msg = error_string.unwrap_or_default();
+                                        // Detect "No connected account found" error from Composio
+                                        if err_msg.contains("No connected account found") {
+                                            tracing::info!("Composio auth required error detected. Initiating connection flow...");
+                                            match mcp_manager.read().initiate_composio_auth(&tool_call.server_name, &tool_call.tool_name).await {
+                                                Ok(url) => {
+                                                    tracing::info!("Successfully initiated Composio auth flow. URL: {}", url);
+                                                    (ToolCallStatus::AuthRequired, url, false)
+                                                },
+                                                Err(e) => {
+                                                    tracing::error!("Failed to initiate Composio auth flow: {}", e);
+                                                    (final_status, err_msg, false)
+                                                }
+                                            }
+                                        } else {
+                                            (final_status, err_msg, false)
+                                        }
                                     } else {
                                         // Check for auth requirement
                                         let mut auth_url = None;
