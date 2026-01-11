@@ -12,6 +12,7 @@ use crate::settings::{Settings, SettingsManager};
 use hobbes_core::models::Attachment;
 
 use crate::processing::summarization_scheduler::{SchedulerSignal};
+use crate::components::focus_context::FocusContext;
 
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +26,9 @@ pub enum ChatCommand {
     NewChatWithMemory,
     ScrollToBottom,
     FocusChat,
+    SubmitModal,
+    CloseModal,
+    SaveModal,
 }
 
 #[component]
@@ -52,6 +56,7 @@ pub fn ChatInput(
     let mut show_profile_selector = use_signal(|| false);
     let mut show_new_chat_menu = use_signal(|| false);
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
+    let focus_context = use_context::<Signal<FocusContext>>();
     
     // Listen for global chat commands (from menu hotkeys)
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
@@ -130,6 +135,9 @@ pub fn ChatInput(
                         const el = document.getElementById('chat-textarea');
                         if (el) { el.focus(); }
                     "#);
+                }
+                ChatCommand::SubmitModal | ChatCommand::CloseModal | ChatCommand::SaveModal => {
+                    // Handled by active modal
                 }
             }
             // Reset command to avoid re-triggering
@@ -403,8 +411,33 @@ pub fn ChatInput(
                         draft.set(event.value());
                     },
                     onkeydown: move |event| {
+                        tracing::debug!("ChatInput::onkeydown - Key: {:?}, Modifiers: {:?}, Context: {:?}", event.key(), event.data.modifiers(), *focus_context.read());
+                        // If a modal owns focus, don't handle keyboard events
+                        if *focus_context.read() != FocusContext::ChatInput {
+                            tracing::debug!("ChatInput ignoring event - Focus owns: {:?}", *focus_context.read());
+                            return;
+                        }
+                        
                         scheduler.send(SchedulerSignal::Activity);
                         let modifiers = event.data.modifiers();
+
+                        // Handle Enter key submission (must be BEFORE modifier guard to catch Cmd+Enter)
+                        if event.key() == Key::Enter {
+                            let is_explicit_submit = modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL);
+                            let is_shift = modifiers.contains(Modifiers::SHIFT);
+
+                            // Submit if:
+                            // 1. Enter is pressed WITHOUT Shift (standard chat behavior)
+                            // 2. Cmd+Enter or Ctrl+Enter is pressed (explicit force submit)
+                            if (!is_shift) || is_explicit_submit {
+                                event.prevent_default();
+                                on_interaction.call(());
+                                send_message();
+                                return;
+                            }
+                        }
+
+                        // Block other modifier-based shortcuts (let OS/browser handle them)
                         if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::ALT) {
                             return;
                         }
@@ -444,12 +477,6 @@ pub fn ChatInput(
                                 }
                             "#);
                             return;
-                        }
-
-                        if event.key() == Key::Enter && !modifiers.contains(Modifiers::SHIFT) {
-                            event.prevent_default();
-                            on_interaction.call(());
-                            send_message();
                         }
                     },
                     onpaste: move |_| {
