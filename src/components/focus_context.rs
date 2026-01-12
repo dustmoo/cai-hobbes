@@ -5,6 +5,7 @@
 
 /// Represents which component currently "owns" keyboard focus.
 /// Components check this signal before handling keyboard events.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Default, Debug)]
 pub enum FocusContext {
     /// Default state - chat input handles keyboard events
@@ -12,19 +13,14 @@ pub enum FocusContext {
     ChatInput,
     /// New Chat with Memory modal is open
     NewChatMemoryModal,
-    
-    // The following variants are currently unused but reserved for future
-    // centralized focus management. Some modals currently use local focus
-    // handling (e.g., ConfirmSaveModal) or are not yet fully integrated (CommentModal).
-    // We allow dead code here to keep the centralized registry intact for implementation.
-    #[allow(dead_code)]
+    /// Comment modal is open
     CommentModal,
-    #[allow(dead_code)]
+    /// Confirm delete modal is open
     ConfirmDeleteModal,
-    #[allow(dead_code)]
+    /// Confirm save modal is open
     ConfirmSaveModal,
-    #[allow(dead_code)]
+    /// Conflict modal is open
     ConflictModal,
-    #[allow(dead_code)]
+    /// Settings panel is focused
     SettingsPanel,
 }

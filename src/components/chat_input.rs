@@ -57,6 +57,22 @@ pub fn ChatInput(
     let mut show_new_chat_menu = use_signal(|| false);
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
     let focus_context = use_context::<Signal<FocusContext>>();
+    let mut textarea_mounted = use_signal(|| Option::<std::rc::Rc<dioxus::html::MountedData>>::None);
+
+    // Active Focus Management: Reclaim focus when context reverts to ChatInput
+    use_effect(move || {
+        let current_context = *focus_context.read();
+        let mounted_opt = textarea_mounted.read().clone();
+        
+        if current_context == FocusContext::ChatInput {
+            if let Some(mounted) = mounted_opt {
+                spawn(async move {
+                    tracing::debug!("ChatInput reclaiming focus via FocusContext");
+                    let _ = mounted.set_focus(true).await;
+                });
+            }
+        }
+    });
     
     // Listen for global chat commands (from menu hotkeys)
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
@@ -396,6 +412,9 @@ pub fn ChatInput(
                     rows: "1",
                     placeholder: "Type your message...",
                     value: "{draft}",
+                    onmounted: move |evt| {
+                        textarea_mounted.set(Some(evt.data()));
+                    },
                     oninput: move |event| {
                         scheduler.send(SchedulerSignal::Activity);
                         
@@ -420,25 +439,13 @@ pub fn ChatInput(
                         
                         scheduler.send(SchedulerSignal::Activity);
                         let modifiers = event.data.modifiers();
+                        
+                        // Allow SUPER/CONTROL/ALT only if it's a specific key we want to handle with modifiers (like Enter),
+                        // otherwise block them to let OS/Global Hotkeys handle them.
+                        // We strictly want to allow Cmd+Enter to pass through to the handler below.
+                        let is_force_submit_candidate = event.key() == Key::Enter && (modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL));
 
-                        // Handle Enter key submission (must be BEFORE modifier guard to catch Cmd+Enter)
-                        if event.key() == Key::Enter {
-                            let is_explicit_submit = modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL);
-                            let is_shift = modifiers.contains(Modifiers::SHIFT);
-
-                            // Submit if:
-                            // 1. Enter is pressed WITHOUT Shift (standard chat behavior)
-                            // 2. Cmd+Enter or Ctrl+Enter is pressed (explicit force submit)
-                            if (!is_shift) || is_explicit_submit {
-                                event.prevent_default();
-                                on_interaction.call(());
-                                send_message();
-                                return;
-                            }
-                        }
-
-                        // Block other modifier-based shortcuts (let OS/browser handle them)
-                        if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::ALT) {
+                        if !is_force_submit_candidate && (modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::ALT)) {
                             return;
                         }
 
@@ -477,6 +484,18 @@ pub fn ChatInput(
                                 }
                             "#);
                             return;
+                        }
+
+                        if event.key() == Key::Enter {
+                            let is_explicit_submit = modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL);
+                            let is_shift = modifiers.contains(Modifiers::SHIFT);
+
+                            // Submit if standard Enter (no shift) OR explicit Cmd+Enter (Force Submit)
+                            if (!is_shift) || is_explicit_submit {
+                                event.prevent_default();
+                                on_interaction.call(());
+                                send_message();
+                            }
                         }
                     },
                     onpaste: move |_| {

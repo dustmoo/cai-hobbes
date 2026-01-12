@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use dioxus_free_icons::{Icon, icons::fi_icons};
 use crate::components::chat::{Comment, Message};
+use crate::components::focus_context::FocusContext;
 use uuid::Uuid;
 
 #[component]
@@ -12,6 +13,36 @@ pub fn CommentModal(
     let mut new_comment_text = use_signal(|| String::new());
     let mut selected_text = use_signal(|| String::new());
     let mut comments = use_signal(|| message.comments.clone());
+    let mut focus_context = use_context::<Signal<FocusContext>>();
+    let mut chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    
+    // Claim focus when modal mounts, release when it unmounts
+    use_effect(move || {
+        focus_context.set(FocusContext::CommentModal);
+    });
+    
+    // Listen for ChatCommands
+    use_effect(move || {
+        let cmd_opt = chat_command.read().clone();
+        if let Some(cmd) = cmd_opt {
+             match cmd {
+                crate::components::chat_input::ChatCommand::SaveModal => {
+                    tracing::info!("CommentModal received SaveModal command");
+                    on_save.call(comments());
+                    focus_context.set(FocusContext::ChatInput);
+                    on_close.call(());
+                    chat_command.set(None);
+                }
+                crate::components::chat_input::ChatCommand::CloseModal => {
+                     tracing::info!("CommentModal received CloseModal command");
+                     focus_context.set(FocusContext::ChatInput);
+                     on_close.call(());
+                     chat_command.set(None);
+                }
+                _ => {}
+            }
+        }
+    });
     
     // Extract text content from message
     let message_text = match &message.content {
@@ -24,27 +55,22 @@ pub fn CommentModal(
         div {
             class: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50",
             tabindex: "0",
-            autofocus: true,
-            onmounted: move |evt| {
-                let mounted = evt.data();
-                spawn(async move {
-                    let _ = mounted.set_focus(true).await;
-                });
+            onclick: move |_| {
+                focus_context.set(FocusContext::ChatInput);
+                on_close.call(());
             },
-            onclick: move |_| on_close.call(()),
-            onkeydown: {
-                let on_close = on_close.clone();
-                let on_save = on_save.clone();
-                move |evt: KeyboardEvent| {
-                    if evt.key() == Key::Escape {
+            onkeydown: move |evt: KeyboardEvent| {
+                tracing::debug!("CommentModal (Outer) keydown: {:?}", evt.key());
+                if evt.key() == Key::Escape {
+                    focus_context.set(FocusContext::ChatInput);
+                    on_close.call(());
+                } else if evt.key() == Key::Enter {
+                    let modifiers = evt.modifiers();
+                    if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
+                        evt.prevent_default();
+                        on_save.call(comments());
+                        focus_context.set(FocusContext::ChatInput);
                         on_close.call(());
-                    } else if evt.key() == Key::Enter {
-                        let modifiers = evt.modifiers();
-                        if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
-                            evt.prevent_default();
-                            on_save.call(comments());
-                            on_close.call(());
-                        }
                     }
                 }
             },
@@ -52,19 +78,17 @@ pub fn CommentModal(
                 class: "bg-dark-card rounded-lg p-6 max-w-2xl w-full mx-4 max-h-[80vh] overflow-y-auto",
                 tabindex: "0",
                 onclick: move |e| e.stop_propagation(),
-                onkeydown: {
-                    let on_close = on_close.clone();
-                    let on_save = on_save.clone();
-                    move |evt: KeyboardEvent| {
-                        if evt.key() == Key::Escape {
+                onkeydown: move |evt: KeyboardEvent| {
+                    if evt.key() == Key::Escape {
+                        focus_context.set(FocusContext::ChatInput);
+                        on_close.call(());
+                    } else if evt.key() == Key::Enter {
+                        let modifiers = evt.modifiers();
+                        if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
+                            evt.prevent_default();
+                            on_save.call(comments());
+                            focus_context.set(FocusContext::ChatInput);
                             on_close.call(());
-                        } else if evt.key() == Key::Enter {
-                            let modifiers = evt.modifiers();
-                            if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
-                                evt.prevent_default();
-                                on_save.call(comments());
-                                on_close.call(());
-                            }
                         }
                     }
                 },
@@ -78,7 +102,10 @@ pub fn CommentModal(
                     }
                     button {
                         class: "text-gray-400 hover:text-white",
-                        onclick: move |_| on_close.call(()),
+                        onclick: move |_| {
+                            focus_context.set(FocusContext::ChatInput);
+                            on_close.call(());
+                        },
                         Icon {
                             width: 20,
                             height: 20,
@@ -128,7 +155,30 @@ pub fn CommentModal(
                         rows: "3",
                         placeholder: "Add your comment...",
                         value: "{new_comment_text}",
-                        oninput: move |e| new_comment_text.set(e.value())
+                        autofocus: true,
+                        onmounted: move |evt| {
+                            let mounted = evt.data();
+                            spawn(async move {
+                                let _ = mounted.set_focus(true).await;
+                            });
+                        },
+                        oninput: move |e| new_comment_text.set(e.value()),
+                        onkeydown: move |evt: KeyboardEvent| {
+                            if evt.key() == Key::Escape {
+                                evt.stop_propagation();
+                                focus_context.set(FocusContext::ChatInput);
+                                on_close.call(());
+                            } else if evt.key() == Key::Enter {
+                                let modifiers = evt.modifiers();
+                                if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
+                                    evt.prevent_default();
+                                    evt.stop_propagation();
+                                    on_save.call(comments());
+                                    focus_context.set(FocusContext::ChatInput);
+                                    on_close.call(());
+                                }
+                            }
+                        }
                     }
                 }
                 
@@ -200,13 +250,17 @@ pub fn CommentModal(
                     class: "flex justify-end space-x-2",
                     button {
                         class: "px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors",
-                        onclick: move |_| on_close.call(()),
+                        onclick: move |_| {
+                            focus_context.set(FocusContext::ChatInput);
+                            on_close.call(());
+                        },
                         "Cancel"
                     }
                     button {
                         class: "px-4 py-2 bg-primary-500 hover:bg-primary-600 text-white rounded-md transition-colors",
                         onclick: move |_| {
                             on_save.call(comments());
+                            focus_context.set(FocusContext::ChatInput);
                             on_close.call(());
                         },
                         "Save & Close"

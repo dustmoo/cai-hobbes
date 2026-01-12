@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use crate::session::ActiveContext;
 use crate::components::syntax_highlighter::highlight_json;
-// use crate::components::mcp_marketplace::McpServerCard; // If we needed this, but we don't.
+use crate::components::focus_context::FocusContext;
 use dioxus_free_icons::icons::fi_icons;
 use dioxus_free_icons::Icon;
 
@@ -14,11 +14,16 @@ pub fn NewChatMemoryModal(
 ) -> Element {
     let mut json_content = use_signal(|| String::new());
     let mut error_message = use_signal(|| Option::<String>::None);
+    let mut focus_context = use_context::<Signal<FocusContext>>();
+    let mut chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
 
     // Initialize content when modal becomes visible or initial context changes
     use_effect(move || {
         if *is_visible.read() {
-             match serde_json::to_string_pretty(&initial_context) {
+            // Claim focus ownership
+            focus_context.set(FocusContext::NewChatMemoryModal);
+            
+            match serde_json::to_string_pretty(&initial_context) {
                 Ok(json) => json_content.set(json),
                 Err(e) => {
                     tracing::error!("Failed to serialize initial context: {}", e);
@@ -26,17 +31,22 @@ pub fn NewChatMemoryModal(
                 }
             }
             error_message.set(None);
+        } else {
+            // Release focus ownership when modal closes
+            focus_context.set(FocusContext::ChatInput);
         }
     });
     
-    // Shared submission logic
     let mut submit_session = move || {
         let content = json_content.read().clone();
+        tracing::error!("DEBUG: NewChatMemoryModal::submit_session called");
         match serde_json::from_str::<ActiveContext>(&content) {
             Ok(valid_context) => {
+                tracing::info!("NewChatMemoryModal::submit_session - valid context parsed, calling on_start_chat");
                 on_start_chat.call(valid_context);
             }
             Err(e) => {
+                tracing::error!("NewChatMemoryModal::submit_session - failed to parse JSON: {}", e);
                 error_message.set(Some(format!("Generic JSON error: {}", e)));
                  // Try to parse as generic Value to give better error if it's just schema mismatch vs syntax
                 if let Err(syntax_err) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -49,6 +59,28 @@ pub fn NewChatMemoryModal(
         }
     };
 
+    // Listen for ChatCommands (e.g. from global hotkeys)
+    use_effect(move || {
+        let cmd_opt = chat_command.read().clone();
+        if let Some(cmd) = cmd_opt {
+            if *is_visible.read() {
+                match cmd {
+                    crate::components::chat_input::ChatCommand::SubmitModal => {
+                        tracing::info!("NewChatMemoryModal received SubmitModal command");
+                        submit_session();
+                        chat_command.set(None); // Reset command
+                    }
+                    crate::components::chat_input::ChatCommand::CloseModal => {
+                        tracing::info!("NewChatMemoryModal received CloseModal command");
+                        on_cancel.call(());
+                        chat_command.set(None); // Reset command
+                    }
+                     _ => {}
+                }
+            }
+        }
+    });
+
     if !*is_visible.read() {
         return rsx! {};
     }
@@ -57,19 +89,14 @@ pub fn NewChatMemoryModal(
         div {
             class: "fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm",
             tabindex: "0",
-            autofocus: true,
-            onmounted: move |evt| {
-                let mounted = evt.data();
-                spawn(async move {
-                    let _ = mounted.set_focus(true).await;
-                });
-            },
             onkeydown: move |evt: KeyboardEvent| {
+                tracing::debug!("NewChatMemoryModal (Outer) onkeydown - Key: {:?}, Modifiers: {:?}", evt.key(), evt.modifiers());
                 if evt.key() == Key::Escape {
                     on_cancel.call(());
                 } else if evt.key() == Key::Enter {
                     let modifiers = evt.modifiers();
                     if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
+                        tracing::info!("NewChatMemoryModal (Outer) submitting via Cmd+Enter");
                         evt.prevent_default();
                         submit_session();
                     }
@@ -155,6 +182,13 @@ pub fn NewChatMemoryModal(
                             style: "color: transparent;",
                             value: "{json_content}",
                             spellcheck: false,
+                            autofocus: true,
+                            onmounted: move |evt| {
+                                let mounted = evt.data();
+                                spawn(async move {
+                                    let _ = mounted.set_focus(true).await;
+                                });
+                            },
                             oninput: move |e| {
                                 json_content.set(e.value());
                                 error_message.set(None);

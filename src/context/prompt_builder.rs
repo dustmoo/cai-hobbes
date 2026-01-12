@@ -18,8 +18,18 @@ impl From<Message> for Content {
     fn from(msg: Message) -> Self {
         let role = if msg.author == "User" { "user" } else { "model" }.to_string();
         match msg.content {
-            MessageContent::Text { content: text, .. } => {
-                let mut parts = vec![Part::Text { text, thought: None }];
+            MessageContent::Text { content: text, thought_summary, .. } => {
+                let mut parts = Vec::new();
+                
+                // Include thinking summary if present (critical for Gemini 2.0 Thinking support)
+                if let Some(summary) = thought_summary {
+                    if !summary.is_empty() {
+                        parts.push(Part::Text { text: summary, thought: Some(true) });
+                    }
+                }
+                
+                parts.push(Part::Text { text, thought: None });
+                
                 for attachment in msg.attachments {
                     parts.push(Part::InlineData {
                         inline_data: InlineDataPart {
@@ -269,7 +279,24 @@ impl<'a> PromptBuilder<'a> {
         let system_instruction = Some(SystemInstruction { parts });
 
         // 3. Construct the conversational contents.
-        let mut contents = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
+        
+        // Helper to add parts while maintaining role alternation (auto-grouping consecutive same-role roles).
+        // This is critical for Gemini API compliance (model -> model is invalid) 
+        // and correctly handles "Thought + Text" or "Thought + Tool" turns.
+        let mut add_to_prompt = |role: &str, part: Part| {
+            if let Some(last) = contents.last_mut() {
+                if last.role == role {
+                    last.parts.push(part);
+                    return;
+                }
+            }
+            contents.push(Content {
+                role: role.to_string(),
+                parts: vec![part],
+            });
+        };
+
         let history_len = self.settings.chat_history_length;
         let messages = &self.session.messages;
         let mut first_message_id = None;
@@ -278,7 +305,10 @@ impl<'a> PromptBuilder<'a> {
         // 1. Add the first user message to preserve the original intent.
         if let Some(first_message) = messages.iter().find(|m| m.author == "User") {
             if let MessageContent::Text { .. } = &first_message.content {
-                 contents.push(first_message.clone().into());
+                 let content: Content = first_message.clone().into();
+                 for part in content.parts {
+                     add_to_prompt(&content.role, part);
+                 }
                  first_message_id = Some(first_message.id);
             }
         }
@@ -299,9 +329,10 @@ impl<'a> PromptBuilder<'a> {
                         if let Some(sig) = thought_signature {
                             last_thought_signature = Some(sig.clone());
                         }
+                        
                         let content: Content = message.clone().into();
-                        if !content.parts.is_empty() {
-                            contents.push(content);
+                        for part in content.parts {
+                            add_to_prompt(&content.role, part);
                         }
                         
                         // Handle comments as separate user messages
@@ -312,10 +343,7 @@ impl<'a> PromptBuilder<'a> {
                             }
                             comment_text.push_str("]");
                             
-                            contents.push(Content {
-                                role: "user".to_string(),
-                                parts: vec![Part::Text { text: comment_text, thought: None }],
-                            });
+                            add_to_prompt("user", Part::Text { text: comment_text, thought: None });
                         }
                     }
                     MessageContent::ToolCall(tc) => {
@@ -325,41 +353,40 @@ impl<'a> PromptBuilder<'a> {
                             last_thought_signature = Some(sig.clone());
                         }
 
+                        // Sanitize tool name - CRITICAL: Must match the sanitized name used in declarations
+                        let sanitized_tool_name = crate::gemini::convert::sanitize_function_name(&format!("{}_{}", tc.server_name, tc.tool_name));
+
                         // 1. Add the model's function call
                         let args_value: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
                         
                         // Log the thought_signature field for debugging
                         if let Some(ref thought_sig) = current_thought_signature {
                             tracing::info!("Reconstructing function call '{}' with thought_signature: '{}'", 
-                                tc.tool_name, 
+                                sanitized_tool_name, 
                                 if thought_sig.len() > 50 { &thought_sig[..50] } else { thought_sig }
                             );
                         } else {
-                            tracing::warn!("Reconstructing function call '{}' WITHOUT thought_signature field - THIS WILL CAUSE API ERROR", tc.tool_name);
+                            tracing::warn!("Reconstructing function call '{}' WITHOUT thought_signature field - THIS WILL CAUSE API ERROR", sanitized_tool_name);
                         }
                         
-                        contents.push(Content {
-                            role: "model".to_string(),
-                            parts: vec![Part::FunctionCall {
-                                function_call: FunctionCallPart {
-                                    name: format!("{}_{}", tc.server_name, tc.tool_name),
-                                    args: args_value,
-                                },
-                                thought_signature: current_thought_signature.clone(),
-                            }],
+                        // Include thinking summary if present
+                        if let Some(summary) = &tc.thought_summary {
+                            if !summary.is_empty() {
+                                add_to_prompt("model", Part::Text { text: summary.clone(), thought: Some(true) });
+                            }
+                        }
+
+                        add_to_prompt("model", Part::FunctionCall {
+                            function_call: FunctionCallPart {
+                                name: sanitized_tool_name.clone(),
+                                args: args_value,
+                            },
+                            thought_signature: current_thought_signature,
                         });
 
                         // 2. Add the user's function response
                         // Truncation logic: If this is a historical tool call (not the most recent message),
                         // and it exceeds the max length, truncate it to save context.
-                        // We check against last_message_id (ignoring placeholder) to determine if it's historical.
-                        let _is_historical = Some(message.id) != first_message_id && // Safety check, though first msg is usually User
-                                          Some(message.id) != last_message.map(|m| m.id) &&
-                                          (!is_continuation_placeholder ||
-                                           Some(message.id) != self.session.messages.get(self.session.messages.len().saturating_sub(2)).map(|m| m.id));
-
-                        // Better historical check:
-                        // The last "meaningful" message is either the last message, or the one before the placeholder.
                         let last_meaningful_id = if is_continuation_placeholder {
                             if self.session.messages.len() >= 2 {
                                 self.session.messages.get(self.session.messages.len() - 2).map(|m| m.id)
@@ -392,14 +419,11 @@ impl<'a> PromptBuilder<'a> {
                         let result_value: serde_json::Value = serde_json::from_str(&result_string)
                             .unwrap_or_else(|_| json!(result_string));
                         
-                        contents.push(Content {
-                            role: "user".to_string(),
-                            parts: vec![Part::FunctionResponse {
-                                function_response: FunctionResponsePart {
-                                    name: format!("{}_{}", tc.server_name, tc.tool_name),
-                                    response: json!({ "result": result_value }),
-                                },
-                            }],
+                        add_to_prompt("user", Part::FunctionResponse {
+                            function_response: FunctionResponsePart {
+                                name: sanitized_tool_name,
+                                response: json!({ "result": result_value }),
+                            },
                         });
 
                         // Handle comments as separate user messages
@@ -410,10 +434,7 @@ impl<'a> PromptBuilder<'a> {
                             }
                             comment_text.push_str("]");
                             
-                            contents.push(Content {
-                                role: "user".to_string(),
-                                parts: vec![Part::Text { text: comment_text, thought: None }],
-                            });
+                            add_to_prompt("user", Part::Text { text: comment_text, thought: None });
                         }
                     }
                     MessageContent::PermissionRequest(_) => {
@@ -428,10 +449,7 @@ impl<'a> PromptBuilder<'a> {
 
         // 5. Add the current user message, only if it's not empty.
         if !user_message.is_empty() {
-            contents.push(Content {
-                role: "user".to_string(),
-                parts: vec![Part::Text { text: user_message, thought: None }],
-            });
+            add_to_prompt("user", Part::Text { text: user_message, thought: None });
         }
 
         // 6. Assemble and return the final LlmPrompt object.

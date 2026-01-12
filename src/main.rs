@@ -170,6 +170,9 @@ fn app() -> Element {
         Signal::new(settings)
     });
 
+    // Global focus context for keyboard event coordination
+    use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
+
     // Asynchronously load secrets from keychain using biometric authentication
     // This prompts once for Touch ID/password, then uses that context for all secrets
     use_effect(move || {
@@ -343,6 +346,13 @@ fn app() -> Element {
     let mcp_context = use_context_provider(|| Signal::new(mcp::manager::McpContext { servers: Vec::new() }));
 
     let _ = use_resource(move || async move {
+        // Wait until secrets are loaded before launching MCP servers
+        // This ensures profile API keys are populated
+        if !secrets_loaded() {
+            tracing::debug!("Waiting for secrets to load before launching MCP servers...");
+            return;
+        }
+        
         let manager = mcp_manager.read().clone();
         let mcp_context_signal = mcp_context.clone();
         let settings_clone = settings.read().clone();
@@ -353,6 +363,38 @@ fn app() -> Element {
         
         manager.launch_servers(mcp_context_signal, settings_clone).await;
     });
+
+    // Reinitialize Composio client when active profile changes
+    // This use_effect subscribes to changes in active_composio_profile
+    {
+        let settings = settings.clone();
+        let mcp_manager = mcp_manager.clone();
+        let mcp_context = mcp_context.clone();
+        
+        // Track the previous profile name to detect actual changes
+        let mut prev_profile_name: Signal<Option<String>> = use_signal(|| None);
+        
+        use_effect(move || {
+            let current_profile_name = settings.read().active_composio_profile.clone();
+            let previous = prev_profile_name.peek().clone();
+            
+            // Only reinitialize if the profile actually changed (not on initial render)
+            if previous.is_some() && current_profile_name != previous {
+                tracing::info!("Active Composio profile changed from {:?} to {:?}, reinitializing client", previous, current_profile_name);
+                
+                let mcp_manager = mcp_manager.clone();
+                let mcp_context_signal = mcp_context.clone();
+                let settings_clone = settings.read().clone();
+                
+                spawn(async move {
+                    mcp_manager.read().reinitialize_composio_client(mcp_context_signal, settings_clone).await;
+                });
+            }
+            
+            // Update the previous profile name
+            prev_profile_name.set(current_profile_name);
+        });
+    }
 
     let mut show_session_manager = use_signal(|| false);
     let mut show_settings_panel = use_signal(|| false);

@@ -249,8 +249,10 @@ pub fn McpMarketplace() -> Element {
         move || {
             let settings = settings.clone();
             let mut connected_slugs = connected_slugs.clone();
+            // Track settings changes
+            let settings_snapshot = settings.read().clone();
+            
             async move {
-                let settings_snapshot = settings.peek().clone();
                 if settings_snapshot.preferred_mcp_source != McpSource::Composio {
                     return; // Only fetch for Composio
                 }
@@ -303,10 +305,12 @@ pub fn McpMarketplace() -> Element {
         // Explicit trigger counter - must be used (not just discarded) for proper reactivity
         let trigger = *trigger_search.read();
         
+        // Track settings changes (e.g. API key loading)
+        let settings_snapshot = settings.read().clone();
+        
         tracing::debug!("Resource triggered - sort={:?}, trigger={}, categories={:?}", sort, trigger, cats);  
         
         // Get the preferred source from settings
-        let settings_snapshot = settings.peek().clone();
         let source = settings_snapshot.preferred_mcp_source.clone();
             
         async move {
@@ -902,8 +906,10 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let status_for_fetch = status.status.clone();
     use_effect(move || {
         let should_fetch = is_composio && *show_toolkits.read() && status_for_fetch == ServerStatus::Loaded;
-        let no_error = toolkits_error.read().is_none();
-        if should_fetch && toolkits.read().is_empty() && !*toolkits_loading.read() && no_error {
+        // Use peek() to avoid creating a dependency on the signals we only check condition against
+        // This prevents infinite loops where we write to these signals within the effect
+        let no_error = toolkits_error.peek().is_none();
+        if should_fetch && toolkits.peek().is_empty() && !*toolkits_loading.peek() && no_error {
             toolkits_loading.set(true);
             
             let mcp_manager_clone = mcp_manager.clone();
@@ -1348,6 +1354,7 @@ fn McpServerCard(
     let mut is_connecting = use_signal(|| false);
     let mut connection_status: Signal<String> = use_signal(|| "Connect".to_string());
     let mut connection_error: Signal<Option<String>> = use_signal(|| None);
+    let mut connection_task = use_signal(|| Option::<Task>::None);
     
     // Source-aware install detection:
     // - Composio: check if toolkit slug is in connected_slugs
@@ -1443,12 +1450,13 @@ fn McpServerCard(
                                             let settings = settings.clone();
                                             let mcp_manager = mcp_manager.clone();
                                             let mut trigger_search = trigger_search.clone();
+                                            let mut connection_task = connection_task;
                                             is_connecting.set(true);
                                             connection_status.set("Connecting...".to_string());
                                             connection_error.set(None);
                                             
-                                            spawn(async move {
-                                                tracing::info!("Initiating Composio connection for toolkit: {} (auth_scheme: {:?}, managed: {})", 
+                                            let task = spawn(async move {
+                                                tracing::info!("Initiating Composio connection for toolkit: {} (auth_scheme: {:?}, managed: {})",  
                                                     toolkit_slug, auth_scheme, use_managed_auth);
                                                 
                                                 let settings_snapshot = settings.peek().clone();
@@ -1585,7 +1593,10 @@ fn McpServerCard(
                                                     tracing::warn!("No Composio profile configured");
                                                     is_connecting.set(false);
                                                 }
+                                                // Clear task on completion
+                                                connection_task.set(None);
                                             });
+                                            connection_task.set(Some(task));
                                         }
                                     },
 
@@ -1597,6 +1608,19 @@ fn McpServerCard(
                                         "{connection_status}"
                                     } else {
                                         "Connect"
+                                    }
+                                }
+                                if *is_connecting.read() {
+                                    button {
+                                        class: "ml-2 text-xs text-red-400 hover:text-red-300 underline",
+                                        onclick: move |_| {
+                                            if let Some(task) = connection_task.write().take() {
+                                                task.cancel();
+                                            }
+                                            is_connecting.set(false);
+                                            connection_status.set("Cancelled".to_string());
+                                        },
+                                        "Cancel"
                                     }
                                 }
                                 // Show error message if present
