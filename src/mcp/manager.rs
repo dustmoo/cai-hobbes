@@ -1277,56 +1277,13 @@ impl McpManager {
     pub async fn get_composio_toolkits(&self) -> Result<Vec<crate::mcp::composio_client::ToolkitInfo>, String> {
         let servers = self.servers.lock().await;
         if let Some(client) = servers.get("composio-native") {
-            // We can derive connected toolkits directly from the loaded tools
-            // This ensures the UI reflects exactly what the MCP server has provided
-            let mut toolkit_map: HashMap<String, crate::mcp::composio_client::ToolkitInfo> = HashMap::new();
-            
-            for tool in &client.tools {
-                // Try to get slug from metadata first
-                let slug = if let Some(meta) = &tool.meta {
-                    // rmcp::model::Meta is essentially a wrapper around HashMap<String, Value>
-                    // We need to inspect the inner map or use provided methods if available
-                    // Since we constructed it in composio_to_rmcp_tool, we check for "toolkit_slug"
-                    meta.get("toolkit_slug").and_then(|v| v.as_str()).map(|s| s.to_string())
-                } else {
-                    None
-                };
-                
-                // Fallback: Parse from name (TOOLKIT_ACTION)
-                // e.g., NEWS_API_GET_EVERYTHING -> news_api
-                let slug = slug.unwrap_or_else(|| {
-                    let parts: Vec<&str> = tool.name.split('_').collect();
-                    if parts.len() > 1 {
-                        // Primitive heuristic: use first part as slug if it looks like a prefix
-                        // For many composio tools, the slug IS the prefix
-                        parts[0].to_lowercase()
-                    } else {
-                        "unknown".to_string()
-                    }
-                });
-                
-                let entry = toolkit_map.entry(slug.clone()).or_insert_with(|| {
-                    // Simple display name generation (Title Case)
-                    let display_name = if let Some(c) = slug.chars().next() {
-                       c.to_uppercase().to_string() + &slug[1..]
-                    } else {
-                       slug.clone()
-                    };
-                    
-                    crate::mcp::composio_client::ToolkitInfo {
-                        slug: slug.clone(),
-                        display_name,
-                        tool_count: 0,
-                        is_connected: true, // If it's loaded in MCP, it's connected
-                    }
-                });
-                
-                entry.tool_count += 1;
+            if let McpClientType::NativeComposio(composio_client) = &client.service {
+                // Use list_connected_toolkits which:
+                // 1. Calls list_connected_accounts() to find connected toolkit slugs
+                // 2. Calls list_tools() (MCP) to count tools per toolkit
+                // This shows ALL connected toolkits, not just force-loaded ones
+                return composio_client.list_connected_toolkits().await;
             }
-            
-            let mut result: Vec<_> = toolkit_map.into_values().collect();
-            result.sort_by(|a, b| a.slug.cmp(&b.slug));
-            return Ok(result);
         }
         Err("Composio client not initialized or not connected".to_string())
     }

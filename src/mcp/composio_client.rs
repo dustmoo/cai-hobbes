@@ -1952,6 +1952,10 @@ impl ComposioClient {
              let e = json_value.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
              (e.is_empty(), json_value.clone(), e)
         };
+        
+        // Extract log_id and session_info for UI observability
+        let log_id = json_value.get("log_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let session_info = json_value.get("session_info").cloned();
 
         // ----------------------------------------------------------------
         // ROBUST AUTH DETECTION (Preserved from recent improvements)
@@ -2060,8 +2064,8 @@ impl ComposioClient {
             data,
             error: if error_msg.is_empty() { None } else { Some(error_msg) },
             successful,
-            log_id: None,
-            session_info: None,
+            log_id,
+            session_info,
         })
     }
 

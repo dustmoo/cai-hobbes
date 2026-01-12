@@ -270,7 +270,9 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
 
         let body: serde_json::Value = serde_json::from_slice(&execute_req.body).unwrap();
         
-        // Check params for connected_account_id - when found, user_id is not sent
-        assert_eq!(body["params"]["connected_account_id"], "acc_12345");
+        // Verify Pure MCP Payload: connected_account_id should NOT be in the body
+        // The routing is handled by user_id in the URL query params, not the body
+        assert!(body["params"].get("connected_account_id").is_none(), 
+            "connected_account_id should NOT be in the body (Pure MCP Payload mandate)");
     }
 }
