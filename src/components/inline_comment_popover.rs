@@ -13,7 +13,7 @@ pub fn InlineCommentPopover(
 
     rsx! {
         div {
-            class: "fixed z-50 bg-dark-card border border-gray-700 rounded-lg shadow-xl p-3 w-72",
+            class: "fixed z-50 bg-dark-card border border-gray-700 rounded-lg shadow-2xl p-4 min-w-[18rem] max-w-[24rem] transition-all duration-200",
             style: "top: {position_top}px; left: {position_left}px;",
             tabindex: "0",
             onclick: move |e| e.stop_propagation(),
@@ -24,8 +24,7 @@ pub fn InlineCommentPopover(
             },
             
             textarea {
-                class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm mb-2 text-gray-200 focus:outline-none focus:ring-1 focus:ring-primary-500",
-                rows: "3",
+                class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm mb-3 text-gray-200 focus:outline-none focus:ring-1 focus:ring-primary-500 min-h-[5rem] resize-none",
                 placeholder: "Add a comment...",
                 value: "{comment_text}",
                 oninput: move |e| comment_text.set(e.value()),
@@ -47,22 +46,23 @@ pub fn InlineCommentPopover(
             }
             
             div {
-                class: "flex justify-end space-x-2",
+                class: "flex justify-end space-x-2 items-center",
+                span { class: "text-[10px] text-gray-500 mr-auto", "Enter to save, Shift+Enter for newline" }
                 button {
-                    class: "p-1 text-gray-400 hover:text-white rounded transition-colors",
+                    class: "p-1.5 text-gray-400 hover:text-white hover:bg-gray-700 rounded transition-colors",
                     onclick: move |_| on_cancel.call(()),
-                    title: "Cancel",
-                    Icon { width: 16, height: 16, icon: fi_icons::FiX }
+                    title: "Cancel (Esc)",
+                    Icon { width: 14, height: 14, icon: fi_icons::FiX }
                 }
                 button {
-                    class: "p-1 text-primary-400 hover:text-primary-300 rounded transition-colors",
+                    class: "p-1.5 text-primary-400 hover:text-primary-300 hover:bg-primary-900/30 rounded transition-colors",
                     onclick: move |_| {
                         if !comment_text().trim().is_empty() {
                             on_save.call(comment_text());
                         }
                     },
-                    title: "Save",
-                    Icon { width: 16, height: 16, icon: fi_icons::FiCheck }
+                    title: "Save (Enter)",
+                    Icon { width: 14, height: 14, icon: fi_icons::FiCheck }
                 }
             }
         }
