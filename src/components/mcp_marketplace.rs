@@ -212,6 +212,7 @@ pub fn McpMarketplace() -> Element {
                             base_url,
                             profile.entity_id.clone(),
                             profile.user_id.clone(),
+                            profile.id.clone(),
                         );
                         
                         tracing::debug!("Fetching toolkit categories...");
@@ -266,6 +267,7 @@ pub fn McpMarketplace() -> Element {
                             base_url,
                             profile.entity_id.clone(),
                             profile.user_id.clone(),
+                            profile.id.clone(),
                         );
                         
                         match client.get_connected_toolkit_slugs().await {
@@ -329,6 +331,7 @@ pub fn McpMarketplace() -> Element {
                                 base_url,
                                 profile.entity_id.clone(),
                                 profile.user_id.clone(),
+                                profile.id.clone(),
                             );
                             
                             // Use search query if provided
@@ -1473,6 +1476,7 @@ fn McpServerCard(
                                                             base_url,
                                                             profile.entity_id.clone(),
                                                             profile.user_id.clone(),
+                                                            profile.id.clone(),
                                                         );
                                                         
                                                         // Step 1: Create auth config with correct auth scheme

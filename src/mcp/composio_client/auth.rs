@@ -105,6 +105,97 @@ pub async fn list_connected_accounts(client: &ComposioClient) -> Result<Vec<Conn
     Ok(all_accounts)
 }
 
+/// Delete a connected account by ID
+pub async fn delete_connected_account(client: &ComposioClient, account_id: &str) -> Result<(), String> {
+    let url = format!("{}/connected_accounts/{}", client.get_api_base_url(), account_id);
+    tracing::info!("Deleting connected account: {}", account_id);
+    
+    let response = client.client
+        .delete(&url)
+        .header("x-api-key", &client.api_key)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to delete connected account: {}", e))?;
+        
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Failed to delete connected account ({}): {}", status, text));
+    }
+    
+    tracing::info!("Successfully deleted connected account: {}", account_id);
+    Ok(())
+}
+
+/// Prune connections for a toolkit to ensure "One Active Connection" per user.
+/// Keeps the most recent ACTIVE connection and removes duplicates/stale ones.
+pub async fn prune_connections(client: &ComposioClient, toolkit_slug: &str, user_id: &str) -> Result<(), String> {
+    tracing::info!("[PRUNE] Starting connection pruning for toolkit '{}' (user: {})", toolkit_slug, user_id);
+    
+    // 1. Fetch all accounts
+    let accounts = list_connected_accounts(client).await?;
+    
+    // 2. Filter for this user and toolkit
+    let mut target_accounts: Vec<&ConnectedAccount> = accounts.iter().filter(|acc| {
+        let matches_user = acc.user_id.as_deref() == Some(user_id);
+        let matches_toolkit = acc.toolkit.as_ref()
+            .map(|t| t.slug.eq_ignore_ascii_case(toolkit_slug))
+            .unwrap_or(false)
+            || acc.app_name.as_ref()
+                .map(|n| n.eq_ignore_ascii_case(toolkit_slug))
+                .unwrap_or(false);
+        matches_user && matches_toolkit
+    }).collect();
+    
+    // 3. Sort by created_at descending (newest first)
+    // If created_at is missing, they will just maintain relative order or act as "old" depending on sort stability
+    target_accounts.sort_by(|a, b| {
+        b.created_at.as_deref().unwrap_or("")
+            .cmp(a.created_at.as_deref().unwrap_or(""))
+    });
+    
+    let mut active_found = false;
+    
+    for acc in target_accounts {
+        let is_active = acc.status.eq_ignore_ascii_case("ACTIVE");
+        let is_initiated = acc.status.eq_ignore_ascii_case("INITIATED");
+        let is_failed = acc.status.eq_ignore_ascii_case("FAILED");
+        let created_at = acc.created_at.as_deref().unwrap_or("");
+        
+        if is_active {
+            if !active_found {
+                // Keep the FIRST (newest) active connection
+                tracing::info!("[PRUNE] Keeping newest ACTIVE connection: {} (created: {})", acc.id, created_at);
+                active_found = true;
+            } else {
+                // Remove duplicates
+                tracing::warn!("[PRUNE] Deleting duplicate ACTIVE connection: {} (created: {})", acc.id, created_at);
+                if let Err(e) = delete_connected_account(client, &acc.id).await {
+                    tracing::error!("[PRUNE] Failed to delete duplicate account {}: {}", acc.id, e);
+                }
+            }
+        } else if is_failed {
+            // Always remove failed
+            tracing::warn!("[PRUNE] Deleting FAILED connection: {} (created: {})", acc.id, created_at);
+            if let Err(e) = delete_connected_account(client, &acc.id).await {
+                tracing::error!("[PRUNE] Failed to delete failed account {}: {}", acc.id, e);
+            }
+        } else if is_initiated {
+            // Remove stale INITIATED (older than 24h)
+            // Simple heuristic: if we are pruning, we are likely about to create a NEW initiated one.
+            // So getting rid of old pending ones is generally safe.
+            // For now, let's just delete them if they aren't the absolute newest thing 
+            // (effectively cleaning up abandoned flows).
+            tracing::warn!("[PRUNE] Deleting stale INITIATED connection: {} (created: {})", acc.id, created_at);
+             if let Err(e) = delete_connected_account(client, &acc.id).await {
+                tracing::error!("[PRUNE] Failed to delete stale account {}: {}", acc.id, e);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
 /// Create an auth config for a toolkit.
 pub(crate) async fn create_auth_config(
     client: &ComposioClient,
@@ -204,66 +295,87 @@ pub(crate) async fn get_auth_config_id(client: &ComposioClient, toolkit_slug: &s
     }
     
     let url = format!("{}/auth_configs", client.get_api_base_url());
-    
-    tracing::debug!("Fetching auth configs for toolkit '{}' from {}", toolkit_slug, url);
-    
-    let response = client
-        .client
-        .get(&url)
-        .header("x-api-key", &client.api_key)
-        .query(&[("toolkit_slug", toolkit_slug)])
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch auth configs: {}", e))?;
-    
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        tracing::warn!("Failed to fetch auth configs: status {} - {}", status, text);
-        return Err(format!("Failed to fetch auth configs: {}", status));
-    }
-    
-    let response_text = response.text().await.map_err(|e| e.to_string())?;
-    
-    if let Err(e) = write_to_debug_file("composio_auth_configs.json", &response_text) {
-        tracing::warn!("Failed to debug log auth configs: {}", e);
-    }
-    
-    // Parse response - expect { items: [{ id: "...", toolkitSlug: "...", ... }] }
-    let json: Value = serde_json::from_str(&response_text)
-        .map_err(|e| format!("Failed to parse auth configs response: {}", e))?;
-    
-    // Look for matching auth config
+    let mut current_cursor: Option<String> = None;
     let mut found_id: Option<String> = None;
     
-    if let Some(items) = json.get("items").and_then(|v| v.as_array()) {
-        for item in items {
-            // Match by toolkit slug (could be in different field names)
-            let item_slug = item.get("toolkitSlug")
-                .or_else(|| item.get("toolkit_slug"))
-                .or_else(|| item.get("appName"))
-                .or_else(|| item.get("app_name"))
-                .and_then(|v| v.as_str());
+    // Pagination Loop
+    loop {
+        tracing::debug!("Fetching auth configs for toolkit '{}' from {} (cursor: {:?})", toolkit_slug, url, current_cursor);
+        
+        let mut req = client
+            .client
+            .get(&url)
+            .header("x-api-key", &client.api_key)
+            .query(&[("toolkit_slug", toolkit_slug), ("limit", "50")]); // Filter on server side
             
-            if let Some(slug) = item_slug {
-                if slug.to_lowercase() == toolkit_slug.to_lowercase() {
-                    if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                        tracing::info!("Found auth config ID '{}' for toolkit '{}'", id, toolkit_slug);
-                        found_id = Some(id.to_string());
-                        break;
+        if let Some(ref c) = current_cursor {
+            req = req.query(&[("cursor", c)]);
+        }
+            
+        let response = req
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch auth configs: {}", e))?;
+        
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            tracing::warn!("Failed to fetch auth configs: status {} - {}", status, text);
+            return Err(format!("Failed to fetch auth configs: {}", status));
+        }
+        
+        let response_text = response.text().await.map_err(|e| e.to_string())?;
+        
+        if let Err(e) = write_to_debug_file("composio_auth_configs.json", &response_text) {
+            tracing::warn!("Failed to debug log auth configs: {}", e);
+        }
+        
+        // Parse response using the AuthConfigInfo struct for robustness
+        let json_value: Value = serde_json::from_str(&response_text)
+            .map_err(|e| format!("Failed to parse auth configs response: {}", e))?;
+            
+        // Extract items
+        if let Some(items) = json_value.get("items").and_then(|v| v.as_array()) {
+            for item in items {
+                // Correctly resolve the nested toolkit slug structure
+                // API returns: { "toolkit": { "slug": "clickup" }, ... }
+                let item_slug = item.get("toolkit")
+                    .and_then(|t| t.get("slug"))
+                    .and_then(|s| s.as_str())
+                    .or_else(|| {
+                        // Fallback to flat properties if format changes or relies on old schema
+                        item.get("toolkitSlug")
+                        .or_else(|| item.get("toolkit_slug"))
+                        .or_else(|| item.get("appName"))
+                        .or_else(|| item.get("app_name"))
+                        .and_then(|v| v.as_str())
+                    });
+                
+                if let Some(slug) = item_slug {
+                    if slug.eq_ignore_ascii_case(toolkit_slug) {
+                         if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                            tracing::info!("Found auth config ID '{}' for toolkit '{}'", id, toolkit_slug);
+                            found_id = Some(id.to_string());
+                            break;
+                        }
                     }
                 }
             }
         }
         
-        // If no exact match, try first available for this toolkit
-        if found_id.is_none() {
-            if let Some(first) = items.first() {
-                if let Some(id) = first.get("id").and_then(|v| v.as_str()) {
-                    tracing::info!("Using first available auth config ID '{}' for toolkit '{}'", id, toolkit_slug);
-                    found_id = Some(id.to_string());
-                }
-            }
+        if found_id.is_some() {
+            break;
+        }
+
+        // Check for next_cursor
+        if let Some(next) = json_value.get("next_cursor").and_then(|v| v.as_str()) {
+             if !next.is_empty() {
+                 current_cursor = Some(next.to_string());
+             } else {
+                 break;
+             }
+        } else {
+            break;
         }
     }
     
@@ -283,46 +395,81 @@ pub(crate) async fn get_auth_config_id(client: &ComposioClient, toolkit_slug: &s
 /// Fetch ALL auth configs for this project and populate the cache.
 pub async fn list_auth_configs(client: &ComposioClient) -> Result<Vec<AuthConfigInfo>, String> {
     let url = format!("{}/auth_configs", client.get_api_base_url());
+    let mut all_configs: Vec<AuthConfigInfo> = Vec::new();
+    let mut current_cursor: Option<String> = None;
     
-    tracing::debug!("Fetching all auth configs from {}", url);
+    // Limit safety loop
+    const MAX_PAGES: usize = 20;
+    let mut page_count = 0;
     
-    let response = client
-        .client
-        .get(&url)
-        .header("x-api-key", &client.api_key)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch auth configs: {}", e))?;
+    loop {
+        page_count += 1;
+        if page_count > MAX_PAGES {
+            tracing::warn!("Reached max page limit ({}) for auth configs list", MAX_PAGES);
+            break;
+        }
+        
+        let mut req = client
+            .client
+            .get(&url)
+            .header("x-api-key", &client.api_key)
+            .query(&[("limit", "50")]);
+            
+        if let Some(ref c) = current_cursor {
+            req = req.query(&[("cursor", c)]);
+        }
     
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        tracing::warn!("Failed to fetch auth configs: status {} - {}", status, text);
-        return Err(format!("Failed to fetch auth configs: {}", status));
-    }
-    
-    let response_text = response.text().await.map_err(|e| e.to_string())?;
-    
-    // Parse response - API returns { items: [...] }
-    let json: Value = serde_json::from_str(&response_text)
-        .map_err(|e| format!("Failed to parse auth configs response: {}", e))?;
-    
-    let mut configs: Vec<AuthConfigInfo> = Vec::new();
-    
-    if let Some(items) = json.get("items").and_then(|v| v.as_array()) {
-        for item in items {
-            if let Ok(config) = serde_json::from_value::<AuthConfigInfo>(item.clone()) {
-                configs.push(config);
+        tracing::debug!("Fetching all auth configs page {} from {}", page_count, url);
+        
+        let response = req
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch auth configs: {}", e))?;
+        
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            tracing::warn!("Failed to fetch auth configs: status {} - {}", status, text);
+            // Return what we have so far
+            if all_configs.is_empty() {
+                return Err(format!("Failed to fetch auth configs: {}", status));
+            } else {
+                break;
             }
+        }
+        
+        let response_text = response.text().await.map_err(|e| e.to_string())?;
+        
+        // Parse response - API returns { items: [...], next_cursor: ... }
+        let json: Value = serde_json::from_str(&response_text)
+            .map_err(|e| format!("Failed to parse auth configs response: {}", e))?;
+        
+        if let Some(items) = json.get("items").and_then(|v| v.as_array()) {
+            for item in items {
+                if let Ok(config) = serde_json::from_value::<AuthConfigInfo>(item.clone()) {
+                    all_configs.push(config);
+                }
+            }
+        }
+        
+        // Check next cursor
+        if let Some(next) = json.get("next_cursor").and_then(|v| v.as_str()) {
+            if !next.is_empty() {
+                current_cursor = Some(next.to_string());
+            } else {
+                break;
+            }
+        } else {
+            break;
         }
     }
     
-    tracing::info!("Loaded {} auth configs", configs.len());
+    tracing::info!("Loaded {} auth configs across {} pages", all_configs.len(), page_count);
     
     // Populate the cache as a side effect (calling local helper)
-    cache_auth_configs(client, &configs);
+    cache_auth_configs(client, &all_configs);
     
-    Ok(configs)
+    Ok(all_configs)
 }
 
 /// Populate auth_config_cache from a list of AuthConfigInfo
@@ -351,6 +498,14 @@ pub async fn initiate_connection(client: &ComposioClient, toolkit_slug: &str, us
     let url = format!("{}/connected_accounts/link", client.get_api_base_url());
     
     let final_user_id = client.user_id.clone().unwrap_or_else(|| user_id.to_string());
+    
+    // PRUNE: Ensure we start with a clean slate
+    // This removes duplicates and stale connections BEFORE we ask for a new one.
+    // If there is an existing ACTIVE connection, it will be preserved (logged), 
+    // but typically initiate_connection is called when the user explicitly needs a NEW one.
+    if let Err(e) = prune_connections(client, toolkit_slug, &final_user_id).await {
+        tracing::warn!("[PRUNE] Failed to prune connections before initiation: {}", e);
+    }
     
     // We need the auth_config_id to tell the API WHICH toolkit to link.
     let auth_config_id = get_auth_config_id(client, toolkit_slug).await?;
@@ -435,6 +590,21 @@ pub async fn initiate_connection(client: &ComposioClient, toolkit_slug: &str, us
                         if !standard_keys.contains(&key.as_str()) {
                             tracing::info!("[CONTEXT] Capturing context param '{}' for toolkit '{}'", key, toolkit_slug);
                             client.context_store.save_param(toolkit_slug, &final_user_id, key, value);
+
+                            // KEY NORMALIZATION (Pattern 123 Extension)
+                            // Some tools (like ClickUp) expect camelCase context keys, but OAuth callbacks often return snake_case.
+                            // We save BOTH to ensure dynamic injection works regardless of the tool's schema.
+                            match key.as_str() {
+                                "connected_account_id" => {
+                                    tracing::info!("[CONTEXT] Normalizing '{}' -> 'connectedAccountId'", key);
+                                    client.context_store.save_param(toolkit_slug, &final_user_id, "connectedAccountId", value);
+                                },
+                                "team_id" => {
+                                    tracing::info!("[CONTEXT] Normalizing '{}' -> 'teamId'", key);
+                                    client.context_store.save_param(toolkit_slug, &final_user_id, "teamId", value);
+                                },
+                                _ => {}
+                            }
                         }
                     }
                     

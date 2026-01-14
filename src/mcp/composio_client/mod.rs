@@ -16,6 +16,8 @@ pub use models::*;
 pub use utils::*;
 pub use context_store::ContextStore;
 
+use reqwest::Client;
+
 #[derive(Clone)]
 pub struct ComposioClient {
     pub(crate) client: reqwest::Client,
@@ -27,22 +29,43 @@ pub struct ComposioClient {
     pub(crate) tool_toolkit_map: Arc<RwLock<HashMap<String, String>>>,
     // Cache of toolkit slug -> auth_config_id for dynamic per-toolkit lookups
     pub(crate) auth_config_cache: Arc<RwLock<HashMap<String, String>>>,
+    // Cache of toolkit slug -> account_id for dynamic per-toolkit lookups
+    #[allow(dead_code)]
+    pub(crate) toolkit_account_map: Arc<RwLock<HashMap<String, String>>>, // Added this field
     // Secure Context Store for tool-specific keys
     pub(crate) context_store: Arc<ContextStore>,
 }
 
 #[allow(dead_code)]
 impl ComposioClient {
-    pub fn new(api_key: String, base_url: String, entity_id: Option<String>, user_id: Option<String>) -> Self {
+    /// Initialize a new ComposioClient.
+    /// 
+    /// # Arguments
+    /// * `api_key` - The API key for REST API access.
+    /// * `base_url` - The base URL for the registry API.
+    /// * `entity_id` - Optional entity ID for scoping.
+    /// * `user_id` - Optional user ID for MCP proxy routing.
+    /// * `profile_id` - The UUID of the active profile for context isolation.
+    pub fn new(api_key: String, base_url: String, entity_id: Option<String>, user_id: Option<String>, profile_id: String) -> Self {
+        
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_default();
+
+        // Pattern 123: Initialize Profile-Scoped Context Store
+        let context_store = Arc::new(ContextStore::new(&profile_id));
+        
         Self {
-            client: reqwest::Client::new(),
             api_key,
             base_url,
             entity_id,
             user_id,
+            client,
             tool_toolkit_map: Arc::new(RwLock::new(HashMap::new())),
+            toolkit_account_map: Arc::new(RwLock::new(HashMap::new())),
             auth_config_cache: Arc::new(RwLock::new(HashMap::new())),
-            context_store: Arc::new(ContextStore::new()),
+            context_store,
         }
     }
 

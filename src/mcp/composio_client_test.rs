@@ -2,7 +2,7 @@
 mod tests {
     use crate::mcp::composio_client::ComposioClient;
     use serde_json::json;
-    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -72,7 +72,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = ComposioClient::new("test-key".to_string(), mock_server.uri(), Some("default".to_string()), None);
+        let client = ComposioClient::new("test-key".to_string(), mock_server.uri(), Some("default".to_string()), None, "test-profile-id".to_string());
         
         let result = client.execute_tool("TEST_TOOL", json!({"arg": "value"})).await;
         
@@ -134,7 +134,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = ComposioClient::new("test-key".to_string(), mock_server.uri(), Some("default".to_string()), None);
+        let client = ComposioClient::new("test-key".to_string(), mock_server.uri(), Some("default".to_string()), None, "test-profile-id".to_string());
         
         let result = client.execute_tool("RAW_TOOL", json!({})).await;
         
@@ -188,7 +188,7 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
     async fn test_execute_tool_with_discovery() {
         let mock_server = MockServer::start().await;
         
-        let discovery_client = ComposioClient::new("test-key".to_string(), mock_server.uri(), None, None);
+        let discovery_client = ComposioClient::new("test-key".to_string(), mock_server.uri(), None, None, "test-profile-id".to_string());
 
         // 1. Mock list_tools response (tools/list)
         let list_tools_response = json!({
@@ -251,6 +251,9 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
             .respond_with(ResponseTemplate::new(200).set_body_json(execute_response))
             .mount(&mock_server)
             .await;
+
+        // Populate the tool-toolkit map so the heuristic/auth check works
+        let _ = discovery_client.list_tools().await;
 
         let result = discovery_client.execute_tool("DISCOVERY_TOOL", json!({})).await;
         

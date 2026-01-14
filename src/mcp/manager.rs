@@ -173,10 +173,12 @@ impl McpManager {
         let user_id = profile.user_id.clone();
         let force_load_slugs = profile.get_force_load_toolkit_slugs();
         let profile_name = profile.name.clone();
+        let profile_id = profile.id.clone();
         
-        tracing::info!("Reinitializing Composio client for profile '{}' with user_id: {:?}", profile_name, user_id);
+        tracing::info!("Reinitializing Composio client for profile '{}' ({}) with user_id: {:?}", profile_name, profile_id, user_id);
         
-        let composio_client = Arc::new(ComposioClient::new(api_key, base_url, entity_id, user_id));
+        // Pattern 123: Pass profile_id for Context isolation
+        let composio_client = Arc::new(ComposioClient::new(api_key, base_url, entity_id, user_id, profile_id));
         let client_for_tools = composio_client.clone();
         
         let composio_config = McpServerConfig {
@@ -342,7 +344,8 @@ impl McpManager {
                         
                         let entity_id = profile.entity_id.clone();
                         let user_id = profile.user_id.clone();
-                        let composio_client = Arc::new(ComposioClient::new(api_key.clone(), base_url, entity_id, user_id));
+                        // Pattern 123: Pass profile_id for Context isolation
+                        let composio_client = Arc::new(ComposioClient::new(api_key.clone(), base_url, entity_id, user_id, profile.id.clone()));
                         let client_for_tools = composio_client.clone();
 
                         // Tool Router pattern: only load force-loaded toolkit tools + meta-tools
@@ -410,7 +413,8 @@ impl McpManager {
                             
                             let entity_id = profile.entity_id.clone();
                             let user_id = profile.user_id.clone();
-                            let composio_client = Arc::new(ComposioClient::new(api_key.clone(), base_url, entity_id, user_id));
+                            // Pattern 123: Pass profile_id for Context isolation
+                            let composio_client = Arc::new(ComposioClient::new(api_key.clone(), base_url, entity_id, user_id, profile.id.clone()));
                             let client_for_tools = composio_client.clone();
 
                             // Tool Router pattern: only load force-loaded toolkit tools + meta-tools
@@ -1615,7 +1619,7 @@ impl McpManager {
                         tracing::info!("Initializing Composio Client (Retry). UserID: {:?}, EntityID: {:?}", 
                             user_id, entity_id);
                             
-                        let composio_client = Arc::new(ComposioClient::new(api_key.clone(), base_url, entity_id, user_id));
+                        let composio_client = Arc::new(ComposioClient::new(api_key.clone(), base_url, entity_id, user_id, profile.id.clone()));
                         let client_for_tools = composio_client.clone();
 
                         match client_for_tools.list_tools().await {

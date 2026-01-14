@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use crate::context::permissions::{PermissionSettings, ToolCategory};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LlmProvider {
@@ -220,6 +221,8 @@ pub struct ComposioToolkitConfig {
 /// A Composio profile containing connection settings for one Composio account
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ComposioProfile {
+    #[serde(default = "default_uuid")]
+    pub id: String,
     pub name: String,
     pub base_url: Option<String>,
     pub entity_id: Option<String>,
@@ -239,9 +242,14 @@ fn default_profile_color() -> String {
     "bg-blue-600".to_string()
 }
 
+fn default_uuid() -> String {
+    Uuid::new_v4().to_string()
+}
+
 impl Default for ComposioProfile {
     fn default() -> Self {
         Self {
+            id: Uuid::new_v4().to_string(),
             name: "Default".to_string(),
             base_url: None,
             entity_id: None,
@@ -389,6 +397,11 @@ impl Settings {
                 .and_then(|p| p.user_id.clone())
                 .or_else(|| Some(uuid::Uuid::new_v4().to_string().to_lowercase()));
         }
+
+        // Ensure ID is set
+        if new_profile.id.is_empty() {
+            new_profile.id = Uuid::new_v4().to_string();
+        }
         
         self.composio_profiles.push(new_profile);
         
@@ -420,6 +433,7 @@ impl Settings {
         if has_legacy && self.composio_profiles.is_empty() {
             tracing::info!("Migrating legacy Composio settings to profile...");
             let profile = ComposioProfile {
+                id: Uuid::new_v4().to_string(),
                 name: "Default".to_string(),
                 base_url: self.composio_base_url.take(),
                 entity_id: self.composio_entity_id.take(),
@@ -431,6 +445,18 @@ impl Settings {
             self.add_profile(profile);
             self.active_composio_profile = Some("Default".to_string());
         }
+    }
+
+    /// Ensure all profiles have a valid UUID.
+    /// If an ID is missing or empty, generate a new one.
+    pub fn ensure_profile_ids(&mut self) {
+        for profile in &mut self.composio_profiles {
+            if profile.id.is_empty() {
+                profile.id = Uuid::new_v4().to_string();
+                tracing::info!("Migrated profile '{}' with new ID: {}", profile.name, profile.id);
+            }
+        }
+        // Save is handled by the caller (load)
     }
 }
 fn default_max_tool_output_length() -> usize {
@@ -552,6 +578,10 @@ impl SettingsManager {
             }
         }
 
+        // Migration: Ensure all composio profiles have an ID
+        // This backfills UUIDs for existing profiles that were created before the 'id' field existed.
+        settings.ensure_profile_ids();
+
         // After migrating, save the repaired settings file for the next run.
         if self.save(&settings).is_err() {
             tracing::error!("Failed to save migrated settings.");
@@ -559,6 +589,8 @@ impl SettingsManager {
 
         settings
     }
+
+
 
     pub fn save(&self, settings: &Settings) -> Result<(), std::io::Error> {
         let content = serde_json::to_string_pretty(settings)?;

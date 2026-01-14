@@ -39,6 +39,8 @@ pub struct ConnectedAccount {
     pub app_name: Option<String>,
     #[serde(alias = "providerId", alias = "provider_id")]
     pub provider_id: Option<String>,
+    #[serde(alias = "createdAt", alias = "created_at")]
+    pub created_at: Option<String>,
     pub toolkit: Option<ConnectedAccountToolkit>,
 }
 

@@ -68,29 +68,6 @@ pub async fn add_toolkit_to_server(client: &ComposioClient, toolkit_slug: &str, 
         false
     });
     
-    // Convert existing toolkits to strings (API returns objects but expects strings in PATCH)
-    let mut toolkit_strings: Vec<String> = toolkits.iter()
-        .filter_map(|t| {
-            // Extract slug from object format
-            if let Some(slug) = t.get("toolkit").and_then(|s| s.as_str()) {
-                return Some(slug.to_string());
-            }
-            // Use string format as-is
-            if let Some(slug) = t.as_str() {
-                return Some(slug.to_string());
-            }
-            None
-        })
-        .collect();
-    
-    // Add the toolkit as a string if not already present
-    if !toolkit_already_exists {
-        toolkit_strings.push(toolkit_slug.to_string());
-        tracing::info!("Adding toolkit '{}' with auth_config '{}' to server", toolkit_slug, auth_config_id);
-    } else {
-        tracing::info!("Toolkit '{}' already exists on server, will add tools", toolkit_slug);
-    }
-    
     // Get existing allowed_tools from the server config
     let mut custom_tools: Vec<String> = server_json
         .get("allowed_tools")
@@ -138,17 +115,44 @@ pub async fn add_toolkit_to_server(client: &ComposioClient, toolkit_slug: &str, 
         tracing::info!("No changes needed for toolkit '{}' - all tools already present", toolkit_slug);
         return Ok(());
     }
+
+    // Convert existing toolkits to objects to preserve/update auth_config
+    let mut final_toolkits: Vec<serde_json::Value> = Vec::new();
+    let mut found = false;
     
-    // PATCH the server with updated toolkits, auth_config, and allowed_tools
-    // Note: API uses 'allowed_tools' (not 'custom_tools' which SDK uses internally)
-    // Note: auth_config_ids links the auth config to the MCP server
-    // API endpoint: PATCH /api/v3/mcp/{server_id}
+    for t in toolkits {
+        let mut obj = if t.is_string() {
+            serde_json::json!({ "toolkit": t.as_str().unwrap() })
+        } else {
+            t.clone()
+        };
+        
+        // Check if this is the toolkit we are updating
+        let slug = obj.get("toolkit").and_then(|s| s.as_str()).unwrap_or_default();
+        if slug.eq_ignore_ascii_case(toolkit_slug) {
+            // UPDATE: Set the correct auth_config_id
+            obj["auth_config"] = serde_json::Value::String(auth_config_id.to_string());
+            found = true;
+        }
+        
+        final_toolkits.push(obj);
+    }
+    
+    // If not found (new toolkit), add it
+    if !found {
+        final_toolkits.push(serde_json::json!({
+            "toolkit": toolkit_slug,
+            "auth_config": auth_config_id
+        }));
+        tracing::info!("Adding new toolkit '{}' to payload", toolkit_slug);
+    }
+    
     let patch_url = format!("{}/mcp/{}", client.get_api_base_url(), server_id);
     
-    // NOTE: Do NOT include auth_config_ids - accumulating stale IDs causes 400 errors
-    // The auth_config is managed separately per toolkit during initiate_connection
+    // NOTE: We now send 'toolkits' as objects to strictly bind the auth_config
+    // according to the "One Auth Config per tool per MCP Server" rule.
     let patch_payload = serde_json::json!({
-        "toolkits": toolkit_strings,
+        "toolkits": final_toolkits,
         "allowed_tools": custom_tools
     });
     
@@ -229,8 +233,16 @@ pub async fn execute_tool(client: &ComposioClient, slug: &str, args: serde_json:
         map.get(slug).cloned()
     };
     
-    // CONTEXT INJECTION
-    // Check if we have stored context keys (e.g. team_id) and inject them if missing
+    // If no mapping, try to infer (heuristic)
+    let toolkit_slug = toolkit_slug.or_else(|| {
+        let guessed = slug.split('_').next()?.to_lowercase();
+        tracing::debug!("Guessed toolkit '{}' for tool '{}'", guessed, slug);
+        Some(guessed)
+    });
+    
+    // CONTEXT INJECTION (Pattern 123)
+    // Check if we have stored context keys (e.g. team_id) and inject them if missing.
+    // NOTE: This must run AFTER heuristic resolution to ensure we don't miss injection for guessed toolkits.
     if let Some(ref tk_slug) = toolkit_slug {
         if let Some(context) = client.context_store.get_context(tk_slug, &user_id) {
              if let Some(obj) = arguments.as_object_mut() {
@@ -243,13 +255,6 @@ pub async fn execute_tool(client: &ComposioClient, slug: &str, args: serde_json:
              }
         }
     }
-
-    // If no mapping, try to infer (heuristic)
-    let toolkit_slug = toolkit_slug.or_else(|| {
-        let guessed = slug.split('_').next()?.to_lowercase();
-        tracing::debug!("Guessed toolkit '{}' for tool '{}'", guessed, slug);
-        Some(guessed)
-    });
 
     // PROACTIVE AUTH CHECK (restored from v0.9.4 pattern)
     // Check for an ACTIVE connected account for this toolkit BEFORE calling the proxy.
@@ -273,6 +278,9 @@ pub async fn execute_tool(client: &ComposioClient, slug: &str, args: serde_json:
                 });
                 if let Some(acc) = active {
                     tracing::debug!("[AUTH] Found ACTIVE connection '{}' for toolkit '{}'", acc.id, tk_slug);
+                    
+
+                    
                     true
                 } else {
                     tracing::info!("[AUTH] No ACTIVE connection found for toolkit '{}'. Available accounts: {:?}", 
@@ -299,23 +307,20 @@ pub async fn execute_tool(client: &ComposioClient, slug: &str, args: serde_json:
             match initiate_connection(client, tk_slug, &user_id).await {
                 Ok(result_msg) => {
                     if result_msg.contains("Authentication successful") {
+                        tracing::info!("[AUTH] Authentication successful, proceeding with tool execution immediately.");
+                        // FALLTHROUGH: Don't return, let the code proceed to step 2 (URL construction & execution)
+                        // This prevents the "Auth Loop" where a retry might hit a stale cache check.
+                    } else {
+                        let url = result_msg.split_whitespace().last().unwrap_or(&result_msg).to_string();
+                        let redirect_url = if url.starts_with("http") { url } else { result_msg.clone() };
                         return Ok(ToolExecuteResponse {
-                            data: serde_json::Value::Null,
-                            error: Some("Authentication successful! Please try the tool again.".to_string()),
+                            data: serde_json::json!({ "redirectUrl": redirect_url }),
+                            error: Some(format!("Authentication required. {}", result_msg)),
                             successful: false,
                             log_id: None,
                             session_info: None,
                         });
                     }
-                    let url = result_msg.split_whitespace().last().unwrap_or(&result_msg).to_string();
-                    let redirect_url = if url.starts_with("http") { url } else { result_msg.clone() };
-                    return Ok(ToolExecuteResponse {
-                        data: serde_json::json!({ "redirectUrl": redirect_url }),
-                        error: Some(format!("Authentication required. {}", result_msg)),
-                        successful: false,
-                        log_id: None,
-                        session_info: None,
-                    });
                 },
                 Err(e) => {
                     tracing::error!("[AUTH] Failed to initiate connection: {}", e);
