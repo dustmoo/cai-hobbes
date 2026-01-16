@@ -28,6 +28,7 @@ pub enum ChatCommand {
     FocusChat,
     SubmitModal,
     CloseModal,
+    DeleteSession,
     SaveModal,
 }
 
@@ -152,8 +153,8 @@ pub fn ChatInput(
                         if (el) { el.focus(); }
                     "#);
                 }
-                ChatCommand::SubmitModal | ChatCommand::CloseModal | ChatCommand::SaveModal => {
-                    // Handled by active modal
+                ChatCommand::SubmitModal | ChatCommand::CloseModal | ChatCommand::SaveModal | ChatCommand::DeleteSession => {
+                    // Handled by active modal or SessionManager
                 }
             }
             // Reset command to avoid re-triggering

@@ -2,7 +2,6 @@ use super::ComposioClient;
 use super::models::*;
 use super::utils::write_to_debug_file;
 use super::meta::get_meta_tools;
-use super::auth::list_connected_accounts;
 
 
 /// List all available tools from Composio (via MCP Protocol endpoint)
@@ -63,52 +62,66 @@ pub async fn list_tools(client: &ComposioClient) -> Result<Vec<ComposioTool>, St
 }
 
 /// Get information about connected toolkits for UI display
+/// 
+/// IMPORTANT: This function derives toolkit info purely from the MCP `tools/list` response,
+/// which is scoped to the active MCP server. It does NOT use the REST `list_connected_accounts`
+/// endpoint, which returns global accounts across all profiles.
+/// 
+/// See COMPOSIO_ENDPOINTS.md mandate: "MCP-First for Status"
+/// 
+/// NOTE: Results are cached. Call `invalidate_toolkit_cache()` on profile change.
 pub async fn list_connected_toolkits(client: &ComposioClient) -> Result<Vec<ToolkitInfo>, String> {
-    // First get all connected accounts to know which toolkits are connected
-    let accounts = list_connected_accounts(client).await?;
+    // Return cached data if available
+    if let Some(cached) = client.get_cached_toolkit_info() {
+        tracing::debug!("Returning {} cached toolkit infos", cached.len());
+        return Ok(cached);
+    }
     
-    // Extract unique toolkit slugs from connected accounts
-    let mut toolkit_slugs: Vec<String> = accounts
-        .iter()
-        .filter_map(|acc| {
-            acc.toolkit.as_ref().map(|t| t.slug.clone())
-                .or(acc.app_name.clone())
-        })
-        .collect();
-    toolkit_slugs.sort();
-    toolkit_slugs.dedup();
-
-    // Get all tools to count per toolkit
+    // MCP-First: Get tools from MCP endpoint (profile-scoped)
     let all_tools = match list_tools(client).await {
         Ok(tools) => tools,
         Err(e) => return Err(format!("Failed to list tools: {}", e)),
     };
-
-    // Count tools per toolkit
-    let toolkit_infos = toolkit_slugs.iter().map(|slug| {
-        let tool_count = all_tools.iter().filter(|t| {
-            // Get explicit toolkit slug
-            let explicit_toolkit = t.toolkit.as_ref().map(|tk| tk.slug.clone())
-                .or_else(|| t.app.as_ref().map(|a| a.slug.clone()));
-            
-            if let Some(ref tk) = explicit_toolkit {
-                return tk.eq_ignore_ascii_case(slug);
-            }
-            
-            // Fallback: check if tool name starts with TOOLKIT_SLUG_ prefix
-            // e.g., NEWS_API_GET_EVERYTHING starts with "NEWS_API_" matches news_api toolkit
-            let prefix = format!("{}_", slug.to_uppercase());
-            t.name.starts_with(&prefix)
-        }).count();
-
+    
+    // Aggregate tools by toolkit slug
+    let mut toolkit_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    
+    for tool in &all_tools {
+        // Get toolkit slug from tool metadata or infer from name prefix
+        let slug = tool.toolkit.as_ref().map(|tk| tk.slug.to_lowercase())
+            .or_else(|| tool.app.as_ref().map(|a| a.slug.to_lowercase()))
+            .or_else(|| {
+                // Infer from tool name: TOOLKIT_ACTION -> toolkit
+                tool.name.split('_').next().map(|s| s.to_lowercase())
+            });
+        
+        if let Some(s) = slug {
+            *toolkit_map.entry(s).or_insert(0) += 1;
+        }
+    }
+    
+    // Build ToolkitInfo from aggregated data
+    let mut toolkit_infos: Vec<ToolkitInfo> = toolkit_map.into_iter().map(|(slug, tool_count)| {
+        // Format display name: "slack" -> "Slack", "news_api" -> "News_api"
+        let display_name = slug.chars().next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_default() + &slug[1..];
+        
         ToolkitInfo {
-            slug: slug.clone(),
-            display_name: slug.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default() + &slug[1..],
+            slug,
+            display_name,
             tool_count,
-            is_connected: true,
+            is_connected: true, // All tools from MCP are connected by definition
         }
     }).collect();
-
+    
+    // Sort for consistent UI ordering
+    toolkit_infos.sort_by(|a, b| a.slug.cmp(&b.slug));
+    
+    // Cache the result
+    client.set_cached_toolkit_info(toolkit_infos.clone());
+    tracing::debug!("Cached {} toolkit infos", toolkit_infos.len());
+    
     Ok(toolkit_infos)
 }
 
@@ -243,13 +256,22 @@ pub async fn list_toolkit_categories(client: &ComposioClient) -> Result<Vec<Comp
 }
 
 /// Get the set of connected toolkit slugs
+/// 
+/// IMPORTANT: This function derives toolkit slugs from the MCP `tools/list` response,
+/// which is scoped to the active MCP server. See COMPOSIO_ENDPOINTS.md mandate.
 pub async fn get_connected_toolkit_slugs(client: &ComposioClient) -> Result<std::collections::HashSet<String>, String> {
-    let accounts = list_connected_accounts(client).await?;
-    let slugs: std::collections::HashSet<String> = accounts
+    // MCP-First: Get tools from MCP endpoint (profile-scoped)
+    let tools = list_tools(client).await?;
+    
+    let slugs: std::collections::HashSet<String> = tools
         .iter()
-        .filter_map(|acc| {
-            acc.toolkit.as_ref().map(|t| t.slug.to_lowercase())
-                .or(acc.app_name.as_ref().map(|n| n.to_lowercase()))
+        .filter_map(|tool| {
+            tool.toolkit.as_ref().map(|t| t.slug.to_lowercase())
+                .or_else(|| tool.app.as_ref().map(|a| a.slug.to_lowercase()))
+                .or_else(|| {
+                    // Infer from tool name: TOOLKIT_ACTION -> toolkit
+                    tool.name.split('_').next().map(|s| s.to_lowercase())
+                })
         })
         .collect();
     Ok(slugs)

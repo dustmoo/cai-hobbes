@@ -751,17 +751,19 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                     const rect = range.getBoundingClientRect();
                                     const text = selection.toString();
                                     
-                                    // Smart positioning: try above first, then below
+                                    // Smart positioning: PREFER BELOW, then above
                                     const popoverHeight = 160; // Approx height including padding
-                                    const wouldOverflowTop = rect.top < popoverHeight + 20;
+                                    const viewportHeight = window.innerHeight;
+                                    const spaceBelow = viewportHeight - rect.bottom;
+                                    const wouldOverflowBottom = spaceBelow < popoverHeight + 20;
                                     
                                     let top;
-                                    if (wouldOverflowTop) {{
-                                        // Position below
-                                        top = rect.bottom + window.scrollY + 8;
-                                    }} else {{
+                                    if (wouldOverflowBottom) {{
                                         // Position above
                                         top = rect.top + window.scrollY - popoverHeight - 8;
+                                    }} else {{
+                                        // Position below
+                                        top = rect.bottom + window.scrollY + 8;
                                     }}
 
                                     dioxus.send({{ 

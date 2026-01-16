@@ -879,8 +879,12 @@ pub fn SettingsPanel() -> Element {
                                                                     checked: is_active,
                                                                     onchange: {
                                                                         let name = profile_name.clone();
+                                                                        let mut global_settings = settings.clone();
                                                                         move |_| {
+                                                                            tracing::info!("Switching to profile: {}", name);
                                                                             local_settings.write().active_composio_profile = Some(name.clone());
+                                                                            // RACE CONDITION FIX: Immediately propagate changes to global settings
+                                                                            global_settings.write().active_composio_profile = Some(name.clone());
                                                                         }
                                                                     }
                                                                 }

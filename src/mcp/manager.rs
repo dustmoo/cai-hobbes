@@ -112,6 +112,8 @@ pub struct McpManager {
     /// Servers whose tools are hidden from the AI (runtime-only state)
     pub unloaded_servers: Arc<Mutex<HashSet<String>>>,
     permission_manager: Signal<PermissionManager>,
+    /// Cached server statuses for Status panel (ephemeral, invalidated on profile change)
+    cached_server_statuses: Arc<Mutex<Option<Vec<McpServerStatus>>>>,
 }
 
 
@@ -124,6 +126,7 @@ impl McpManager {
             unloaded_servers: Arc::new(Mutex::new(HashSet::new())),
             permission_manager,
             config_path: Some(config_path),
+            cached_server_statuses: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -136,6 +139,35 @@ impl McpManager {
         tracing::debug!("Restored {} unloaded servers from persisted state", unloaded.len());
     }
 
+    /// Reloads the MCP configuration and restarts servers.
+    /// This is used for hot-reloading when mcp_servers.json is modified.
+    pub async fn reload_config(
+        &self,
+        mcp_context_signal: dioxus::prelude::Signal<McpContext>,
+        settings: crate::settings::Settings,
+    ) {
+        tracing::info!("Reloading MCP configuration...");
+        
+        // 1. Stop and clear existing servers
+        // Dropping the active clients should effectively stop the running services
+        {
+            let mut servers = self.servers.lock().await;
+             // We want to keep composio-native if it's managed separately, 
+             // but launch_servers re-initializes it based on settings anyway.
+             // So clearing everything is safer to avoid duplicates.
+            servers.clear();
+            tracing::info!("Cleared existing MCP servers for reload.");
+        }
+        
+        // 2. Clear failed servers map
+        self.failed_servers.lock().await.clear();
+        
+        // 3. Launch servers with new config
+        self.launch_servers(mcp_context_signal, settings).await;
+        
+        tracing::info!("MCP configuration reload initiated.");
+    }
+
     /// Reinitialize the Composio client when the active profile changes.
     /// This removes the existing composio-native client and creates a new one
     /// with the updated profile settings (API key, user_id, base_url).
@@ -144,25 +176,18 @@ impl McpManager {
         mcp_context_signal: dioxus::prelude::Signal<McpContext>,
         settings: crate::settings::Settings,
     ) {
-        // Remove existing composio-native client from active servers
-        {
-            let mut servers = self.servers.lock().await;
-            if servers.remove("composio-native").is_some() {
-                tracing::info!("Removed existing composio-native client for reinitialization");
-            }
-        }
-        
-        // Also clear from failed_servers in case it was there
-        self.failed_servers.lock().await.remove("composio-native");
-        
         // Check if we have an active profile to initialize
         let Some(profile) = settings.get_active_profile() else {
             tracing::warn!("No active Composio profile found during reinitialization");
+            // If no profile is active, we should ensure no composio client is running
+            self.servers.lock().await.remove("composio-native");
+            self.failed_servers.lock().await.remove("composio-native");
             return;
         };
         
         let Some(api_key) = profile.api_key.clone() else {
             tracing::warn!("Active Composio profile has no API key");
+            self.servers.lock().await.remove("composio-native");
             return;
         };
         
@@ -192,6 +217,9 @@ impl McpManager {
             always_allow: Vec::new(),
         };
         
+        // NOTE: We do NOT remove the old client yet. We wait until the new one is ready
+        // to perform an ATOMIC SWAP. This prevents the "Flash -> Blank" gap in the UI.
+        
         match client_for_tools.list_tools_for_session(&force_load_slugs).await {
             Ok(composio_tools) => {
                 let tools = composio_tools.iter().map(composio_to_rmcp_tool).collect();
@@ -201,8 +229,16 @@ impl McpManager {
                     tools,
                 };
                 
-                // Insert the new client
-                self.servers.lock().await.insert("composio-native".to_string(), active_client);
+                // ATOMIC SWAP: Replace the old client with the new one cleanly
+                {
+                    let mut servers = self.servers.lock().await;
+                    servers.insert("composio-native".to_string(), active_client);
+                    // Also clear from failed servers just in case
+                    self.failed_servers.lock().await.remove("composio-native");
+                }
+                
+                // CRITICAL: Clear any intermediate/poisoned cache before signaling UI (Pattern 150.7)
+                self.invalidate_status_cache_async().await;
                 
                 // Update the context signal
                 let new_context = self.get_mcp_context().await;
@@ -214,6 +250,14 @@ impl McpManager {
             Err(e) => {
                 let error_msg = format!("Failed to list Composio tools during reinit: {}", e);
                 tracing::error!("{}", error_msg);
+                
+                // FAIL SAFETY: If initialization fails, we MUST remove the old client
+                // to avoid leaving the user on the wrong profile (Zombie Profile)
+                {
+                    let mut servers = self.servers.lock().await;
+                    servers.remove("composio-native");
+                }
+                
                 self.failed_servers.lock().await.insert("composio-native".to_string(), (composio_config, error_msg));
             }
         }
@@ -1402,6 +1446,12 @@ impl McpManager {
     }
     
     pub async fn get_all_server_statuses(&self) -> Vec<McpServerStatus> {
+        // Return cached data if available
+        if let Some(cached) = self.cached_server_statuses.lock().await.clone() {
+            tracing::debug!("Returning {} cached server statuses", cached.len());
+            return cached;
+        }
+        
         let mut statuses = Vec::new();
         
         // Get all configs
@@ -1553,7 +1603,27 @@ impl McpManager {
             }
         }
         
+        // Cache the result before returning
+        *self.cached_server_statuses.lock().await = Some(statuses.clone());
+        tracing::debug!("Cached {} server statuses", statuses.len());
+        
         statuses
+    }
+
+    /// Invalidate the server status cache (call on profile change or server state change)
+    pub fn invalidate_status_cache(&self) {
+        // Use try_lock to avoid deadlocks in sync context
+        if let Ok(mut cache) = self.cached_server_statuses.try_lock() {
+            *cache = None;
+            tracing::debug!("Invalidated server status cache");
+        }
+    }
+
+    /// Async version of invalidate_status_cache for use in async contexts
+    pub async fn invalidate_status_cache_async(&self) {
+        let mut cache = self.cached_server_statuses.lock().await;
+        *cache = None;
+        tracing::debug!("Invalidated server status cache (async)");
     }
 
     pub async fn retry_server(&self, server_name: &str, mcp_context_signal: dioxus::prelude::Signal<McpContext>, settings: crate::settings::Settings, access_token: Option<String>) -> Result<(), String> {

@@ -274,10 +274,15 @@ pub(crate) async fn create_auth_config(
     
     tracing::info!("Created auth config '{}' for toolkit '{}'", auth_config_id, toolkit_slug);
     
-    // Cache the new auth config
     {
-        let mut cache = client.auth_config_cache.write().unwrap();
-        cache.insert(toolkit_slug.to_string(), auth_config_id.to_string());
+        match client.auth_config_cache.write() {
+            Ok(mut cache) => {
+                cache.insert(toolkit_slug.to_string(), auth_config_id.to_string());
+            }
+            Err(e) => {
+                 tracing::error!("[PANIC PREVENTION] Failed to acquire write lock to cache auth config: {}", e);
+            }
+        }
     }
     
     Ok(auth_config_id.to_string())
@@ -287,10 +292,17 @@ pub(crate) async fn create_auth_config(
 pub(crate) async fn get_auth_config_id(client: &ComposioClient, toolkit_slug: &str) -> Result<String, String> {
     // Check cache first
     {
-        let cache = client.auth_config_cache.read().unwrap();
-        if let Some(cached_id) = cache.get(toolkit_slug) {
-            tracing::debug!("Using cached auth_config_id '{}' for toolkit '{}'", cached_id, toolkit_slug);
-            return Ok(cached_id.clone());
+        match client.auth_config_cache.read() {
+            Ok(cache) => {
+                if let Some(cached_id) = cache.get(toolkit_slug) {
+                    tracing::debug!("Using cached auth_config_id '{}' for toolkit '{}'", cached_id, toolkit_slug);
+                    return Ok(cached_id.clone());
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[PANIC PREVENTION] Failed to acquire read lock on auth_config_cache: {}", e);
+                // Continue to fetch from API if cache read fails
+            }
         }
     }
     
@@ -379,10 +391,15 @@ pub(crate) async fn get_auth_config_id(client: &ComposioClient, toolkit_slug: &s
         }
     }
     
-    // Cache the result if found
     if let Some(ref id) = found_id {
-        let mut cache = client.auth_config_cache.write().unwrap();
-        cache.insert(toolkit_slug.to_string(), id.clone());
+        match client.auth_config_cache.write() {
+            Ok(mut cache) => {
+                cache.insert(toolkit_slug.to_string(), id.clone());
+            }
+            Err(e) => {
+                 tracing::error!("[PANIC PREVENTION] Failed to acquire write lock to cache auth config id: {}", e);
+            }
+        }
         return Ok(id.clone());
     }
     
@@ -474,7 +491,13 @@ pub async fn list_auth_configs(client: &ComposioClient) -> Result<Vec<AuthConfig
 
 /// Populate auth_config_cache from a list of AuthConfigInfo
 fn cache_auth_configs(client: &ComposioClient, configs: &[AuthConfigInfo]) {
-    let mut cache = client.auth_config_cache.write().unwrap();
+    let mut cache = match client.auth_config_cache.write() {
+        Ok(c) => c,
+        Err(e) => {
+             tracing::error!("[PANIC PREVENTION] Failed to acquire write lock for bulk auth config cache: {}", e);
+             return;
+        }
+    };
     cache.clear();
     
     for config in configs {

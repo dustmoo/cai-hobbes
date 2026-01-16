@@ -5,6 +5,7 @@ use crate::{
     context::permissions::PermissionManager,
     session::SessionState,
     settings::Settings,
+    components::chat_input::ChatCommand,
 };
 
 #[derive(Props, PartialEq, Clone)]
@@ -14,6 +15,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
     let mut session_state = use_context::<Signal<SessionState>>();
     let mut permission_manager = use_context::<Signal<PermissionManager>>();
     let settings = use_context::<Signal<Settings>>();
+    let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     let mut editing_session_id = use_signal(|| None::<String>);
     let mut temp_session_name = use_signal(String::new);
     let mut show_confirm_modal = use_context::<Signal<bool>>();
@@ -23,6 +25,30 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
     let mut filter_query = use_signal(String::new);
     let mut current_page = use_signal(|| 0);
     let mut items_per_page = use_signal(|| 10);
+
+    // Listen for Global Commands (e.g., Delete Session Hotkey)
+    use_effect(move || {
+        let should_listen = {
+            let read = chat_command.read();
+            matches!(read.as_ref(), Some(ChatCommand::DeleteSession))
+        };
+
+        if should_listen {
+             // Clone active ID to avoid borrow issues
+             let active_id = session_state.read().active_session_id.clone();
+             if !active_id.is_empty() {
+                tracing::info!("Delete Session Hotkey Triggered for: {}", active_id);
+                if settings.read().confirm_on_delete {
+                    session_to_delete.set(active_id);
+                    show_confirm_modal.set(true);
+                } else {
+                    session_state.write().delete_session(&active_id);
+                }
+             }
+             // Reset command
+             chat_command.set(None);
+        }
+    });
 
     let sessions = session_state.read();
     let active_id = sessions.active_session_id.clone();

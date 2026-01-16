@@ -138,7 +138,8 @@ pub fn McpMarketplace() -> Element {
     let mut config_content = use_signal(|| "".to_string());
     let mut error_message = use_signal(|| Option::<String>::None);
     let mut success_message = use_signal(|| Option::<String>::None);
-    let _mcp_manager = use_context::<Signal<McpManager>>();
+    let mcp_manager = use_context::<Signal<McpManager>>();
+    let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let settings = use_context::<Signal<Settings>>();
     let filter_verified = use_signal(|| true);
     let filter_deployed = use_signal(|| false);
@@ -447,9 +448,17 @@ pub fn McpMarketplace() -> Element {
                     Ok(_) => {
                         tracing::info!("Successfully saved MCP config.");
                         config_content.set(new_content);
-                        success_message.set(Some("Configuration saved. Restart app to apply changes.".to_string()));
+                        success_message.set(Some("Configuration saved. Reloading servers...".to_string()));
                         error_message.set(None);
-                        // TODO: Trigger reload on McpManager if possible
+                        
+                        // Trigger reload on McpManager
+                        let manager = mcp_manager.read().clone();
+                        let context_signal = mcp_context.clone();
+                        let current_settings = settings.read().clone();
+                        
+                        spawn(async move {
+                            manager.reload_config(context_signal, current_settings).await;
+                        });
                     }
                     Err(e) => {
                         error_message.set(Some(format!("Failed to save config: {}", e)));
@@ -768,13 +777,14 @@ pub fn McpMarketplace() -> Element {
 #[component]
 fn StatusView() -> Element {
     let mcp_manager = use_context::<Signal<McpManager>>();
-    let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     
     // Trigger signal for forcing resource refresh
     let mut refresh_trigger = use_signal(|| 0i32);
     
     let server_statuses = use_resource(move || {
-        let _trigger = *refresh_trigger.read(); // Subscribe to trigger
+        let _trigger = *refresh_trigger.read(); // Subscribe to manual refresh
+        let _context = mcp_context.read(); // Subscribe to context changes (profile switch)
         let mcp_manager = mcp_manager.clone();
         async move {
             let mut statuses = mcp_manager.read().get_all_server_statuses().await;
@@ -784,6 +794,8 @@ fn StatusView() -> Element {
     });
 
     let refresh_statuses = move |_| {
+        // Invalidate cache before refresh
+        mcp_manager.read().invalidate_status_cache();
         let current = *refresh_trigger.peek();
         refresh_trigger.set(current + 1);
     };
@@ -891,7 +903,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     
     // Toolkit management state (only relevant for Composio)
     let is_composio = status.name == "composio-native";
-    let mut show_toolkits = use_signal(|| false);
+    // NOTE: show_toolkits is read from ui_state.composio_toolkit_expanded instead of local signal
     let mut toolkits: Signal<Vec<crate::mcp::composio_client::ToolkitInfo>> = use_signal(|| Vec::new());
     let mut toolkits_loading = use_signal(|| false);
     let mut toolkits_error: Signal<Option<String>> = use_signal(|| None);
@@ -904,11 +916,31 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
         }
     });
     
+    // Reset toolkit state when the ACTIVE PROFILE changes (not on every mount)
+    // This clears stale data and allows a fresh fetch with the new client
+    let mut last_profile_name: Signal<Option<String>> = use_signal(|| None);
+    use_effect(move || {
+        let _context = mcp_context.read(); // Subscribe to context changes
+        let current_profile = settings.read().active_composio_profile.clone();
+        let previous_profile = last_profile_name.peek().clone();
+        
+        // Only reset if profile actually changed (not on initial mount with None -> Some)
+        if previous_profile.is_some() && previous_profile != current_profile {
+            tracing::debug!("Profile changed from {:?} to {:?}, resetting toolkit state", previous_profile, current_profile);
+            toolkits.set(Vec::new());
+            toolkits_error.set(None);
+            toolkits_loading.set(false);
+            // ALSO sync local_settings with global settings
+            local_settings.set(settings.read().clone());
+        }
+        last_profile_name.set(current_profile);
+    });
+    
     // Fetch toolkits when show_toolkits is expanded for Composio
     // Only fetch if: composio server is loaded, dropdown is expanded, no toolkits yet, not loading, and no prior error
     let status_for_fetch = status.status.clone();
     use_effect(move || {
-        let should_fetch = is_composio && *show_toolkits.read() && status_for_fetch == ServerStatus::Loaded;
+        let should_fetch = is_composio && ui_state.read().composio_toolkit_expanded && status_for_fetch == ServerStatus::Loaded;
         // Use peek() to avoid creating a dependency on the signals we only check condition against
         // This prevents infinite loops where we write to these signals within the effect
         let no_error = toolkits_error.peek().is_none();
@@ -1059,7 +1091,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                     // Update mcp_context with filtered tools
                                                     let new_context = mcp_manager.read().get_mcp_context().await;
                                                     mcp_context.set(new_context);
-                                                    // Trigger refresh of status list
+                                                    // Invalidate cache and trigger refresh
+                                                    mcp_manager.read().invalidate_status_cache();
                                                     let current = *refresh_trigger.peek();
                                                     refresh_trigger.set(current + 1);
                                                 });
@@ -1199,18 +1232,28 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                     class: "mt-4 border-t border-gray-600 pt-4",
                     div {
                         class: "flex items-center justify-between cursor-pointer hover:bg-gray-700/50 rounded p-2 -m-2",
-                        onclick: move |_| show_toolkits.set(!show_toolkits()),
+                        onclick: {
+                            let mut ui_state = ui_state.clone();
+                            let ui_state_manager = ui_state_manager.clone();
+                            move |_| {
+                                let new_state = !ui_state.read().composio_toolkit_expanded;
+                                ui_state.write().composio_toolkit_expanded = new_state;
+                                if let Err(e) = ui_state_manager.read().save(&ui_state.read()) {
+                                    tracing::error!("Failed to save toolkit expanded state: {}", e);
+                                }
+                            }
+                        },
                         h4 {
                             class: "text-sm font-semibold text-gray-300",
                             "Toolkit Loading Configuration"
                         }
                         span {
                             class: "text-gray-400",
-                            if *show_toolkits.read() { "▼" } else { "▶" }
+                            if ui_state.read().composio_toolkit_expanded { "▼" } else { "▶" }
                         }
                     }
                     
-                    if *show_toolkits.read() {
+                    if ui_state.read().composio_toolkit_expanded {
                         div {
                             class: "mt-3 space-y-2",
                             if *toolkits_loading.read() {
@@ -1310,7 +1353,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                     // Update mcp_context with new tools
                                                                     let new_context = mcp_manager.read().get_mcp_context().await;
                                                                     mcp_context.set(new_context);
-                                                                    // Trigger refresh of status list
+                                                                    // Invalidate cache and trigger refresh
+                                                                    mcp_manager.read().invalidate_status_cache();
                                                                     let current = *refresh_trigger.peek();
                                                                     refresh_trigger.set(current + 1);
                                                                 });

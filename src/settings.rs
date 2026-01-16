@@ -642,6 +642,9 @@ pub struct UiState {
     /// Whether MCP instructions are collapsed
     #[serde(default)]
     pub mcp_instructions_collapsed: bool,
+    /// Whether the Composio toolkit config panel is expanded
+    #[serde(default)]
+    pub composio_toolkit_expanded: bool,
 }
 
 impl Default for UiState {
@@ -655,6 +658,7 @@ impl Default for UiState {
             active_settings_tab: SettingsTab::default(),
             llm_config_collapsed: false,
             mcp_instructions_collapsed: false,
+            composio_toolkit_expanded: false,
         }
     }
 }

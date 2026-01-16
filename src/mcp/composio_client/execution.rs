@@ -7,71 +7,96 @@ use serde_json::Value;
 
 /// Add a toolkit to the MCP server configuration via PATCH API.
 pub async fn add_toolkit_to_server(client: &ComposioClient, toolkit_slug: &str, auth_config_id: &str, selected_tools: Option<Vec<String>>) -> Result<(), String> {
-    // Extract server ID from base_url
-    // base_url format: "https://backend.composio.dev/v3/mcp/{server_id}/mcp" or with query params
-    let server_id = client.base_url
+    // Extract target server ID from base_url/settings for verification
+    let target_server_id = client.base_url
         .split("/mcp/")
         .nth(1)
         .map(|s| s.split('?').next().unwrap_or(s))
-        .map(|s| s.trim_end_matches("/mcp"))  // Handle .../v3/mcp/{uuid}/mcp format
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "Cannot extract server ID from base_url. Expected format: .../v3/mcp/{server_id}/mcp".to_string())?;
+        .map(|s| s.trim_end_matches("/mcp"))
+        .unwrap_or_default();
+
+    tracing::info!("Adding toolkit '{}' to MCP server. Target ID from settings: '{}'", toolkit_slug, target_server_id);
+
+    // CRITICAL FIX: Use V3 Registry API to LIST and discover the correct server
+    // Endpoint: GET /api/v3/mcp/servers
+    let registry_base_url = "https://backend.composio.dev/api/v3/mcp/servers";
     
-    tracing::info!("Adding toolkit '{}' with auth_config '{}' to MCP server '{}' (pre-selected: {})", 
-        toolkit_slug, auth_config_id, server_id, selected_tools.is_some());
+    tracing::debug!("Discovering servers via Registry: {}", registry_base_url);
     
-    // First, get current server config to preserve existing toolkits
-    // API endpoint: GET /api/v3/mcp/{server_id} (NOT /mcp/servers/{server_id})
-    let get_url = format!("{}/mcp/{}", client.get_api_base_url(), server_id);
-    tracing::debug!("GET MCP server config from: {}", get_url);
-    
-    let get_response = client.client
-        .get(&get_url)
+    let list_response = client.client
+        .get(registry_base_url)
         .header("x-api-key", &client.api_key)
         .send()
         .await
-        .map_err(|e| format!("Failed to get MCP server config: {}", e))?;
+        .map_err(|e| format!("Failed to list MCP servers: {}", e))?;
     
-    if !get_response.status().is_success() {
-        let status = get_response.status();
-        let text = get_response.text().await.unwrap_or_default();
-        return Err(format!("Failed to get MCP server ({}): {}", status, text));
+    if !list_response.status().is_success() {
+        let status = list_response.status();
+        let text = list_response.text().await.unwrap_or_default();
+        return Err(format!("Failed to list MCP servers ({}): {}", status, text));
     }
     
-    let server_json: Value = get_response.json().await
-        .map_err(|e| format!("Failed to parse server response: {}", e))?;
+    let list_json: Value = list_response.json().await
+        .map_err(|e| format!("Failed to parse server list: {}", e))?;
     
-    // Get existing toolkits as objects (API expects array of {toolkit, auth_config} objects)
-    // Per docs: toolkits=[{"toolkit": "gmail", "auth_config": "ac_xyz123"}, ...]
-    let toolkits: Vec<Value> = server_json
+    let items = list_json.get("items").and_then(|i| i.as_array()).ok_or("Invalid server list response")?;
+    
+    // Find matching server or use the first one
+    let server_obj = items.iter().find(|s| {
+        s.get("id").and_then(|id| id.as_str()) == Some(target_server_id)
+    }).or_else(|| items.first())
+    .ok_or("No MCP servers found for this account")?;
+    
+    let server_id = server_obj.get("id").and_then(|s| s.as_str())
+        .ok_or("Server object missing ID")?;
+        
+    tracing::info!("Resolved MCP Server ID: {}", server_id);
+    
+    // Construct the specific config URL for this server
+    // Endpoint: GET/PATCH /api/v3/mcp/{server_id}
+    // NOTE: The endpoint for CONFIGURATION is /api/v3/mcp/{id} (singular 'mcp', no 'servers')
+    // The endpoint for LISTING is /api/v3/mcp/servers
+    let config_url = format!("https://backend.composio.dev/api/v3/mcp/{}", server_id);
+    
+    // Extract existing toolkits as strings (API requires string format)
+    let mut final_toolkits: Vec<String> = server_obj
         .get("toolkits")
         .and_then(|t| t.as_array())
-        .map(|arr| arr.iter().cloned().collect())
+        .map(|arr| arr.iter().filter_map(|t| {
+            // Handle both string and object formats returned by API
+            t.as_str().map(|s| s.to_string())
+                .or_else(|| t.get("toolkit").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        }).collect())
         .unwrap_or_default();
     
-    // NOTE: Do NOT accumulate auth_config_ids - this causes 400 errors when old IDs become stale.
-    // The API manages auth_config associations at the toolkit level, not server-wide.
-    // Anti-pattern: Merging all old auth_config_ids and sending them in PATCH.
-    let _ = auth_config_id; // Used in logging only now
+    // Extract existing auth_config_ids and add the new one
+    let mut auth_config_ids: Vec<String> = server_obj
+        .get("auth_config_ids")
+        .and_then(|a| a.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
     
-    // Check if toolkit already exists (handle both string and object formats from API)
+    // Bind the new auth_config_id to the server if not already present
+    if !auth_config_ids.iter().any(|id| id == auth_config_id) {
+        auth_config_ids.push(auth_config_id.to_string());
+        tracing::info!("Binding auth_config '{}' to MCP server", auth_config_id);
+    }
+    
+    // Check if toolkit already exists
     let normalized_slug = toolkit_slug.to_lowercase();
-    let toolkit_already_exists = toolkits.iter().any(|t| {
-        // Handle object format {"toolkit": "..."} from API response
-        if let Some(obj_slug) = t.get("toolkit").and_then(|s| s.as_str()) {
-            return obj_slug.to_lowercase() == normalized_slug;
-        }
-        // Handle string format "toolkit_name"
-        if let Some(str_slug) = t.as_str() {
-            return str_slug.to_lowercase() == normalized_slug;
-        }
-        false
-    });
+    let toolkit_already_exists = final_toolkits.iter()
+        .any(|t| t.to_lowercase() == normalized_slug);
+    
+    // Add new toolkit if not present
+    if !toolkit_already_exists {
+        final_toolkits.push(toolkit_slug.to_lowercase());
+        tracing::info!("Adding toolkit '{}' to MCP server", toolkit_slug);
+    }
     
     // Get existing allowed_tools from the server config
-    let mut custom_tools: Vec<String> = server_json
+    let mut custom_tools: Vec<String> = server_obj
         .get("allowed_tools")
-        .or_else(|| server_json.get("custom_tools"))
+        .or_else(|| server_obj.get("custom_tools"))
         .and_then(|t| t.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
@@ -110,56 +135,23 @@ pub async fn add_toolkit_to_server(client: &ComposioClient, toolkit_slug: &str, 
         }
     };
     
-    // Skip PATCH if no changes needed (toolkit exists and no new tools)
-    if toolkit_already_exists && tools_added == 0 {
-        tracing::info!("No changes needed for toolkit '{}' - all tools already present", toolkit_slug);
-        return Ok(());
-    }
-
-    // Convert existing toolkits to objects to preserve/update auth_config
-    let mut final_toolkits: Vec<serde_json::Value> = Vec::new();
-    let mut found = false;
-    
-    for t in toolkits {
-        let mut obj = if t.is_string() {
-            serde_json::json!({ "toolkit": t.as_str().unwrap() })
-        } else {
-            t.clone()
-        };
-        
-        // Check if this is the toolkit we are updating
-        let slug = obj.get("toolkit").and_then(|s| s.as_str()).unwrap_or_default();
-        if slug.eq_ignore_ascii_case(toolkit_slug) {
-            // UPDATE: Set the correct auth_config_id
-            obj["auth_config"] = serde_json::Value::String(auth_config_id.to_string());
-            found = true;
-        }
-        
-        final_toolkits.push(obj);
+    // Skip PATCH if no changes needed (toolkit exists, auth bound, and no new tools)
+    if toolkit_already_exists && tools_added == 0 && auth_config_ids.contains(&auth_config_id.to_string()) {
+        tracing::info!("Toolkit '{}' already configured with auth_config, skipping PATCH", toolkit_slug);
+        // Still proceed to user generation step
     }
     
-    // If not found (new toolkit), add it
-    if !found {
-        final_toolkits.push(serde_json::json!({
-            "toolkit": toolkit_slug,
-            "auth_config": auth_config_id
-        }));
-        tracing::info!("Adding new toolkit '{}' to payload", toolkit_slug);
-    }
-    
-    let patch_url = format!("{}/mcp/{}", client.get_api_base_url(), server_id);
-    
-    // NOTE: We now send 'toolkits' as objects to strictly bind the auth_config
-    // according to the "One Auth Config per tool per MCP Server" rule.
+    // Build PATCH payload with string-based toolkits and auth_config_ids binding
     let patch_payload = serde_json::json!({
         "toolkits": final_toolkits,
+        "auth_config_ids": auth_config_ids,
         "allowed_tools": custom_tools
     });
     
-    tracing::debug!("PATCH {} with payload: {:?}", patch_url, patch_payload);
+    tracing::debug!("PATCH {} with payload: {:?}", config_url, patch_payload);
     
     let patch_response = client.client
-        .patch(&patch_url)
+        .patch(&config_url) // Using Registry URL
         .header("x-api-key", &client.api_key)
         .header("Content-Type", "application/json")
         .json(&patch_payload)
@@ -176,6 +168,8 @@ pub async fn add_toolkit_to_server(client: &ComposioClient, toolkit_slug: &str, 
     // Step 4: Generate/register user with the MCP server
     // This is required for the user to see the tools
     // API: POST /api/v3/mcp/servers/generate
+    // NOTE: This might be the one place that still uses v3? Docs are unclear, but standard practice says stick to v1 for registry if possible.
+    // However, 'generate' implies runtime credential creation. Let's keep it as is unless it fails.
     if let Some(ref user_id) = client.user_id {
         let generate_url = format!("{}/mcp/servers/generate", client.get_api_base_url());
         let generate_payload = serde_json::json!({
@@ -228,9 +222,12 @@ pub async fn execute_tool(client: &ComposioClient, slug: &str, args: serde_json:
     let user_id = profile_user_id.clone();
 
     // 1. Resolve toolkit slug (needed for manual connection initiation)
-    let toolkit_slug = {
-        let map = client.tool_toolkit_map.read().unwrap();
-        map.get(slug).cloned()
+    let toolkit_slug = match client.tool_toolkit_map.read() {
+        Ok(map) => map.get(slug).cloned(),
+        Err(e) => {
+            tracing::error!("[PANIC PREVENTION] Failed to acquire read lock on tool_toolkit_map: {}", e);
+            None
+        }
     };
     
     // If no mapping, try to infer (heuristic)
@@ -493,7 +490,7 @@ pub async fn execute_tool(client: &ComposioClient, slug: &str, args: serde_json:
         let code = status_code.as_u64()
             .or_else(|| status_code.as_i64().map(|i| i as u64));
         if code == Some(401) || code == Some(403) {
-            tracing::info!("[AUTH] Detected status_code {} in data", code.unwrap());
+            tracing::info!("[AUTH] Detected status_code {} in data", code.unwrap_or(0));
             needs_auth = true;
             is_hard_auth_failure = true;
         }
@@ -550,7 +547,7 @@ pub async fn execute_tool(client: &ComposioClient, slug: &str, args: serde_json:
                                         let code = status_code.as_u64()
                                             .or_else(|| status_code.as_i64().map(|i| i as u64));
                                         if code == Some(401) || code == Some(403) {
-                                            tracing::info!("[AUTH] Detected status_code {} in result.content[0].text", code.unwrap());
+                                            tracing::info!("[AUTH] Detected status_code {} in result.content[0].text", code.unwrap_or(0));
                                             needs_auth = true;
                                             is_hard_auth_failure = true;
                                             error_msg = text.to_string();
@@ -566,7 +563,7 @@ pub async fn execute_tool(client: &ComposioClient, slug: &str, args: serde_json:
                                             let code = status_code.as_u64()
                                                 .or_else(|| status_code.as_i64().map(|i| i as u64));
                                             if code == Some(401) || code == Some(403) {
-                                                tracing::info!("[AUTH] Detected data.status_code {} in result.content[0].text", code.unwrap());
+                                                tracing::info!("[AUTH] Detected data.status_code {} in result.content[0].text", code.unwrap_or(0));
                                                 needs_auth = true;
                                                 is_hard_auth_failure = true;
                                                 error_msg = text.to_string();

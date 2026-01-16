@@ -541,29 +541,32 @@ pub fn MarkdownRenderer(
                             // Tooltip - hidden and non-interactive by default
                             // Becomes visible and interactive only when the group (parent) is hovered
                             div {
-                                class: "absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded shadow-lg opacity-0 pointer-events-none group-hover/comment:opacity-100 group-hover/comment:pointer-events-auto transition-opacity z-50 min-w-max",
+                                class: "absolute top-full left-1/2 transform -translate-x-1/2 pt-2 z-50 opacity-0 pointer-events-none group-hover/comment:opacity-100 group-hover/comment:pointer-events-auto transition-opacity min-w-max",
                                 div {
-                                    class: "flex flex-col gap-1",
-                                    // Comment text
+                                    class: "bg-gray-900 text-white text-xs rounded shadow-lg px-3 py-2",
                                     div {
-                                        class: "whitespace-normal max-w-xs",
-                                        "{comment.comment}"
-                                    }
-                                    // Controls row
-                                    div {
-                                        class: "flex justify-end gap-2 mt-1 pt-1 border-t border-gray-700",
-                                        "data-comment-id": "{comment.id}",
-                                        span {
-                                            class: "p-1 hover:bg-gray-700 rounded cursor-pointer text-gray-400 hover:text-white transition-colors",
-                                            title: "Edit comment",
-                                            "data-action": "edit",
-                                            Icon { width: 12, height: 12, icon: fi_icons::FiEdit2 }
+                                        class: "flex flex-col gap-1",
+                                        // Comment text
+                                        div {
+                                            class: "whitespace-normal max-w-xs",
+                                            "{comment.comment}"
                                         }
-                                        span {
-                                            class: "p-1 hover:bg-gray-700 rounded cursor-pointer text-gray-400 hover:text-red-400 transition-colors",
-                                            title: "Delete comment",
-                                            "data-action": "delete",
-                                            Icon { width: 12, height: 12, icon: fi_icons::FiTrash2 }
+                                        // Controls row
+                                        div {
+                                            class: "flex justify-end gap-2 mt-1 pt-1 border-t border-gray-700",
+                                            "data-comment-id": "{comment.id}",
+                                            span {
+                                                class: "p-1 hover:bg-gray-700 rounded cursor-pointer text-gray-400 hover:text-white transition-colors",
+                                                title: "Edit comment",
+                                                "data-action": "edit",
+                                                Icon { width: 12, height: 12, icon: fi_icons::FiEdit2 }
+                                            }
+                                            span {
+                                                class: "p-1 hover:bg-gray-700 rounded cursor-pointer text-gray-400 hover:text-red-400 transition-colors",
+                                                title: "Delete comment",
+                                                "data-action": "delete",
+                                                Icon { width: 12, height: 12, icon: fi_icons::FiTrash2 }
+                                            }
                                         }
                                     }
                                 }
@@ -724,7 +727,7 @@ pub fn MarkdownRenderer(
     rsx! {
         div {
             id: "{container_id}",
-            class: "prose prose-sm dark:prose-invert w-full max-w-full break-words overflow-hidden",
+            class: "prose prose-sm dark:prose-invert w-full max-w-full break-words",
             style: "word-wrap: break-word; overflow-wrap: anywhere;",
             for el in elements.iter() {
                 {el.clone()}

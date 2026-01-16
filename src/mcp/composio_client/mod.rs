@@ -31,9 +31,11 @@ pub struct ComposioClient {
     pub(crate) auth_config_cache: Arc<RwLock<HashMap<String, String>>>,
     // Cache of toolkit slug -> account_id for dynamic per-toolkit lookups
     #[allow(dead_code)]
-    pub(crate) toolkit_account_map: Arc<RwLock<HashMap<String, String>>>, // Added this field
+    pub(crate) toolkit_account_map: Arc<RwLock<HashMap<String, String>>>,
     // Secure Context Store for tool-specific keys
     pub(crate) context_store: Arc<ContextStore>,
+    /// Cached connected toolkit info for Status panel (ephemeral, invalidated on profile change)
+    pub(crate) cached_toolkit_info: Arc<RwLock<Option<Vec<ToolkitInfo>>>>,
 }
 
 #[allow(dead_code)]
@@ -66,6 +68,7 @@ impl ComposioClient {
             toolkit_account_map: Arc::new(RwLock::new(HashMap::new())),
             auth_config_cache: Arc::new(RwLock::new(HashMap::new())),
             context_store,
+            cached_toolkit_info: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -170,5 +173,27 @@ impl ComposioClient {
 
     pub async fn add_toolkit_to_server(&self, toolkit_slug: &str, auth_config_id: &str, selected_tools: Option<Vec<String>>) -> Result<(), String> {
         execution::add_toolkit_to_server(self, toolkit_slug, auth_config_id, selected_tools).await
+    }
+
+    // --- Cache Methods ---
+
+    /// Get cached toolkit info if available
+    pub fn get_cached_toolkit_info(&self) -> Option<Vec<ToolkitInfo>> {
+        self.cached_toolkit_info.read().ok()?.clone()
+    }
+
+    /// Set cached toolkit info
+    pub fn set_cached_toolkit_info(&self, info: Vec<ToolkitInfo>) {
+        if let Ok(mut cache) = self.cached_toolkit_info.write() {
+            *cache = Some(info);
+        }
+    }
+
+    /// Invalidate the toolkit info cache (call on profile change or toolkit install/remove)
+    pub fn invalidate_toolkit_cache(&self) {
+        if let Ok(mut cache) = self.cached_toolkit_info.write() {
+            *cache = None;
+            tracing::debug!("Invalidated toolkit info cache");
+        }
     }
 }

@@ -371,16 +371,29 @@ fn app() -> Element {
         let mcp_manager = mcp_manager.clone();
         let mcp_context = mcp_context.clone();
         
-        // Track the previous profile name to detect actual changes
-        let mut prev_profile_name: Signal<Option<String>> = use_signal(|| None);
+        // Track key profile properties to detect changes (API key, base URL, etc.)
+        let mut prev_profile_signature: Signal<Option<String>> = use_signal(|| None);
         
         use_effect(move || {
-            let current_profile_name = settings.read().active_composio_profile.clone();
-            let previous = prev_profile_name.peek().clone();
+            // Create a signature of the active profile properties we care about
+            let current_signature = settings.read().get_active_profile().map(|p| {
+                format!("{}:{}:{}:{}:{}", 
+                    p.name, 
+                    p.api_key.as_deref().unwrap_or(""),
+                    p.base_url.as_deref().unwrap_or(""),
+                    p.entity_id.as_deref().unwrap_or(""),
+                    p.user_id.as_deref().unwrap_or("")
+                )
+            });
             
-            // Only reinitialize if the profile actually changed (not on initial render)
-            if previous.is_some() && current_profile_name != previous {
-                tracing::info!("Active Composio profile changed from {:?} to {:?}, reinitializing client", previous, current_profile_name);
+            let previous = prev_profile_signature.peek().clone();
+            
+            // Only reinitialize if the profile signature actually changed (not on initial render)
+            if previous.is_some() && current_signature != previous {
+                tracing::info!("Active Composio profile properties changed, reinitializing client");
+                
+                // Invalidate caches - profile changed
+                mcp_manager.read().invalidate_status_cache();
                 
                 let mcp_manager = mcp_manager.clone();
                 let mcp_context_signal = mcp_context.clone();
@@ -391,8 +404,8 @@ fn app() -> Element {
                 });
             }
             
-            // Update the previous profile name
-            prev_profile_name.set(current_profile_name);
+            // Update the previous signature
+            prev_profile_signature.set(current_signature);
         });
     }
 

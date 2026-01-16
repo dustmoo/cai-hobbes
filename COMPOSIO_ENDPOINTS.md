@@ -35,10 +35,28 @@ flowchart TB
 
 ## API Surface Summary
 
-| Surface | Base URL Pattern | Auth Method | Purpose |
-|---------|-----------------|-------------|---------|
-| **REST API** | `https://backend.composio.dev/api/v3/...` | `x-api-key` header | Admin tasks: catalog browsing, auth config, server management |
-| **MCP Proxy** | `https://backend.composio.dev/v3/mcp/{server_id}/mcp?user_id=...` | `user_id` query param | Operational tasks: tool listing, tool execution |
+Composio exposes three distinct API surfaces. It is critical to distinguish between the **Configuration Endpoint** (REST) and the **Operational Endpoint** (Proxy).
+
+### 1. REST Registry (`/api/v3/...`)
+Used for global account management tasks such as creating auth configurations, listing connected accounts, and browsing the marketplace catalog.
+*   **Auth**: `x-api-key` header
+
+### 2. MCP Configuration Endpoint (`/api/v3/mcp/{server_id}`)
+**"The First MCP Endpoint"**
+Used **strictly for configuration** of the MCP server instance itself. You PATCH this endpoint to register toolkits, bind auth configurations, and set allowed tools.
+*   **Protocol**: REST
+*   **Auth**: `x-api-key` header
+*   **Payload**: Object with `toolkits`, `auth_config_ids`, `allowed_tools`
+
+### 3. MCP Operational Proxy (`/v3/mcp/{server_id}/mcp`)
+**"The Second MCP Endpoint"**
+Used **strictly for operation** (runtime usage). This is the endpoint that the LLM/Agent talks to via the MCP protocol. It proxies JSON-RPC requests to the underlying tools.
+*   **Protocol**: JSON-RPC over HTTP (SSE)
+*   **Auth**: `user_id` query parameter (No API Key)
+*   **Payload**: JSON-RPC body
+
+> [!WARNING]
+> **The Redirect Trap**: The route `/v3/mcp/{server_id}` (without the `/mcp` suffix) exists but returns a **307 Redirect to SSE**. It is NOT a REST endpoint for configuration. Always use the `/api/v3/mcp/{server_id}` endpoint for configuration (PATCH).
 
 ---
 
@@ -56,7 +74,7 @@ These calls use the `x-api-key` header for authentication and are used for admin
 | `list_toolkit_categories()` | GET | `/api/v3/toolkits/categories` | Fetch category list for marketplace filtering |
 | `get_toolkit_tools()` | GET | `/api/v3/tools/enum` | Get tool names for a specific toolkit |
 | `get_toolkit_tools_detailed()` | GET | `/api/v3/tools/enum` | Get tool names + descriptions for smart selection |
-| `add_toolkit_to_server()` | PATCH | `/api/v3/mcp/{server_id}` | Add toolkit to MCP server config, set allowed tools |
+| `add_toolkit_to_server()` | PATCH | `/api/v3/mcp/{server_id}` | Add toolkit + auth_config binding to MCP server |
 | `initiate_connection()` | POST | `/api/v3/connected_accounts/link` | Generate OAuth link URL for user authentication |
 
 ---
@@ -104,3 +122,8 @@ Output: https://backend.composio.dev/v3/mcp/0a4474b3-d8e6-4417-a848-0d0c867b20f4
 3. **No API Key on Proxy**: MCP Proxy calls MUST NOT include the `x-api-key` header. Auth is implicit via `user_id`.
 
 4. **Accept Header**: MCP Proxy calls MUST include `Accept: application/json, text/event-stream` header for SSE responses.
+
+5. **PATCH Payload Format** (Jan 2026): When adding toolkits via `PATCH /api/v3/mcp/{server_id}`, the payload MUST include:
+   - `toolkits`: Array of **strings** (e.g., `["gmail", "slack"]`) - NOT objects
+   - `auth_config_ids`: Array of auth config IDs to bind (e.g., `["ac_abc123"]`)
+   - `allowed_tools`: Array of tool names to enable (accumulate, don't replace)
