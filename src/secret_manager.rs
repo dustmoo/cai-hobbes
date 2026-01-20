@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 /// Known secret keys used by the application
 pub const KNOWN_KEYS: &[&str] = &[
-    "api_key",           // Gemini API key
-    "smithery_api_key",  // Smithery API key
+    "api_key",          // Gemini API key
+    "smithery_api_key", // Smithery API key
 ];
 
 /// Prefix for Composio profile API keys
@@ -65,7 +65,10 @@ impl SecretManager {
             }
         }
 
-        tracing::info!("SecretManager loaded {} secrets from keychain", self.secrets.len());
+        tracing::info!(
+            "SecretManager loaded {} secrets from keychain",
+            self.secrets.len()
+        );
     }
 
     /// Get a secret by key
@@ -149,7 +152,7 @@ impl SecretManager {
     /// Load a Composio profile key from keychain (for dynamically discovered profiles)
     pub fn load_composio_key(&mut self, profile_name: &str) {
         let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
-        
+
         // Use our FFI to load (includes access group)
         match keychain_ffi::find_generic_password(&key) {
             Ok(value) => {
@@ -169,15 +172,15 @@ impl SecretManager {
     // =========================================================================
 
     /// Load all known secrets using a pre-authenticated biometric context.
-    /// 
+    ///
     /// This is the preferred method for loading secrets as it uses the
     /// authenticated LAContext to avoid prompting the user multiple times.
-    /// 
+    ///
     /// # Arguments
     /// * `context` - An authenticated AuthContext from biometric authentication
     pub fn load_all_with_context(&mut self, context: &AuthContext) {
         tracing::debug!("Loading secrets with biometric context...");
-        
+
         // Load known static keys
         for key in KNOWN_KEYS {
             match keychain_ffi::find_generic_password_with_context(key, context) {
@@ -206,31 +209,41 @@ impl SecretManager {
             }
         }
 
-        tracing::debug!("SecretManager loaded {} secrets with biometric context", self.secrets.len());
+        tracing::debug!(
+            "SecretManager loaded {} secrets with biometric context",
+            self.secrets.len()
+        );
     }
 
     /// Load a Composio profile key using a pre-authenticated biometric context.
-    /// 
+    ///
     /// # Arguments
     /// * `profile_name` - The name of the Composio profile
     /// * `context` - Optional authenticated AuthContext; falls back to regular access if None
-    pub fn load_composio_key_with_context(&mut self, profile_name: &str, context: Option<&AuthContext>) {
+    pub fn load_composio_key_with_context(
+        &mut self,
+        profile_name: &str,
+        context: Option<&AuthContext>,
+    ) {
         let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
-        
+
         let result = if let Some(ctx) = context {
             match keychain_ffi::find_generic_password_with_context(&key, ctx) {
                 Ok(val) => Ok(val),
                 Err(keychain_ffi::KeychainError::NotFound) => {
-                     // Fallback: Try loading without context (in case it was saved without biometric protection)
-                     tracing::debug!("Key '{}' not found with context, trying fallback lookup", key);
-                     keychain_ffi::find_generic_password(&key)
-                },
+                    // Fallback: Try loading without context (in case it was saved without biometric protection)
+                    tracing::debug!(
+                        "Key '{}' not found with context, trying fallback lookup",
+                        key
+                    );
+                    keychain_ffi::find_generic_password(&key)
+                }
                 Err(e) => Err(e),
             }
         } else {
             keychain_ffi::find_generic_password(&key)
         };
-        
+
         match result {
             Ok(value) => {
                 self.secrets.insert(key, value);
@@ -240,7 +253,11 @@ impl SecretManager {
                 tracing::debug!("No Composio key found for profile: {}", profile_name);
             }
             Err(e) => {
-                tracing::warn!("Failed to load Composio key for profile '{}': {}", profile_name, e);
+                tracing::warn!(
+                    "Failed to load Composio key for profile '{}': {}",
+                    profile_name,
+                    e
+                );
             }
         }
     }
@@ -253,12 +270,12 @@ impl SecretManager {
     /// Delete all cached secrets from keychain.
     /// This is useful for resetting keychain items so they can be re-saved
     /// with biometric protection (when upgrading from non-biometric items).
-    /// 
+    ///
     /// Returns the list of keys that were deleted.
     pub fn delete_all(&mut self) -> Vec<String> {
         let keys: Vec<String> = self.secrets.keys().cloned().collect();
         let mut deleted = Vec::new();
-        
+
         for key in &keys {
             match keychain_ffi::delete_generic_password(key) {
                 Ok(()) => {
@@ -274,10 +291,10 @@ impl SecretManager {
                 }
             }
         }
-        
+
         // Clear the cache
         self.secrets.clear();
-        
+
         tracing::info!("Cleared {} secrets from keychain and cache", deleted.len());
         deleted
     }

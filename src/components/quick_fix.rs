@@ -2,10 +2,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
 #[component]
-pub fn QuickFix(
-    suggestions: Vec<String>,
-    on_select: EventHandler<String>,
-) -> Element {
+pub fn QuickFix(suggestions: Vec<String>, on_select: EventHandler<String>) -> Element {
     if suggestions.is_empty() {
         return rsx!({});
     }

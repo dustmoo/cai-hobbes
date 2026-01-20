@@ -1,14 +1,14 @@
-use dioxus::prelude::*;
-use dioxus_free_icons::{Icon, icons::fi_icons};
-use rfd;
-use crate::settings::{Settings, SettingsManager, HotkeySettings, is_sandboxed};
-use crate::{context::permissions::ToolCategory, session::SessionState};
-use crate::mcp::composio_client::validate_composio_api_key;
-use std::io::Write;
-use crate::components::conflict_modal::ConflictModal;
 use crate::components::confirm_save_modal::ConfirmSaveModal;
-use zip::write::{FileOptions, ZipWriter};
+use crate::components::conflict_modal::ConflictModal;
 use crate::components::hotkey_recorder::HotkeyRecorder;
+use crate::mcp::composio_client::validate_composio_api_key;
+use crate::settings::{is_sandboxed, HotkeySettings, Settings, SettingsManager};
+use crate::{context::permissions::ToolCategory, session::SessionState};
+use dioxus::prelude::*;
+use dioxus_free_icons::{icons::fi_icons, Icon};
+use rfd;
+use std::io::Write;
+use zip::write::{FileOptions, ZipWriter};
 
 #[component]
 pub fn SettingsPanel() -> Element {
@@ -19,7 +19,8 @@ pub fn SettingsPanel() -> Element {
     let mut ui_state = use_context::<Signal<crate::settings::UiState>>();
     let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
     let mut session_state = use_context::<Signal<SessionState>>();
-    let _permission_manager = use_context::<Signal<crate::context::permissions::PermissionManager>>();
+    let _permission_manager =
+        use_context::<Signal<crate::context::permissions::PermissionManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut secret_manager = use_context::<Signal<crate::secret_manager::SecretManager>>();
@@ -31,7 +32,8 @@ pub fn SettingsPanel() -> Element {
     let mut has_unsaved_changes = use_signal(|| false);
 
     // Signals for model fetching
-    let mut available_models = use_signal(|| Vec::<crate::services::gemini_models::GeminiModel>::new());
+    let mut available_models =
+        use_signal(|| Vec::<crate::services::gemini_models::GeminiModel>::new());
     let mut models_loading = use_signal(|| false);
     let mut models_error = use_signal(|| Option::<String>::None);
     let mut models_fetch_trigger = use_signal(|| 0u32);
@@ -40,13 +42,14 @@ pub fn SettingsPanel() -> Element {
     use_effect(move || {
         let api_key = local_settings.read().gemini_config.api_key.clone();
         let _trigger = models_fetch_trigger.read(); // Subscribe to trigger changes
-        
+
         if api_key.is_some() {
             models_loading.set(true);
             models_error.set(None);
-            
+
             spawn(async move {
-                match crate::services::gemini_models::fetch_gemini_models(api_key.as_deref()).await {
+                match crate::services::gemini_models::fetch_gemini_models(api_key.as_deref()).await
+                {
                     Ok(models) => {
                         available_models.set(models);
                         models_loading.set(false);
@@ -85,7 +88,7 @@ pub fn SettingsPanel() -> Element {
     let mut show_conflict_modal = use_signal(|| false);
     let mut show_confirm_save_modal = use_signal(|| false);
     let mut conflicting_sessions = use_signal(|| Vec::<(String, crate::session::Session)>::new());
-    
+
     // UI Persistence Helpers
     let toggle_llm_collapsed = move |_| {
         {
@@ -95,7 +98,7 @@ pub fn SettingsPanel() -> Element {
         let state = (*ui_state.read()).clone();
         let manager = (*ui_state_manager.read()).clone();
         spawn(async move {
-             let _ = manager.save(&state);
+            let _ = manager.save(&state);
         });
     };
 
@@ -107,7 +110,7 @@ pub fn SettingsPanel() -> Element {
         let state = (*ui_state.read()).clone();
         let manager = (*ui_state_manager.read()).clone();
         spawn(async move {
-             let _ = manager.save(&state);
+            let _ = manager.save(&state);
         });
     };
 
@@ -201,7 +204,7 @@ pub fn SettingsPanel() -> Element {
                                         // Clear all keychain secrets
                                         let deleted = secret_manager.write().delete_all();
                                         tracing::info!("Cleared {} keychain items for mode switch", deleted.len());
-                                        
+
                                         // Clear API keys from local settings
                                         {
                                             let mut ls = local_settings.write();
@@ -244,8 +247,8 @@ pub fn SettingsPanel() -> Element {
                         let composio_keys: Vec<(String, String)> = settings_to_save.composio_profiles.iter()
                             .filter_map(|p| p.api_key.as_ref().map(|k| (p.name.clone(), k.clone())))
                             .collect();
-                        
-                        // We also need to update the settings to store "trimmed" keys if we modify them logic-wise, 
+
+                        // We also need to update the settings to store "trimmed" keys if we modify them logic-wise,
                         // but for now let's just save what we have.
                         // Actually, the original logic trimmed the smithery key. Let's replicate that.
                         let smithery_key_to_save = smithery_key_opt.map(|k| k.trim().to_string());
@@ -261,26 +264,26 @@ pub fn SettingsPanel() -> Element {
                         // Let's check settings.rs. It doesn't derive Clone!
                         // We can reconstruct it or just pass the path?
                         // Or we can just use the signal reader inside the spawn_blocking? No, signal is not Send.
-                        
+
                         // Workaround: We only need `save` which writes to a path.
                         // Let's just capture the path if possible, or assume we can't easily clone SettingsManager.
                         // Actually, looking at code, `SettingsManager` is `Clone`? No, looking at `settings.rs` line 299: `pub struct SettingsManager { settings_path: PathBuf, }`.
                         // It does NOT derive Clone.
-                        // However, we can construct a new one if we know the path. 
-                        // Or better: `settings_manager` signal held by the component. 
+                        // However, we can construct a new one if we know the path.
+                        // Or better: `settings_manager` signal held by the component.
                         // We can't pass the signal.
                         // We just need to write the file. `Settings` is serializable.
                         // We can use `std::fs::write` in the blocking task manually or implement a helper.
                         // The `save` method just does: `fs::write(&self.settings_path, content)`.
-                        
-                        // Strategy: We can't easily call `settings_manager.save` in background without cloning it. 
-                        // Let's assume for now we keep `settings_manager.save` on main thread (file IO is fast-ish) 
+
+                        // Strategy: We can't easily call `settings_manager.save` in background without cloning it.
+                        // Let's assume for now we keep `settings_manager.save` on main thread (file IO is fast-ish)
                         // BUT definitely move Keychain IO (Composio/Smithery keys) to background.
 
                         // Critical: Update the global settings signal so the app (menus, hotkeys) reacts immediately
                         *global_settings = settings_to_save.clone();
                         has_unsaved_changes.set(false);
-                        
+
                         let mut secret_updates = Vec::new();
                         if let Some(k) = gemini_key_opt { secret_updates.push(("api_key".to_string(), k)); }
                         if let Some(k) = smithery_key_to_save { secret_updates.push(("smithery_api_key".to_string(), k)); }
@@ -304,7 +307,7 @@ pub fn SettingsPanel() -> Element {
                                     }
                                 }
                             }
-                            
+
                             // Build final secret updates with validated Composio keys
                             let mut final_secret_updates = secret_updates;
                             for (profile_name, key) in validated_composio_keys {
@@ -322,7 +325,7 @@ pub fn SettingsPanel() -> Element {
                                 crate::settings::KeychainStorageMode::LocalKeychain
                             };
                             let use_biometric = effective_mode == crate::settings::KeychainStorageMode::Biometric;
-                            
+
                             let results = tokio::task::spawn_blocking(move || {
                                 let mut saved = Vec::new();
                                 for (key_name, key_value) in final_secret_updates {
@@ -341,7 +344,7 @@ pub fn SettingsPanel() -> Element {
                                         // iCloud sync mode: syncs across devices, no biometric
                                         crate::keychain_ffi::set_generic_password(&key_name, &key_value)
                                     };
-                                    
+
                                     if let Err(e) = save_result {
                                         tracing::error!("Failed to save secret {}: {}", key_name, e);
                                     } else {
@@ -362,9 +365,9 @@ pub fn SettingsPanel() -> Element {
                                 }
                                 Err(e) => tracing::error!("Keychain task failed: {}", e),
                             }
-                            
+
                             // Save settings.json (fast enough for main thread usually, or we could spawn another blocking task if we could clone path)
-                            // Since we didn't solve the SettingsManager Clone issue easily without editing settings.rs, 
+                            // Since we didn't solve the SettingsManager Clone issue easily without editing settings.rs,
                             // we'll run this here. It's just a file write.
                             if let Err(e) = settings_manager.read().save(&settings_to_save) {
                                 tracing::error!("Failed to save settings: {}", e);
@@ -383,7 +386,7 @@ pub fn SettingsPanel() -> Element {
                 class: "w-48 shrink-0 flex flex-col border-r border-primary-700 bg-dark-section",
                 h2 { class: "text-lg font-bold p-4 border-b border-primary-700", "Settings" }
                 // Tabs
-                button { 
+                button {
                     class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::General { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::General;
@@ -394,7 +397,7 @@ pub fn SettingsPanel() -> Element {
                     Icon { width: 18, height: 18, icon: fi_icons::FiSettings }
                     "General"
                 }
-                button { 
+                button {
                     class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Mcp { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Mcp;
@@ -405,7 +408,7 @@ pub fn SettingsPanel() -> Element {
                     Icon { width: 18, height: 18, icon: fi_icons::FiCpu }
                     "MCP Tools"
                 }
-                button { 
+                button {
                     class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Behavior { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Behavior;
@@ -416,7 +419,7 @@ pub fn SettingsPanel() -> Element {
                     Icon { width: 18, height: 18, icon: fi_icons::FiSliders }
                     "Behavior"
                 }
-                button { 
+                button {
                     class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Data { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Data;
@@ -427,7 +430,7 @@ pub fn SettingsPanel() -> Element {
                     Icon { width: 18, height: 18, icon: fi_icons::FiDatabase }
                     "Data"
                 }
-                button { 
+                button {
                     class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Permissions { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Permissions;
@@ -438,7 +441,7 @@ pub fn SettingsPanel() -> Element {
                     Icon { width: 18, height: 18, icon: fi_icons::FiLock }
                     "Permissions"
                 }
-                button { 
+                button {
                     class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Hotkeys { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Hotkeys;
@@ -449,7 +452,7 @@ pub fn SettingsPanel() -> Element {
                     Icon { width: 18, height: 18, icon: fi_icons::FiCommand }
                     "Hotkeys"
                 }
-                button { 
+                button {
                     class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::About { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::About;
@@ -508,7 +511,7 @@ pub fn SettingsPanel() -> Element {
                                     div {
                                         class: "mb-4 p-3 bg-dark-bg rounded-lg border border-primary-700",
                                         label { class: "block text-sm font-medium text-gray-300 mb-2", "API Key Storage" }
-                                        
+
                                         if is_sandboxed() {
                                             // App Store/TestFlight: Show Biometric and iCloud options
                                             div {
@@ -661,7 +664,7 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
-                                    
+
                                     // Thinking Mode Section
                                     div {
                                         class: "mb-4 pt-4 border-t border-primary-700",
@@ -685,14 +688,14 @@ pub fn SettingsPanel() -> Element {
                                             class: "text-xs text-gray-400 mb-3",
                                             "Enable extended reasoning for complex tasks. Gemini 3 Pro uses thinking level, Gemini 2.5 uses thinking budget."
                                         }
-                                        
+
                                         if local_settings.read().gemini_config.thinking_enabled {
                                             {
                                                 let current_model = local_settings.read().gemini_config.chat_model.clone();
                                                 let gemini_model = crate::components::llm::GeminiModel::from_slug(&current_model);
-                                                
+
                                                 match gemini_model.thinking_config_style() {
-                                                    crate::components::llm::ThinkingConfigStyle::LevelPro | 
+                                                    crate::components::llm::ThinkingConfigStyle::LevelPro |
                                                     crate::components::llm::ThinkingConfigStyle::LevelFlash => {
                                                         rsx! {
                                                             div {
@@ -704,10 +707,10 @@ pub fn SettingsPanel() -> Element {
                                                                         local_settings.write().gemini_config.thinking_level = event.value();
                                                                     },
                                                                     for level in gemini_model.valid_thinking_levels() {
-                                                                        option { 
-                                                                            value: "{level}", 
-                                                                            selected: local_settings.read().gemini_config.thinking_level == *level, 
-                                                                            "{level}" 
+                                                                        option {
+                                                                            value: "{level}",
+                                                                            selected: local_settings.read().gemini_config.thinking_level == *level,
+                                                                            "{level}"
                                                                         }
                                                                     }
                                                                 }
@@ -744,7 +747,7 @@ pub fn SettingsPanel() -> Element {
                                                     crate::components::llm::ThinkingConfigStyle::None => {
                                                         rsx! {
                                                             div {
-                                                                class: "p-3 bg-yellow-900/30 border border-yellow-700/50 rounded-lg", 
+                                                                class: "p-3 bg-yellow-900/30 border border-yellow-700/50 rounded-lg",
                                                                 p { class: "text-sm text-yellow-200", "⚠️ This model does not support thinking mode." }
                                                             }
                                                         }
@@ -792,7 +795,7 @@ pub fn SettingsPanel() -> Element {
                                     "Smithery.ai (Deprecated)"
                                 }
                             }
-                            
+
                             if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
                                 div {
                                     class: "mt-3 p-3 bg-red-900/30 border border-red-700 rounded-lg",
@@ -807,7 +810,7 @@ pub fn SettingsPanel() -> Element {
                                 class: "text-xs text-gray-400 mt-2",
                                 "Choose which registry to use when installing new MCP servers. Smithery uses a hosted proxy (requires API key), while Composio runs locally."
                             }
-                            
+
                             // Smithery API Key - shown when Smithery is selected
                             if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
                                 div {
@@ -826,7 +829,7 @@ pub fn SettingsPanel() -> Element {
                                     }
                                 }
                             }
-                            
+
                             if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
                                 div {
                                     class: "mt-4 pt-4 border-t border-primary-700",
@@ -861,7 +864,7 @@ pub fn SettingsPanel() -> Element {
                                                 }
                                                 div {
                                                     class: "mt-3 pt-3 border-t border-primary-700/30",
-                                                    a { 
+                                                    a {
                                                         class: "text-xs text-primary-400 hover:text-primary-300 flex items-center gap-1",
                                                         href: "https://docs.composio.dev/docs/welcome",
                                                         target: "_blank",
@@ -886,7 +889,7 @@ pub fn SettingsPanel() -> Element {
                                                 "+ Add Profile"
                                             }
                                         }
-                                        
+
                                         // Profile list
                                         div {
                                             class: "space-y-2 mb-4",
@@ -897,7 +900,7 @@ pub fn SettingsPanel() -> Element {
                                                     let is_active = active_name.as_ref() == Some(&profile_name);
                                                     rsx! {
                                                         div {
-                                                            class: format!("flex items-center justify-between p-2 rounded-md transition-all {}", 
+                                                            class: format!("flex items-center justify-between p-2 rounded-md transition-all {}",
                                                                 if is_active { "bg-dark-input border border-primary-500 ring-1 ring-primary-500/20" } else { "bg-dark-input/50 border border-transparent hover:bg-dark-input" }),
                                                             div {
                                                                 class: "flex items-center gap-3",
@@ -917,9 +920,9 @@ pub fn SettingsPanel() -> Element {
                                                                         }
                                                                     }
                                                                 }
-                                                                span { 
+                                                                span {
                                                                     class: format!("text-sm font-medium {}", if is_active { "text-white" } else { "text-gray-300" }),
-                                                                    "{profile_name}" 
+                                                                    "{profile_name}"
                                                                 }
                                                                 if is_active {
                                                                     span {
@@ -943,13 +946,13 @@ pub fn SettingsPanel() -> Element {
                                                 }
                                             }
                                         }
-                                        
+
                                         // Edit active profile
                                         if let Some(active_name) = local_settings.read().active_composio_profile.clone() {
                                             div {
                                                 class: "border border-primary-700 rounded-lg p-3",
                                                 h4 { class: "text-sm font-medium text-gray-300 mb-3", "Edit Profile: {active_name}" }
-                                                
+
                                                 // Profile Name
                                                 div {
                                                     class: "mb-3",
@@ -972,7 +975,7 @@ pub fn SettingsPanel() -> Element {
                                                         }
                                                     }
                                                 }
-                                                
+
                                                 // Profile Color
                                                 div {
                                                     class: "mb-3",
@@ -981,7 +984,7 @@ pub fn SettingsPanel() -> Element {
                                                         class: "flex gap-2 flex-wrap",
                                                         for color in ["bg-blue-600", "bg-purple-600", "bg-green-600", "bg-red-600", "bg-orange-600", "bg-pink-600", "bg-teal-600", "bg-gray-600"] {
                                                             button {
-                                                                class: format!("w-6 h-6 rounded-full cursor-pointer transition-transform hover:scale-110 {} {}", 
+                                                                class: format!("w-6 h-6 rounded-full cursor-pointer transition-transform hover:scale-110 {} {}",
                                                                     color,
                                                                     if local_settings.read().get_active_profile().map(|p| p.color.as_str()) == Some(color) { "ring-2 ring-white scale-110 border border-transparent shadow-md" } else { "border border-gray-600 hover:border-white" }
                                                                 ),
@@ -1073,12 +1076,12 @@ pub fn SettingsPanel() -> Element {
                                                                             .filter(|(k, _)| k != "user_id")
                                                                             .map(|(k, v)| (k.into_owned(), v.into_owned()))
                                                                             .collect();
-                                                                        
+
                                                                         url.query_pairs_mut().clear();
                                                                         for (k, v) in pairs {
                                                                             url.query_pairs_mut().append_pair(&k, &v);
                                                                         }
-                                                                        
+
                                                                         // Clean up if query is empty (Url::to_string might leave ?)
                                                                         if url.query() == Some("") {
                                                                             url.set_query(None);
@@ -1088,7 +1091,7 @@ pub fn SettingsPanel() -> Element {
                                                                         warning = Some("Note: Embedded User ID removed. Using the app-generated User ID below.".to_string());
                                                                     }
                                                                 }
-                                                                
+
                                                                 composio_url_warning.set(warning);
 
                                                                 let mut settings = local_settings.write();
@@ -1099,13 +1102,13 @@ pub fn SettingsPanel() -> Element {
                                                         }
                                                     }
                                                     if let Some(msg) = composio_url_warning.read().as_ref() {
-                                                        p { class: "text-xs text-yellow-400 mt-1 flex items-center gap-1", 
+                                                        p { class: "text-xs text-yellow-400 mt-1 flex items-center gap-1",
                                                             Icon { width: 12, height: 12, icon: fi_icons::FiAlertCircle }
-                                                            "{msg}" 
+                                                            "{msg}"
                                                         }
                                                     }
                                                 }
-                                                
+
                                                 // API Key
                                                 div {
                                                     class: "mb-3",
@@ -1127,7 +1130,7 @@ pub fn SettingsPanel() -> Element {
                                                         }
                                                     }
                                                 }
-                                                
+
                                                 // User ID (read-only, auto-generated)
                                                 div {
                                                     class: "mb-3",
@@ -1191,7 +1194,7 @@ pub fn SettingsPanel() -> Element {
                                                         "Auto-generated. Regenerating will break existing toolkit connections."
                                                     }
                                                 }
-                                                
+
                                                 // Connection status
                                                 div {
                                                     class: "flex items-center justify-end gap-2 mt-2",
@@ -1246,7 +1249,7 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
-                                    
+
                                     // Max Tool Output Length
                                     div {
                                         class: "flex flex-col gap-1",
@@ -1323,7 +1326,7 @@ pub fn SettingsPanel() -> Element {
                                 h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Chat Bar Icons" }
                                 div {
                                     class: "grid grid-cols-2 gap-3",
-                                    
+
                                     // History Icon
                                     div {
                                         class: "flex items-center justify-between",
@@ -1395,7 +1398,7 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
-                                    
+
                                     // Attachments Icon
                                     div {
                                         class: "flex items-center justify-between",
@@ -1490,7 +1493,7 @@ pub fn SettingsPanel() -> Element {
                                 class: "pt-4 border-t border-primary-700",
                                 h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Tool Display Defaults" }
                                 p { class: "text-xs text-gray-500 mb-3", "Set initial state for collapsible sections in tool call bubbles." }
-                                
+
                                 div {
                                     class: "space-y-3",
                                     div {
@@ -1795,7 +1798,7 @@ pub fn SettingsPanel() -> Element {
                                                                 current_state.sessions.insert(id, session);
                                                             }
                                                         }
-                                        
+
                                                         if !conflicting_sessions.read().is_empty() {
                                                             show_conflict_modal.set(true);
                                                         } else {
@@ -1830,7 +1833,7 @@ pub fn SettingsPanel() -> Element {
                                         // Delete all keychain items
                                         let deleted_keys = secret_manager.write().delete_all();
                                         tracing::info!("Reset {} keychain items.", deleted_keys.len());
-                                        
+
                                         // Clear API keys from local settings
                                         let mut ls = local_settings.write();
                                         ls.gemini_config.api_key = None;
@@ -1899,7 +1902,7 @@ pub fn SettingsPanel() -> Element {
                                             div { class: if local_settings.read().permission_settings.granular_permissions.get(&ToolCategory::Mcp).copied().unwrap_or(false) { "toggle-switch active" } else { "toggle-switch" } }
                                         }
                                     }
-                                    
+
                                     if local_settings.read().permission_settings.granular_permissions.get(&ToolCategory::Mcp).copied().unwrap_or(false) {
                                         div {
                                             class: "mt-2 pl-4 border-l border-gray-700 space-y-2",
@@ -1908,7 +1911,7 @@ pub fn SettingsPanel() -> Element {
                                                 {
                                                     let server_name = server.name.clone();
                                                     let is_allowed = local_settings.read().permission_settings.mcp_server_permissions.get(&server_name).copied().unwrap_or(true);
-                                                    
+
                                                     rsx! {
                                                         div {
                                                             key: "{server_name}",
@@ -1956,8 +1959,8 @@ pub fn SettingsPanel() -> Element {
                             div {
                                 class: "p-4 bg-dark-section rounded-lg",
                                 h3 { class: "text-md font-semibold mb-4", "Keyboard Shortcuts" }
-                                p { class: "text-xs text-gray-400 mb-4", 
-                                    "Customize global shortcuts using the format: " 
+                                p { class: "text-xs text-gray-400 mb-4",
+                                    "Customize global shortcuts using the format: "
                                     code { class: "bg-black/30 px-1 rounded", "CmdOrCtrl+Shift+Key" }
                                 ". Changes apply immediately after saving."
                                 }
@@ -1977,7 +1980,7 @@ pub fn SettingsPanel() -> Element {
 
                                 div {
                                     class: "space-y-4",
-                                    
+
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
                                         label { class: "text-sm text-gray-300", "Toggle Settings" }
@@ -1986,7 +1989,7 @@ pub fn SettingsPanel() -> Element {
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_settings = v,
                                         }
                                     }
-                                    
+
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
                                         label { class: "text-sm text-gray-300", "Toggle History" }
@@ -2083,26 +2086,26 @@ pub fn SettingsPanel() -> Element {
                     div {
                         class: "p-4 bg-dark-section rounded-lg",
                         h3 { class: "text-md font-semibold mb-3", "About & Legal" }
-                        
+
                         // Version and app name
                         div {
                             class: "flex items-center gap-2 mb-3",
                             span { class: "text-sm text-gray-300", "{app_name}" }
                             span { class: "text-xs text-gray-500", "{app_version}" }
                         }
-                        
+
                         // Privacy statement
                         p {
                             class: "text-sm text-green-400 mb-3",
                             "🔒 Built without telemetry for your privacy."
                         }
-                        
+
                         // Attribution
                         p {
                             class: "text-xs text-gray-400 mb-4",
                             "{crate::settings::APP_ATTRIBUTION}"
                         }
-                        
+
                         // Legal links
                         div {
                             class: "flex gap-4",
@@ -2124,7 +2127,7 @@ pub fn SettingsPanel() -> Element {
                    } // End About
                    } // End Match
                 } // End Scrollable Content
-                
+
                 // Footer (Sticky)
                 div {
                     class: "p-4 border-t border-primary-700 bg-dark-section",
@@ -2152,7 +2155,7 @@ pub fn SettingsPanel() -> Element {
                             let composio_keys: Vec<(String, String)> = settings_to_save.composio_profiles.iter()
                                 .filter_map(|p| p.api_key.as_ref().map(|k| (p.name.clone(), k.clone())))
                                 .collect();
-                            
+
                             let smithery_key_to_save = smithery_key_opt.map(|k| k.trim().to_string());
                             if let Some(ref trimmed) = smithery_key_to_save {
                                  settings_to_save.smithery_api_key = Some(trimmed.clone());
@@ -2181,7 +2184,7 @@ pub fn SettingsPanel() -> Element {
                                         }
                                     }
                                 }
-                                
+
                                 // Build final secret updates with validated Composio keys
                                 let mut final_secret_updates = secret_updates;
                                 for (profile_name, key) in validated_composio_keys {
@@ -2218,7 +2221,7 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     Err(e) => tracing::error!("Keychain task failed: {}", e),
                                 }
-                                
+
                                 if let Err(e) = settings_manager.read().save(&settings_to_save) {
                                     tracing::error!("Failed to save settings: {}", e);
                                 }

@@ -1,8 +1,8 @@
-use serde::{Deserialize, Serialize};
-use reqwest::Client;
-use futures_util::StreamExt;
-use tokio::sync::mpsc;
 use async_trait::async_trait;
+use futures_util::StreamExt;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use crate::components::shared::{StreamMessage, ToolCall};
 use crate::context::prompt_builder::LlmPrompt;
@@ -57,8 +57,7 @@ pub struct FunctionCallingConfig {
     pub allowed_function_names: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize)]
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Content {
     pub role: String,
     pub parts: Vec<Part>,
@@ -168,49 +167,71 @@ impl GeminiModel {
     pub fn from_slug(slug: &str) -> Self {
         // Strip optional "models/" prefix if present, though usually handled by caller
         let s = slug.strip_prefix("models/").unwrap_or(slug);
-        
+
         match s {
             // Gemini 3 Series - STRICT PREFIX MATCHING FIRST
-            _ if s.starts_with("gemini-3.0-pro") || s.starts_with("gemini-3-pro") => GeminiModel::Gemini3_0ProPreview,
-            _ if s.starts_with("gemini-3.0-flash") || s.starts_with("gemini-3-flash") => GeminiModel::Gemini3_0FlashPreview,
-             "deep-research-pro-preview-dec-12-2025" => GeminiModel::Gemini3_0ProPreview,
+            _ if s.starts_with("gemini-3.0-pro") || s.starts_with("gemini-3-pro") => {
+                GeminiModel::Gemini3_0ProPreview
+            }
+            _ if s.starts_with("gemini-3.0-flash") || s.starts_with("gemini-3-flash") => {
+                GeminiModel::Gemini3_0FlashPreview
+            }
+            "deep-research-pro-preview-dec-12-2025" => GeminiModel::Gemini3_0ProPreview,
 
             // Gemini 2.5 Series
             "gemini-2.5-pro" | "gemini-2.5-pro-preview-tts" => GeminiModel::Gemini2_5Pro,
-            "gemini-2.5-flash" | "gemini-2.5-flash-preview-sep-2025" | "gemini-2.5-flash-preview-tts" => GeminiModel::Gemini2_5Flash,
-            "gemini-2.5-flash-lite" | "gemini-2.5-flash-lite-preview-sep-2025" => GeminiModel::Gemini2_5FlashLite,
+            "gemini-2.5-flash"
+            | "gemini-2.5-flash-preview-sep-2025"
+            | "gemini-2.5-flash-preview-tts" => GeminiModel::Gemini2_5Flash,
+            "gemini-2.5-flash-lite" | "gemini-2.5-flash-lite-preview-sep-2025" => {
+                GeminiModel::Gemini2_5FlashLite
+            }
             "gemini-2.5-computer-use-preview-10-2025" => GeminiModel::Gemini2_5ComputerUsePreview,
-            
+
             // Gemini 2.0 Series
-            "gemini-2.0-flash" | "gemini-2.0-flash-001" | "gemini-2.0-flash-experimental" | "gemini-2.0-flash-image-generation-experimental" | "gemini-experimental-1206" => GeminiModel::Gemini2_0Flash,
-            "gemini-2.0-flash-lite" | "gemini-2.0-flash-lite-001" | "gemini-2.0-flash-lite-preview" | "gemini-2.0-flash-lite-preview-02-05" => GeminiModel::Gemini2_0FlashLite,
-            "gemini-2.0-flash-thinking-exp-01-21" | "gemini-2.0-flash-thinking-exp" => GeminiModel::Gemini2_0FlashThinking,
-            
+            "gemini-2.0-flash"
+            | "gemini-2.0-flash-001"
+            | "gemini-2.0-flash-experimental"
+            | "gemini-2.0-flash-image-generation-experimental"
+            | "gemini-experimental-1206" => GeminiModel::Gemini2_0Flash,
+            "gemini-2.0-flash-lite"
+            | "gemini-2.0-flash-lite-001"
+            | "gemini-2.0-flash-lite-preview"
+            | "gemini-2.0-flash-lite-preview-02-05" => GeminiModel::Gemini2_0FlashLite,
+            "gemini-2.0-flash-thinking-exp-01-21" | "gemini-2.0-flash-thinking-exp" => {
+                GeminiModel::Gemini2_0FlashThinking
+            }
+
             // Gemini 1.5 Series (DEPRECATED: Map to 2.x equivalents)
-            "gemini-pro-latest" | "gemini-1.5-pro" | "gemini-1.5-pro-latest" | "gemini-robotics-er-1.5-preview" => GeminiModel::Gemini2_5Pro,
-            "gemini-flash-latest" | "gemini-1.5-flash" | "gemini-1.5-flash-latest" => GeminiModel::Gemini2_0Flash,
+            "gemini-pro-latest"
+            | "gemini-1.5-pro"
+            | "gemini-1.5-pro-latest"
+            | "gemini-robotics-er-1.5-preview" => GeminiModel::Gemini2_5Pro,
+            "gemini-flash-latest" | "gemini-1.5-flash" | "gemini-1.5-flash-latest" => {
+                GeminiModel::Gemini2_0Flash
+            }
             "gemini-flash-lite-latest" | "gemini-1.5-flash-8b" => GeminiModel::Gemini2_0FlashLite,
-            
+
             // Nano & Gemma
             "nano-banana" => GeminiModel::NanoBanana,
             "nano-banana-pro" => GeminiModel::NanoBananaPro,
-            
+
             // Strict match for Gemma3 variants
             _ if s.starts_with("gemma-3") || s.starts_with("gemma-3n") => GeminiModel::Gemma3,
 
             // Legacy Prefix matching (Priority is strictly below Gemini 3 specific checks)
             _ if s.starts_with("gemini-2.5-pro") => GeminiModel::Gemini2_5Pro,
             _ if s.starts_with("gemini-2.5-flash") => GeminiModel::Gemini2_5Flash,
-            
+
             // Fallback Heuristics for Unknown/New Models
             _ if s.contains("thinking") => GeminiModel::Gemini2_0FlashThinking,
             _ if s.contains("nano") => GeminiModel::NanoBanana,
             _ if s.contains("gemma") => GeminiModel::Gemma3,
             _ if s.contains("flash-lite") => GeminiModel::Gemini2_0FlashLite, // assume cheap
-            _ if s.contains("flash") => GeminiModel::Gemini2_0Flash, // assume mid-tier
+            _ if s.contains("flash") => GeminiModel::Gemini2_0Flash,          // assume mid-tier
             // Jan 2026: 1.5 deprecated, use 2.5 Pro (has thinking budget support)
             _ if s.contains("pro") => GeminiModel::Gemini2_5Pro,
-            
+
             _ => {
                 tracing::warn!("Unknown Gemini model slug encountered: '{}'. Defaulting to Gemini 2.0 Flash pricing.", s);
                 GeminiModel::Unknown(s.to_string())
@@ -221,24 +242,32 @@ impl GeminiModel {
     pub fn get_rates(&self, prompt_tokens: i32) -> (f64, f64) {
         match self {
             GeminiModel::Gemini3_0ProPreview => {
-                if prompt_tokens > 200_000 { (4.00, 18.00) } else { (2.00, 12.00) }
-            },
+                if prompt_tokens > 200_000 {
+                    (4.00, 18.00)
+                } else {
+                    (2.00, 12.00)
+                }
+            }
             GeminiModel::Gemini3_0FlashPreview => (0.50, 3.00),
-            
+
             GeminiModel::Gemini2_5Pro => (1.25, 10.00),
-            GeminiModel::Gemini2_5Flash => (0.15, 0.60), // Updated to correct rates: $0.15 Input, $0.60 Output
+            GeminiModel::Gemini2_5Flash => (0.15, 0.60), // Updated to correct rates: $0.15 Input, $0.60 Outpu
             GeminiModel::Gemini2_5FlashLite => (0.10, 0.40),
             GeminiModel::Gemini2_5ComputerUsePreview => {
-                 if prompt_tokens > 200_000 { (2.50, 15.00) } else { (1.25, 10.00) }
-            },
-            
+                if prompt_tokens > 200_000 {
+                    (2.50, 15.00)
+                } else {
+                    (1.25, 10.00)
+                }
+            }
+
             GeminiModel::Gemini2_0Flash | GeminiModel::Gemini2_0FlashThinking => (0.10, 0.40),
             GeminiModel::Gemini2_0FlashLite => (0.075, 0.30),
-            
 
-            
-            GeminiModel::Gemma3 | GeminiModel::NanoBanana | GeminiModel::NanoBananaPro => (0.00, 0.00),
-            
+            GeminiModel::Gemma3 | GeminiModel::NanoBanana | GeminiModel::NanoBananaPro => {
+                (0.00, 0.00)
+            }
+
             GeminiModel::Unknown(_) => {
                 // Safety Default: Gemini 2.0 Flash (1.5 deprecated Jan 2026)
                 (0.10, 0.40)
@@ -254,33 +283,32 @@ impl GeminiModel {
 pub fn calculate_cost(model: &str, usage: &UsageMetadata) -> f64 {
     let gemini_model = GeminiModel::from_slug(model);
     let (input_rate, mut output_rate) = gemini_model.get_rates(usage.prompt_token_count);
-    
+
     // Safety check for cached tokens
     let cached_tokens = usage.cached_content_token_count.unwrap_or(0);
     // prompt_token_count includes cached tokens, so we determine standard input tokens by subtracting
     let standard_input_tokens = (usage.prompt_token_count - cached_tokens).max(0);
-    
+
     // Cached content is typically ~25% of the standard input rate
     let cached_rate = input_rate * 0.25;
-    
+
     let input_cost = (standard_input_tokens as f64 / 1_000_000.0) * input_rate;
     let cached_cost = (cached_tokens as f64 / 1_000_000.0) * cached_rate;
-    
+
     // Check for Thinking Mode Surcharges (Gemini 2.5 Flash)
     if let GeminiModel::Gemini2_5Flash = gemini_model {
         if usage.thoughts_token_count.unwrap_or(0) > 0 {
-             output_rate = 3.50; // Thinking Mode Output Rate
+            output_rate = 3.50; // Thinking Mode Output Rate
         }
     }
-    
+
     let completion_tokens = usage.candidates_token_count.unwrap_or(0);
     let output_cost = (completion_tokens as f64 / 1_000_000.0) * output_rate;
-    
-    input_cost + cached_cost + output_cost
+
+    input_cost + cached_cost + output_cos
 }
 
 #[derive(Deserialize, Debug)]
-
 #[serde(rename_all = "camelCase")]
 pub struct Candidate {
     pub content: ContentResponse,
@@ -332,7 +360,6 @@ impl From<PartResponse> for Part {
     }
 }
 
-
 #[async_trait]
 pub trait LlmConnector: Send + Sync {
     async fn generate_content_stream(
@@ -374,21 +401,22 @@ impl GeminiModel {
     pub fn supports_thinking(&self) -> bool {
         !matches!(self.thinking_config_style(), ThinkingConfigStyle::None)
     }
-    
+
     /// Returns the thinking config style for this model
     pub fn thinking_config_style(&self) -> ThinkingConfigStyle {
         match self {
             GeminiModel::Gemini3_0ProPreview => ThinkingConfigStyle::LevelPro,
-            GeminiModel::Gemini3_0FlashPreview | 
-            GeminiModel::Gemini2_0FlashThinking => ThinkingConfigStyle::LevelFlash,
-            GeminiModel::Gemini2_5Pro |
-            GeminiModel::Gemini2_5Flash |
-            GeminiModel::Gemini2_5FlashLite |
-            GeminiModel::Gemini2_5ComputerUsePreview => ThinkingConfigStyle::Budget,
+            GeminiModel::Gemini3_0FlashPreview | GeminiModel::Gemini2_0FlashThinking => {
+                ThinkingConfigStyle::LevelFlash
+            }
+            GeminiModel::Gemini2_5Pro
+            | GeminiModel::Gemini2_5Flash
+            | GeminiModel::Gemini2_5FlashLite
+            | GeminiModel::Gemini2_5ComputerUsePreview => ThinkingConfigStyle::Budget,
             _ => ThinkingConfigStyle::None,
         }
     }
-    
+
     /// Valid thinking levels for Flash 3 (Pro only supports low/high)
     pub fn valid_thinking_levels(&self) -> &'static [&'static str] {
         match self.thinking_config_style() {
@@ -401,7 +429,7 @@ impl GeminiModel {
 
 impl GeminiConnector {
     pub fn new(config: GeminiConfig) -> Self {
-        Self { 
+        Self {
             config,
             base_url: BASE_API_URL.to_string(),
         }
@@ -422,16 +450,22 @@ impl GeminiConnector {
         } else {
             format!("models/{}", model)
         };
-        format!("{}/{}:{}?key={}", self.base_url, model_path, action, api_key)
+        format!(
+            "{}/{}:{}?key={}",
+            self.base_url, model_path, action, api_key
+        )
     }
 
     /// Select the most useful tools from a large toolkit using LLM
     pub async fn select_tools_for_toolkit(
         &self,
         request: &crate::mcp::tool_selection::ToolSelectionRequest,
-    ) -> Result<crate::mcp::tool_selection::ToolSelectionResponse, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        crate::mcp::tool_selection::ToolSelectionResponse,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         use crate::mcp::tool_selection::{build_selection_prompt, parse_selection_response};
-        
+
         tracing::info!(
             model = %self.config.summary_model,
             toolkit = %request.toolkit_name,
@@ -439,7 +473,7 @@ impl GeminiConnector {
             max_tools = %request.max_tools,
             "LLM: Selecting tools for toolkit"
         );
-        
+
         let api_key = match self.config.api_key.clone() {
             Some(key) => key,
             None => match std::env::var("GEMINI_API_KEY") {
@@ -449,54 +483,65 @@ impl GeminiConnector {
                     return Err(Box::new(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         "GEMINI_API_KEY not configured",
-                    )) as Box<dyn std::error::Error + Send + Sync>);
+                    ))
+                        as Box<dyn std::error::Error + Send + Sync>);
                 }
-            }
+            },
         };
-        
+
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .expect("Failed to build reqwest client");
-        
+
         let prompt = build_selection_prompt(request);
-        
+
         let request_body = GeminiRequest {
             contents: vec![Content {
                 role: "user".to_string(),
-                parts: vec![Part::Text { text: prompt, thought: None }],
+                parts: vec![Part::Text {
+                    text: prompt,
+                    thought: None,
+                }],
             }],
             tools: None,
             system_instruction: None,
             tool_config: None,
             generation_config: None,
         };
-        
-        let url = self.build_model_endpoint(&self.config.summary_model, "generateContent", &api_key);
-        
-        let response = client
+
+        let url =
+            self.build_model_endpoint(&self.config.summary_model, "generateContent", &api_key);
+
+        let response = clien
             .post(&url)
             .json(&request_body)
             .send()
-            .await
+            .awai
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        
+
         if !response.status().is_success() {
             let status = response.status();
-            let body_text = response.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
+            let body_text = response
+                .text()
+                .awai
+                .unwrap_or_else(|_| "Failed to read error body".to_string());
             tracing::error!("Gemini API Error [{}]: {}", status, body_text);
-                return Err(Box::new(std::io::Error::other(
-                    format!("API request failed with status {}: {}", status, body_text),
-                )) as Box<dyn std::error::Error + Send + Sync>);
+            return Err(Box::new(std::io::Error::other(format!(
+                "API request failed with status {}: {}",
+                status, body_tex
+            ))) as Box<dyn std::error::Error + Send + Sync>);
         }
-        
-        let response_json: GeminiResponse = response.json().await
+
+        let response_json: GeminiResponse = response
+            .json()
+            .awai
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        
+
         if let Some(candidate) = response_json.candidates.first() {
             if let Some(part) = candidate.content.parts.first() {
                 tracing::debug!("Raw LLM tool selection response: {}", part.text);
-                
+
                 match parse_selection_response(&part.text) {
                     Ok(selection) => {
                         tracing::info!(
@@ -508,15 +553,15 @@ impl GeminiConnector {
                     }
                     Err(e) => {
                         tracing::error!("Failed to parse tool selection response: {}", e);
-                        return Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            e,
-                        )) as Box<dyn std::error::Error + Send + Sync>);
+                        return Err(
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                                as Box<dyn std::error::Error + Send + Sync>,
+                        );
                     }
                 }
             }
         }
-        
+
         Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "No response from LLM for tool selection",
@@ -536,9 +581,10 @@ impl GeminiConnector {
                     return Err(Box::new(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         "GEMINI_API_KEY not configured",
-                    )) as Box<dyn std::error::Error + Send + Sync>);
+                    ))
+                        as Box<dyn std::error::Error + Send + Sync>);
                 }
-            }
+            },
         };
 
         let client = Client::builder()
@@ -554,30 +600,36 @@ impl GeminiConnector {
         // Use the helper for standardizing
         let url = self.build_model_endpoint(&model, "generateContent", &api_key);
 
-        let response = client
+        let response = clien
             .post(&url)
             .json(&request)
             .send()
-            .await
+            .awai
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
-            
+
             // Try to parse structured error
             if let Ok(error_response) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
-                 return Err(Box::new(std::io::Error::other(
-                    format!("Gemini API Error [{}]: {}", status, error_response.error.message),
-                )) as Box<dyn std::error::Error + Send + Sync>);
+                return Err(Box::new(std::io::Error::other(format!(
+                    "Gemini API Error [{}]: {}",
+                    status, error_response.error.message
+                )))
+                    as Box<dyn std::error::Error + Send + Sync>);
             } else {
-                 return Err(Box::new(std::io::Error::other(
-                    format!("Gemini API Error [{}]: {}", status, body_text),
-                )) as Box<dyn std::error::Error + Send + Sync>);
+                return Err(Box::new(std::io::Error::other(format!(
+                    "Gemini API Error [{}]: {}",
+                    status, body_tex
+                )))
+                    as Box<dyn std::error::Error + Send + Sync>);
             }
         }
 
-        let response_json: GeminiResponse = response.json().await
+        let response_json: GeminiResponse = response
+            .json()
+            .awai
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         Ok(response_json)
@@ -603,28 +655,31 @@ impl LlmConnector for GeminiConnector {
                     });
                     return;
                 }
-            }
+            },
         };
         let mut model = self.config.chat_model.clone();
         if model.starts_with("models/") {
             model = model.strip_prefix("models/").unwrap().to_string();
         }
-        
+
         tracing::info!(model = %model, "LLM: Generating content stream");
 
-    const MAX_RETRIES: u32 = 2;
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .expect("Failed to build reqwest client");
+        const MAX_RETRIES: u32 = 2;
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .expect("Failed to build reqwest client");
 
-    // Build thinking config based on model and settings
+        // Build thinking config based on model and settings
         let generation_config = if self.config.thinking_enabled {
             let gemini_model = GeminiModel::from_slug(&model);
             match gemini_model.thinking_config_style() {
                 ThinkingConfigStyle::LevelPro | ThinkingConfigStyle::LevelFlash => {
                     // Validate level is supported for this model
-                    let level = if gemini_model.valid_thinking_levels().contains(&self.config.thinking_level.as_str()) {
+                    let level = if gemini_model
+                        .valid_thinking_levels()
+                        .contains(&self.config.thinking_level.as_str())
+                    {
                         self.config.thinking_level.clone()
                     } else {
                         "high".to_string() // Default fallback
@@ -634,413 +689,522 @@ impl LlmConnector for GeminiConnector {
                         thinking_budget: None,
                         include_thoughts: Some(true),
                     })
-                },
+                }
                 ThinkingConfigStyle::Budget => Some(ThinkingConfig {
                     thinking_level: None,
                     thinking_budget: self.config.thinking_budget,
                     include_thoughts: Some(true),
                 }),
                 ThinkingConfigStyle::None => None,
-            }.map(|tc| GenerationConfig {
+            }
+            .map(|tc| GenerationConfig {
                 thinking_config: Some(tc),
             })
         } else {
             None
         };
 
-    let mut request_body = GeminiRequest {
-        contents: prompt_data.contents,
-        tools: prompt_data.tools.clone(),
-        system_instruction: prompt_data.system_instruction,
-        tool_config: if prompt_data.tools.is_some() {
-            Some(ToolConfig {
-                function_calling_config: FunctionCallingConfig {
-                    mode: "AUTO".to_string(),
-                    allowed_function_names: None,
-                },
-            })
-        } else {
-            None
-        },
-        generation_config,
-    };
-
-    // --- Synchronous Logging Block ---
-    {
-        // Create a sanitized version of the request for logging
-        let mut sanitized_request = request_body.clone();
-        for content in &mut sanitized_request.contents {
-            for part in &mut content.parts {
-                if let Part::InlineData { inline_data } = part {
-                    let original_len = inline_data.data.len();
-                    if original_len > 100 {
-                        let truncated_data = inline_data.data.chars().take(50).collect::<String>();
-                        inline_data.data = format!("[{} bytes, truncated]...{}", original_len, truncated_data);
-                    }
-                }
-            }
-        }
-        tracing::debug!("Sending Gemini request: {:?}", sanitized_request);
-        
-        // Write the full request (with tools) to debug file for diagnosis
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            if let Ok(request_json) = serde_json::to_string_pretty(&request_body) {
-                let debug_dir = std::env::temp_dir().join("hobbes_debug_logs");
-                if std::fs::create_dir_all(&debug_dir).is_ok() {
-                    let file_path = debug_dir.join("gemini_request.json");
-                    if let Err(e) = std::fs::write(&file_path, &request_json) {
-                        tracing::warn!("Failed to write Gemini debug file: {}", e);
-                    } else {
-                        tracing::debug!("Wrote Gemini request to {:?}", file_path);
-                    }
-                }
-            }
-        }
-        tracing::info!("Using chat model: {}", model);
-    }
-    // --- End Synchronous Logging Block ---
-
-    // --- End Synchronous Logging Block ---
-
-    let url = if self.config.chat_model.starts_with("models/") || !self.base_url.contains("generativelanguage.googleapis.com") {
-         // Use the helper for standardizing
-         self.build_model_endpoint(&self.config.chat_model, "streamGenerateContent", &api_key) + "&alt=sse"
-    } else {
-        // Fallback or explicit full path logic if ever needed, but standardizing is safer
-         self.build_model_endpoint(&self.config.chat_model, "streamGenerateContent", &api_key) + "&alt=sse"
-    };
-
-    for attempt in 0..MAX_RETRIES {
-        let response = match client.post(&url).json(&request_body).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                let error_msg = if e.is_timeout() {
-                    tracing::error!("Gemini API Request TIMED OUT on attempt {}. Duration: 600s", attempt + 1);
-                    format!("Request timed out after 600 seconds (attempt {}/{})", attempt + 1, MAX_RETRIES)
-                } else {
-                    tracing::error!("Error sending request on attempt {}: {}", attempt + 1, e);
-                    format!("Network error: {} (attempt {}/{})", e, attempt + 1, MAX_RETRIES)
-                };
-                
-                if attempt + 1 == MAX_RETRIES {
-                    let _ = tx.send(StreamMessage::Error {
-                        message: format!("Failed to connect to Gemini API after {} attempts. {}", MAX_RETRIES, error_msg),
-                    });
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
+        let mut request_body = GeminiRequest {
+            contents: prompt_data.contents,
+            tools: prompt_data.tools.clone(),
+            system_instruction: prompt_data.system_instruction,
+            tool_config: if prompt_data.tools.is_some() {
+                Some(ToolConfig {
+                    function_calling_config: FunctionCallingConfig {
+                        mode: "AUTO".to_string(),
+                        allowed_function_names: None,
+                    },
+                })
+            } else {
+                None
+            },
+            generation_config,
         };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body_text = response.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
-            let error_message = if let Ok(error_response) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
-                tracing::error!("Gemini API Error [{}]: {}", status, error_response.error.message);
-                format!("Gemini API Error [{}]: {}", status, error_response.error.message)
-            } else {
-                tracing::error!("Gemini API Error [{}]: {}", status, body_text);
-                format!("Gemini API Error [{}]: {}", status, body_text)
-            };
-            
-            let _ = tx.send(StreamMessage::Error { message: error_message });
-            return;
+        // --- Synchronous Logging Block ---
+        {
+            // Create a sanitized version of the request for logging
+            let mut sanitized_request = request_body.clone();
+            for content in &mut sanitized_request.contents {
+                for part in &mut content.parts {
+                    if let Part::InlineData { inline_data } = part {
+                        let original_len = inline_data.data.len();
+                        if original_len > 100 {
+                            let truncated_data =
+                                inline_data.data.chars().take(50).collect::<String>();
+                            inline_data.data =
+                                format!("[{} bytes, truncated]...{}", original_len, truncated_data);
+                        }
+                    }
+                }
+            }
+            tracing::debug!("Sending Gemini request: {:?}", sanitized_request);
+
+            // Write the full request (with tools) to debug file for diagnosis
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                if let Ok(request_json) = serde_json::to_string_pretty(&request_body) {
+                    let debug_dir = std::env::temp_dir().join("hobbes_debug_logs");
+                    if std::fs::create_dir_all(&debug_dir).is_ok() {
+                        let file_path = debug_dir.join("gemini_request.json");
+                        if let Err(e) = std::fs::write(&file_path, &request_json) {
+                            tracing::warn!("Failed to write Gemini debug file: {}", e);
+                        } else {
+                            tracing::debug!("Wrote Gemini request to {:?}", file_path);
+                        }
+                    }
+                }
+            }
+            tracing::info!("Using chat model: {}", model);
         }
+        // --- End Synchronous Logging Block ---
 
-        let mut stream = response.bytes_stream();
-        let mut has_sent_data = false;
-        let mut finish_reason: Option<String> = None;
-        let mut buffer = Vec::<u8>::new();
-        let mut malformed_call_detected = false;
-        let mut unexpected_tool_call_detected = false;
-        let mut current_attempt_parts = Vec::<Part>::new();
+        // --- End Synchronous Logging Block ---
 
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(bytes) => {
-                    buffer.extend_from_slice(&bytes);
-                    while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
-                        let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
-                        let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+        let url = if self.config.chat_model.starts_with("models/")
+            || !self.base_url.contains("generativelanguage.googleapis.com")
+        {
+            // Use the helper for standardizing
+            self.build_model_endpoint(&self.config.chat_model, "streamGenerateContent", &api_key)
+                + "&alt=sse"
+        } else {
+            // Fallback or explicit full path logic if ever needed, but standardizing is safer
+            self.build_model_endpoint(&self.config.chat_model, "streamGenerateContent", &api_key)
+                + "&alt=sse"
+        };
 
-                        if line.starts_with("data: ") {
-                            let json_str = &line["data: ".len()..];
-                            if json_str.is_empty() { continue; }
-                            match serde_json::from_str::<GeminiResponse>(json_str) {
-                                Ok(parsed) => {
-                                    if let Some(candidate) = parsed.candidates.first() {
-                                        if let Some(reason) = &candidate.finish_reason {
-                                            finish_reason = Some(reason.clone());
-                                            if reason == "MALFORMED_FUNCTION_CALL" {
-                                                tracing::warn!("Malformed function call detected on attempt {}. Retrying...", attempt + 1);
-                                                malformed_call_detected = true;
-                                                break; // Break from inner while to retry
-                                            }
-                                            if reason == "UNEXPECTED_TOOL_CALL" {
-                                                tracing::warn!("Unexpected tool call detected on attempt {}. Retrying with correction...", attempt + 1);
-                                                unexpected_tool_call_detected = true;
-                                                break; // Break from inner while to retry
-                                            }
-                                            if reason != "STOP" {
-                                                tracing::warn!("Gemini stream finished with reason: {}", reason);
-                                            }
-                                        }
-                                        // Process ALL parts - Gemini with thinking returns multiple parts
-                                        // (thought parts AND content parts) in a single response
-                                        for part in &candidate.content.parts {
-                                            current_attempt_parts.push(Part::from(part.clone()));
-                                            // Check if this is a thought summary part first
-                                            if part.thought.unwrap_or(false) && !part.text.is_empty() {
-                                                // This is a thought summary - send it as thought_summary
-                                                if tx.send(StreamMessage::Text {
-                                                    content: String::new(),
-                                                    thought_signature: None,
-                                                    thought_summary: Some(part.text.clone()),
-                                                }).is_err() {
-                                                    return;
+        for attempt in 0..MAX_RETRIES {
+            let response = match client.post(&url).json(&request_body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let error_msg = if e.is_timeout() {
+                        tracing::error!(
+                            "Gemini API Request TIMED OUT on attempt {}. Duration: 600s",
+                            attempt + 1
+                        );
+                        format!(
+                            "Request timed out after 600 seconds (attempt {}/{})",
+                            attempt + 1,
+                            MAX_RETRIES
+                        )
+                    } else {
+                        tracing::error!("Error sending request on attempt {}: {}", attempt + 1, e);
+                        format!(
+                            "Network error: {} (attempt {}/{})",
+                            e,
+                            attempt + 1,
+                            MAX_RETRIES
+                        )
+                    };
+
+                    if attempt + 1 == MAX_RETRIES {
+                        let _ = tx.send(StreamMessage::Error {
+                            message: format!(
+                                "Failed to connect to Gemini API after {} attempts. {}",
+                                MAX_RETRIES, error_msg
+                            ),
+                        });
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body_text = response
+                    .text()
+                    .awai
+                    .unwrap_or_else(|_| "Failed to read error body".to_string());
+                let error_message = if let Ok(error_response) =
+                    serde_json::from_str::<GeminiErrorResponse>(&body_text)
+                {
+                    tracing::error!(
+                        "Gemini API Error [{}]: {}",
+                        status,
+                        error_response.error.message
+                    );
+                    format!(
+                        "Gemini API Error [{}]: {}",
+                        status, error_response.error.message
+                    )
+                } else {
+                    tracing::error!("Gemini API Error [{}]: {}", status, body_text);
+                    format!("Gemini API Error [{}]: {}", status, body_text)
+                };
+
+                let _ = tx.send(StreamMessage::Error {
+                    message: error_message,
+                });
+                return;
+            }
+
+            let mut stream = response.bytes_stream();
+            let mut has_sent_data = false;
+            let mut finish_reason: Option<String> = None;
+            let mut buffer = Vec::<u8>::new();
+            let mut malformed_call_detected = false;
+            let mut unexpected_tool_call_detected = false;
+            let mut current_attempt_parts = Vec::<Part>::new();
+
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(bytes) => {
+                        buffer.extend_from_slice(&bytes);
+                        while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
+                            let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
+                            let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+
+                            if line.starts_with("data: ") {
+                                let json_str = &line["data: ".len()..];
+                                if json_str.is_empty() {
+                                    continue;
+                                }
+                                match serde_json::from_str::<GeminiResponse>(json_str) {
+                                    Ok(parsed) => {
+                                        if let Some(candidate) = parsed.candidates.first() {
+                                            if let Some(reason) = &candidate.finish_reason {
+                                                finish_reason = Some(reason.clone());
+                                                if reason == "MALFORMED_FUNCTION_CALL" {
+                                                    tracing::warn!("Malformed function call detected on attempt {}. Retrying...", attempt + 1);
+                                                    malformed_call_detected = true;
+                                                    break; // Break from inner while to retry
                                                 }
-                                                has_sent_data = true;
-                                            } else if let Some(function_call) = &part.function_call {
-                                                // Log raw JSON if it contains a function call
-                                                tracing::debug!("Raw JSON with function call: {}", json_str);
-                                                
-                                                // Log the thought_signature field for debugging
-                                                if let Some(ref thought_sig) = part.thought_signature {
-                                                    tracing::info!("Received function call '{}' with thought_signature: '{}'", 
-                                                        function_call.name, 
+                                                if reason == "UNEXPECTED_TOOL_CALL" {
+                                                    tracing::warn!("Unexpected tool call detected on attempt {}. Retrying with correction...", attempt + 1);
+                                                    unexpected_tool_call_detected = true;
+                                                    break; // Break from inner while to retry
+                                                }
+                                                if reason != "STOP" {
+                                                    tracing::warn!(
+                                                        "Gemini stream finished with reason: {}",
+                                                        reason
+                                                    );
+                                                }
+                                            }
+                                            // Process ALL parts - Gemini with thinking returns multiple parts
+                                            // (thought parts AND content parts) in a single response
+                                            for part in &candidate.content.parts {
+                                                current_attempt_parts
+                                                    .push(Part::from(part.clone()));
+                                                // Check if this is a thought summary part firs
+                                                if part.thought.unwrap_or(false)
+                                                    && !part.text.is_empty()
+                                                {
+                                                    // This is a thought summary - send it as thought_summary
+                                                    if tx
+                                                        .send(StreamMessage::Text {
+                                                            content: String::new(),
+                                                            thought_signature: None,
+                                                            thought_summary: Some(
+                                                                part.text.clone(),
+                                                            ),
+                                                        })
+                                                        .is_err()
+                                                    {
+                                                        return;
+                                                    }
+                                                    has_sent_data = true;
+                                                } else if let Some(function_call) =
+                                                    &part.function_call
+                                                {
+                                                    // Log raw JSON if it contains a function call
+                                                    tracing::debug!(
+                                                        "Raw JSON with function call: {}",
+                                                        json_str
+                                                    );
+
+                                                    // Log the thought_signature field for debugging
+                                                    if let Some(ref thought_sig) =
+                                                        part.thought_signature
+                                                    {
+                                                        tracing::info!("Received function call '{}' with thought_signature: '{}'",
+                                                        function_call.name,
                                                         if thought_sig.len() > 50 { &thought_sig[..50] } else { thought_sig }
                                                     );
-                                                } else {
-                                                    tracing::warn!("Received function call '{}' WITHOUT thought_signature field", function_call.name);
-                                                }
-                                                
-                                                let mut found_tool = false;
-                                                
-                                                // Note: composio_meta routing removed - Tool Router handles on-demand tools
-                                                if let Some(context) = &mcp_context {
-                                                    'server_loop: for server in &context.servers {
-                                                        for tool in &server.tools {
-                                                            let sanitized_tool_name = crate::gemini::convert::sanitize_function_name(&format!("{}_{}", server.name, tool.name));
-                                                            if sanitized_tool_name == function_call.name {
-                                                                let tool_call = ToolCall::new(
-                                                                    server.name.clone(),
-                                                                    tool.name.to_string(), // Use original tool name for execution
-                                                                    function_call.args.clone(),
-                                                                    part.thought_signature.clone().or(function_call.thought_signature.clone()),
-                                                                    None, // thought_summary will be populated by stream_manager
-                                                                );
-                                                                if tx.send(StreamMessage::ToolCall(tool_call)).is_err() {
-                                                                    return;
+                                                    } else {
+                                                        tracing::warn!("Received function call '{}' WITHOUT thought_signature field", function_call.name);
+                                                    }
+
+                                                    let mut found_tool = false;
+
+                                                    // Note: composio_meta routing removed - Tool Router handles on-demand tools
+                                                    if let Some(context) = &mcp_context {
+                                                        'server_loop: for server in &context.servers
+                                                        {
+                                                            for tool in &server.tools {
+                                                                let sanitized_tool_name = crate::gemini::convert::sanitize_function_name(&format!("{}_{}", server.name, tool.name));
+                                                                if sanitized_tool_name
+                                                                    == function_call.name
+                                                                {
+                                                                    let tool_call = ToolCall::new(
+                                                                        server.name.clone(),
+                                                                        tool.name.to_string(), // Use original tool name for execution
+                                                                        function_call.args.clone(),
+                                                                        part.thought_signature
+                                                                            .clone()
+                                                                            .or(function_call
+                                                                                .thought_signature
+                                                                                .clone()),
+                                                                        None, // thought_summary will be populated by stream_manager
+                                                                    );
+                                                                    if tx
+                                                                        .send(
+                                                                            StreamMessage::ToolCall(
+                                                                                tool_call,
+                                                                            ),
+                                                                        )
+                                                                        .is_err()
+                                                                    {
+                                                                        return;
+                                                                    }
+                                                                    has_sent_data = true;
+                                                                    found_tool = true;
+                                                                    break 'server_loop;
                                                                 }
-                                                                has_sent_data = true;
-                                                                found_tool = true;
-                                                                break 'server_loop;
                                                             }
                                                         }
                                                     }
-                                                }
-                                                if !found_tool {
-                                                    tracing::error!("LLM requested tool '{}' which was not found in the provided context.", function_call.name);
-                                                    // Send a user-friendly message about the missing tool
-                                                    let tool_error_msg = format!(
-                                                        "⚠️ **Tool Not Available: `{}`**\n\n\
-                                                        Hobbes tried to use a tool that isn't currently loaded. This can happen if:\n\n\
-                                                        • The MCP server providing this tool is not running\n\
-                                                        • The tool requires authentication that hasn't been set up\n\
-                                                        • The tool list needs to be refreshed\n\n\
+                                                    if !found_tool {
+                                                        tracing::error!("LLM requested tool '{}' which was not found in the provided context.", function_call.name);
+                                                        // Send a user-friendly message about the missing tool
+                                                        let tool_error_msg = format!(
+                                                        "⚠️ **Tool Not Available: `{}`**\n\n
+                                                        Hobbes tried to use a tool that isn't currently loaded. This can happen if:\n\n
+                                                        • The MCP server providing this tool is not running\n
+                                                        • The tool requires authentication that hasn't been set up\n
+                                                        • The tool list needs to be refreshed\n\n
                                                         Please check your MCP Integration settings.",
                                                         function_call.name
                                                     );
-                                                    if tx.send(StreamMessage::Text {
-                                                        content: tool_error_msg,
-                                                        thought_signature: None,
-                                                        thought_summary: None,
-                                                    }).is_err() {
-                                                        return;
+                                                        if tx
+                                                            .send(StreamMessage::Text {
+                                                                content: tool_error_msg,
+                                                                thought_signature: None,
+                                                                thought_summary: None,
+                                                            })
+                                                            .is_err()
+                                                        {
+                                                            return;
+                                                        }
+                                                        has_sent_data = true;
                                                     }
-                                                    has_sent_data = true;
-                                                }
-                                            } else if !part.text.is_empty() {
-                                                // Check if the text is structured JSON that needs unwrapping
-                                                let (content, thought_summary) = if part.text.trim().starts_with('{') && part.text.trim().ends_with('}') {
-                                                    unparse_json_response(&part.text)
-                                                } else {
-                                                    (part.text.clone(), None)
-                                                };
+                                                } else if !part.text.is_empty() {
+                                                    // Check if the text is structured JSON that needs unwrapping
+                                                    let (content, thought_summary) =
+                                                        if part.text.trim().starts_with('{')
+                                                            && part.text.trim().ends_with('}')
+                                                        {
+                                                            unparse_json_response(&part.text)
+                                                        } else {
+                                                            (part.text.clone(), None)
+                                                        };
 
-                                                if !content.is_empty() || thought_summary.is_some() {
-                                                    if tx.send(StreamMessage::Text {
-                                                        content,
-                                                        thought_signature: None,
-                                                        thought_summary,
-                                                    }).is_err() {
-                                                        return;
+                                                    if !content.is_empty()
+                                                        || thought_summary.is_some()
+                                                    {
+                                                        if tx
+                                                            .send(StreamMessage::Text {
+                                                                content,
+                                                                thought_signature: None,
+                                                                thought_summary,
+                                                            })
+                                                            .is_err()
+                                                        {
+                                                            return;
+                                                        }
+                                                        has_sent_data = true;
                                                     }
-                                                    has_sent_data = true;
                                                 }
                                             }
                                         }
-                                    }
-                                    
-                                    // Send usage data if present
-                                    if let Some(usage) = &parsed.usage_metadata {
-                                        let cost = calculate_cost(&model, usage);
-                                        let usage_data = crate::components::shared::UsageData {
-                                            prompt_tokens: usage.prompt_token_count,
-                                            completion_tokens: usage.candidates_token_count.unwrap_or(0),
-                                            total_tokens: usage.total_token_count,
-                                            thoughts_tokens: usage.thoughts_token_count,
-                                            cached_content_tokens: usage.cached_content_token_count,
-                                            cost: Some(cost),
-                                        };
-                                        if tx.send(StreamMessage::Usage(usage_data)).is_err() {
-                                            tracing::warn!("Failed to send usage data to stream");
+
+                                        // Send usage data if presen
+                                        if let Some(usage) = &parsed.usage_metadata {
+                                            let cost = calculate_cost(&model, usage);
+                                            let usage_data = crate::components::shared::UsageData {
+                                                prompt_tokens: usage.prompt_token_count,
+                                                completion_tokens: usage
+                                                    .candidates_token_coun
+                                                    .unwrap_or(0),
+                                                total_tokens: usage.total_token_count,
+                                                thoughts_tokens: usage.thoughts_token_count,
+                                                cached_content_tokens: usage
+                                                    .cached_content_token_count,
+                                                cost: Some(cost),
+                                            };
+                                            if tx.send(StreamMessage::Usage(usage_data)).is_err() {
+                                                tracing::warn!(
+                                                    "Failed to send usage data to stream"
+                                                );
+                                            }
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to parse JSON chunk from stream: {}. Chunk: '{}'", e, json_str);
-                                    // Check if this is a malformed call finish reason
-                                    if json_str.contains("MALFORMED_FUNCTION_CALL") {
-                                        tracing::warn!("Malformed function call detected via string search on attempt {}. Retrying...", attempt + 1);
-                                        malformed_call_detected = true;
-                                        break; // Break from inner while to retry
+                                    Err(e) => {
+                                        tracing::error!("Failed to parse JSON chunk from stream: {}. Chunk: '{}'", e, json_str);
+                                        // Check if this is a malformed call finish reason
+                                        if json_str.contains("MALFORMED_FUNCTION_CALL") {
+                                            tracing::warn!("Malformed function call detected via string search on attempt {}. Retrying...", attempt + 1);
+                                            malformed_call_detected = true;
+                                            break; // Break from inner while to retry
+                                        }
+                                        // Check if this is an unexpected tool call finish reason
+                                        if json_str.contains("UNEXPECTED_TOOL_CALL") {
+                                            tracing::warn!("Unexpected tool call detected via string search on attempt {}. Retrying with correction...", attempt + 1);
+                                            unexpected_tool_call_detected = true;
+                                            break; // Break from inner while to retry
+                                        }
+                                        let error_message = "[Hobbes encountered a stream error. Please check the logs for details.]";
+                                        if tx
+                                            .send(StreamMessage::Text {
+                                                content: error_message.to_string(),
+                                                thought_signature: None,
+                                                thought_summary: None,
+                                            })
+                                            .is_err()
+                                        {
+                                            tracing::error!(
+                                                "Failed to send stream error message to UI."
+                                            );
+                                        }
+                                        return;
                                     }
-                                    // Check if this is an unexpected tool call finish reason
-                                    if json_str.contains("UNEXPECTED_TOOL_CALL") {
-                                        tracing::warn!("Unexpected tool call detected via string search on attempt {}. Retrying with correction...", attempt + 1);
-                                        unexpected_tool_call_detected = true;
-                                        break; // Break from inner while to retry
-                                    }
-                                    let error_message = "[Hobbes encountered a stream error. Please check the logs for details.]";
-                                    if tx.send(StreamMessage::Text {
-                                        content: error_message.to_string(),
-                                        thought_signature: None,
-                                        thought_summary: None,
-                                    }).is_err() {
-                                        tracing::error!("Failed to send stream error message to UI.");
-                                    }
-                                    return;
                                 }
                             }
                         }
+                        if malformed_call_detected || unexpected_tool_call_detected {
+                            break;
+                        }
                     }
-                    if malformed_call_detected || unexpected_tool_call_detected { break; }
-                }
-                Err(e) => {
-                    tracing::error!("Error in stream: {}", e);
-                    break;
+                    Err(e) => {
+                        tracing::error!("Error in stream: {}", e);
+                        break;
+                    }
                 }
             }
-        }
 
+            if malformed_call_detected || unexpected_tool_call_detected {
+                if attempt + 1 < MAX_RETRIES {
+                    tracing::warn!(
+                        "Retry triggered for stream error (attempt {}/{}). Sleeping 1s...",
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
 
-        if malformed_call_detected || unexpected_tool_call_detected {
-            if attempt + 1 < MAX_RETRIES {
-                tracing::warn!("Retry triggered for stream error (attempt {}/{}). Sleeping 1s...", attempt + 1, MAX_RETRIES);
-                
-                // Ground the model by adding its failed attempt and a correction to the context history
-                // This prevents "model myopia" where the model repeats the same hallucination.
-                if !current_attempt_parts.is_empty() {
-                    request_body.contents.push(Content {
-                        role: "model".to_string(),
-                        parts: current_attempt_parts,
-                    });
-                    
-                    let correction_text = if unexpected_tool_call_detected {
-                        // Generate a list of available tools to help the model correct itself
-                        let available_tools_str = if let Some(context) = &mcp_context {
-                            let mut tools = Vec::new();
-                            for server in &context.servers {
-                                for tool in &server.tools {
-                                     let sanitized_name = crate::gemini::convert::sanitize_function_name(&format!("{}_{}", server.name, tool.name));
-                                     tools.push(format!("- {}", sanitized_name));
+                    // Ground the model by adding its failed attempt and a correction to the context history
+                    // This prevents "model myopia" where the model repeats the same hallucination.
+                    if !current_attempt_parts.is_empty() {
+                        request_body.contents.push(Content {
+                            role: "model".to_string(),
+                            parts: current_attempt_parts,
+                        });
+
+                        let correction_text = if unexpected_tool_call_detected {
+                            // Generate a list of available tools to help the model correct itself
+                            let available_tools_str = if let Some(context) = &mcp_context {
+                                let mut tools = Vec::new();
+                                for server in &context.servers {
+                                    for tool in &server.tools {
+                                        let sanitized_name =
+                                            crate::gemini::convert::sanitize_function_name(
+                                                &format!("{}_{}", server.name, tool.name),
+                                            );
+                                        tools.push(format!("- {}", sanitized_name));
+                                    }
                                 }
-                            }
-                            if tools.is_empty() {
-                                "No tools are currently available.".to_string()
+                                if tools.is_empty() {
+                                    "No tools are currently available.".to_string()
+                                } else {
+                                    format!("Available tools:\n{}", tools.join("\n"))
+                                }
                             } else {
-                                format!("Available tools:\n{}", tools.join("\n"))
-                            }
+                                "No tools context available.".to_string()
+                            };
+
+                            format!("[System Note]: The previous generation failed because you attempted to call a tool that is not in the `tools` list. \n\n{}\n\nPlease verify the `tools` list and try again. Do not hallucinate function names. If you cannot perform the action with available tools, explain why.", available_tools_str)
                         } else {
-                            "No tools context available.".to_string()
+                            "[System Note]: The previous generation failed because the function call was malformed. Please ensure your tool call matches the defined schema exactly.".to_string()
                         };
 
-                        format!("[System Note]: The previous generation failed because you attempted to call a tool that is not in the `tools` list. \n\n{}\n\nPlease verify the `tools` list and try again. Do not hallucinate function names. If you cannot perform the action with available tools, explain why.", available_tools_str)
-                    } else {
-                        "[System Note]: The previous generation failed because the function call was malformed. Please ensure your tool call matches the defined schema exactly.".to_string()
-                    };
-                    
-                    request_body.contents.push(Content {
-                        role: "user".to_string(),
-                        parts: vec![Part::Text {
-                            text: correction_text,
-                            thought: None,
-                        }],
-                    });
-                }
-                
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue; // Go to the next iteration of the for loop
-            } else {
-                tracing::error!("Stream error persisted after {} retries. Aborting.", MAX_RETRIES);
-                // Send an explicit failure message to the UI
-                if tx.send(StreamMessage::Text {
-                    content: format!("[Hobbes encountered a persistent error ('{}') after multiple retries. The model may be hallucinating a tool that does not exist.]", 
+                        request_body.contents.push(Content {
+                            role: "user".to_string(),
+                            parts: vec![Part::Text {
+                                text: correction_text,
+                                thought: None,
+                            }],
+                        });
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue; // Go to the next iteration of the for loop
+                } else {
+                    tracing::error!(
+                        "Stream error persisted after {} retries. Aborting.",
+                        MAX_RETRIES
+                    );
+                    // Send an explicit failure message to the UI
+                    if tx.send(StreamMessage::Text {
+                    content: format!("[Hobbes encountered a persistent error ('{}') after multiple retries. The model may be hallucinating a tool that does not exist.]",
                         if unexpected_tool_call_detected { "UNEXPECTED_TOOL_CALL" } else { "MALFORMED_FUNCTION_CALL" }),
                     thought_signature: None,
                     thought_summary: None,
                 }).is_err() {
                     tracing::error!("Failed to send final error message to UI.");
                 }
-                // We return here to stop the stream.
-                // The outer 'if !has_sent_data' check might fire too if we didn't send anything earlier, 
-                // but we just sent a message, so we should be good? 
-                // Wait, 'has_sent_data' is local to the attempt loop? No, it's defined inside 'attempt' loop.
-                // So if we 'return', the task ends.
-                return;
+                    // We return here to stop the stream.
+                    // The outer 'if !has_sent_data' check might fire too if we didn't send anything earlier,
+                    // but we just sent a message, so we should be good?
+                    // Wait, 'has_sent_data' is local to the attempt loop? No, it's defined inside 'attempt' loop.
+                    // So if we 'return', the task ends.
+                    return;
+                }
             }
-        }
 
-        if !has_sent_data {
-            tracing::error!("Gemini finished without sending data. Finish Reason: {:?}. Request was: {}", finish_reason, serde_json::to_string_pretty(&request_body).unwrap_or_default());
-            let default_message = match finish_reason.as_deref() {
+            if !has_sent_data {
+                tracing::error!(
+                    "Gemini finished without sending data. Finish Reason: {:?}. Request was: {}",
+                    finish_reason,
+                    serde_json::to_string_pretty(&request_body).unwrap_or_default()
+                );
+                let default_message = match finish_reason.as_deref() {
                 Some("SAFETY") => "[Hobbes did not provide a response due to the safety filter.]".to_string(),
                 Some("UNEXPECTED_TOOL_CALL") => {
-                    "⚠️ **Tool Connection Issue**\n\n\
-                    Hobbes tried to use a tool that isn't currently available. Please check:\n\n\
-                    1. **Is the MCP server running?** Open Settings → MCP Integration and verify the server status.\n\
-                    2. **Is the tool connected?** For Composio tools, ensure the profile is active and connected.\n\
-                    3. **Try refreshing** the tool list by toggling the MCP server off and on.\n\n\
+                    "⚠️ **Tool Connection Issue**\n\n
+                    Hobbes tried to use a tool that isn't currently available. Please check:\n\n
+                    1. **Is the MCP server running?** Open Settings → MCP Integration and verify the server status.\n
+                    2. **Is the tool connected?** For Composio tools, ensure the profile is active and connected.\n
+                    3. **Try refreshing** the tool list by toggling the MCP server off and on.\n\n
                     If the issue persists, the tool may need to be re-authorized or the server restarted.".to_string()
                 },
                 Some("MALFORMED_FUNCTION_CALL") => {
-                    "⚠️ **Tool Call Error**\n\n\
-                    Hobbes encountered an issue formatting a tool request. This is usually temporary.\n\
+                    "⚠️ **Tool Call Error**\n\n
+                    Hobbes encountered an issue formatting a tool request. This is usually temporary.\n
                     Please try your request again.".to_string()
                 },
                 Some(reason) => format!(
-                    "⚠️ **Response Issue**\n\n\
-                    Hobbes could not complete the response.\n\
-                    **Reason:** {}\n\n\
+                    "⚠️ **Response Issue**\n\n
+                    Hobbes could not complete the response.\n
+                    **Reason:** {}\n\n
                     If this persists, try simplifying your request or checking your tool connections.",
                     reason
                 ),
                 None => "[Hobbes did not provide a response due to an internal error.]".to_string(),
             };
-            if tx.send(StreamMessage::Text {
-                content: default_message,
-                thought_signature: None,
-                thought_summary: None,
-            }).is_err() {
-                tracing::error!("Failed to send default message to UI.");
+                if tx
+                    .send(StreamMessage::Text {
+                        content: default_message,
+                        thought_signature: None,
+                        thought_summary: None,
+                    })
+                    .is_err()
+                {
+                    tracing::error!("Failed to send default message to UI.");
+                }
             }
+            // If we've successfully processed the stream without a malformed call, break the retry loop.
+            break;
         }
-        // If we've successfully processed the stream without a malformed call, break the retry loop.
-        break;
     }
-}
 
     async fn summarize_conversation(
         &self,
@@ -1048,28 +1212,30 @@ impl LlmConnector for GeminiConnector {
         recent_messages: String,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!(model = %self.config.summary_model, "LLM: Summarizing conversation");
-        
-        let api_key = match self.config.api_key.clone() {
 
+        let api_key = match self.config.api_key.clone() {
             Some(key) => key,
-            None => match std::env::var("GEMINI_API_KEY") {
-                Ok(key) => key,
-                Err(_) => {
-                    tracing::warn!("Skipping summarization: GEMINI_API_KEY not set in settings or environment");
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "GEMINI_API_KEY not configured",
-                    )) as Box<dyn std::error::Error + Send + Sync>);
+            None => {
+                match std::env::var("GEMINI_API_KEY") {
+                    Ok(key) => key,
+                    Err(_) => {
+                        tracing::warn!("Skipping summarization: GEMINI_API_KEY not set in settings or environment");
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "GEMINI_API_KEY not configured",
+                        ))
+                            as Box<dyn std::error::Error + Send + Sync>);
+                    }
                 }
             }
         };
         let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .expect("Failed to build reqwest client");
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("Failed to build reqwest client");
 
-    let full_prompt = format!(
-        r#"
+        let full_prompt = format!(
+            r#"
 You are an AI assistant that refines a conversation summary.
 You will be given a previous summary (which may be empty) and the most recent messages in a conversation.
 Your primary task is to integrate the new information from the recent messages into the previous summary, updating and extending it.
@@ -1091,105 +1257,123 @@ Recent Messages:
 ---
 {}
 "#,
-        previous_summary,
-        recent_messages
-    );
+            previous_summary, recent_messages
+        );
 
-    let request_body = GeminiRequest {
-        contents: vec![Content {
-            role: "user".to_string(),
-            parts: vec![Part::Text { text: full_prompt, thought: None }],
-        }],
-        tools: None,
-        system_instruction: None,
-        tool_config: None,
-        generation_config: None,
-    };
+        let request_body = GeminiRequest {
+            contents: vec![Content {
+                role: "user".to_string(),
+                parts: vec![Part::Text {
+                    text: full_prompt,
+                    thought: None,
+                }],
+            }],
+            tools: None,
+            system_instruction: None,
+            tool_config: None,
+            generation_config: None,
+        };
 
-    tracing::info!("Using summary model: {}", self.config.summary_model);
-    let url = self.build_model_endpoint(&self.config.summary_model, "generateContent", &api_key);
+        tracing::info!("Using summary model: {}", self.config.summary_model);
+        let url =
+            self.build_model_endpoint(&self.config.summary_model, "generateContent", &api_key);
 
-    let response = client
-        .post(&url)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let response = clien
+            .post(&url)
+            .json(&request_body)
+            .send()
+            .awai
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
-        if let Ok(error_response) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
-            tracing::error!("Gemini API Error [{}]: {}", status, error_response.error.message);
-        } else {
-            tracing::error!("Gemini API Error [{}]: {}", status, body_text);
-        }
-        // Return a structured error instead of panicking or returning a generic reqwest::Error
-        return Err(Box::new(std::io::Error::other(
-            format!("API request failed with status {}: {}", status, body_text),
-        )) as Box<dyn std::error::Error + Send + Sync>);
-    }
-
-    let response_json: GeminiResponse = response.json().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-    if let Some(candidate) = response_json.candidates.first() {
-        if let Some(part) = candidate.content.parts.first() {
-            // The model's response is expected to be a JSON string.
-            tracing::debug!("Raw LLM summary response: {}", part.text);
-
-            // Attempt to parse the text directly as JSON.
-            if let Ok(json_value) = serde_json::from_str(&part.text) {
-                return Ok(json_value);
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response
+                .text()
+                .awai
+                .unwrap_or_else(|_| "Failed to read error body".to_string());
+            if let Ok(error_response) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
+                tracing::error!(
+                    "Gemini API Error [{}]: {}",
+                    status,
+                    error_response.error.message
+                );
+            } else {
+                tracing::error!("Gemini API Error [{}]: {}", status, body_text);
             }
+            // Return a structured error instead of panicking or returning a generic reqwest::Error
+            return Err(Box::new(std::io::Error::other(format!(
+                "API request failed with status {}: {}",
+                status, body_tex
+            ))) as Box<dyn std::error::Error + Send + Sync>);
+        }
 
-            // If direct parsing fails, try to extract it from a markdown code block.
-            if let Some(start) = part.text.find('{') {
-                if let Some(end) = part.text.rfind('}') {
-                    let potential_json = &part.text[start..=end];
-                    if let Ok(json_value) = serde_json::from_str(potential_json) {
-                        tracing::warn!("Successfully parsed JSON from markdown code block.");
-                        return Ok(json_value);
+        let response_json: GeminiResponse = response
+            .json()
+            .awai
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        if let Some(candidate) = response_json.candidates.first() {
+            if let Some(part) = candidate.content.parts.first() {
+                // The model's response is expected to be a JSON string.
+                tracing::debug!("Raw LLM summary response: {}", part.text);
+
+                // Attempt to parse the text directly as JSON.
+                if let Ok(json_value) = serde_json::from_str(&part.text) {
+                    return Ok(json_value);
+                }
+
+                // If direct parsing fails, try to extract it from a markdown code block.
+                if let Some(start) = part.text.find('{') {
+                    if let Some(end) = part.text.rfind('}') {
+                        let potential_json = &part.text[start..=end];
+                        if let Ok(json_value) = serde_json::from_str(potential_json) {
+                            tracing::warn!("Successfully parsed JSON from markdown code block.");
+                            return Ok(json_value);
+                        }
                     }
                 }
+
+                // If all parsing fails, return the raw text as the summary.
+                tracing::warn!(
+                    "Failed to parse LLM response as JSON. Returning raw text as summary."
+                );
+                let fallback_json = serde_json::json!({
+                    "summary": part.text,
+                    "entities": {}
+                });
+                return Ok(fallback_json);
             }
-
-            // If all parsing fails, return the raw text as the summary.
-            tracing::warn!("Failed to parse LLM response as JSON. Returning raw text as summary.");
-            let fallback_json = serde_json::json!({
-                "summary": part.text,
-                "entities": {}
-            });
-            return Ok(fallback_json);
         }
-    }
 
-    Ok(serde_json::Value::Null)
-}
+        Ok(serde_json::Value::Null)
+    }
 }
 
 fn unparse_json_response(text: &str) -> (String, Option<String>) {
     // Attempt to parse the text directly as JSON.
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
         if let Some(obj) = json.as_object() {
-            // Check for common fields in the model's structured output
-            let reply_text = obj.get("reply_text")
+            // Check for common fields in the model's structured outpu
+            let reply_text = obj
+                .get("reply_text")
                 .or_else(|| obj.get("content"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            
-            let thought = obj.get("thought")
+
+            let thought = obj
+                .get("thought")
                 .or_else(|| obj.get("thought_summary"))
                 .or_else(|| obj.get("action_name"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            
+
             // If we found either a reply or a thought, consider it a successful unwrap
             if reply_text.is_some() || thought.is_some() {
                 return (reply_text.unwrap_or_default(), thought);
             }
         }
     }
-    
+
     // If not valid JSON or doesn't have the expected fields, return as-is
     (text.to_string(), None)
 }
@@ -1197,13 +1381,13 @@ fn unparse_json_response(text: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::{MockServer, Mock, ResponseTemplate};
-    use wiremock::matchers::{method, path};
     use tokio::sync::mpsc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_unparse_json_response() {
-        // Test with reply_text and thought
+        // Test with reply_text and though
         let text = r#"{"reply_text": "Hello world", "thought": "The user said hello"}"#;
         let (content, thought) = unparse_json_response(text);
         assert_eq!(content, "Hello world");
@@ -1244,7 +1428,7 @@ mod tests {
                 }
             }]
         });
-        
+
         let content_json = serde_json::json!({
             "candidates": [{
                 "content": {
@@ -1279,12 +1463,15 @@ mod tests {
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
-        
+
         // Create prompt data
         let prompt_data = LlmPrompt {
             contents: vec![Content {
                 role: "user".to_string(),
-                parts: vec![Part::Text { text: "Hello".to_string(), thought: None }],
+                parts: vec![Part::Text {
+                    text: "Hello".to_string(),
+                    thought: None,
+                }],
             }],
             tools: None,
             system_instruction: None,
@@ -1294,7 +1481,9 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         // Run generate_content_stream
-        connector.generate_content_stream(prompt_data, tx, None).await;
+        connector
+            .generate_content_stream(prompt_data, tx, None)
+            .await;
 
         // Verify results
         let mut thought_received = false;
@@ -1302,7 +1491,11 @@ mod tests {
 
         while let Some(msg) = rx.recv().await {
             match msg {
-                StreamMessage::Text { content, thought_summary, .. } => {
+                StreamMessage::Text {
+                    content,
+                    thought_summary,
+                    ..
+                } => {
                     if let Some(summary) = thought_summary {
                         assert_eq!(summary, "I am thinking about the user's request.");
                         thought_received = true;
@@ -1327,7 +1520,7 @@ mod tests {
     async fn test_unexpected_tool_call_error_message() {
         let mock_server = MockServer::start().await;
 
-        // Simulate a response with UNEXPECTED_TOOL_CALL finish reason and no content
+        // Simulate a response with UNEXPECTED_TOOL_CALL finish reason and no conten
         let response_json = serde_json::json!({
             "candidates": [{
                 "content": {
@@ -1355,29 +1548,39 @@ mod tests {
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
-        
+
         let prompt_data = LlmPrompt {
             contents: vec![Content {
                 role: "user".to_string(),
-                parts: vec![Part::Text { text: "Use a tool".to_string(), thought: None }],
+                parts: vec![Part::Text {
+                    text: "Use a tool".to_string(),
+                    thought: None,
+                }],
             }],
             tools: None,
             system_instruction: None,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        connector.generate_content_stream(prompt_data, tx, None).await;
+        connector
+            .generate_content_stream(prompt_data, tx, None)
+            .await;
 
         let mut received_error_guidance = false;
         while let Some(msg) = rx.recv().await {
             if let StreamMessage::Text { content, .. } = msg {
-                if content.contains("[Hobbes encountered a persistent error") && content.contains("UNEXPECTED_TOOL_CALL") {
+                if content.contains("[Hobbes encountered a persistent error")
+                    && content.contains("UNEXPECTED_TOOL_CALL")
+                {
                     received_error_guidance = true;
                 }
             }
         }
 
-        assert!(received_error_guidance, "Should receive persistent error message for UNEXPECTED_TOOL_CALL");
+        assert!(
+            received_error_guidance,
+            "Should receive persistent error message for UNEXPECTED_TOOL_CALL"
+        );
     }
 
     #[tokio::test]
@@ -1411,18 +1614,23 @@ mod tests {
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
-        
+
         let prompt_data = LlmPrompt {
             contents: vec![Content {
                 role: "user".to_string(),
-                parts: vec![Part::Text { text: "Test".to_string(), thought: None }],
+                parts: vec![Part::Text {
+                    text: "Test".to_string(),
+                    thought: None,
+                }],
             }],
             tools: None,
             system_instruction: None,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        connector.generate_content_stream(prompt_data, tx, None).await;
+        connector
+            .generate_content_stream(prompt_data, tx, None)
+            .await;
 
         let mut received_safety_message = false;
         while let Some(msg) = rx.recv().await {
@@ -1433,14 +1641,17 @@ mod tests {
             }
         }
 
-        assert!(received_safety_message, "Should receive safety filter message");
+        assert!(
+            received_safety_message,
+            "Should receive safety filter message"
+        );
     }
 
     #[tokio::test]
     async fn test_tool_not_found_sends_user_message() {
         let mock_server = MockServer::start().await;
 
-        // Response with a function call for a tool that won't be in the context
+        // Response with a function call for a tool that won't be in the contex
         let response_json = serde_json::json!({
             "candidates": [{
                 "content": {
@@ -1473,11 +1684,14 @@ mod tests {
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
-        
+
         let prompt_data = LlmPrompt {
             contents: vec![Content {
                 role: "user".to_string(),
-                parts: vec![Part::Text { text: "Use a tool".to_string(), thought: None }],
+                parts: vec![Part::Text {
+                    text: "Use a tool".to_string(),
+                    thought: None,
+                }],
             }],
             tools: None,
             system_instruction: None,
@@ -1485,20 +1699,27 @@ mod tests {
 
         // Pass an empty MCP context so the tool won't be found
         let mcp_context = Some(crate::mcp::manager::McpContext { servers: vec![] });
-        
+
         let (tx, mut rx) = mpsc::unbounded_channel();
-        connector.generate_content_stream(prompt_data, tx, mcp_context).await;
+        connector
+            .generate_content_stream(prompt_data, tx, mcp_context)
+            .await;
 
         let mut received_tool_error = false;
         while let Some(msg) = rx.recv().await {
             if let StreamMessage::Text { content, .. } = msg {
-                if content.contains("Tool Not Available") && content.contains("unknown_server_nonexistent_tool") {
+                if content.contains("Tool Not Available")
+                    && content.contains("unknown_server_nonexistent_tool")
+                {
                     received_tool_error = true;
                 }
             }
         }
 
-        assert!(received_tool_error, "Should receive tool not available error with tool name");
+        assert!(
+            received_tool_error,
+            "Should receive tool not available error with tool name"
+        );
     }
 
     #[test]
@@ -1512,27 +1733,43 @@ mod tests {
             cached_content_token_count: None,
         };
 
-        // Flash 2.5: $0.15/1M input, $0.60/1M output
+        // Flash 2.5: $0.15/1M input, $0.60/1M outpu
         let usage = make_usage(1_000_000, 0);
         let cost = calculate_cost("gemini-2.5-flash", &usage);
-        assert!((cost - 0.15).abs() < 1e-6, "Gemini 2.5 Flash Input: Expected $0.15, got {}", cost);
-        
+        assert!(
+            (cost - 0.15).abs() < 1e-6,
+            "Gemini 2.5 Flash Input: Expected $0.15, got {}",
+            cos
+        );
+
         let usage = make_usage(0, 1_000_000);
         let cost = calculate_cost("gemini-2.5-flash", &usage);
-        assert!((cost - 0.60).abs() < 1e-6, "Gemini 2.5 Flash Output: Expected $0.60, got {}", cost);
-        
-        // Pro 2.5 <= 200k: $1.25/1M input, $10.00/1M output
+        assert!(
+            (cost - 0.60).abs() < 1e-6,
+            "Gemini 2.5 Flash Output: Expected $0.60, got {}",
+            cos
+        );
+
+        // Pro 2.5 <= 200k: $1.25/1M input, $10.00/1M outpu
         let usage = make_usage(1_000_000, 0);
         let cost = calculate_cost("gemini-2.5-pro", &usage);
-        assert!((cost - 1.25).abs() < 1e-6, "Gemini 2.5 Pro Input: Expected $1.25, got {}", cost);
+        assert!(
+            (cost - 1.25).abs() < 1e-6,
+            "Gemini 2.5 Pro Input: Expected $1.25, got {}",
+            cos
+        );
 
         // Fallback (unknown): Defaults to Gemini 2.0 Flash (Safety mechanism)
         // 1M tokens * $0.10 rates
         let usage = make_usage(1_000_000, 0);
         let cost = calculate_cost("unknown-model", &usage);
-        assert!((cost - 0.10).abs() < 1e-6, "Unknown model: Expected default $0.10 (Flash), got {}", cost);
+        assert!(
+            (cost - 0.10).abs() < 1e-6,
+            "Unknown model: Expected default $0.10 (Flash), got {}",
+            cos
+        );
     }
-    
+
     #[test]
     fn test_parse_usage_metadata() {
         let json = r#"{
@@ -1544,8 +1781,9 @@ mod tests {
                 "thoughtsTokenCount": 20
             }
         }"#;
-        
-        let response: GeminiResponse = serde_json::from_str(json).expect("Failed to parse GeminiResponse with usageMetadata");
+
+        let response: GeminiResponse =
+            serde_json::from_str(json).expect("Failed to parse GeminiResponse with usageMetadata");
         assert!(response.usage_metadata.is_some());
         let usage = response.usage_metadata.unwrap();
         assert_eq!(usage.prompt_token_count, 100);
@@ -1568,10 +1806,19 @@ mod tests {
     #[test]
     fn test_thinking_config_style() {
         use ThinkingConfigStyle::*;
-        assert_eq!(GeminiModel::Gemini3_0ProPreview.thinking_config_style(), LevelPro);
-        assert_eq!(GeminiModel::Gemini3_0FlashPreview.thinking_config_style(), LevelFlash);
+        assert_eq!(
+            GeminiModel::Gemini3_0ProPreview.thinking_config_style(),
+            LevelPro
+        );
+        assert_eq!(
+            GeminiModel::Gemini3_0FlashPreview.thinking_config_style(),
+            LevelFlash
+        );
         // Experimental Flash Thinking 2.0 uses LevelFlash (minimal/low/medium/high)
-        assert_eq!(GeminiModel::Gemini2_0FlashThinking.thinking_config_style(), LevelFlash);
+        assert_eq!(
+            GeminiModel::Gemini2_0FlashThinking.thinking_config_style(),
+            LevelFlash
+        );
         assert_eq!(GeminiModel::Gemini2_5Flash.thinking_config_style(), Budget);
         assert_eq!(GeminiModel::Gemini2_0Flash.thinking_config_style(), None);
         assert_eq!(GeminiModel::Gemma3.thinking_config_style(), None);
@@ -1579,9 +1826,17 @@ mod tests {
 
     #[test]
     fn test_valid_thinking_levels() {
-        assert_eq!(GeminiModel::Gemini3_0ProPreview.valid_thinking_levels(), &["low", "high"]);
-        assert_eq!(GeminiModel::Gemini3_0FlashPreview.valid_thinking_levels(), &["minimal", "low", "medium", "high"]);
-        assert!(GeminiModel::Gemini2_0Flash.valid_thinking_levels().is_empty());
+        assert_eq!(
+            GeminiModel::Gemini3_0ProPreview.valid_thinking_levels(),
+            &["low", "high"]
+        );
+        assert_eq!(
+            GeminiModel::Gemini3_0FlashPreview.valid_thinking_levels(),
+            &["minimal", "low", "medium", "high"]
+        );
+        assert!(GeminiModel::Gemini2_0Flash
+            .valid_thinking_levels()
+            .is_empty());
         assert!(GeminiModel::Gemma3.valid_thinking_levels().is_empty());
     }
 
@@ -1589,29 +1844,38 @@ mod tests {
     fn test_from_slug_versioned_models() {
         // Gemini 3 versioned slugs should map correctly
         // Test Official API style (gemini-3-pro)
-        assert_eq!(GeminiModel::from_slug("gemini-3-pro-preview"), GeminiModel::Gemini3_0ProPreview);
-        assert_eq!(GeminiModel::from_slug("gemini-3-flash-preview"), GeminiModel::Gemini3_0FlashPreview);
+        assert_eq!(
+            GeminiModel::from_slug("gemini-3-pro-preview"),
+            GeminiModel::Gemini3_0ProPreview
+        );
+        assert_eq!(
+            GeminiModel::from_slug("gemini-3-flash-preview"),
+            GeminiModel::Gemini3_0FlashPreview
+        );
 
         let model = GeminiModel::from_slug("gemini-3.0-pro-preview-02-05");
         assert_eq!(model, GeminiModel::Gemini3_0ProPreview);
         assert!(model.supports_thinking());
         assert_eq!(model.thinking_config_style(), ThinkingConfigStyle::LevelPro);
-        
+
         // With models/ prefix
         let model2 = GeminiModel::from_slug("models/gemini-3.0-pro-preview-02-05");
         assert_eq!(model2, GeminiModel::Gemini3_0ProPreview);
-        
+
         // Flash versioned
         let flash = GeminiModel::from_slug("gemini-3.0-flash-preview-01-21");
         assert_eq!(flash, GeminiModel::Gemini3_0FlashPreview);
-        assert_eq!(flash.thinking_config_style(), ThinkingConfigStyle::LevelFlash);
-        
+        assert_eq!(
+            flash.thinking_config_style(),
+            ThinkingConfigStyle::LevelFlash
+        );
+
         // Gemini 2.0 Flash Thinking
         let ft = GeminiModel::from_slug("gemini-2.0-flash-thinking-exp-01-21");
         assert_eq!(ft, GeminiModel::Gemini2_0FlashThinking);
         assert!(ft.supports_thinking());
         assert_eq!(ft.thinking_config_style(), ThinkingConfigStyle::LevelFlash);
-        
+
         // Pro heuristic now maps to 2.5 Pro (has thinking support)
         let pro_unknown = GeminiModel::from_slug("some-new-pro-model");
         assert_eq!(pro_unknown, GeminiModel::Gemini2_5Pro);

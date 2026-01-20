@@ -2,6 +2,8 @@
 
 ![Version](https://img.shields.io/github/v/tag/dustmoo/cai-hobbes?label=version)
 ![Build Status](https://github.com/dustmoo/cai-hobbes/actions/workflows/ci.yml/badge.svg)
+![Clippy](https://github.com/dustmoo/cai-hobbes/actions/workflows/clippy.yml/badge.svg)
+[![Rust Report Card](https://rust-reportcard.xzu.fi/badge/github.com/dustmoo/cai-hobbes)](https://rust-reportcard.xzu.fi/report/github.com/dustmoo/cai-hobbes)
 ![License](https://img.shields.io/badge/License-FSL%201.1-blue.svg)
 
 ## Welcome to Hobbes!
@@ -107,8 +109,8 @@ The architecture is designed to integrate both external long-term memory and int
 ```mermaid
 graph TD
     subgraph "MCP Servers (Launched as Child Processes)"
-        A[Memory MCP] -- "Provides strategic context" --> L;
-        B[GitHub MCP] -- "Provides PR/Issue data" --> L;
+        A[ConPort/Graphiti MCP] -- "Provides strategic context" --> L;
+        B[Composio Embedded MCP] -- "Provides access to tools defined by Admins" --> L;
         C[Filesystem MCP] -- "Provides workspace data" --> L;
     end
 
@@ -170,7 +172,7 @@ graph TD
 -   **Services & Processors**:
     -   **`McpManager`**: Manages the lifecycle of all MCP servers, launching them as child processes and discovering their available tools.
     -   **`StreamManager`**: Orchestrates the entire tool-call lifecycle, from detecting the LLM's request to executing the tool and feeding the result back in a robust feedback loop.
-    -   **`ConversationProcessor`**: Summarizes dialogue using a dedicated Summary LLM to maintain conversational memory.
+    -   **`ConversationProcessor`**: Summarizes dialogue using a dedicated Summary LLM to maintain conversational memory. (Note: Manual "Zap" optimization is now handled via the "New Chat with Memory" modal flow).
     -   **`ToolCallSummarizer`**: A dedicated service that creates concise "snapshots" of tool interactions for the active context after a tool loop concludes.
 
 ## Using Hobbes for your Projects

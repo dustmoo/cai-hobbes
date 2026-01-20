@@ -1,7 +1,7 @@
-use crate::session::{ConversationSummary, Session};
 use crate::components::llm::LlmConnector;
+use crate::components::shared::MessageContent;
+use crate::session::{ConversationSummary, Session};
 use crate::settings::Settings;
-use crate::components::shared::{MessageContent};
 use std::sync::Arc;
 
 use dioxus::prelude::*;
@@ -19,11 +19,18 @@ impl ConversationProcessor {
 
     /// Takes the last few messages, generates a context summary using a fast LLM,
     /// and returns the summary.
-    pub async fn generate_summary(&self, session: &Session, _settings: &Settings) -> Option<ConversationSummary> {
+    pub async fn generate_summary(
+        &self,
+        session: &Session,
+        _settings: &Settings,
+    ) -> Option<ConversationSummary> {
         // 1. Get the previous summary from the active context by serializing the struct
         let previous_summary = serde_json::to_string(&session.active_context.conversation_summary)
             .unwrap_or_else(|e| {
-                tracing::warn!("Failed to serialize previous summary: {}. Using default.", e);
+                tracing::warn!(
+                    "Failed to serialize previous summary: {}. Using default.",
+                    e
+                );
                 "{}".to_string()
             });
 
@@ -38,7 +45,9 @@ impl ConversationProcessor {
                 let content_str = match &m.content {
                     MessageContent::Text { content: text, .. } => text.clone(),
                     MessageContent::ToolCall(tc) => format!("[Tool Call: {}]", tc.tool_name),
-                    MessageContent::PermissionRequest(tc) => format!("[Permission Request for Tool: {}]", tc.tool_name),
+                    MessageContent::PermissionRequest(tc) => {
+                        format!("[Permission Request for Tool: {}]", tc.tool_name)
+                    }
                     MessageContent::Error { message } => format!("[Error: {}]", message),
                 };
                 format!("{}: {}", m.author, content_str)
@@ -46,9 +55,12 @@ impl ConversationProcessor {
             .collect();
 
         // Inject active profile context to help the summarizer detect profile switches
-        let active_profile_name = _settings.active_composio_profile.clone().unwrap_or_else(|| "None".to_string());
+        let active_profile_name = _settings
+            .active_composio_profile
+            .clone()
+            .unwrap_or_else(|| "None".to_string());
         let system_note = format!("[System Note: Current Active Composio Profile is '{}'. If this differs from the previous summary, update the summary to reflect the new profile.]", active_profile_name);
-        
+
         let recent_history = std::iter::once(system_note)
             .chain(messages_vec.into_iter())
             .collect::<Vec<String>>()
@@ -60,24 +72,20 @@ impl ConversationProcessor {
 
         // 3. Call the LLM to refine the summary
         let connector = self.llm_connector.read().clone();
-        match connector.summarize_conversation(
-            previous_summary,
-            recent_history,
-        )
-        .await
+        match connector
+            .summarize_conversation(previous_summary, recent_history)
+            .await
         {
-            Ok(summary_json) => {
-                match serde_json::from_value::<ConversationSummary>(summary_json) {
-                    Ok(summary) => {
-                        tracing::info!("Successfully deserialized new conversation summary.");
-                        Some(summary)
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to deserialize conversation summary: {}", e);
-                        None
-                    }
+            Ok(summary_json) => match serde_json::from_value::<ConversationSummary>(summary_json) {
+                Ok(summary) => {
+                    tracing::info!("Successfully deserialized new conversation summary.");
+                    Some(summary)
                 }
-            }
+                Err(e) => {
+                    tracing::error!("Failed to deserialize conversation summary: {}", e);
+                    None
+                }
+            },
             Err(e) => {
                 tracing::error!("Failed to summarize conversation: {}", e);
                 None

@@ -28,8 +28,13 @@ mod tests {
         }
         "#;
 
-        let tool: Result<crate::mcp::composio_client::ComposioTool, _> = serde_json::from_str(json_data);
-        assert!(tool.is_ok(), "Failed to deserialize ComposioTool: {:?}", tool.err());
+        let tool: Result<crate::mcp::composio_client::ComposioTool, _> =
+            serde_json::from_str(json_data);
+        assert!(
+            tool.is_ok(),
+            "Failed to deserialize ComposioTool: {:?}",
+            tool.err()
+        );
         let tool = tool.unwrap();
         assert_eq!(tool.name, "GMAIL_ADD_LABEL_TO_EMAIL");
         assert!(tool.input_schema.is_some());
@@ -39,7 +44,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_tool_success() {
         let mock_server = MockServer::start().await;
-        
+
         // 1. Mock connected accounts response (account discovery flow)
         let connected_accounts_response = json!({
             "items": [
@@ -72,26 +77,41 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = ComposioClient::new("test-key".to_string(), mock_server.uri(), Some("default".to_string()), None, "test-profile-id".to_string());
-        
-        let result = client.execute_tool("TEST_TOOL", json!({"arg": "value"})).await;
-        
+        let client = ComposioClient::new(
+            "test-key".to_string(),
+            mock_server.uri(),
+            Some("default".to_string()),
+            None,
+            "test-profile-id".to_string(),
+        );
+
+        let result = client
+            .execute_tool("TEST_TOOL", json!({"arg": "value"}))
+            .await;
+
         assert!(result.is_ok(), "Execute failed: {:?}", result.err());
         let response = result.unwrap();
         eprintln!("DEBUG: response = {:?}", response);
-        assert!(response.successful, "Response not successful: {:?}", response);
+        assert!(
+            response.successful,
+            "Response not successful: {:?}",
+            response
+        );
         assert_eq!(response.data["result"], "success");
         assert_eq!(response.log_id, Some("test-log-id".to_string()));
 
         // Verify we made requests (connected_accounts + tool execution)
         let requests = mock_server.received_requests().await.unwrap();
         assert!(requests.len() >= 1, "Expected at least 1 request");
-        
+
         // Find the tool execution request
-        let tool_req = requests.iter().find(|r| {
-            let body = std::str::from_utf8(&r.body).unwrap_or("");
-            body.contains("tools/call")
-        }).expect("Tool execution request not found");
+        let tool_req = requests
+            .iter()
+            .find(|r| {
+                let body = std::str::from_utf8(&r.body).unwrap_or("");
+                body.contains("tools/call")
+            })
+            .expect("Tool execution request not found");
 
         // Verify JSON-RPC body
         let body: serde_json::Value = serde_json::from_slice(&tool_req.body).unwrap();
@@ -104,7 +124,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_tool_fallback() {
         let mock_server = MockServer::start().await;
-        
+
         // 1. Mock connected accounts response (account discovery flow)
         let connected_accounts_response = json!({
             "items": [
@@ -134,10 +154,16 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = ComposioClient::new("test-key".to_string(), mock_server.uri(), Some("default".to_string()), None, "test-profile-id".to_string());
-        
+        let client = ComposioClient::new(
+            "test-key".to_string(),
+            mock_server.uri(),
+            Some("default".to_string()),
+            None,
+            "test-profile-id".to_string(),
+        );
+
         let result = client.execute_tool("RAW_TOOL", json!({})).await;
-        
+
         assert!(result.is_ok(), "Execute failed: {:?}", result.err());
         let response = result.unwrap();
         assert!(response.successful);
@@ -146,10 +172,13 @@ mod tests {
 
         // Find tool execution request
         let requests = mock_server.received_requests().await.unwrap();
-        let tool_req = requests.iter().find(|r| {
-            let body = std::str::from_utf8(&r.body).unwrap_or("");
-            body.contains("tools/call")
-        }).expect("Tool execution request not found");
+        let tool_req = requests
+            .iter()
+            .find(|r| {
+                let body = std::str::from_utf8(&r.body).unwrap_or("");
+                body.contains("tools/call")
+            })
+            .expect("Tool execution request not found");
 
         // Verify JSON-RPC body
         let body: serde_json::Value = serde_json::from_slice(&tool_req.body).unwrap();
@@ -166,9 +195,9 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
         // Simulate the logic in list_tools
         let data_start = response_text.find("data:").unwrap() + "data:".len();
         let json_text = response_text[data_start..].trim();
-        
+
         let json_value: serde_json::Value = serde_json::from_str(json_text).unwrap();
-        
+
         // This mirrors the fix logic
         let mut tools_found = false;
         if let Some(result) = json_value.get("result") {
@@ -181,14 +210,23 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
                 }
             }
         }
-        
-        assert!(tools_found, "Failed to navigate nested structure result.tools");
+
+        assert!(
+            tools_found,
+            "Failed to navigate nested structure result.tools"
+        );
     }
     #[tokio::test]
     async fn test_execute_tool_with_discovery() {
         let mock_server = MockServer::start().await;
-        
-        let discovery_client = ComposioClient::new("test-key".to_string(), mock_server.uri(), None, None, "test-profile-id".to_string());
+
+        let discovery_client = ComposioClient::new(
+            "test-key".to_string(),
+            mock_server.uri(),
+            None,
+            None,
+            "test-profile-id".to_string(),
+        );
 
         // 1. Mock list_tools response (tools/list)
         let list_tools_response = json!({
@@ -204,10 +242,10 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
             "jsonrpc": "2.0",
             "id": "1"
         });
-        
+
         // Matcher for tools/list
         let list_tools_matcher = wiremock::matchers::body_string_contains("tools/list");
-        
+
         Mock::given(method("POST"))
             .and(path_regex("/.*"))
             .and(list_tools_matcher)
@@ -242,7 +280,7 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
             "successful": true,
             "data": { "result": "discovered" }
         });
-        
+
         let execute_matcher = wiremock::matchers::body_string_contains("tools/call");
 
         Mock::given(method("POST"))
@@ -255,8 +293,10 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
         // Populate the tool-toolkit map so the heuristic/auth check works
         let _ = discovery_client.list_tools().await;
 
-        let result = discovery_client.execute_tool("DISCOVERY_TOOL", json!({})).await;
-        
+        let result = discovery_client
+            .execute_tool("DISCOVERY_TOOL", json!({}))
+            .await;
+
         assert!(result.is_ok(), "Execution failed: {:?}", result.err());
         let response = result.unwrap();
         assert!(response.successful);
@@ -264,18 +304,23 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
         // Verify the execute request used the discovered account ID
         let requests = mock_server.received_requests().await.unwrap();
         // Requests could be list_tools, connect_accounts, execute_tool (in order)
-        
+
         // Find the execute request
-        let execute_req = requests.iter().find(|r| {
-             let body = std::str::from_utf8(&r.body).unwrap();
-             body.contains("tools/call")
-        }).expect("Execute request not found");
+        let execute_req = requests
+            .iter()
+            .find(|r| {
+                let body = std::str::from_utf8(&r.body).unwrap();
+                body.contains("tools/call")
+            })
+            .expect("Execute request not found");
 
         let body: serde_json::Value = serde_json::from_slice(&execute_req.body).unwrap();
-        
+
         // Verify Pure MCP Payload: connected_account_id should NOT be in the body
         // The routing is handled by user_id in the URL query params, not the body
-        assert!(body["params"].get("connected_account_id").is_none(), 
-            "connected_account_id should NOT be in the body (Pure MCP Payload mandate)");
+        assert!(
+            body["params"].get("connected_account_id").is_none(),
+            "connected_account_id should NOT be in the body (Pure MCP Payload mandate)"
+        );
     }
 }

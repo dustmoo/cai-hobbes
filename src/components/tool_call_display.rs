@@ -1,10 +1,10 @@
 #![allow(non_snake_case)]
+use super::chat::CodeBlock;
+use super::markdown_renderer::ThinkingMarkdownRenderer;
+use super::shared::{ToolCall, ToolCallStatus, UsageData};
+use crate::settings::UiState;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
-use super::chat::CodeBlock;
-use super::shared::{ToolCall, ToolCallStatus, UsageData};
-use super::markdown_renderer::ThinkingMarkdownRenderer;
-use crate::settings::UiState;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct ToolCallDisplayProps {
@@ -19,7 +19,7 @@ pub struct ToolCallDisplayProps {
 pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
     // Consume global UI state for default preferences (read-only for initial values)
     let ui_state = consume_context::<Signal<UiState>>();
-    
+
     // Local signals initialized from global defaults - these are NOT synced back
     let mut show_arguments = use_signal(|| ui_state.read().default_tool_arguments_open);
     // Auto-expand response section for auth-required tools so user sees the connect button
@@ -36,7 +36,6 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
     let response = props.tool_call.response.clone();
     // Use thought_summary (actual thinking content) not thought_signature (encrypted)
     let thought_content = props.tool_call.thought_summary.clone().unwrap_or_default();
-
 
     rsx! {
         div {
@@ -60,7 +59,7 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                 }
                 if let Some(usage) = &props.usage {
                     if props.token_display_mode != "none" {
-                       div { 
+                       div {
                             class: "ml-auto text-xs text-gray-400 font-mono flex items-center gap-2",
                             if let Some(cost) = usage.cost {
                                 span { class: "text-green-400", {format!("${:.6}", cost)} }
@@ -206,9 +205,6 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
         }
     }
 }
-
-
-
 
 #[derive(Props, Clone, PartialEq)]
 pub struct PermissionPromptProps {

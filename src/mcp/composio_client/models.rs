@@ -155,23 +155,23 @@ impl ComposioToolkitListing {
     pub fn description(&self) -> Option<String> {
         self.meta.as_ref().and_then(|m| m.description.clone())
     }
-    
+
     /// Get the logo URL from meta
     #[allow(dead_code)]
     pub fn logo(&self) -> Option<String> {
         self.meta.as_ref().and_then(|m| m.logo.clone())
     }
-    
+
     /// Get the app URL from meta
     pub fn app_url(&self) -> Option<String> {
         self.meta.as_ref().and_then(|m| m.app_url.clone())
     }
-    
+
     /// Get the tools count from meta
     pub fn tools_count(&self) -> Option<usize> {
         self.meta.as_ref().and_then(|m| m.tools_count)
     }
-    
+
     /// Determine if Composio managed auth is available for this toolkit
     pub fn supports_managed_auth(&self) -> bool {
         self.composio_managed_auth_schemes
@@ -179,12 +179,12 @@ impl ComposioToolkitListing {
             .map(|schemes| !schemes.is_empty())
             .unwrap_or(false)
     }
-    
+
     /// Get the primary auth scheme for this toolkit (uppercase, e.g., "OAUTH2", "API_KEY")
     pub fn primary_auth_scheme(&self) -> Option<String> {
         self.auth_schemes.as_ref()?.first().cloned()
     }
-    
+
     /// Check if this toolkit requires no authentication
     #[allow(dead_code)]
     pub fn requires_no_auth(&self) -> bool {
@@ -223,7 +223,8 @@ impl ComposioCategory {
     /// Get the display-friendly name for this category
     #[allow(dead_code)]
     pub fn display(&self) -> String {
-        self.display_name.clone()
+        self.display_name
+            .clone()
             .or_else(|| self.name.clone())
             .unwrap_or_else(|| self.slug.clone())
     }

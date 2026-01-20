@@ -1,7 +1,7 @@
-use dioxus::prelude::*;
-use crate::session::ActiveContext;
-use crate::components::syntax_highlighter::highlight_json;
 use crate::components::focus_context::FocusContext;
+use crate::components::syntax_highlighter::highlight_json;
+use crate::session::ActiveContext;
+use dioxus::prelude::*;
 use dioxus_free_icons::icons::fi_icons;
 use dioxus_free_icons::Icon;
 
@@ -17,7 +17,7 @@ pub fn NewChatMemoryModal(
     let mut json_content = use_signal(|| String::new());
     let mut error_message = use_signal(|| Option::<String>::None);
     let mut focus_context = use_context::<Signal<FocusContext>>();
-    
+
     // Track previous context to detect external updates (like from optimization)
     let mut last_processed_context = use_signal(|| String::new());
 
@@ -26,7 +26,7 @@ pub fn NewChatMemoryModal(
         if *is_visible.read() {
             // Claim focus ownership
             focus_context.set(FocusContext::NewChatMemoryModal);
-            
+
             // Check if context has changed externally (e.g. returning from optimization)
             let new_json = serde_json::to_string_pretty(&initial_context).unwrap_or_default();
             if *last_processed_context.read() != new_json {
@@ -47,7 +47,7 @@ pub fn NewChatMemoryModal(
             Err(e) => error_message.set(Some(format!("Cannot optimize invalid JSON: {}", e))),
         }
     };
-    
+
     let mut submit_session = move || {
         let content = json_content.read().clone();
         tracing::debug!("NewChatMemoryModal::submit_session called");
@@ -57,20 +57,21 @@ pub fn NewChatMemoryModal(
                 on_start_chat.call(valid_context);
             }
             Err(e) => {
-                tracing::error!("NewChatMemoryModal::submit_session - failed to parse JSON: {}", e);
+                tracing::error!(
+                    "NewChatMemoryModal::submit_session - failed to parse JSON: {}",
+                    e
+                );
                 error_message.set(Some(format!("Generic JSON error: {}", e)));
-                 // Try to parse as generic Value to give better error if it's just schema mismatch vs syntax
+                // Try to parse as generic Value to give better error if it's just schema mismatch vs syntax
                 if let Err(syntax_err) = serde_json::from_str::<serde_json::Value>(&content) {
-                     error_message.set(Some(format!("Syntax Error: {}", syntax_err)));
+                    error_message.set(Some(format!("Syntax Error: {}", syntax_err)));
                 } else {
-                     // If syntax is valid but schema matches failed
-                     error_message.set(Some(format!("Schema Mismatch: The JSON structure doesn't match the expected memory format. ({})", e)));
+                    // If syntax is valid but schema matches failed
+                    error_message.set(Some(format!("Schema Mismatch: The JSON structure doesn't match the expected memory format. ({})", e)));
                 }
             }
         }
     };
-
-
 
     if !*is_visible.read() {
         return rsx! {};
@@ -95,7 +96,7 @@ pub fn NewChatMemoryModal(
             },
             div {
                 class: "bg-dark-card border border-primary-700 rounded-lg shadow-xl w-[800px] h-[80vh] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200",
-                
+
                 // Header
                 div {
                     class: "p-4 border-b border-primary-700 flex justify-between items-center bg-dark-section",
@@ -104,14 +105,14 @@ pub fn NewChatMemoryModal(
                             Icon { width: 20, height: 20, icon: fi_icons::FiCpu }
                             "New Chat with Memory"
                         }
-                        p { class: "text-xs text-gray-400 mt-1", 
-                            "Edit the short-term memory (persona, instructions, etc.) for the new session." 
+                        p { class: "text-xs text-gray-400 mt-1",
+                            "Edit the short-term memory (persona, instructions, etc.) for the new session."
                         }
                         {
                             let context_size = json_content.read().len();
                             let estimated_tokens = context_size / 4;
                             rsx! {
-                                p { 
+                                p {
                                     class: "text-xs text-gray-500 mt-1",
                                     "Context size: ~{estimated_tokens} tokens ({context_size} chars)"
                                 }
@@ -146,7 +147,7 @@ pub fn NewChatMemoryModal(
                 // Body
                 div {
                     class: "flex-1 flex flex-col p-4 overflow-hidden bg-dark-bg",
-                    
+
                     // Toolbar
                     div {
                         class: "flex justify-between items-center mb-2",
@@ -184,7 +185,7 @@ pub fn NewChatMemoryModal(
                     div {
                         class: "flex-1 relative bg-dark-section rounded-md border border-gray-700 overflow-hidden",
                         id: "memory-json-editor-container",
-                        
+
                         // Highlighted layer
                         pre {
                             class: "absolute inset-0 p-4 text-sm font-mono pointer-events-none whitespace-pre-wrap break-words overflow-auto",
@@ -193,7 +194,7 @@ pub fn NewChatMemoryModal(
                                 dangerous_inner_html: "{highlight_json(json_content.read().clone())}"
                             }
                         }
-                        
+
                         // Editable layer
                         textarea {
                             class: "absolute inset-0 w-full h-full p-4 bg-transparent font-mono text-sm text-transparent caret-white border-0 focus:outline-none resize-none overflow-auto whitespace-pre-wrap break-words",
@@ -227,7 +228,7 @@ pub fn NewChatMemoryModal(
 
                     // Error Message
                     if let Some(msg) = error_message.read().as_ref() {
-                        div { 
+                        div {
                             class: "mt-2 p-2 bg-red-900/50 border border-red-700 text-red-200 rounded text-sm flex items-start gap-2 animate-in slide-in-from-bottom-2",
                             Icon { width: 16, height: 16, icon: fi_icons::FiAlertCircle, class: "mt-0.5 min-w-[16px]" }
                             span { "{msg}" }
@@ -238,12 +239,12 @@ pub fn NewChatMemoryModal(
                 // Footer
                 div {
                     class: "p-4 border-t border-primary-700 bg-dark-section flex justify-between items-center",
-                    
+
                     // Left Side: Optimization Control
                     button {
                         class: "flex items-center gap-2 px-3 py-2 text-yellow-500 hover:text-yellow-400 hover:bg-yellow-500/10 rounded transition-colors text-sm font-medium",
                         onclick: move |_| trigger_optimize(),
-                        "⚡ Optimize Memory" 
+                        "⚡ Optimize Memory"
                     }
 
                     // Right Side: Action Buttons

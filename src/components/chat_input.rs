@@ -1,20 +1,19 @@
+use base64::{engine::general_purpose, Engine as _};
 use dioxus::{html::HasFileData, prelude::*};
 use dioxus_free_icons::{icons::fi_icons, Icon};
+use image::{imageops, DynamicImage, ImageFormat};
 use rfd::FileDialog;
-use std::time::SystemTime;
-use base64::{engine::general_purpose, Engine as _};
-use image::{imageops, ImageFormat, DynamicImage};
 use std::io::Cursor;
+use std::time::SystemTime;
 
 #[cfg(debug_assertions)]
 use crate::context::prompt_builder::PromptBuilder;
 use crate::settings::{Settings, SettingsManager, UiState};
 use hobbes_core::models::Attachment;
 
-use crate::processing::summarization_scheduler::{SchedulerSignal};
-use crate::components::shared::{ChatBarIconButton};
 use crate::components::focus_context::FocusContext;
-
+use crate::components::shared::ChatBarIconButton;
+use crate::processing::summarization_scheduler::SchedulerSignal;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChatCommand {
@@ -57,13 +56,14 @@ pub fn ChatInput(
     let mut show_new_chat_menu = use_signal(|| false);
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
     let focus_context = use_context::<Signal<FocusContext>>();
-    let mut textarea_mounted = use_signal(|| Option::<std::rc::Rc<dioxus::html::MountedData>>::None);
+    let mut textarea_mounted =
+        use_signal(|| Option::<std::rc::Rc<dioxus::html::MountedData>>::None);
 
     // Active Focus Management: Reclaim focus when context reverts to ChatInput
     use_effect(move || {
         let current_context = *focus_context.read();
         let mounted_opt = textarea_mounted.read().clone();
-        
+
         if current_context == FocusContext::ChatInput {
             if let Some(mounted) = mounted_opt {
                 spawn(async move {
@@ -73,7 +73,7 @@ pub fn ChatInput(
             }
         }
     });
-    
+
     // Listen for global chat commands (from menu hotkeys)
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     use_effect(move || {
@@ -90,7 +90,7 @@ pub fn ChatInput(
                     on_toggle_sessions.call(());
                 }
                 ChatCommand::ToggleMcp => {
-                     on_toggle_mcp_manager.call(());
+                    on_toggle_mcp_manager.call(());
                 }
                 ChatCommand::NewChat => {
                     tracing::info!("ChatCommand::NewChat triggered");
@@ -147,10 +147,12 @@ pub fn ChatInput(
                     // Handled by MessageList
                 }
                 ChatCommand::FocusChat => {
-                     let _ = document::eval(r#"
+                    let _ = document::eval(
+                        r#"
                         const el = document.getElementById('chat-textarea');
                         if (el) { el.focus(); }
-                    "#);
+                    "#,
+                    );
                 }
                 ChatCommand::DeleteSession => {
                     // Handled by SessionManager
@@ -169,16 +171,22 @@ pub fn ChatInput(
             return;
         }
         let user_message = draft.read().clone();
-        if user_message.is_empty() && attachments.read().is_empty() && !*has_new_comments.read() && !*has_pending_approvals.read() {
+        if user_message.is_empty()
+            && attachments.read().is_empty()
+            && !*has_new_comments.read()
+            && !*has_pending_approvals.read()
+        {
             return;
         }
         on_send.call((user_message, attachments.read().clone()));
         draft.set("".to_string());
         attachments.set(Vec::new());
-        let _ = document::eval(r#"
+        let _ = document::eval(
+            r#"
             const el = document.getElementById('chat-textarea');
             if (el) { el.style.height = 'auto'; }
-        "#);
+        "#,
+        );
     };
 
     rsx! {
@@ -279,11 +287,11 @@ pub fn ChatInput(
                     {
                         let settings_read = _settings.read();
                         let profiles = &settings_read.composio_profiles;
-                        
+
                         if profiles.len() > 1 {
                             let active_profile = settings_read.get_active_profile().cloned().unwrap_or_default();
                             let active_initial = active_profile.name.chars().next().unwrap_or('?').to_uppercase();
-                            
+
                             rsx! {
                                 div {
                                     class: "relative",
@@ -292,7 +300,7 @@ pub fn ChatInput(
                                         onclick: move |_| show_profile_selector.set(!show_profile_selector()),
                                         "{active_initial}"
                                     }
-                                    
+
                                     if show_profile_selector() {
                                         div {
                                             class: "absolute bottom-10 left-0 w-56 bg-dark-card border border-primary-700 rounded-lg shadow-xl z-50 overflow-hidden py-1",
@@ -408,7 +416,7 @@ pub fn ChatInput(
                     },
                     oninput: move |event| {
                         scheduler.send(SchedulerSignal::Activity);
-                        
+
                         // Auto-resize logic
                         let _ = document::eval(r#"
                             const el = document.getElementById('chat-textarea');
@@ -417,7 +425,7 @@ pub fn ChatInput(
                                 el.style.height = (el.scrollHeight) + 'px';
                             }
                         "#);
-                        
+
                         draft.set(event.value());
                     },
                     onkeydown: move |event| {
@@ -427,10 +435,10 @@ pub fn ChatInput(
                             tracing::debug!("ChatInput ignoring event - Focus owns: {:?}", *focus_context.read());
                             return;
                         }
-                        
+
                         scheduler.send(SchedulerSignal::Activity);
                         let modifiers = event.data.modifiers();
-                        
+
                         // Allow SUPER/CONTROL/ALT only if it's a specific key we want to handle with modifiers (like Enter),
                         // otherwise block them to let OS/Global Hotkeys handle them.
                         // We strictly want to allow Cmd+Enter to pass through to the handler below.
@@ -583,7 +591,7 @@ pub fn ChatInput(
                                 icon: fi_icons::FiPlus
                             }
                         }
-                        
+
                         if show_new_chat_menu() {
                             div {
                                 class: "absolute bottom-10 right-0 w-64 bg-dark-card border border-primary-700 rounded-lg shadow-xl z-50 overflow-hidden py-1",
@@ -664,7 +672,7 @@ pub fn ChatInput(
                         }
                     }
                 }
-            }    
+            }
         }
     }
 }
@@ -805,13 +813,13 @@ fn SessionCostIcon() -> Element {
                     {format!("{:.2}", total_cost)}
                 }
             }
-            
+
             if *show_popover.read() {
                 div {
                     class: "absolute bottom-full left-0 mb-2 w-64 bg-dark-card border border-gray-700 rounded-lg shadow-xl p-3 z-50",
-                    
+
                     div { class: "text-sm font-semibold text-gray-200 mb-2 border-b border-gray-700 pb-1", "Session Usage" }
-                    
+
                     div { class: "space-y-2 text-xs",
                         div { class: "flex justify-between text-gray-400",
                             span { "Total Cost:" }

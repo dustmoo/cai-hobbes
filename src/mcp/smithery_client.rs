@@ -4,14 +4,13 @@
 //
 // This module is designed to be clean and modular for potential contribution to Smithery.
 
+use crate::mcp::oauth_flow::{
+    build_authorization_url, discover_oauth_metadata, exchange_code_for_tokens,
+    find_available_port, generate_code_challenge, generate_code_verifier, refresh_access_token,
+    start_callback_server, OAuthClientInfo, OAuthClientMetadata, OAuthServerMetadata, OAuthTokens,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::mcp::oauth_flow::{
-    OAuthTokens, OAuthServerMetadata, OAuthClientInfo, OAuthClientMetadata,
-    generate_code_verifier, generate_code_challenge,
-    discover_oauth_metadata, exchange_code_for_tokens, refresh_access_token,
-    build_authorization_url, find_available_port, start_callback_server,
-};
 
 // ============================================================================
 // Smithery OAuth Client
@@ -29,10 +28,7 @@ pub enum OAuthState {
     },
     /// Authorization code received, ready to exchange for tokens
     #[allow(dead_code)]
-    AwaitingTokenExchange {
-        code: String,
-        code_verifier: String,
-    },
+    AwaitingTokenExchange { code: String, code_verifier: String },
     /// Connected with valid tokens
     Connected,
     /// Error state
@@ -78,21 +74,21 @@ impl SmitheryOAuthConfig {
             callback_port: port,
         }
     }
-    
+
     pub fn callback_url(&self) -> String {
         format!("http://localhost:{}/callback", self.callback_port)
     }
 }
 
 /// Smithery OAuth Client
-/// 
+///
 /// Handles the complete OAuth 2.1 flow with PKCE for Smithery-hosted MCP servers.
-/// 
+///
 /// # Example
 /// ```rust
 /// let config = SmitheryOAuthConfig::new("https://server.smithery.ai/googlecalendar/mcp");
 /// let mut client = SmitheryOAuthClient::new(config);
-/// 
+///
 /// // Attempt to connect
 /// match client.connect().await {
 ///     Ok(()) => println!("Connected without auth!"),
@@ -106,7 +102,7 @@ impl SmitheryOAuthConfig {
 ///     }
 ///     Err(e) => return Err(e),
 /// }
-/// 
+///
 /// // Now connected - use the access token
 /// let token = client.access_token().await;
 /// ```
@@ -131,56 +127,57 @@ impl SmitheryOAuthClient {
             http_client: reqwest::Client::new(),
         }
     }
-    
+
     /// Attempt to connect to the server
     /// Returns Ok(()) if no auth needed, or Err(AuthRequired(url)) if authorization needed
     pub async fn connect(&self) -> Result<(), SmitheryOAuthError> {
         // Try to make a test request to the server
-        let response = self.http_client
+        let response = self
+            .http_client
             .get(&self.config.server_url)
             .send()
             .await
             .map_err(|e| SmitheryOAuthError::ConnectionFailed(e.to_string()))?;
-        
+
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             // Need to authenticate
             return self.initiate_auth().await;
         }
-        
+
         if response.status().is_success() {
             *self.state.write().await = OAuthState::Connected;
             return Ok(());
         }
-        
+
         Err(SmitheryOAuthError::ConnectionFailed(format!(
             "Server returned status: {}",
             response.status()
         )))
     }
-    
+
     /// Initiate the OAuth authorization flow
     async fn initiate_auth(&self) -> Result<(), SmitheryOAuthError> {
         // Get API key from env if available (to help with discovery)
         let api_key = std::env::var("SMITHERY_API_KEY").ok();
-        
+
         // Discover OAuth metadata
         let metadata = discover_oauth_metadata(&self.config.server_url, api_key.as_deref())
             .await
             .map_err(SmitheryOAuthError::DiscoveryFailed)?;
-        
+
         *self.server_metadata.write().await = Some(metadata.clone());
-        
+
         // Generate PKCE codes
         let code_verifier = generate_code_verifier();
         let code_challenge = generate_code_challenge(&code_verifier);
-        
+
         // For now, use a simple client_id (in production, you'd register dynamically)
         let client_id = "hobbes-mcp-client";
         *self.client_info.write().await = Some(OAuthClientInfo {
             client_id: client_id.to_string(),
             client_secret: None,
         });
-        
+
         // Build authorization URL
         let auth_url = build_authorization_url(
             &metadata.authorization_endpoint,
@@ -190,32 +187,40 @@ impl SmitheryOAuthClient {
             self.config.client_metadata.scope.as_deref(),
             None,
         );
-        
+
         *self.state.write().await = OAuthState::AwaitingAuthorization {
             auth_url: auth_url.clone(),
             code_verifier,
         };
-        
+
         Err(SmitheryOAuthError::AuthRequired(auth_url))
     }
-    
+
     /// Complete the OAuth flow with the authorization code from callback
     pub async fn finish_auth(&self, code: &str) -> Result<(), SmitheryOAuthError> {
         let state = self.state.read().await.clone();
-        
+
         let code_verifier = match state {
             OAuthState::AwaitingAuthorization { code_verifier, .. } => code_verifier,
-            _ => return Err(SmitheryOAuthError::InvalidState(
-                "Not awaiting authorization".to_string()
-            )),
+            _ => {
+                return Err(SmitheryOAuthError::InvalidState(
+                    "Not awaiting authorization".to_string(),
+                ))
+            }
         };
-        
-        let metadata = self.server_metadata.read().await.clone()
-            .ok_or_else(|| SmitheryOAuthError::InvalidState("No server metadata".to_string()))?;
-        
-        let client_info = self.client_info.read().await.clone()
+
+        let metadata =
+            self.server_metadata.read().await.clone().ok_or_else(|| {
+                SmitheryOAuthError::InvalidState("No server metadata".to_string())
+            })?;
+
+        let client_info = self
+            .client_info
+            .read()
+            .await
+            .clone()
             .ok_or_else(|| SmitheryOAuthError::InvalidState("No client info".to_string()))?;
-        
+
         // Exchange code for tokens
         let tokens = exchange_code_for_tokens(
             &metadata.token_endpoint,
@@ -227,33 +232,46 @@ impl SmitheryOAuthClient {
         )
         .await
         .map_err(SmitheryOAuthError::TokenExchangeFailed)?;
-        
+
         *self.tokens.write().await = Some(tokens);
         *self.state.write().await = OAuthState::Connected;
-        
+
         Ok(())
     }
-    
+
     /// Get the current access token (if any)
     pub async fn access_token(&self) -> Option<String> {
-        self.tokens.read().await.as_ref().map(|t| t.access_token.clone())
+        self.tokens
+            .read()
+            .await
+            .as_ref()
+            .map(|t| t.access_token.clone())
     }
-    
+
     /// Refresh the access token using the refresh token
     #[allow(dead_code)]
     pub async fn refresh(&self) -> Result<(), SmitheryOAuthError> {
-        let tokens = self.tokens.read().await.clone()
-            .ok_or_else(|| SmitheryOAuthError::InvalidState("No tokens to refresh".to_string()))?;
-        
-        let refresh_token = tokens.refresh_token
+        let tokens =
+            self.tokens.read().await.clone().ok_or_else(|| {
+                SmitheryOAuthError::InvalidState("No tokens to refresh".to_string())
+            })?;
+
+        let refresh_token = tokens
+            .refresh_token
             .ok_or_else(|| SmitheryOAuthError::InvalidState("No refresh token".to_string()))?;
-        
-        let metadata = self.server_metadata.read().await.clone()
-            .ok_or_else(|| SmitheryOAuthError::InvalidState("No server metadata".to_string()))?;
-        
-        let client_info = self.client_info.read().await.clone()
+
+        let metadata =
+            self.server_metadata.read().await.clone().ok_or_else(|| {
+                SmitheryOAuthError::InvalidState("No server metadata".to_string())
+            })?;
+
+        let client_info = self
+            .client_info
+            .read()
+            .await
+            .clone()
             .ok_or_else(|| SmitheryOAuthError::InvalidState("No client info".to_string()))?;
-        
+
         let new_tokens = refresh_access_token(
             &metadata.token_endpoint,
             &refresh_token,
@@ -262,35 +280,37 @@ impl SmitheryOAuthClient {
         )
         .await
         .map_err(SmitheryOAuthError::TokenExchangeFailed)?;
-        
+
         *self.tokens.write().await = Some(new_tokens);
-        
+
         Ok(())
     }
-    
+
     /// Get the current state
     #[allow(dead_code)]
     pub async fn state(&self) -> OAuthState {
         self.state.read().await.clone()
     }
-    
+
     /// Check if connected
     #[allow(dead_code)]
     pub async fn is_connected(&self) -> bool {
         matches!(*self.state.read().await, OAuthState::Connected)
     }
-    
+
     /// Start the callback server and return the receiver for auth codes
-    pub fn start_callback_server(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::mcp::oauth_flow::OAuthResult> {
+    pub fn start_callback_server(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::mcp::oauth_flow::OAuthResult> {
         start_callback_server(self.config.callback_port)
     }
-    
+
     /// Get the server URL
     #[allow(dead_code)]
     pub fn server_url(&self) -> &str {
         &self.config.server_url
     }
-    
+
     /// Get the callback URL
     #[allow(dead_code)]
     pub fn callback_url(&self) -> String {
@@ -313,19 +333,19 @@ pub fn create_smithery_client(server_name: &str) -> SmitheryOAuthClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_config_default() {
         let config = SmitheryOAuthConfig::new("https://server.smithery.ai/test/mcp");
         assert!(config.callback_url().contains("localhost"));
         assert!(config.callback_url().contains("/callback"));
     }
-    
+
     #[test]
     fn test_pkce_generation() {
         let verifier = generate_code_verifier();
         let challenge = generate_code_challenge(&verifier);
-        
+
         // Verifier should be 43 characters (32 bytes base64 encoded)
         assert_eq!(verifier.len(), 43);
         // Challenge should be 43 characters (SHA256 hash base64 encoded)

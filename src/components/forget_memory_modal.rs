@@ -1,10 +1,10 @@
-use dioxus::prelude::*;
+use crate::components::focus_context::FocusContext;
+use crate::components::llm::{Content, GeminiRequest, Part};
 use crate::session::ActiveContext;
 use crate::settings::Settings;
-use crate::components::focus_context::FocusContext;
+use dioxus::prelude::*;
 use dioxus_free_icons::icons::fi_icons;
 use dioxus_free_icons::Icon;
-use crate::components::llm::{GeminiRequest, Content, Part};
 
 #[component]
 pub fn ForgetMemoryModal(
@@ -16,7 +16,7 @@ pub fn ForgetMemoryModal(
     let mut instruction = use_signal(|| String::new());
     let mut is_generating = use_signal(|| false);
     let mut error_message = use_signal(|| Option::<String>::None);
-    
+
     let mut focus_context = use_context::<Signal<FocusContext>>();
     let settings = use_context::<Signal<Settings>>(); // Used for gemini config
 
@@ -34,7 +34,9 @@ pub fn ForgetMemoryModal(
 
     let mut handle_generate = move || {
         if instruction.read().trim().is_empty() {
-            error_message.set(Some("Please describe what to forget or focus on.".to_string()));
+            error_message.set(Some(
+                "Please describe what to forget or focus on.".to_string(),
+            ));
             return;
         }
         is_generating.set(true);
@@ -45,8 +47,6 @@ pub fn ForgetMemoryModal(
         let context_json = serde_json::to_string_pretty(&current_context_val).unwrap_or_default();
         let settings_read = settings.read();
 
-
-        
         // Clone the full config from state to preserve all fields (API key, etc.)
         // This ensures strictly correct state usage ("We SHOULD be using what is returned from STATE")
         let mut transient_config = settings_read.gemini_config.clone();
@@ -54,17 +54,17 @@ pub fn ForgetMemoryModal(
         transient_config.chat_model = settings_read.gemini_config.summary_model.clone();
         // Ensure thinking is disabled for this utility task
         transient_config.thinking_enabled = false;
-        
+
         drop(settings_read);
-        
+
         spawn(async move {
             // We use the configured summary model via the transient config
-            // The connector will now use the properly loaded settings state 
-            
+            // The connector will now use the properly loaded settings state
+
             let connector = crate::components::llm::GeminiConnector::new(transient_config);
 
             let prompt = format!(
-r#"You are an intelligent memory optimization assistant.
+                r#"You are an intelligent memory optimization assistant.
 Your task is to update the current 'ActiveContext' (JSON) based on the user's instructions to 'forget' or 'focus'.
 
 User Instruction:
@@ -78,20 +78,22 @@ Return a JSON object with exactly two keys:
 - "summary": A concise, structured markdown summary (max 3 lines) of what was removed, condensed, or added.
 
 Ensure the "optimized_context" maintains the correct schema for ActiveContext."#,
-                user_instruction,
-                context_json
+                user_instruction, context_json
             );
 
             let request_body = GeminiRequest {
                 contents: vec![Content {
                     role: "user".to_string(),
-                    parts: vec![Part::Text { text: prompt, thought: None }],
+                    parts: vec![Part::Text {
+                        text: prompt,
+                        thought: None,
+                    }],
                 }],
                 tools: None,
                 system_instruction: None,
                 tool_config: None,
                 generation_config: Some(crate::components::llm::GenerationConfig {
-                     thinking_config: None, // No thinking needed for this utility task
+                    thinking_config: None, // No thinking needed for this utility task
                 }),
             };
 
@@ -100,40 +102,49 @@ Ensure the "optimized_context" maintains the correct schema for ActiveContext."#
                     if let Some(candidate) = response.candidates.first() {
                         if let Some(part) = candidate.content.parts.first() {
                             let text = part.text.clone();
-                            
+
                             // Extract JSON from response using shared helper
-                            let json_str = crate::components::shared::extract_json_from_response(&text);
+                            let json_str =
+                                crate::components::shared::extract_json_from_response(&text);
 
                             match serde_json::from_str::<serde_json::Value>(json_str) {
-
                                 Ok(val) => {
-                                    if let (Some(ctx_val), Some(summary_val)) = (val.get("optimized_context"), val.get("summary")) {
-                                        match serde_json::from_value::<ActiveContext>(ctx_val.clone()) {
+                                    if let (Some(ctx_val), Some(summary_val)) =
+                                        (val.get("optimized_context"), val.get("summary"))
+                                    {
+                                        match serde_json::from_value::<ActiveContext>(
+                                            ctx_val.clone(),
+                                        ) {
                                             Ok(new_ctx) => {
-                                                let summary = summary_val.as_str().unwrap_or("Memory optimized.").to_string();
+                                                let summary = summary_val
+                                                    .as_str()
+                                                    .unwrap_or("Memory optimized.")
+                                                    .to_string();
                                                 // Auto-apply immediately on success
                                                 on_apply.call((new_ctx, summary));
-                                            },
-                                            Err(e) => error_message.set(Some(format!("Failed to parse optimized context: {}", e))),
+                                            }
+                                            Err(e) => error_message.set(Some(format!(
+                                                "Failed to parse optimized context: {}",
+                                                e
+                                            ))),
                                         }
                                     } else {
                                         error_message.set(Some("LLM response missing 'optimized_context' or 'summary' keys.".to_string()));
                                     }
-                                },
-                                Err(e) => error_message.set(Some(format!("Failed to parse LLM JSON: {}", e))),
+                                }
+                                Err(e) => error_message
+                                    .set(Some(format!("Failed to parse LLM JSON: {}", e))),
                             }
                         }
                     } else {
                         error_message.set(Some("No response candidates from LLM.".to_string()));
                     }
-                },
+                }
                 Err(e) => error_message.set(Some(format!("API Error: {}", e))),
             }
             is_generating.set(false);
         });
     };
-
-
 
     if !*is_visible.read() {
         return rsx! {};
@@ -144,7 +155,7 @@ Ensure the "optimized_context" maintains the correct schema for ActiveContext."#
             class: "fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm",
             onclick: move |_| {
                  // Close on backdrop click if not confirming? Better to keep modal strict.
-                 // on_cancel.call(()); 
+                 // on_cancel.call(());
             },
             onkeydown: move |evt: KeyboardEvent| {
                 if evt.key() == Key::Escape {
@@ -153,7 +164,7 @@ Ensure the "optimized_context" maintains the correct schema for ActiveContext."#
             },
             div {
                 class: "bg-dark-card border border-primary-700 rounded-lg shadow-xl w-[600px] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200",
-                
+
                 // Header
                 div {
                     class: "p-4 border-b border-primary-700 flex justify-between items-center bg-dark-section",
@@ -174,7 +185,7 @@ Ensure the "optimized_context" maintains the correct schema for ActiveContext."#
                 // Body
                 div {
                     class: "p-6 bg-dark-bg flex flex-col gap-4",
-                    
+
                     div {
                         label { class: "block text-sm font-medium text-gray-300 mb-2", "Instructions" }
                         textarea {
@@ -200,7 +211,7 @@ Ensure the "optimized_context" maintains the correct schema for ActiveContext."#
                 // Footer
                 div {
                     class: "p-4 border-t border-primary-700 bg-dark-section flex justify-end gap-3",
-                    
+
                     button {
                         class: "px-4 py-2 text-gray-300 hover:text-white transition-colors",
                         onclick: move |_| on_cancel.call(()),

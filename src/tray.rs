@@ -1,10 +1,5 @@
 use dioxus_signals::{GlobalSignal, Signal};
-use tray_icon::{
-    TrayIconBuilder,
-    Icon,
-    TrayIconEvent,
-    TrayIcon,
-};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 pub static WINDOW_VISIBLE: GlobalSignal<bool> = Signal::global(|| true);
 pub static APP_QUIT: GlobalSignal<bool> = Signal::global(|| false);
@@ -49,7 +44,7 @@ pub fn init_tray() -> TrayIcon {
                         tracing::info!("Tray icon clicked, toggling visibility.");
                         let mut visible = WINDOW_VISIBLE.write();
                         *visible = !*visible;
-                    },
+                    }
                     _ => (),
                 }
             }

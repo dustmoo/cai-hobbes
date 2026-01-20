@@ -4,15 +4,15 @@
 // - JS Local Global: For all other app shortcuts (Cmd+, Cmd+N, etc.)
 //   This ensures sandbox compatibility while providing "global-like" feel when focused.
 
-use dioxus::prelude::*;
-use dioxus_desktop::{DesktopContext, ShortcutHandle};
-use global_hotkey::hotkey::HotKey;
 use crate::components::chat_input::ChatCommand;
 use crate::settings::{Settings, SettingsManager};
 use crate::{permissions, tray::WINDOW_VISIBLE};
-use std::str::FromStr;
+use dioxus::prelude::*;
+use dioxus_desktop::{DesktopContext, ShortcutHandle};
+use futures_util::{SinkExt, StreamExt};
+use global_hotkey::hotkey::HotKey;
 use std::cell::RefCell;
-use futures_util::{StreamExt, SinkExt};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HotkeyAction {
@@ -24,19 +24,19 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
     let settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
-    
+
     // Coroutine to handle actions from the Native Global Hotkey (Tray Toggle)
     let tray_action_handler = use_coroutine(|mut rx: UnboundedReceiver<HotkeyAction>| async move {
         let mut last_trigger = std::time::Instant::now();
         // Initialize simple debounce mechanism
-        
+
         while let Some(action) = rx.next().await {
             // Debounce: Ignore events if they happen too close together (e.g. < 300ms)
             if last_trigger.elapsed() < std::time::Duration::from_millis(300) {
                 tracing::debug!("Debouncing global hotkey trigger");
                 continue;
             }
-            
+
             last_trigger = std::time::Instant::now();
             tracing::info!("Global Hotkey triggered: {:?}", action);
             match action {
@@ -54,10 +54,13 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
 
     use_effect(move || {
         // Only attempt to register native hotkeys if permissions are granted.
-        if matches!(permission_status.read().clone(), permissions::PermissionStatus::Granted) {
+        if matches!(
+            permission_status.read().clone(),
+            permissions::PermissionStatus::Granted
+        ) {
             let hotkey_str = settings.read().hotkeys.toggle_tray.clone();
             let tx = tray_action_handler.tx();
-            
+
             // Unregister old shortcut
             if let Some(handle) = current_tray_shortcut.borrow_mut().take() {
                 desktop.remove_shortcut(handle);
@@ -66,7 +69,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
             if let Ok(hotkey) = HotKey::from_str(&hotkey_str) {
                 // We access the static directly for the callback to keep it simple and thread-safe
                 if let Ok(handle) = desktop.create_shortcut(hotkey, move || {
-                     let _ = tx.unbounded_send(HotkeyAction::ToggleTray);
+                    let _ = tx.unbounded_send(HotkeyAction::ToggleTray);
                 }) {
                     *current_tray_shortcut.borrow_mut() = Some(handle);
                     tracing::info!("Registered Native Global Hotkey: {}", &hotkey_str);
@@ -99,7 +102,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 // Profile switching
                 s if s.starts_with("switch_profile_") => {
                     if let Ok(idx) = s.replace("switch_profile_", "").parse::<usize>() {
-                         switch_profile_by_index(idx, settings, settings_manager);
+                        switch_profile_by_index(idx, settings, settings_manager);
                     }
                 }
                 _ => tracing::warn!("Unknown JS hotkey action: {}", msg),
@@ -114,7 +117,8 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
         let mut tx = js_action_handler.tx();
 
         spawn(async move {
-            let js_code = format!(r#"
+            let js_code = format!(
+                r#"
                 window.hobbes_hotkey_config = {{}};
                 try {{
                     window.hobbes_hotkey_config = {};
@@ -191,11 +195,13 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                     
                     window.addEventListener('keydown', window.hobbes_hotkey_listener);
                 }}
-            "#, hotkey_json);
-            
+            "#,
+                hotkey_json
+            );
+
             // Create the eval context that listens for messages
             let mut eval = document::eval(&js_code);
-            
+
             // Relay messages to the Dioxus handler
             while let Ok(msg) = eval.recv::<String>().await {
                 let _ = tx.send(msg).await;
@@ -205,22 +211,26 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
 }
 
 // Helper to switch profile
-fn switch_profile_by_index(index: usize, mut settings: Signal<Settings>, settings_manager: Signal<SettingsManager>) {
+fn switch_profile_by_index(
+    index: usize,
+    mut settings: Signal<Settings>,
+    settings_manager: Signal<SettingsManager>,
+) {
     let mut current_settings = settings.read().clone();
-    
+
     // Check if we have enough profiles
     if index < current_settings.composio_profiles.len() {
         let new_profile_name = current_settings.composio_profiles[index].name.clone();
-        
+
         // Only if different
         if current_settings.active_composio_profile.as_deref() != Some(&new_profile_name) {
-             tracing::info!("Switching to profile index {}: {}", index, new_profile_name);
-             current_settings.active_composio_profile = Some(new_profile_name);
-             settings.set(current_settings);
-             // Persist to disk
-             if let Err(e) = settings_manager.read().save(&settings.read()) {
-                 tracing::error!("Failed to save profile switch: {}", e);
-             }
+            tracing::info!("Switching to profile index {}: {}", index, new_profile_name);
+            current_settings.active_composio_profile = Some(new_profile_name);
+            settings.set(current_settings);
+            // Persist to disk
+            if let Err(e) = settings_manager.read().save(&settings.read()) {
+                tracing::error!("Failed to save profile switch: {}", e);
+            }
         }
     }
 }

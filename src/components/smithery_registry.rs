@@ -68,38 +68,56 @@ impl SmitheryClient {
         }
     }
 
-    pub async fn fetch_servers(&self, query: Option<&str>, page: Option<u32>, sort: Option<&str>) -> Result<SmitheryResponse, String> {
+    pub async fn fetch_servers(
+        &self,
+        query: Option<&str>,
+        page: Option<u32>,
+        sort: Option<&str>,
+    ) -> Result<SmitheryResponse, String> {
         let url = "https://registry.smithery.ai/servers";
         let platform = get_platform();
         let search_query = query.unwrap_or("is:verified");
         let page = page.unwrap_or(1).to_string();
         let sort_param = sort.unwrap_or("relevance");
 
-        let response = self.client
+        let response = self
+            .client
             .get(url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .query(&[("q", search_query), ("platform", &platform), ("page", &page), ("sort", sort_param)])
+            .query(&[
+                ("q", search_query),
+                ("platform", &platform),
+                ("page", &page),
+                ("sort", sort_param),
+            ])
             .send()
             .await
             .map_err(|e| format!("Failed to fetch from Smithery: {}", e))?;
-        
+
         if !response.status().is_success() {
-            return Err(format!("Smithery API returned status: {}", response.status()));
+            return Err(format!(
+                "Smithery API returned status: {}",
+                response.status()
+            ));
         }
-        
+
         let smithery_response: SmitheryResponse = response
             .json()
             .await
             .map_err(|e| format!("Failed to parse Smithery response: {}", e))?;
-            
+
         Ok(smithery_response)
     }
 
     #[allow(dead_code)]
-    pub async fn fetch_server_details(&self, server_id: &str) -> Result<SmitheryServerDetail, String> {
+    pub async fn fetch_server_details(
+        &self,
+        server_id: &str,
+    ) -> Result<SmitheryServerDetail, String> {
         let url = format!("https://registry.smithery.ai/servers/{}", server_id);
-        
-        let response = self.client
+
+        let response = self
+            .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
@@ -107,7 +125,10 @@ impl SmitheryClient {
             .map_err(|e| format!("Failed to fetch from Smithery: {}", e))?;
 
         if !response.status().is_success() {
-            return Err(format!("Smithery API returned status: {}", response.status()));
+            return Err(format!(
+                "Smithery API returned status: {}",
+                response.status()
+            ));
         }
 
         response

@@ -1,34 +1,33 @@
-use dioxus::prelude::*;
-use tokio::sync::mpsc;
-use uuid::Uuid;
-use dioxus_free_icons::{Icon, icons::fi_icons};
-use std::rc::Rc;
-use dioxus::html::geometry::euclid::Rect;
-use std::time::Duration;
-use tokio::time::sleep;
-use crate::{components::stream_manager::StreamManagerContext};
-use lazy_static::lazy_static;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{ThemeSet, Theme};
-use syntect::parsing::SyntaxSet;
-use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
-use feature_clipboard::copy_to_clipboard;
-use crate::context::prompt_builder::PromptBuilder;
-use serde::{Deserialize, Serialize};
-use crate::{settings::Settings};
-use hobbes_core::models::Attachment;
-use super::shared::{MessageContent, StreamMessage};
-use super::continuation_controller::ContinuationController;
 use super::chat_input::ChatInput;
-use super::message_list::MessageList;
-use crate::context::permissions::PermissionManager;
-use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRenderer};
 use super::confirm_delete_modal::ConfirmDeleteModal;
-use super::quick_fix::QuickFix;
-use super::new_chat_memory_modal::NewChatMemoryModal;
+use super::continuation_controller::ContinuationController;
 use super::forget_memory_modal::ForgetMemoryModal;
+use super::message_list::MessageList;
+use super::new_chat_memory_modal::NewChatMemoryModal;
+use super::quick_fix::QuickFix;
+use super::shared::{MessageContent, StreamMessage};
+use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRenderer};
+use crate::components::stream_manager::StreamManagerContext;
+use crate::context::permissions::PermissionManager;
+use crate::context::prompt_builder::PromptBuilder;
 use crate::session::ActiveContext;
-
+use crate::settings::Settings;
+use dioxus::html::geometry::euclid::Rect;
+use dioxus::prelude::*;
+use dioxus_free_icons::{icons::fi_icons, Icon};
+use feature_clipboard::copy_to_clipboard;
+use hobbes_core::models::Attachment;
+use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
+use std::rc::Rc;
+use std::time::Duration;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
+use syntect::parsing::SyntaxSet;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SelectionData {
@@ -73,7 +72,13 @@ pub struct Message {
 
 // The main ChatWindow component
 #[component]
-pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interaction: EventHandler<()>, on_toggle_sessions: EventHandler<()>, on_toggle_settings: EventHandler<()>, on_toggle_mcp_manager: EventHandler<()>) -> Element {
+pub fn ChatWindow(
+    on_content_resize: EventHandler<Rect<f64, f64>>,
+    on_interaction: EventHandler<()>,
+    on_toggle_sessions: EventHandler<()>,
+    on_toggle_settings: EventHandler<()>,
+    on_toggle_mcp_manager: EventHandler<()>,
+) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let mut settings = use_context::<Signal<Settings>>();
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
@@ -89,7 +94,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     let mut last_session_id = use_signal(|| session_state.read().active_session_id.clone());
     let mut stream_update_trigger = use_signal(|| 0);
     let mut show_scroll_button = use_signal(|| false);
-    
+
     // Delete modal state
     let mut show_delete_confirm_modal = use_signal(|| false);
     let mut pending_delete_message_id = use_signal(|| None::<String>);
@@ -148,24 +153,31 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 // On the very first load, we always scroll to the bottom.
                 // On subsequent loads, we only scroll if the user was already near the bottom.
                 if is_session_switch || *is_initial_load.read() || is_near_bottom {
-                    let _ = document::eval(r#"
+                    let _ = document::eval(
+                        r#"
                         const el = document.getElementById('message-list');
                         if (el) { el.scrollTop = el.scrollHeight; }
-                    "#).await;
+                    "#,
+                    )
+                    .await;
                     if *is_initial_load.read() {
                         is_initial_load.set(false);
                     }
                 }
 
                 // After scrolling, check if the scroll button should be visible.
-                let show_button = if let Ok(result) = document::eval(r#"
+                let show_button = if let Ok(result) = document::eval(
+                    r#"
                     const el = document.getElementById('message-list');
                     if (el) {
                         // Show button if not at the bottom (with a small threshold)
                         return el.scrollHeight - el.scrollTop - el.clientHeight > 10;
                     }
                     return false; // Don't show if element doesn't exist
-                "#).await {
+                "#,
+                )
+                .await
+                {
                     result.as_bool().unwrap_or(false)
                 } else {
                     false
@@ -199,7 +211,9 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&active_session_id) {
                         for msg in &session.messages {
-                            if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
+                            if let crate::components::shared::MessageContent::ToolCall(tc) =
+                                &msg.content
+                            {
                                 if tc.status == crate::components::shared::ToolCallStatus::Running {
                                     tools_to_run.push((msg.id, tc.clone()));
                                 }
@@ -209,16 +223,24 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                 }
 
                 if tools_to_run.is_empty() {
-                     stream_manager_is_sending.set(false);
-                     return;
+                    stream_manager_is_sending.set(false);
+                    return;
                 }
 
                 // 2. Execute tools
                 for (msg_id, tool_call) in tools_to_run {
-                    let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
+                    let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments)
+                        .unwrap_or(serde_json::Value::Null);
                     // Bypass permission check since user explicitly approved this instance
                     let manager = mcp_manager.read().clone();
-                    let result_receiver = manager.use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, true).await;
+                    let result_receiver = manager
+                        .use_mcp_tool(
+                            &tool_call.server_name,
+                            &tool_call.tool_name,
+                            args_json,
+                            true,
+                        )
+                        .await;
 
                     let (status, response_str, _) = match result_receiver {
                         Ok(receiver) => {
@@ -230,34 +252,35 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     // Update session state with result
                     {
                         let mut state = session_state.write();
-                        
+
                         // Update message status
                         if let Some(msg) = state.get_message_mut(&msg_id) {
-                            if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                            if let crate::components::shared::MessageContent::ToolCall(tc) =
+                                &mut msg.content
+                            {
                                 tc.status = status;
                                 tc.response = response_str.clone();
                             }
                         }
 
                         // Add to history for context
-                        state.tool_call_history.push(crate::components::shared::ToolCallRecord {
-                            call: tool_call.clone(),
-                            result: crate::components::shared::ToolResult {
-                                status,
-                                response: response_str,
-                            },
-                        });
+                        state
+                            .tool_call_history
+                            .push(crate::components::shared::ToolCallRecord {
+                                call: tool_call.clone(),
+                                result: crate::components::shared::ToolResult {
+                                    status,
+                                    response: response_str,
+                                },
+                            });
                     }
                 }
-                
+
                 // 3. Trigger continuation to send results back to LLM
                 continuation_controller.read().trigger_continuation();
             });
         }
     });
-
-
-
 
     // Reusable closure for sending a message
     let send_prompt_to_llm = {
@@ -266,7 +289,9 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
         let settings = settings;
         let active_message_id = active_message_id;
 
-        move |prompt_data: crate::context::prompt_builder::LlmPrompt, mcp_context: Option<crate::mcp::manager::McpContext>, hobbes_message_id: Uuid| {
+        move |prompt_data: crate::context::prompt_builder::LlmPrompt,
+              mcp_context: Option<crate::mcp::manager::McpContext>,
+              hobbes_message_id: Uuid| {
             spawn(async move {
                 // Now clone/read them inside the async block
                 let stream_manager = stream_manager;
@@ -334,29 +359,32 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
             if user_message.trim().is_empty() && attachments.is_empty() {
                 // Auto-resume handled by use_effect now.
 
-                
                 if *has_new_comments.read() {
-                     // Submit comments as a turn
-                     has_new_comments.set(false);
-                     
-                     // Trigger LLM generation with empty user message (PromptBuilder will use history + comments)
-                     let hobbes_message_id = Uuid::new_v4();
-                     {
+                    // Submit comments as a turn
+                    has_new_comments.set(false);
+
+                    // Trigger LLM generation with empty user message (PromptBuilder will use history + comments)
+                    let hobbes_message_id = Uuid::new_v4();
+                    {
                         let mut state = session_state.write();
                         if let Some(session) = state.get_active_session_mut() {
                             session.messages.push(Message {
                                 id: hobbes_message_id,
                                 author: "Hobbes".to_string(),
-                                content: MessageContent::Text { content: "".to_string(), thought_signature: None, thought_summary: None },
+                                content: MessageContent::Text {
+                                    content: "".to_string(),
+                                    thought_signature: None,
+                                    thought_summary: None,
+                                },
                                 attachments: Vec::new(),
                                 comments: Vec::new(),
                                 created_at: chrono::Utc::now(),
                                 usage: None,
                             });
                         }
-                     }
-                     
-                     let prompt_data = {
+                    }
+
+                    let prompt_data = {
                         let state = session_state.read();
                         if let Some(session) = state.get_active_session() {
                             let builder = PromptBuilder::new(session, &settings, &state);
@@ -364,14 +392,17 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                         } else {
                             return;
                         }
-                     };
-                     
-                     let mcp_context = session_state.read().get_active_session().and_then(|s| s.active_context.mcp_tools.clone());
-                     send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
+                    };
+
+                    let mcp_context = session_state
+                        .read()
+                        .get_active_session()
+                        .and_then(|s| s.active_context.mcp_tools.clone());
+                    send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
                 }
                 return;
             }
-            
+
             has_new_comments.set(false);
 
             if permission_manager.read().is_turn_limit_reached() {
@@ -380,7 +411,11 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
                         author: "User".to_string(),
-content: MessageContent::Text { content: user_message.clone(), thought_signature: None, thought_summary: None },
+                        content: MessageContent::Text {
+                            content: user_message.clone(),
+                            thought_signature: None,
+                            thought_summary: None,
+                        },
                         attachments,
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
@@ -402,11 +437,14 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
             let hobbes_message_id = Uuid::new_v4();
             {
                 let mut state = session_state.write();
-                
-                // Ensure we have a valid active session. 
+
+                // Ensure we have a valid active session.
                 // If active_session_id is set but not found (inconsistent state), or empty, create a new one.
                 if state.get_active_session().is_none() {
-                    tracing::warn!("Active session ID '{}' not found in sessions. Creating new session.", state.active_session_id);
+                    tracing::warn!(
+                        "Active session ID '{}' not found in sessions. Creating new session.",
+                        state.active_session_id
+                    );
                     state.create_session();
                 }
 
@@ -414,7 +452,11 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
                         author: "User".to_string(),
-                        content: MessageContent::Text { content: user_message.clone(), thought_signature: None, thought_summary: None },
+                        content: MessageContent::Text {
+                            content: user_message.clone(),
+                            thought_signature: None,
+                            thought_summary: None,
+                        },
                         attachments,
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
@@ -423,7 +465,11 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                     session.messages.push(Message {
                         id: hobbes_message_id,
                         author: "Hobbes".to_string(),
-                        content: MessageContent::Text { content: "".to_string(), thought_signature: None, thought_summary: None },
+                        content: MessageContent::Text {
+                            content: "".to_string(),
+                            thought_signature: None,
+                            thought_summary: None,
+                        },
                         attachments: Vec::new(),
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
@@ -435,9 +481,10 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
             let prompt_data = {
                 let mcp_context = mcp_manager.read().get_mcp_context().await;
                 let user_prompt = user_message.clone();
-                
+
                 // Safely get conversation summary
-                let conversation_summary = session_state.read()
+                let conversation_summary = session_state
+                    .read()
                     .get_active_session()
                     .map(|s| s.active_context.conversation_summary.clone())
                     .unwrap_or_default();
@@ -500,7 +547,11 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                         session.messages.push(Message {
                             id: hobbes_message_id,
                             author: "Hobbes".to_string(),
-                            content: MessageContent::Text { content: "".to_string(), thought_signature: None, thought_summary: None },
+                            content: MessageContent::Text {
+                                content: "".to_string(),
+                                thought_signature: None,
+                                thought_summary: None,
+                            },
                             attachments: Vec::new(),
                             comments: Vec::new(),
                             created_at: chrono::Utc::now(),
@@ -520,7 +571,10 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                     tracing::error!("Failed to save session state before continuation: {}", e);
                 }
 
-                let mcp_context = session_state.read().get_active_session().and_then(|s| s.active_context.mcp_tools.clone());
+                let mcp_context = session_state
+                    .read()
+                    .get_active_session()
+                    .and_then(|s| s.active_context.mcp_tools.clone());
                 tracing::debug!("Sending continuation prompt to LLM.");
                 send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
             });
@@ -528,16 +582,26 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
     };
 
     use_effect(move || {
-        continuation_controller.write().register_callback(continue_prompt_flow.clone());
+        continuation_controller
+            .write()
+            .register_callback(continue_prompt_flow.clone());
     });
-    
+
     let root_classes = "relative flex flex-col bg-dark-bg text-dark-text rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
 
     let delete_message = move |message_id: Uuid| {
         let confirm = settings.read().confirm_on_message_delete;
         if confirm {
-            if let Some(index) = session_state.read().get_active_session().and_then(|s| s.messages.iter().position(|m| m.id == message_id)) {
-                let session_len = session_state.read().get_active_session().map(|s| s.messages.len()).unwrap_or(0);
+            if let Some(index) = session_state
+                .read()
+                .get_active_session()
+                .and_then(|s| s.messages.iter().position(|m| m.id == message_id))
+            {
+                let session_len = session_state
+                    .read()
+                    .get_active_session()
+                    .map(|s| s.messages.len())
+                    .unwrap_or(0);
                 let count = session_len - index;
                 delete_message_count.set(count);
                 pending_delete_message_id.set(Some(message_id.to_string()));
@@ -571,16 +635,16 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                     let mut state = session_state.write();
                     if let Some(session) = state.get_active_session_mut() {
                         session.active_context = new_context;
-                        session.memory_optimization_summary = Some(summary.clone()); 
-                        
+                        session.memory_optimization_summary = Some(summary.clone());
+
                         // Insert Internal Turn Message
                         session.messages.push(Message {
                             id: Uuid::new_v4(),
                             author: "Hobbes".to_string(),
-                            content: MessageContent::Text { 
-                                content: format!("✨ **Memory Optimized**\n\n{}", summary), 
-                                thought_signature: None, 
-                                thought_summary: None 
+                            content: MessageContent::Text {
+                                content: format!("✨ **Memory Optimized**\n\n{}", summary),
+                                thought_signature: None,
+                                thought_summary: None,
                             },
                             attachments: Vec::new(),
                             comments: Vec::new(),
@@ -588,13 +652,13 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                             usage: None,
                         });
                     }
-                } 
+                }
                 if let Err(e) = session_state.read().save() {
-                        tracing::error!("Failed to save session after optimization: {}", e);
+                    tracing::error!("Failed to save session after optimization: {}", e);
                 }
                 // Force refresh messagelist
                 stream_update_trigger.set(stream_update_trigger() + 1);
-            },
+            }
             OptimizationTarget::NewChatModal => {
                 // Update the New Chat Modal's initial context signal
                 // This triggers the use_effect in NewChatMemoryModal to update the JSON editor
@@ -721,12 +785,15 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
 
     let lang_for_memo = lang.clone();
     let highlighted_html = use_memo(move || {
-        let syntax = SYNTAX_SET.find_syntax_by_token(&lang_for_memo).unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
+        let syntax = SYNTAX_SET
+            .find_syntax_by_token(&lang_for_memo)
+            .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
         let mut h = HighlightLines::new(syntax, &THEME);
         let mut html = String::new();
         for line in code.lines() {
             let regions = h.highlight_line(line, &SYNTAX_SET).unwrap();
-            let html_line = styled_line_to_highlighted_html(&regions, IncludeBackground::No).unwrap();
+            let html_line =
+                styled_line_to_highlighted_html(&regions, IncludeBackground::No).unwrap();
             html.push_str(&html_line);
             html.push('\n');
         }
@@ -782,56 +849,71 @@ enum SelectionMode {
 }
 
 #[component]
-pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_selection: EventHandler<(String, f64, f64)>, on_delete: EventHandler<()>, on_comment: EventHandler<()>) -> Element {
+pub fn MessageBubble(
+    message: Message,
+    on_content_update: EventHandler<()>,
+    on_selection: EventHandler<(String, f64, f64)>,
+    on_delete: EventHandler<()>,
+    on_comment: EventHandler<()>,
+) -> Element {
     let is_user = message.author == "User";
-    
+
     // Get necessary contexts
     let settings = consume_context::<Signal<Settings>>();
     let stream_manager = consume_context::<StreamManagerContext>();
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let mut chat_input_draft = consume_context::<Signal<String>>();
-    
+
     let _is_thinking = false;
     let mut thought_signature: Option<String> = None;
     let mut thought_summary: Option<String> = None;
 
-    if let MessageContent::Text { thought_signature: ts, thought_summary: tsum, .. } = &message.content {
+    if let MessageContent::Text {
+        thought_signature: ts,
+        thought_summary: tsum,
+        ..
+    } = &message.content
+    {
         if stream_manager.is_generating(&message.id) {
-             // is_thinking = true;
+            // is_thinking = true;
         }
         thought_signature = ts.clone();
         thought_summary = tsum.clone();
     }
 
     match &message.content {
-        MessageContent::Text { content: text_content, .. } => {
+        MessageContent::Text {
+            content: text_content,
+            ..
+        } => {
             let mut content = use_signal(|| text_content.clone());
             let mut local_thought_summary = use_signal(|| thought_summary.clone());
             let mut copied = use_signal(|| false);
-            
+
             // Token usage display settings - consume BEFORE signal initialization
             let ui_state = consume_context::<Signal<crate::settings::UiState>>();
-            
+
             // Initialize toggle states from UiState defaults (not hardcoded)
             let mut show_thinking = use_signal(|| ui_state.read().default_tool_thought_open);
             let mut show_usage = use_signal(|| false); // No default setting yet
-            
+
             let display_mode = ui_state.read().token_display_mode.clone();
             let usage_data = message.usage.clone();
-            
+
             // Inline comment state
             let mut selection_mode = use_signal(|| SelectionMode::None);
             let mut selection_data = use_signal(|| (String::new(), 0.0, 0.0)); // text, top, left
             let mut editing_comment_id = use_signal(|| None::<String>);
             let mut is_mouse_over_toolbar = use_signal(|| false);
-            
+
             // Setup eval for text selection
             let message_id_str = message.id.to_string();
-            
+
             use_effect(move || {
                 let message_id_clone = message_id_str.clone();
                 spawn(async move {
-                    let mut eval = document::eval(&format!(r#"
+                    let mut eval = document::eval(&format!(
+                        r#"
                         const bubble = document.getElementById('message-bubble-{}');
                         if (bubble) {{
                             bubble.addEventListener('mouseup', (e) => {{
@@ -881,7 +963,9 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                 dioxus.send({{ text: "", top: 0, left: 0, hide: true }});
                             }}
                         }});
-                    "#, message_id_clone));
+                    "#,
+                        message_id_clone
+                    ));
 
                     while let Ok(msg) = eval.recv().await {
                         if let Ok(data) = serde_json::from_value::<SelectionData>(msg) {
@@ -906,18 +990,23 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                     spawn(async move {
                         if let Some(mut rx) = stream_manager.take_stream(&message.id) {
                             while let Some(stream_msg) = rx.recv().await {
-                                if let StreamMessage::Text { content: chunk, thought_summary: summary_chunk, .. } = stream_msg {
+                                if let StreamMessage::Text {
+                                    content: chunk,
+                                    thought_summary: summary_chunk,
+                                    ..
+                                } = stream_msg
+                                {
                                     tracing::debug!("CHUNK RECEIVED: '{}'", &chunk);
                                     if !chunk.is_empty() {
-                                       content.write().push_str(&chunk);
+                                        content.write().push_str(&chunk);
                                     }
                                     if let Some(summary) = summary_chunk {
-                                       let mut current = local_thought_summary.write();
-                                       if let Some(curr_str) = &mut *current {
-                                           curr_str.push_str(&summary);
-                                       } else {
-                                           *current = Some(summary);
-                                       }
+                                        let mut current = local_thought_summary.write();
+                                        if let Some(curr_str) = &mut *current {
+                                            curr_str.push_str(&summary);
+                                        } else {
+                                            *current = Some(summary);
+                                        }
                                     }
                                     on_content_update.call(());
                                 }
@@ -935,22 +1024,29 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
             } else {
                 "bg-dark-card text-dark-text self-start mr-auto"
             };
-            let container_classes = if is_user { "flex justify-end" } else { "flex justify-start" };
-        let author_classes = format!(
-            "text-xs text-gray-500 mt-1 px-2 {}",
-            if is_user { "text-right" } else { "text-left" }
-        );
+            let container_classes = if is_user {
+                "flex justify-end"
+            } else {
+                "flex justify-start"
+            };
+            let author_classes = format!(
+                "text-xs text-gray-500 mt-1 px-2 {}",
+                if is_user { "text-right" } else { "text-left" }
+            );
 
+            let _button_position_classes = if is_user {
+                "absolute bottom-[-10px] left-[-10px]"
+            } else {
+                "absolute bottom-[-10px] right-[-10px]"
+            };
 
-        let _button_position_classes = if is_user {
-            "absolute bottom-[-10px] left-[-10px]"
-        } else {
-            "absolute bottom-[-10px] right-[-10px]"
-        };
+            let controls_position_class = if is_user {
+                "bottom-[-25px] left-[-25px]"
+            } else {
+                "bottom-[-25px] right-[-25px]"
+            };
 
-        let controls_position_class = if is_user { "bottom-[-25px] left-[-25px]" } else { "bottom-[-25px] right-[-25px]" };
-
-        rsx! {
+            rsx! {
             div {
                 class: "{container_classes} w-full",
                 div {
@@ -963,8 +1059,8 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                             if is_thinking {
                                 ThinkingIndicator { thinking_mode_enabled, thought_summary: local_thought_summary.read().clone() }
                             } else {
-                                MarkdownRenderer { 
-                                    content: content(), 
+                                MarkdownRenderer {
+                                    content: content(),
                                     comments: message.comments.clone(),
                                     pending_highlight: if *selection_mode.read() != SelectionMode::None && *selection_mode.read() != SelectionMode::CommentEdit {
                                         Some(selection_data.read().0.clone())
@@ -1047,7 +1143,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                 }
                             }
                         }
-                        
+
                         if *selection_mode.read() == SelectionMode::Toolbar {
                             SelectionToolbar {
                                 position_top: selection_data.read().1,
@@ -1084,7 +1180,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                         end_offset: 0,   // Not used in this version
                                         comment: comment_text,
                                     };
-                                    
+
                                     // Update session state
                                     let mut state = session_state.write();
                                     if let Some(msg) = state.get_message_mut(&message.id) {
@@ -1093,9 +1189,9 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                     if let Err(e) = state.save() {
                                         tracing::error!("Failed to save session after adding comment: {}", e);
                                     }
-                                    
+
                                     on_comment.call(());
-                                    
+
                                     selection_mode.set(SelectionMode::None);
                                 },
                                 on_cancel: move |_| {
@@ -1103,7 +1199,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                 }
                             }
                         }
-                        
+
                         if *selection_mode.read() == SelectionMode::CommentEdit {
                             // Get the comment being edited
                             {{
@@ -1112,7 +1208,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                         .find(|c| &c.id == comment_id)
                                         .map(|c| c.comment.clone())
                                 });
-                                
+
                                 rsx! {
                                     crate::components::inline_comment_popover::InlineCommentPopover {
                                         position_top: 150.0,
@@ -1168,7 +1264,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                         Icon { width: 14, height: 14, icon: fi_icons::FiCopy }
                                     }
                                 }
-                                
+
                                 button {
                                     class: "p-1.5 text-gray-400 hover:text-red-400 rounded transition-colors",
                                     onclick: move |_| on_delete.call(()),
@@ -1177,18 +1273,18 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                 }
                             }
                         }
-                        
+
                         // Two-column footer: Thinking Process (left) | Metering (right)
                         {
                             let has_thinking = !is_thinking && (local_thought_summary.read().is_some() || thought_signature.is_some());
                             let has_usage = usage_data.is_some() && display_mode != "none";
-                            
+
                             if has_thinking || has_usage {
                                 rsx! {
                                     div {
                                         // Two-column layout with gap
                                         class: "mx-4 mb-2 flex justify-between items-start gap-4",
-                                        
+
                                         // Left column: Thinking Process
                                         div {
                                             class: "flex flex-col",
@@ -1200,16 +1296,16 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                                         show_thinking.set(!current);
                                                     },
                                                     if *show_thinking.read() {
-                                                        Icon { 
-                                                            width: 10, 
-                                                            height: 10, 
+                                                        Icon {
+                                                            width: 10,
+                                                            height: 10,
                                                             icon: fi_icons::FiChevronDown,
                                                             class: "mr-1"
                                                         }
                                                     } else {
-                                                        Icon { 
-                                                            width: 10, 
-                                                            height: 10, 
+                                                        Icon {
+                                                            width: 10,
+                                                            height: 10,
                                                             icon: fi_icons::FiChevronRight,
                                                             class: "mr-1"
                                                         }
@@ -1234,7 +1330,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                                 }
                                             }
                                         }
-                                        
+
                                         // Right column: Token usage / Metering
                                         div {
                                             class: "flex flex-col items-end",
@@ -1246,7 +1342,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                                             let current = *show_usage.read();
                                                             show_usage.set(!current);
                                                         },
-                                                        span { 
+                                                        span {
                                                             class: "opacity-70 font-mono",
                                                             {
                                                                 let tokens = usage.total_tokens;
@@ -1267,7 +1363,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                                     if *show_usage.read() {
                                                         div {
                                                             class: "mt-2 p-3 bg-dark-bg rounded-lg text-xs text-gray-300 font-mono",
-                                                            div { class: "flex justify-between gap-4", 
+                                                            div { class: "flex justify-between gap-4",
                                                                 span { "Prompt:" }
                                                                 span { "{usage.prompt_tokens}" }
                                                             }
@@ -1318,7 +1414,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                         div {
                             id: "message-bubble-{message.id}",
                             class: "rounded-lg p-4 max-w-3xl shadow-md {bubble_classes}",
-                            
+
                             div {
                                 class: "flex items-start gap-3",
                                 div {
@@ -1351,7 +1447,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                 }
             }
         }
-        _ => rsx! {}
+        _ => rsx! {},
     }
 }
 
@@ -1384,7 +1480,7 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                         }}
                         return false;
                     "#, unique_id_js));
-                    
+
                     if let Ok(should_pop_left) = eval.recv::<bool>().await {
                         pop_left.set(should_pop_left);
                     }
@@ -1399,11 +1495,11 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                 "{text}"
             }
             span {
-                class: format!("inline-flex items-center absolute {} z-10 {} transition-opacity duration-200 bg-dark-card rounded-lg p-1 shadow-lg border border-gray-700 space-x-2", 
+                class: format!("inline-flex items-center absolute {} z-10 {} transition-opacity duration-200 bg-dark-card rounded-lg p-1 shadow-lg border border-gray-700 space-x-2",
                     if *pop_left.read() { "right-full mr-1" } else { "left-full ml-1" },
                     if *is_hovered.read() { "opacity-100" } else { "opacity-0" }
                 ),
-                
+
                 button {
                     class: "p-1.5 text-gray-400 hover:text-white rounded transition-colors",
                     onclick: move |evt| {
@@ -1482,17 +1578,20 @@ fn ThinkingIndicator(thinking_mode_enabled: bool, thought_summary: Option<String
     }
 }
 
-
 fn extract_bold_blocks(content: &str) -> Option<String> {
     let parts: Vec<&str> = content.split("**").collect();
-    if parts.len() < 3 { return None; }
+    if parts.len() < 3 {
+        return None;
+    }
     let mut bolded = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         if i % 2 == 1 && !part.is_empty() {
-             bolded.push(*part);
+            bolded.push(*part);
         }
     }
-    if bolded.is_empty() { return None; }
+    if bolded.is_empty() {
+        return None;
+    }
     let summary = bolded.into_iter().take(3).collect::<Vec<_>>().join("... ");
     Some(summary)
 }

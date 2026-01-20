@@ -42,7 +42,7 @@ unsafe extern "C" {
     fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTypeRef) -> i32;
     fn SecItemAdd(attributes: CFTypeRef, result: *mut CFTypeRef) -> i32;
     fn SecItemDelete(query: CFTypeRef) -> i32;
-    
+
     // SecAccessControl functions
     fn SecAccessControlCreateWithFlags(
         allocator: CFTypeRef, // CFAllocatorRef, use null for default
@@ -50,7 +50,7 @@ unsafe extern "C" {
         flags: u64, // SecAccessControlCreateFlags
         error: *mut CFTypeRef,
     ) -> CFTypeRef; // Returns SecAccessControlRef
-    
+
     // CoreFoundation functions
     fn CFDictionarySetValue(theDict: CFTypeRef, key: CFTypeRef, value: CFTypeRef);
     fn CFRelease(cf: CFTypeRef);
@@ -75,7 +75,11 @@ unsafe fn set_access_group_if_sandboxed(query: &CFMutableDictionary) {
     if is_sandboxed() {
         let access_group = CFString::new(KEYCHAIN_ACCESS_GROUP);
         unsafe {
-            dict_set(query, kSecAttrAccessGroup, access_group.as_concrete_TypeRef() as CFTypeRef);
+            dict_set(
+                query,
+                kSecAttrAccessGroup,
+                access_group.as_concrete_TypeRef() as CFTypeRef,
+            );
         }
     }
     // For PRO/Developer ID builds, omit access group to use default keychain access
@@ -142,12 +146,24 @@ pub fn find_generic_password_with_context(
 
     unsafe {
         dict_set(&query, kSecClass, kSecClassGenericPassword);
-        dict_set(&query, kSecAttrService, service_name.as_concrete_TypeRef() as CFTypeRef);
-        dict_set(&query, kSecAttrAccount, account_name.as_concrete_TypeRef() as CFTypeRef);
+        dict_set(
+            &query,
+            kSecAttrService,
+            service_name.as_concrete_TypeRef() as CFTypeRef,
+        );
+        dict_set(
+            &query,
+            kSecAttrAccount,
+            account_name.as_concrete_TypeRef() as CFTypeRef,
+        );
         set_access_group_if_sandboxed(&query);
         dict_set(&query, kSecMatchLimit, kSecMatchLimitOne);
-        dict_set(&query, kSecReturnData, CFBoolean::true_value().as_concrete_TypeRef() as CFTypeRef);
-        
+        dict_set(
+            &query,
+            kSecReturnData,
+            CFBoolean::true_value().as_concrete_TypeRef() as CFTypeRef,
+        );
+
         // Search for both local and synchronizable items
         dict_set(&query, kSecAttrSynchronizable, kSecAttrSynchronizableAny);
 
@@ -161,12 +177,8 @@ pub fn find_generic_password_with_context(
 
     let mut result: CFTypeRef = ptr::null();
 
-    let status = unsafe {
-        SecItemCopyMatching(
-            query.as_concrete_TypeRef() as CFTypeRef,
-            &mut result,
-        )
-    };
+    let status =
+        unsafe { SecItemCopyMatching(query.as_concrete_TypeRef() as CFTypeRef, &mut result) };
 
     match status {
         ERR_SEC_SUCCESS => {
@@ -208,24 +220,32 @@ pub fn find_generic_password(account: &str) -> Result<String, KeychainError> {
 
     unsafe {
         dict_set(&query, kSecClass, kSecClassGenericPassword);
-        dict_set(&query, kSecAttrService, service_name.as_concrete_TypeRef() as CFTypeRef);
-        dict_set(&query, kSecAttrAccount, account_name.as_concrete_TypeRef() as CFTypeRef);
+        dict_set(
+            &query,
+            kSecAttrService,
+            service_name.as_concrete_TypeRef() as CFTypeRef,
+        );
+        dict_set(
+            &query,
+            kSecAttrAccount,
+            account_name.as_concrete_TypeRef() as CFTypeRef,
+        );
         set_access_group_if_sandboxed(&query);
         dict_set(&query, kSecMatchLimit, kSecMatchLimitOne);
-        dict_set(&query, kSecReturnData, CFBoolean::true_value().as_concrete_TypeRef() as CFTypeRef);
-        
+        dict_set(
+            &query,
+            kSecReturnData,
+            CFBoolean::true_value().as_concrete_TypeRef() as CFTypeRef,
+        );
+
         // Search for both local and synchronizable items
         dict_set(&query, kSecAttrSynchronizable, kSecAttrSynchronizableAny);
     }
 
     let mut result: CFTypeRef = ptr::null();
 
-    let status = unsafe {
-        SecItemCopyMatching(
-            query.as_concrete_TypeRef() as CFTypeRef,
-            &mut result,
-        )
-    };
+    let status =
+        unsafe { SecItemCopyMatching(query.as_concrete_TypeRef() as CFTypeRef, &mut result) };
 
     match status {
         ERR_SEC_SUCCESS => {
@@ -269,17 +289,33 @@ pub fn set_generic_password(account: &str, password: &str) -> Result<(), Keychai
 
     unsafe {
         dict_set(&query, kSecClass, kSecClassGenericPassword);
-        dict_set(&query, kSecAttrService, service_name.as_concrete_TypeRef() as CFTypeRef);
-        dict_set(&query, kSecAttrAccount, account_name.as_concrete_TypeRef() as CFTypeRef);
+        dict_set(
+            &query,
+            kSecAttrService,
+            service_name.as_concrete_TypeRef() as CFTypeRef,
+        );
+        dict_set(
+            &query,
+            kSecAttrAccount,
+            account_name.as_concrete_TypeRef() as CFTypeRef,
+        );
         set_access_group_if_sandboxed(&query);
-        dict_set(&query, kSecValueData, password_data.as_concrete_TypeRef() as CFTypeRef);
-        
+        dict_set(
+            &query,
+            kSecValueData,
+            password_data.as_concrete_TypeRef() as CFTypeRef,
+        );
+
         // Make the item synchronizable (syncs via iCloud) ONLY if sandboxed (provisioned)
         // PRO builds without provisioning profiles cannot use iCloud Keychain
         if is_sandboxed() {
-            dict_set(&query, kSecAttrSynchronizable, CFBoolean::true_value().as_concrete_TypeRef() as CFTypeRef);
+            dict_set(
+                &query,
+                kSecAttrSynchronizable,
+                CFBoolean::true_value().as_concrete_TypeRef() as CFTypeRef,
+            );
         }
-        
+
         // Use standard "WhenUnlocked" protection (required for sync, "ThisDeviceOnly" prevents it)
         dict_set(&query, kSecAttrAccessible, kSecAttrAccessibleWhenUnlocked);
     }
@@ -308,10 +344,18 @@ pub fn delete_generic_password(account: &str) -> Result<(), KeychainError> {
 
     unsafe {
         dict_set(&query, kSecClass, kSecClassGenericPassword);
-        dict_set(&query, kSecAttrService, service_name.as_concrete_TypeRef() as CFTypeRef);
-        dict_set(&query, kSecAttrAccount, account_name.as_concrete_TypeRef() as CFTypeRef);
+        dict_set(
+            &query,
+            kSecAttrService,
+            service_name.as_concrete_TypeRef() as CFTypeRef,
+        );
+        dict_set(
+            &query,
+            kSecAttrAccount,
+            account_name.as_concrete_TypeRef() as CFTypeRef,
+        );
         set_access_group_if_sandboxed(&query);
-        
+
         // Ensure we find synchronizable items to delete them
         dict_set(&query, kSecAttrSynchronizable, kSecAttrSynchronizableAny);
     }
@@ -351,12 +395,12 @@ pub fn set_generic_password_with_biometric_protection(
     let access_control = unsafe {
         let mut error: CFTypeRef = ptr::null();
         let ac = SecAccessControlCreateWithFlags(
-            ptr::null(),  // Use default allocator
-            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,  // Device-only (biometrics can't sync)
-            SEC_ACCESS_CONTROL_USER_PRESENCE,  // Requires biometric OR passcode
+            ptr::null(),                                  // Use default allocator
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly, // Device-only (biometrics can't sync)
+            SEC_ACCESS_CONTROL_USER_PRESENCE,             // Requires biometric OR passcode
             &mut error,
         );
-        
+
         if ac.is_null() {
             tracing::error!("Failed to create SecAccessControl: error = {:?}", error);
             if !error.is_null() {
@@ -364,7 +408,7 @@ pub fn set_generic_password_with_biometric_protection(
             }
             return Err(KeychainError::SecurityError(-1));
         }
-        
+
         ac
     };
 
@@ -375,14 +419,26 @@ pub fn set_generic_password_with_biometric_protection(
 
     unsafe {
         dict_set(&query, kSecClass, kSecClassGenericPassword);
-        dict_set(&query, kSecAttrService, service_name.as_concrete_TypeRef() as CFTypeRef);
-        dict_set(&query, kSecAttrAccount, account_name.as_concrete_TypeRef() as CFTypeRef);
+        dict_set(
+            &query,
+            kSecAttrService,
+            service_name.as_concrete_TypeRef() as CFTypeRef,
+        );
+        dict_set(
+            &query,
+            kSecAttrAccount,
+            account_name.as_concrete_TypeRef() as CFTypeRef,
+        );
         set_access_group_if_sandboxed(&query);
-        dict_set(&query, kSecValueData, password_data.as_concrete_TypeRef() as CFTypeRef);
-        
+        dict_set(
+            &query,
+            kSecValueData,
+            password_data.as_concrete_TypeRef() as CFTypeRef,
+        );
+
         // NOTE: Biometric items (kSecAttrAccessControl with userPresence) CANNOT be synchronizable.
         // The Secure Enclave binds them to this device. Do NOT set kSecAttrSynchronizable here.
-        
+
         // This is the key: set the access control to require user presence!
         dict_set(&query, kSecAttrAccessControl, access_control);
     }
@@ -398,7 +454,11 @@ pub fn set_generic_password_with_biometric_protection(
             Ok(())
         }
         code => {
-            tracing::error!("Failed to save secret '{}' with biometric protection: error = {}", account, code);
+            tracing::error!(
+                "Failed to save secret '{}' with biometric protection: error = {}",
+                account,
+                code
+            );
             Err(KeychainError::SecurityError(code))
         }
     }

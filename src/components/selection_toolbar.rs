@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_free_icons::{Icon, icons::fi_icons};
+use dioxus_free_icons::{icons::fi_icons, Icon};
 
 #[component]
 pub fn SelectionToolbar(
@@ -18,7 +18,7 @@ pub fn SelectionToolbar(
             onclick: move |e| e.stop_propagation(),
             onmouseenter: move |_| on_mouseenter.call(()),
             onmouseleave: move |_| on_mouseleave.call(()),
-            
+
             button {
                 class: "p-2 text-gray-400 hover:text-white hover:bg-gray-700 rounded-md transition-colors",
                 onclick: move |_| on_copy.call(()),

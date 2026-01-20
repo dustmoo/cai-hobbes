@@ -1,13 +1,13 @@
+use super::continuation_controller::ContinuationController;
+use crate::components::shared::{StreamMessage, ToolCallStatus};
 use crate::services::tool_call_summarizer::ToolCallSummarizer;
+use crate::session::SessionState;
+use crate::settings::Settings;
 use dioxus::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use uuid::Uuid;
-use crate::session::SessionState;
-use crate::components::shared::{StreamMessage, ToolCallStatus};
-use std::sync::Arc;
-use crate::settings::Settings;
-use super::continuation_controller::ContinuationController;
 
 use crate::processing::summarization_scheduler::SchedulerSignal;
 
@@ -51,7 +51,7 @@ impl StreamManagerContext {
         tracing::info!(message_id = %message_id, "'start_stream' entered.");
         // Create a channel for the MessageBubble to receive chunks.
         let (stream_tx, stream_rx) = mpsc::unbounded_channel::<StreamMessage>();
-        
+
         // Store the receiver for the MessageBubble to pick up.
         self.stream_receivers.write().insert(message_id, stream_rx);
         *self.stream_activity.write() += 1;
@@ -63,11 +63,14 @@ impl StreamManagerContext {
 
             let llm_connector = self.llm_connector.read().clone();
             spawn(async move {
-                llm_connector.generate_content_stream(prompt_data, llm_tx, mcp_context).await;
+                llm_connector
+                    .generate_content_stream(prompt_data, llm_tx, mcp_context)
+                    .await;
             });
 
             let mut is_first_message = true;
-            let (tool_results_tx, mut tool_results_rx) = mpsc::unbounded_channel::<crate::components::shared::ToolCallRecord>();
+            let (tool_results_tx, mut tool_results_rx) =
+                mpsc::unbounded_channel::<crate::components::shared::ToolCallRecord>();
             let mut tool_call_count = 0;
             let completed_tool_tasks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut final_text_for_this_turn = String::new();
@@ -76,7 +79,11 @@ impl StreamManagerContext {
 
             while let Some(message) = llm_rx.recv().await {
                 match message {
-                    StreamMessage::Text { content, thought_signature, thought_summary } => {
+                    StreamMessage::Text {
+                        content,
+                        thought_signature,
+                        thought_summary,
+                    } => {
                         // Append the content to the buffer
                         let was_empty = final_text_for_this_turn.is_empty();
                         final_text_for_this_turn.push_str(&content);
@@ -90,11 +97,18 @@ impl StreamManagerContext {
                                 thought_summary_for_this_turn = Some(summary.clone());
                             }
                         }
-                        if stream_tx.send(StreamMessage::Text { content: content.clone(), thought_signature: thought_signature.clone(), thought_summary: thought_summary.clone() }).is_err() {
+                        if stream_tx
+                            .send(StreamMessage::Text {
+                                content: content.clone(),
+                                thought_signature: thought_signature.clone(),
+                                thought_summary: thought_summary.clone(),
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                         self.scheduler.send(SchedulerSignal::Activity);
-                        
+
                         // Critical Fix: Update session state immediately on the first chunk.
                         // This ensures that the parent `MessageList` sees that the message has content
                         // and continues to render the `MessageBubble` even if `is_generating` momentarily flips to false
@@ -102,34 +116,36 @@ impl StreamManagerContext {
                         // IMPORTANT: We must also flush thought_signature/thought_summary, otherwise when the stream
                         // ends (e.g., UNEXPECTED_TOOL_CALL), the message has no content AND no thoughts => pruned.
                         if was_empty {
-                             let mut state = self.session_state.write();
-                             if let Some(msg) = state.get_message_mut(&message_id) {
-                                 if let crate::components::shared::MessageContent::Text { 
-                                     content: msg_content, 
-                                     thought_signature: msg_thought_sig, 
-                                     thought_summary: msg_thought_sum 
-                                 } = &mut msg.content {
-                                     *msg_content = final_text_for_this_turn.clone();
-                                     *msg_thought_sig = thought_signature_for_this_turn.clone();
-                                     *msg_thought_sum = thought_summary_for_this_turn.clone();
-                                 }
-                             }
+                            let mut state = self.session_state.write();
+                            if let Some(msg) = state.get_message_mut(&message_id) {
+                                if let crate::components::shared::MessageContent::Text {
+                                    content: msg_content,
+                                    thought_signature: msg_thought_sig,
+                                    thought_summary: msg_thought_sum,
+                                } = &mut msg.content
+                                {
+                                    *msg_content = final_text_for_this_turn.clone();
+                                    *msg_thought_sig = thought_signature_for_this_turn.clone();
+                                    *msg_thought_sum = thought_summary_for_this_turn.clone();
+                                }
+                            }
                         }
 
                         is_first_message = false;
                     }
                     StreamMessage::Error { message: error_msg } => {
                         tracing::error!("LLM stream error: {}", error_msg);
-                        
+
                         // Save error message to session
                         {
                             let mut state = self.session_state.write();
                             if is_first_message {
                                 // Update the placeholder message with the error
                                 if let Some(msg) = state.get_message_mut(&message_id) {
-                                    msg.content = crate::components::shared::MessageContent::Error {
-                                        message: error_msg.clone(),
-                                    };
+                                    msg.content =
+                                        crate::components::shared::MessageContent::Error {
+                                            message: error_msg.clone(),
+                                        };
                                 }
                             } else {
                                 // Create a new error message
@@ -149,21 +165,26 @@ impl StreamManagerContext {
                                 }
                             }
                         }
-                        
+
                         // Forward error to UI
-                        if stream_tx.send(StreamMessage::Error { message: error_msg }).is_err() {
+                        if stream_tx
+                            .send(StreamMessage::Error { message: error_msg })
+                            .is_err()
+                        {
                             break;
                         }
-                        
+
                         // Error ends the stream
                         break;
                     }
                     StreamMessage::ToolCall(mut tool_call) => {
                         // Attach any accumulated thinking summary to this tool call
-                        if tool_call.thought_summary.is_none() && thought_summary_for_this_turn.is_some() {
+                        if tool_call.thought_summary.is_none()
+                            && thought_summary_for_this_turn.is_some()
+                        {
                             tool_call.thought_summary = thought_summary_for_this_turn.clone();
                         }
-                        
+
                         // Thought Signature Handling (per Gemini API requirements):
                         // 1. If this tool call HAS a signature, capture it for subsequent calls
                         // 2. If this tool call LACKS a signature, use the captured one from earlier in this turn
@@ -171,10 +192,17 @@ impl StreamManagerContext {
                         if tool_call.thought_signature.is_some() {
                             // Capture signature from this tool call for potential reuse
                             if thought_signature_for_this_turn.is_none() {
-                                thought_signature_for_this_turn = tool_call.thought_signature.clone();
-                                tracing::info!("Captured thought_signature from tool call '{}': '{}'", 
+                                thought_signature_for_this_turn =
+                                    tool_call.thought_signature.clone();
+                                tracing::info!(
+                                    "Captured thought_signature from tool call '{}': '{}'",
                                     tool_call.tool_name,
-                                    tool_call.thought_signature.as_ref().map(|s| if s.len() > 30 { &s[..30] } else { s }).unwrap_or("None"));
+                                    tool_call
+                                        .thought_signature
+                                        .as_ref()
+                                        .map(|s| if s.len() > 30 { &s[..30] } else { s })
+                                        .unwrap_or("None")
+                                );
                             }
                         } else if thought_signature_for_this_turn.is_some() {
                             // Propagate captured signature to this tool call
@@ -183,16 +211,19 @@ impl StreamManagerContext {
                         } else {
                             tracing::warn!("Tool call '{}' has NO thought_signature and none available to propagate!", tool_call.tool_name);
                         }
-                        
+
                         tool_call_count += 1;
                         let tool_call_message_id = {
                             let mut state = self.session_state.write();
-                            // Message Upgrading: If this is the "first" content of the turn, OR if we have only 
-                            // received thinking data so far (final_text is empty), we upgrade the existing 
+                            // Message Upgrading: If this is the "first" content of the turn, OR if we have only
+                            // received thinking data so far (final_text is empty), we upgrade the existing
                             // placeholder message to a ToolCall instead of splitting into two bubbles.
                             if is_first_message || final_text_for_this_turn.is_empty() {
                                 if let Some(msg) = state.get_message_mut(&message_id) {
-                                    msg.content = crate::components::shared::MessageContent::ToolCall(tool_call.clone());
+                                    msg.content =
+                                        crate::components::shared::MessageContent::ToolCall(
+                                            tool_call.clone(),
+                                        );
                                 }
                                 message_id
                             } else {
@@ -201,7 +232,10 @@ impl StreamManagerContext {
                                     session.messages.push(crate::components::chat::Message {
                                         id: new_id,
                                         author: "Hobbes".to_string(),
-                                        content: crate::components::shared::MessageContent::ToolCall(tool_call.clone()),
+                                        content:
+                                            crate::components::shared::MessageContent::ToolCall(
+                                                tool_call.clone(),
+                                            ),
                                         attachments: Vec::new(),
                                         comments: Vec::new(),
                                         created_at: chrono::Utc::now(),
@@ -217,86 +251,132 @@ impl StreamManagerContext {
                         let tool_results_tx_clone = tool_results_tx.clone();
                         let completed_tool_tasks_clone = completed_tool_tasks.clone();
                         let _handle = spawn(async move {
-                            let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
-                            let result_receiver = mcp_manager.read().use_mcp_tool(&tool_call.server_name, &tool_call.tool_name, args_json, false).await;
+                            let args_json: serde_json::Value =
+                                serde_json::from_str(&tool_call.arguments)
+                                    .unwrap_or(serde_json::Value::Null);
+                            let result_receiver = mcp_manager
+                                .read()
+                                .use_mcp_tool(
+                                    &tool_call.server_name,
+                                    &tool_call.tool_name,
+                                    args_json,
+                                    false,
+                                )
+                                .await;
 
-                            let (status, response_str, is_permission_request) = match result_receiver {
-                                Ok(mut receiver) => {
-                                    let mut aggregated_content: Vec<rmcp::model::Content> = Vec::new();
-                                    let mut final_status = ToolCallStatus::Completed;
-                                    let mut error_string = None;
+                            let (status, response_str, is_permission_request) =
+                                match result_receiver {
+                                    Ok(mut receiver) => {
+                                        let mut aggregated_content: Vec<rmcp::model::Content> =
+                                            Vec::new();
+                                        let mut final_status = ToolCallStatus::Completed;
+                                        let mut error_string = None;
 
-                                    while let Some(result) = receiver.recv().await {
-                                        match result {
-                                            Ok(call_tool_result) => {
-                                                aggregated_content.extend(call_tool_result.content);
-                                            }
-                                            Err(e) => {
-                                                final_status = ToolCallStatus::Error;
-                                                error_string = Some(e);
-                                                break;
-                                            }
-                                        }
-                                    }
-
-                                    if final_status == ToolCallStatus::Error {
-                                        let err_msg = error_string.unwrap_or_default();
-                                        // Detect "No connected account found" error from Composio
-                                        if err_msg.contains("No connected account found") {
-                                            tracing::info!("Composio auth required error detected. Initiating connection flow...");
-                                            match mcp_manager.read().initiate_composio_auth(&tool_call.server_name, &tool_call.tool_name).await {
-                                                Ok(url) => {
-                                                    tracing::info!("Successfully initiated Composio auth flow. URL: {}", url);
-                                                    (ToolCallStatus::AuthRequired, url, false)
-                                                },
+                                        while let Some(result) = receiver.recv().await {
+                                            match result {
+                                                Ok(call_tool_result) => {
+                                                    aggregated_content
+                                                        .extend(call_tool_result.content);
+                                                }
                                                 Err(e) => {
-                                                    tracing::error!("Failed to initiate Composio auth flow: {}", e);
-                                                    (final_status, err_msg, false)
+                                                    final_status = ToolCallStatus::Error;
+                                                    error_string = Some(e);
+                                                    break;
                                                 }
                                             }
-                                        } else {
-                                            (final_status, err_msg, false)
                                         }
-                                    } else {
-                                        // Check for auth requirement
-                                        let mut auth_url = None;
-                                        for content in &aggregated_content {
-                                            let json_content = serde_json::to_value(content).unwrap_or(serde_json::Value::Null);
-                                            if let Some(text) = json_content.get("text").and_then(|t| t.as_str()) {
-                                                if text.contains("Authentication required") && text.contains("connect your account") {
-                                                    if let Some(start) = text.find("http") {
-                                                        auth_url = Some(text[start..].trim().to_string());
+
+                                        if final_status == ToolCallStatus::Error {
+                                            let err_msg = error_string.unwrap_or_default();
+                                            // Detect "No connected account found" error from Composio
+                                            if err_msg.contains("No connected account found") {
+                                                tracing::info!("Composio auth required error detected. Initiating connection flow...");
+                                                match mcp_manager
+                                                    .read()
+                                                    .initiate_composio_auth(
+                                                        &tool_call.server_name,
+                                                        &tool_call.tool_name,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(url) => {
+                                                        tracing::info!("Successfully initiated Composio auth flow. URL: {}", url);
+                                                        (ToolCallStatus::AuthRequired, url, false)
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!("Failed to initiate Composio auth flow: {}", e);
+                                                        (final_status, err_msg, false)
+                                                    }
+                                                }
+                                            } else {
+                                                (final_status, err_msg, false)
+                                            }
+                                        } else {
+                                            // Check for auth requirement
+                                            let mut auth_url = None;
+                                            for content in &aggregated_content {
+                                                let json_content = serde_json::to_value(content)
+                                                    .unwrap_or(serde_json::Value::Null);
+                                                if let Some(text) = json_content
+                                                    .get("text")
+                                                    .and_then(|t| t.as_str())
+                                                {
+                                                    if text.contains("Authentication required")
+                                                        && text.contains("connect your account")
+                                                    {
+                                                        if let Some(start) = text.find("http") {
+                                                            auth_url = Some(
+                                                                text[start..].trim().to_string(),
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
 
-                                        if let Some(url) = auth_url {
-                                            (ToolCallStatus::AuthRequired, url, false)
-                                        } else {
-                                            let final_json = serde_json::to_value(aggregated_content).unwrap_or(serde_json::Value::Null);
-                                            (final_status, serde_json::to_string_pretty(&final_json).unwrap_or_default(), false)
+                                            if let Some(url) = auth_url {
+                                                (ToolCallStatus::AuthRequired, url, false)
+                                            } else {
+                                                let final_json =
+                                                    serde_json::to_value(aggregated_content)
+                                                        .unwrap_or(serde_json::Value::Null);
+                                                (
+                                                    final_status,
+                                                    serde_json::to_string_pretty(&final_json)
+                                                        .unwrap_or_default(),
+                                                    false,
+                                                )
+                                            }
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    // Check if this error is actually a serialized ToolCall indicating a permission request
-                                    if let Ok(_tc) = serde_json::from_str::<crate::components::shared::ToolCall>(&e) {
-                                        (ToolCallStatus::Error, e, true)
-                                    } else {
-                                        (ToolCallStatus::Error, e, false)
+                                    Err(e) => {
+                                        // Check if this error is actually a serialized ToolCall indicating a permission request
+                                        if let Ok(_tc) =
+                                            serde_json::from_str::<
+                                                crate::components::shared::ToolCall,
+                                            >(&e)
+                                        {
+                                            (ToolCallStatus::Error, e, true)
+                                        } else {
+                                            (ToolCallStatus::Error, e, false)
+                                        }
                                     }
-                                }
-                            };
-                            
+                                };
+
                             let mut state = session_state.write();
 
                             if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
                                 if is_permission_request {
-                                    if let Ok(tc) = serde_json::from_str::<crate::components::shared::ToolCall>(&response_str) {
+                                    if let Ok(tc) =
+                                        serde_json::from_str::<crate::components::shared::ToolCall>(
+                                            &response_str,
+                                        )
+                                    {
                                         msg.content = crate::components::shared::MessageContent::PermissionRequest(tc);
                                     }
-                                } else if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                                } else if let crate::components::shared::MessageContent::ToolCall(
+                                    tc,
+                                ) = &mut msg.content
+                                {
                                     tc.status = status;
                                     tc.response = response_str.clone();
                                 }
@@ -305,12 +385,16 @@ impl StreamManagerContext {
                             if !is_permission_request {
                                 let record = crate::components::shared::ToolCallRecord {
                                     call: tool_call.clone(),
-                                    result: crate::components::shared::ToolResult { status, response: response_str },
+                                    result: crate::components::shared::ToolResult {
+                                        status,
+                                        response: response_str,
+                                    },
                                 };
                                 let _ = tool_results_tx_clone.send(record);
                             }
                             // Signal completion regardless of permission status
-                            completed_tool_tasks_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            completed_tool_tasks_clone
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         });
                         is_first_message = false;
                     }
@@ -339,7 +423,12 @@ impl StreamManagerContext {
             if !final_text_for_this_turn.is_empty() {
                 let mut state = self.session_state.write();
                 if let Some(msg) = state.get_message_mut(&message_id) {
-                    if let crate::components::shared::MessageContent::Text { content, thought_signature, thought_summary } = &mut msg.content {
+                    if let crate::components::shared::MessageContent::Text {
+                        content,
+                        thought_signature,
+                        thought_summary,
+                    } = &mut msg.content
+                    {
                         *content = final_text_for_this_turn.clone();
                         *thought_signature = thought_signature_for_this_turn.clone();
                         *thought_summary = thought_summary_for_this_turn.clone();
@@ -370,11 +459,17 @@ impl StreamManagerContext {
                     // Don't trigger continuation; user needs to approve the permission request(s).
                     // Save and clean up.
                     if !collected_records.is_empty() {
-                        self.session_state.write().tool_call_history.extend(collected_records.clone());
+                        self.session_state
+                            .write()
+                            .tool_call_history
+                            .extend(collected_records.clone());
                     }
                     self.active_stream_handles.write().remove(&message_id);
                     if let Err(e) = self.session_state.write().save() {
-                        tracing::error!("Failed to save session state after permission request: {}", e);
+                        tracing::error!(
+                            "Failed to save session state after permission request: {}",
+                            e
+                        );
                     }
                     on_complete();
                     self.is_sending.set(false);
@@ -382,15 +477,18 @@ impl StreamManagerContext {
                     return; // Wait for user to approve
                 }
 
-                self.session_state.write().tool_call_history.extend(collected_records.clone());
+                self.session_state
+                    .write()
+                    .tool_call_history
+                    .extend(collected_records.clone());
                 // Tools were called in this turn. Increment the turn counter and trigger a continuation.
                 self.permission_manager.write().increment_turn_count();
-                
+
                 // CRITICAL FIX: Remove the active stream handle for THIS message before triggering the continuation.
                 // The continuation will spawn a NEW task with a NEW message ID.
                 // If we don't remove this one, is_any_generating() will remain true forever because this task never "completes" normally.
                 self.active_stream_handles.write().remove(&message_id);
-                
+
                 if let Err(e) = self.session_state.write().save() {
                     tracing::error!("Failed to save session state before continuation: {}", e);
                 }
@@ -420,7 +518,9 @@ impl StreamManagerContext {
 
             let settings = self.settings.read().clone();
             let summarizer = self.tool_call_summarizer.read();
-            summarizer.summarize_and_cleanup(&mut self.session_state.write(), &settings).await;
+            summarizer
+                .summarize_and_cleanup(&mut self.session_state.write(), &settings)
+                .await;
             on_complete();
             self.is_sending.set(false);
             self.scheduler.send(SchedulerSignal::Activity);
@@ -432,12 +532,14 @@ impl StreamManagerContext {
         });
 
         // Store the handle so we can abort it if needed
-        self.active_stream_handles.write().insert(message_id, master_task_handle);
+        self.active_stream_handles
+            .write()
+            .insert(message_id, master_task_handle);
     }
 
     pub fn cancel_stream(mut self, message_id: &Uuid) {
         tracing::info!(message_id = %message_id, "Attempting to cancel stream.");
-        
+
         // 1. Remove and abort the task handle
         if let Some(handle) = self.active_stream_handles.write().remove(message_id) {
             handle.cancel();
@@ -453,7 +555,7 @@ impl StreamManagerContext {
         } else {
             tracing::warn!(message_id = %message_id, "No stream receiver found to remove.");
         }
-        
+
         self.is_sending.set(false);
         tracing::info!(message_id = %message_id, "Stream cancellation process complete.");
     }
@@ -465,10 +567,7 @@ impl StreamManagerContext {
         }
         result
     }
-
 }
-
-
 
 #[derive(Props, PartialEq, Clone)]
 pub struct StreamManagerProps {
@@ -480,9 +579,11 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
     let session_state = consume_context::<Signal<SessionState>>();
     let mcp_manager = consume_context::<Signal<crate::mcp::manager::McpManager>>();
     let settings = consume_context::<Signal<Settings>>();
-    let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
+    let continuation_controller =
+        use_context_provider(|| Signal::new(ContinuationController::new()));
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
-    let permission_manager = consume_context::<Signal<crate::context::permissions::PermissionManager>>();
+    let permission_manager =
+        consume_context::<Signal<crate::context::permissions::PermissionManager>>();
     let context = use_hook(|| StreamManagerContext {
         stream_receivers: Signal::new(HashMap::new()),
         active_stream_handles: Signal::new(HashMap::new()),
@@ -506,21 +607,30 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dioxus_signals::Signal;
-    use crate::mcp::manager::McpManager;
-    use std::path::PathBuf;
     use crate::context::permissions::PermissionManager;
+    use crate::mcp::manager::McpManager;
     use crate::settings::Settings;
+    use dioxus_signals::Signal;
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn test_stream_registration_and_deregistration() {
         let mut dom = VirtualDom::new(|| {
             let session_state = use_context_provider(|| Signal::new(SessionState::new()));
             let settings = use_context_provider(|| Signal::new(Settings::default()));
-            let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
-            let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
-            let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
-            let llm_connector = use_context_provider(|| Signal::new(Arc::new(crate::components::llm::GeminiConnector::new(settings.read().gemini_config.clone())) as Arc<dyn crate::components::llm::LlmConnector>));
+            let permission_manager =
+                use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+            let mcp_manager = use_context_provider(|| {
+                Signal::new(McpManager::new(PathBuf::new(), permission_manager))
+            });
+            let continuation_controller =
+                use_context_provider(|| Signal::new(ContinuationController::new()));
+            let llm_connector = use_context_provider(|| {
+                Signal::new(Arc::new(crate::components::llm::GeminiConnector::new(
+                    settings.read().gemini_config.clone(),
+                ))
+                    as Arc<dyn crate::components::llm::LlmConnector>)
+            });
             let scheduler = use_coroutine(|_| async {});
             let mut stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
@@ -544,7 +654,10 @@ mod tests {
 
             // Register a stream
             let (_tx, rx) = mpsc::unbounded_channel();
-            stream_manager.stream_receivers.write().insert(message_id, rx);
+            stream_manager
+                .stream_receivers
+                .write()
+                .insert(message_id, rx);
 
             // Now a stream should be registered
             assert!(stream_manager.is_streaming(&message_id));
@@ -555,7 +668,7 @@ mod tests {
 
             // After taking, the stream should no longer be registered
             assert!(!stream_manager.is_streaming(&message_id));
-            
+
             rsx! { div {} }
         });
 
@@ -568,10 +681,19 @@ mod tests {
         let mut dom = VirtualDom::new(|| {
             let session_state = use_context_provider(|| Signal::new(SessionState::new()));
             let settings = use_context_provider(|| Signal::new(Settings::default()));
-            let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
-            let mcp_manager = use_context_provider(|| Signal::new(McpManager::new(PathBuf::new(), permission_manager)));
-            let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
-            let llm_connector = use_context_provider(|| Signal::new(Arc::new(crate::components::llm::GeminiConnector::new(settings.read().gemini_config.clone())) as Arc<dyn crate::components::llm::LlmConnector>));
+            let permission_manager =
+                use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+            let mcp_manager = use_context_provider(|| {
+                Signal::new(McpManager::new(PathBuf::new(), permission_manager))
+            });
+            let continuation_controller =
+                use_context_provider(|| Signal::new(ContinuationController::new()));
+            let llm_connector = use_context_provider(|| {
+                Signal::new(Arc::new(crate::components::llm::GeminiConnector::new(
+                    settings.read().gemini_config.clone(),
+                ))
+                    as Arc<dyn crate::components::llm::LlmConnector>)
+            });
             let scheduler = use_coroutine(|_| async {});
             let stream_manager = use_context_provider(|| StreamManagerContext {
                 stream_receivers: Signal::new(HashMap::new()),
@@ -593,7 +715,7 @@ mod tests {
             // Taking a stream that doesn't exist should return None
             let taken_rx = stream_manager.take_stream(&message_id);
             assert!(taken_rx.is_none());
-            
+
             rsx! { div {} }
         });
 

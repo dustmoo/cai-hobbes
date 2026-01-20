@@ -25,7 +25,7 @@ impl MessageContent {
         }
     }
 }
- 
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct ToolCall {
     pub execution_id: String,
@@ -69,7 +69,13 @@ pub struct UsageData {
 }
 
 impl ToolCall {
-    pub fn new(server_name: String, tool_name: String, args: serde_json::Value, thought_signature: Option<String>, thought_summary: Option<String>) -> Self {
+    pub fn new(
+        server_name: String,
+        tool_name: String,
+        args: serde_json::Value,
+        thought_signature: Option<String>,
+        thought_summary: Option<String>,
+    ) -> Self {
         Self {
             execution_id: uuid::Uuid::new_v4().to_string(),
             server_name,
@@ -119,21 +125,21 @@ pub struct ToolCallRecord {
 /// It handles markdown blocks (```json ... ```) and raw JSON objects.
 pub fn extract_json_from_response(text: &str) -> &str {
     let text = text.trim();
-    
+
     // 1. Try markdown JSON block
     if let (Some(s), Some(e)) = (text.find("```json"), text.rfind("```")) {
         if s < e {
             return text[s + 7..e].trim();
         }
     }
-    
+
     // 2. Try finding literal JSON object braces
     if let (Some(s), Some(e)) = (text.find('{'), text.rfind('}')) {
         if s < e {
             return &text[s..=e];
         }
     }
-    
+
     // 3. Fallback to raw text
     text
 }
@@ -142,10 +148,8 @@ pub fn extract_json_from_response(text: &str) -> &str {
 pub fn ChatBarIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static>(
     icon: I,
     onclick: EventHandler<MouseEvent>,
-    #[props(default = true)]
-    visible: bool,
-    #[props(default = String::new())]
-    title: String,
+    #[props(default = true)] visible: bool,
+    #[props(default = String::new())] title: String,
 ) -> Element {
     if !visible {
         return rsx! {};

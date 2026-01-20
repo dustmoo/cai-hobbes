@@ -1,6 +1,6 @@
-use dioxus::prelude::*;
-use crate::settings::{Settings, SettingsManager, KeychainStorageMode, is_sandboxed};
 use crate::services::gemini_models::validate_gemini_api_key;
+use crate::settings::{is_sandboxed, KeychainStorageMode, Settings, SettingsManager};
+use dioxus::prelude::*;
 
 #[component]
 pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
@@ -13,7 +13,7 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
     let mut error_message = use_signal(|| String::new());
     let mut success_message = use_signal(|| String::new());
     let mut is_validating = use_signal(|| false);
-    
+
     // Detect if we're in a sandboxed environment (App Store/TestFlight)
     let sandboxed = is_sandboxed();
 
@@ -26,7 +26,8 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
         // Clone values for async block
         let api_key = gemini_api_key.read().clone();
         // Defensive check: Pro builds can't use biometric even if setting says so
-        let use_biometric = is_sandboxed() && *keychain_mode.read() == KeychainStorageMode::Biometric;
+        let use_biometric =
+            is_sandboxed() && *keychain_mode.read() == KeychainStorageMode::Biometric;
         let selected_mode = if is_sandboxed() {
             keychain_mode.read().clone()
         } else {
@@ -46,22 +47,32 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                         move || {
                             if use_biometric {
                                 // Biometric: device-only, Touch ID protected
-                                crate::keychain_ffi::set_generic_password_with_biometric_protection("api_key", &api_key)
-                                    .or_else(|e| {
-                                        if let crate::keychain_ffi::KeychainError::SecurityError(-34018) = e {
-                                            crate::keychain_ffi::set_generic_password("api_key", &api_key)
-                                        } else {
-                                            Err(e)
-                                        }
-                                    })
+                                crate::keychain_ffi::set_generic_password_with_biometric_protection(
+                                    "api_key", &api_key,
+                                )
+                                .or_else(|e| {
+                                    if let crate::keychain_ffi::KeychainError::SecurityError(
+                                        -34018,
+                                    ) = e
+                                    {
+                                        crate::keychain_ffi::set_generic_password(
+                                            "api_key", &api_key,
+                                        )
+                                    } else {
+                                        Err(e)
+                                    }
+                                })
                             } else {
                                 // iCloud sync or Local Keychain: regular keychain save
                                 crate::keychain_ffi::set_generic_password("api_key", &api_key)
                             }
                         }
-                    }).await;
-                    
-                    if let Err(e) = save_result.unwrap_or(Err(crate::keychain_ffi::KeychainError::SecurityError(-1))) {
+                    })
+                    .await;
+
+                    if let Err(e) = save_result
+                        .unwrap_or(Err(crate::keychain_ffi::KeychainError::SecurityError(-1)))
+                    {
                         error_message.set(format!("Failed to save API key: {}", e));
                         is_validating.set(false);
                         return;
@@ -71,7 +82,7 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                     let mut current_settings = settings.read().clone();
                     current_settings.gemini_config.api_key = Some(api_key);
                     current_settings.keychain_storage_mode = selected_mode;
-                    
+
                     // Save settings to file
                     if let Err(e) = settings_manager.read().save(&current_settings) {
                         error_message.set(format!("Failed to save settings: {}", e));
@@ -142,7 +153,7 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                 div {
                     class: "mb-6 p-3 bg-dark-bg rounded-lg border border-primary-700",
                     label { class: "block text-sm font-medium text-gray-300 mb-2", "API Key Storage" }
-                    
+
                     if sandboxed {
                         // App Store/TestFlight: Show Biometric and iCloud options
                         div {

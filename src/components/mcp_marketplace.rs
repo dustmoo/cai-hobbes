@@ -1,14 +1,13 @@
-use dioxus::prelude::*;
-use futures_util::StreamExt;
-use crate::mcp::manager::{McpManager, McpServerStatus, ServerStatus};
-use crate::mcp::composio_client::{ComposioClient, ComposioToolkitListing, ComposioCategory};
-use crate::settings::{Settings, SettingsManager, McpSource};
 use crate::components::mcp_search_form::McpSearchForm;
 use crate::components::smithery_registry::{SmitheryClient, SmitheryServer};
-use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 use crate::components::syntax_highlighter::highlight_json;
-
+use crate::mcp::composio_client::{ComposioCategory, ComposioClient, ComposioToolkitListing};
+use crate::mcp::manager::{McpManager, McpServerStatus, ServerStatus};
+use crate::settings::{McpSource, Settings, SettingsManager};
+use dioxus::prelude::*;
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Clone, PartialEq)]
 enum ActiveTab {
@@ -41,7 +40,12 @@ impl From<SmitheryServer> for FeaturedMcp {
             display_name: server.display_name,
             description: server.description,
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@smithery/cli@latest".to_string(), "run".to_string(), server.qualified_name],
+            args: vec![
+                "-y".to_string(),
+                "@smithery/cli@latest".to_string(),
+                "run".to_string(),
+                server.qualified_name,
+            ],
             env_vars: vec![], // This will be populated by the detailed fetch
             homepage: server.homepage,
             auth_scheme: None, // Not applicable for Smithery
@@ -53,14 +57,16 @@ impl From<SmitheryServer> for FeaturedMcp {
 impl From<ComposioToolkitListing> for FeaturedMcp {
     fn from(toolkit: ComposioToolkitListing) -> Self {
         let description = toolkit.description().unwrap_or_default();
-        let homepage = toolkit.app_url().unwrap_or_else(|| format!("https://app.composio.dev/app/{}", toolkit.slug));
+        let homepage = toolkit
+            .app_url()
+            .unwrap_or_else(|| format!("https://app.composio.dev/app/{}", toolkit.slug));
         let use_managed_auth = toolkit.supports_managed_auth();
         let auth_scheme = toolkit.primary_auth_scheme();
         FeaturedMcp {
             name: toolkit.slug,
             display_name: toolkit.name,
             description,
-            command: String::new(),  // Not used for Composio
+            command: String::new(), // Not used for Composio
             args: vec![],
             env_vars: vec![],
             homepage,
@@ -75,9 +81,14 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
         FeaturedMcp {
             name: "filesystem".to_string(),
             display_name: "Filesystem".to_string(),
-            description: "Give the AI access to read and write files in a specific directory.".to_string(),
+            description: "Give the AI access to read and write files in a specific directory."
+                .to_string(),
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string(), "/path/to/allowed/dir".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string(),
+                "/path/to/allowed/dir".to_string(),
+            ],
             env_vars: vec![],
             homepage: "".to_string(),
             auth_scheme: None,
@@ -88,7 +99,10 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             display_name: "Brave Search".to_string(),
             description: "Allow the AI to search the web using Brave Search.".to_string(),
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@modelcontextprotocol/server-brave-search".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-brave-search".to_string(),
+            ],
             env_vars: vec!["BRAVE_API_KEY".to_string()],
             homepage: "".to_string(),
             auth_scheme: None,
@@ -97,9 +111,13 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
         FeaturedMcp {
             name: "github".to_string(),
             display_name: "GitHub".to_string(),
-            description: "Interact with GitHub repositories, issues, and pull requests.".to_string(),
+            description: "Interact with GitHub repositories, issues, and pull requests."
+                .to_string(),
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@modelcontextprotocol/server-github".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-github".to_string(),
+            ],
             env_vars: vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()],
             homepage: "".to_string(),
             auth_scheme: None,
@@ -110,7 +128,11 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             display_name: "PostgreSQL".to_string(),
             description: "Read and write data to a PostgreSQL database.".to_string(),
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@modelcontextprotocol/server-postgres".to_string(), "<YOUR_POSTGRES_CONNECTION_STRING>".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-postgres".to_string(),
+                "<YOUR_POSTGRES_CONNECTION_STRING>".to_string(),
+            ],
             env_vars: vec![],
             homepage: "".to_string(),
             auth_scheme: None,
@@ -121,7 +143,10 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             display_name: "Google Maps".to_string(),
             description: "Access location data and directions via Google Maps.".to_string(),
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@modelcontextprotocol/server-google-maps".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-google-maps".to_string(),
+            ],
             env_vars: vec!["GOOGLE_MAPS_API_KEY".to_string()],
             homepage: "".to_string(),
             auth_scheme: None,
@@ -145,27 +170,28 @@ pub fn McpMarketplace() -> Element {
     let filter_deployed = use_signal(|| false);
     let sort_by = use_signal(|| "usage".to_string());
     let _refresh_signal = use_signal(|| 0);
-    
+
     // State for server list
     let mut current_page = use_signal(|| 1i32);
     let mut total_pages = use_signal(|| 1i32);
-    
+
     // Cursor-based pagination for Composio
     // cursor_stack stores previous cursors for "back" navigation
     // next_cursor stores the cursor for the next page
     let mut cursor_stack: Signal<Vec<String>> = use_signal(|| vec![]);
     let mut current_cursor: Signal<Option<String>> = use_signal(|| None);
     let mut next_cursor: Signal<Option<String>> = use_signal(|| None);
-    
+
     // Connected toolkit slugs for Composio (for "Connected" detection in marketplace)
-    let connected_slugs: Signal<std::collections::HashSet<String>> = use_signal(|| std::collections::HashSet::new());
-    
+    let connected_slugs: Signal<std::collections::HashSet<String>> =
+        use_signal(|| std::collections::HashSet::new());
+
     // Composio category filtering state
     let selected_categories: Signal<Vec<String>> = use_signal(|| vec![]);
     let available_categories: Signal<Vec<ComposioCategory>> = use_signal(|| vec![]);
     let show_category_dropdown = use_signal(|| false);
     let categories_loading = use_signal(|| false);
-    
+
     // Reset cursor state when search query, categories, or sort order change
     {
         let search_query = search_query;
@@ -185,7 +211,7 @@ pub fn McpMarketplace() -> Element {
             current_page.set(1);
         });
     }
-    
+
     // Fetch categories when Composio is selected - use effect with explicit dependency
     {
         let settings = settings;
@@ -195,18 +221,20 @@ pub fn McpMarketplace() -> Element {
             let settings_snapshot = settings.read().clone();
             let mut available_categories = available_categories;
             let mut categories_loading = categories_loading;
-            
+
             if settings_snapshot.preferred_mcp_source != McpSource::Composio {
                 return; // Only fetch for Composio
             }
-            
+
             // Set loading state
             categories_loading.set(true);
-            
+
             spawn(async move {
                 if let Some(profile) = settings_snapshot.get_active_profile() {
                     if let Some(api_key) = &profile.api_key {
-                        let base_url = profile.base_url.clone()
+                        let base_url = profile
+                            .base_url
+                            .clone()
                             .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
                         let client = ComposioClient::new(
                             api_key.clone(),
@@ -215,7 +243,7 @@ pub fn McpMarketplace() -> Element {
                             profile.user_id.clone(),
                             profile.id.clone(),
                         );
-                        
+
                         tracing::debug!("Fetching toolkit categories...");
                         match client.list_toolkit_categories().await {
                             Ok(cats) => {
@@ -253,15 +281,17 @@ pub fn McpMarketplace() -> Element {
             let mut connected_slugs = connected_slugs;
             // Track settings changes
             let settings_snapshot = settings.read().clone();
-            
+
             async move {
                 if settings_snapshot.preferred_mcp_source != McpSource::Composio {
                     return; // Only fetch for Composio
                 }
-                
+
                 if let Some(profile) = settings_snapshot.get_active_profile() {
                     if let Some(api_key) = &profile.api_key {
-                        let base_url = profile.base_url.clone()
+                        let base_url = profile
+                            .base_url
+                            .clone()
                             .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
                         let client = ComposioClient::new(
                             api_key.clone(),
@@ -270,7 +300,7 @@ pub fn McpMarketplace() -> Element {
                             profile.user_id.clone(),
                             profile.id.clone(),
                         );
-                        
+
                         match client.get_connected_toolkit_slugs().await {
                             Ok(slugs) => {
                                 tracing::debug!("Fetched {} connected toolkit slugs", slugs.len());
@@ -295,117 +325,165 @@ pub fn McpMarketplace() -> Element {
         }
     });
 
-    let server_resource: Resource<Result<(Vec<FeaturedMcp>, String), String>> = use_resource(move || {
-        // This resource will re-run whenever any of these signals change.
-        // IMPORTANT: All signals must be read at the top level of this closure for reactive tracking.
-        let page = *current_page.read();
-        let verified = *filter_verified.read();
-        let deployed = *filter_deployed.read();
-        let query = search_query.read().clone();
-        let sort = sort_by.read().clone();
-        // Track selected categories so changes trigger a refetch
-        let cats = selected_categories.read().clone();
-        // Explicit trigger counter - must be used (not just discarded) for proper reactivity
-        let trigger = *trigger_search.read();
-        
-        // Track settings changes (e.g. API key loading)
-        let settings_snapshot = settings.read().clone();
-        
-        tracing::debug!("Resource triggered - sort={:?}, trigger={}, categories={:?}", sort, trigger, cats);  
-        
-        // Get the preferred source from settings
-        let source = settings_snapshot.preferred_mcp_source.clone();
-            
-        async move {
-            // Ensure trigger is captured for reactive tracking
-            let _ = trigger;
-            
-            match source {
-                McpSource::Composio => {
-                    // Fetch from Composio
-                    if let Some(profile) = settings_snapshot.get_active_profile() {
-                        if let Some(api_key) = &profile.api_key {
-                            let base_url = profile.base_url.clone()
-                                .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
-                            let client = ComposioClient::new(
-                                api_key.clone(),
-                                base_url,
-                                profile.entity_id.clone(),
-                                profile.user_id.clone(),
-                                profile.id.clone(),
-                            );
-                            
-                            // Use search query if provided
-                            let search_param = if query.is_empty() { None } else { Some(query.as_str()) };
-                            
-                            // Use categories from the captured cats variable (already read in reactive tracking section)
-                            let categories_param = if cats.is_empty() { None } else { Some(cats.clone()) };
-                            
-                            // Get current cursor for pagination
-                            let cursor_param = current_cursor.peek().clone();
-                            let cursor_ref = cursor_param.as_deref();
-                            
-                            // Get sort parameter
-                            let sort_param = if sort.is_empty() { None } else { Some(sort.as_str()) };
-                            
-                            tracing::debug!("Fetching toolkits with search={:?}, cursor={:?}, categories={:?}, sort={:?}", search_param, cursor_ref, categories_param, sort_param);
-                            
-                            match client.list_all_toolkits(search_param, cursor_ref, Some(20), categories_param, sort_param).await {
-                                Ok((toolkits, pages, next_cur)) => {
-                                    total_pages.set(pages);
-                                    next_cursor.set(next_cur);
-                                    let mcps: Vec<FeaturedMcp> = toolkits.into_iter()
-                                        .map(Into::into)
-                                        .collect();
-                                    Ok((mcps, "Composio".to_string()))
+    let server_resource: Resource<Result<(Vec<FeaturedMcp>, String), String>> = use_resource(
+        move || {
+            // This resource will re-run whenever any of these signals change.
+            // IMPORTANT: All signals must be read at the top level of this closure for reactive tracking.
+            let page = *current_page.read();
+            let verified = *filter_verified.read();
+            let deployed = *filter_deployed.read();
+            let query = search_query.read().clone();
+            let sort = sort_by.read().clone();
+            // Track selected categories so changes trigger a refetch
+            let cats = selected_categories.read().clone();
+            // Explicit trigger counter - must be used (not just discarded) for proper reactivity
+            let trigger = *trigger_search.read();
+
+            // Track settings changes (e.g. API key loading)
+            let settings_snapshot = settings.read().clone();
+
+            tracing::debug!(
+                "Resource triggered - sort={:?}, trigger={}, categories={:?}",
+                sort,
+                trigger,
+                cats
+            );
+
+            // Get the preferred source from settings
+            let source = settings_snapshot.preferred_mcp_source.clone();
+
+            async move {
+                // Ensure trigger is captured for reactive tracking
+                let _ = trigger;
+
+                match source {
+                    McpSource::Composio => {
+                        // Fetch from Composio
+                        if let Some(profile) = settings_snapshot.get_active_profile() {
+                            if let Some(api_key) = &profile.api_key {
+                                let base_url = profile.base_url.clone().unwrap_or_else(|| {
+                                    "https://backend.composio.dev/v3/mcp".to_string()
+                                });
+                                let client = ComposioClient::new(
+                                    api_key.clone(),
+                                    base_url,
+                                    profile.entity_id.clone(),
+                                    profile.user_id.clone(),
+                                    profile.id.clone(),
+                                );
+
+                                // Use search query if provided
+                                let search_param = if query.is_empty() {
+                                    None
+                                } else {
+                                    Some(query.as_str())
+                                };
+
+                                // Use categories from the captured cats variable (already read in reactive tracking section)
+                                let categories_param = if cats.is_empty() {
+                                    None
+                                } else {
+                                    Some(cats.clone())
+                                };
+
+                                // Get current cursor for pagination
+                                let cursor_param = current_cursor.peek().clone();
+                                let cursor_ref = cursor_param.as_deref();
+
+                                // Get sort parameter
+                                let sort_param = if sort.is_empty() {
+                                    None
+                                } else {
+                                    Some(sort.as_str())
+                                };
+
+                                tracing::debug!("Fetching toolkits with search={:?}, cursor={:?}, categories={:?}, sort={:?}", search_param, cursor_ref, categories_param, sort_param);
+
+                                match client
+                                    .list_all_toolkits(
+                                        search_param,
+                                        cursor_ref,
+                                        Some(20),
+                                        categories_param,
+                                        sort_param,
+                                    )
+                                    .await
+                                {
+                                    Ok((toolkits, pages, next_cur)) => {
+                                        total_pages.set(pages);
+                                        next_cursor.set(next_cur);
+                                        let mcps: Vec<FeaturedMcp> =
+                                            toolkits.into_iter().map(Into::into).collect();
+                                        Ok((mcps, "Composio".to_string()))
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to fetch from Composio: {}", e);
+                                        Err(format!("Composio error: {}", e))
+                                    }
+                                }
+                            } else {
+                                Err("No Composio API key configured. Set your API key in Settings → MCP → Composio".to_string())
+                            }
+                        } else {
+                            Err(
+                                "No Composio profile configured. Add a profile in Settings → MCP"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                    McpSource::Smithery => {
+                        // Existing Smithery logic
+                        let api_key = settings_snapshot.smithery_api_key.clone();
+
+                        if let Some(key) = api_key {
+                            let client = SmitheryClient::new(key);
+                            let mut filters = Vec::new();
+                            if verified {
+                                filters.push("is:verified");
+                            }
+                            if deployed {
+                                filters.push("is:deployed");
+                            }
+                            if !query.is_empty() {
+                                filters.push(&query);
+                            }
+                            let final_query = filters.join(" ");
+                            let search_param = if final_query.is_empty() {
+                                None
+                            } else {
+                                Some(final_query.as_str())
+                            };
+
+                            match client
+                                .fetch_servers(search_param, Some(page as u32), Some(&sort))
+                                .await
+                            {
+                                Ok(response) => {
+                                    total_pages.set(response.pagination.total_pages as i32);
+                                    let mcps: Vec<FeaturedMcp> =
+                                        response.servers.into_iter().map(Into::into).collect();
+                                    Ok((mcps, "Smithery".to_string()))
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Failed to fetch from Composio: {}", e);
-                                    Err(format!("Composio error: {}", e))
+                                    tracing::warn!("Failed to fetch from Smithery: {}", e);
+                                    Ok((
+                                        get_featured_mcps(),
+                                        "Hardcoded (Smithery error)".to_string(),
+                                    ))
                                 }
                             }
                         } else {
-                            Err("No Composio API key configured. Set your API key in Settings → MCP → Composio".to_string())
+                            Ok((get_featured_mcps(), "Hardcoded".to_string()))
                         }
-                    } else {
-                        Err("No Composio profile configured. Add a profile in Settings → MCP".to_string())
-                    }
-                },
-                McpSource::Smithery => {
-                    // Existing Smithery logic
-                    let api_key = settings_snapshot.smithery_api_key.clone();
-                    
-                    if let Some(key) = api_key {
-                        let client = SmitheryClient::new(key);
-                        let mut filters = Vec::new();
-                        if verified { filters.push("is:verified"); }
-                        if deployed { filters.push("is:deployed"); }
-                        if !query.is_empty() { filters.push(&query); }
-                        let final_query = filters.join(" ");
-                        let search_param = if final_query.is_empty() { None } else { Some(final_query.as_str()) };
-
-                        match client.fetch_servers(search_param, Some(page as u32), Some(&sort)).await {
-                            Ok(response) => {
-                                total_pages.set(response.pagination.total_pages as i32);
-                                let mcps: Vec<FeaturedMcp> = response.servers.into_iter().map(Into::into).collect();
-                                Ok((mcps, "Smithery".to_string()))
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to fetch from Smithery: {}", e);
-                                Ok((get_featured_mcps(), "Hardcoded (Smithery error)".to_string()))
-                            }
-                        }
-                    } else {
-                        Ok((get_featured_mcps(), "Hardcoded".to_string()))
                     }
                 }
             }
-        }
-    });
+        },
+    );
 
     // Get current search query for client-side filtering (Composio API doesn't support server-side filtering)
     let current_query = search_query.read().to_lowercase();
-    
+
     let (filtered_mcps, data_source, is_loading) = match &*server_resource.read() {
         Some(Ok((mcps, source))) => {
             // Apply client-side filtering for Composio since API ignores search params
@@ -414,15 +492,15 @@ pub fn McpMarketplace() -> Element {
             } else {
                 mcps.iter()
                     .filter(|mcp| {
-                        mcp.display_name.to_lowercase().contains(&current_query) ||
-                        mcp.name.to_lowercase().contains(&current_query) ||
-                        mcp.description.to_lowercase().contains(&current_query)
+                        mcp.display_name.to_lowercase().contains(&current_query)
+                            || mcp.name.to_lowercase().contains(&current_query)
+                            || mcp.description.to_lowercase().contains(&current_query)
                     })
                     .cloned()
                     .collect()
             };
             (filtered, source.clone(), false)
-        },
+        }
         Some(Err(e)) => (vec![], format!("Error: {}", e), false),
         None => (vec![], "Loading...".to_string(), true),
     };
@@ -435,29 +513,34 @@ pub fn McpMarketplace() -> Element {
         async move {
             while let Some(new_content) = rx.next().await {
                 let path = get_mcp_config_path();
-                
+
                 tracing::debug!("Attempting to save MCP config to: {:?}", path);
-                
+
                 // Clone new_content for the blocking task
                 let content_for_write = new_content.clone();
-                let write_result = tokio::task::spawn_blocking(move || {
-                    std::fs::write(&path, &content_for_write)
-                }).await.unwrap();
+                let write_result =
+                    tokio::task::spawn_blocking(move || std::fs::write(&path, &content_for_write))
+                        .await
+                        .unwrap();
 
                 match write_result {
                     Ok(_) => {
                         tracing::info!("Successfully saved MCP config.");
                         config_content.set(new_content);
-                        success_message.set(Some("Configuration saved. Reloading servers...".to_string()));
+                        success_message.set(Some(
+                            "Configuration saved. Reloading servers...".to_string(),
+                        ));
                         error_message.set(None);
-                        
+
                         // Trigger reload on McpManager
                         let manager = mcp_manager.read().clone();
                         let context_signal = mcp_context.clone();
                         let current_settings = settings.read().clone();
-                        
+
                         spawn(async move {
-                            manager.reload_config(context_signal, current_settings).await;
+                            manager
+                                .reload_config(context_signal, current_settings)
+                                .await;
                         });
                     }
                     Err(e) => {
@@ -474,19 +557,23 @@ pub fn McpMarketplace() -> Element {
         let mut error_msg = error_message.clone();
         spawn(async move {
             tracing::debug!("Attempting to add MCP server: {}", mcp.name);
-            
+
             let current_config_str = config_content.read().clone();
-            
+
             // Extract short server name (e.g., "@smithery/googlecalendar" -> "googlecalendar")
             // This is a rough heuristic, might need refinement for composio mapping
-            let short_name = mcp.name.split('/').last().unwrap_or(&mcp.name).replace("-mcp", "");
-            
+            let short_name = mcp
+                .name
+                .split('/')
+                .last()
+                .unwrap_or(&mcp.name)
+                .replace("-mcp", "");
+
             if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&current_config_str) {
                 if let Some(servers) = json.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
-                    
                     match current_settings.preferred_mcp_source {
                         crate::settings::McpSource::Smithery => {
-                             if let Some(api_key) = current_settings.smithery_api_key.clone() {
+                            if let Some(api_key) = current_settings.smithery_api_key.clone() {
                                 // Use standard Smithery CLI pattern
                                 let new_server = serde_json::json!({
                                     "command": "npx",
@@ -501,16 +588,22 @@ pub fn McpMarketplace() -> Element {
                                     "description": mcp.description
                                 });
                                 servers.insert(short_name.clone(), new_server);
-                             } else {
+                            } else {
                                 tracing::warn!("No Smithery API key configured");
-                                error_msg.set(Some("Please set your Smithery API key in Settings first".to_string()));
+                                error_msg.set(Some(
+                                    "Please set your Smithery API key in Settings first"
+                                        .to_string(),
+                                ));
                                 return;
-                             }
-                        },
+                            }
+                        }
                         crate::settings::McpSource::Composio => {
                             // Composio integration is now handled via SSE in Settings
                             tracing::warn!("Attempted to add Composio tool via legacy path");
-                            error_msg.set(Some("Please manage Composio tools via your Composio Dashboard.".to_string()));
+                            error_msg.set(Some(
+                                "Please manage Composio tools via your Composio Dashboard."
+                                    .to_string(),
+                            ));
                             return;
                         }
                     }
@@ -684,12 +777,12 @@ pub fn McpMarketplace() -> Element {
                         div {
                             class: "flex-1 flex flex-col min-h-0",
                             p { class: "text-sm text-gray-400 mb-2", "Directly edit the JSON configuration for your MCP servers." }
-                            
+
                             // Syntax highlighted editor
                             div {
                                 class: "flex-1 relative bg-dark-section rounded-md border border-gray-700",
                                 id: "json-editor-container",
-                                
+
                                 // Highlighted background layer
                                 pre {
                                     class: "absolute inset-0 p-4 text-sm font-mono pointer-events-none whitespace-pre-wrap break-words overflow-auto",
@@ -698,7 +791,7 @@ pub fn McpMarketplace() -> Element {
                                         dangerous_inner_html: "{highlight_json(config_content.read().clone())}"
                                     }
                                 }
-                                
+
                                 // Editable overlay with scroll
                                 textarea {
                                     class: "absolute inset-0 w-full h-full p-4 bg-transparent font-mono text-sm text-transparent caret-white border-0 focus:outline-none resize-none overflow-auto whitespace-pre-wrap break-words",
@@ -723,7 +816,7 @@ pub fn McpMarketplace() -> Element {
                                     },
                                 }
                             }
-                            
+
                             div {
                                 class: "mt-4 flex justify-end gap-2",
                                 button {
@@ -778,10 +871,10 @@ pub fn McpMarketplace() -> Element {
 fn StatusView() -> Element {
     let mcp_manager = use_context::<Signal<McpManager>>();
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
-    
+
     // Trigger signal for forcing resource refresh
     let mut refresh_trigger = use_signal(|| 0i32);
-    
+
     let server_statuses = use_resource(move || {
         let _trigger = *refresh_trigger.read(); // Subscribe to manual refresh
         let _context = mcp_context.read(); // Subscribe to context changes (profile switch)
@@ -804,18 +897,19 @@ fn StatusView() -> Element {
     let (total_tools, loaded_tools) = match server_statuses.read().as_ref() {
         Some(statuses) => {
             let total: usize = statuses.iter().map(|s| s.tools).sum();
-            let loaded: usize = statuses.iter()
+            let loaded: usize = statuses
+                .iter()
                 .filter(|s| s.is_loaded)
                 .map(|s| s.tools)
                 .sum();
             (total, loaded)
-        },
+        }
         None => (0, 0),
     };
-    
+
     // Format for display in rsx
     let tool_count_display = format!("{} / {} tools loaded", loaded_tools, total_tools);
-    
+
     // Pre-compute warning state to avoid rsx type inference issues
     let exceeds_limit = loaded_tools > 128;
     let above_optimal = loaded_tools > 50;
@@ -826,7 +920,7 @@ fn StatusView() -> Element {
     } else {
         "text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-300"
     };
-    
+
     rsx! {
         div {
             class: "space-y-4",
@@ -862,7 +956,7 @@ fn StatusView() -> Element {
                     "Refresh"
                 }
             }
-            
+
             match server_statuses.read().as_ref() {
                 Some(statuses) => rsx! {
                     if statuses.is_empty() {
@@ -874,7 +968,7 @@ fn StatusView() -> Element {
                         div {
                             class: "grid grid-cols-1 gap-3",
                             for status in statuses {
-                                StatusCard { 
+                                StatusCard {
                                     status: status.clone(),
                                     refresh_trigger: refresh_trigger
                                 }
@@ -900,14 +994,15 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
     let mut local_settings = use_signal(|| settings.read().clone());
     let mut is_retrying = use_signal(|| false);
-    
+
     // Toolkit management state (only relevant for Composio)
     let is_composio = status.name == "composio-native";
     // NOTE: show_toolkits is read from ui_state.composio_toolkit_expanded instead of local signal
-    let mut toolkits: Signal<Vec<crate::mcp::composio_client::ToolkitInfo>> = use_signal(|| Vec::new());
+    let mut toolkits: Signal<Vec<crate::mcp::composio_client::ToolkitInfo>> =
+        use_signal(|| Vec::new());
     let mut toolkits_loading = use_signal(|| false);
     let mut toolkits_error: Signal<Option<String>> = use_signal(|| None);
-    
+
     // Log errors to console for debugging
     let status_for_logging = status.clone();
     use_effect(move || {
@@ -915,7 +1010,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
             tracing::error!("[MCP {}] {}", status_for_logging.name, error);
         }
     });
-    
+
     // Reset toolkit state when the ACTIVE PROFILE changes (not on every mount)
     // This clears stale data and allows a fresh fetch with the new client
     let mut last_profile_name: Signal<Option<String>> = use_signal(|| None);
@@ -923,10 +1018,14 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
         let _context = mcp_context.read(); // Subscribe to context changes
         let current_profile = settings.read().active_composio_profile.clone();
         let previous_profile = last_profile_name.peek().clone();
-        
+
         // Only reset if profile actually changed (not on initial mount with None -> Some)
         if previous_profile.is_some() && previous_profile != current_profile {
-            tracing::debug!("Profile changed from {:?} to {:?}, resetting toolkit state", previous_profile, current_profile);
+            tracing::debug!(
+                "Profile changed from {:?} to {:?}, resetting toolkit state",
+                previous_profile,
+                current_profile
+            );
             toolkits.set(Vec::new());
             toolkits_error.set(None);
             toolkits_loading.set(false);
@@ -935,18 +1034,20 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
         }
         last_profile_name.set(current_profile);
     });
-    
+
     // Fetch toolkits when show_toolkits is expanded for Composio
     // Only fetch if: composio server is loaded, dropdown is expanded, no toolkits yet, not loading, and no prior error
     let status_for_fetch = status.status.clone();
     use_effect(move || {
-        let should_fetch = is_composio && ui_state.read().composio_toolkit_expanded && status_for_fetch == ServerStatus::Loaded;
+        let should_fetch = is_composio
+            && ui_state.read().composio_toolkit_expanded
+            && status_for_fetch == ServerStatus::Loaded;
         // Use peek() to avoid creating a dependency on the signals we only check condition against
         // This prevents infinite loops where we write to these signals within the effect
         let no_error = toolkits_error.peek().is_none();
         if should_fetch && toolkits.peek().is_empty() && !*toolkits_loading.peek() && no_error {
             toolkits_loading.set(true);
-            
+
             let mcp_manager_clone = mcp_manager.clone();
             spawn(async move {
                 match mcp_manager_clone.read().get_composio_toolkits().await {
@@ -963,10 +1064,10 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
             });
         }
     });
-    
+
     // Note: Settings persistence is now handled directly in the dropdown onchange handler,
     // which calls settings_manager.save() immediately when the user changes a value.
-    
+
     let (status_color, status_text, status_bg) = match status.status {
         ServerStatus::Loaded => ("bg-green-500", "Loaded", "bg-green-900/20"),
         ServerStatus::Error => ("bg-red-500", "Error", "bg-red-900/20"),
@@ -981,10 +1082,13 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
         let mcp_context = mcp_context.clone();
         let settings = settings.clone();
         is_retrying.set(true);
-        
+
         spawn(async move {
             tracing::debug!("Retrying server: {}", server_name);
-            let result = mcp_manager.read().retry_server(&server_name, mcp_context, settings.read().clone(), None).await;
+            let result = mcp_manager
+                .read()
+                .retry_server(&server_name, mcp_context, settings.read().clone(), None)
+                .await;
             match result {
                 Ok(_) => tracing::debug!("Retry initiated for {}", server_name),
                 Err(e) => tracing::error!("Failed to retry {}: {}", server_name, e),
@@ -996,23 +1100,33 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
 
     // OAuth authentication is now handled by Smithery CLI automatically
     // No manual authentication needed - just ensure SMITHERY_API_KEY is set in env
-    
+
     // Determine if this server needs OAuth authorization
     // More deterministic checks:
     // 1. NeedsAuth status (set explicitly via is_auth_error detection)
     // 2. Error message contains 401/invalid_token (HTTP status based)
     // 3. Server is using Smithery CLI (indicates Smithery-hosted server)
-    let is_smithery_hosted = status.uri.as_ref().map(|u| u.contains("smithery.ai")).unwrap_or(false) ||
-        status.name.contains("google") || status.name.contains("calendar") || 
-        status.name.contains("drive") || status.name.contains("gmail");
-    
-    let has_auth_error = status.error_message.as_ref().map(|e| {
-        // Check for HTTP 401 status or known auth error patterns
-        e.contains("401") || e.contains("invalid_token") || e.contains("unauthorized")
-    }).unwrap_or(false);
-    
-    let needs_oauth = status.status == ServerStatus::NeedsAuth || 
-       (status.status == ServerStatus::Error && (has_auth_error || is_smithery_hosted));
+    let is_smithery_hosted = status
+        .uri
+        .as_ref()
+        .map(|u| u.contains("smithery.ai"))
+        .unwrap_or(false)
+        || status.name.contains("google")
+        || status.name.contains("calendar")
+        || status.name.contains("drive")
+        || status.name.contains("gmail");
+
+    let has_auth_error = status
+        .error_message
+        .as_ref()
+        .map(|e| {
+            // Check for HTTP 401 status or known auth error patterns
+            e.contains("401") || e.contains("invalid_token") || e.contains("unauthorized")
+        })
+        .unwrap_or(false);
+
+    let needs_oauth = status.status == ServerStatus::NeedsAuth
+        || (status.status == ServerStatus::Error && (has_auth_error || is_smithery_hosted));
 
     rsx! {
         div {
@@ -1070,7 +1184,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                     } else {
                                                         mcp_manager.read().unload_server(&server_name).await;
                                                     }
-                                                    
+
                                                     // Persist unloaded state to UiState
                                                     {
                                                         let mut state = ui_state.write();
@@ -1087,7 +1201,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                             tracing::error!("Failed to save UI state after load/unload toggle: {}", e);
                                                         }
                                                     }
-                                                    
+
                                                     // Update mcp_context with filtered tools
                                                     let new_context = mcp_manager.read().get_mcp_context().await;
                                                     mcp_context.set(new_context);
@@ -1109,9 +1223,9 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                         if let Some(ref error) = status.error_message {
                             div {
                                 class: "mt-2 p-2 bg-red-900/20 rounded border border-red-800",
-                                p { 
-                                    class: "text-sm text-red-300 font-mono whitespace-pre-wrap break-all", 
-                                    "Error: {error}" 
+                                p {
+                                    class: "text-sm text-red-300 font-mono whitespace-pre-wrap break-all",
+                                    "Error: {error}"
                                 }
                             }
                         }
@@ -1155,20 +1269,20 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     let mcp_manager = mcp_manager.clone();
                                     let mcp_context = mcp_context.clone();
                                     let settings = settings.clone();
-                                    
+
                                     spawn(async move {
                                         use crate::mcp::smithery_client::{SmitheryOAuthClient, SmitheryOAuthConfig, SmitheryOAuthError};
-                                        
+
                                         tracing::info!("Starting OAuth flow for: {}", server_name);
-                                        
+
                                         // Create OAuth client
                                         let server_url = format!("https://server.smithery.ai/{}/mcp", server_name);
                                         let config = SmitheryOAuthConfig::new(&server_url);
                                         let client = SmitheryOAuthClient::new(config);
-                                        
+
                                         // Start callback server to receive auth code
                                         let mut callback_rx = client.start_callback_server();
-                                        
+
                                         // Try to connect - this triggers OAuth discovery
                                         match client.connect().await {
                                             Ok(()) => {
@@ -1176,29 +1290,29 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                             }
                                             Err(SmitheryOAuthError::AuthRequired(auth_url)) => {
                                                 tracing::info!("Opening OAuth authorization URL: {}", auth_url);
-                                                
+
                                                 // Open browser for user to authorize
                                                 if let Err(e) = open::that(&auth_url) {
                                                     tracing::error!("Failed to open browser: {}", e);
                                                     return;
                                                 }
-                                                
+
                                                 // Wait for callback with auth code
                                                 tracing::debug!("Waiting for OAuth callback...");
                                                 if let Some(result) = callback_rx.recv().await {
                                                     if result.success {
                                                         if let Some(code) = result.auth_code {
                                                             tracing::debug!("Received auth code, completing OAuth flow...");
-                                                            
+
                                                             // Exchange code for tokens
                                                             match client.finish_auth(&code).await {
                                                                 Ok(()) => {
                                                                     tracing::info!("OAuth complete! Retrying server connection...");
-                                                                    
+
                                                                     // Retry the server now that we have auth
                                                                     let _ = mcp_manager.read().retry_server(
-                                                                        &server_name, 
-                                                                        mcp_context, 
+                                                                        &server_name,
+                                                                        mcp_context,
                                                                         settings.read().clone(),
                                                                         client.access_token().await
                                                                     ).await;
@@ -1225,7 +1339,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                     }
                 }
             }
-            
+
             // Composio toolkit configuration section
             if is_composio && status.status == ServerStatus::Loaded {
                 div {
@@ -1252,7 +1366,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                             if ui_state.read().composio_toolkit_expanded { "▼" } else { "▶" }
                         }
                     }
-                    
+
                     if ui_state.read().composio_toolkit_expanded {
                         div {
                             class: "mt-3 space-y-2",
@@ -1276,13 +1390,13 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     {
                                         let toolkit_slug = toolkit.slug.clone();
                                         let settings_snapshot = local_settings.read().clone();
-                                        
+
                                         // Get the current force_load status (default: false = on-demand)
                                         let is_force_load = settings_snapshot.get_active_profile()
                                             .and_then(|p| p.toolkit_configs.iter().find(|c| c.slug == toolkit_slug))
                                             .map(|c| c.force_load)
                                             .unwrap_or(false);
-                                        
+
                                         rsx! {
                                             div {
                                                 class: "flex items-center justify-between p-2 bg-dark-input rounded border border-gray-600",
@@ -1319,7 +1433,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                 let mcp_manager = mcp_manager.clone();
                                                                 let mut mcp_context = mcp_context.clone();
                                                                 let mut refresh_trigger = refresh_trigger.clone();
-                                                                
+
                                                                 // Update local settings
                                                                 let mut s = local_settings.write();
                                                                 if let Some(profile) = s.get_active_profile_mut() {
@@ -1336,7 +1450,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                 }
                                                                 let updated_settings = s.clone();
                                                                 drop(s); // Release write lock
-                                                                
+
                                                                 // Persist to global settings and disk
                                                                 settings.set(updated_settings.clone());
                                                                 if let Err(e) = settings_manager.read().save(&updated_settings) {
@@ -1344,7 +1458,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                 } else {
                                                                     tracing::debug!("Saved toolkit config: {} = {}", slug, if new_force_load { "force-load" } else { "on-demand" });
                                                                 }
-                                                                
+
                                                                 // Reload Composio tools and update UI
                                                                 spawn(async move {
                                                                     if let Err(e) = mcp_manager.read().reload_composio_tools(&updated_settings).await {
@@ -1396,13 +1510,13 @@ fn McpServerCard(
     let mcp_clone_for_add = mcp.clone();
     let mcp_manager = use_context::<Signal<McpManager>>();
     let settings = use_context::<Signal<Settings>>();
-    
+
     // Connection state for Composio Connect button
     let mut is_connecting = use_signal(|| false);
     let mut connection_status: Signal<String> = use_signal(|| "Connect".to_string());
     let mut connection_error: Signal<Option<String>> = use_signal(|| None);
     let mut connection_task = use_signal(|| Option::<Task>::None);
-    
+
     // Source-aware install detection:
     // - Composio: check if toolkit slug is in connected_slugs
     // - Smithery: check if MCP server is running
@@ -1416,29 +1530,37 @@ fn McpServerCard(
             let mcp_name = mcp.name.clone();
             let connected = connected_slugs.read().clone();
             let is_composio = settings.peek().preferred_mcp_source == McpSource::Composio;
-            
+
             async move {
                 if is_composio {
                     // For Composio: check if toolkit is connected
                     let is_connected = connected.contains(&mcp_name.to_lowercase());
-                    tracing::debug!("Connection check for '{}': connected={}, slugs={:?}", 
-                        mcp_name.to_lowercase(), is_connected, connected);
+                    tracing::debug!(
+                        "Connection check for '{}': connected={}, slugs={:?}",
+                        mcp_name.to_lowercase(),
+                        is_connected,
+                        connected
+                    );
                     return (is_connected, false); // (installed/connected, has_error)
                 }
-                
+
                 // For Smithery: check MCP server status
                 let guard = mcp_manager.read();
                 let servers = guard.servers.lock().await;
                 let failed = guard.failed_servers.lock().await;
 
                 let server_key = mcp_name.split('/').last().unwrap_or(&mcp_name);
-                let is_loaded = servers.keys().any(|key| key == server_key || key == &mcp_name);
+                let is_loaded = servers
+                    .keys()
+                    .any(|key| key == server_key || key == &mcp_name);
 
                 if is_loaded {
                     return (true, false);
                 }
 
-                let has_error = failed.keys().any(|key| key == server_key || key == &mcp_name);
+                let has_error = failed
+                    .keys()
+                    .any(|key| key == server_key || key == &mcp_name);
                 (has_error, has_error)
             }
         }
@@ -1447,9 +1569,19 @@ fn McpServerCard(
     // Source-aware status display
     let is_composio = settings.read().preferred_mcp_source == McpSource::Composio;
     let (status_class, _status_text) = match install_status.read().as_ref() {
-        Some((true, false)) => ("h-2 w-2 rounded-full bg-green-500", if is_composio { "Connected" } else { "Loaded" }),
+        Some((true, false)) => (
+            "h-2 w-2 rounded-full bg-green-500",
+            if is_composio { "Connected" } else { "Loaded" },
+        ),
         Some((true, true)) => ("h-2 w-2 rounded-full bg-red-500", "Error"),
-        _ => ("h-2 w-2 rounded-full bg-gray-500", if is_composio { "Not Connected" } else { "Not Installed" }),
+        _ => (
+            "h-2 w-2 rounded-full bg-gray-500",
+            if is_composio {
+                "Not Connected"
+            } else {
+                "Not Installed"
+            },
+        ),
     };
 
     rsx! {
@@ -1501,11 +1633,11 @@ fn McpServerCard(
                                             is_connecting.set(true);
                                             connection_status.set("Connecting...".to_string());
                                             connection_error.set(None);
-                                            
+
                                             let task = spawn(async move {
-                                                tracing::info!("Initiating Composio connection for toolkit: {} (auth_scheme: {:?}, managed: {})",  
+                                                tracing::info!("Initiating Composio connection for toolkit: {} (auth_scheme: {:?}, managed: {})",
                                                     toolkit_slug, auth_scheme, use_managed_auth);
-                                                
+
                                                 let settings_snapshot = settings.peek().clone();
                                                 if let Some(profile) = settings_snapshot.get_active_profile() {
                                                     if let Some(api_key) = &profile.api_key {
@@ -1514,7 +1646,7 @@ fn McpServerCard(
                                                         let user_id = profile.user_id.clone()
                                                             .or(profile.entity_id.clone())
                                                             .unwrap_or_else(|| "default".to_string());
-                                                        
+
                                                         let client = ComposioClient::new(
                                                             api_key.clone(),
                                                             base_url,
@@ -1522,7 +1654,7 @@ fn McpServerCard(
                                                             profile.user_id.clone(),
                                                             profile.id.clone(),
                                                         );
-                                                        
+
                                                         // Step 1: Create auth config with correct auth scheme
                                                         let auth_config_id = match client.create_auth_config(
                                                             &toolkit_slug,
@@ -1540,44 +1672,44 @@ fn McpServerCard(
                                                                 return;
                                                             }
                                                         };
-                                                        
+
                                                         // Step 2: Smart tool selection for large toolkits
                                                         // Get tool details and use LLM to select if > threshold
                                                         use crate::mcp::tool_selection::{TOOL_SELECTION_THRESHOLD, ToolSelectionRequest, ToolCandidate};
-                                                        
+
                                                         let selected_tools: Option<Vec<String>> = match client.get_toolkit_tools_detailed(&toolkit_slug).await {
                                                             Ok(tools) if tools.len() > TOOL_SELECTION_THRESHOLD => {
                                                                 // Update status with tool count so user understands the wait
                                                                 connection_status.set(format!("Selecting from {} tools...", tools.len()));
-                                                                
-                                                                tracing::info!("Toolkit '{}' has {} tools (> {}), using smart selection", 
+
+                                                                tracing::info!("Toolkit '{}' has {} tools (> {}), using smart selection",
                                                                     toolkit_slug, tools.len(), TOOL_SELECTION_THRESHOLD);
-                                                                
+
                                                                 // Build tool candidates for LLM
                                                                 let candidates: Vec<ToolCandidate> = tools.into_iter()
                                                                     .map(|(name, desc)| ToolCandidate { name, description: desc })
                                                                     .collect();
-                                                                
+
                                                                 let request = ToolSelectionRequest::new(
                                                                     toolkit_slug.clone(),
                                                                     None, // No toolkit description available here
                                                                     candidates,
                                                                 );
-                                                                
+
                                                                 // Call LLM for tool selection
                                                                 let settings_snap = settings.peek().clone();
                                                                 let llm_connector = crate::components::llm::GeminiConnector::new(
                                                                     settings_snap.gemini_config.clone()
                                                                 );
-                                                                
+
                                                                 match llm_connector.select_tools_for_toolkit(&request).await {
                                                                     Ok(selection) => {
-                                                                        tracing::info!("Smart selection for '{}': {} tools - {}", 
+                                                                        tracing::info!("Smart selection for '{}': {} tools - {}",
                                                                             toolkit_slug, selection.selected_tools.len(), selection.reasoning);
                                                                         Some(selection.selected_tools)
                                                                     }
                                                                     Err(e) => {
-                                                                        tracing::warn!("LLM tool selection failed for '{}': {}. Falling back to first {} tools.", 
+                                                                        tracing::warn!("LLM tool selection failed for '{}': {}. Falling back to first {} tools.",
                                                                             toolkit_slug, e, TOOL_SELECTION_THRESHOLD);
                                                                         // Fallback: use first N tools alphabetically
                                                                         None
@@ -1594,35 +1726,35 @@ fn McpServerCard(
                                                                 None
                                                             }
                                                         };
-                                                        
+
                                                         // Step 3: Add toolkit to MCP server with optional pre-selected tools
                                                         if let Err(e) = client.add_toolkit_to_server(&toolkit_slug, &auth_config_id, selected_tools).await {
                                                             tracing::error!("Failed to add toolkit to MCP server: {}", e);
                                                             // Continue anyway - OAuth might still work if server already has it
                                                         }
-                                                        
+
                                                         // Step 4: Initiate OAuth/connection flow
                                                         connection_status.set("Authenticating...".to_string());
                                                         match client.initiate_connection(&toolkit_slug, &user_id).await {
                                                             Ok(result_msg) => {
                                                                 tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
-                                                                
+
                                                                 // Reload Composio tools to pick up newly enabled tools
                                                                 let updated_settings = settings.peek().clone();
                                                                 if let Err(e) = mcp_manager.read().reload_composio_tools(&updated_settings).await {
                                                                     tracing::warn!("Failed to reload Composio tools after connection: {}", e);
                                                                 }
-                                                                
+
                                                                 // Trigger UI refresh
                                                                 let current = *trigger_search.peek();
                                                                 trigger_search.set(current + 1);
-                                                                
+
                                                                 // Update connected_slugs immediately so button shows "Connected"
                                                                 {
                                                                     let mut slugs = connected_slugs.write();
                                                                     slugs.insert(toolkit_slug.to_lowercase());
                                                                 }
-                                                                
+
                                                                 is_connecting.set(false);
                                                             }
                                                             Err(e) => {
@@ -1716,7 +1848,6 @@ fn McpServerCard(
         }
     }
 }
-
 
 fn get_mcp_config_path() -> PathBuf {
     dirs::config_dir()

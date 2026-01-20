@@ -9,7 +9,7 @@ pub enum ToolCategory {
     // ReadOnly, // e.g., read_file, list_files
     // Write,    // e.g., write_to_file, apply_diff
     // Execute,  // e.g., execute_command
-    Mcp,      // General MCP tools
+    Mcp, // General MCP tools
 }
 
 #[derive(Debug, PartialEq)]
@@ -54,10 +54,9 @@ impl PermissionManager {
         }
     }
 
-
     pub fn check_mcp_permission(&self, server_name: &str) -> PermissionStatus {
         let settings = self.settings.read();
-        
+
         // 1. Global Auto-Approval Check
         if !settings.permission_settings.auto_approval_enabled {
             return PermissionStatus::RequiresPrompt;
@@ -77,7 +76,11 @@ impl PermissionManager {
         }
 
         // 3. Per-Server Toggle
-        if let Some(&allowed) = settings.permission_settings.mcp_server_permissions.get(server_name) {
+        if let Some(&allowed) = settings
+            .permission_settings
+            .mcp_server_permissions
+            .get(server_name)
+        {
             if allowed {
                 PermissionStatus::Allowed
             } else {

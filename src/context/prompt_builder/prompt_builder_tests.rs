@@ -1,9 +1,9 @@
 use super::*;
-use serde_json::json;
-use crate::settings::Settings;
-use crate::session::Session;
 use crate::session::ActiveContext;
-use chrono::Utc; // Needed for Session last_updated
+use crate::session::Session;
+use crate::settings::Settings;
+use chrono::Utc;
+use serde_json::json; // Needed for Session last_updated
 
 #[test]
 fn test_sanitize_removes_invalid_keys() {
@@ -26,24 +26,50 @@ fn test_sanitize_removes_invalid_keys() {
     });
 
     // List of keys to remove (matching the plan)
-    let keys = ["_meta", "additionalProperties", "$ref", "default", "minLength", "maxLength", "pattern"];
+    let keys = [
+        "_meta",
+        "additionalProperties",
+        "$ref",
+        "default",
+        "minLength",
+        "maxLength",
+        "pattern",
+    ];
     recursively_remove_keys(&mut schema, &keys);
 
     // Verify invalid keys are removed
-    assert!(schema.get("additionalProperties").is_none(), "additionalProperties should be removed");
+    assert!(
+        schema.get("additionalProperties").is_none(),
+        "additionalProperties should be removed"
+    );
     assert!(schema.get("$ref").is_none(), "$ref should be removed");
     assert!(schema.get("_meta").is_none(), "_meta should be removed");
 
     // Verify nested invalid keys are removed
     let name_prop = schema.get("properties").unwrap().get("name").unwrap();
-    assert!(name_prop.get("default").is_none(), "default should be removed");
-    assert!(name_prop.get("minLength").is_none(), "minLength should be removed");
-    assert!(name_prop.get("maxLength").is_none(), "maxLength should be removed");
-    assert!(name_prop.get("pattern").is_none(), "pattern should be removed");
+    assert!(
+        name_prop.get("default").is_none(),
+        "default should be removed"
+    );
+    assert!(
+        name_prop.get("minLength").is_none(),
+        "minLength should be removed"
+    );
+    assert!(
+        name_prop.get("maxLength").is_none(),
+        "maxLength should be removed"
+    );
+    assert!(
+        name_prop.get("pattern").is_none(),
+        "pattern should be removed"
+    );
 
     // Verify valid keys are preserved
     assert!(name_prop.get("type").is_some(), "type should be preserved");
-    assert!(name_prop.get("description").is_some(), "description should be preserved");
+    assert!(
+        name_prop.get("description").is_some(),
+        "description should be preserved"
+    );
 }
 
 #[test]
@@ -89,9 +115,18 @@ fn test_sanitize_strips_raw_type_name_strings() {
     let props = schema.get("properties").unwrap();
 
     // Malformed type-name strings should be STRIPPED (removed)
-    assert!(props.get("malformed_object").is_none(), "malformed_object should be removed");
-    assert!(props.get("malformed_string").is_none(), "malformed_string should be removed");
-    assert!(props.get("malformed_array").is_none(), "malformed_array should be removed");
+    assert!(
+        props.get("malformed_object").is_none(),
+        "malformed_object should be removed"
+    );
+    assert!(
+        props.get("malformed_string").is_none(),
+        "malformed_string should be removed"
+    );
+    assert!(
+        props.get("malformed_array").is_none(),
+        "malformed_array should be removed"
+    );
 
     // Valid prop should be unchanged
     let valid = props.get("valid_prop").unwrap();
@@ -107,7 +142,7 @@ fn test_sanitize_strips_deeply_nested_raw_type_strings() {
         "type": "OBJECT",
         "properties": {
             "outer_prop": {
-                "type": "OBJECT", 
+                "type": "OBJECT",
                 "properties": {
                     "value": "OBJECT",           // Deeply nested malformed - like Google Sheets error
                     "nested_string": "string",   // Another deeply nested malformed
@@ -140,9 +175,15 @@ fn test_sanitize_strips_deeply_nested_raw_type_strings() {
 
     // The key test: deeply nested malformed properties should be STRIPPED
     let outer_props = outer.get("properties").unwrap();
-    
-    assert!(outer_props.get("value").is_none(), "Deeply nested 'value' should be checked/removed");
-    assert!(outer_props.get("nested_string").is_none(), "Deeply nested 'nested_string' should be removed");
+
+    assert!(
+        outer_props.get("value").is_none(),
+        "Deeply nested 'value' should be checked/removed"
+    );
+    assert!(
+        outer_props.get("nested_string").is_none(),
+        "Deeply nested 'nested_string' should be removed"
+    );
 
     // Verify valid nested prop remains
     let valid_nested = outer_props.get("valid_nested").unwrap();
@@ -152,11 +193,13 @@ fn test_sanitize_strips_deeply_nested_raw_type_strings() {
     let array_prop = props.get("array_with_malformed_items").unwrap();
     let items = array_prop.get("items").unwrap();
     let items_props = items.get("properties").unwrap();
-    
-    // Note: items inside logic are simplified differently, but if Rule 5 runs, it should strip.
-    assert!(items_props.get("deeply_nested_value").is_none(), "deeply_nested_value inside array items should be removed");
-}
 
+    // Note: items inside logic are simplified differently, but if Rule 5 runs, it should strip.
+    assert!(
+        items_props.get("deeply_nested_value").is_none(),
+        "deeply_nested_value inside array items should be removed"
+    );
+}
 
 // =========================================================================
 // Composio Context Injection Tests
@@ -200,15 +243,35 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
     let prompt = builder.build_prompt("Hello".to_string(), None);
 
     // Extract the system instruction text
-    let system_instruction = prompt.system_instruction.expect("Should have system instruction");
-    let full_text: String = system_instruction.parts.iter().filter_map(|p| {
-        if let Part::Text { text, .. } = p { Some(text.as_str()) } else { None }
-    }).collect::<Vec<_>>().join("");
+    let system_instruction = prompt
+        .system_instruction
+        .expect("Should have system instruction");
+    let full_text: String = system_instruction
+        .parts
+        .iter()
+        .filter_map(|p| {
+            if let Part::Text { text, .. } = p {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("");
 
     // Assert: Composio context should be present
-    assert!(full_text.contains("composio_context"), "System prompt should contain composio_context");
-    assert!(full_text.contains("Test Profile"), "System prompt should contain active profile name");
-    assert!(full_text.contains("external tools via Composio"), "System prompt should explain Composio");
+    assert!(
+        full_text.contains("composio_context"),
+        "System prompt should contain composio_context"
+    );
+    assert!(
+        full_text.contains("Test Profile"),
+        "System prompt should contain active profile name"
+    );
+    assert!(
+        full_text.contains("external tools via Composio"),
+        "System prompt should explain Composio"
+    );
 }
 
 #[test]
@@ -229,13 +292,27 @@ fn test_composio_context_not_injected_when_profile_missing_api_key() {
     let builder = PromptBuilder::new(&session, &settings, &session_state);
     let prompt = builder.build_prompt("Hello".to_string(), None);
 
-    let system_instruction = prompt.system_instruction.expect("Should have system instruction");
-    let full_text: String = system_instruction.parts.iter().filter_map(|p| {
-        if let Part::Text { text, .. } = p { Some(text.as_str()) } else { None }
-    }).collect::<Vec<_>>().join("");
+    let system_instruction = prompt
+        .system_instruction
+        .expect("Should have system instruction");
+    let full_text: String = system_instruction
+        .parts
+        .iter()
+        .filter_map(|p| {
+            if let Part::Text { text, .. } = p {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("");
 
     // Assert: Composio context should NOT be present
-    assert!(!full_text.contains("composio_context"), "System prompt should NOT contain composio_context when API key is missing");
+    assert!(
+        !full_text.contains("composio_context"),
+        "System prompt should NOT contain composio_context when API key is missing"
+    );
 }
 
 #[test]
@@ -256,15 +333,25 @@ fn test_composio_context_not_injected_when_profile_missing_user_id() {
     let builder = PromptBuilder::new(&session, &settings, &session_state);
     let prompt = builder.build_prompt("Hello".to_string(), None);
 
-    let system_instruction = prompt.system_instruction.expect("Should have system instruction");
-    let full_text: String = system_instruction.parts.iter().filter_map(|p| {
-        if let Part::Text { text, .. } = p { Some(text.as_str()) } else { None }
-    }).collect::<Vec<_>>().join("");
+    let system_instruction = prompt
+        .system_instruction
+        .expect("Should have system instruction");
+    let full_text: String = system_instruction
+        .parts
+        .iter()
+        .filter_map(|p| {
+            if let Part::Text { text, .. } = p {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("");
 
     // Assert: Composio context should NOT be present
-    assert!(!full_text.contains("composio_context"), "System prompt should NOT contain composio_context when User ID is missing");
+    assert!(
+        !full_text.contains("composio_context"),
+        "System prompt should NOT contain composio_context when User ID is missing"
+    );
 }
-
-
-
-

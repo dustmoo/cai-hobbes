@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_free_icons::{Icon, icons::fi_icons};
+use dioxus_free_icons::{icons::fi_icons, Icon};
 
 #[component]
 pub fn InlineCommentPopover(
@@ -22,7 +22,7 @@ pub fn InlineCommentPopover(
                     on_cancel.call(());
                 }
             },
-            
+
             textarea {
                 class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm mb-3 text-gray-200 focus:outline-none focus:ring-1 focus:ring-primary-500 min-h-[5rem] resize-none",
                 placeholder: "Add a comment...",
@@ -44,7 +44,7 @@ pub fn InlineCommentPopover(
                 },
                 autofocus: true,
             }
-            
+
             div {
                 class: "flex justify-end space-x-2 items-center",
                 span { class: "text-[10px] text-gray-500 mr-auto", "Enter to save, Shift+Enter for newline" }

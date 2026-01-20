@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,7 +55,7 @@ pub async fn validate_gemini_api_key(api_key: &str) -> Result<(), String> {
 
     let client = Client::new();
     let url = format!("{}?key={}&pageSize=1", MODELS_API_URL, api_key);
-    
+
     match client.get(&url).send().await {
         Ok(response) => {
             let status = response.status();
@@ -74,7 +74,9 @@ pub async fn validate_gemini_api_key(api_key: &str) -> Result<(), String> {
 
 /// Fetch available Gemini models from the API
 /// Returns cached results if available and not expired
-pub async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<GeminiModel>, ModelFetchError> {
+pub async fn fetch_gemini_models(
+    api_key: Option<&str>,
+) -> Result<Vec<GeminiModel>, ModelFetchError> {
     // Check if we have a valid cached result
     {
         let cache = MODELS_CACHE.lock().unwrap();
@@ -90,7 +92,7 @@ pub async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<GeminiMode
     let api_key = api_key.ok_or(ModelFetchError::NoApiKey)?;
 
     tracing::debug!("Fetching Gemini models from API");
-    
+
     let client = Client::new();
     let mut all_models = Vec::new();
     let mut page_token: Option<String> = None;
@@ -102,16 +104,15 @@ pub async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<GeminiMode
             url.push_str(&format!("&pageToken={}", token));
         }
 
-        let response = client.get(&url)
-            .send()
-            .await?;
+        let response = client.get(&url).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(ModelFetchError::ParseError(
-                format!("API returned status {}: {}", status, error_text)
-            ));
+            return Err(ModelFetchError::ParseError(format!(
+                "API returned status {}: {}",
+                status, error_text
+            )));
         }
 
         let list_response: ModelsListResponse = response.json().await?;
@@ -127,11 +128,16 @@ pub async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<GeminiMode
     let filtered_models: Vec<GeminiModel> = all_models
         .into_iter()
         .filter(|model| {
-            model.supported_generation_methods.contains(&"generateContent".to_string())
+            model
+                .supported_generation_methods
+                .contains(&"generateContent".to_string())
         })
         .collect();
 
-    tracing::debug!("Fetched {} models supporting generateContent", filtered_models.len());
+    tracing::debug!(
+        "Fetched {} models supporting generateContent",
+        filtered_models.len()
+    );
 
     // Update cache
     {

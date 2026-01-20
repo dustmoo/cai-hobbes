@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::Value;
 use crate::mcp::manager::McpContext;
+use serde_json::Value;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct ConversationSummaryEntities {
@@ -126,33 +126,39 @@ impl Session {
             0
         }
     }
-    
+
     /// Calculate total cost for all messages in this session
     /// Always sums from message-level usage data, which is the source of truth.
     pub fn total_cost(&self) -> f64 {
-        self.messages.iter()
+        self.messages
+            .iter()
             .filter_map(|m| m.usage.as_ref())
             .filter_map(|u| u.cost)
             .sum()
     }
-    
+
     /// Calculate total tokens for all messages in this session
     /// Always sums from message-level usage data, which is the source of truth.
     pub fn total_tokens(&self) -> i32 {
-        self.messages.iter()
+        self.messages
+            .iter()
             .filter_map(|m| m.usage.as_ref())
             .map(|u| u.total_tokens)
             .sum()
     }
-    
+
     /// Calculate average tokens per turn
     /// Always calculates from message-level usage data, which is the source of truth.
     pub fn average_tokens_per_turn(&self) -> f64 {
-        let tokens = self.messages.iter()
+        let tokens = self
+            .messages
+            .iter()
             .filter_map(|m| m.usage.as_ref())
             .map(|u| u.total_tokens)
             .sum::<i32>() as f64;
-        let turns = self.messages.iter()
+        let turns = self
+            .messages
+            .iter()
             .filter(|m| m.author == "Hobbes")
             .count() as f64;
 
@@ -175,12 +181,14 @@ pub struct SessionState {
 }
 
 fn get_sessions_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|mut path| {
-        path.push("com.hobbes.app");
-        fs::create_dir_all(&path).ok()?;
-        path.push("sessions.json");
-        Some(path)
-    }).flatten()
+    dirs::config_dir()
+        .map(|mut path| {
+            path.push("com.hobbes.app");
+            fs::create_dir_all(&path).ok()?;
+            path.push("sessions.json");
+            Some(path)
+        })
+        .flatten()
 }
 
 impl SessionState {
@@ -192,21 +200,28 @@ impl SessionState {
     }
 
     pub fn load() -> Result<Self, std::io::Error> {
-        let path = get_sessions_path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find sessions path"))?;
+        let path = get_sessions_path().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find sessions path")
+        })?;
         let data = fs::read_to_string(&path).map_err(|e| {
             tracing::error!("Failed to read session file at {:?}: {}", path, e);
             e
         })?;
-        
+
         // Try direct deserialization first
         if let Ok(mut state) = serde_json::from_str::<Self>(&data) {
             tracing::info!("Successfully loaded session data.");
-            
+
             // Validate active_session_id
             if !state.sessions.contains_key(&state.active_session_id) {
-                tracing::warn!("Loaded active_session_id '{}' not found in sessions. Resetting.", state.active_session_id);
+                tracing::warn!(
+                    "Loaded active_session_id '{}' not found in sessions. Resetting.",
+                    state.active_session_id
+                );
                 if !state.sessions.is_empty() {
-                    state.active_session_id = state.sessions.values()
+                    state.active_session_id = state
+                        .sessions
+                        .values()
                         .max_by_key(|s| s.last_updated)
                         .map(|s| s.id.clone())
                         .unwrap_or_default();
@@ -219,7 +234,7 @@ impl SessionState {
 
         // If direct deserialization fails, attempt migration
         tracing::warn!("Failed to deserialize session state directly, attempting migration...");
-        
+
         // Backup the old file before attempting to overwrite
         let backup_path = path.with_extension("json.bak");
         fs::copy(&path, backup_path)?;
@@ -229,11 +244,15 @@ impl SessionState {
             // Migrate MessageContent::Text from old tuple format to new struct format
             if let Some(sessions_obj) = value.get_mut("sessions").and_then(|v| v.as_object_mut()) {
                 for (_session_id, session_val) in sessions_obj.iter_mut() {
-                    if let Some(messages) = session_val.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                    if let Some(messages) = session_val
+                        .get_mut("messages")
+                        .and_then(|v| v.as_array_mut())
+                    {
                         for message in messages.iter_mut() {
                             if let Some(content) = message.get_mut("content") {
                                 // Check if this is the old Text format: {"Text": "string"}
-                                if let Some(text_str) = content.get("Text").and_then(|v| v.as_str()) {
+                                if let Some(text_str) = content.get("Text").and_then(|v| v.as_str())
+                                {
                                     // Convert to new format: {"Text": {"content": "string", "thought_signature": null}}
                                     *content = serde_json::json!({
                                         "Text": {
@@ -247,18 +266,22 @@ impl SessionState {
                             }
                         }
                     }
-                    
+
                     // Migrate messages without created_at timestamps
-                    if let Some(messages) = session_val.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                    if let Some(messages) = session_val
+                        .get_mut("messages")
+                        .and_then(|v| v.as_array_mut())
+                    {
                         let base_time = chrono::Utc::now() - chrono::Duration::hours(1); // Start 1 hour ago
                         for (index, message) in messages.iter_mut().enumerate() {
                             // Check if created_at field exists
                             if message.get("created_at").is_none() {
                                 // Assign timestamp: base_time + index milliseconds
-                                let timestamp = base_time + chrono::Duration::milliseconds(index as i64);
+                                let timestamp =
+                                    base_time + chrono::Duration::milliseconds(index as i64);
                                 message.as_object_mut().unwrap().insert(
                                     "created_at".to_string(),
-                                    serde_json::json!(timestamp.to_rfc3339())
+                                    serde_json::json!(timestamp.to_rfc3339()),
                                 );
                                 tracing::debug!("Migrated message {} with timestamp", index);
                             }
@@ -266,7 +289,7 @@ impl SessionState {
                     }
                 }
             }
-            
+
             // Now deserialize the migrated value
             if let Some(sessions_val) = value.get("sessions") {
                 if let Ok(sessions) = serde_json::from_value(sessions_val.clone()) {
@@ -299,21 +322,29 @@ impl SessionState {
 
     pub fn save(&self) -> Result<(), std::io::Error> {
         use std::io::Write;
-        
-        let path = get_sessions_path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find sessions path"))?;
-        let parent_dir = path.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find parent directory"))?;
-        
-        let data = serde_json::to_string_pretty(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        
+
+        let path = get_sessions_path().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find sessions path")
+        })?;
+        let parent_dir = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Could not find parent directory",
+            )
+        })?;
+
+        let data = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
         // Create temp file in the same directory (required for atomic rename on same filesystem)
         let mut temp_file = tempfile::NamedTempFile::new_in(parent_dir)?;
-        
+
         // Write data to temp file
         temp_file.write_all(data.as_bytes())?;
-        
+
         // Sync to disk to ensure data is persisted before rename
         temp_file.as_file().sync_all()?;
-        
+
         // Set restrictive permissions on the temp file before persisting
         #[cfg(unix)]
         {
@@ -321,12 +352,12 @@ impl SessionState {
             let permissions = fs::Permissions::from_mode(0o600);
             temp_file.as_file().set_permissions(permissions)?;
         }
-        
+
         // Atomically rename temp file to target path
         // This is the key operation - if it succeeds, the file is fully written
         // If it fails, the original file remains intact
         temp_file.persist(&path).map_err(|e| e.error)?;
-        
+
         Ok(())
     }
 
@@ -357,7 +388,9 @@ impl SessionState {
 
         if self.active_session_id == id {
             // The active session was deleted. Find a new one or clear the active id.
-            self.active_session_id = self.sessions.values()
+            self.active_session_id = self
+                .sessions
+                .values()
                 .max_by_key(|s| s.last_updated)
                 .map(|s| s.id.clone())
                 .unwrap_or_default();
@@ -386,7 +419,10 @@ impl SessionState {
     pub fn set_active_session(&mut self, id: String) {
         self.active_session_id = id;
         if let Err(e) = self.save() {
-            tracing::error!("Failed to save session state after setting active session: {}", e);
+            tracing::error!(
+                "Failed to save session state after setting active session: {}",
+                e
+            );
         }
     }
 
@@ -412,11 +448,17 @@ impl SessionState {
         if let Some(session) = self.sessions.get_mut(id) {
             session.name = new_name;
             if let Err(e) = self.save() {
-                tracing::error!("Failed to save session state after updating session name: {}", e);
+                tracing::error!(
+                    "Failed to save session state after updating session name: {}",
+                    e
+                );
             }
         }
     }
-    pub fn get_message_mut(&mut self, message_id: &uuid::Uuid) -> Option<&mut super::components::chat::Message> {
+    pub fn get_message_mut(
+        &mut self,
+        message_id: &uuid::Uuid,
+    ) -> Option<&mut super::components::chat::Message> {
         self.get_active_session_mut()
             .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
     }
@@ -429,15 +471,21 @@ impl SessionState {
             }
         }
     }
-    pub fn get_message_mut_by_execution_id(&mut self, execution_id: &str) -> Option<&mut super::components::chat::Message> {
-        self.get_active_session_mut()
-            .and_then(|session| session.messages.iter_mut().find(|m| {
-                match &m.content {
-                    super::components::shared::MessageContent::ToolCall(tc) => tc.execution_id == execution_id,
-                    super::components::shared::MessageContent::PermissionRequest(tc) => tc.execution_id == execution_id,
-                    _ => false,
+    pub fn get_message_mut_by_execution_id(
+        &mut self,
+        execution_id: &str,
+    ) -> Option<&mut super::components::chat::Message> {
+        self.get_active_session_mut().and_then(|session| {
+            session.messages.iter_mut().find(|m| match &m.content {
+                super::components::shared::MessageContent::ToolCall(tc) => {
+                    tc.execution_id == execution_id
                 }
-            }))
+                super::components::shared::MessageContent::PermissionRequest(tc) => {
+                    tc.execution_id == execution_id
+                }
+                _ => false,
+            })
+        })
     }
 }
 impl Default for SessionState {
@@ -445,7 +493,7 @@ impl Default for SessionState {
         Self {
             sessions: HashMap::new(),
             active_session_id: String::new(),
-            window_width: 1440.0,  // 16:9 ratio default
+            window_width: 1440.0, // 16:9 ratio default
             window_height: 810.0,
             tool_call_history: Vec::new(),
         }
@@ -463,42 +511,48 @@ mod tests {
         // Create a temp directory to simulate the config dir
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let test_path = temp_dir.path().join("test_sessions.json");
-        
+
         // Create a test SessionState
         let mut state = SessionState::default();
         state.window_width = 800.0;
         state.window_height = 600.0;
-        
+
         // Manually save to our test path (bypassing get_sessions_path)
         let data = serde_json::to_string_pretty(&state).expect("Failed to serialize");
-        
+
         // Use the same atomic write pattern
         {
             use std::io::Write;
             let mut temp_file = tempfile::NamedTempFile::new_in(temp_dir.path())
                 .expect("Failed to create temp file");
-            temp_file.write_all(data.as_bytes()).expect("Failed to write");
+            temp_file
+                .write_all(data.as_bytes())
+                .expect("Failed to write");
             temp_file.as_file().sync_all().expect("Failed to sync");
-            
+
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let permissions = fs::Permissions::from_mode(0o600);
-                temp_file.as_file().set_permissions(permissions).expect("Failed to set permissions");
+                temp_file
+                    .as_file()
+                    .set_permissions(permissions)
+                    .expect("Failed to set permissions");
             }
-            
+
             temp_file.persist(&test_path).expect("Failed to persist");
         }
-        
+
         // Verify the file exists and is valid JSON
         let mut file = fs::File::open(&test_path).expect("Failed to open saved file");
         let mut contents = String::new();
-        file.read_to_string(&mut contents).expect("Failed to read file");
-        
+        file.read_to_string(&mut contents)
+            .expect("Failed to read file");
+
         let loaded: SessionState = serde_json::from_str(&contents).expect("Failed to parse JSON");
         assert_eq!(loaded.window_width, 800.0);
         assert_eq!(loaded.window_height, 600.0);
-        
+
         // Verify permissions on Unix
         #[cfg(unix)]
         {
@@ -514,18 +568,18 @@ mod tests {
     fn test_atomic_save_preserves_original_on_failure() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let test_path = temp_dir.path().join("test_sessions.json");
-        
+
         // Write an initial file
         let initial_content = r#"{"sessions":{},"active_session_id":"","window_width":100.0,"window_height":100.0,"tool_call_history":[]}"#;
         fs::write(&test_path, initial_content).expect("Failed to write initial file");
-        
+
         // Verify original exists
         assert!(test_path.exists());
-        
+
         // The temp file approach means even if we fail mid-write, original is preserved
         // Since persist() is atomic, we can't really test a mid-write failure easily,
         // but we can verify the pattern works for normal cases
-        
+
         let original = fs::read_to_string(&test_path).expect("Failed to read original");
         assert!(original.contains("100.0"));
     }

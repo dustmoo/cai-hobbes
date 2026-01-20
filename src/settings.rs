@@ -1,8 +1,8 @@
+use crate::context::permissions::{PermissionSettings, ToolCategory};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use crate::context::permissions::{PermissionSettings, ToolCategory};
-use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -65,16 +65,36 @@ impl Default for HotkeySettings {
     }
 }
 
-fn default_toggle_settings() -> String { "CmdOrCtrl+,".to_string() }
-fn default_toggle_history() -> String { "CmdOrCtrl+Shift+H".to_string() }
-fn default_toggle_mcp() -> String { "CmdOrCtrl+Shift+M".to_string() }
-fn default_toggle_profile() -> String { "CmdOrCtrl+Shift+P".to_string() }
-fn default_toggle_attachments() -> String { "CmdOrCtrl+Shift+A".to_string() }
-fn default_toggle_tray() -> String { "CmdOrCtrl+Shift+Space".to_string() }
-fn default_toggle_new_chat() -> String { "CmdOrCtrl+Shift+N".to_string() }
-fn default_toggle_new_chat_with_memory() -> String { "CmdOrCtrl+Alt+N".to_string() }
-fn default_toggle_focus_chat() -> String { "CmdOrCtrl+/".to_string() }
-fn default_toggle_scroll_to_bottom() -> String { "CmdOrCtrl+Shift+ArrowDown".to_string() }
+fn default_toggle_settings() -> String {
+    "CmdOrCtrl+,".to_string()
+}
+fn default_toggle_history() -> String {
+    "CmdOrCtrl+Shift+H".to_string()
+}
+fn default_toggle_mcp() -> String {
+    "CmdOrCtrl+Shift+M".to_string()
+}
+fn default_toggle_profile() -> String {
+    "CmdOrCtrl+Shift+P".to_string()
+}
+fn default_toggle_attachments() -> String {
+    "CmdOrCtrl+Shift+A".to_string()
+}
+fn default_toggle_tray() -> String {
+    "CmdOrCtrl+Shift+Space".to_string()
+}
+fn default_toggle_new_chat() -> String {
+    "CmdOrCtrl+Shift+N".to_string()
+}
+fn default_toggle_new_chat_with_memory() -> String {
+    "CmdOrCtrl+Alt+N".to_string()
+}
+fn default_toggle_focus_chat() -> String {
+    "CmdOrCtrl+/".to_string()
+}
+fn default_toggle_scroll_to_bottom() -> String {
+    "CmdOrCtrl+Shift+ArrowDown".to_string()
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -165,11 +185,11 @@ impl Default for KeychainStorageMode {
 }
 
 /// Check if the app is running in a sandboxed environment (App Store/TestFlight build).
-/// 
+///
 /// Detection methods (in order):
 /// 1. Check if HOME is within an App Sandbox container path
 /// 2. Fallback: Check for embedded.provisionprofile (works during local dev builds)
-/// 
+///
 /// Apple strips embedded.provisionprofile during TestFlight/App Store distribution,
 /// so we can't rely on that file alone for production builds.
 pub fn is_sandboxed() -> bool {
@@ -182,16 +202,19 @@ pub fn is_sandboxed() -> bool {
                 return true;
             }
         }
-        
+
         // Fallback: Check for provisioning profile (local dev builds)
-        std::env::current_exe().ok()
+        std::env::current_exe()
+            .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             .map(|p| p.join("embedded.provisionprofile").exists())
             .unwrap_or(false)
     }
     #[cfg(not(target_os = "macos"))]
-    { false }
+    {
+        false
+    }
 }
 
 /// Returns the branded app name based on distribution variant.
@@ -206,7 +229,8 @@ pub fn get_app_name() -> &'static str {
 }
 
 /// Attribution line for About screens (applies to both variants)
-pub const APP_ATTRIBUTION: &str = "Made w/ ❤️ by Clear Mirror LLC, Gemini 2.5, 3 and Claude model families.";
+pub const APP_ATTRIBUTION: &str =
+    "Made w/ ❤️ by Clear Mirror LLC, Gemini 2.5, 3 and Claude model families.";
 
 /// Configuration for a single Composio toolkit's loading behavior
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -300,7 +324,11 @@ impl ComposioProfile {
     /// Update or add a toolkit configuration
     #[allow(dead_code)]
     pub fn set_toolkit_config(&mut self, config: ComposioToolkitConfig) {
-        if let Some(existing) = self.toolkit_configs.iter_mut().find(|c| c.slug == config.slug) {
+        if let Some(existing) = self
+            .toolkit_configs
+            .iter_mut()
+            .find(|c| c.slug == config.slug)
+        {
             *existing = config;
         } else {
             self.toolkit_configs.push(config);
@@ -367,7 +395,9 @@ impl Settings {
     /// Get the currently active Composio profile
     pub fn get_active_profile(&self) -> Option<&ComposioProfile> {
         if let Some(active_name) = &self.active_composio_profile {
-            self.composio_profiles.iter().find(|p| &p.name == active_name)
+            self.composio_profiles
+                .iter()
+                .find(|p| &p.name == active_name)
         } else {
             self.composio_profiles.first()
         }
@@ -393,15 +423,16 @@ impl Settings {
             name = format!("{} ({})", profile.name, counter);
             counter += 1;
         }
-        
+
         let mut new_profile = profile;
         new_profile.name = name;
-        
+
         // Auto-generate user_id if not set:
         // - Inherit from first existing profile if available
         // - Otherwise generate a new lowercase UUID
         if new_profile.user_id.is_none() {
-            new_profile.user_id = self.composio_profiles
+            new_profile.user_id = self
+                .composio_profiles
                 .first()
                 .and_then(|p| p.user_id.clone())
                 .or_else(|| Some(uuid::Uuid::new_v4().to_string().to_lowercase()));
@@ -411,9 +442,9 @@ impl Settings {
         if new_profile.id.is_empty() {
             new_profile.id = Uuid::new_v4().to_string();
         }
-        
+
         self.composio_profiles.push(new_profile);
-        
+
         // If this is the first profile, make it active
         if self.active_composio_profile.is_none() && self.composio_profiles.len() == 1 {
             self.active_composio_profile = Some(self.composio_profiles[0].name.clone());
@@ -423,7 +454,7 @@ impl Settings {
     /// Remove a Composio profile by name
     pub fn remove_profile(&mut self, name: &str) {
         self.composio_profiles.retain(|p| p.name != name);
-        
+
         // If we removed the active profile, reset to first available
         if self.active_composio_profile.as_deref() == Some(name) {
             self.active_composio_profile = self.composio_profiles.first().map(|p| p.name.clone());
@@ -434,11 +465,11 @@ impl Settings {
     #[allow(dead_code)]
     pub fn migrate_legacy_composio_settings(&mut self) {
         // Only migrate if we have legacy settings and no profiles yet
-        let has_legacy = self.composio_base_url.is_some() 
-            || self.composio_entity_id.is_some() 
+        let has_legacy = self.composio_base_url.is_some()
+            || self.composio_entity_id.is_some()
             || self.composio_user_id.is_some()
             || self.composio_api_key.is_some();
-            
+
         if has_legacy && self.composio_profiles.is_empty() {
             tracing::info!("Migrating legacy Composio settings to profile...");
             let profile = ComposioProfile {
@@ -462,7 +493,11 @@ impl Settings {
         for profile in &mut self.composio_profiles {
             if profile.id.is_empty() {
                 profile.id = Uuid::new_v4().to_string();
-                tracing::info!("Migrated profile '{}' with new ID: {}", profile.name, profile.id);
+                tracing::info!(
+                    "Migrated profile '{}' with new ID: {}",
+                    profile.name,
+                    profile.id
+                );
             }
         }
         // Save is handled by the caller (load)
@@ -561,14 +596,16 @@ impl SettingsManager {
             // Note: Complex nested structs like permission_settings are harder to migrate
             // field-by-field and will fall back to default if they fail to parse.
             if let Some(perms) = value.get("permission_settings") {
-                if let Ok(mut permission_settings) = serde_json::from_value::<PermissionSettings>(perms.clone()) {
+                if let Ok(mut permission_settings) =
+                    serde_json::from_value::<PermissionSettings>(perms.clone())
+                {
                     // Manual migration for mcp_server_permissions if it was somehow skipped by serde default
                     if permission_settings.mcp_server_permissions.is_empty() {
-                         if let Some(mcp_perms) = perms.get("mcp_server_permissions") {
-                             if let Ok(map) = serde_json::from_value(mcp_perms.clone()) {
-                                 permission_settings.mcp_server_permissions = map;
-                             }
-                         }
+                        if let Some(mcp_perms) = perms.get("mcp_server_permissions") {
+                            if let Ok(map) = serde_json::from_value(mcp_perms.clone()) {
+                                permission_settings.mcp_server_permissions = map;
+                            }
+                        }
                     }
                     settings.permission_settings = permission_settings;
                 }
@@ -587,7 +624,10 @@ impl SettingsManager {
             if let Some(len) = value.get("max_tool_output_length").and_then(|v| v.as_u64()) {
                 settings.max_tool_output_length = len as usize;
             }
-            if let Some(len) = value.get("max_active_tool_output_length").and_then(|v| v.as_u64()) {
+            if let Some(len) = value
+                .get("max_active_tool_output_length")
+                .and_then(|v| v.as_u64())
+            {
                 settings.max_active_tool_output_length = len as usize;
             }
             if let Some(uid) = value.get("composio_user_id").and_then(|v| v.as_str()) {
@@ -606,8 +646,6 @@ impl SettingsManager {
 
         settings
     }
-
-
 
     pub fn save(&self, settings: &Settings) -> Result<(), std::io::Error> {
         let content = serde_json::to_string_pretty(settings)?;
@@ -668,7 +706,7 @@ pub struct UiState {
     /// What token/cost info to display: "all", "tokens", "cost", "none"
     #[serde(default = "default_token_display_mode")]
     pub token_display_mode: String,
-    
+
     // Feature Toggles (Chat Bar Icons)
     #[serde(default = "default_true")]
     pub show_history_icon: bool,
@@ -687,7 +725,7 @@ fn default_token_display_mode() -> String {
 impl Default for UiState {
     fn default() -> Self {
         Self {
-            settings_panel_width: 420.0,  // Comfortable width for 1440px window
+            settings_panel_width: 420.0, // Comfortable width for 1440px window
             default_tool_arguments_open: true,
             default_tool_response_open: false,
             default_tool_thought_open: false,

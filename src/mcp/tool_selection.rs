@@ -46,21 +46,30 @@ impl ToolSelectionRequest {
 
 /// Build the prompt for the LLM to select tools
 pub fn build_selection_prompt(request: &ToolSelectionRequest) -> String {
-    let toolkit_desc = request.toolkit_description.clone()
+    let toolkit_desc = request
+        .toolkit_description
+        .clone()
         .unwrap_or_else(|| format!("{} integration toolkit", request.toolkit_name));
-    
+
     // Build tool list with descriptions (truncated for large toolkits)
-    let tool_list: String = request.available_tools.iter()
+    let tool_list: String = request
+        .available_tools
+        .iter()
         .map(|t| {
             let desc = t.description.clone().unwrap_or_default();
             // Truncate long descriptions
-            let desc_short = if desc.len() > 100 { format!("{}...", &desc[..100]) } else { desc };
+            let desc_short = if desc.len() > 100 {
+                format!("{}...", &desc[..100])
+            } else {
+                desc
+            };
             format!("- {}: {}", t.name, desc_short)
         })
         .collect::<Vec<_>>()
         .join("\n");
-    
-    format!(r#"You are selecting the most useful tools from a toolkit for an AI coding assistant.
+
+    format!(
+        r#"You are selecting the most useful tools from a toolkit for an AI coding assistant.
 
 Toolkit: {toolkit_name}
 Description: {toolkit_desc}
@@ -99,19 +108,24 @@ Respond ONLY with valid JSON (no markdown, no explanation outside JSON):
 /// Parse the LLM response into a ToolSelectionResponse
 pub fn parse_selection_response(response: &str) -> Result<ToolSelectionResponse, String> {
     let json_str = crate::components::shared::extract_json_from_response(response);
-    
+
     match serde_json::from_str::<ToolSelectionResponse>(json_str) {
         Ok(parsed) => Ok(parsed),
-        Err(_) => Err(format!("Failed to parse tool selection response as JSON: {}", 
-            if response.len() > 200 { &response[..200] } else { response })),
+        Err(_) => Err(format!(
+            "Failed to parse tool selection response as JSON: {}",
+            if response.len() > 200 {
+                &response[..200]
+            } else {
+                response
+            }
+        )),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_valid_json() {
         let response = r#"{"selected_tools": ["GITHUB_CREATE_ISSUE", "GITHUB_LIST_REPOS"], "reasoning": "Core operations"}"#;
@@ -119,7 +133,7 @@ mod tests {
         assert_eq!(result.selected_tools.len(), 2);
         assert_eq!(result.reasoning, "Core operations");
     }
-    
+
     #[test]
     fn test_parse_markdown_json() {
         let response = r#"Here's the selection:
@@ -129,10 +143,11 @@ mod tests {
         let result = parse_selection_response(response).unwrap();
         assert_eq!(result.selected_tools, vec!["TOOL_A"]);
     }
-    
+
     #[test]
     fn test_parse_embedded_json() {
-        let response = r#"I recommend: {"selected_tools": ["X"], "reasoning": "Y"} for your use case."#;
+        let response =
+            r#"I recommend: {"selected_tools": ["X"], "reasoning": "Y"} for your use case."#;
         let result = parse_selection_response(response).unwrap();
         assert_eq!(result.selected_tools, vec!["X"]);
     }

@@ -12,7 +12,12 @@ use super::shared::MessageContent;
 const INITIAL_MESSAGES_TO_SHOW: usize = 20;
 
 #[component]
-pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signal<bool>, on_delete: EventHandler<Uuid>, on_comment: EventHandler<()>) -> Element {
+pub fn MessageList(
+    stream_update_trigger: Signal<i32>,
+    show_scroll_button: Signal<bool>,
+    on_delete: EventHandler<Uuid>,
+    on_comment: EventHandler<()>,
+) -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
     let ui_state = consume_context::<Signal<crate::settings::UiState>>();
     let chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
@@ -21,13 +26,19 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
 
     use_effect(move || {
         if let Some(cmd) = chat_command.read().clone() {
-            if matches!(cmd, crate::components::chat_input::ChatCommand::ScrollToBottom) {
-                 spawn(async move {
-                    let _ = document::eval(r#"
+            if matches!(
+                cmd,
+                crate::components::chat_input::ChatCommand::ScrollToBottom
+            ) {
+                spawn(async move {
+                    let _ = document::eval(
+                        r#"
                         const el = document.getElementById('message-list');
                         if (el) { el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }); }
-                    "#).await;
-                 });
+                    "#,
+                    )
+                    .await;
+                });
             }
         }
     });
@@ -103,11 +114,11 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&state.active_session_id) {
                         let total_messages = session.messages.len();
-                        
+
                         // Sort messages by created_at timestamp to ensure chronological order
                         let mut sorted_messages = session.messages.clone();
                         sorted_messages.sort_by_key(|m| m.created_at);
-                        
+
                         let messages_to_render = sorted_messages.iter().skip(total_messages.saturating_sub(*visible_message_count.read())).collect::<Vec<_>>();
 
                         if session.messages.is_empty() {
@@ -167,7 +178,7 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                                                         class: "flex flex-col max-w-2/3 min-w-0",
                                                         div {
                                                             class: "relative group rounded-2xl {bubble_classes}",
-                                                            ToolCallDisplay { 
+                                                            ToolCallDisplay {
                                                                 tool_call: tool_call.clone(),
                                                                 usage: message.usage.clone(),
                                                                 token_display_mode: ui_state.read().token_display_mode.clone()

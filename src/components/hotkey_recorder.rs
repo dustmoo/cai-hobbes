@@ -37,7 +37,7 @@ pub fn HotkeyRecorder(props: HotkeyRecorderProps) -> Element {
         if !*recording.read() {
             return;
         }
-        
+
         evt.stop_propagation();
         evt.prevent_default();
 
@@ -54,16 +54,16 @@ pub fn HotkeyRecorder(props: HotkeyRecorderProps) -> Element {
 
         // Build the accelerator string from modifiers
         let mut parts = Vec::new();
-        
+
         // Mac-specific modifier mapping preference: CmdOrCtrl > Shift > Alt > Ctrl
         if modifiers.contains(dioxus::events::Modifiers::META) {
             parts.push("CmdOrCtrl");
         }
         if modifiers.contains(dioxus::events::Modifiers::CONTROL) {
-             // On Mac, Ctrl is Control. But standard accelerators often use Cmd. 
-             // If Cmd is pressed, we used CmdOrCtrl. 
-             // If Control is ALSO pressed, we add Control.
-             parts.push("Control");
+            // On Mac, Ctrl is Control. But standard accelerators often use Cmd.
+            // If Cmd is pressed, we used CmdOrCtrl.
+            // If Control is ALSO pressed, we add Control.
+            parts.push("Control");
         }
         if modifiers.contains(dioxus::events::Modifiers::ALT) {
             parts.push("Alt");
@@ -73,16 +73,14 @@ pub fn HotkeyRecorder(props: HotkeyRecorderProps) -> Element {
         }
 
         // Determine if non-modifier key is pressed
-        let is_modifier_key = matches!(key, 
-            Key::Meta | Key::Control | Key::Alt | Key::Shift 
-        );
+        let is_modifier_key = matches!(key, Key::Meta | Key::Control | Key::Alt | Key::Shift);
 
         if !is_modifier_key {
             // Map keys to muda-friendly strings
             // Muda expects "KeyA" -> "A" (usually), and "Digit1" -> "1"
             // But strict accelerator parsing might need specifics.
             // Let's rely on the Key enum's string representation but cleaned up.
-            
+
             let key_str = match key {
                 Key::Character(c) if c == " " => "Space".to_string(),
                 Key::Character(c) => c.to_uppercase(),
@@ -98,28 +96,40 @@ pub fn HotkeyRecorder(props: HotkeyRecorderProps) -> Element {
             };
 
             parts.push(key_str.as_str());
-            
+
             let final_hotkey = parts.join("+");
-            
+
             // Commit
             props.onchange.call(final_hotkey.clone());
             display_value.set(final_hotkey);
             recording.set(false);
         } else {
             // Update display with current modifiers?
-            // Optional: Show "Cmd+" while holding. 
+            // Optional: Show "Cmd+" while holding.
             // For simplicity, keep "Press keys..." until completion or implement live preview.
             // Let's implement live preview.
-             let preview = parts.join("+");
-             if !preview.is_empty() {
-                 display_value.set(preview + "...");
-             }
+            let preview = parts.join("+");
+            if !preview.is_empty() {
+                display_value.set(preview + "...");
+            }
         }
     };
 
-    let border_color = if *recording.read() { "border-primary-500 ring-2 ring-primary-900" } else { "border-primary-600" };
-    let bg_color = if *recording.read() { "bg-dark-section" } else { "bg-dark-input" };
-    let text_color = if *recording.read() { "text-primary-300" } else { "text-gray-200" };
+    let border_color = if *recording.read() {
+        "border-primary-500 ring-2 ring-primary-900"
+    } else {
+        "border-primary-600"
+    };
+    let bg_color = if *recording.read() {
+        "bg-dark-section"
+    } else {
+        "bg-dark-input"
+    };
+    let text_color = if *recording.read() {
+        "text-primary-300"
+    } else {
+        "text-gray-200"
+    };
 
     rsx! {
         div {

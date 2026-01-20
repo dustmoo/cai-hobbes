@@ -1,6 +1,6 @@
-use dioxus::prelude::*;
-use crate::settings::McpSource;
 use crate::mcp::composio_client::ComposioCategory;
+use crate::settings::McpSource;
+use dioxus::prelude::*;
 
 #[component]
 pub fn McpSearchForm(
@@ -18,7 +18,7 @@ pub fn McpSearchForm(
     // Clone signals for use in closures - this ensures proper reactivity
     let mut sort_by_writer = sort_by;
     let mut trigger_search_writer = trigger_search;
-    
+
     rsx! {
         div {
             class: "mb-4",

@@ -1,11 +1,12 @@
-
-use crate::components::llm::{Content, FunctionCallPart, FunctionResponsePart, InlineDataPart, Part, SystemInstruction};
+use crate::components::chat::Message;
+use crate::components::llm::{
+    Content, FunctionCallPart, FunctionResponsePart, InlineDataPart, Part, SystemInstruction,
+};
+use crate::components::shared::MessageContent;
 use crate::session::{Session, Tool};
 use crate::settings::Settings;
 use chrono::Local;
 use serde_json::{self, json};
-use crate::components::chat::Message;
-use crate::components::shared::MessageContent;
 
 /// Gemini API has a limit of 128 function declarations per request.
 /// See: https://ai.google.dev/gemini-api/docs/function-calling#best-practices
@@ -16,20 +17,35 @@ mod prompt_builder_tests;
 
 impl From<Message> for Content {
     fn from(msg: Message) -> Self {
-        let role = if msg.author == "User" { "user" } else { "model" }.to_string();
+        let role = if msg.author == "User" {
+            "user"
+        } else {
+            "model"
+        }
+        .to_string();
         match msg.content {
-            MessageContent::Text { content: text, thought_summary, .. } => {
+            MessageContent::Text {
+                content: text,
+                thought_summary,
+                ..
+            } => {
                 let mut parts = Vec::new();
-                
+
                 // Include thinking summary if present (critical for Gemini 2.0 Thinking support)
                 if let Some(summary) = thought_summary {
                     if !summary.is_empty() {
-                        parts.push(Part::Text { text: summary, thought: Some(true) });
+                        parts.push(Part::Text {
+                            text: summary,
+                            thought: Some(true),
+                        });
                     }
                 }
-                
-                parts.push(Part::Text { text, thought: None });
-                
+
+                parts.push(Part::Text {
+                    text,
+                    thought: None,
+                });
+
                 for attachment in msg.attachments {
                     parts.push(Part::InlineData {
                         inline_data: InlineDataPart {
@@ -43,15 +59,24 @@ impl From<Message> for Content {
             MessageContent::ToolCall(_) => {
                 // Tool calls are handled separately in the tool_call_history loop.
                 // Return empty parts so this message is filtered out from the main history.
-                Content { role, parts: vec![] }
-            },
+                Content {
+                    role,
+                    parts: vec![],
+                }
+            }
             MessageContent::PermissionRequest(_) => {
                 // Permission requests are UI-only and should not be in the prompt history.
-                Content { role, parts: vec![] }
+                Content {
+                    role,
+                    parts: vec![],
+                }
             }
             MessageContent::Error { .. } => {
                 // Error messages are UI-only and should not be in the prompt history.
-                Content { role, parts: vec![] }
+                Content {
+                    role,
+                    parts: vec![],
+                }
             }
         }
     }
@@ -73,8 +98,16 @@ pub struct PromptBuilder<'a> {
 }
 
 impl<'a> PromptBuilder<'a> {
-    pub fn new(session: &'a Session, settings: &'a Settings, session_state: &'a crate::session::SessionState) -> Self {
-        Self { session, settings, session_state }
+    pub fn new(
+        session: &'a Session,
+        settings: &'a Settings,
+        session_state: &'a crate::session::SessionState,
+    ) -> Self {
+        Self {
+            session,
+            settings,
+            session_state,
+        }
     }
 
     /// Builds the structured `LlmPrompt` with system instructions, tools, and conversation history.
@@ -86,64 +119,80 @@ impl<'a> PromptBuilder<'a> {
         // Note: Tool Router handles on-demand tools via search→execute pattern.
         // Force-loaded toolkits (force_load: true) have their tools included below.
         // No filtering needed here - all tools from the MCP context are included.
-        
+
         // 1. Extract and format tools from the session context using TYPE-SAFE conversion.
         // Tools that fail conversion (incompatible with Gemini) are logged and skipped.
         let mut tools_truncated_count = 0usize;
-        let tools = self.session.active_context.mcp_tools.as_ref().map(|mcp_context| {
-            let mut function_declarations = Vec::new();
-            for server in &mcp_context.servers {
-                for tool in &server.tools {
-                    // Use type-safe conversion - if it fails, skip the tool
-                    match crate::gemini::convert::mcp_tool_to_gemini(tool, &server.name) {
-                        Ok(gemini_decl) => {
-                            // Convert the type-safe struct to JSON Value for the existing API
-                            match serde_json::to_value(&gemini_decl) {
-                                Ok(tool_value) => {
-                                    function_declarations.push(tool_value);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Tool '{}' serialization failed: {}. Skipping.",
-                                        tool.name, e
-                                    );
+        let tools = self
+            .session
+            .active_context
+            .mcp_tools
+            .as_ref()
+            .map(|mcp_context| {
+                let mut function_declarations = Vec::new();
+                for server in &mcp_context.servers {
+                    for tool in &server.tools {
+                        // Use type-safe conversion - if it fails, skip the tool
+                        match crate::gemini::convert::mcp_tool_to_gemini(tool, &server.name) {
+                            Ok(gemini_decl) => {
+                                // Convert the type-safe struct to JSON Value for the existing API
+                                match serde_json::to_value(&gemini_decl) {
+                                    Ok(tool_value) => {
+                                        function_declarations.push(tool_value);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Tool '{}' serialization failed: {}. Skipping.",
+                                            tool.name,
+                                            e
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Tool '{}:{}' incompatible with Gemini: {}. Skipping.",
-                                server.name, tool.name, e
-                            );
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Tool '{}:{}' incompatible with Gemini: {}. Skipping.",
+                                    server.name,
+                                    tool.name,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
-            }
-            
-            // Enforce Gemini's 128-tool limit to prevent 400 errors
-            if function_declarations.len() > GEMINI_TOOL_LIMIT {
-                let original_count = function_declarations.len();
-                tools_truncated_count = original_count - GEMINI_TOOL_LIMIT;
-                function_declarations.truncate(GEMINI_TOOL_LIMIT);
-                tracing::warn!(
-                    "Tool count ({}) exceeds Gemini limit ({}). Truncated {} tools.",
-                    original_count, GEMINI_TOOL_LIMIT, tools_truncated_count
-                );
-            }
-            
-            vec![Tool { function_declarations }]
-        });
 
+                // Enforce Gemini's 128-tool limit to prevent 400 errors
+                if function_declarations.len() > GEMINI_TOOL_LIMIT {
+                    let original_count = function_declarations.len();
+                    tools_truncated_count = original_count - GEMINI_TOOL_LIMIT;
+                    function_declarations.truncate(GEMINI_TOOL_LIMIT);
+                    tracing::warn!(
+                        "Tool count ({}) exceeds Gemini limit ({}). Truncated {} tools.",
+                        original_count,
+                        GEMINI_TOOL_LIMIT,
+                        tools_truncated_count
+                    );
+                }
+
+                vec![Tool {
+                    function_declarations,
+                }]
+            });
 
         // 2. Build the system instruction from the remaining context.
         let mut active_context = self.session.active_context.clone();
-        
+
         // Apply memory size limits from settings
-        active_context.conversation_summary.truncate_summary(self.settings.max_summary_chars);
-        active_context.conversation_summary.entities.prune_entities(self.settings.max_entity_count);
-        
+        active_context
+            .conversation_summary
+            .truncate_summary(self.settings.max_summary_chars);
+        active_context
+            .conversation_summary
+            .entities
+            .prune_entities(self.settings.max_entity_count);
+
         let mut persona = self.settings.persona.clone();
-        
+
         // Inject warning if tools were truncated to fit Gemini limits
         if tools_truncated_count > 0 {
             persona = format!(
@@ -155,8 +204,6 @@ impl<'a> PromptBuilder<'a> {
         if let Some(instruction) = &self.settings.force_tool_use_instruction {
             persona = format!("{}\n\nCRITICAL INSTRUCTION: {}", persona, instruction);
         }
-
-
 
         // Check if the last message is an empty placeholder from Hobbes (continuation scenario)
         let last_message = self.session.messages.last();
@@ -176,9 +223,8 @@ impl<'a> PromptBuilder<'a> {
                 last_message
             };
 
-            let last_message_was_tool = message_to_check.map_or(false, |m| {
-                matches!(m.content, MessageContent::ToolCall(_))
-            });
+            let last_message_was_tool = message_to_check
+                .map_or(false, |m| matches!(m.content, MessageContent::ToolCall(_)));
 
             if last_message_was_tool {
                 let tool_completion_instruction = "\n\nTOOL COMPLETION INSTRUCTION: The tool execution has completed. Use the tool output above to answer the user's request. Do not ask the user for the tool output again.";
@@ -189,38 +235,50 @@ impl<'a> PromptBuilder<'a> {
             }
         }
 
-        if self.session_state.tool_call_history.iter().any(|r| matches!(r.result.status, crate::components::shared::ToolCallStatus::Error)) {
+        if self.session_state.tool_call_history.iter().any(|r| {
+            matches!(
+                r.result.status,
+                crate::components::shared::ToolCallStatus::Error
+            )
+        }) {
             let recovery_instruction = "\n\nCRITICAL RECOVERY INSTRUCTION: A previous tool call failed. Analyze the error message and attempt a different tool call to accomplish the user's goal. Do not repeat the failed tool call.";
             persona.push_str(recovery_instruction);
         }
-        
+
         active_context.system_persona = Some(persona);
-        
+
         // Extract MCP server info BEFORE nulling mcp_tools - so LLM knows what each server is
-        let mcp_servers_info: Option<Vec<serde_json::Value>> = active_context.mcp_tools.as_ref().map(|ctx| {
-            ctx.servers.iter().map(|server| {
-                serde_json::json!({
-                    "name": server.name,
-                    "description": server.description,
-                    "tools_count": server.tools.len()
-                })
-            }).collect()
-        });
-        
+        let mcp_servers_info: Option<Vec<serde_json::Value>> =
+            active_context.mcp_tools.as_ref().map(|ctx| {
+                ctx.servers
+                    .iter()
+                    .map(|server| {
+                        serde_json::json!({
+                            "name": server.name,
+                            "description": server.description,
+                            "tools_count": server.tools.len()
+                        })
+                    })
+                    .collect()
+            });
+
         active_context.mcp_tools = None; // Exclude full tool definitions from the instruction text.
 
         let mut system_context_map = serde_json::Map::new();
         if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(&active_context) {
             system_context_map = map;
         }
-        
+
         // Re-add summarized MCP server info so LLM understands available servers
         if let Some(servers) = mcp_servers_info {
             system_context_map.insert("mcp_servers".to_string(), serde_json::Value::Array(servers));
         }
 
         // Determine the user's name, prioritizing settings over conversation summary.
-        let final_user_name = self.settings.user_name.as_deref()
+        let final_user_name = self
+            .settings
+            .user_name
+            .as_deref()
             .filter(|s| !s.trim().is_empty())
             .or_else(|| {
                 let name_from_summary = &active_context.conversation_summary.entities.user_name;
@@ -252,11 +310,18 @@ impl<'a> PromptBuilder<'a> {
         );
 
         // Check for fully configured Composio profiles and inject context
-        if self.settings.composio_profiles.iter().any(|p| p.is_fully_configured()) {
-            let active_profile_name = self.settings.get_active_profile()
+        if self
+            .settings
+            .composio_profiles
+            .iter()
+            .any(|p| p.is_fully_configured())
+        {
+            let active_profile_name = self
+                .settings
+                .get_active_profile()
                 .map(|p| p.name.as_str())
                 .unwrap_or("Default");
-            
+
             system_context_map.insert(
                 "composio_context".to_string(),
                 json!({
@@ -267,17 +332,21 @@ impl<'a> PromptBuilder<'a> {
             );
         }
 
-        let persona = system_context_map.remove("system_persona")
+        let persona = system_context_map
+            .remove("system_persona")
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_default();
 
         let context_json = serde_json::to_string_pretty(&system_context_map).unwrap_or_default();
-        
-        let mut parts = vec![Part::Text { text: persona, thought: None }];
+
+        let mut parts = vec![Part::Text {
+            text: persona,
+            thought: None,
+        }];
         if !context_json.is_empty() && context_json != "{}" {
-            parts.push(Part::Text { 
+            parts.push(Part::Text {
                 text: format!("\n\n<SYSTEM_CONTEXT>\n{}\n</SYSTEM_CONTEXT>", context_json),
-                thought: None 
+                thought: None,
             });
         }
 
@@ -285,9 +354,9 @@ impl<'a> PromptBuilder<'a> {
 
         // 3. Construct the conversational contents.
         let mut contents: Vec<Content> = Vec::new();
-        
+
         // Helper to add parts while maintaining role alternation (auto-grouping consecutive same-role roles).
-        // This is critical for Gemini API compliance (model -> model is invalid) 
+        // This is critical for Gemini API compliance (model -> model is invalid)
         // and correctly handles "Thought + Text" or "Thought + Tool" turns.
         let mut add_to_prompt = |role: &str, part: Part| {
             if let Some(last) = contents.last_mut() {
@@ -310,17 +379,17 @@ impl<'a> PromptBuilder<'a> {
         // 1. Add the first user message to preserve the original intent.
         if let Some(first_message) = messages.iter().find(|m| m.author == "User") {
             if let MessageContent::Text { .. } = &first_message.content {
-                 let content: Content = first_message.clone().into();
-                 for part in content.parts {
-                     add_to_prompt(&content.role, part);
-                 }
-                 first_message_id = Some(first_message.id);
+                let content: Content = first_message.clone().into();
+                for part in content.parts {
+                    add_to_prompt(&content.role, part);
+                }
+                first_message_id = Some(first_message.id);
             }
         }
 
         // 2. Add the last `history_len` messages.
         let start_index = messages.len().saturating_sub(history_len);
-        
+
         for message in messages.iter().skip(start_index) {
             // Avoid duplicating the first message if it's within the recent window
             if Some(message.id) != first_message_id {
@@ -330,71 +399,106 @@ impl<'a> PromptBuilder<'a> {
                 }
 
                 match &message.content {
-                    MessageContent::Text { thought_signature, .. } => {
+                    MessageContent::Text {
+                        thought_signature, ..
+                    } => {
                         if let Some(sig) = thought_signature {
                             last_thought_signature = Some(sig.clone());
                         }
-                        
+
                         let content: Content = message.clone().into();
                         for part in content.parts {
                             add_to_prompt(&content.role, part);
                         }
-                        
+
                         // Handle comments as separate user messages
                         if !message.comments.is_empty() {
-                            let mut comment_text = String::from("[User comments on the above message:");
+                            let mut comment_text =
+                                String::from("[User comments on the above message:");
                             for comment in &message.comments {
-                                comment_text.push_str(&format!("\n- On \"{}\": {}", comment.text_selection, comment.comment));
+                                comment_text.push_str(&format!(
+                                    "\n- On \"{}\": {}",
+                                    comment.text_selection, comment.comment
+                                ));
                             }
                             comment_text.push_str("]");
-                            
-                            add_to_prompt("user", Part::Text { text: comment_text, thought: None });
+
+                            add_to_prompt(
+                                "user",
+                                Part::Text {
+                                    text: comment_text,
+                                    thought: None,
+                                },
+                            );
                         }
                     }
                     MessageContent::ToolCall(tc) => {
                         // Update thought signature if present, or use the last one
-                        let current_thought_signature = tc.thought_signature.clone().or(last_thought_signature.clone());
+                        let current_thought_signature = tc
+                            .thought_signature
+                            .clone()
+                            .or(last_thought_signature.clone());
                         if let Some(sig) = &tc.thought_signature {
                             last_thought_signature = Some(sig.clone());
                         }
 
                         // Sanitize tool name - CRITICAL: Must match the sanitized name used in declarations
-                        let sanitized_tool_name = crate::gemini::convert::sanitize_function_name(&format!("{}_{}", tc.server_name, tc.tool_name));
+                        let sanitized_tool_name = crate::gemini::convert::sanitize_function_name(
+                            &format!("{}_{}", tc.server_name, tc.tool_name),
+                        );
 
                         // 1. Add the model's function call
-                        let args_value: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
-                        
+                        let args_value: serde_json::Value =
+                            serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+
                         // Log the thought_signature field for debugging
                         if let Some(ref thought_sig) = current_thought_signature {
-                            tracing::info!("Reconstructing function call '{}' with thought_signature: '{}'", 
-                                sanitized_tool_name, 
-                                if thought_sig.len() > 50 { &thought_sig[..50] } else { thought_sig }
+                            tracing::info!(
+                                "Reconstructing function call '{}' with thought_signature: '{}'",
+                                sanitized_tool_name,
+                                if thought_sig.len() > 50 {
+                                    &thought_sig[..50]
+                                } else {
+                                    thought_sig
+                                }
                             );
                         } else {
                             tracing::warn!("Reconstructing function call '{}' WITHOUT thought_signature field - THIS WILL CAUSE API ERROR", sanitized_tool_name);
                         }
-                        
+
                         // Include thinking summary if present
                         if let Some(summary) = &tc.thought_summary {
                             if !summary.is_empty() {
-                                add_to_prompt("model", Part::Text { text: summary.clone(), thought: Some(true) });
+                                add_to_prompt(
+                                    "model",
+                                    Part::Text {
+                                        text: summary.clone(),
+                                        thought: Some(true),
+                                    },
+                                );
                             }
                         }
 
-                        add_to_prompt("model", Part::FunctionCall {
-                            function_call: FunctionCallPart {
-                                name: sanitized_tool_name.clone(),
-                                args: args_value,
+                        add_to_prompt(
+                            "model",
+                            Part::FunctionCall {
+                                function_call: FunctionCallPart {
+                                    name: sanitized_tool_name.clone(),
+                                    args: args_value,
+                                },
+                                thought_signature: current_thought_signature,
                             },
-                            thought_signature: current_thought_signature,
-                        });
+                        );
 
                         // 2. Add the user's function response
                         // Truncation logic: If this is a historical tool call (not the most recent message),
                         // and it exceeds the max length, truncate it to save context.
                         let last_meaningful_id = if is_continuation_placeholder {
                             if self.session.messages.len() >= 2 {
-                                self.session.messages.get(self.session.messages.len() - 2).map(|m| m.id)
+                                self.session
+                                    .messages
+                                    .get(self.session.messages.len() - 2)
+                                    .map(|m| m.id)
                             } else {
                                 None
                             }
@@ -403,7 +507,7 @@ impl<'a> PromptBuilder<'a> {
                         };
 
                         let is_active_tool_call = Some(message.id) == last_meaningful_id;
-                        
+
                         let mut result_string = tc.response.clone();
                         let max_len = if is_active_tool_call {
                             self.settings.max_active_tool_output_length
@@ -414,32 +518,50 @@ impl<'a> PromptBuilder<'a> {
                         if result_string.len() > max_len {
                             let original_len = result_string.len();
                             let mut truncated_len = max_len;
-                            while truncated_len > 0 && !result_string.is_char_boundary(truncated_len) {
+                            while truncated_len > 0
+                                && !result_string.is_char_boundary(truncated_len)
+                            {
                                 truncated_len -= 1;
                             }
                             result_string.truncate(truncated_len);
-                            result_string.push_str(&format!("... [Output truncated from {} bytes - excessive size]", original_len));
+                            result_string.push_str(&format!(
+                                "... [Output truncated from {} bytes - excessive size]",
+                                original_len
+                            ));
                         }
 
                         let result_value: serde_json::Value = serde_json::from_str(&result_string)
                             .unwrap_or_else(|_| json!(result_string));
-                        
-                        add_to_prompt("user", Part::FunctionResponse {
-                            function_response: FunctionResponsePart {
-                                name: sanitized_tool_name,
-                                response: json!({ "result": result_value }),
+
+                        add_to_prompt(
+                            "user",
+                            Part::FunctionResponse {
+                                function_response: FunctionResponsePart {
+                                    name: sanitized_tool_name,
+                                    response: json!({ "result": result_value }),
+                                },
                             },
-                        });
+                        );
 
                         // Handle comments as separate user messages
                         if !message.comments.is_empty() {
-                            let mut comment_text = String::from("[User comments on the above message:");
+                            let mut comment_text =
+                                String::from("[User comments on the above message:");
                             for comment in &message.comments {
-                                comment_text.push_str(&format!("\n- On \"{}\": {}", comment.text_selection, comment.comment));
+                                comment_text.push_str(&format!(
+                                    "\n- On \"{}\": {}",
+                                    comment.text_selection, comment.comment
+                                ));
                             }
                             comment_text.push_str("]");
-                            
-                            add_to_prompt("user", Part::Text { text: comment_text, thought: None });
+
+                            add_to_prompt(
+                                "user",
+                                Part::Text {
+                                    text: comment_text,
+                                    thought: None,
+                                },
+                            );
                         }
                     }
                     MessageContent::PermissionRequest(_) => {
@@ -454,7 +576,13 @@ impl<'a> PromptBuilder<'a> {
 
         // 5. Add the current user message, only if it's not empty.
         if !user_message.is_empty() {
-            add_to_prompt("user", Part::Text { text: user_message, thought: None });
+            add_to_prompt(
+                "user",
+                Part::Text {
+                    text: user_message,
+                    thought: None,
+                },
+            );
         }
 
         // 6. Assemble and return the final LlmPrompt object.
@@ -474,12 +602,13 @@ fn recursively_remove_keys(value: &mut serde_json::Value, keys_to_remove: &[&str
             for key in keys_to_remove {
                 map.remove(*key);
             }
-            
+
             // Check properties for string values and remove them
             // This catches the 'value': 'OBJECT' case specifically requested by the user logic
             if let Some(props_val) = map.get_mut("properties") {
                 if let Some(props_map) = props_val.as_object_mut() {
-                     let keys_to_strip: Vec<String> = props_map.iter()
+                    let keys_to_strip: Vec<String> = props_map
+                        .iter()
                         .filter_map(|(k, v)| {
                             if v.as_str().is_some() {
                                 return Some(k.clone());
@@ -487,9 +616,9 @@ fn recursively_remove_keys(value: &mut serde_json::Value, keys_to_remove: &[&str
                             None
                         })
                         .collect();
-                     for k in keys_to_strip {
-                         props_map.remove(&k);
-                     }
+                    for k in keys_to_strip {
+                        props_map.remove(&k);
+                    }
                 }
             }
 
@@ -505,8 +634,6 @@ fn recursively_remove_keys(value: &mut serde_json::Value, keys_to_remove: &[&str
         _ => {}
     }
 }
-
-
 
 #[allow(dead_code)]
 fn recursively_sanitize_schema(value: &mut serde_json::Value) {
@@ -647,19 +774,20 @@ fn fix_and_remove_invalid_fields(value: &mut serde_json::Value) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::chat::Message;
+    use crate::components::shared::MessageContent;
     use crate::mcp::manager::{McpContext, McpServerContext};
-    use crate::session::{ActiveContext, ConversationSummary, ConversationSummaryEntities, Session};
+    use crate::session::{
+        ActiveContext, ConversationSummary, ConversationSummaryEntities, Session,
+    };
     use crate::settings::Settings;
     use chrono::Utc;
     use rmcp::model::Tool;
     use serde_json::json;
     use uuid::Uuid;
-    use crate::components::chat::Message;
-    use crate::components::shared::MessageContent;
 
     fn create_mock_session_with_tools() -> Session {
         let tool1: Tool = serde_json::from_value(json!({
@@ -859,10 +987,16 @@ mod tests {
         assert!(tag_items.get("properties").is_some());
 
         let deep_items = properties.get("deep_items").unwrap();
-        let deep_items_level1 = deep_items.get("items").unwrap().get("properties").unwrap().get("level1").unwrap();
+        let deep_items_level1 = deep_items
+            .get("items")
+            .unwrap()
+            .get("properties")
+            .unwrap()
+            .get("level1")
+            .unwrap();
         let deep_items_level2_items = deep_items_level1.get("items").unwrap();
         assert_eq!(deep_items_level2_items.get("type"), Some(&json!("OBJECT"))); // Verify deeply nested type is NOT removed
-        
+
         let complex_items = properties.get("complex_items").unwrap();
         let complex_items_items = complex_items.get("items").unwrap();
         assert!(complex_items_items.get("oneOf").is_none()); // oneOf is simplified
@@ -882,7 +1016,10 @@ mod tests {
         // Check string array
         let string_array = complex_props.get("string_array").unwrap();
         assert_eq!(string_array.get("type"), Some(&json!("ARRAY")));
-        assert_eq!(string_array.get("items").unwrap().get("type"), Some(&json!("STRING")));
+        assert_eq!(
+            string_array.get("items").unwrap().get("type"),
+            Some(&json!("STRING"))
+        );
 
         // Check object array
         let object_array = complex_props.get("object_array").unwrap();
@@ -912,7 +1049,7 @@ mod tests {
         let mut session = create_mock_session_with_tools();
         let settings = Settings::default();
         let session_state = crate::session::SessionState::default();
-        
+
         // 1. Add a tool call message
         let tool_call_msg = Message {
             id: Uuid::new_v4(),
@@ -938,7 +1075,11 @@ mod tests {
         let placeholder_msg = Message {
             id: Uuid::new_v4(),
             author: "Hobbes".to_string(),
-            content: MessageContent::Text { content: "".to_string(), thought_signature: None, thought_summary: None },
+            content: MessageContent::Text {
+                content: "".to_string(),
+                thought_signature: None,
+                thought_summary: None,
+            },
             usage: None,
             attachments: vec![],
             comments: vec![],
@@ -951,18 +1092,26 @@ mod tests {
 
         // 3. Verify System Instruction contains TOOL COMPLETION INSTRUCTION
         // The current implementation will likely FAIL this because it looks at the last message (placeholder)
-        let system_instruction = if let Some(crate::components::llm::Part::Text { text, .. }) = prompt.system_instruction.as_ref().unwrap().parts.get(0) {
+        let system_instruction = if let Some(crate::components::llm::Part::Text { text, .. }) =
+            prompt.system_instruction.as_ref().unwrap().parts.get(0)
+        {
             text
         } else {
             panic!("System instruction should be text");
         };
-        assert!(system_instruction.contains("TOOL COMPLETION INSTRUCTION"), "System instruction should contain tool completion instruction");
+        assert!(
+            system_instruction.contains("TOOL COMPLETION INSTRUCTION"),
+            "System instruction should contain tool completion instruction"
+        );
 
         // 4. Verify the contents do NOT contain the empty placeholder
         // The current implementation will likely FAIL this
         let last_content = prompt.contents.last().unwrap();
         if let Some(crate::components::llm::Part::Text { text, .. }) = last_content.parts.get(0) {
-             assert!(!text.is_empty(), "Last content should not be empty placeholder");
+            assert!(
+                !text.is_empty(),
+                "Last content should not be empty placeholder"
+            );
         }
     }
 
@@ -983,7 +1132,8 @@ mod tests {
                 },
                 "_meta": "schema meta info"
             }
-        })).unwrap();
+        }))
+        .unwrap();
 
         let server = McpServerContext {
             name: "meta_server".to_string(),
@@ -991,8 +1141,10 @@ mod tests {
             tools: vec![tool],
         };
 
-        let mcp_context = McpContext { servers: vec![server] };
-        
+        let mcp_context = McpContext {
+            servers: vec![server],
+        };
+
         let active_context = ActiveContext {
             mcp_tools: Some(mcp_context),
             ..Default::default()
@@ -1019,14 +1171,23 @@ mod tests {
         let tool_json = &tools[0].function_declarations[0];
 
         // Verify top-level _meta is removed
-        assert!(tool_json.get("_meta").is_none(), "Top-level _meta should be removed");
+        assert!(
+            tool_json.get("_meta").is_none(),
+            "Top-level _meta should be removed"
+        );
 
         // Verify nested _meta is removed from parameters
         let parameters = tool_json.get("parameters").unwrap();
-        assert!(parameters.get("_meta").is_none(), "Schema-level _meta should be removed");
-        
+        assert!(
+            parameters.get("_meta").is_none(),
+            "Schema-level _meta should be removed"
+        );
+
         let field1 = parameters.get("properties").unwrap().get("field1").unwrap();
-        assert!(field1.get("_meta").is_none(), "Nested _meta should be removed");
+        assert!(
+            field1.get("_meta").is_none(),
+            "Nested _meta should be removed"
+        );
     }
 
     #[test]
@@ -1034,7 +1195,7 @@ mod tests {
         let mut session = create_mock_session_with_tools();
         let settings = Settings::default();
         let session_state = crate::session::SessionState::default();
-        
+
         let signature = "original_signature".to_string();
 
         // 1. First tool call with signature
@@ -1085,7 +1246,7 @@ mod tests {
         let prompt = builder.build_prompt("User message".to_string(), None);
 
         // Verify contents
-        // Expected: 
+        // Expected:
         // 0. Model: Tool Call 1 (with sig)
         // 1. User: Tool Result 1
         // 2. Model: Tool Call 2 (with BACKFILLED sig)
@@ -1094,8 +1255,15 @@ mod tests {
 
         let model_msg_2 = &prompt.contents[2];
         assert_eq!(model_msg_2.role, "model");
-        if let crate::components::llm::Part::FunctionCall { thought_signature, .. } = &model_msg_2.parts[0] {
-            assert_eq!(thought_signature.as_ref().unwrap(), &signature, "Second tool call should have backfilled signature");
+        if let crate::components::llm::Part::FunctionCall {
+            thought_signature, ..
+        } = &model_msg_2.parts[0]
+        {
+            assert_eq!(
+                thought_signature.as_ref().unwrap(),
+                &signature,
+                "Second tool call should have backfilled signature"
+            );
         } else {
             panic!("Expected FunctionCall part");
         }
@@ -1114,17 +1282,26 @@ mod tests {
 
         // "weather_server" is the server name in mock
         // "get_weather" is the tool name
-        
-        let found_names: Vec<String> = tool_declarations.iter()
-            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+
+        let found_names: Vec<String> = tool_declarations
+            .iter()
+            .filter_map(|t| {
+                t.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
         println!("Found tool names: {:?}", found_names);
 
-        let weather_tool = tool_declarations.iter().find(|t| {
-            t.get("name").and_then(|n| n.as_str()) == Some("weather_server_get_weather")
-        });
-        
-        assert!(weather_tool.is_some(), "Tool name should be prefixed with server name. Found: {:?}", found_names);
+        let weather_tool = tool_declarations
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("weather_server_get_weather"));
+
+        assert!(
+            weather_tool.is_some(),
+            "Tool name should be prefixed with server name. Found: {:?}",
+            found_names
+        );
     }
 
     #[test]
@@ -1201,31 +1378,60 @@ mod tests {
         let prompt = builder.build_prompt("Test".to_string(), None);
         let tools = prompt.tools.expect("Should have tools");
         let tool_json = &tools[0].function_declarations[0];
-        let properties = tool_json.get("parameters").unwrap().get("properties").unwrap();
+        let properties = tool_json
+            .get("parameters")
+            .unwrap()
+            .get("properties")
+            .unwrap();
 
         // Test 1: Array with no items should now have items: {}
         let array_no_items = properties.get("array_no_items").unwrap();
         assert_eq!(array_no_items.get("type"), Some(&json!("ARRAY")));
-        assert!(array_no_items.get("items").is_some(), "Missing items should be added");
-        assert!(array_no_items.get("items").unwrap().is_object(), "Items should be an object");
+        assert!(
+            array_no_items.get("items").is_some(),
+            "Missing items should be added"
+        );
+        assert!(
+            array_no_items.get("items").unwrap().is_object(),
+            "Items should be an object"
+        );
 
         // Test 2: Array with null items should now have items: {}
         let array_null_items = properties.get("array_null_items").unwrap();
         assert_eq!(array_null_items.get("type"), Some(&json!("ARRAY")));
-        assert!(array_null_items.get("items").is_some(), "Null items should be replaced");
-        assert!(array_null_items.get("items").unwrap().is_object(), "Items should be an object");
+        assert!(
+            array_null_items.get("items").is_some(),
+            "Null items should be replaced"
+        );
+        assert!(
+            array_null_items.get("items").unwrap().is_object(),
+            "Items should be an object"
+        );
 
         // Test 3: Nested array should also have items added
         let nested = properties.get("nested_object_with_array_no_items").unwrap();
-        let inner_array = nested.get("properties").unwrap().get("inner_array").unwrap();
-        assert!(inner_array.get("items").is_some(), "Nested array should have items added");
+        let inner_array = nested
+            .get("properties")
+            .unwrap()
+            .get("inner_array")
+            .unwrap();
+        assert!(
+            inner_array.get("items").is_some(),
+            "Nested array should have items added"
+        );
 
         // Test 4: Array type in union should also have items added
         let array_union = properties.get("array_type_in_union").unwrap();
-        assert!(array_union.get("items").is_some(), "Union with array type should have items added");
+        assert!(
+            array_union.get("items").is_some(),
+            "Union with array type should have items added"
+        );
 
         // Test 5: Normal array should keep its existing items
         let normal_array = properties.get("normal_array").unwrap();
-        assert_eq!(normal_array.get("items").unwrap().get("type"), Some(&json!("STRING")));
+        assert_eq!(
+            normal_array.get("items").unwrap().get("type"),
+            Some(&json!("STRING"))
+        );
     }
 }

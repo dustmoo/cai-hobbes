@@ -15,7 +15,7 @@ The architecture is designed to integrate both external long-term memory and int
 ```mermaid
 graph TD
     subgraph "MCP Servers (Launched as Child Processes)"
-        A[ConPort MCP] -- "Provides strategic context" --> L;
+        A[ConPort/Graphiti MCP] -- "Provides strategic context" --> L;
         B[Composio Embedded MCP] -- "Provides access to tools defined by Admins in platform.composio.com" --> L;
         C[Filesystem MCP] -- "Provides workspace data" --> L;
     end
@@ -116,6 +116,10 @@ Hobbes implements several advanced patterns to ensure stability with "Thinking" 
 
 -   **Native Menu (`menu.rs`):** To ensure standard hotkeys (e.g., Copy, Paste, Quit) work as expected, the application initializes a native OS menu bar at startup. This is built using the `muda` crate and configured in `main.rs`.
 -   **System Tray Icon (`tray.rs`):** The application features a system tray icon that allows the user to toggle the main window's visibility. The icon's presence is reactive and can be enabled or disabled in real-time from the settings panel.
+-   **Chat Bar Icons:** The chat interface features a modular icon bar with visibility toggles managed in Settings.
+    -   **Context & History:** Toggles for the Chat History sidebar.
+    -   **Tools & Attachments:** Toggles for MCP Tools, Attachments, and Profile selection.
+    -   **Behavior:** Icons update reactively based on usage (e.g., highlighting when tools are active).
 -   **Dynamic App Icons:** The application correctly bundles macOS `.icns` files and handles Dioxus 0.6 bundle metadata requirements to ensure the correct app icon appears in the Dock and About screens.
 
 ### 5. Multimodal Input Flow

@@ -1,7 +1,7 @@
-use dioxus::prelude::*;
-use dioxus_free_icons::{Icon, icons::fi_icons};
 use crate::components::chat::{Comment, Message};
 use crate::components::focus_context::FocusContext;
+use dioxus::prelude::*;
+use dioxus_free_icons::{icons::fi_icons, Icon};
 use uuid::Uuid;
 
 #[component]
@@ -22,7 +22,9 @@ pub fn CommentModal(
     // Extract text content from message
     let message_text = match &message.content {
         crate::components::shared::MessageContent::Text { content, .. } => content.clone(),
-        crate::components::shared::MessageContent::Error { message } => format!("[Error: {}]", message),
+        crate::components::shared::MessageContent::Error { message } => {
+            format!("[Error: {}]", message)
+        }
         _ => String::new(),
     };
 
@@ -67,7 +69,7 @@ pub fn CommentModal(
                         }
                     }
                 },
-                
+
                 // Header
                 div {
                     class: "flex justify-between items-center mb-4",
@@ -88,7 +90,7 @@ pub fn CommentModal(
                         }
                     }
                 }
-                
+
                 // Message content (read-only)
                 div {
                     class: "mb-4",
@@ -101,7 +103,7 @@ pub fn CommentModal(
                         "{message_text}"
                     }
                 }
-                
+
                 // Text selection input
                 div {
                     class: "mb-4",
@@ -117,7 +119,7 @@ pub fn CommentModal(
                         oninput: move |e| selected_text.set(e.value())
                     }
                 }
-                
+
                 // Comment input
                 div {
                     class: "mb-4",
@@ -156,7 +158,7 @@ pub fn CommentModal(
                         }
                     }
                 }
-                
+
                 // Add comment button
                 button {
                     class: "w-full mb-4 px-4 py-2 bg-primary-500 hover:bg-primary-600 text-white rounded-md transition-colors",
@@ -177,7 +179,7 @@ pub fn CommentModal(
                     disabled: selected_text().is_empty() || new_comment_text().is_empty(),
                     "Add Comment"
                 }
-                
+
                 // Existing comments list
                 if !comments().is_empty() {
                     div {
@@ -219,7 +221,7 @@ pub fn CommentModal(
                         }
                     }
                 }
-                
+
                 // Action buttons
                 div {
                     class: "flex justify-end space-x-2",

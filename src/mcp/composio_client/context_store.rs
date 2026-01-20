@@ -1,12 +1,12 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 use std::fs;
 use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
+use std::sync::{Arc, RwLock};
 
 /// A simple sidecar store for sustaining tool context (e.g. team_id, workspace_url)
 /// that cannot be derived from the auth token alone.
-/// 
+///
 /// This is used to inject parameters into tool execution arguments for routed toolkits.
 #[derive(Debug, Clone)]
 pub struct ContextStore {
@@ -26,13 +26,13 @@ impl ContextStore {
     pub fn new(profile_id: &str) -> Self {
         let mut path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         path.push("context_store.json");
-        
+
         let store = Self {
             profile_id: profile_id.to_string(),
             file_path: path,
             cache: Arc::new(RwLock::new(HashMap::new())),
         };
-        
+
         store.load();
         store
     }
@@ -60,20 +60,24 @@ impl ContextStore {
 
     pub fn save_param(&self, toolkit_slug: &str, user_id: &str, key: &str, value: &str) {
         let mut cache = self.cache.write().unwrap();
-        
+
         let toolkit_entry = cache.entry(toolkit_slug.to_string()).or_default();
         let user_entry = toolkit_entry.entry(user_id.to_string()).or_default();
-        
+
         user_entry.insert(key.to_string(), value.to_string());
-        
+
         // Release lock before saving to avoid deadlocks (though save() takes a read lock)
         drop(cache);
         self.save();
     }
 
-    pub fn get_context(&self, toolkit_slug: &str, user_id: &str) -> Option<HashMap<String, String>> {
+    pub fn get_context(
+        &self,
+        toolkit_slug: &str,
+        user_id: &str,
+    ) -> Option<HashMap<String, String>> {
         let cache = self.cache.read().unwrap();
-        
+
         if let Some(toolkit_entry) = cache.get(toolkit_slug) {
             if let Some(user_entry) = toolkit_entry.get(user_id) {
                 return Some(user_entry.clone());

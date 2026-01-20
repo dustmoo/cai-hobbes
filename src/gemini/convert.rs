@@ -26,17 +26,17 @@ impl std::fmt::Display for ConversionError {
 impl std::error::Error for ConversionError {}
 
 /// Convert an MCP tool (rmcp::model::Tool) to a Gemini-compatible FunctionDeclaration.
-/// 
+///
 /// This function handles all the edge cases and unsupported fields:
 /// - Unsupported schema keys are ignored (not present in GeminiSchema)
 /// - Properties with string values (like "OBJECT") are skipped
 /// - The `required` array is filtered to only include existing properties
 /// - Type names are normalized to uppercase
-/// 
+///
 /// # Arguments
 /// * `tool` - The MCP tool to convert
 /// * `server_name` - The MCP server name (used for prefixing)
-/// 
+///
 /// # Returns
 /// A `Result` containing the `GeminiFunctionDeclaration` or a `ConversionError`.
 /// Sanitize a function name to comply with Gemini API requirements:
@@ -44,7 +44,8 @@ impl std::error::Error for ConversionError {}
 /// - Only alphanumeric, underscores, dots, colons, or dashes allowed
 /// - Maximum 64 characters
 pub fn sanitize_function_name(name: &str) -> String {
-    let mut sanitized: String = name.chars()
+    let mut sanitized: String = name
+        .chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '_' || c == '.' || c == ':' || c == '-' {
                 c
@@ -53,24 +54,24 @@ pub fn sanitize_function_name(name: &str) -> String {
             }
         })
         .collect();
-    
+
     // Ensure it starts with a letter or underscore
     if let Some(first_char) = sanitized.chars().next() {
         if !first_char.is_alphabetic() && first_char != '_' {
             sanitized = format!("_{}", sanitized);
         }
     }
-    
+
     // Truncate to 64 characters
     if sanitized.len() > 64 {
         sanitized.truncate(64);
     }
-    
+
     // Remove consecutive underscores for cleaner names
     while sanitized.contains("__") {
         sanitized = sanitized.replace("__", "_");
     }
-    
+
     sanitized
 }
 
@@ -81,14 +82,18 @@ pub fn mcp_tool_to_gemini(
     // Create prefixed name and sanitize it for Gemini API requirements
     let raw_name = format!("{}_{}", server_name, tool.name);
     let prefixed_name = sanitize_function_name(&raw_name);
-    
+
     // Convert the input_schema (Arc<Map<String, Value>>) to a serde_json::Value
     let schema_value = Value::Object((*tool.input_schema).clone());
     let parameters = convert_schema(&schema_value)?;
-    
+
     Ok(GeminiFunctionDeclaration {
         name: prefixed_name,
-        description: tool.description.as_ref().map(|d| d.to_string()).filter(|s| !s.is_empty()),
+        description: tool
+            .description
+            .as_ref()
+            .map(|d| d.to_string())
+            .filter(|s| !s.is_empty()),
         parameters: Some(parameters),
     })
 }
@@ -97,7 +102,7 @@ pub fn mcp_tool_to_gemini(
 /// Takes the first element from these arrays and merges its properties into the result.
 fn simplify_compound_types(obj: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
     let mut result = obj.clone();
-    
+
     // Handle oneOf/anyOf/allOf by taking the first element
     for key in ["oneOf", "anyOf", "allOf"] {
         if let Some(arr_val) = result.remove(key) {
@@ -118,7 +123,7 @@ fn simplify_compound_types(obj: &serde_json::Map<String, Value>) -> serde_json::
             break;
         }
     }
-    
+
     // If items is an array, replace with the first element
     if let Some(items_val) = result.get("items").cloned() {
         if let Some(arr) = items_val.as_array() {
@@ -130,22 +135,22 @@ fn simplify_compound_types(obj: &serde_json::Map<String, Value>) -> serde_json::
             }
         }
     }
-    
+
     result
 }
 
 /// Convert a serde_json::Value representing a JSON Schema to a GeminiSchema.
 /// This recursively processes the schema, ignoring unsupported fields.
 fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
-    let obj = value.as_object().ok_or_else(|| {
-        ConversionError::InvalidSchema("Schema must be an object".to_string())
-    })?;
-    
+    let obj = value
+        .as_object()
+        .ok_or_else(|| ConversionError::InvalidSchema("Schema must be an object".to_string()))?;
+
     // Pre-process: Handle oneOf/anyOf/allOf by using the first element
     // Gemini doesn't support these compound types
     let working_obj = simplify_compound_types(obj);
     let obj = &working_obj;
-    
+
     // Determine the type
     let schema_type = if let Some(type_val) = obj.get("type") {
         parse_schema_type(type_val)?
@@ -156,7 +161,7 @@ fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
         // Default to STRING if no type is specified
         SchemaType::String
     };
-    
+
     // Convert properties (filtering out invalid entries)
     let properties = if let Some(props_val) = obj.get("properties") {
         if let Some(props_obj) = props_val.as_object() {
@@ -171,14 +176,18 @@ fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
                     );
                     continue;
                 }
-                
+
                 // Recursively convert the property schema
                 match convert_schema(val) {
                     Ok(schema) => {
                         converted_props.insert(key.clone(), schema);
                     }
                     Err(e) => {
-                        tracing::warn!("Skipping property '{}' due to conversion error: {}", key, e);
+                        tracing::warn!(
+                            "Skipping property '{}' due to conversion error: {}",
+                            key,
+                            e
+                        );
                     }
                 }
             }
@@ -193,7 +202,7 @@ fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
     } else {
         None
     };
-    
+
     // Filter required to only include properties that exist
     // BUT: if any required properties were dropped, return an error (tool is incompatible)
     let required = if let Some(req_val) = obj.get("required") {
@@ -203,24 +212,25 @@ fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
                 .filter_map(|v| v.as_str())
                 .map(|s| s.to_string())
                 .collect();
-            
+
             let valid_props: std::collections::HashSet<&String> = properties
                 .as_ref()
                 .map(|p| p.keys().collect())
                 .unwrap_or_default();
-            
+
             // Check for dropped required properties
             let dropped: Vec<&String> = original_required
                 .iter()
                 .filter(|r| !valid_props.contains(r))
                 .collect();
-            
+
             if !dropped.is_empty() {
-                return Err(ConversionError::MissingField(
-                    format!("Required properties dropped during conversion: {:?}", dropped)
-                ));
+                return Err(ConversionError::MissingField(format!(
+                    "Required properties dropped during conversion: {:?}",
+                    dropped
+                )));
             }
-            
+
             if original_required.is_empty() {
                 None
             } else {
@@ -232,7 +242,7 @@ fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
     } else {
         None
     };
-    
+
     // Convert items (for arrays)
     let items = if let Some(items_val) = obj.get("items") {
         // Handle null items or failed conversion
@@ -264,7 +274,7 @@ fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
             None
         }
     };
-    
+
     // Convert enum values (must all be strings)
     let enum_values = if let Some(enum_val) = obj.get("enum") {
         if let Some(enum_arr) = enum_val.as_array() {
@@ -290,10 +300,13 @@ fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
     } else {
         None
     };
-    
+
     // Get description
-    let description = obj.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
-    
+    let description = obj
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     Ok(GeminiSchema {
         schema_type,
         description,
@@ -320,7 +333,7 @@ fn parse_schema_type(value: &Value) -> Result<SchemaType, ConversionError> {
             "Type must be a string or array".to_string(),
         ));
     };
-    
+
     match type_str.as_str() {
         "OBJECT" => Ok(SchemaType::Object),
         "STRING" => Ok(SchemaType::String),
@@ -355,7 +368,7 @@ mod tests {
             },
             "required": ["name"]
         });
-        
+
         let result = convert_schema(&schema).unwrap();
         assert_eq!(result.schema_type, SchemaType::Object);
         assert!(result.properties.is_some());
@@ -376,11 +389,11 @@ mod tests {
             },
             "required": ["valid_prop", "invalid_prop"]
         });
-        
+
         // Should fail because required property "invalid_prop" would be dropped
         let result = convert_schema(&schema);
         assert!(result.is_err());
-        
+
         let err = result.unwrap_err();
         assert!(err.to_string().contains("Required properties dropped"));
     }
@@ -393,7 +406,7 @@ mod tests {
                 "type": "string"
             }
         });
-        
+
         let result = convert_schema(&schema).unwrap();
         assert_eq!(result.schema_type, SchemaType::Array);
         assert!(result.items.is_some());
@@ -406,10 +419,17 @@ mod tests {
             "type": "string",
             "enum": ["red", "green", "blue"]
         });
-        
+
         let result = convert_schema(&schema).unwrap();
         assert_eq!(result.schema_type, SchemaType::String);
-        assert_eq!(result.enum_values, Some(vec!["red".to_string(), "green".to_string(), "blue".to_string()]));
+        assert_eq!(
+            result.enum_values,
+            Some(vec![
+                "red".to_string(),
+                "green".to_string(),
+                "blue".to_string()
+            ])
+        );
     }
 
     #[test]
@@ -427,13 +447,13 @@ mod tests {
                 }
             }
         });
-        
+
         let result = convert_schema(&schema).unwrap();
-        
+
         // Should succeed and only include supported fields
         assert_eq!(result.schema_type, SchemaType::Object);
         assert!(result.properties.is_some());
-        
+
         // Verify the serialized output doesn't contain unsupported fields
         let json_str = serde_json::to_string(&result).unwrap();
         assert!(!json_str.contains("additionalProperties"));

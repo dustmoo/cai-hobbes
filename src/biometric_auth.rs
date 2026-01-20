@@ -33,10 +33,10 @@ pub enum AuthResult {
 }
 
 /// Wrapper around LAContext that can be used for keychain operations.
-/// 
+///
 /// After successful authentication, this context can be passed to keychain
 /// queries via kSecUseAuthenticationContext to avoid repeated prompts.
-/// 
+///
 /// The context remains valid for the duration of the app's lifetime or until
 /// explicitly invalidated.
 pub struct AuthContext {
@@ -54,13 +54,13 @@ impl std::fmt::Debug for AuthContext {
 
 impl AuthContext {
     /// Check if biometric authentication is available on this device.
-    /// 
+    ///
     /// Returns true if Touch ID or Face ID is available and configured.
     #[allow(dead_code)]
     pub fn is_biometrics_available() -> bool {
         // SAFETY: LAContext::new() is safe to call during normal operation
         let context = unsafe { LAContext::new() };
-        
+
         // Check if device owner authentication (biometrics or passcode) can be evaluated
         // SAFETY: canEvaluatePolicy_error is safe with a valid policy
         unsafe {
@@ -71,19 +71,19 @@ impl AuthContext {
     }
 
     /// Prompt the user for biometric authentication (Touch ID or Face ID).
-    /// 
+    ///
     /// This function will:
     /// 1. Create an LAContext with session reuse enabled
     /// 2. Display the system authentication prompt with the provided reason
     /// 3. Return an authenticated context that can be used for keychain operations
-    /// 
+    ///
     /// The context is configured with a 5-minute reuse duration, meaning subsequent
     /// authentications within that window will succeed automatically if the device
     /// was unlocked with biometrics.
-    /// 
+    ///
     /// # Arguments
     /// * `reason` - The localized reason shown to the user in the authentication prompt
-    /// 
+    ///
     /// # Returns
     /// * `AuthResult::Success(context)` - Authentication succeeded
     /// * `AuthResult::Cancelled` - User cancelled the prompt
@@ -101,9 +101,8 @@ impl AuthContext {
 
         // Check if we can evaluate the policy first
         // SAFETY: canEvaluatePolicy_error is safe with valid policy
-        let can_evaluate = unsafe {
-            context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication)
-        };
+        let can_evaluate =
+            unsafe { context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) };
 
         if let Err(error) = can_evaluate {
             let error_msg = format!("{:?}", error);
@@ -120,17 +119,19 @@ impl AuthContext {
 
         // Create the reply block that will be called when auth completes
         // SAFETY: The block captures tx by value and will be called exactly once
-        let reply_block = RcBlock::new(move |success: objc2::runtime::Bool, error: *mut objc2_foundation::NSError| {
-            let success = success.as_bool();
-            let error_msg = if error.is_null() {
-                None
-            } else {
-                // SAFETY: We checked for null, and NSError is valid if not null
-                let error_ref = unsafe { &*error };
-                Some(format!("{:?}", error_ref))
-            };
-            let _ = tx.send((success, error_msg));
-        });
+        let reply_block = RcBlock::new(
+            move |success: objc2::runtime::Bool, error: *mut objc2_foundation::NSError| {
+                let success = success.as_bool();
+                let error_msg = if error.is_null() {
+                    None
+                } else {
+                    // SAFETY: We checked for null, and NSError is valid if not null
+                    let error_ref = unsafe { &*error };
+                    Some(format!("{:?}", error_ref))
+                };
+                let _ = tx.send((success, error_msg));
+            },
+        );
 
         // Evaluate the policy - this will show the Touch ID prompt
         // SAFETY: evaluatePolicy_localizedReason_reply is safe with valid parameters
@@ -173,14 +174,14 @@ impl AuthContext {
                     e
                 );
                 AuthResult::Failed(
-                    "Authentication timed out. Check Info.plist and code signing.".to_string()
+                    "Authentication timed out. Check Info.plist and code signing.".to_string(),
                 )
             }
         }
     }
-    
+
     /// Get a reference to the underlying LAContext.
-    /// 
+    ///
     /// This can be used to pass the context to keychain operations.
     #[allow(dead_code)]
     pub fn context(&self) -> &LAContext {
@@ -188,10 +189,10 @@ impl AuthContext {
     }
 
     /// Get the raw pointer to the underlying LAContext for FFI use.
-    /// 
+    ///
     /// This returns the actual Objective-C object pointer, suitable for
     /// passing to Security framework as kSecUseAuthenticationContext.
-    /// 
+    ///
     /// Note: This must use Retained::as_ptr() rather than casting a reference,
     /// as the Security framework expects the actual object pointer.
     pub fn as_ptr(&self) -> *const std::ffi::c_void {
@@ -199,7 +200,7 @@ impl AuthContext {
     }
 
     /// Invalidate this authentication context.
-    /// 
+    ///
     /// After calling this, the context can no longer be used for keychain operations
     /// and any in-progress operations will be cancelled.
     #[allow(dead_code)]
