@@ -9,13 +9,17 @@ use dioxus_free_icons::Icon;
 pub fn NewChatMemoryModal(
     is_visible: Signal<bool>,
     initial_context: ActiveContext,
+    optimization_summary: Signal<Option<String>>,
     on_start_chat: EventHandler<ActiveContext>,
+    on_optimize_memory: EventHandler<ActiveContext>,
     on_cancel: EventHandler<()>,
 ) -> Element {
     let mut json_content = use_signal(|| String::new());
     let mut error_message = use_signal(|| Option::<String>::None);
     let mut focus_context = use_context::<Signal<FocusContext>>();
-    let mut chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    
+    // Track previous context to detect external updates (like from optimization)
+    let mut last_processed_context = use_signal(|| String::new());
 
     // Initialize content when modal becomes visible or initial context changes
     use_effect(move || {
@@ -23,23 +27,30 @@ pub fn NewChatMemoryModal(
             // Claim focus ownership
             focus_context.set(FocusContext::NewChatMemoryModal);
             
-            match serde_json::to_string_pretty(&initial_context) {
-                Ok(json) => json_content.set(json),
-                Err(e) => {
-                    tracing::error!("Failed to serialize initial context: {}", e);
-                    json_content.set("{}".to_string());
-                }
+            // Check if context has changed externally (e.g. returning from optimization)
+            let new_json = serde_json::to_string_pretty(&initial_context).unwrap_or_default();
+            if *last_processed_context.read() != new_json {
+                json_content.set(new_json.clone());
+                last_processed_context.set(new_json);
+                error_message.set(None);
             }
-            error_message.set(None);
         } else {
             // Release focus ownership when modal closes
             focus_context.set(FocusContext::ChatInput);
         }
     });
+
+    let mut trigger_optimize = move || {
+        let content = json_content.read().clone();
+        match serde_json::from_str::<ActiveContext>(&content) {
+            Ok(ctx) => on_optimize_memory.call(ctx),
+            Err(e) => error_message.set(Some(format!("Cannot optimize invalid JSON: {}", e))),
+        }
+    };
     
     let mut submit_session = move || {
         let content = json_content.read().clone();
-        tracing::error!("DEBUG: NewChatMemoryModal::submit_session called");
+        tracing::debug!("NewChatMemoryModal::submit_session called");
         match serde_json::from_str::<ActiveContext>(&content) {
             Ok(valid_context) => {
                 tracing::info!("NewChatMemoryModal::submit_session - valid context parsed, calling on_start_chat");
@@ -59,27 +70,7 @@ pub fn NewChatMemoryModal(
         }
     };
 
-    // Listen for ChatCommands (e.g. from global hotkeys)
-    use_effect(move || {
-        let cmd_opt = chat_command.read().clone();
-        if let Some(cmd) = cmd_opt {
-            if *is_visible.read() {
-                match cmd {
-                    crate::components::chat_input::ChatCommand::SubmitModal => {
-                        tracing::info!("NewChatMemoryModal received SubmitModal command");
-                        submit_session();
-                        chat_command.set(None); // Reset command
-                    }
-                    crate::components::chat_input::ChatCommand::CloseModal => {
-                        tracing::info!("NewChatMemoryModal received CloseModal command");
-                        on_cancel.call(());
-                        chat_command.set(None); // Reset command
-                    }
-                     _ => {}
-                }
-            }
-        }
-    });
+
 
     if !*is_visible.read() {
         return rsx! {};
@@ -116,11 +107,39 @@ pub fn NewChatMemoryModal(
                         p { class: "text-xs text-gray-400 mt-1", 
                             "Edit the short-term memory (persona, instructions, etc.) for the new session." 
                         }
+                        {
+                            let context_size = json_content.read().len();
+                            let estimated_tokens = context_size / 4;
+                            rsx! {
+                                p { 
+                                    class: "text-xs text-gray-500 mt-1",
+                                    "Context size: ~{estimated_tokens} tokens ({context_size} chars)"
+                                }
+                            }
+                        }
                     }
                     button {
                         class: "text-gray-400 hover:text-white transition-colors",
                         onclick: move |_| on_cancel.call(()),
                         Icon { width: 24, height: 24, icon: fi_icons::FiX }
+                    }
+                }
+
+                // Optimization Summary Banner (if present)
+                if let Some(summary) = optimization_summary.read().as_ref() {
+                    div {
+                        class: "mx-4 my-3 p-3 bg-primary-900/30 border border-primary-700/50 rounded-lg flex items-start gap-2 animate-in slide-in-from-top-2",
+                        div { class: "text-primary-400 mt-0.5", "✨" }
+                        div {
+                            class: "flex-1",
+                            p { class: "text-xs font-semibold text-primary-400 mb-0.5", "Memory Optimization Result" }
+                            p { class: "text-sm text-gray-200", "{summary}" }
+                        }
+                        button {
+                            class: "text-gray-400 hover:text-white transition-colors p-1",
+                            onclick: move |_| optimization_summary.set(None),
+                            Icon { width: 14, height: 14, icon: fi_icons::FiX }
+                        }
                     }
                 }
 
@@ -218,16 +237,28 @@ pub fn NewChatMemoryModal(
 
                 // Footer
                 div {
-                    class: "p-4 border-t border-primary-700 bg-dark-section flex justify-end gap-3",
+                    class: "p-4 border-t border-primary-700 bg-dark-section flex justify-between items-center",
+                    
+                    // Left Side: Optimization Control
                     button {
-                        class: "px-4 py-2 text-gray-300 hover:text-white font-medium transition-colors",
-                        onclick: move |_| on_cancel.call(()),
-                        "Cancel"
+                        class: "flex items-center gap-2 px-3 py-2 text-yellow-500 hover:text-yellow-400 hover:bg-yellow-500/10 rounded transition-colors text-sm font-medium",
+                        onclick: move |_| trigger_optimize(),
+                        "⚡ Optimize Memory" 
                     }
-                    button {
-                        class: "px-6 py-2 bg-primary-600 hover:bg-primary-500 text-white rounded-md font-semibold shadow-lg shadow-primary-900/20 transition-all hover:scale-105 active:scale-95",
-                        onclick: move |_| submit_session(),
-                        "Start New Session"
+
+                    // Right Side: Action Buttons
+                    div {
+                        class: "flex gap-3",
+                        button {
+                            class: "px-4 py-2 text-gray-300 hover:text-white font-medium transition-colors",
+                            onclick: move |_| on_cancel.call(()),
+                            "Cancel"
+                        }
+                        button {
+                            class: "px-6 py-2 bg-primary-600 hover:bg-primary-500 text-white rounded-md font-semibold shadow-lg shadow-primary-900/20 transition-all hover:scale-105 active:scale-95",
+                            onclick: move |_| submit_session(),
+                            "Start New Session"
+                        }
                     }
                 }
             }

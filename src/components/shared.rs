@@ -1,3 +1,4 @@
+use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -49,6 +50,22 @@ pub enum StreamMessage {
     Error {
         message: String,
     },
+    Usage(UsageData),
+}
+
+/// Token usage data from LLM API response
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct UsageData {
+    pub prompt_tokens: i32,
+    pub completion_tokens: i32,
+    pub total_tokens: i32,
+    #[serde(default)]
+    pub thoughts_tokens: Option<i32>,
+    #[serde(default)]
+    pub cached_content_tokens: Option<i32>,
+    /// Calculated cost in USD
+    #[serde(default)]
+    pub cost: Option<f64>,
 }
 
 impl ToolCall {
@@ -96,4 +113,54 @@ pub struct ToolResult {
 pub struct ToolCallRecord {
     pub call: ToolCall,
     pub result: ToolResult,
+}
+
+/// Helper to extract JSON content from an LLM response string.
+/// It handles markdown blocks (```json ... ```) and raw JSON objects.
+pub fn extract_json_from_response(text: &str) -> &str {
+    let text = text.trim();
+    
+    // 1. Try markdown JSON block
+    if let (Some(s), Some(e)) = (text.find("```json"), text.rfind("```")) {
+        if s < e {
+            return text[s + 7..e].trim();
+        }
+    }
+    
+    // 2. Try finding literal JSON object braces
+    if let (Some(s), Some(e)) = (text.find('{'), text.rfind('}')) {
+        if s < e {
+            return &text[s..=e];
+        }
+    }
+    
+    // 3. Fallback to raw text
+    text
+}
+
+#[component]
+pub fn ChatBarIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static>(
+    icon: I,
+    onclick: EventHandler<MouseEvent>,
+    #[props(default = true)]
+    visible: bool,
+    #[props(default = String::new())]
+    title: String,
+) -> Element {
+    if !visible {
+        return rsx! {};
+    }
+
+    rsx! {
+        button {
+            class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600 transition-colors",
+            onclick: move |evt| onclick.call(evt),
+            title: "{title}",
+            dioxus_free_icons::Icon {
+                width: 20,
+                height: 20,
+                icon: icon
+            }
+        }
+    }
 }

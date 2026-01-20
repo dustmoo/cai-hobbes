@@ -687,39 +687,68 @@ pub fn SettingsPanel() -> Element {
                                         }
                                         
                                         if local_settings.read().gemini_config.thinking_enabled {
-                                            div {
-                                                class: "mb-3",
-                                                label { class: "block text-sm font-medium text-gray-300 mb-1", "Thinking Level (Gemini 3 Pro)" }
-                                                select {
-                                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                                    onchange: move |event| {
-                                                        local_settings.write().gemini_config.thinking_level = event.value();
+                                            {
+                                                let current_model = local_settings.read().gemini_config.chat_model.clone();
+                                                let gemini_model = crate::components::llm::GeminiModel::from_slug(&current_model);
+                                                
+                                                match gemini_model.thinking_config_style() {
+                                                    crate::components::llm::ThinkingConfigStyle::LevelPro | 
+                                                    crate::components::llm::ThinkingConfigStyle::LevelFlash => {
+                                                        rsx! {
+                                                            div {
+                                                                class: "mb-3",
+                                                                label { class: "block text-sm font-medium text-gray-300 mb-1", "Thinking Level" }
+                                                                select {
+                                                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                                    onchange: move |event| {
+                                                                        local_settings.write().gemini_config.thinking_level = event.value();
+                                                                    },
+                                                                    for level in gemini_model.valid_thinking_levels() {
+                                                                        option { 
+                                                                            value: "{level}", 
+                                                                            selected: local_settings.read().gemini_config.thinking_level == *level, 
+                                                                            "{level}" 
+                                                                        }
+                                                                    }
+                                                                }
+                                                                p { class: "text-xs text-gray-400 mt-1", "Controls reasoning depth." }
+                                                            }
+                                                        }
                                                     },
-                                                    option { value: "low", selected: local_settings.read().gemini_config.thinking_level == "low", "Low" }
-                                                    option { value: "high", selected: local_settings.read().gemini_config.thinking_level == "high", "High (Default)" }
-                                                }
-                                            }
-                                            
-                                            div {
-                                                class: "mb-3",
-                                                label { class: "block text-sm font-medium text-gray-300 mb-1", "Thinking Budget (Gemini 2.5)" }
-                                                input {
-                                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                                    r#type: "number",
-                                                    placeholder: "Leave empty for model default",
-                                                    value: "{local_settings.read().gemini_config.thinking_budget.map(|v| v.to_string()).unwrap_or_default()}",
-                                                    oninput: move |event| {
-                                                        let val = event.value();
-                                                        local_settings.write().gemini_config.thinking_budget = if val.is_empty() {
-                                                            None
-                                                        } else {
-                                                            val.parse::<i32>().ok()
-                                                        };
+                                                    crate::components::llm::ThinkingConfigStyle::Budget => {
+                                                        rsx! {
+                                                            div {
+                                                                class: "mb-3",
+                                                                label { class: "block text-sm font-medium text-gray-300 mb-1", "Thinking Budget (Web 2.5)" }
+                                                                input {
+                                                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                                    r#type: "number",
+                                                                    placeholder: "Leave empty for model default",
+                                                                    value: "{local_settings.read().gemini_config.thinking_budget.map(|v| v.to_string()).unwrap_or_default()}",
+                                                                    oninput: move |event| {
+                                                                        let val = event.value();
+                                                                        local_settings.write().gemini_config.thinking_budget = if val.is_empty() {
+                                                                            None
+                                                                        } else {
+                                                                            val.parse::<i32>().ok()
+                                                                        };
+                                                                    }
+                                                                }
+                                                                p {
+                                                                    class: "text-xs text-gray-400 mt-1",
+                                                                    "Higher values allow more reasoning tokens (increases cost)"
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    crate::components::llm::ThinkingConfigStyle::None => {
+                                                        rsx! {
+                                                            div {
+                                                                class: "p-3 bg-yellow-900/30 border border-yellow-700/50 rounded-lg", 
+                                                                p { class: "text-sm text-yellow-200", "⚠️ This model does not support thinking mode." }
+                                                            }
+                                                        }
                                                     }
-                                                }
-                                                p {
-                                                    class: "text-xs text-gray-400 mt-1",
-                                                    "Higher values allow more reasoning tokens (increases cost)"
                                                 }
                                             }
                                         }
@@ -986,20 +1015,19 @@ pub fn SettingsPanel() -> Element {
                                                             class: "px-3 py-2 bg-dark-input hover:bg-white/10 border border-primary-600 rounded-md text-gray-300 transition-colors",
                                                             title: "Copy User ID",
                                                             onclick: {
-                                                                let user_id = local_settings.read().get_active_profile().and_then(|p| p.user_id.clone()).unwrap_or_default();
+                                                                let user_id = local_settings.read().get_active_profile().map(|p| p.user_id.clone()).unwrap_or_default();
                                                                 move |_| {
-                                                                    if !user_id.is_empty() {
+                                                                    if user_id.as_ref().map_or(true, |s| !s.is_empty()) {
                                                                         use std::process::Command;
-                                                                        let _ = Command::new("pbcopy")
-                                                                            .stdin(std::process::Stdio::piped())
-                                                                            .spawn()
-                                                                            .and_then(|mut child| {
-                                                                                use std::io::Write;
-                                                                                if let Some(mut stdin) = child.stdin.take() {
-                                                                                    let _ = stdin.write_all(user_id.as_bytes());
-                                                                                }
-                                                                                Ok(())
-                                                                            });
+                                                                         let _ = Command::new("pbcopy")
+                                                                             .stdin(std::process::Stdio::piped())
+                                                                             .spawn()
+                                                                             .map(|mut child| {
+                                                                                 use std::io::Write;
+                                                                                 if let Some(mut stdin) = child.stdin.take() {
+                                                                                     let _ = stdin.write_all(user_id.as_deref().unwrap_or("").as_bytes());
+                                                                                 }
+                                                                             });
                                                                     }
                                                                 }
                                                             },
@@ -1195,201 +1223,423 @@ pub fn SettingsPanel() -> Element {
                     }
                     if !app_behavior_collapsed() {
                         div {
-                            class: "p-4",
+                            class: "p-4 space-y-6",
+
+                            // 1. Context & History
                             div {
-                                class: "mb-4",
-                                label { class: "block text-sm font-medium text-gray-300", "Chat History Length" }
-                                input {
-                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                    r#type: "number",
-                                    value: "{local_settings.read().chat_history_length}",
-                                    oninput: move |event| {
-                                        if let Ok(val) = event.value().parse::<usize>() {
-                                            local_settings.write().chat_history_length = val;
-                                        }
-                                    }
-                                }
-                            }
-                            div {
-                                class: "mb-4",
-                                label { class: "block text-sm font-medium text-gray-300", "Max Tool Output Length" }
-                                input {
-                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                    r#type: "number",
-                                    value: "{local_settings.read().max_tool_output_length}",
-                                    oninput: move |event| {
-                                        if let Ok(val) = event.value().parse::<usize>() {
-                                            local_settings.write().max_tool_output_length = val;
-                                        }
-                                    }
-                                }
-                                p {
-                                    class: "text-xs text-gray-400 mt-1",
-                                    "Limits the size of tool outputs in history to save tokens. Default is 2000."
-                                }
-                            }
-                            div {
-                                class: "mb-4",
-                                label { class: "block text-sm font-medium text-gray-300", "Max Active Tool Output Length" }
-                                input {
-                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                    r#type: "number",
-                                    value: "{local_settings.read().max_active_tool_output_length}",
-                                    oninput: move |event| {
-                                        if let Ok(val) = event.value().parse::<usize>() {
-                                            local_settings.write().max_active_tool_output_length = val;
-                                        }
-                                    }
-                                }
-                                p {
-                                    class: "text-xs text-gray-400 mt-1",
-                                    "Safety limit for the CURRENT tool response to prevent API errors. Default is 500,000."
-                                }
-                            }
-                            div {
-                                class: "mt-4 mb-4 flex items-center justify-between",
-                                label { class: "block text-sm font-medium text-gray-300", "Show Tray Icon" }
-                                label {
-                                    class: "relative inline-flex items-center cursor-pointer",
-                                    input {
-                                        r#type: "checkbox",
-                                        class: "sr-only peer",
-                                        checked: local_settings.read().show_tray_icon,
-                                        oninput: move |event| {
-                                            if let Some(checked) = event.value().parse().ok() {
-                                                local_settings.write().show_tray_icon = checked;
+                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Context & History" }
+                                div {
+                                    class: "space-y-3",
+                                    // Chat History Length
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-gray-300", "Chat History Length" }
+                                        p { class: "text-xs text-gray-500", "Number of past messages included in context window" }
+                                        input {
+                                            r#type: "number",
+                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            value: "{local_settings.read().chat_history_length}",
+                                            oninput: move |e| {
+                                                if let Ok(value) = e.value().parse::<usize>() {
+                                                    local_settings.write().chat_history_length = value;
+                                                }
                                             }
                                         }
                                     }
-                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
-                                }
-                            }
-                            div {
-                                class: "mt-4 mb-4 flex items-center justify-between",
-                                label { class: "block text-sm font-medium text-gray-300", "Confirm Before Deleting Sessions" }
-                                label {
-                                    class: "relative inline-flex items-center cursor-pointer",
-                                    input {
-                                        r#type: "checkbox",
-                                        class: "sr-only peer",
-                                        checked: local_settings.read().confirm_on_delete,
-                                        oninput: move |event| {
-                                            if let Some(checked) = event.value().parse().ok() {
-                                                local_settings.write().confirm_on_delete = checked;
+                                    
+                                    // Max Tool Output Length
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-gray-300", "Max Tool Output Length" }
+                                        p { class: "text-xs text-gray-500", "Maximum characters displayed in tool outputs (0 for unlimited)" }
+                                        input {
+                                            r#type: "number",
+                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            value: "{local_settings.read().max_tool_output_length}",
+                                            oninput: move |e| {
+                                                if let Ok(value) = e.value().parse::<usize>() {
+                                                    local_settings.write().max_tool_output_length = value;
+                                                }
                                             }
                                         }
                                     }
-                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
-                                }
-                            }
-                            div {
-                                class: "mt-4 mb-4 flex items-center justify-between",
-                                label { class: "block text-sm font-medium text-gray-300", "Confirm Before Saving Settings" }
-                                label {
-                                    class: "relative inline-flex items-center cursor-pointer",
-                                    input {
-                                        r#type: "checkbox",
-                                        class: "sr-only peer",
-                                        checked: local_settings.read().confirm_on_save,
-                                        oninput: move |event| {
-                                            if let Some(checked) = event.value().parse().ok() {
-                                                local_settings.write().confirm_on_save = checked;
+
+                                    // Max Active Tool Output Length
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-gray-300", "Max Active Tool Output Length" }
+                                        p { class: "text-xs text-gray-500", "Maximum characters persisted for tool context" }
+                                        input {
+                                            r#type: "number",
+                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            value: "{local_settings.read().max_active_tool_output_length}",
+                                            oninput: move |e| {
+                                                if let Ok(value) = e.value().parse::<usize>() {
+                                                    local_settings.write().max_active_tool_output_length = value;
+                                                }
                                             }
                                         }
                                     }
-                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
-                                }
-                            }
-                            div {
-                                class: "mt-4 mb-4 flex items-center justify-between",
-                                label { class: "block text-sm font-medium text-gray-300", "Confirm Before Deleting Messages" }
-                                label {
-                                    class: "relative inline-flex items-center cursor-pointer",
-                                    input {
-                                        r#type: "checkbox",
-                                        class: "sr-only peer",
-                                        checked: local_settings.read().confirm_on_message_delete,
-                                        oninput: move |event| {
-                                            if let Some(checked) = event.value().parse().ok() {
-                                                local_settings.write().confirm_on_message_delete = checked;
+
+                                    // Max Memory Summary Length
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-gray-300", "Max Memory Summary Length" }
+                                        p { class: "text-xs text-gray-500", "Character limit for conversation summary (~4 chars = 1 token)" }
+                                        input {
+                                            r#type: "number",
+                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            value: "{local_settings.read().max_summary_chars}",
+                                            oninput: move |e| {
+                                                if let Ok(value) = e.value().parse::<usize>() {
+                                                    local_settings.write().max_summary_chars = value;
+                                                }
                                             }
                                         }
                                     }
-                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
+
+                                    // Max Stored Entities
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-gray-300", "Max Stored Entities" }
+                                        p { class: "text-xs text-gray-500", "Maximum entities retained in memory (topics, facts, goals)" }
+                                        input {
+                                            r#type: "number",
+                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            value: "{local_settings.read().max_entity_count}",
+                                            oninput: move |e| {
+                                                if let Ok(value) = e.value().parse::<usize>() {
+                                                    local_settings.write().max_entity_count = value;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
+                            // 2. Chat Bar Icons
                             div {
-                                class: "mt-4 mb-4",
-                                label { class: "block text-sm font-medium text-gray-300", "Max AI Turns" }
-                                input {
-                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm",
-                                    r#type: "number",
-                                    value: "{local_settings.read().permission_settings.max_ai_turns}",
-                                    oninput: move |event| {
-                                        if let Ok(val) = event.value().parse::<u32>() {
-                                            local_settings.write().permission_settings.max_ai_turns = val;
-                                        }
-                                    }
-                                }
-                            }
-                            div {
-                                class: "mt-4 mb-4",
-                                label { class: "block text-sm font-medium text-gray-300", "What should Hobbes call you?" }
-                                input {
-                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                    r#type: "text",
-                                    placeholder: "e.g., Dustin",
-                                    value: "{local_settings.read().user_name.as_deref().unwrap_or(\"\")}",
-                                    oninput: move |event| {
-                                        let value = event.value();
-                                        if value.is_empty() {
-                                            local_settings.write().user_name = None;
-                                        } else {
-                                            local_settings.write().user_name = Some(value);
-                                        }
-                                    }
-                                }
-                            }
-                            div {
-                                class: "mb-4",
-                                label { class: "block text-sm font-medium text-gray-300", "Persona" }
-                                textarea {
-                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                    rows: "4",
-                                    value: "{local_settings.read().persona}",
-                                    oninput: move |event| local_settings.write().persona = event.value()
-                                }
-                            }
-                            div {
-                                class: "mb-4",
-                                label { class: "block text-sm font-medium text-gray-300", "Force Tool Use Instruction" }
-                                textarea {
-                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                    rows: "4",
-                                    value: "{local_settings.read().force_tool_use_instruction.as_deref().unwrap_or(\"\")}",
-                                    oninput: move |event| local_settings.write().force_tool_use_instruction = Some(event.value())
-                                }
-                            }
-                            div {
-                                class: "mb-4",
-                                label { class: "block text-sm font-medium text-gray-300", "Project Folder" }
+                                class: "pt-4 border-t border-primary-700",
+                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Chat Bar Icons" }
                                 div {
-                                    class: "mt-1 flex items-center",
-                                    p {
-                                        class: "flex-grow px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                        "{local_settings.read().project_folder.clone().unwrap_or(\"None\".to_string())}"
+                                    class: "grid grid-cols-2 gap-3",
+                                    
+                                    // History Icon
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Show History Icon" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{ui_state.read().show_history_icon}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.show_history_icon = e.value() == "true";
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
                                     }
-                                    button {
-                                        class: "ml-2 px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600",
-                                        onclick: move |_| {
-                                            spawn(async move {
-                                                if let Some(folder_path) = rfd::AsyncFileDialog::new().pick_folder().await {
-                                                    local_settings.write().project_folder = Some(folder_path.path().to_string_lossy().to_string());
+
+                                    // MCP Tools Icon
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Show MCP Tools Icon" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{ui_state.read().show_mcp_icon}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.show_mcp_icon = e.value() == "true";
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+
+                                    // Session Cost Icon
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Show Session Cost" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{ui_state.read().show_session_cost_icon}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.show_session_cost_icon = e.value() == "true";
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+
+                                    // Profile Selector
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Show Profile Selector" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{ui_state.read().show_profile_selector}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.show_profile_selector = e.value() == "true";
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Attachments Icon
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Show Attachments Icon" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{ui_state.read().show_attachments_icon}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.show_attachments_icon = e.value() == "true";
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 3. Confirmation Dialogs
+                            div {
+                                class: "pt-4 border-t border-primary-700",
+                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Confirmation Dialogs" }
+                                div {
+                                    class: "space-y-3",
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Confirm before deleting sessions" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{local_settings.read().confirm_on_delete}",
+                                            onchange: move |e| {
+                                                local_settings.write().confirm_on_delete = e.value() == "true";
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Confirm before saving settings" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{local_settings.read().confirm_on_save}",
+                                            onchange: move |e| {
+                                                local_settings.write().confirm_on_save = e.value() == "true";
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Confirm before deleting messages" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{local_settings.read().confirm_on_message_delete}",
+                                            onchange: move |e| {
+                                                local_settings.write().confirm_on_message_delete = e.value() == "true";
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Confirm before optimizing memory" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{local_settings.read().confirm_forget_memory}",
+                                            onchange: move |e| {
+                                                local_settings.write().confirm_forget_memory = e.value() == "true";
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Show System Tray Icon" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{local_settings.read().show_tray_icon}",
+                                            onchange: move |e| {
+                                                local_settings.write().show_tray_icon = e.value() == "true";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 4. Tool Display Defaults
+                            div {
+                                class: "pt-4 border-t border-primary-700",
+                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Tool Display Defaults" }
+                                p { class: "text-xs text-gray-500 mb-3", "Set initial state for collapsible sections in tool call bubbles." }
+                                
+                                div {
+                                    class: "space-y-3",
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Expand Arguments by Default" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{ui_state.read().default_tool_arguments_open}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.default_tool_arguments_open = e.value() == "true";
+                                                let state_clone = state.clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Expand Response by Default" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{ui_state.read().default_tool_response_open}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.default_tool_response_open = e.value() == "true";
+                                                let state_clone = state.clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Expand Thinking Process by Default" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{ui_state.read().default_tool_thought_open}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.default_tool_thought_open = e.value() == "true";
+                                                let state_clone = state.clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 5. AI Behavior
+                            div {
+                                class: "pt-4 border-t border-primary-700",
+                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "AI Behavior" }
+                                div {
+                                    class: "space-y-3",
+                                    // Max AI Turns
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-gray-300", "Max AI Turns" }
+                                        p { class: "text-xs text-gray-500", "Maximum consecutive responses allowed" }
+                                        select {
+                                            class: "bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            onchange: move |e| {
+                                                if let Ok(value) = e.value().parse::<u32>() {
+                                                    local_settings.write().permission_settings.max_ai_turns = value;
                                                 }
-                                            });
-                                        },
-                                        "Select Folder"
+                                            },
+                                            option { value: "1", selected: local_settings.read().permission_settings.max_ai_turns == 1, "1 (Strict turn-taking)" }
+                                            option { value: "3", selected: local_settings.read().permission_settings.max_ai_turns == 3, "3 (Default)" }
+                                            option { value: "5", selected: local_settings.read().permission_settings.max_ai_turns == 5, "5 (More autonomy)" }
+                                            option { value: "10", selected: local_settings.read().permission_settings.max_ai_turns == 10, "10 (For complex tasks)" }
+                                        }
+                                    }
+
+                                    // User Name
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-gray-300", "What should Hobbes call you?" }
+                                        input {
+                                            r#type: "text",
+                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            placeholder: "Dr. Calvin",
+                                            value: "{local_settings.read().user_name.clone().unwrap_or_default()}",
+                                            oninput: move |e| {
+                                                let value = e.value();
+                                                local_settings.write().user_name = if value.is_empty() { None } else { Some(value) };
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 6. Persona & Instructions
+                            div {
+                                class: "pt-4 border-t border-primary-700",
+                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Persona & Instructions" }
+                                div {
+                                    class: "space-y-3",
+                                    // Persona
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-gray-300", "Persona" }
+                                        textarea {
+                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white h-24 focus:border-blue-500 focus:outline-none",
+                                            value: "{local_settings.read().persona}",
+                                            oninput: move |e| local_settings.write().persona = e.value()
+                                        }
+                                    }
+
+                                    // Force Tool Use Instruction
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-gray-300", "Force Tool Use Instruction" }
+                                        p { class: "text-xs text-gray-500", "Appended to system prompt to encourage specific behaviors" }
+                                        textarea {
+                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white h-24 focus:border-blue-500 focus:outline-none",
+                                            value: "{local_settings.read().force_tool_use_instruction.clone().unwrap_or_default()}",
+                                            oninput: move |e| local_settings.write().force_tool_use_instruction = Some(e.value())
+                                        }
+                                    }
+
+                                    // Project Folder
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-gray-300", "Project Folder" }
+                                        div {
+                                            class: "flex gap-2",
+                                            input {
+                                                r#type: "text",
+                                                class: "flex-1 bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                                value: "{local_settings.read().project_folder.clone().unwrap_or_default()}",
+                                                readonly: true,
+                                            }
+                                            button {
+                                                class: "px-3 py-2 bg-dark-card hover:bg-gray-700 rounded border border-gray-600 transition-colors",
+                                                onclick: move |_| {
+                                                    spawn(async move {
+                                                        if let Some(folder_path) = rfd::AsyncFileDialog::new().pick_folder().await {
+                                                            local_settings.write().project_folder = Some(folder_path.path().to_string_lossy().to_string());
+                                                        }
+                                                    });
+                                                },
+                                                "Browse"
+                                            }
+                                        }
                                     }
                                 }
                             }

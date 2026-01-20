@@ -14,36 +14,11 @@ pub fn CommentModal(
     let mut selected_text = use_signal(|| String::new());
     let mut comments = use_signal(|| message.comments.clone());
     let mut focus_context = use_context::<Signal<FocusContext>>();
-    let mut chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
-    
-    // Claim focus when modal mounts, release when it unmounts
+    // Claim focus when modal mounts
     use_effect(move || {
         focus_context.set(FocusContext::CommentModal);
     });
-    
-    // Listen for ChatCommands
-    use_effect(move || {
-        let cmd_opt = chat_command.read().clone();
-        if let Some(cmd) = cmd_opt {
-             match cmd {
-                crate::components::chat_input::ChatCommand::SaveModal => {
-                    tracing::info!("CommentModal received SaveModal command");
-                    on_save.call(comments());
-                    focus_context.set(FocusContext::ChatInput);
-                    on_close.call(());
-                    chat_command.set(None);
-                }
-                crate::components::chat_input::ChatCommand::CloseModal => {
-                     tracing::info!("CommentModal received CloseModal command");
-                     focus_context.set(FocusContext::ChatInput);
-                     on_close.call(());
-                     chat_command.set(None);
-                }
-                _ => {}
-            }
-        }
-    });
-    
+
     // Extract text content from message
     let message_text = match &message.content {
         crate::components::shared::MessageContent::Text { content, .. } => content.clone(),

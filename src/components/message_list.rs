@@ -14,6 +14,7 @@ const INITIAL_MESSAGES_TO_SHOW: usize = 20;
 #[component]
 pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signal<bool>, on_delete: EventHandler<Uuid>, on_comment: EventHandler<()>) -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let ui_state = consume_context::<Signal<crate::settings::UiState>>();
     let chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
     let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     let _ = stream_update_trigger.read();
@@ -166,7 +167,11 @@ pub fn MessageList(stream_update_trigger: Signal<i32>, show_scroll_button: Signa
                                                         class: "flex flex-col max-w-2/3 min-w-0",
                                                         div {
                                                             class: "relative group rounded-2xl {bubble_classes}",
-                                                            ToolCallDisplay { tool_call: tool_call.clone() }
+                                                            ToolCallDisplay { 
+                                                                tool_call: tool_call.clone(),
+                                                                usage: message.usage.clone(),
+                                                                token_display_mode: ui_state.read().token_display_mode.clone()
+                                                            }
                                                         }
                                                         div {
                                                             class: "{author_classes}",

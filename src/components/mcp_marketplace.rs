@@ -168,12 +168,12 @@ pub fn McpMarketplace() -> Element {
     
     // Reset cursor state when search query, categories, or sort order change
     {
-        let search_query = search_query.clone();
-        let selected_categories = selected_categories.clone();
-        let sort_by = sort_by.clone();
-        let mut cursor_stack = cursor_stack.clone();
-        let mut current_cursor = current_cursor.clone();
-        let mut current_page = current_page.clone();
+        let search_query = search_query;
+        let selected_categories = selected_categories;
+        let sort_by = sort_by;
+        let mut cursor_stack = cursor_stack;
+        let mut current_cursor = current_cursor;
+        let mut current_page = current_page;
         use_effect(move || {
             // Subscribe to changes in search query, categories, and sort order
             let _ = search_query.read();
@@ -188,13 +188,13 @@ pub fn McpMarketplace() -> Element {
     
     // Fetch categories when Composio is selected - use effect with explicit dependency
     {
-        let settings = settings.clone();
-        let available_categories = available_categories.clone();
-        let categories_loading = categories_loading.clone();
+        let settings = settings;
+        let available_categories = available_categories;
+        let categories_loading = categories_loading;
         use_effect(move || {
             let settings_snapshot = settings.read().clone();
-            let mut available_categories = available_categories.clone();
-            let mut categories_loading = categories_loading.clone();
+            let mut available_categories = available_categories;
+            let mut categories_loading = categories_loading;
             
             if settings_snapshot.preferred_mcp_source != McpSource::Composio {
                 return; // Only fetch for Composio
@@ -246,11 +246,11 @@ pub fn McpMarketplace() -> Element {
 
     // Fetch connected toolkits when Composio is selected
     let _connected_slugs_resource = use_resource({
-        let settings = settings.clone();
-        let connected_slugs = connected_slugs.clone();
+        let settings = settings;
+        let connected_slugs = connected_slugs;
         move || {
-            let settings = settings.clone();
-            let mut connected_slugs = connected_slugs.clone();
+            let settings = settings;
+            let mut connected_slugs = connected_slugs;
             // Track settings changes
             let settings_snapshot = settings.read().clone();
             
@@ -603,9 +603,9 @@ pub fn McpMarketplace() -> Element {
                             filter_deployed: filter_deployed,
                             sort_by: sort_by,
                             mcp_source: settings.peek().preferred_mcp_source.clone(),
-                            composio_categories: selected_categories.clone(),
-                            available_categories: available_categories.clone(),
-                            show_category_dropdown: show_category_dropdown.clone(),
+                            composio_categories: selected_categories,
+                            available_categories: available_categories,
+                            show_category_dropdown: show_category_dropdown,
                             categories_loading: *categories_loading.read()
                         }
                         div {
@@ -615,8 +615,8 @@ pub fn McpMarketplace() -> Element {
                                     key: "{mcp.name}",
                                     mcp: mcp.clone(),
                                     add_mcp: move |m| add_mcp(m),
-                                    trigger_search: trigger_search.clone(),
-                                    connected_slugs: connected_slugs.clone()
+                                    trigger_search: trigger_search,
+                                    connected_slugs: connected_slugs
                                 }
                             }
                         }

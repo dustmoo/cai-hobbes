@@ -144,6 +144,7 @@ impl StreamManagerContext {
                                         attachments: Vec::new(),
                                         comments: Vec::new(),
                                         created_at: chrono::Utc::now(),
+                                        usage: None,
                                     });
                                 }
                             }
@@ -204,6 +205,7 @@ impl StreamManagerContext {
                                         attachments: Vec::new(),
                                         comments: Vec::new(),
                                         created_at: chrono::Utc::now(),
+                                        usage: None,
                                     });
                                 }
                                 new_id
@@ -311,6 +313,25 @@ impl StreamManagerContext {
                             completed_tool_tasks_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         });
                         is_first_message = false;
+                    }
+                    StreamMessage::Usage(usage_data) => {
+                        // Update message with usage data
+                        let mut state = self.session_state.write();
+                        if let Some(msg) = state.get_message_mut(&message_id) {
+                            msg.usage = Some(usage_data.clone());
+                        }
+
+                        // Increment session accumulated usage
+                        if let Some(session) = state.get_active_session_mut() {
+                            session.accumulated_cost += usage_data.cost.unwrap_or(0.0);
+                            session.accumulated_tokens += usage_data.total_tokens;
+                            session.accumulated_turns += 1;
+                        }
+
+                        // Forward usage to UI
+                        if stream_tx.send(StreamMessage::Usage(usage_data)).is_err() {
+                            tracing::warn!("Failed to forward usage data to stream");
+                        }
                     }
                 }
             }

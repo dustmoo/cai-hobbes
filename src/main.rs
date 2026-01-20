@@ -4,8 +4,6 @@ use dioxus::desktop::{use_window, Config, WindowBuilder, use_wry_event_handler, 
 use dioxus::prelude::*;
 use dioxus::desktop::tao::dpi::PhysicalSize;
 use dioxus::desktop::tao::event::{Event, WindowEvent};
-use dioxus_logger;
-use tracing;
 use dotenvy::dotenv;
 use futures_util::StreamExt;
 
@@ -424,13 +422,11 @@ fn app() -> Element {
     let mut chat_command = use_context_provider(|| Signal::new(None::<ChatCommand>));
 
     // Call the summarization scheduler hook BEFORE the hotkey manager
-    // This provides the SchedulerSignal context needed by use_profile_hotkeys
     processing::summarization_scheduler::use_summarization_scheduler();
 
     // Unconditionally call the hotkey manager hook, passing in the permission status signal.
     // The hook itself will handle the conditional logic internally.
     hotkey::use_hotkey_manager(permission_status_signal);
-    hotkey::use_profile_hotkeys();
 
     // This handler continuously updates the last known size during a resize.
     use_wry_event_handler(move |event, _| {

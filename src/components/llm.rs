@@ -31,16 +31,16 @@ pub struct GenerationConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct GeminiRequest {
-    contents: Vec<Content>,
+pub struct GeminiRequest {
+    pub contents: Vec<Content>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<Tool>>,
+    pub tools: Option<Vec<Tool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system_instruction: Option<SystemInstruction>,
+    pub system_instruction: Option<SystemInstruction>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_config: Option<ToolConfig>,
+    pub tool_config: Option<ToolConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    generation_config: Option<GenerationConfig>,
+    pub generation_config: Option<GenerationConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -109,13 +109,13 @@ pub struct InlineDataPart {
 }
 
 #[derive(Deserialize, Debug)]
-struct GeminiErrorResponse {
-    error: GeminiError,
+pub struct GeminiErrorResponse {
+    pub error: GeminiError,
 }
 
 #[derive(Deserialize, Debug)]
-struct GeminiError {
-    message: String,
+pub struct GeminiError {
+    pub message: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -124,21 +124,173 @@ pub struct SystemInstruction {
 }
 
 #[derive(Deserialize, Debug)]
-struct GeminiResponse {
-    candidates: Vec<Candidate>,
-}
-
-#[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-struct Candidate {
-    content: ContentResponse,
-    finish_reason: Option<String>,
+pub struct GeminiResponse {
+    pub candidates: Vec<Candidate>,
+    #[serde(default)]
+    pub usage_metadata: Option<UsageMetadata>,
+}
+
+/// Usage metadata from Gemini API response
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageMetadata {
+    pub prompt_token_count: i32,
+    #[serde(default)]
+    pub candidates_token_count: Option<i32>,
+    pub total_token_count: i32,
+    #[serde(default)]
+    pub thoughts_token_count: Option<i32>,
+    #[serde(default)]
+    pub cached_content_token_count: Option<i32>,
+}
+
+/// Supported Gemini Models for Pricing
+#[derive(Debug, PartialEq, Clone)]
+pub enum GeminiModel {
+    Gemini3_0ProPreview,
+    Gemini3_0FlashPreview,
+    Gemini2_5Pro,
+    Gemini2_5Flash,
+    Gemini2_5FlashLite,
+    Gemini2_5ComputerUsePreview,
+    Gemini2_0Flash,
+    Gemini2_0FlashLite,
+    Gemini2_0FlashThinking,
+
+    Gemma3,
+    NanoBanana,
+    NanoBananaPro,
+    Unknown(String),
+}
+
+impl GeminiModel {
+    pub fn from_slug(slug: &str) -> Self {
+        // Strip optional "models/" prefix if present, though usually handled by caller
+        let s = slug.strip_prefix("models/").unwrap_or(slug);
+        
+        match s {
+            // Gemini 3 Series - STRICT PREFIX MATCHING FIRST
+            _ if s.starts_with("gemini-3.0-pro") || s.starts_with("gemini-3-pro") => GeminiModel::Gemini3_0ProPreview,
+            _ if s.starts_with("gemini-3.0-flash") || s.starts_with("gemini-3-flash") => GeminiModel::Gemini3_0FlashPreview,
+             "deep-research-pro-preview-dec-12-2025" => GeminiModel::Gemini3_0ProPreview,
+
+            // Gemini 2.5 Series
+            "gemini-2.5-pro" | "gemini-2.5-pro-preview-tts" => GeminiModel::Gemini2_5Pro,
+            "gemini-2.5-flash" | "gemini-2.5-flash-preview-sep-2025" | "gemini-2.5-flash-preview-tts" => GeminiModel::Gemini2_5Flash,
+            "gemini-2.5-flash-lite" | "gemini-2.5-flash-lite-preview-sep-2025" => GeminiModel::Gemini2_5FlashLite,
+            "gemini-2.5-computer-use-preview-10-2025" => GeminiModel::Gemini2_5ComputerUsePreview,
+            
+            // Gemini 2.0 Series
+            "gemini-2.0-flash" | "gemini-2.0-flash-001" | "gemini-2.0-flash-experimental" | "gemini-2.0-flash-image-generation-experimental" | "gemini-experimental-1206" => GeminiModel::Gemini2_0Flash,
+            "gemini-2.0-flash-lite" | "gemini-2.0-flash-lite-001" | "gemini-2.0-flash-lite-preview" | "gemini-2.0-flash-lite-preview-02-05" => GeminiModel::Gemini2_0FlashLite,
+            "gemini-2.0-flash-thinking-exp-01-21" | "gemini-2.0-flash-thinking-exp" => GeminiModel::Gemini2_0FlashThinking,
+            
+            // Gemini 1.5 Series (DEPRECATED: Map to 2.x equivalents)
+            "gemini-pro-latest" | "gemini-1.5-pro" | "gemini-1.5-pro-latest" | "gemini-robotics-er-1.5-preview" => GeminiModel::Gemini2_5Pro,
+            "gemini-flash-latest" | "gemini-1.5-flash" | "gemini-1.5-flash-latest" => GeminiModel::Gemini2_0Flash,
+            "gemini-flash-lite-latest" | "gemini-1.5-flash-8b" => GeminiModel::Gemini2_0FlashLite,
+            
+            // Nano & Gemma
+            "nano-banana" => GeminiModel::NanoBanana,
+            "nano-banana-pro" => GeminiModel::NanoBananaPro,
+            
+            // Strict match for Gemma3 variants
+            _ if s.starts_with("gemma-3") || s.starts_with("gemma-3n") => GeminiModel::Gemma3,
+
+            // Legacy Prefix matching (Priority is strictly below Gemini 3 specific checks)
+            _ if s.starts_with("gemini-2.5-pro") => GeminiModel::Gemini2_5Pro,
+            _ if s.starts_with("gemini-2.5-flash") => GeminiModel::Gemini2_5Flash,
+            
+            // Fallback Heuristics for Unknown/New Models
+            _ if s.contains("thinking") => GeminiModel::Gemini2_0FlashThinking,
+            _ if s.contains("nano") => GeminiModel::NanoBanana,
+            _ if s.contains("gemma") => GeminiModel::Gemma3,
+            _ if s.contains("flash-lite") => GeminiModel::Gemini2_0FlashLite, // assume cheap
+            _ if s.contains("flash") => GeminiModel::Gemini2_0Flash, // assume mid-tier
+            // Jan 2026: 1.5 deprecated, use 2.5 Pro (has thinking budget support)
+            _ if s.contains("pro") => GeminiModel::Gemini2_5Pro,
+            
+            _ => {
+                tracing::warn!("Unknown Gemini model slug encountered: '{}'. Defaulting to Gemini 2.0 Flash pricing.", s);
+                GeminiModel::Unknown(s.to_string())
+            }
+        }
+    }
+
+    pub fn get_rates(&self, prompt_tokens: i32) -> (f64, f64) {
+        match self {
+            GeminiModel::Gemini3_0ProPreview => {
+                if prompt_tokens > 200_000 { (4.00, 18.00) } else { (2.00, 12.00) }
+            },
+            GeminiModel::Gemini3_0FlashPreview => (0.50, 3.00),
+            
+            GeminiModel::Gemini2_5Pro => (1.25, 10.00),
+            GeminiModel::Gemini2_5Flash => (0.15, 0.60), // Updated to correct rates: $0.15 Input, $0.60 Output
+            GeminiModel::Gemini2_5FlashLite => (0.10, 0.40),
+            GeminiModel::Gemini2_5ComputerUsePreview => {
+                 if prompt_tokens > 200_000 { (2.50, 15.00) } else { (1.25, 10.00) }
+            },
+            
+            GeminiModel::Gemini2_0Flash | GeminiModel::Gemini2_0FlashThinking => (0.10, 0.40),
+            GeminiModel::Gemini2_0FlashLite => (0.075, 0.30),
+            
+
+            
+            GeminiModel::Gemma3 | GeminiModel::NanoBanana | GeminiModel::NanoBananaPro => (0.00, 0.00),
+            
+            GeminiModel::Unknown(_) => {
+                // Safety Default: Gemini 2.0 Flash (1.5 deprecated Jan 2026)
+                (0.10, 0.40)
+            }
+        }
+    }
+}
+
+/// Calculate cost in USD based on model and token usage
+/// Pricing per million tokens for Gemini models (as of Jan 2026)
+/// Calculate cost in USD based on model and token usage
+/// Handles dynamic rates for Thinking Mode and Context Caching
+pub fn calculate_cost(model: &str, usage: &UsageMetadata) -> f64 {
+    let gemini_model = GeminiModel::from_slug(model);
+    let (input_rate, mut output_rate) = gemini_model.get_rates(usage.prompt_token_count);
+    
+    // Safety check for cached tokens
+    let cached_tokens = usage.cached_content_token_count.unwrap_or(0);
+    // prompt_token_count includes cached tokens, so we determine standard input tokens by subtracting
+    let standard_input_tokens = (usage.prompt_token_count - cached_tokens).max(0);
+    
+    // Cached content is typically ~25% of the standard input rate
+    let cached_rate = input_rate * 0.25;
+    
+    let input_cost = (standard_input_tokens as f64 / 1_000_000.0) * input_rate;
+    let cached_cost = (cached_tokens as f64 / 1_000_000.0) * cached_rate;
+    
+    // Check for Thinking Mode Surcharges (Gemini 2.5 Flash)
+    if let GeminiModel::Gemini2_5Flash = gemini_model {
+        if usage.thoughts_token_count.unwrap_or(0) > 0 {
+             output_rate = 3.50; // Thinking Mode Output Rate
+        }
+    }
+    
+    let completion_tokens = usage.candidates_token_count.unwrap_or(0);
+    let output_cost = (completion_tokens as f64 / 1_000_000.0) * output_rate;
+    
+    input_cost + cached_cost + output_cost
 }
 
 #[derive(Deserialize, Debug)]
-struct ContentResponse {
+
+#[serde(rename_all = "camelCase")]
+pub struct Candidate {
+    pub content: ContentResponse,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ContentResponse {
     #[serde(default)]
-    parts: Vec<PartResponse>,
+    pub parts: Vec<PartResponse>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -151,14 +303,14 @@ pub struct FunctionCall {
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-struct PartResponse {
+pub struct PartResponse {
     #[serde(default)]
-    text: String,
-    function_call: Option<FunctionCall>,
+    pub text: String,
+    pub function_call: Option<FunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    thought_signature: Option<String>,
+    pub thought_signature: Option<String>,
     #[serde(default)]
-    thought: Option<bool>,
+    pub thought: Option<bool>,
 }
 
 impl From<PartResponse> for Part {
@@ -200,6 +352,51 @@ pub trait LlmConnector: Send + Sync {
 pub struct GeminiConnector {
     config: GeminiConfig,
     base_url: String,
+}
+
+/// Thinking configuration variants per Google AI docs
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ThinkingConfigStyle {
+    /// Gemini 3.x Pro - uses thinkingLevel: low|high
+    LevelPro,
+    /// Gemini 3.x Flash - uses thinkingLevel: minimal|low|medium|high
+    LevelFlash,
+    /// Gemini 2.x - uses thinkingBudget (token count)
+    Budget,
+    /// Not supported (1.x and older)
+    None,
+}
+
+impl GeminiModel {
+    /// Returns true if this model supports thinking/reasoning features
+    /// Source: https://ai.google.dev/gemini-api/docs/thinking
+    #[allow(dead_code)] // Used in tests and available for future UI integration
+    pub fn supports_thinking(&self) -> bool {
+        !matches!(self.thinking_config_style(), ThinkingConfigStyle::None)
+    }
+    
+    /// Returns the thinking config style for this model
+    pub fn thinking_config_style(&self) -> ThinkingConfigStyle {
+        match self {
+            GeminiModel::Gemini3_0ProPreview => ThinkingConfigStyle::LevelPro,
+            GeminiModel::Gemini3_0FlashPreview | 
+            GeminiModel::Gemini2_0FlashThinking => ThinkingConfigStyle::LevelFlash,
+            GeminiModel::Gemini2_5Pro |
+            GeminiModel::Gemini2_5Flash |
+            GeminiModel::Gemini2_5FlashLite |
+            GeminiModel::Gemini2_5ComputerUsePreview => ThinkingConfigStyle::Budget,
+            _ => ThinkingConfigStyle::None,
+        }
+    }
+    
+    /// Valid thinking levels for Flash 3 (Pro only supports low/high)
+    pub fn valid_thinking_levels(&self) -> &'static [&'static str] {
+        match self.thinking_config_style() {
+            ThinkingConfigStyle::LevelPro => &["low", "high"],
+            ThinkingConfigStyle::LevelFlash => &["minimal", "low", "medium", "high"],
+            _ => &[],
+        }
+    }
 }
 
 impl GeminiConnector {
@@ -288,17 +485,16 @@ impl GeminiConnector {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
             tracing::error!("Gemini API Error [{}]: {}", status, body_text);
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("API request failed with status {}: {}", status, body_text),
-            )) as Box<dyn std::error::Error + Send + Sync>);
+                return Err(Box::new(std::io::Error::other(
+                    format!("API request failed with status {}: {}", status, body_text),
+                )) as Box<dyn std::error::Error + Send + Sync>);
         }
         
         let response_json: GeminiResponse = response.json().await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         
-        if let Some(candidate) = response_json.candidates.get(0) {
-            if let Some(part) = candidate.content.parts.get(0) {
+        if let Some(candidate) = response_json.candidates.first() {
+            if let Some(part) = candidate.content.parts.first() {
                 tracing::debug!("Raw LLM tool selection response: {}", part.text);
                 
                 match parse_selection_response(&part.text) {
@@ -325,6 +521,66 @@ impl GeminiConnector {
             std::io::ErrorKind::InvalidData,
             "No response from LLM for tool selection",
         )) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    /// Generate content (non-streaming)
+    pub async fn generate_content(
+        &self,
+        request: GeminiRequest,
+    ) -> Result<GeminiResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let api_key = match self.config.api_key.clone() {
+            Some(key) => key,
+            None => match std::env::var("GEMINI_API_KEY") {
+                Ok(key) => key,
+                Err(_) => {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "GEMINI_API_KEY not configured",
+                    )) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+        };
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_default();
+
+        let mut model = self.config.chat_model.clone();
+        if model.starts_with("models/") {
+            model = model.strip_prefix("models/").unwrap().to_string();
+        }
+
+        // Use the helper for standardizing
+        let url = self.build_model_endpoint(&model, "generateContent", &api_key);
+
+        let response = client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            
+            // Try to parse structured error
+            if let Ok(error_response) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
+                 return Err(Box::new(std::io::Error::other(
+                    format!("Gemini API Error [{}]: {}", status, error_response.error.message),
+                )) as Box<dyn std::error::Error + Send + Sync>);
+            } else {
+                 return Err(Box::new(std::io::Error::other(
+                    format!("Gemini API Error [{}]: {}", status, body_text),
+                )) as Box<dyn std::error::Error + Send + Sync>);
+            }
+        }
+
+        let response_json: GeminiResponse = response.json().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(response_json)
     }
 }
 
@@ -363,32 +619,34 @@ impl LlmConnector for GeminiConnector {
         .expect("Failed to build reqwest client");
 
     // Build thinking config based on model and settings
-    let generation_config = if self.config.thinking_enabled {
-        let thinking_config = if model.starts_with("gemini-3") {
-            // Gemini 3 Pro uses thinkingLevel
-            Some(ThinkingConfig {
-                thinking_level: Some(self.config.thinking_level.clone()),
-                thinking_budget: None,
-                include_thoughts: Some(true),
-            })
-        } else if model.starts_with("gemini-2.5") || model.starts_with("gemini-2.0") {
-            // Gemini 2.5 and 2.0 series use thinkingBudget
-            Some(ThinkingConfig {
-                thinking_level: None,
-                thinking_budget: self.config.thinking_budget,
-                include_thoughts: Some(true),
+        let generation_config = if self.config.thinking_enabled {
+            let gemini_model = GeminiModel::from_slug(&model);
+            match gemini_model.thinking_config_style() {
+                ThinkingConfigStyle::LevelPro | ThinkingConfigStyle::LevelFlash => {
+                    // Validate level is supported for this model
+                    let level = if gemini_model.valid_thinking_levels().contains(&self.config.thinking_level.as_str()) {
+                        self.config.thinking_level.clone()
+                    } else {
+                        "high".to_string() // Default fallback
+                    };
+                    Some(ThinkingConfig {
+                        thinking_level: Some(level),
+                        thinking_budget: None,
+                        include_thoughts: Some(true),
+                    })
+                },
+                ThinkingConfigStyle::Budget => Some(ThinkingConfig {
+                    thinking_level: None,
+                    thinking_budget: self.config.thinking_budget,
+                    include_thoughts: Some(true),
+                }),
+                ThinkingConfigStyle::None => None,
+            }.map(|tc| GenerationConfig {
+                thinking_config: Some(tc),
             })
         } else {
-            // Unknown model, skip thinking config
             None
         };
-
-        thinking_config.map(|tc| GenerationConfig {
-            thinking_config: Some(tc),
-        })
-    } else {
-        None
-    };
 
     let mut request_body = GeminiRequest {
         contents: prompt_data.contents,
@@ -511,7 +769,7 @@ impl LlmConnector for GeminiConnector {
                             if json_str.is_empty() { continue; }
                             match serde_json::from_str::<GeminiResponse>(json_str) {
                                 Ok(parsed) => {
-                                    if let Some(candidate) = parsed.candidates.get(0) {
+                                    if let Some(candidate) = parsed.candidates.first() {
                                         if let Some(reason) = &candidate.finish_reason {
                                             finish_reason = Some(reason.clone());
                                             if reason == "MALFORMED_FUNCTION_CALL" {
@@ -615,13 +873,29 @@ impl LlmConnector for GeminiConnector {
                                                     if tx.send(StreamMessage::Text {
                                                         content,
                                                         thought_signature: None,
-                                                        thought_summary: thought_summary,
+                                                        thought_summary,
                                                     }).is_err() {
                                                         return;
                                                     }
                                                     has_sent_data = true;
                                                 }
                                             }
+                                        }
+                                    }
+                                    
+                                    // Send usage data if present
+                                    if let Some(usage) = &parsed.usage_metadata {
+                                        let cost = calculate_cost(&model, usage);
+                                        let usage_data = crate::components::shared::UsageData {
+                                            prompt_tokens: usage.prompt_token_count,
+                                            completion_tokens: usage.candidates_token_count.unwrap_or(0),
+                                            total_tokens: usage.total_token_count,
+                                            thoughts_tokens: usage.thoughts_token_count,
+                                            cached_content_tokens: usage.cached_content_token_count,
+                                            cost: Some(cost),
+                                        };
+                                        if tx.send(StreamMessage::Usage(usage_data)).is_err() {
+                                            tracing::warn!("Failed to send usage data to stream");
                                         }
                                     }
                                 }
@@ -851,16 +1125,15 @@ Recent Messages:
             tracing::error!("Gemini API Error [{}]: {}", status, body_text);
         }
         // Return a structured error instead of panicking or returning a generic reqwest::Error
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(Box::new(std::io::Error::other(
             format!("API request failed with status {}: {}", status, body_text),
         )) as Box<dyn std::error::Error + Send + Sync>);
     }
 
     let response_json: GeminiResponse = response.json().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-    if let Some(candidate) = response_json.candidates.get(0) {
-        if let Some(part) = candidate.content.parts.get(0) {
+    if let Some(candidate) = response_json.candidates.first() {
+        if let Some(part) = candidate.content.parts.first() {
             // The model's response is expected to be a JSON string.
             tracing::debug!("Raw LLM summary response: {}", part.text);
 
@@ -1226,5 +1499,122 @@ mod tests {
         }
 
         assert!(received_tool_error, "Should receive tool not available error with tool name");
+    }
+
+    #[test]
+    fn test_calculate_cost() {
+        // Helper to make usage metadata
+        let make_usage = |prompt: i32, candidates: i32| UsageMetadata {
+            prompt_token_count: prompt,
+            candidates_token_count: Some(candidates),
+            total_token_count: prompt + candidates,
+            thoughts_token_count: None,
+            cached_content_token_count: None,
+        };
+
+        // Flash 2.5: $0.15/1M input, $0.60/1M output
+        let usage = make_usage(1_000_000, 0);
+        let cost = calculate_cost("gemini-2.5-flash", &usage);
+        assert!((cost - 0.15).abs() < 1e-6, "Gemini 2.5 Flash Input: Expected $0.15, got {}", cost);
+        
+        let usage = make_usage(0, 1_000_000);
+        let cost = calculate_cost("gemini-2.5-flash", &usage);
+        assert!((cost - 0.60).abs() < 1e-6, "Gemini 2.5 Flash Output: Expected $0.60, got {}", cost);
+        
+        // Pro 2.5 <= 200k: $1.25/1M input, $10.00/1M output
+        let usage = make_usage(1_000_000, 0);
+        let cost = calculate_cost("gemini-2.5-pro", &usage);
+        assert!((cost - 1.25).abs() < 1e-6, "Gemini 2.5 Pro Input: Expected $1.25, got {}", cost);
+
+        // Fallback (unknown): Defaults to Gemini 2.0 Flash (Safety mechanism)
+        // 1M tokens * $0.10 rates
+        let usage = make_usage(1_000_000, 0);
+        let cost = calculate_cost("unknown-model", &usage);
+        assert!((cost - 0.10).abs() < 1e-6, "Unknown model: Expected default $0.10 (Flash), got {}", cost);
+    }
+    
+    #[test]
+    fn test_parse_usage_metadata() {
+        let json = r#"{
+            "candidates": [],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 50,
+                "totalTokenCount": 150,
+                "thoughtsTokenCount": 20
+            }
+        }"#;
+        
+        let response: GeminiResponse = serde_json::from_str(json).expect("Failed to parse GeminiResponse with usageMetadata");
+        assert!(response.usage_metadata.is_some());
+        let usage = response.usage_metadata.unwrap();
+        assert_eq!(usage.prompt_token_count, 100);
+        assert_eq!(usage.candidates_token_count, Some(50));
+        assert_eq!(usage.total_token_count, 150);
+        assert_eq!(usage.thoughts_token_count, Some(20));
+    }
+
+    #[test]
+    fn test_supports_thinking() {
+        assert!(GeminiModel::Gemini3_0ProPreview.supports_thinking());
+        assert!(GeminiModel::Gemini3_0FlashPreview.supports_thinking());
+        assert!(GeminiModel::Gemini2_5Pro.supports_thinking());
+        assert!(GeminiModel::Gemini2_5Flash.supports_thinking());
+        assert!(GeminiModel::Gemini2_0FlashThinking.supports_thinking());
+        assert!(!GeminiModel::Gemini2_0Flash.supports_thinking());
+        assert!(!GeminiModel::Gemma3.supports_thinking());
+    }
+
+    #[test]
+    fn test_thinking_config_style() {
+        use ThinkingConfigStyle::*;
+        assert_eq!(GeminiModel::Gemini3_0ProPreview.thinking_config_style(), LevelPro);
+        assert_eq!(GeminiModel::Gemini3_0FlashPreview.thinking_config_style(), LevelFlash);
+        // Experimental Flash Thinking 2.0 uses LevelFlash (minimal/low/medium/high)
+        assert_eq!(GeminiModel::Gemini2_0FlashThinking.thinking_config_style(), LevelFlash);
+        assert_eq!(GeminiModel::Gemini2_5Flash.thinking_config_style(), Budget);
+        assert_eq!(GeminiModel::Gemini2_0Flash.thinking_config_style(), None);
+        assert_eq!(GeminiModel::Gemma3.thinking_config_style(), None);
+    }
+
+    #[test]
+    fn test_valid_thinking_levels() {
+        assert_eq!(GeminiModel::Gemini3_0ProPreview.valid_thinking_levels(), &["low", "high"]);
+        assert_eq!(GeminiModel::Gemini3_0FlashPreview.valid_thinking_levels(), &["minimal", "low", "medium", "high"]);
+        assert!(GeminiModel::Gemini2_0Flash.valid_thinking_levels().is_empty());
+        assert!(GeminiModel::Gemma3.valid_thinking_levels().is_empty());
+    }
+
+    #[test]
+    fn test_from_slug_versioned_models() {
+        // Gemini 3 versioned slugs should map correctly
+        // Test Official API style (gemini-3-pro)
+        assert_eq!(GeminiModel::from_slug("gemini-3-pro-preview"), GeminiModel::Gemini3_0ProPreview);
+        assert_eq!(GeminiModel::from_slug("gemini-3-flash-preview"), GeminiModel::Gemini3_0FlashPreview);
+
+        let model = GeminiModel::from_slug("gemini-3.0-pro-preview-02-05");
+        assert_eq!(model, GeminiModel::Gemini3_0ProPreview);
+        assert!(model.supports_thinking());
+        assert_eq!(model.thinking_config_style(), ThinkingConfigStyle::LevelPro);
+        
+        // With models/ prefix
+        let model2 = GeminiModel::from_slug("models/gemini-3.0-pro-preview-02-05");
+        assert_eq!(model2, GeminiModel::Gemini3_0ProPreview);
+        
+        // Flash versioned
+        let flash = GeminiModel::from_slug("gemini-3.0-flash-preview-01-21");
+        assert_eq!(flash, GeminiModel::Gemini3_0FlashPreview);
+        assert_eq!(flash.thinking_config_style(), ThinkingConfigStyle::LevelFlash);
+        
+        // Gemini 2.0 Flash Thinking
+        let ft = GeminiModel::from_slug("gemini-2.0-flash-thinking-exp-01-21");
+        assert_eq!(ft, GeminiModel::Gemini2_0FlashThinking);
+        assert!(ft.supports_thinking());
+        assert_eq!(ft.thinking_config_style(), ThinkingConfigStyle::LevelFlash);
+        
+        // Pro heuristic now maps to 2.5 Pro (has thinking support)
+        let pro_unknown = GeminiModel::from_slug("some-new-pro-model");
+        assert_eq!(pro_unknown, GeminiModel::Gemini2_5Pro);
+        assert!(pro_unknown.supports_thinking());
     }
 }

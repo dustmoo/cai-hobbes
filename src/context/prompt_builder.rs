@@ -137,6 +137,11 @@ impl<'a> PromptBuilder<'a> {
 
         // 2. Build the system instruction from the remaining context.
         let mut active_context = self.session.active_context.clone();
+        
+        // Apply memory size limits from settings
+        active_context.conversation_summary.truncate_summary(self.settings.max_summary_chars);
+        active_context.conversation_summary.entities.prune_entities(self.settings.max_entity_count);
+        
         let mut persona = self.settings.persona.clone();
         
         // Inject warning if tools were truncated to fit Gemini limits
@@ -799,6 +804,10 @@ mod tests {
             messages: vec![],
             active_context,
             last_updated: Utc::now(),
+            accumulated_cost: 0.0,
+            accumulated_tokens: 0,
+            accumulated_turns: 0,
+            memory_optimization_summary: None,
         }
     }
 
@@ -918,6 +927,7 @@ mod tests {
                 thought_signature: Some("Checking weather...".to_string()),
                 thought_summary: None,
             }),
+            usage: None,
             attachments: vec![],
             comments: vec![],
             created_at: Utc::now(),
@@ -929,6 +939,7 @@ mod tests {
             id: Uuid::new_v4(),
             author: "Hobbes".to_string(),
             content: MessageContent::Text { content: "".to_string(), thought_signature: None, thought_summary: None },
+            usage: None,
             attachments: vec![],
             comments: vec![],
             created_at: Utc::now(),
@@ -993,6 +1004,10 @@ mod tests {
             messages: vec![],
             active_context,
             last_updated: Utc::now(),
+            accumulated_cost: 0.0,
+            accumulated_tokens: 0,
+            accumulated_turns: 0,
+            memory_optimization_summary: None,
         };
 
         let settings = Settings::default();
@@ -1036,6 +1051,7 @@ mod tests {
                 thought_signature: Some(signature.clone()),
                 thought_summary: None,
             }),
+            usage: None,
             attachments: vec![],
             comments: vec![],
             created_at: Utc::now(),
@@ -1058,6 +1074,7 @@ mod tests {
                 thought_signature: None,
                 thought_summary: None,
             }),
+            usage: None,
             attachments: vec![],
             comments: vec![],
             created_at: Utc::now(),
@@ -1171,6 +1188,10 @@ mod tests {
             messages: vec![],
             active_context,
             last_updated: Utc::now(),
+            accumulated_cost: 0.0,
+            accumulated_tokens: 0,
+            accumulated_turns: 0,
+            memory_optimization_summary: None,
         };
 
         let settings = Settings::default();

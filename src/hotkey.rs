@@ -204,9 +204,6 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
     });
 }
 
-// Redefine the hook to empty as it's now integrated
-pub fn use_profile_hotkeys() {}
-
 // Helper to switch profile
 fn switch_profile_by_index(index: usize, mut settings: Signal<Settings>, settings_manager: Signal<SettingsManager>) {
     let mut current_settings = settings.read().clone();

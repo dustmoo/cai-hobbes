@@ -26,3 +26,4 @@ pub mod confirm_save_modal;
 pub mod hotkey_recorder;
 pub mod quick_fix;
 pub mod focus_context;
+pub mod forget_memory_modal;

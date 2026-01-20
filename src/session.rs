@@ -3,8 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use uuid;
-use dirs;
 
 use serde_json::Value;
 use crate::mcp::manager::McpContext;
@@ -25,6 +23,33 @@ pub struct ConversationSummary {
     pub sentiment: String,
     #[serde(default)]
     pub entities: ConversationSummaryEntities,
+}
+
+impl ConversationSummary {
+    /// Truncate summary to max_chars, appending truncation notice if needed
+    pub fn truncate_summary(&mut self, max_chars: usize) {
+        if max_chars > 0 && self.summary.len() > max_chars {
+            let mut truncated_len = max_chars.saturating_sub(20); // Leave room for notice
+            while truncated_len > 0 && !self.summary.is_char_boundary(truncated_len) {
+                truncated_len -= 1;
+            }
+            self.summary.truncate(truncated_len);
+            self.summary.push_str("... [truncated]");
+        }
+    }
+}
+
+impl ConversationSummaryEntities {
+    /// Prune entities to max_count
+    pub fn prune_entities(&mut self, max_count: usize) {
+        if max_count > 0 && self.other_entities.len() > max_count {
+            while self.other_entities.len() > max_count {
+                if let Some(key) = self.other_entities.keys().next().cloned() {
+                    self.other_entities.remove(&key);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -76,6 +101,14 @@ pub struct Session {
     pub messages: Vec<super::components::chat::Message>,
     pub active_context: ActiveContext,
     pub last_updated: DateTime<Utc>,
+    #[serde(default)]
+    pub accumulated_cost: f64,
+    #[serde(default)]
+    pub accumulated_tokens: i32,
+    #[serde(default)]
+    pub accumulated_turns: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_optimization_summary: Option<String>,
 }
 
 impl Session {
@@ -91,6 +124,42 @@ impl Session {
             }
         } else {
             0
+        }
+    }
+    
+    /// Calculate total cost for all messages in this session
+    /// Always sums from message-level usage data, which is the source of truth.
+    pub fn total_cost(&self) -> f64 {
+        self.messages.iter()
+            .filter_map(|m| m.usage.as_ref())
+            .filter_map(|u| u.cost)
+            .sum()
+    }
+    
+    /// Calculate total tokens for all messages in this session
+    /// Always sums from message-level usage data, which is the source of truth.
+    pub fn total_tokens(&self) -> i32 {
+        self.messages.iter()
+            .filter_map(|m| m.usage.as_ref())
+            .map(|u| u.total_tokens)
+            .sum()
+    }
+    
+    /// Calculate average tokens per turn
+    /// Always calculates from message-level usage data, which is the source of truth.
+    pub fn average_tokens_per_turn(&self) -> f64 {
+        let tokens = self.messages.iter()
+            .filter_map(|m| m.usage.as_ref())
+            .map(|u| u.total_tokens)
+            .sum::<i32>() as f64;
+        let turns = self.messages.iter()
+            .filter(|m| m.author == "Hobbes")
+            .count() as f64;
+
+        if turns > 0.0 {
+            tokens / turns
+        } else {
+            0.0
         }
     }
 }
@@ -270,6 +339,10 @@ impl SessionState {
             messages: vec![],
             active_context: ActiveContext::default(),
             last_updated: Utc::now(),
+            accumulated_cost: 0.0,
+            accumulated_tokens: 0,
+            accumulated_turns: 0,
+            memory_optimization_summary: None,
         };
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id.clone();

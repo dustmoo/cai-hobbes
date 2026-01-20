@@ -3,7 +3,6 @@ use serde_json::json;
 use crate::settings::Settings;
 use crate::session::Session;
 use crate::session::ActiveContext;
-use crate::mcp::manager::{McpContext, McpServerContext};
 use chrono::Utc; // Needed for Session last_updated
 
 #[test]
@@ -170,6 +169,10 @@ fn create_test_session() -> Session {
         messages: vec![],
         active_context: ActiveContext::default(),
         last_updated: Utc::now(),
+        accumulated_cost: 0.0,
+        accumulated_tokens: 0,
+        accumulated_turns: 0,
+        memory_optimization_summary: None,
     }
 }
 

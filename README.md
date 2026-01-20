@@ -2,7 +2,7 @@
 
 ![Version](https://img.shields.io/github/v/tag/dustmoo/cai-hobbes?label=version)
 ![Build Status](https://github.com/dustmoo/cai-hobbes/actions/workflows/ci.yml/badge.svg)
-![License](https://img.shields.io/github/license/dustmoo/cai-hobbes)
+![License](https://img.shields.io/badge/License-FSL%201.1-blue.svg)
 
 ## Welcome to Hobbes!
 
@@ -175,9 +175,10 @@ graph TD
 
 ## Using Hobbes for your Projects
 
-I plan on keeping Hobbes under the MIT license for the foreseeable future. I built Hobbes "clean" to control and minimize my frameworks in Rust. Shoutout to [Dioxus](https://dioxuslabs.com/) and the Rust community for all the packages I'm using (check the `Cargo.toml` file for the latest)—they all deserve our support (I will be sponsoring downstream!).
-
-However, I actually recommend that you use [Goose](https://github.com/block/goose), a proper open-source Rust project for multi-app development. They are set up for sustainability.
+I plan on keeping Hobbes under the **Functional Source License (FSL 1.1)**. This ensures the project remains sustainable while allowing you to use, study, and modify the code freely.
+- **Free to Use:** You can run Hobbes for yourself, your business, or your friends without restriction.
+- **Protection:** The only restriction is that you cannot offer a commercial SaaS version of Hobbes that competes with Clear Mirror LLC for 2 years.
+- **Open Future:** On **2028-01-20**, this version automatically converts to the permissive **Apache 2.0** license.
 
 I built Hobbes to help my AI expertise, and it has been fruitful for that. I am now a beginner in Rust (great stack team!) and have the agent I've always wanted, allowing me to fully control what I refer to as the **"Prompt Composition Lifecycle"**—from system prompt through chat flow and execution. This was an experiment in _context composition_, not just another wrapper. Try it, and I would LOVE to see different approaches to our short-term memory usages.
 
@@ -196,7 +197,7 @@ Depends on what you mean. If you mean "Did I use AI to code this?", absolutely. 
 Yes. I picked Rust precisely because I didn't know it. I knew TypeScript (but clearly was rusty when I tried to interview and forgot a simple `=>` map pattern, those poor interviewees haha). I wanted to lean on AI but not have to learn from scratch, so I used **Dioxus 0.6** (React patterns in Rust) and **Tailwind**. AI is so well-trained on this stack that it's literally killing their training business. Full disclosure: I already knew Tailwind and you can see that I didn't modify it much (mainly because I want to pay for Pro rather than layer in another UX framework—I gotcha [Tailwind UI](https://tailwindui.com/)).
 
 ### Will there be a Free Version of Hobbes?
-You're looking at it. For now, I'm grappling with the ethical implications of using LLMs trained on humanity's work on the internet to build my product, combined with the fact that I *paid* enterprise models (Google, AWS) to build this code. On one hand, I don't think it should always be free. I have code ready to start on a "Pro" build of Hobbes, but most of this stuff is still new. Composio has competitors for "MCP OAUTH BRIDGE". I fully expect this stack to change a lot this year. Time will tell, but for now, I'm recouping costs via the App Store and my Pro build. Since this is a combination of my experience AND the collective experience included in Google's and other LLM trainers' datasets, I'm releasing under MIT. Enjoy and please contribute if you like what we are doing here.
+You're looking at it. For now, I'm grappling with the ethical implications of using LLMs trained on humanity's work on the internet to build my product, combined with the fact that I *paid* enterprise models (Google, AWS) to build this code. On one hand, I don't think it should always be free. I have code ready to start on a "Pro" build of Hobbes, but most of this stuff is still new. Composio has competitors for "MCP OAUTH BRIDGE". I fully expect this stack to change a lot this year. Time will tell, but for now, I'm recouping costs via the App Store and my Pro build. Since this is a combination of my experience AND the collective experience included in Google's and other LLM trainers' datasets, I'm releasing under the **Functional Source License (FSL)** to balance openness with sustainability. Enjoy and please contribute if you like what we are doing here.
 
 — @dustmoo
 

@@ -39,7 +39,6 @@ impl std::error::Error for ConversionError {}
 /// 
 /// # Returns
 /// A `Result` containing the `GeminiFunctionDeclaration` or a `ConversionError`.
-
 /// Sanitize a function name to comply with Gemini API requirements:
 /// - Must start with a letter or underscore
 /// - Only alphanumeric, underscores, dots, colons, or dashes allowed

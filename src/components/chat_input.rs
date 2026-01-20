@@ -8,10 +8,11 @@ use std::io::Cursor;
 
 #[cfg(debug_assertions)]
 use crate::context::prompt_builder::PromptBuilder;
-use crate::settings::{Settings, SettingsManager};
+use crate::settings::{Settings, SettingsManager, UiState};
 use hobbes_core::models::Attachment;
 
 use crate::processing::summarization_scheduler::{SchedulerSignal};
+use crate::components::shared::{ChatBarIconButton};
 use crate::components::focus_context::FocusContext;
 
 
@@ -26,10 +27,7 @@ pub enum ChatCommand {
     NewChatWithMemory,
     ScrollToBottom,
     FocusChat,
-    SubmitModal,
-    CloseModal,
     DeleteSession,
-    SaveModal,
 }
 
 #[component]
@@ -50,6 +48,7 @@ pub fn ChatInput(
     let settings_manager = use_context::<Signal<SettingsManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let ui_state = use_context::<Signal<UiState>>();
     let mut draft = use_context::<Signal<String>>();
     let mut is_dragging = use_signal(|| false);
     let mut attachments = use_signal(Vec::<Attachment>::new);
@@ -153,8 +152,8 @@ pub fn ChatInput(
                         if (el) { el.focus(); }
                     "#);
                 }
-                ChatCommand::SubmitModal | ChatCommand::CloseModal | ChatCommand::SaveModal | ChatCommand::DeleteSession => {
-                    // Handled by active modal or SessionManager
+                ChatCommand::DeleteSession => {
+                    // Handled by SessionManager
                 }
             }
             // Reset command to avoid re-triggering
@@ -256,109 +255,105 @@ pub fn ChatInput(
             },
             div {
                 class: "flex items-center space-x-3",
-                button {
-                    class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                ChatBarIconButton {
+                    icon: fi_icons::FiSettings,
                     onclick: move |_| on_toggle_settings.call(()),
-                    Icon {
-                        width: 20,
-                        height: 20,
-                        icon: fi_icons::FiSettings
-                    }
+                    title: "Settings"
                 }
-                button {
-                    class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                ChatBarIconButton {
+                    icon: fi_icons::FiClock,
                     onclick: move |_| on_toggle_sessions.call(()),
-                    Icon {
-                        width: 20,
-                        height: 20,
-                        icon: fi_icons::FiClock
-                    }
+                    visible: ui_state.read().show_history_icon,
+                    title: "History"
                 }
-                button {
-                    class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                ChatBarIconButton {
+                    icon: fi_icons::FiPackage,
                     onclick: move |_| on_toggle_mcp_manager.call(()),
-                    Icon {
-                        width: 20,
-                        height: 20,
-                        icon: fi_icons::FiPackage
-                    }
+                    visible: ui_state.read().show_mcp_icon,
+                    title: "MCP Tools"
                 }
+                SessionCostIcon {}
+
                 // Composio Profile Selector
-                {
-                    let settings_read = _settings.read();
-                    let profiles = &settings_read.composio_profiles;
-                    
-                    if profiles.len() > 1 {
-                        let active_profile = settings_read.get_active_profile().cloned().unwrap_or_default();
-                        let active_initial = active_profile.name.chars().next().unwrap_or('?').to_uppercase();
+                { if ui_state.read().show_profile_selector {
+                    {
+                        let settings_read = _settings.read();
+                        let profiles = &settings_read.composio_profiles;
                         
-                        rsx! {
-                            div {
-                                class: "relative",
-                                button {
-                                    class: format!("w-8 h-8 rounded-full {} border border-primary-700 flex items-center justify-center text-xs font-bold text-white hover:brightness-110 hover:border-primary-500 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600 shadow-md", active_profile.color),
-                                    onclick: move |_| show_profile_selector.set(!show_profile_selector()),
-                                    "{active_initial}"
-                                }
-                                
-                                if show_profile_selector() {
-                                    div {
-                                        class: "absolute bottom-10 left-0 w-56 bg-dark-card border border-primary-700 rounded-lg shadow-xl z-50 overflow-hidden py-1",
-                                        for (index, profile) in profiles.iter().enumerate() {
-                                            if profile.name != active_profile.name {
-                                                button {
-                                                    class: "w-full text-left px-4 py-2 text-sm text-gray-300 hover:bg-primary-900/50 hover:text-white transition-colors flex items-center justify-between",
-                                                    onclick: {
-                                                        let new_profile_name = profile.name.clone();
-                                                        let mut settings = _settings;
-                                                        let settings_manager = settings_manager;
-                                                        let scheduler = scheduler.clone();
-                                                        move |_| {
-                                                            settings.write().active_composio_profile = Some(new_profile_name.clone());
-                                                            // Auto-save changes
-                                                            if let Err(e) = settings_manager.read().save(&settings.read()) {
-                                                                tracing::error!("Failed to save profile change: {}", e);
+                        if profiles.len() > 1 {
+                            let active_profile = settings_read.get_active_profile().cloned().unwrap_or_default();
+                            let active_initial = active_profile.name.chars().next().unwrap_or('?').to_uppercase();
+                            
+                            rsx! {
+                                div {
+                                    class: "relative",
+                                    button {
+                                        class: format!("w-8 h-8 rounded-full {} border border-primary-700 flex items-center justify-center text-xs font-bold text-white hover:brightness-110 hover:border-primary-500 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600 shadow-md", active_profile.color),
+                                        onclick: move |_| show_profile_selector.set(!show_profile_selector()),
+                                        "{active_initial}"
+                                    }
+                                    
+                                    if show_profile_selector() {
+                                        div {
+                                            class: "absolute bottom-10 left-0 w-56 bg-dark-card border border-primary-700 rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                                            for (index, profile) in profiles.iter().enumerate() {
+                                                if profile.name != active_profile.name {
+                                                    button {
+                                                        class: "w-full text-left px-4 py-2 text-sm text-gray-300 hover:bg-primary-900/50 hover:text-white transition-colors flex items-center justify-between",
+                                                        onclick: {
+                                                            let new_profile_name = profile.name.clone();
+                                                            let mut settings = _settings;
+                                                            let settings_manager = settings_manager;
+                                                            let scheduler = scheduler.clone();
+                                                            move |_| {
+                                                                settings.write().active_composio_profile = Some(new_profile_name.clone());
+                                                                // Auto-save changes
+                                                                if let Err(e) = settings_manager.read().save(&settings.read()) {
+                                                                    tracing::error!("Failed to save profile change: {}", e);
+                                                                }
+                                                                // Trigger summary refresh
+                                                                scheduler.send(SchedulerSignal::ForceRefresh);
+                                                                show_profile_selector.set(false);
                                                             }
-                                                            // Trigger summary refresh
-                                                            scheduler.send(SchedulerSignal::ForceRefresh);
-                                                            show_profile_selector.set(false);
+                                                        },
+                                                        div {
+                                                            class: "flex items-center space-x-2",
+                                                            span {
+                                                                class: format!("w-6 h-6 rounded-full {} border border-gray-700 flex items-center justify-center text-[10px] text-white font-bold shadow-sm", profile.color),
+                                                                "{profile.name.chars().next().unwrap_or('?').to_uppercase()}"
+                                                            }
+                                                            span { class: "truncate", "{profile.name}" }
                                                         }
-                                                    },
-                                                    div {
-                                                        class: "flex items-center space-x-2",
-                                                        span {
-                                                            class: format!("w-6 h-6 rounded-full {} border border-gray-700 flex items-center justify-center text-[10px] text-white font-bold shadow-sm", profile.color),
-                                                            "{profile.name.chars().next().unwrap_or('?').to_uppercase()}"
-                                                        }
-                                                        span { class: "truncate", "{profile.name}" }
-                                                    }
-                                                    // Hotkey hint (1-indexed)
-                                                    if index < 9 {
-                                                        span {
-                                                            class: "text-xs text-gray-500 font-mono",
-                                                            "⌘{index + 1}"
+                                                        // Hotkey hint (1-indexed)
+                                                        if index < 9 {
+                                                            span {
+                                                                class: "text-xs text-gray-500 font-mono",
+                                                                "⌘{index + 1}"
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                                // Click outside handler to close dropdown
-                                if show_profile_selector() {
-                                    div {
-                                        class: "fixed inset-0 z-40",
-                                        onclick: move |_| show_profile_selector.set(false)
+                                    // Click outside handler to close dropdown
+                                    if show_profile_selector() {
+                                        div {
+                                            class: "fixed inset-0 z-40",
+                                            onclick: move |_| show_profile_selector.set(false)
+                                        }
                                     }
                                 }
                             }
+                        } else {
+                            rsx!({})
                         }
-                    } else {
-                        rsx!({})
                     }
-                }
-                button {
-                    class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                } else { rsx!({}) } }
+                ChatBarIconButton {
+                    icon: fi_icons::FiPaperclip,
+                    visible: ui_state.read().show_attachments_icon,
+                    title: "Attachments",
                     onclick: move |_| {
                         let mut attachments = attachments;
                         spawn(async move {
@@ -399,11 +394,6 @@ pub fn ChatInput(
                             }
                             is_processing_attachments.set(false);
                         });
-                    },
-                    Icon {
-                        width: 20,
-                        height: 20,
-                        icon: fi_icons::FiPaperclip
                     }
                 }
                 textarea {
@@ -772,4 +762,80 @@ fn format_hotkey(hotkey: &str) -> String {
         .replace("Alt", "⌥")
         .replace("Shift", "⇧")
         .replace("+", "")
+}
+
+#[component]
+fn SessionCostIcon() -> Element {
+    let session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let ui_state = consume_context::<Signal<UiState>>();
+    let mut show_popover = use_signal(|| false);
+
+    // Check if we should show the icon
+    if !ui_state.read().show_session_cost_icon {
+        return rsx! {};
+    }
+
+    let state = session_state.read();
+    let session = match state.get_active_session() {
+        Some(s) => s,
+        None => return rsx! {},
+    };
+
+    let total_cost = session.total_cost();
+    let total_tokens = session.total_tokens();
+    let avg_tokens = session.average_tokens_per_turn();
+
+    rsx! {
+        div {
+            class: "relative",
+            button {
+                class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-green-400 focus:outline-none focus:ring-2 focus:ring-gray-600 flex items-center space-x-1 transition-colors",
+                onclick: move |_| {
+                    let current = *show_popover.read();
+                    show_popover.set(!current);
+                },
+                title: "Session Cost",
+                Icon {
+                    width: 16,
+                    height: 16,
+                    icon: fi_icons::FiDollarSign
+                }
+                span {
+                    class: "text-xs font-mono font-medium",
+                    {format!("{:.2}", total_cost)}
+                }
+            }
+            
+            if *show_popover.read() {
+                div {
+                    class: "absolute bottom-full left-0 mb-2 w-64 bg-dark-card border border-gray-700 rounded-lg shadow-xl p-3 z-50",
+                    
+                    div { class: "text-sm font-semibold text-gray-200 mb-2 border-b border-gray-700 pb-1", "Session Usage" }
+                    
+                    div { class: "space-y-2 text-xs",
+                        div { class: "flex justify-between text-gray-400",
+                            span { "Total Cost:" }
+                            span { class: "text-green-400 font-mono", {format!("${:.4}", total_cost)} }
+                        }
+                        div { class: "flex justify-between text-gray-400",
+                            span { "Total Tokens:" }
+                            span { class: "text-white font-mono", "{total_tokens}" }
+                        }
+                        div { class: "flex justify-between text-gray-400",
+                            span { "Avg Tokens/Turn:" }
+                            span { class: "text-white font-mono", {format!("{:.0}", avg_tokens)} }
+                        }
+                    }
+                    div { class: "mt-2 pt-2 border-t border-gray-700 text-[10px] text-gray-500 text-center",
+                        "Estimates based on Gemini pricing"
+                    }
+                }
+                // Backdrop to close
+                div {
+                    class: "fixed inset-0 z-40 bg-transparent cursor-default",
+                    onclick: move |_| show_popover.set(false),
+                }
+            }
+        }
+    }
 }

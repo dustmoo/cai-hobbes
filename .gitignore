@@ -32,3 +32,16 @@ temp_*/
 # Scratch files
 src/repro_*.rs
 RooFlow_temp_*archive/
+
+# Node
+node_modules/
+npm-debug.log
+
+# Temporary Debugging Artifacts
+check_output*.json
+*_payload*.json
+verify_*.json
+clickup_tools*.json
+connected_accounts.json
+bootstrap_*.json
+tools.json

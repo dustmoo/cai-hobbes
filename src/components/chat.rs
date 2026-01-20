@@ -26,6 +26,7 @@ use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRen
 use super::confirm_delete_modal::ConfirmDeleteModal;
 use super::quick_fix::QuickFix;
 use super::new_chat_memory_modal::NewChatMemoryModal;
+use super::forget_memory_modal::ForgetMemoryModal;
 use crate::session::ActiveContext;
 
 
@@ -65,6 +66,9 @@ pub struct Message {
     pub comments: Vec<Comment>,
     #[serde(default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Token usage data and cost for this message
+    #[serde(default)]
+    pub usage: Option<crate::components::shared::UsageData>,
 }
 
 // The main ChatWindow component
@@ -97,6 +101,11 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
     // New Chat with Memory Modal State
     let mut show_new_chat_memory_modal = use_signal(|| false);
     let mut modal_initial_context = use_signal(|| ActiveContext::default());
+
+    // Forget Memory Modal State
+    let mut show_forget_memory_modal = use_signal(|| false);
+    let mut forget_modal_context = use_signal(|| ActiveContext::default());
+    let mut modal_optimization_summary = use_signal(|| Option::<String>::None);
 
     let on_interaction = move || {
         show_scroll_button.set(false);
@@ -342,6 +351,7 @@ pub fn ChatWindow(on_content_resize: EventHandler<Rect<f64, f64>>, on_interactio
                                 attachments: Vec::new(),
                                 comments: Vec::new(),
                                 created_at: chrono::Utc::now(),
+                                usage: None,
                             });
                         }
                      }
@@ -374,6 +384,7 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                         attachments,
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
+                        usage: None,
                     });
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
@@ -382,6 +393,7 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                         attachments: Vec::new(),
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
+                        usage: None,
                     });
                 }
                 return;
@@ -406,6 +418,7 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                         attachments,
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
+                        usage: None,
                     });
                     session.messages.push(Message {
                         id: hobbes_message_id,
@@ -414,6 +427,7 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                         attachments: Vec::new(),
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
+                        usage: None,
                     });
                 }
             }
@@ -490,6 +504,7 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                             attachments: Vec::new(),
                             comments: Vec::new(),
                             created_at: chrono::Utc::now(),
+                            usage: None,
                         });
                     }
                 }
@@ -521,13 +536,12 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
     let delete_message = move |message_id: Uuid| {
         let confirm = settings.read().confirm_on_message_delete;
         if confirm {
-            if let Some(session) = session_state.read().get_active_session() {
-                if let Some(index) = session.messages.iter().position(|m| m.id == message_id) {
-                    let count = session.messages.len() - index;
-                    delete_message_count.set(count);
-                    pending_delete_message_id.set(Some(message_id.to_string()));
-                    show_delete_confirm_modal.set(true);
-                }
+            if let Some(index) = session_state.read().get_active_session().and_then(|s| s.messages.iter().position(|m| m.id == message_id)) {
+                let session_len = session_state.read().get_active_session().map(|s| s.messages.len()).unwrap_or(0);
+                let count = session_len - index;
+                delete_message_count.set(count);
+                pending_delete_message_id.set(Some(message_id.to_string()));
+                show_delete_confirm_modal.set(true);
             }
         } else {
             // Delete immediately
@@ -541,6 +555,56 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
         }
     };
 
+    // Optimization Routing
+    #[derive(Clone, Copy, PartialEq)]
+    enum OptimizationTarget {
+        Session,
+        NewChatModal,
+    }
+    let mut optimization_target = use_signal(|| OptimizationTarget::Session);
+
+    // Forget Modal Logic
+    let on_forget_apply = move |(new_context, summary): (ActiveContext, String)| {
+        match *optimization_target.read() {
+            OptimizationTarget::Session => {
+                {
+                    let mut state = session_state.write();
+                    if let Some(session) = state.get_active_session_mut() {
+                        session.active_context = new_context;
+                        session.memory_optimization_summary = Some(summary.clone()); 
+                        
+                        // Insert Internal Turn Message
+                        session.messages.push(Message {
+                            id: Uuid::new_v4(),
+                            author: "Hobbes".to_string(),
+                            content: MessageContent::Text { 
+                                content: format!("✨ **Memory Optimized**\n\n{}", summary), 
+                                thought_signature: None, 
+                                thought_summary: None 
+                            },
+                            attachments: Vec::new(),
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        });
+                    }
+                } 
+                if let Err(e) = session_state.read().save() {
+                        tracing::error!("Failed to save session after optimization: {}", e);
+                }
+                // Force refresh messagelist
+                stream_update_trigger.set(stream_update_trigger() + 1);
+            },
+            OptimizationTarget::NewChatModal => {
+                // Update the New Chat Modal's initial context signal
+                // This triggers the use_effect in NewChatMemoryModal to update the JSON editor
+                modal_initial_context.set(new_context);
+                modal_optimization_summary.set(Some(summary));
+            }
+        }
+        show_forget_memory_modal.set(false);
+    };
+
     rsx! {
         div {
             class: "{root_classes}",
@@ -552,7 +616,7 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                 on_comment: move |_| has_new_comments.set(true),
             },
             ChatInput {
-                is_sending: Signal::new(stream_manager.is_sending.read().clone() || stream_manager.is_any_generating()),
+                is_sending: Signal::new(*stream_manager.is_sending.read() || stream_manager.is_any_generating()),
                 has_new_comments: has_new_comments,
                 has_pending_approvals: has_pending_approvals,
                 on_send: move |(msg, attachments)| send_message((msg, attachments)),
@@ -572,6 +636,7 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
             NewChatMemoryModal {
                 is_visible: show_new_chat_memory_modal,
                 initial_context: modal_initial_context.read().clone(),
+                optimization_summary: modal_optimization_summary,
                 on_start_chat: move |new_context: ActiveContext| {
                      // Create new session
                      let new_session_id = session_state.write().create_session();
@@ -580,8 +645,24 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                          session.active_context = new_context;
                      }
                      show_new_chat_memory_modal.set(false);
+                     modal_optimization_summary.set(None); // Clear summary on close
                 },
-                on_cancel: move |_| show_new_chat_memory_modal.set(false),
+                on_optimize_memory: move |current_context: ActiveContext| {
+                    optimization_target.set(OptimizationTarget::NewChatModal);
+                    forget_modal_context.set(current_context);
+                    show_forget_memory_modal.set(true);
+                },
+                on_cancel: move |_| {
+                    show_new_chat_memory_modal.set(false);
+                    modal_optimization_summary.set(None); // Clear summary on close
+                },
+            }
+
+            ForgetMemoryModal {
+                is_visible: show_forget_memory_modal,
+                current_context: forget_modal_context.read().clone(),
+                on_apply: on_forget_apply,
+                on_cancel: move |_| show_forget_memory_modal.set(false),
             }
 
             ConfirmDeleteModal {
@@ -594,10 +675,10 @@ content: MessageContent::Text { content: user_message.clone(), thought_signature
                     if dont_ask_again {
                         settings.write().confirm_on_message_delete = false;
                     }
-                    if let Some(id) = pending_delete_message_id.read().clone() {
+                    if let Some(id) = pending_delete_message_id.read().as_ref() {
                         let active_session_id = session_state.read().active_session_id.clone();
                         if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
-                            session.delete_message_and_after(&id);
+                            session.delete_message_and_after(id);
                             // Trigger update
                             stream_update_trigger.set(stream_update_trigger() + 1);
                         }
@@ -727,7 +808,16 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
             let mut content = use_signal(|| text_content.clone());
             let mut local_thought_summary = use_signal(|| thought_summary.clone());
             let mut copied = use_signal(|| false);
-            let mut show_thinking = use_signal(|| false);
+            
+            // Token usage display settings - consume BEFORE signal initialization
+            let ui_state = consume_context::<Signal<crate::settings::UiState>>();
+            
+            // Initialize toggle states from UiState defaults (not hardcoded)
+            let mut show_thinking = use_signal(|| ui_state.read().default_tool_thought_open);
+            let mut show_usage = use_signal(|| false); // No default setting yet
+            
+            let display_mode = ui_state.read().token_display_mode.clone();
+            let usage_data = message.usage.clone();
             
             // Inline comment state
             let mut selection_mode = use_signal(|| SelectionMode::None);
@@ -910,8 +1000,8 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                 if content().starts_with("[Hobbes encountered a persistent error") {
                                     QuickFix {
                                         suggestions: vec![
-                                            "Pardon, reloaded clickup tools please try again.".to_string(),
-                                            "Please try that again.".to_string(),
+                                            "You are using bad syntax, the user has loaded the tools please try again.".to_string(),
+                                            "Please check your tool syntax & attributes and try again..".to_string(),
                                         ],
                                         on_select: move |suggestion: String| {
                                             chat_input_draft.set(suggestion);
@@ -986,7 +1076,7 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                                 position_top: selection_data.read().1,
                                 position_left: selection_data.read().2,
                                 on_save: move |comment_text: String| {
-                                    let (text, _, _) = selection_data.read().clone();
+                                    let text = selection_data.read().0.clone();
                                     let new_comment = Comment {
                                         id: Uuid::new_v4().to_string(),
                                         text_selection: text,
@@ -1088,44 +1178,122 @@ pub fn MessageBubble(message: Message, on_content_update: EventHandler<()>, on_s
                             }
                         }
                         
-                        if !is_thinking && (local_thought_summary.read().is_some() || thought_signature.is_some()) {
-                            div {
-                                class: "m-4 mb-2",
-                                button {
-                                    class: "flex items-center text-xs text-gray-500 hover:text-gray-300 focus:outline-none transition-colors",
-
-                                    onclick: move |_| {
-                                        let current = *show_thinking.read();
-                                        show_thinking.set(!current);
-                                    },
-                                    if *show_thinking.read() {
-                                        Icon { 
-                                            width: 10, 
-                                            height: 10, 
-                                            icon: fi_icons::FiChevronDown,
-                                            class: "mr-1"
-                                        }
-                                    } else {
-                                        Icon { 
-                                            width: 10, 
-                                            height: 10, 
-                                            icon: fi_icons::FiChevronRight,
-                                            class: "mr-1"
-                                        }
-                                    }
-                                    span { class: "opacity-70", "Thinking Process" }
-                                }
-                                if *show_thinking.read() {
+                        // Two-column footer: Thinking Process (left) | Metering (right)
+                        {
+                            let has_thinking = !is_thinking && (local_thought_summary.read().is_some() || thought_signature.is_some());
+                            let has_usage = usage_data.is_some() && display_mode != "none";
+                            
+                            if has_thinking || has_usage {
+                                rsx! {
                                     div {
-                                        class: "mt-2 p-3 bg-dark-bg rounded-lg text-xs text-gray-300",
-                                        if let Some(summary) = local_thought_summary.read().as_ref() {
-                                            ThinkingMarkdownRenderer { content: summary.clone(), compact: false }
-                                        } else if let Some(sig) = &thought_signature {
-                                            div { class: "opacity-50 italic mb-1 font-mono whitespace-pre-wrap", "Encrypted Thought Signature:" }
-                                            span { class: "font-mono whitespace-pre-wrap", "{sig}" }
+                                        // Two-column layout with gap
+                                        class: "mx-4 mb-2 flex justify-between items-start gap-4",
+                                        
+                                        // Left column: Thinking Process
+                                        div {
+                                            class: "flex flex-col",
+                                            if has_thinking {
+                                                button {
+                                                    class: "flex items-center text-xs text-gray-500 hover:text-gray-300 focus:outline-none transition-colors",
+                                                    onclick: move |_| {
+                                                        let current = *show_thinking.read();
+                                                        show_thinking.set(!current);
+                                                    },
+                                                    if *show_thinking.read() {
+                                                        Icon { 
+                                                            width: 10, 
+                                                            height: 10, 
+                                                            icon: fi_icons::FiChevronDown,
+                                                            class: "mr-1"
+                                                        }
+                                                    } else {
+                                                        Icon { 
+                                                            width: 10, 
+                                                            height: 10, 
+                                                            icon: fi_icons::FiChevronRight,
+                                                            class: "mr-1"
+                                                        }
+                                                    }
+                                                    span { class: "opacity-70", "Thinking Process" }
+                                                    if !*show_thinking.read() {
+                                                        if let Some(summary) = local_thought_summary.read().as_ref().and_then(|s| extract_bold_blocks(s)) {
+                                                            span { class: "ml-2 text-gray-500 truncate max-w-[200px]", "— {summary}" }
+                                                        }
+                                                    }
+                                                }
+                                                if *show_thinking.read() {
+                                                    div {
+                                                        class: "mt-2 p-3 bg-dark-bg rounded-lg text-xs text-gray-300",
+                                                        if let Some(summary) = local_thought_summary.read().as_ref() {
+                                                            ThinkingMarkdownRenderer { content: summary.clone(), compact: false }
+                                                        } else if let Some(sig) = &thought_signature {
+                                                            div { class: "opacity-50 italic mb-1 font-mono whitespace-pre-wrap", "Encrypted Thought Signature:" }
+                                                            span { class: "font-mono whitespace-pre-wrap", "{sig}" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Right column: Token usage / Metering
+                                        div {
+                                            class: "flex flex-col items-end",
+                                            if let Some(usage) = &usage_data {
+                                                if display_mode != "none" {
+                                                    button {
+                                                        class: "flex items-center text-xs text-gray-500 hover:text-gray-300 focus:outline-none transition-colors",
+                                                        onclick: move |_| {
+                                                            let current = *show_usage.read();
+                                                            show_usage.set(!current);
+                                                        },
+                                                        span { 
+                                                            class: "opacity-70 font-mono",
+                                                            {
+                                                                let tokens = usage.total_tokens;
+                                                                let cost = usage.cost.unwrap_or(0.0);
+                                                                match display_mode.as_str() {
+                                                                    "tokens" => format!("{} tokens", tokens),
+                                                                    "cost" => format!("${:.4}", cost),
+                                                                    _ => format!("{} tokens (${:.4})", tokens, cost),
+                                                                }
+                                                            }
+                                                        }
+                                                        if *show_usage.read() {
+                                                            Icon { width: 10, height: 10, icon: fi_icons::FiChevronDown, class: "ml-1" }
+                                                        } else {
+                                                            Icon { width: 10, height: 10, icon: fi_icons::FiChevronLeft, class: "ml-1" }
+                                                        }
+                                                    }
+                                                    if *show_usage.read() {
+                                                        div {
+                                                            class: "mt-2 p-3 bg-dark-bg rounded-lg text-xs text-gray-300 font-mono",
+                                                            div { class: "flex justify-between gap-4", 
+                                                                span { "Prompt:" }
+                                                                span { "{usage.prompt_tokens}" }
+                                                            }
+                                                            div { class: "flex justify-between gap-4",
+                                                                span { "Completion:" }
+                                                                span { "{usage.completion_tokens}" }
+                                                            }
+                                                            if let Some(thoughts) = usage.thoughts_tokens {
+                                                                div { class: "flex justify-between gap-4",
+                                                                    span { "Thoughts:" }
+                                                                    span { "{thoughts}" }
+                                                                }
+                                                            }
+                                                            div { class: "flex justify-between gap-4 mt-1 pt-1 border-t border-gray-700",
+                                                                span { "Cost:" }
+                                                                span { {format!("${:.6}", usage.cost.unwrap_or(0.0))} }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
+                            } else {
+                                rsx! {}
                             }
                         }
                     }
@@ -1289,11 +1457,11 @@ fn ThinkingIndicator(thinking_mode_enabled: bool, thought_summary: Option<String
                         width: 16,
                         height: 16,
                         icon: fi_icons::FiCpu,
-                        class: "text-white animate-pulse"
+                        class: "text-primary-400 animate-pulse"
                     }
                     span {
-                        class: "text-sm text-white",
-                        "Thinking..."
+                        class: "text-sm text-primary-400 animate-pulse",
+                        "Generating..."
                     }
                 }
                 if let Some(summary) = thought_summary {
@@ -1312,6 +1480,21 @@ fn ThinkingIndicator(thinking_mode_enabled: bool, thought_summary: Option<String
             }
         }
     }
+}
+
+
+fn extract_bold_blocks(content: &str) -> Option<String> {
+    let parts: Vec<&str> = content.split("**").collect();
+    if parts.len() < 3 { return None; }
+    let mut bolded = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i % 2 == 1 && !part.is_empty() {
+             bolded.push(*part);
+        }
+    }
+    if bolded.is_empty() { return None; }
+    let summary = bolded.into_iter().take(3).collect::<Vec<_>>().join("... ");
+    Some(summary)
 }
 
 #[component]

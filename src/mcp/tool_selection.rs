@@ -98,48 +98,15 @@ Respond ONLY with valid JSON (no markdown, no explanation outside JSON):
 
 /// Parse the LLM response into a ToolSelectionResponse
 pub fn parse_selection_response(response: &str) -> Result<ToolSelectionResponse, String> {
-    // Try direct JSON parse first
-    if let Ok(parsed) = serde_json::from_str::<ToolSelectionResponse>(response) {
-        return Ok(parsed);
+    let json_str = crate::components::shared::extract_json_from_response(response);
+    
+    match serde_json::from_str::<ToolSelectionResponse>(json_str) {
+        Ok(parsed) => Ok(parsed),
+        Err(_) => Err(format!("Failed to parse tool selection response as JSON: {}", 
+            if response.len() > 200 { &response[..200] } else { response })),
     }
-    
-    // Try extracting JSON from markdown code block
-    let json_content = if response.contains("```json") {
-        response
-            .split("```json")
-            .nth(1)
-            .and_then(|s| s.split("```").next())
-            .map(|s| s.trim())
-    } else if response.contains("```") {
-        response
-            .split("```")
-            .nth(1)
-            .map(|s| s.trim())
-    } else {
-        None
-    };
-    
-    if let Some(json_str) = json_content {
-        if let Ok(parsed) = serde_json::from_str::<ToolSelectionResponse>(json_str) {
-            tracing::debug!("Successfully parsed JSON from markdown code block");
-            return Ok(parsed);
-        }
-    }
-    
-    // Try to find JSON object in the response
-    if let Some(start) = response.find('{') {
-        if let Some(end) = response.rfind('}') {
-            let json_str = &response[start..=end];
-            if let Ok(parsed) = serde_json::from_str::<ToolSelectionResponse>(json_str) {
-                tracing::debug!("Successfully extracted JSON object from response");
-                return Ok(parsed);
-            }
-        }
-    }
-    
-    Err(format!("Failed to parse tool selection response as JSON: {}", 
-        if response.len() > 200 { &response[..200] } else { response }))
 }
+
 
 #[cfg(test)]
 mod tests {

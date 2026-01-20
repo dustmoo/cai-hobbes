@@ -5,7 +5,6 @@ use tray_icon::{
     TrayIconEvent,
     TrayIcon,
 };
-use tracing;
 
 pub static WINDOW_VISIBLE: GlobalSignal<bool> = Signal::global(|| true);
 pub static APP_QUIT: GlobalSignal<bool> = Signal::global(|| false);

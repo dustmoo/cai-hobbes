@@ -277,7 +277,7 @@ pub fn MarkdownRenderer(
                     
                     new_nodes.push(RenderNode::CommentWrapped {
                         children: wrapped_children,
-                        comment: comment,
+                        comment,
                     });
                 }
 
@@ -890,12 +890,12 @@ pub fn ThinkingMarkdownRenderer(content: String, #[props(default = false)] compa
                             br {}
                         }
                     } else {
-                        // Full: span with a single line break (no margin spacing)
+                        // Full: use proper paragraph with margin for readability
                         rsx! {
-                            span {
+                            p {
+                                class: "mb-4 leading-relaxed",
                                 for inline in inlines { {render_inline(inline)} }
                             }
-                            br {}
                         }
                     }
                 }

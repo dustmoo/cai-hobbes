@@ -93,6 +93,8 @@ pub struct Settings {
     pub confirm_on_save: bool,
     #[serde(default = "default_true")]
     pub confirm_on_message_delete: bool,
+    #[serde(default = "default_true")]
+    pub confirm_forget_memory: bool,
     #[serde(skip)]
     pub smithery_api_key: Option<String>,
     #[serde(default)]
@@ -106,6 +108,10 @@ pub struct Settings {
     pub max_tool_output_length: usize,
     #[serde(default = "default_max_active_tool_output_length")]
     pub max_active_tool_output_length: usize,
+    #[serde(default = "default_max_summary_chars")]
+    pub max_summary_chars: usize,
+    #[serde(default = "default_max_entity_count")]
+    pub max_entity_count: usize,
     // Composio profiles
     #[serde(default)]
     pub composio_profiles: Vec<ComposioProfile>,
@@ -337,11 +343,14 @@ impl Default for Settings {
             confirm_on_delete: true,
             confirm_on_save: true,
             confirm_on_message_delete: true,
+            confirm_forget_memory: true,
             smithery_api_key: None,
             preferred_mcp_source: McpSource::default(),
             keychain_storage_mode: KeychainStorageMode::default(),
             max_tool_output_length: default_max_tool_output_length(),
             max_active_tool_output_length: default_max_active_tool_output_length(),
+            max_summary_chars: default_max_summary_chars(),
+            max_entity_count: default_max_entity_count(),
             composio_profiles: Vec::new(),
             hotkeys: HotkeySettings::default(),
             active_composio_profile: None,
@@ -465,6 +474,14 @@ fn default_max_tool_output_length() -> usize {
 
 fn default_max_active_tool_output_length() -> usize {
     500_000 // ~125k tokens, well within 1M limit but high enough for most data
+}
+
+fn default_max_summary_chars() -> usize {
+    4000 // ~1000 tokens
+}
+
+fn default_max_entity_count() -> usize {
+    50
 }
 
 fn default_true() -> bool {
@@ -621,15 +638,15 @@ impl Default for SettingsTab {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UiState {
     pub settings_panel_width: f64,
-    /// Whether to show tool call Arguments section by default
-    #[serde(default = "default_true")]
-    pub show_tool_arguments: bool,
-    /// Whether to show tool call Response section by default
-    #[serde(default)]
-    pub show_tool_response: bool,
-    /// Whether to show tool call Thinking Process section by default
-    #[serde(default)]
-    pub show_tool_thought: bool,
+    /// Default state for tool call Arguments section (expanded or collapsed)
+    #[serde(default = "default_true", alias = "show_tool_arguments")]
+    pub default_tool_arguments_open: bool,
+    /// Default state for tool call Response section (expanded or collapsed)
+    #[serde(default, alias = "show_tool_response")]
+    pub default_tool_response_open: bool,
+    /// Default state for tool call Thinking Process section (expanded or collapsed)
+    #[serde(default, alias = "show_tool_thought")]
+    pub default_tool_thought_open: bool,
     /// MCP servers that are unloaded (tools hidden from AI)
     #[serde(default)]
     pub unloaded_mcp_servers: Vec<String>,
@@ -645,20 +662,46 @@ pub struct UiState {
     /// Whether the Composio toolkit config panel is expanded
     #[serde(default)]
     pub composio_toolkit_expanded: bool,
+    /// Whether to show the session cost icon in the chat bar
+    #[serde(default = "default_true")]
+    pub show_session_cost_icon: bool,
+    /// What token/cost info to display: "all", "tokens", "cost", "none"
+    #[serde(default = "default_token_display_mode")]
+    pub token_display_mode: String,
+    
+    // Feature Toggles (Chat Bar Icons)
+    #[serde(default = "default_true")]
+    pub show_history_icon: bool,
+    #[serde(default = "default_true")]
+    pub show_mcp_icon: bool,
+    #[serde(default = "default_true")]
+    pub show_profile_selector: bool,
+    #[serde(default = "default_true")]
+    pub show_attachments_icon: bool,
+}
+
+fn default_token_display_mode() -> String {
+    "all".to_string()
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
             settings_panel_width: 420.0,  // Comfortable width for 1440px window
-            show_tool_arguments: true,
-            show_tool_response: false,
-            show_tool_thought: false,
+            default_tool_arguments_open: true,
+            default_tool_response_open: false,
+            default_tool_thought_open: false,
             unloaded_mcp_servers: Vec::new(),
             active_settings_tab: SettingsTab::default(),
             llm_config_collapsed: false,
             mcp_instructions_collapsed: false,
             composio_toolkit_expanded: false,
+            show_session_cost_icon: true,
+            token_display_mode: "all".to_string(),
+            show_history_icon: true,
+            show_mcp_icon: true,
+            show_profile_selector: true,
+            show_attachments_icon: true,
         }
     }
 }
