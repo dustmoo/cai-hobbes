@@ -14,7 +14,7 @@ fn main() {
 
     // Run tailwindcss to build the CSS file
     let status = Command::new("npx")
-        .args(&[
+        .args([
             "tailwindcss",
             "-i",
             "./assets/tailwind.css",
