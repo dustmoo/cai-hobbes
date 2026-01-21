@@ -1,25 +1,21 @@
-Functional Source License, Version 1.1, Apache 2.0 Future License
+MIT License
 
-(c) 2026 Clear Mirror LLC
+Copyright (c) 2025 Clear Mirror AI
 
-Licensor: Clear Mirror LLC
-Software: Hobbes
-Change Date: 2028-01-20
-Resulting License: Apache License, Version 2.0
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-TERMS AND CONDITIONS
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-1. License Grant. Subject to your compliance with this License Grant and the Patents, Redistribution, and Trademark clauses below, we hereby grant you the right to use, copy, modify, create derivative works, publicly perform, publicly display and redistribute the Software for any Permitted Purpose identified below.
-
-2. Permitted Purpose. A Permitted Purpose is any purpose other than a Competing Use. "Competing Use" means making the Software available to others in a commercial product or service that: (a) substitutes for the Software; (b) substitutes for any other product or service we offer using the Software that exists as of the date we make the Software available; or (c) is otherwise a direct competitor to the Software or any other product or service we offer using the Software.
-Permitted Purposes specifically include using the Software: (a) for your internal use and access; (b) for non-commercial education; (c) for non-commercial research; and (d) in connection with professional services that you provide to a licensee using the Software in accordance with these Terms and Conditions, or in connection with software development services or managed services that you provide to a licensee using the Software in accordance with these Terms and Conditions.
-
-3. Patents. To the extent that a Permitted Purpose would infringe on our patents, this License Grant includes a license under those patents. However, if a claim is made against any party that the Software infringes or contributes to the infringement of any patent, the patent license to the Software ends immediately.
-
-4. Redistribution. You may redistribute copies of the Software, provided that you include a copy of this License with every copy of the Software.
-
-5. Trademarks. Except for displaying the License Details and identifying the licensor as the origin of the Software, you have no right under these Terms and Conditions to use the licensor's trademarks, trade names, service marks, or product names.
-
-6. Grant of Future License. On the Change Date, the Licensor hereby grants you rights under the Resulting License for the Software.
-
-7. No Warranty. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
