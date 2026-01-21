@@ -3,7 +3,7 @@
 ![Version](https://img.shields.io/github/v/tag/dustmoo/cai-hobbes?label=version)
 ![Build Status](https://github.com/dustmoo/cai-hobbes/actions/workflows/ci.yml/badge.svg)
 ![Clippy](https://github.com/dustmoo/cai-hobbes/actions/workflows/clippy.yml/badge.svg)
-[![Rust Report Card](https://rust-reportcard.xzu.fi/badge/github.com/dustmoo/cai-hobbes)](https://rust-reportcard.xzu.fi/report/github.com/dustmoo/cai-hobbes)
+
 ![License](https://img.shields.io/badge/License-FSL%201.1-blue.svg)
 
 ## Welcome to Hobbes!
