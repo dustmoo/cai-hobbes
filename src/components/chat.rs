@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_invalid_type)]
+
 use super::chat_input::ChatInput;
 use super::confirm_delete_modal::ConfirmDeleteModal;
 use super::continuation_controller::ContinuationController;

@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_invalid_type)]
+
 use crate::components::mcp_search_form::McpSearchForm;
 use crate::components::smithery_registry::{SmitheryClient, SmitheryServer};
 use crate::components::syntax_highlighter::highlight_json;

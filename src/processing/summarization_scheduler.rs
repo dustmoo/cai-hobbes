@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_invalid_type)]
+
 use dioxus::prelude::*;
 use futures_util::StreamExt;
 use tokio::time::Duration;

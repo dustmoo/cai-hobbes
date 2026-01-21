@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_invalid_type)]
+
 use super::continuation_controller::ContinuationController;
 use crate::components::shared::{StreamMessage, ToolCallStatus};
 use crate::services::tool_call_summarizer::ToolCallSummarizer;

@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_invalid_type)]
+
 use base64::{engine::general_purpose, Engine as _};
 use dioxus::{html::HasFileData, prelude::*};
 use dioxus_free_icons::{icons::fi_icons, Icon};
