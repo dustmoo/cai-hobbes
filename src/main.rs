@@ -224,7 +224,7 @@ fn app() -> Element {
                         None
                     };
 
-                    // Step 2: Load secrets with or without the authenticated contex
+                    // Step 2: Load secrets with or without the authenticated context
                     if let Some(ref ctx) = auth_context {
                         // Use the authenticated context for all keychain operations
                         sm.load_all_with_context(ctx);
@@ -344,7 +344,7 @@ fn app() -> Element {
             let result = tokio::task::spawn_blocking(move || {
                 permissions::check_and_prompt_for_accessibility()
             })
-            .awai
+            .await
             .unwrap_or(permissions::PermissionStatus::Denied);
             status.set(result);
         }
@@ -358,7 +358,7 @@ fn app() -> Element {
         let settings = settings.read();
         let key_present =
             settings.gemini_config.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok();
-        !key_presen
+        !key_present
     });
     let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
     let mcp_manager = use_context_provider(|| {
@@ -407,7 +407,7 @@ fn app() -> Element {
         let mut prev_profile_signature: Signal<Option<String>> = use_signal(|| None);
 
         use_effect(move || {
-            // Create a signature of the active profile properties we care abou
+            // Create a signature of the active profile properties we care about
             let current_signature = settings.read().get_active_profile().map(|p| {
                 format!(
                     "{}:{}:{}:{}:{}",
@@ -686,7 +686,7 @@ fn app() -> Element {
                         // The draggable header has been removed as per user request.
                         // Main content area
                         div {
-                            class: "flex flex-row flex-1 min-h-0", // This will contain the sidebars and cha
+                            class: "flex flex-row flex-1 min-h-0", // This will contain the sidebars and chat
                             // The onkeydown handler has been removed to allow native hotkeys (copy, paste, etc.) to function correctly.
                             // The global hotkey for toggling visibility is no longer required.
                             // When the user releases the mouse, save the last known size.
@@ -723,7 +723,7 @@ fn app() -> Element {
                                     id: "settings-panel",
                                     style: "width: {settings_panel_width}px;",
                                     class: "bg-dark-section text-white h-full",
-                                    // This is the correct location for the settings panel componen
+                                    // This is the correct location for the settings panel component
                                     components::settings_panel::SettingsPanel {}
                                 }
                                 // Draggable Divider

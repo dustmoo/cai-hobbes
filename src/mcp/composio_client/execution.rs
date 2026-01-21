@@ -13,7 +13,7 @@ pub async fn add_toolkit_to_server(
     selected_tools: Option<Vec<String>>,
 ) -> Result<(), String> {
     // Extract target server ID from base_url/settings for verification
-    let target_server_id = clien
+    let target_server_id = client
         .base_url
         .split("/mcp/")
         .nth(1)
@@ -33,12 +33,12 @@ pub async fn add_toolkit_to_server(
 
     tracing::debug!("Discovering servers via Registry: {}", registry_base_url);
 
-    let list_response = clien
-        .clien
+    let list_response = client
+        .client
         .get(registry_base_url)
         .header("x-api-key", &client.api_key)
         .send()
-        .awai
+        .await
         .map_err(|e| format!("Failed to list MCP servers: {}", e))?;
 
     if !list_response.status().is_success() {
@@ -49,7 +49,7 @@ pub async fn add_toolkit_to_server(
 
     let list_json: Value = list_response
         .json()
-        .awai
+        .await
         .map_err(|e| format!("Failed to parse server list: {}", e))?;
 
     let items = list_json
@@ -106,7 +106,7 @@ pub async fn add_toolkit_to_server(
         })
         .unwrap_or_default();
 
-    // Bind the new auth_config_id to the server if not already presen
+    // Bind the new auth_config_id to the server if not already present
     if !auth_config_ids.iter().any(|id| id == auth_config_id) {
         auth_config_ids.push(auth_config_id.to_string());
         tracing::info!("Binding auth_config '{}' to MCP server", auth_config_id);
@@ -118,7 +118,7 @@ pub async fn add_toolkit_to_server(
         .iter()
         .any(|t| t.to_lowercase() == normalized_slug);
 
-    // Add new toolkit if not presen
+    // Add new toolkit if not present
     if !toolkit_already_exists {
         final_toolkits.push(toolkit_slug.to_lowercase());
         tracing::info!("Adding toolkit '{}' to MCP server", toolkit_slug);
@@ -205,14 +205,14 @@ pub async fn add_toolkit_to_server(
 
     tracing::debug!("PATCH {} with payload: {:?}", config_url, patch_payload);
 
-    let patch_response = clien
-        .clien
+    let patch_response = client
+        .client
         .patch(&config_url) // Using Registry URL
         .header("x-api-key", &client.api_key)
         .header("Content-Type", "application/json")
         .json(&patch_payload)
         .send()
-        .awai
+        .await
         .map_err(|e| format!("Failed to update MCP server: {}", e))?;
 
     if !patch_response.status().is_success() {
@@ -220,7 +220,7 @@ pub async fn add_toolkit_to_server(
         let text = patch_response.text().await.unwrap_or_default();
         return Err(format!(
             "Failed to add toolkit to server ({}): {}",
-            status, tex
+            status, text
         ));
     }
 
@@ -242,8 +242,8 @@ pub async fn add_toolkit_to_server(
             server_id
         );
 
-        let generate_response = clien
-            .clien
+        let generate_response = client
+            .client
             .post(&generate_url)
             .header("x-api-key", &client.api_key)
             .header("Content-Type", "application/json")
@@ -279,7 +279,7 @@ pub async fn execute_tool(
     slug: &str,
     args: serde_json::Value,
 ) -> Result<ToolExecuteResponse, String> {
-    // Ensure arguments are wrapped in an objec
+    // Ensure arguments are wrapped in an object
     let mut arguments = if args.is_object() {
         args
     } else {
@@ -287,7 +287,7 @@ pub async fn execute_tool(
     };
 
     // Determine the target user_id (prioritize Settings/Profile ID)
-    let profile_user_id = clien
+    let profile_user_id = client
         .user_id
         .clone()
         .or(client.entity_id.clone())
@@ -346,10 +346,10 @@ pub async fn execute_tool(
         // Fetch connected accounts and check for ACTIVE status
         let has_active_connection = match list_connected_accounts(client).await {
             Ok(accounts) => {
-                // Find an ACTIVE account for this toolki
+                // Find an ACTIVE account for this toolkit
                 let active = accounts.iter().find(|acc| {
                     let matches_toolkit = acc
-                        .toolki
+                        .toolkit
                         .as_ref()
                         .map(|t| t.slug.eq_ignore_ascii_case(tk_slug))
                         .unwrap_or(false)
@@ -464,15 +464,15 @@ pub async fn execute_tool(
         tracing::warn!("Failed to write request debug file: {}", e);
     }
 
-    let response = clien
-        .clien
+    let response = client
+        .client
         .post(&url)
         .header("Accept", "application/json, text/event-stream")
         .header("Content-Type", "application/json")
         .query(&[("user_id", &user_id)]) // Keep query param for Proxy routing
         .json(&body)
         .send()
-        .awai
+        .await
         .map_err(|e| e.to_string())?;
 
     let status = response.status();
@@ -558,14 +558,14 @@ pub async fn execute_tool(
             trimmed_response
         }
     } else {
-        &response_tex
+        &response_text
     };
 
     // 1. Try to parse as ToolExecuteResponse directly (The Simple Path)
     let json_value: Value = match serde_json::from_str::<ToolExecuteResponse>(json_text) {
         Ok(result) => {
             tracing::debug!("Successfully parsed ToolExecuteResponse directly");
-            // Convert back to Value for unified auth checking, or just use i
+            // Convert back to Value for unified auth checking, or just use it
             // We'll hydrate a Value from it to reuse the auth logic below
             serde_json::to_value(result).unwrap_or(Value::Null)
         }
@@ -725,7 +725,7 @@ pub async fn execute_tool(
                             {
                                 tracing::info!(
                                     "[AUTH] Detected MCP Protocol error (substring match): {}",
-                                    tex
+                                    text
                                 );
                                 needs_auth = true;
                                 is_hard_auth_failure = true;

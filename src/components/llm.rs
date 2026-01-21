@@ -251,7 +251,7 @@ impl GeminiModel {
             GeminiModel::Gemini3_0FlashPreview => (0.50, 3.00),
 
             GeminiModel::Gemini2_5Pro => (1.25, 10.00),
-            GeminiModel::Gemini2_5Flash => (0.15, 0.60), // Updated to correct rates: $0.15 Input, $0.60 Outpu
+            GeminiModel::Gemini2_5Flash => (0.15, 0.60), // Updated to correct rates: $0.15 Input, $0.60 Output
             GeminiModel::Gemini2_5FlashLite => (0.10, 0.40),
             GeminiModel::Gemini2_5ComputerUsePreview => {
                 if prompt_tokens > 200_000 {
@@ -305,7 +305,7 @@ pub fn calculate_cost(model: &str, usage: &UsageMetadata) -> f64 {
     let completion_tokens = usage.candidates_token_count.unwrap_or(0);
     let output_cost = (completion_tokens as f64 / 1_000_000.0) * output_rate;
 
-    input_cost + cached_cost + output_cos
+    input_cost + cached_cost + output_cost
 }
 
 #[derive(Deserialize, Debug)]
@@ -513,29 +513,29 @@ impl GeminiConnector {
         let url =
             self.build_model_endpoint(&self.config.summary_model, "generateContent", &api_key);
 
-        let response = clien
+        let response = client
             .post(&url)
             .json(&request_body)
             .send()
-            .awai
+            .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response
                 .text()
-                .awai
+                .await
                 .unwrap_or_else(|_| "Failed to read error body".to_string());
             tracing::error!("Gemini API Error [{}]: {}", status, body_text);
             return Err(Box::new(std::io::Error::other(format!(
                 "API request failed with status {}: {}",
-                status, body_tex
+                status, body_text
             ))) as Box<dyn std::error::Error + Send + Sync>);
         }
 
         let response_json: GeminiResponse = response
             .json()
-            .awai
+            .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         if let Some(candidate) = response_json.candidates.first() {
@@ -600,11 +600,11 @@ impl GeminiConnector {
         // Use the helper for standardizing
         let url = self.build_model_endpoint(&model, "generateContent", &api_key);
 
-        let response = clien
+        let response = client
             .post(&url)
             .json(&request)
             .send()
-            .awai
+            .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         if !response.status().is_success() {
@@ -621,7 +621,7 @@ impl GeminiConnector {
             } else {
                 return Err(Box::new(std::io::Error::other(format!(
                     "Gemini API Error [{}]: {}",
-                    status, body_tex
+                    status, body_text
                 )))
                     as Box<dyn std::error::Error + Send + Sync>);
             }
@@ -629,7 +629,7 @@ impl GeminiConnector {
 
         let response_json: GeminiResponse = response
             .json()
-            .awai
+            .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         Ok(response_json)
@@ -814,7 +814,7 @@ impl LlmConnector for GeminiConnector {
                 let status = response.status();
                 let body_text = response
                     .text()
-                    .awai
+                    .await
                     .unwrap_or_else(|_| "Failed to read error body".to_string());
                 let error_message = if let Ok(error_response) =
                     serde_json::from_str::<GeminiErrorResponse>(&body_text)
@@ -887,7 +887,7 @@ impl LlmConnector for GeminiConnector {
                                             for part in &candidate.content.parts {
                                                 current_attempt_parts
                                                     .push(Part::from(part.clone()));
-                                                // Check if this is a thought summary part firs
+                                                // Check if this is a thought summary part first
                                                 if part.thought.unwrap_or(false)
                                                     && !part.text.is_empty()
                                                 {
@@ -969,11 +969,11 @@ impl LlmConnector for GeminiConnector {
                                                         tracing::error!("LLM requested tool '{}' which was not found in the provided context.", function_call.name);
                                                         // Send a user-friendly message about the missing tool
                                                         let tool_error_msg = format!(
-                                                        "⚠️ **Tool Not Available: `{}`**\n\n
-                                                        Hobbes tried to use a tool that isn't currently loaded. This can happen if:\n\n
-                                                        • The MCP server providing this tool is not running\n
-                                                        • The tool requires authentication that hasn't been set up\n
-                                                        • The tool list needs to be refreshed\n\n
+                                                        "⚠️ **Tool Not Available: `{}`**\n\n\
+                                                        Hobbes tried to use a tool that isn't currently loaded. This can happen if:\n\n\
+                                                        • The MCP server providing this tool is not running\n\
+                                                        • The tool requires authentication that hasn't been set up\n\
+                                                        • The tool list needs to be refreshed\n\n\
                                                         Please check your MCP Integration settings.",
                                                         function_call.name
                                                     );
@@ -1019,13 +1019,13 @@ impl LlmConnector for GeminiConnector {
                                             }
                                         }
 
-                                        // Send usage data if presen
+                                        // Send usage data if present
                                         if let Some(usage) = &parsed.usage_metadata {
                                             let cost = calculate_cost(&model, usage);
                                             let usage_data = crate::components::shared::UsageData {
                                                 prompt_tokens: usage.prompt_token_count,
                                                 completion_tokens: usage
-                                                    .candidates_token_coun
+                                                    .candidates_token_count
                                                     .unwrap_or(0),
                                                 total_tokens: usage.total_token_count,
                                                 thoughts_tokens: usage.thoughts_token_count,
@@ -1169,22 +1169,22 @@ impl LlmConnector for GeminiConnector {
                 let default_message = match finish_reason.as_deref() {
                 Some("SAFETY") => "[Hobbes did not provide a response due to the safety filter.]".to_string(),
                 Some("UNEXPECTED_TOOL_CALL") => {
-                    "⚠️ **Tool Connection Issue**\n\n
-                    Hobbes tried to use a tool that isn't currently available. Please check:\n\n
-                    1. **Is the MCP server running?** Open Settings → MCP Integration and verify the server status.\n
-                    2. **Is the tool connected?** For Composio tools, ensure the profile is active and connected.\n
-                    3. **Try refreshing** the tool list by toggling the MCP server off and on.\n\n
+                    "⚠️ **Tool Connection Issue**\n\n\
+                    Hobbes tried to use a tool that isn't currently available. Please check:\n\n\
+                    1. **Is the MCP server running?** Open Settings → MCP Integration and verify the server status.\n\
+                    2. **Is the tool connected?** For Composio tools, ensure the profile is active and connected.\n\
+                    3. **Try refreshing** the tool list by toggling the MCP server off and on.\n\n\
                     If the issue persists, the tool may need to be re-authorized or the server restarted.".to_string()
                 },
                 Some("MALFORMED_FUNCTION_CALL") => {
-                    "⚠️ **Tool Call Error**\n\n
-                    Hobbes encountered an issue formatting a tool request. This is usually temporary.\n
+                    "⚠️ **Tool Call Error**\n\n\
+                    Hobbes encountered an issue formatting a tool request. This is usually temporary.\n\
                     Please try your request again.".to_string()
                 },
                 Some(reason) => format!(
-                    "⚠️ **Response Issue**\n\n
-                    Hobbes could not complete the response.\n
-                    **Reason:** {}\n\n
+                    "⚠️ **Response Issue**\n\n\
+                    Hobbes could not complete the response.\n\
+                    **Reason:** {}\n\n\
                     If this persists, try simplifying your request or checking your tool connections.",
                     reason
                 ),
@@ -1278,18 +1278,18 @@ Recent Messages:
         let url =
             self.build_model_endpoint(&self.config.summary_model, "generateContent", &api_key);
 
-        let response = clien
+        let response = client
             .post(&url)
             .json(&request_body)
             .send()
-            .awai
+            .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response
                 .text()
-                .awai
+                .await
                 .unwrap_or_else(|_| "Failed to read error body".to_string());
             if let Ok(error_response) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
                 tracing::error!(
@@ -1303,13 +1303,13 @@ Recent Messages:
             // Return a structured error instead of panicking or returning a generic reqwest::Error
             return Err(Box::new(std::io::Error::other(format!(
                 "API request failed with status {}: {}",
-                status, body_tex
+                status, body_text
             ))) as Box<dyn std::error::Error + Send + Sync>);
         }
 
         let response_json: GeminiResponse = response
             .json()
-            .awai
+            .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         if let Some(candidate) = response_json.candidates.first() {
@@ -1353,7 +1353,7 @@ fn unparse_json_response(text: &str) -> (String, Option<String>) {
     // Attempt to parse the text directly as JSON.
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
         if let Some(obj) = json.as_object() {
-            // Check for common fields in the model's structured outpu
+            // Check for common fields in the model's structured output
             let reply_text = obj
                 .get("reply_text")
                 .or_else(|| obj.get("content"))
@@ -1387,7 +1387,7 @@ mod tests {
 
     #[test]
     fn test_unparse_json_response() {
-        // Test with reply_text and though
+        // Test with reply_text and thought
         let text = r#"{"reply_text": "Hello world", "thought": "The user said hello"}"#;
         let (content, thought) = unparse_json_response(text);
         assert_eq!(content, "Hello world");
@@ -1520,7 +1520,7 @@ mod tests {
     async fn test_unexpected_tool_call_error_message() {
         let mock_server = MockServer::start().await;
 
-        // Simulate a response with UNEXPECTED_TOOL_CALL finish reason and no conten
+        // Simulate a response with UNEXPECTED_TOOL_CALL finish reason and no content
         let response_json = serde_json::json!({
             "candidates": [{
                 "content": {
@@ -1651,7 +1651,7 @@ mod tests {
     async fn test_tool_not_found_sends_user_message() {
         let mock_server = MockServer::start().await;
 
-        // Response with a function call for a tool that won't be in the contex
+        // Response with a function call for a tool that won't be in the context
         let response_json = serde_json::json!({
             "candidates": [{
                 "content": {
@@ -1733,13 +1733,13 @@ mod tests {
             cached_content_token_count: None,
         };
 
-        // Flash 2.5: $0.15/1M input, $0.60/1M outpu
+        // Flash 2.5: $0.15/1M input, $0.60/1M output
         let usage = make_usage(1_000_000, 0);
         let cost = calculate_cost("gemini-2.5-flash", &usage);
         assert!(
             (cost - 0.15).abs() < 1e-6,
             "Gemini 2.5 Flash Input: Expected $0.15, got {}",
-            cos
+            cost
         );
 
         let usage = make_usage(0, 1_000_000);
@@ -1747,16 +1747,16 @@ mod tests {
         assert!(
             (cost - 0.60).abs() < 1e-6,
             "Gemini 2.5 Flash Output: Expected $0.60, got {}",
-            cos
+            cost
         );
 
-        // Pro 2.5 <= 200k: $1.25/1M input, $10.00/1M outpu
+        // Pro 2.5 <= 200k: $1.25/1M input, $10.00/1M output
         let usage = make_usage(1_000_000, 0);
         let cost = calculate_cost("gemini-2.5-pro", &usage);
         assert!(
             (cost - 1.25).abs() < 1e-6,
             "Gemini 2.5 Pro Input: Expected $1.25, got {}",
-            cos
+            cost
         );
 
         // Fallback (unknown): Defaults to Gemini 2.0 Flash (Safety mechanism)
@@ -1766,7 +1766,7 @@ mod tests {
         assert!(
             (cost - 0.10).abs() < 1e-6,
             "Unknown model: Expected default $0.10 (Flash), got {}",
-            cos
+            cost
         );
     }
 
