@@ -55,7 +55,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
     use_effect(move || {
         // Only attempt to register native hotkeys if permissions are granted.
         if matches!(
-            permission_status.read().clone(),
+            *permission_status.read(),
             permissions::PermissionStatus::Granted
         ) {
             let hotkey_str = settings.read().hotkeys.toggle_tray.clone();
@@ -77,10 +77,8 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                     tracing::error!("Failed to register Tray Hotkey: {}", &hotkey_str);
                 }
             }
-        } else {
-            if let Some(handle) = current_tray_shortcut.borrow_mut().take() {
-                desktop.remove_shortcut(handle);
-            }
+        } else if let Some(handle) = current_tray_shortcut.borrow_mut().take() {
+            desktop.remove_shortcut(handle);
         }
     });
 

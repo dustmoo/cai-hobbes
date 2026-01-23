@@ -7,11 +7,11 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
     let mut settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
 
-    let mut gemini_api_key = use_signal(|| String::new());
+    let mut gemini_api_key = use_signal(String::new);
     // Default based on environment
-    let mut keychain_mode = use_signal(|| KeychainStorageMode::default());
-    let mut error_message = use_signal(|| String::new());
-    let mut success_message = use_signal(|| String::new());
+    let mut keychain_mode = use_signal(KeychainStorageMode::default);
+    let mut error_message = use_signal(String::new);
+    let mut success_message = use_signal(String::new);
     let mut is_validating = use_signal(|| false);
 
     // Detect if we're in a sandboxed environment (App Store/TestFlight)

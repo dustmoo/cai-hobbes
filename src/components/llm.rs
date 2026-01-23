@@ -855,8 +855,7 @@ impl LlmConnector for GeminiConnector {
                             let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
                             let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
 
-                            if line.starts_with("data: ") {
-                                let json_str = &line["data: ".len()..];
+                            if let Some(json_str) = line.strip_prefix("data: ") {
                                 if json_str.is_empty() {
                                     continue;
                                 }

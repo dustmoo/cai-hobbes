@@ -109,5 +109,5 @@ pub fn use_summarization_scheduler() {
         }
     });
 
-    use_context_provider(|| coroutine.clone());
+    use_context_provider(|| coroutine);
 }

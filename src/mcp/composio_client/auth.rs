@@ -741,14 +741,11 @@ pub async fn initiate_connection(
         .and_then(|v| v.as_str())
     {
         Some(url.to_string())
-    } else if let Some(url) = json
-        .get("connectionRequest")
-        .and_then(|d| d.get("redirectUrl"))
-        .and_then(|v| v.as_str())
-    {
-        Some(url.to_string())
     } else {
-        None
+        json.get("connectionRequest")
+            .and_then(|d| d.get("redirectUrl"))
+            .and_then(|v| v.as_str())
+            .map(|url| url.to_string())
     };
 
     if let Some(auth_url) = redirect_url {
@@ -844,17 +841,17 @@ pub async fn initiate_connection(
                     // Refresh auth configs cache to pick up any new configs
                     let _ = list_auth_configs(client).await;
 
-                    return Ok("Authentication successful! You can now use the tool.".to_string());
+                    Ok("Authentication successful! You can now use the tool.".to_string())
                 } else {
                     let error = result.error.unwrap_or_else(|| "Unknown error".to_string());
-                    return Err(format!("Authentication failed: {}", error));
+                    Err(format!("Authentication failed: {}", error))
                 }
             }
             Ok(None) => {
-                return Err("Callback server closed unexpectedly".to_string());
+                Err("Callback server closed unexpectedly".to_string())
             }
             Err(_) => {
-                return Err("Authentication timed out (5 minutes)".to_string());
+                Err("Authentication timed out (5 minutes)".to_string())
             }
         }
     } else {

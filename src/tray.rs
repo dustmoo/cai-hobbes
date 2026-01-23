@@ -38,15 +38,10 @@ pub fn init_tray() -> TrayIcon {
     std::thread::spawn(move || {
         tracing::info!("Tray listener thread started.");
         loop {
-            if let Ok(event) = tray_channel.recv() {
-                match event {
-                    TrayIconEvent::Click { .. } => {
-                        tracing::info!("Tray icon clicked, toggling visibility.");
-                        let mut visible = WINDOW_VISIBLE.write();
-                        *visible = !*visible;
-                    }
-                    _ => (),
-                }
+            if let Ok(TrayIconEvent::Click { .. }) = tray_channel.recv() {
+                tracing::info!("Tray icon clicked, toggling visibility.");
+                let mut visible = WINDOW_VISIBLE.write();
+                *visible = !*visible;
             }
         }
     });

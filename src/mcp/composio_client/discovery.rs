@@ -643,7 +643,7 @@ fn parse_tools_response(
             }
             Err(e) => return Err(e.to_string()),
         }
-        return Err("Failed to parse Composio SSE response into a usable format".to_string());
+        Err("Failed to parse Composio SSE response into a usable format".to_string())
     } else {
         // Regular JSON
         match serde_json::from_str::<serde_json::Value>(response_text) {

@@ -33,7 +33,7 @@ pub fn SettingsPanel() -> Element {
 
     // Signals for model fetching
     let mut available_models =
-        use_signal(|| Vec::<crate::services::gemini_models::GeminiModel>::new());
+        use_signal(Vec::<crate::services::gemini_models::GeminiModel>::new);
     let mut models_loading = use_signal(|| false);
     let mut models_error = use_signal(|| Option::<String>::None);
     let mut models_fetch_trigger = use_signal(|| 0u32);
@@ -87,7 +87,7 @@ pub fn SettingsPanel() -> Element {
     let mut permissions_collapsed = use_signal(|| false);
     let mut show_conflict_modal = use_signal(|| false);
     let mut show_confirm_save_modal = use_signal(|| false);
-    let mut conflicting_sessions = use_signal(|| Vec::<(String, crate::session::Session)>::new());
+    let mut conflicting_sessions = use_signal(Vec::<(String, crate::session::Session)>::new);
 
     // UI Persistence Helpers
     let toggle_llm_collapsed = move |_| {
@@ -911,7 +911,7 @@ pub fn SettingsPanel() -> Element {
                                                                     checked: is_active,
                                                                     onchange: {
                                                                         let name = profile_name.clone();
-                                                                        let mut global_settings = settings.clone();
+                                                                        let mut global_settings = settings;
                                                                         move |_| {
                                                                             tracing::info!("Switching to profile: {}", name);
                                                                             local_settings.write().active_composio_profile = Some(name.clone());
@@ -1020,7 +1020,7 @@ pub fn SettingsPanel() -> Element {
                                                             onclick: {
                                                                 let user_id = local_settings.read().get_active_profile().map(|p| p.user_id.clone()).unwrap_or_default();
                                                                 move |_| {
-                                                                    if user_id.as_ref().map_or(true, |s| !s.is_empty()) {
+                                                                    if user_id.as_ref().is_none_or(|s| !s.is_empty()) {
                                                                         use std::process::Command;
                                                                          let _ = Command::new("pbcopy")
                                                                              .stdin(std::process::Stdio::piped())
@@ -1790,6 +1790,7 @@ pub fn SettingsPanel() -> Element {
                                                 match serde_json::from_str::<SessionState>(&contents) {
                                                     Ok(imported_state) => {
                                                         let mut current_state = session_state.write();
+                                                        #[allow(clippy::map_entry)]
                                                         for (id, session) in imported_state.sessions {
                                                             if current_state.sessions.contains_key(&id) {
                                                                 conflicting_sessions.write().push((id, session));
@@ -1873,7 +1874,7 @@ pub fn SettingsPanel() -> Element {
                                         class: "sr-only peer",
                                         checked: local_settings.read().permission_settings.auto_approval_enabled,
                                         oninput: move |event| {
-                                            if let Some(checked) = event.value().parse().ok() {
+                                            if let Ok(checked) = event.value().parse() {
                                                 local_settings.write().permission_settings.auto_approval_enabled = checked;
                                             }
                                         }
@@ -1894,7 +1895,7 @@ pub fn SettingsPanel() -> Element {
                                                 class: "sr-only peer",
                                                 checked: local_settings.read().permission_settings.granular_permissions.get(&ToolCategory::Mcp).copied().unwrap_or(false),
                                                 oninput: move |event| {
-                                                    if let Some(checked) = event.value().parse().ok() {
+                                                    if let Ok(checked) = event.value().parse() {
                                                         local_settings.write().permission_settings.granular_permissions.insert(ToolCategory::Mcp, checked);
                                                     }
                                                 }
@@ -1932,7 +1933,7 @@ pub fn SettingsPanel() -> Element {
                                                                     oninput: {
                                                                         let server_name = server_name.clone();
                                                                         move |event: Event<FormData>| {
-                                                                            if let Some(checked) = event.value().parse().ok() {
+                                                                            if let Ok(checked) = event.value().parse() {
                                                                                 local_settings.write().permission_settings.mcp_server_permissions.insert(server_name.clone(), checked);
                                                                             }
                                                                         }

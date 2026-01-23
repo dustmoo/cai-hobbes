@@ -62,6 +62,7 @@ pub struct ToolWrapper {
     pub tool: Tool,
 }
 
+#[derive(Default)]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ActiveContext {
@@ -80,19 +81,7 @@ pub struct ActiveContext {
     pub extra: HashMap<String, Value>,
 }
 
-impl Default for ActiveContext {
-    fn default() -> Self {
-        Self {
-            system_persona: None,
-            user_instruction: None,
-            force_tool_use_instruction: None,
-            conversation_summary: ConversationSummary::default(),
-            mcp_tools: None,
-            tools: None,
-            extra: HashMap::new(),
-        }
-    }
-}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Session {
@@ -182,13 +171,12 @@ pub struct SessionState {
 
 fn get_sessions_path() -> Option<PathBuf> {
     dirs::config_dir()
-        .map(|mut path| {
+        .and_then(|mut path| {
             path.push("com.hobbes.app");
             fs::create_dir_all(&path).ok()?;
             path.push("sessions.json");
             Some(path)
         })
-        .flatten()
 }
 
 impl SessionState {

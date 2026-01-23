@@ -122,7 +122,7 @@ pub fn composio_to_rmcp_tool(composio_tool: &super::models::ComposioTool) -> rmc
             .into(), // Use slug if available, else name
         description: composio_tool.description.clone().map(|s| s.into()),
         input_schema: schema,
-        title: Some(composio_tool.name.clone().into()), // Use display name as title
+        title: Some(composio_tool.name.clone()), // Use display name as title
         output_schema: None,
         annotations: None,
         icons: None,

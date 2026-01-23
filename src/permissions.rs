@@ -14,11 +14,9 @@ pub enum PermissionStatus {
 pub fn check_and_prompt_for_accessibility() -> PermissionStatus {
     if accessibility::application_is_trusted() {
         PermissionStatus::Granted
+    } else if accessibility::application_is_trusted_with_prompt() {
+        PermissionStatus::JustGranted
     } else {
-        if accessibility::application_is_trusted_with_prompt() {
-            PermissionStatus::JustGranted
-        } else {
-            PermissionStatus::Denied
-        }
+        PermissionStatus::Denied
     }
 }

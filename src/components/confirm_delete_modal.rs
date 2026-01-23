@@ -33,8 +33,8 @@ pub fn ConfirmDeleteModal(props: ConfirmDeleteModalProps) -> Element {
                 },
                 onclick: move |_| props.on_cancel.call(()),
                 onkeydown: {
-                    let on_cancel = props.on_cancel.clone();
-                    let on_confirm = props.on_confirm.clone();
+                    let on_cancel = props.on_cancel;
+                    let on_confirm = props.on_confirm;
                     move |evt: KeyboardEvent| {
                         if evt.key() == Key::Escape {
                             on_cancel.call(());
@@ -54,8 +54,8 @@ pub fn ConfirmDeleteModal(props: ConfirmDeleteModalProps) -> Element {
                     tabindex: "0",
                     onclick: |event| event.stop_propagation(), // Prevent clicks inside from closing the modal
                     onkeydown: {
-                        let on_cancel = props.on_cancel.clone();
-                        let on_confirm = props.on_confirm.clone();
+                        let on_cancel = props.on_cancel;
+                        let on_confirm = props.on_confirm;
                         move |evt: KeyboardEvent| {
                             if evt.key() == Key::Escape {
                                 on_cancel.call(());

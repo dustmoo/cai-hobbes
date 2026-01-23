@@ -45,7 +45,7 @@ pub fn ChatInput(
     on_new_chat_with_memory: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let _settings = use_context::<Signal<Settings>>();
+    let mut _settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
@@ -312,13 +312,10 @@ pub fn ChatInput(
                                                         class: "w-full text-left px-4 py-2 text-sm text-gray-300 hover:bg-primary-900/50 hover:text-white transition-colors flex items-center justify-between",
                                                         onclick: {
                                                             let new_profile_name = profile.name.clone();
-                                                            let mut settings = _settings;
-                                                            let settings_manager = settings_manager;
-                                                            let scheduler = scheduler.clone();
                                                             move |_| {
-                                                                settings.write().active_composio_profile = Some(new_profile_name.clone());
+                                                                _settings.write().active_composio_profile = Some(new_profile_name.clone());
                                                                 // Auto-save changes
-                                                                if let Err(e) = settings_manager.read().save(&settings.read()) {
+                                                                if let Err(e) = settings_manager.read().save(&_settings.read()) {
                                                                     tracing::error!("Failed to save profile change: {}", e);
                                                                 }
                                                                 // Trigger summary refresh
@@ -529,12 +526,9 @@ pub fn ChatInput(
                                     button {
                                         class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
                                         onclick: move |_| {
-                                            let session_state = session_state.clone();
-                                            let settings = _settings.clone();
-                                            let mcp_manager = _mcp_manager.clone();
                                             spawn(async move {
                                                 let mcp_context = {
-                                                    let mcp_manager_reader = mcp_manager.read();
+                                                    let mcp_manager_reader = _mcp_manager.read();
                                                     mcp_manager_reader.get_mcp_context().await
                                                 };
 
@@ -547,7 +541,7 @@ pub fn ChatInput(
                                                             session_for_debug.active_context.mcp_tools = Some(mcp_context);
                                                         }
 
-                                                        let settings_reader = settings.read();
+                                                        let settings_reader = _settings.read();
                                                         let builder = PromptBuilder::new(&session_for_debug, &settings_reader, &state);
                                                         let prompt_data = builder.build_prompt("[DEBUG USER MESSAGE]".to_string(), None);
                                                         format!("{:#?}", prompt_data)
@@ -560,7 +554,7 @@ pub fn ChatInput(
                                                     .unwrap()
                                                     .as_secs();
                                                 let debug_dir = std::env::temp_dir().join("hobbes_debug_logs");
-                                                if let Ok(_) = std::fs::create_dir_all(&debug_dir) {
+                                                if std::fs::create_dir_all(&debug_dir).is_ok() {
                                                     let file_path = debug_dir.join(format!("prompt_{}.log", timestamp));
                                                     if let Err(e) = std::fs::write(&file_path, &context_string) {
                                                         tracing::error!("Failed to write debug prompt to file: {}", e);

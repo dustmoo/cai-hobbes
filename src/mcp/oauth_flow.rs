@@ -481,8 +481,8 @@ pub fn start_callback_server(port: u16) -> mpsc::UnboundedReceiver<OAuthResult> 
                         error: Some(error.clone()),
                         params,
                     });
-                } else if params.get("connectedAccountId").is_some()
-                    || params.get("connected_account_id").is_some()
+                } else if params.contains_key("connectedAccountId")
+                    || params.contains_key("connected_account_id")
                     || params
                         .get("status")
                         .map(|s| s == "success")

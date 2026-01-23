@@ -107,11 +107,11 @@ pub fn ChatWindow(
 
     // New Chat with Memory Modal State
     let mut show_new_chat_memory_modal = use_signal(|| false);
-    let mut modal_initial_context = use_signal(|| ActiveContext::default());
+    let mut modal_initial_context = use_signal(ActiveContext::default);
 
     // Forget Memory Modal State
     let mut show_forget_memory_modal = use_signal(|| false);
-    let mut forget_modal_context = use_signal(|| ActiveContext::default());
+    let mut forget_modal_context = use_signal(ActiveContext::default);
     let mut modal_optimization_summary = use_signal(|| Option::<String>::None);
 
     let on_interaction = move || {
@@ -286,18 +286,10 @@ pub fn ChatWindow(
 
     // Reusable closure for sending a message
     let send_prompt_to_llm = {
-        // Capture signals which are all `Copy`
-        let stream_manager = stream_manager;
-        let settings = settings;
-        let active_message_id = active_message_id;
-
         move |prompt_data: crate::context::prompt_builder::LlmPrompt,
               mcp_context: Option<crate::mcp::manager::McpContext>,
               hobbes_message_id: Uuid| {
             spawn(async move {
-                // Now clone/read them inside the async block
-                let stream_manager = stream_manager;
-                let _settings = settings.read().clone();
                 let mut active_message_id = active_message_id;
 
                 active_message_id.set(Some(hobbes_message_id));
@@ -346,7 +338,7 @@ pub fn ChatWindow(
             // Check if the last message was the turn limit warning.
             let last_message_was_warning = session_state.read().get_active_session()
                 .and_then(|s| s.messages.last())
-                .map_or(false, |m| {
+                .is_some_and(|m| {
                     if let MessageContent::Text { content: text, .. } = &m.content {
                         text.starts_with("Pardon, I have reached the 'Max Turn Limit' currently set to X in settings")
                     } else {
@@ -530,17 +522,12 @@ pub fn ChatWindow(
     };
 
     let continue_prompt_flow = {
-        let session_state = session_state;
-        let settings = settings;
-        let send_prompt_to_llm = send_prompt_to_llm;
-
         Rc::new(move || {
             tracing::debug!("continue_prompt_flow callback INVOKED.");
             spawn(async move {
                 tracing::debug!("continue_prompt_flow task SPAWNED.");
                 let mut session_state = session_state;
                 let settings = settings.read().clone();
-                let send_prompt_to_llm = send_prompt_to_llm;
 
                 let hobbes_message_id = Uuid::new_v4();
                 {

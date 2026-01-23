@@ -14,12 +14,12 @@ pub fn NewChatMemoryModal(
     on_optimize_memory: EventHandler<ActiveContext>,
     on_cancel: EventHandler<()>,
 ) -> Element {
-    let mut json_content = use_signal(|| String::new());
+    let mut json_content = use_signal(String::new);
     let mut error_message = use_signal(|| Option::<String>::None);
     let mut focus_context = use_context::<Signal<FocusContext>>();
 
     // Track previous context to detect external updates (like from optimization)
-    let mut last_processed_context = use_signal(|| String::new());
+    let mut last_processed_context = use_signal(String::new);
 
     // Initialize content when modal becomes visible or initial context changes
     use_effect(move || {

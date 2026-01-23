@@ -207,7 +207,7 @@ impl<'a> PromptBuilder<'a> {
 
         // Check if the last message is an empty placeholder from Hobbes (continuation scenario)
         let last_message = self.session.messages.last();
-        let is_continuation_placeholder = last_message.map_or(false, |m| {
+        let is_continuation_placeholder = last_message.is_some_and(|m| {
             m.author == "Hobbes" && matches!(m.content, MessageContent::Text { ref content, .. } if content.is_empty())
         });
 
@@ -224,7 +224,7 @@ impl<'a> PromptBuilder<'a> {
             };
 
             let last_message_was_tool = message_to_check
-                .map_or(false, |m| matches!(m.content, MessageContent::ToolCall(_)));
+                .is_some_and(|m| matches!(m.content, MessageContent::ToolCall(_)));
 
             if last_message_was_tool {
                 let tool_completion_instruction = "\n\nTOOL COMPLETION INSTRUCTION: The tool execution has completed. Use the tool output above to answer the user's request. Do not ask the user for the tool output again.";
@@ -421,7 +421,7 @@ impl<'a> PromptBuilder<'a> {
                                     comment.text_selection, comment.comment
                                 ));
                             }
-                            comment_text.push_str("]");
+                            comment_text.push(']');
 
                             add_to_prompt(
                                 "user",
@@ -553,7 +553,7 @@ impl<'a> PromptBuilder<'a> {
                                     comment.text_selection, comment.comment
                                 ));
                             }
-                            comment_text.push_str("]");
+                            comment_text.push(']');
 
                             add_to_prompt(
                                 "user",
@@ -650,7 +650,7 @@ fn simplify_schema(value: &mut serde_json::Value) {
         for key in ["oneOf", "anyOf", "allOf"].iter() {
             if let Some(arr_val) = map.remove(*key) {
                 if let Some(arr) = arr_val.as_array() {
-                    if let Some(first_item) = arr.get(0) {
+                    if let Some(first_item) = arr.first() {
                         // If the first item is an object, merge its properties into the current map.
                         if let Some(obj) = first_item.as_object() {
                             for (k, v) in obj {
@@ -666,7 +666,7 @@ fn simplify_schema(value: &mut serde_json::Value) {
         // If `items` is an array, replace it with its first element.
         if let Some(items_val) = map.get_mut("items") {
             if let Some(arr) = items_val.as_array() {
-                if let Some(first_item) = arr.get(0) {
+                if let Some(first_item) = arr.first() {
                     *items_val = first_item.clone();
                 } else {
                     // If the array is empty, replace it with an empty object to satisfy the API.
@@ -713,7 +713,7 @@ fn fix_and_remove_invalid_fields(value: &mut serde_json::Value) {
         if let Some(type_val) = map.get_mut("type") {
             if let serde_json::Value::Array(arr) = type_val {
                 // If type is an array (e.g., ["string", "number"]), take the first type.
-                if let Some(first) = arr.get(0) {
+                if let Some(first) = arr.first() {
                     if let Some(s) = first.as_str() {
                         *type_val = serde_json::Value::String(s.to_string());
                     }

@@ -362,7 +362,7 @@ impl McpManager {
         let (tx, mut rx) = mpsc::unbounded_channel::<ActiveMcpClient>();
         let servers_map_clone = self.servers.clone();
         let self_clone_for_receiver = self.clone();
-        let mut mcp_context_signal_clone_for_receiver = mcp_context_signal.clone();
+        let mut mcp_context_signal_clone_for_receiver = mcp_context_signal;
 
         // Spawn a dedicated receiver task to serialize context updates
         spawn(async move {
@@ -1965,7 +1965,7 @@ impl McpManager {
         let auth_required_servers_clone = self.auth_required_servers.clone();
         let servers_clone = self.servers.clone();
         let self_clone = self.clone();
-        let mut mcp_context_signal_clone = mcp_context_signal.clone();
+        let mut mcp_context_signal_clone = mcp_context_signal;
         let access_token_clone = access_token.clone();
 
         spawn(async move {

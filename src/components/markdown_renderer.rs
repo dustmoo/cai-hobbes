@@ -19,10 +19,11 @@ pub fn MarkdownRenderer(
         options.insert(Options::ENABLE_TASKLISTS);
         options.insert(Options::ENABLE_TABLES);
 
-        let parser = Parser::new_ext(&content_reader, options);
+        let parser = Parser::new_ext(content_reader, options);
 
         // --- Intermediate Representation (IR) ---
         #[derive(Debug, Clone)]
+        #[allow(clippy::enum_variant_names)]
         enum Block {
             Header {
                 level: HeadingLevel,
@@ -604,6 +605,7 @@ pub fn MarkdownRenderer(
         let comments_ref = comments.as_ref();
         let pending_highlight_ref = pending_highlight.as_ref();
 
+        #[allow(clippy::only_used_in_recursion)]
         fn render_node(
             node: RenderNode,
             comments: Option<&Vec<Comment>>,
@@ -830,8 +832,8 @@ pub fn MarkdownRenderer(
     // Set up event delegation for comment actions
     use_effect(move || {
         let id = container_id();
-        let on_edit = on_comment_edit.clone();
-        let on_delete = on_comment_delete.clone();
+        let on_edit = on_comment_edit;
+        let on_delete = on_comment_delete;
 
         spawn(async move {
             let mut eval = document::eval(&format!(
@@ -906,7 +908,7 @@ pub fn ThinkingMarkdownRenderer(
         let mut options = pulldown_cmark::Options::empty();
         options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
 
-        let parser = pulldown_cmark::Parser::new_ext(&content_reader, options);
+        let parser = pulldown_cmark::Parser::new_ext(content_reader, options);
 
         // Simplified IR for thinking content
         #[derive(Debug, Clone)]

@@ -21,7 +21,7 @@ pub fn ConflictModal(props: ConflictModalProps) -> Element {
                 });
             },
             onkeydown: {
-                let on_resolve = props.on_resolve.clone();
+                let on_resolve = props.on_resolve;
                 move |evt: KeyboardEvent| {
                     if evt.key() == Key::Escape {
                         on_resolve.call((false, *apply_to_all.read()));
@@ -38,7 +38,7 @@ pub fn ConflictModal(props: ConflictModalProps) -> Element {
                 class: "bg-gray-800 rounded-lg p-6 max-w-sm w-full",
                 tabindex: "0",
                 onkeydown: {
-                    let on_resolve = props.on_resolve.clone();
+                    let on_resolve = props.on_resolve;
                     move |evt: KeyboardEvent| {
                         if evt.key() == Key::Escape {
                             on_resolve.call((false, *apply_to_all.read()));
@@ -68,7 +68,7 @@ pub fn ConflictModal(props: ConflictModalProps) -> Element {
                         id: "apply_all",
                         class: "h-4 w-4 text-indigo-600 bg-gray-700 border-gray-600 rounded focus:ring-indigo-500",
                         oninput: move |event| {
-                            if let Some(checked) = event.value().parse().ok() {
+                            if let Ok(checked) = event.value().parse() {
                                 apply_to_all.set(checked);
                             }
                         }

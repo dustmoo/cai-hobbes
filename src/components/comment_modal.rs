@@ -10,8 +10,8 @@ pub fn CommentModal(
     on_close: EventHandler<()>,
     on_save: EventHandler<Vec<Comment>>,
 ) -> Element {
-    let mut new_comment_text = use_signal(|| String::new());
-    let mut selected_text = use_signal(|| String::new());
+    let mut new_comment_text = use_signal(String::new);
+    let mut selected_text = use_signal(String::new);
     let mut comments = use_signal(|| message.comments.clone());
     let mut focus_context = use_context::<Signal<FocusContext>>();
     // Claim focus when modal mounts

@@ -13,7 +13,7 @@ pub fn ForgetMemoryModal(
     on_apply: EventHandler<(ActiveContext, String)>,
     on_cancel: EventHandler<()>,
 ) -> Element {
-    let mut instruction = use_signal(|| String::new());
+    let mut instruction = use_signal(String::new);
     let mut is_generating = use_signal(|| false);
     let mut error_message = use_signal(|| Option::<String>::None);
 

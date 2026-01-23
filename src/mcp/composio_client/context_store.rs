@@ -10,9 +10,11 @@ use std::sync::{Arc, RwLock};
 /// This is used to inject parameters into tool execution arguments for routed toolkits.
 #[derive(Debug, Clone)]
 pub struct ContextStore {
+    #[allow(dead_code)]
     profile_id: String,
     file_path: PathBuf,
     // Map<ToolkitSlug, Map<UserId, Map<Key, Value>>>
+    #[allow(clippy::type_complexity)]
     cache: Arc<RwLock<HashMap<String, HashMap<String, HashMap<String, String>>>>>,
 }
 

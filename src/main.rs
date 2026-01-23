@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(clippy::await_holding_invalid_type)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::collapsible_else_if)]
+#![allow(clippy::collapsible_match)]
 
 use dioxus::desktop::tao::dpi::PhysicalSize;
 use dioxus::desktop::tao::event::{Event, WindowEvent};
@@ -338,7 +341,7 @@ fn app() -> Element {
         use_context_provider(|| Signal::new(permissions::PermissionStatus::Denied));
 
     let _ = use_resource(move || async move {
-        let mut status = permission_status_signal.clone();
+        let mut status = permission_status_signal;
         #[cfg(target_os = "macos")]
         {
             // Run the blocking check in a separate thread
@@ -365,7 +368,7 @@ fn app() -> Element {
     let mcp_manager = use_context_provider(|| {
         Signal::new(McpManager::new(
             get_mcp_config_path(),
-            permission_manager.clone(),
+            permission_manager,
         ))
     });
     let mcp_context = use_context_provider(|| {
@@ -383,7 +386,7 @@ fn app() -> Element {
         }
 
         let manager = mcp_manager.read().clone();
-        let mcp_context_signal = mcp_context.clone();
+        let mcp_context_signal = mcp_context;
         let settings_clone = settings.read().clone();
 
         // Restore persisted unloaded servers state before launching
@@ -400,9 +403,6 @@ fn app() -> Element {
     // Reinitialize Composio client when active profile changes
     // This use_effect subscribes to changes in active_composio_profile
     {
-        let settings = settings.clone();
-        let mcp_manager = mcp_manager.clone();
-        let mcp_context = mcp_context.clone();
 
         // Track key profile properties to detect changes (API key, base URL, etc.)
         let mut prev_profile_signature: Signal<Option<String>> = use_signal(|| None);
@@ -429,8 +429,7 @@ fn app() -> Element {
                 // Invalidate caches - profile changed
                 mcp_manager.read().invalidate_status_cache();
 
-                let mcp_manager = mcp_manager.clone();
-                let mcp_context_signal = mcp_context.clone();
+                let mcp_context_signal = mcp_context;
                 let settings_clone = settings.read().clone();
 
                 spawn(async move {
@@ -611,10 +610,10 @@ fn app() -> Element {
     use_effect(move || {
         let physical_size = last_known_size.read();
         if physical_size.width > 0 && physical_size.height > 0 {
-            let mut session_state = session_state.clone();
-            let show_session_manager = show_session_manager.clone();
-            let show_settings_panel = show_settings_panel.clone();
-            let show_mcp_manager = show_mcp_manager.clone();
+            let mut session_state = session_state;
+            let show_session_manager = show_session_manager;
+            let show_settings_panel = show_settings_panel;
+            let show_mcp_manager = show_mcp_manager;
 
             // Capture the current values we need for calculation
             let current_physical_size = *physical_size;

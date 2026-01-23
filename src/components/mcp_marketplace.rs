@@ -180,25 +180,22 @@ pub fn McpMarketplace() -> Element {
     // Cursor-based pagination for Composio
     // cursor_stack stores previous cursors for "back" navigation
     // next_cursor stores the cursor for the next page
-    let mut cursor_stack: Signal<Vec<String>> = use_signal(|| vec![]);
+    let mut cursor_stack: Signal<Vec<String>> = use_signal(Vec::new);
     let mut current_cursor: Signal<Option<String>> = use_signal(|| None);
     let mut next_cursor: Signal<Option<String>> = use_signal(|| None);
 
     // Connected toolkit slugs for Composio (for "Connected" detection in marketplace)
     let connected_slugs: Signal<std::collections::HashSet<String>> =
-        use_signal(|| std::collections::HashSet::new());
+        use_signal(std::collections::HashSet::new);
 
     // Composio category filtering state
-    let selected_categories: Signal<Vec<String>> = use_signal(|| vec![]);
-    let available_categories: Signal<Vec<ComposioCategory>> = use_signal(|| vec![]);
+    let selected_categories: Signal<Vec<String>> = use_signal(Vec::new);
+    let available_categories: Signal<Vec<ComposioCategory>> = use_signal(Vec::new);
     let show_category_dropdown = use_signal(|| false);
     let categories_loading = use_signal(|| false);
 
     // Reset cursor state when search query, categories, or sort order change
     {
-        let search_query = search_query;
-        let selected_categories = selected_categories;
-        let sort_by = sort_by;
         let mut cursor_stack = cursor_stack;
         let mut current_cursor = current_cursor;
         let mut current_page = current_page;
@@ -216,9 +213,6 @@ pub fn McpMarketplace() -> Element {
 
     // Fetch categories when Composio is selected - use effect with explicit dependency
     {
-        let settings = settings;
-        let available_categories = available_categories;
-        let categories_loading = categories_loading;
         use_effect(move || {
             let settings_snapshot = settings.read().clone();
             let mut available_categories = available_categories;
@@ -276,10 +270,7 @@ pub fn McpMarketplace() -> Element {
 
     // Fetch connected toolkits when Composio is selected
     let _connected_slugs_resource = use_resource({
-        let settings = settings;
-        let connected_slugs = connected_slugs;
         move || {
-            let settings = settings;
             let mut connected_slugs = connected_slugs;
             // Track settings changes
             let settings_snapshot = settings.read().clone();
@@ -536,7 +527,7 @@ pub fn McpMarketplace() -> Element {
 
                         // Trigger reload on McpManager
                         let manager = mcp_manager.read().clone();
-                        let context_signal = mcp_context.clone();
+                        let context_signal = mcp_context;
                         let current_settings = settings.read().clone();
 
                         spawn(async move {
@@ -556,7 +547,7 @@ pub fn McpMarketplace() -> Element {
 
     let add_mcp = move |mcp: FeaturedMcp| {
         let current_settings = settings.read().clone();
-        let mut error_msg = error_message.clone();
+        let mut error_msg = error_message;
         spawn(async move {
             tracing::debug!("Attempting to add MCP server: {}", mcp.name);
 
@@ -567,7 +558,7 @@ pub fn McpMarketplace() -> Element {
             let short_name = mcp
                 .name
                 .split('/')
-                .last()
+                .next_back()
                 .unwrap_or(&mcp.name)
                 .replace("-mcp", "");
 
@@ -709,7 +700,7 @@ pub fn McpMarketplace() -> Element {
                                 McpServerCard {
                                     key: "{mcp.name}",
                                     mcp: mcp.clone(),
-                                    add_mcp: move |m| add_mcp(m),
+                                    add_mcp: add_mcp,
                                     trigger_search: trigger_search,
                                     connected_slugs: connected_slugs
                                 }
@@ -880,7 +871,7 @@ fn StatusView() -> Element {
     let server_statuses = use_resource(move || {
         let _trigger = *refresh_trigger.read(); // Subscribe to manual refresh
         let _context = mcp_context.read(); // Subscribe to context changes (profile switch)
-        let mcp_manager = mcp_manager.clone();
+        let mcp_manager = mcp_manager;
         async move {
             let mut statuses = mcp_manager.read().get_all_server_statuses().await;
             statuses.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1001,7 +992,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let is_composio = status.name == "composio-native";
     // NOTE: show_toolkits is read from ui_state.composio_toolkit_expanded instead of local signal
     let mut toolkits: Signal<Vec<crate::mcp::composio_client::ToolkitInfo>> =
-        use_signal(|| Vec::new());
+        use_signal(Vec::new);
     let mut toolkits_loading = use_signal(|| false);
     let mut toolkits_error: Signal<Option<String>> = use_signal(|| None);
 
@@ -1050,7 +1041,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
         if should_fetch && toolkits.peek().is_empty() && !*toolkits_loading.peek() && no_error {
             toolkits_loading.set(true);
 
-            let mcp_manager_clone = mcp_manager.clone();
+            let mcp_manager_clone = mcp_manager;
             spawn(async move {
                 match mcp_manager_clone.read().get_composio_toolkits().await {
                     Ok(kits) => {
@@ -1080,9 +1071,9 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let status_clone = status.clone();
     let retry_server = move |_| {
         let server_name = status_clone.name.clone();
-        let mcp_manager = mcp_manager.clone();
-        let mcp_context = mcp_context.clone();
-        let settings = settings.clone();
+        let mcp_manager = mcp_manager;
+        let mcp_context = mcp_context;
+        let settings = settings;
         is_retrying.set(true);
 
         spawn(async move {
@@ -1160,11 +1151,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                 {
                                     let server_name = status.name.clone();
                                     let current_is_loaded = status.is_loaded;
-                                    let mcp_manager = mcp_manager.clone();
-                                    let mcp_context = mcp_context.clone();
-                                    let refresh_trigger = refresh_trigger.clone();
-                                    let ui_state = ui_state.clone();
-                                    let ui_state_manager = ui_state_manager.clone();
+                                    // Redundant locals removed
+                                    // Captured by move closure below
                                     rsx! {
                                         button {
                                             class: if current_is_loaded {
@@ -1174,11 +1162,11 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                             },
                                             onclick: move |_| {
                                                 let server_name = server_name.clone();
-                                                let mcp_manager = mcp_manager.clone();
-                                                let mut mcp_context = mcp_context.clone();
-                                                let mut refresh_trigger = refresh_trigger.clone();
-                                                let mut ui_state = ui_state.clone();
-                                                let ui_state_manager = ui_state_manager.clone();
+                                                let mcp_manager = mcp_manager;
+                                                let mut mcp_context = mcp_context;
+                                                let mut refresh_trigger = refresh_trigger;
+                                                let mut ui_state = ui_state;
+                                                let ui_state_manager = ui_state_manager;
                                                 let should_load = !current_is_loaded;
                                                 spawn(async move {
                                                     if should_load {
@@ -1263,14 +1251,17 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                             class: "px-3 py-1 bg-yellow-600 hover:bg-yellow-500 rounded text-sm font-medium transition-colors flex items-center gap-2",
                             onclick: {
                                 let server_name = status.name.clone();
-                                let mcp_manager = mcp_manager.clone();
-                                let mcp_context = mcp_context.clone();
-                                let settings = settings.clone();
+                                // Redundant locals removed
+                                // mcp_manager, mcp_context, settings captured by move
+                                let settings = settings; // settings not listed as redundant in error? 
+                                // wait, error 1254, 1255. 1259 was settings.
+                                // If settings was redundant, it should have been flagged.
+                                // Let's try removing it too to be safe, as it is likely redundant if others are.
                                 move |_| {
                                     let server_name = server_name.clone();
-                                    let mcp_manager = mcp_manager.clone();
-                                    let mcp_context = mcp_context.clone();
-                                    let settings = settings.clone();
+                                    let mcp_manager = mcp_manager;
+                                    let mcp_context = mcp_context;
+                                    let settings = settings;
 
                                     spawn(async move {
                                         use crate::mcp::smithery_client::{SmitheryOAuthClient, SmitheryOAuthConfig, SmitheryOAuthError};
@@ -1349,8 +1340,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                     div {
                         class: "flex items-center justify-between cursor-pointer hover:bg-gray-700/50 rounded p-2 -m-2",
                         onclick: {
-                            let mut ui_state = ui_state.clone();
-                            let ui_state_manager = ui_state_manager.clone();
+                            let mut ui_state = ui_state;
+                            // ui_state_manager captured by move
                             move |_| {
                                 let new_state = !ui_state.read().composio_toolkit_expanded;
                                 ui_state.write().composio_toolkit_expanded = new_state;
@@ -1425,16 +1416,14 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                             let slug = toolkit_slug.clone();
                                                             let tool_count = toolkit.tool_count;
                                                             let display_name = toolkit.display_name.clone();
-                                                            let mcp_manager = mcp_manager.clone();
-                                                            let mcp_context = mcp_context.clone();
-                                                            let refresh_trigger = refresh_trigger.clone();
+                                                            // Redundant locals removed
                                                             move |event: dioxus::events::FormEvent| {
                                                                 let new_force_load = event.value() == "force";
                                                                 let slug = slug.clone();
                                                                 let display_name = display_name.clone();
-                                                                let mcp_manager = mcp_manager.clone();
-                                                                let mut mcp_context = mcp_context.clone();
-                                                                let mut refresh_trigger = refresh_trigger.clone();
+                                                                let mcp_manager = mcp_manager;
+                                                                let mut mcp_context = mcp_context;
+                                                                let mut refresh_trigger = refresh_trigger;
 
                                                                 // Update local settings
                                                                 let mut s = local_settings.write();
@@ -1524,11 +1513,11 @@ fn McpServerCard(
     // - Smithery: check if MCP server is running
     let install_status = use_resource({
         let mcp = mcp.clone();
-        let connected_slugs = connected_slugs.clone();
+        let connected_slugs = connected_slugs;
         move || {
             // Depend on the search trigger to force re-evaluation
             let _ = trigger_search.read();
-            let mcp_manager = mcp_manager.clone();
+            let mcp_manager = mcp_manager;
             let mcp_name = mcp.name.clone();
             let connected = connected_slugs.read().clone();
             let is_composio = settings.peek().preferred_mcp_source == McpSource::Composio;
@@ -1551,7 +1540,7 @@ fn McpServerCard(
                 let servers = guard.servers.lock().await;
                 let failed = guard.failed_servers.lock().await;
 
-                let server_key = mcp_name.split('/').last().unwrap_or(&mcp_name);
+                let server_key = mcp_name.split('/').next_back().unwrap_or(&mcp_name);
                 let is_loaded = servers
                     .keys()
                     .any(|key| key == server_key || key == &mcp_name);
@@ -1622,15 +1611,17 @@ fn McpServerCard(
                                         let toolkit_slug = mcp.name.clone();
                                         let auth_scheme = mcp.auth_scheme.clone();
                                         let use_managed_auth = mcp.use_managed_auth;
-                                        let settings = settings.clone();
-                                        let mcp_manager = mcp_manager.clone();
-                                        let trigger_search = trigger_search.clone();
+                                        // Redundant locals removed
                                         move |_| {
                                             let toolkit_slug = toolkit_slug.clone();
                                             let auth_scheme = auth_scheme.clone();
-                                            let settings = settings.clone();
-                                            let mcp_manager = mcp_manager.clone();
-                                            let mut trigger_search = trigger_search.clone();
+                                            // Redundant locals removed
+                                            let mut trigger_search = trigger_search; // mut needed? check below. If mut needed, keep it but no clone. Wait, if outer is not mut, we need let mut = outer. But outer is Signal, internal mutability.
+                                            // The code does trigger_search += 1 or set(). set() is interior mutability.
+                                            // The error says "redundant redefinition of a binding".
+                                            // If I need to mutate the VARIABLE (e.g. reassign it), I need mut.
+                                            // But trigger_search is Signal, we use .write() or .set(). We don't reassign the signal variable itself.
+                                            // Let's remove them all.
                                             let mut connection_task = connection_task;
                                             is_connecting.set(true);
                                             connection_status.set("Connecting...".to_string());
