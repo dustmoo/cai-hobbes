@@ -97,6 +97,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 "focus_chat" => chat_command.set(Some(ChatCommand::FocusChat)),
                 "scroll_bottom" => chat_command.set(Some(ChatCommand::ScrollToBottom)),
                 "delete_session" => chat_command.set(Some(ChatCommand::DeleteSession)),
+                "cancel_generation" => chat_command.set(Some(ChatCommand::CancelGeneration)),
                 // Profile switching
                 s if s.starts_with("switch_profile_") => {
                     if let Ok(idx) = s.replace("switch_profile_", "").parse::<usize>() {
@@ -151,6 +152,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                             // Special keys mapping
                             if (lastPart === ',') return e.key === ',';
                             if (lastPart === '/') return e.key === '/';
+                            if (lastPart === '.') return e.key === '.';
                             if (lastPart === 'space') return e.code === 'Space';
                             if (lastPart === 'arrowdown') return e.key === 'ArrowDown' || e.code === 'ArrowDown';
                             
@@ -173,6 +175,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                         else if (check(config.toggle_new_chat_with_memory, event)) action = "new_chat_memory";
                         else if (check(config.toggle_focus_chat, event)) action = "focus_chat";
                         else if (check(config.toggle_scroll_to_bottom, event)) action = "scroll_bottom";
+                        else if (check(config.cancel_generation, event)) action = "cancel_generation";
                         
                         // Delete Session (Cmd+Backspace or Cmd+Delete)
                         else if ((event.metaKey || event.ctrlKey) && (event.key === 'Backspace' || event.key === 'Delete')) {{
@@ -230,5 +233,136 @@ fn switch_profile_by_index(
                 tracing::error!("Failed to save profile switch: {}", e);
             }
         }
+    }
+}
+
+/// Checks if a Dioxus KeyboardEvent matches a hotkey string (e.g. "CmdOrCtrl+Enter").
+pub fn matches_hotkey(evt: &KeyboardEvent, hotkey_str: &str) -> bool {
+    matches_hotkey_internal(evt.modifiers(), &evt.key(), hotkey_str)
+}
+
+/// Internal logic for hotkey matching, decoupled from Event wrapper for testing.
+pub fn matches_hotkey_internal(modifiers: Modifiers, key: &Key, hotkey_str: &str) -> bool {
+    let parts: Vec<&str> = hotkey_str.split('+').collect();
+    if parts.is_empty() {
+        return false;
+    }
+
+    // Parsing Config
+    let has_cmd_or_ctrl = parts.iter().any(|p| {
+        let s = p.to_lowercase();
+        s == "cmdorctrl" || s == "cmd" || s == "ctrl" || s == "meta" || s == "control"
+    });
+    let has_shift = parts.iter().any(|p| p.to_lowercase() == "shift");
+    let has_alt = parts.iter().any(|p| {
+        let s = p.to_lowercase();
+        s == "alt" || s == "option"
+    });
+
+    // Parsing Event
+    let evt_cmd = modifiers.contains(Modifiers::SUPER);
+    let evt_ctrl = modifiers.contains(Modifiers::CONTROL);
+    let evt_shift = modifiers.contains(Modifiers::SHIFT);
+    let evt_alt = modifiers.contains(Modifiers::ALT);
+
+    // 1. Modifier Check
+    // The presence of the modifier in config must match the presence in event.
+    // "CmdOrCtrl" conflates Command and Control into a single "Primary" modifier.
+    if has_cmd_or_ctrl != (evt_cmd || evt_ctrl) {
+        return false;
+    }
+    if has_shift != evt_shift {
+        return false;
+    }
+    if has_alt != evt_alt {
+        return false;
+    }
+
+    // 2. Key Check
+    // The last part implies the key.
+    if let Some(target_key_part) = parts.last() {
+        let target = target_key_part.trim().to_lowercase();
+        match target.as_str() {
+            "enter" => *key == Key::Enter,
+            "escape" | "esc" => *key == Key::Escape,
+            "backspace" => *key == Key::Backspace,
+            "delete" => *key == Key::Delete,
+            "arrowup" => *key == Key::ArrowUp,
+            "arrowdown" => *key == Key::ArrowDown,
+            "arrowleft" => *key == Key::ArrowLeft,
+            "arrowright" => *key == Key::ArrowRight,
+            "tab" => *key == Key::Tab,
+            "space" => matches!(key, Key::Character(c) if c == " ") || *key == Key::Character("Space".to_string()),
+            k => {
+                // Character match (case-insensitive)
+                match key {
+                    Key::Character(c) => c.to_lowercase() == k,
+                    _ => false,
+                }
+            }
+        }
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dioxus::prelude::*;
+
+    #[test]
+    fn test_simple_hotkeys() {
+        // Cmd+Enter
+        assert!(matches_hotkey_internal(
+            Modifiers::SUPER,
+            &Key::Enter,
+            "CmdOrCtrl+Enter"
+        ));
+
+        // Ctrl+Enter (should also match CmdOrCtrl)
+        assert!(matches_hotkey_internal(
+            Modifiers::CONTROL,
+            &Key::Enter,
+            "CmdOrCtrl+Enter"
+        ));
+
+        // Shift+Enter != Cmd+Enter
+        assert!(!matches_hotkey_internal(
+            Modifiers::SHIFT,
+            &Key::Enter,
+            "CmdOrCtrl+Enter"
+        ));
+    
+        // Cmd+Shift+Enter
+        assert!(matches_hotkey_internal(
+            Modifiers::SUPER | Modifiers::SHIFT,
+            &Key::Enter,
+            "CmdOrCtrl+Shift+Enter"
+        ));
+
+        // Cmd+S
+        assert!(matches_hotkey_internal(
+            Modifiers::SUPER,
+            &Key::Character("s".to_string()),
+            "CmdOrCtrl+S"
+        ));
+        
+        // Case insensitive S
+        assert!(matches_hotkey_internal(
+            Modifiers::SUPER,
+            &Key::Character("S".to_string()),
+            "CmdOrCtrl+s"
+        ));
+    }
+
+    #[test]
+    fn test_period_hotkey() {
+        // Cmd+. (Cancel Generation)
+        assert!(matches_hotkey_internal(
+            Modifiers::SUPER,
+            &Key::Character(".".to_string()),
+            "CmdOrCtrl+."
+        ));
     }
 }

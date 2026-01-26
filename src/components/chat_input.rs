@@ -15,6 +15,7 @@ use hobbes_core::models::Attachment;
 
 use crate::components::focus_context::FocusContext;
 use crate::components::shared::ChatBarIconButton;
+use crate::hotkey::matches_hotkey;
 use crate::processing::summarization_scheduler::SchedulerSignal;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +30,7 @@ pub enum ChatCommand {
     ScrollToBottom,
     FocusChat,
     DeleteSession,
+    CancelGeneration,
 }
 
 #[component]
@@ -158,6 +160,12 @@ pub fn ChatInput(
                 }
                 ChatCommand::DeleteSession => {
                     // Handled by SessionManager
+                }
+                ChatCommand::CancelGeneration => {
+                    if *is_sending.read() {
+                        tracing::info!("ChatCommand::CancelGeneration triggered");
+                        on_cancel.call(());
+                    }
                 }
             }
             // Reset command to avoid re-triggering
@@ -437,16 +445,27 @@ pub fn ChatInput(
 
                         scheduler.send(SchedulerSignal::Activity);
                         let modifiers = event.data.modifiers();
+                        let hotkeys = _settings.read().hotkeys.clone();
 
-                        // Allow SUPER/CONTROL/ALT only if it's a specific key we want to handle with modifiers (like Enter),
-                        // otherwise block them to let OS/Global Hotkeys handle them.
-                        // We strictly want to allow Cmd+Enter to pass through to the handler below.
-                        let is_force_submit_candidate = event.key() == Key::Enter && (modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL));
-
-                        if !is_force_submit_candidate && (modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::ALT)) {
+                        // 1. Check Configurable Hotkeys
+                        if matches_hotkey(&event, &hotkeys.cancel_generation) {
+                            if *is_sending.read() {
+                                event.prevent_default();
+                                on_cancel.call(());
+                            }
                             return;
                         }
 
+                        let is_force_submit = matches_hotkey(&event, &hotkeys.submit_chat);
+                        
+                        // 2. Filter Global Modifiers
+                        // Allow if it matches our force submit (e.g. Cmd+Enter), otherwise let browser/OS handle Cmd+X, Cmd+R, etc.
+                        let has_cmd_opt_ctrl = modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::ALT);
+                        if has_cmd_opt_ctrl && !is_force_submit {
+                            return;
+                        }
+
+                        // 3. Tab Handling (Indentation)
                         if event.key() == Key::Tab {
                             event.prevent_default();
                             let script = if modifiers.contains(Modifiers::SHIFT) {
@@ -484,16 +503,14 @@ pub fn ChatInput(
                             return;
                         }
 
-                        if event.key() == Key::Enter {
-                            let is_explicit_submit = modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL);
-                            let is_shift = modifiers.contains(Modifiers::SHIFT);
+                        // 4. Submit Handling
+                        let is_standard_submit = event.key() == Key::Enter && !modifiers.contains(Modifiers::SHIFT);
 
-                            // Submit if standard Enter (no shift) OR explicit Cmd+Enter (Force Submit)
-                            if (!is_shift) || is_explicit_submit {
-                                event.prevent_default();
-                                on_interaction.call(());
-                                send_message();
-                            }
+                        // Submit if standard Enter (no shift) OR Force Submit matches
+                        if is_standard_submit || is_force_submit {
+                            event.prevent_default();
+                            on_interaction.call(());
+                            send_message();
                         }
                     },
                     onpaste: move |_| {

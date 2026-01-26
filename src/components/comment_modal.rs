@@ -1,5 +1,7 @@
 use crate::components::chat::{Comment, Message};
 use crate::components::focus_context::FocusContext;
+use crate::hotkey::matches_hotkey;
+use crate::settings::Settings;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use uuid::Uuid;
@@ -14,6 +16,7 @@ pub fn CommentModal(
     let mut selected_text = use_signal(String::new);
     let mut comments = use_signal(|| message.comments.clone());
     let mut focus_context = use_context::<Signal<FocusContext>>();
+    let settings = use_context::<Signal<Settings>>();
     // Claim focus when modal mounts
     use_effect(move || {
         focus_context.set(FocusContext::CommentModal);
@@ -41,14 +44,11 @@ pub fn CommentModal(
                 if evt.key() == Key::Escape {
                     focus_context.set(FocusContext::ChatInput);
                     on_close.call(());
-                } else if evt.key() == Key::Enter {
-                    let modifiers = evt.modifiers();
-                    if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
-                        evt.prevent_default();
-                        on_save.call(comments());
-                        focus_context.set(FocusContext::ChatInput);
-                        on_close.call(());
-                    }
+                } else if matches_hotkey(&evt, &settings.read().hotkeys.submit_chat) {
+                    evt.prevent_default();
+                    on_save.call(comments());
+                    focus_context.set(FocusContext::ChatInput);
+                    on_close.call(());
                 }
             },
             div {
@@ -59,14 +59,11 @@ pub fn CommentModal(
                     if evt.key() == Key::Escape {
                         focus_context.set(FocusContext::ChatInput);
                         on_close.call(());
-                    } else if evt.key() == Key::Enter {
-                        let modifiers = evt.modifiers();
-                        if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
-                            evt.prevent_default();
-                            on_save.call(comments());
-                            focus_context.set(FocusContext::ChatInput);
-                            on_close.call(());
-                        }
+                    } else if matches_hotkey(&evt, &settings.read().hotkeys.submit_chat) {
+                        evt.prevent_default();
+                        on_save.call(comments());
+                        focus_context.set(FocusContext::ChatInput);
+                        on_close.call(());
                     }
                 },
 
@@ -145,15 +142,12 @@ pub fn CommentModal(
                                 evt.stop_propagation();
                                 focus_context.set(FocusContext::ChatInput);
                                 on_close.call(());
-                            } else if evt.key() == Key::Enter {
-                                let modifiers = evt.modifiers();
-                                if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
-                                    evt.prevent_default();
-                                    evt.stop_propagation();
-                                    on_save.call(comments());
-                                    focus_context.set(FocusContext::ChatInput);
-                                    on_close.call(());
-                                }
+                            } else if matches_hotkey(&evt, &settings.read().hotkeys.submit_chat) {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                                on_save.call(comments());
+                                focus_context.set(FocusContext::ChatInput);
+                                on_close.call(());
                             }
                         }
                     }

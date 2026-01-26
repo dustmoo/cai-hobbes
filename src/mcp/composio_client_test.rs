@@ -323,4 +323,86 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
             "connected_account_id should NOT be in the body (Pure MCP Payload mandate)"
         );
     }
+
+    #[tokio::test]
+    async fn test_list_tools_pagination() {
+        let mock_server = MockServer::start().await;
+
+        let client = ComposioClient::new(
+            "test-key".to_string(),
+            mock_server.uri(),
+            Some("default".to_string()),
+            None,
+            "test-profile-id".to_string(),
+        );
+
+        // Mock Page 1
+        let page1_response = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "items": [
+                    { "name": "TOOL_1", "toolkit": { "slug": "test" } },
+                    { "name": "TOOL_2", "toolkit": { "slug": "test" } }
+                ],
+                "nextCursor": "page_2_cursor"
+            }
+        });
+
+        // Mock Page 2
+        let page2_response = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "items": [
+                    { "name": "TOOL_3", "toolkit": { "slug": "test" } }
+                ],
+                "nextCursor": null
+            }
+        });
+
+        // Use wiremock to match based on body params
+        // Matcher for Page 1 (no cursor or initial request)
+        // We can't strictly match "no cursor" easily with body_string_contains,
+        // so we'll match based on the absence of "page_2_cursor"
+        Mock::given(method("POST"))
+            .and(path_regex("/.*"))
+            .and(wiremock::matchers::body_string_contains("tools/list"))
+            .and(wiremock::matchers::body_string_contains("limit")) // Ensure limit is set
+            .and(move |req: &wiremock::Request| {
+                let body_str = std::str::from_utf8(&req.body).unwrap();
+                !body_str.contains("page_2_cursor")
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(page1_response))
+            .mount(&mock_server)
+            .await;
+
+        // Matcher for Page 2 (has cursor)
+        Mock::given(method("POST"))
+            .and(path_regex("/.*"))
+            .and(wiremock::matchers::body_string_contains("tools/list"))
+            .and(wiremock::matchers::body_string_contains("page_2_cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page2_response))
+            .mount(&mock_server)
+            .await;
+
+        let tools = client.list_tools().await.expect("Failed to list tools");
+
+        assert_eq!(tools.tools.len(), 3, "Should have fetched 3 tools total across 2 pages");
+        assert_eq!(tools.tools[0].name, "TOOL_1");
+        assert_eq!(tools.tools[1].name, "TOOL_2");
+        assert_eq!(tools.tools[2].name, "TOOL_3");
+
+        // Verify request payload purity (Pattern: Pure MCP Payload)
+        let requests = mock_server.received_requests().await.unwrap();
+        for req in requests {
+             let body_str = std::str::from_utf8(&req.body).unwrap();
+             if body_str.contains("tools/list") {
+                 let body: serde_json::Value = serde_json::from_str(body_str).unwrap();
+                 let params = body["params"].as_object().unwrap();
+                 assert!(params.contains_key("limit"), "Optimization: Should request limit");
+                 assert!(!params.contains_key("user_id"), "Mandate: Body must NOT contain user_id");
+             }
+        }
+    }
 }

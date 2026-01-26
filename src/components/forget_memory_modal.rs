@@ -44,7 +44,11 @@ pub fn ForgetMemoryModal(
 
         let user_instruction = instruction.read().clone();
         let current_context_val = current_context.clone();
-        let context_json = serde_json::to_string_pretty(&current_context_val).unwrap_or_default();
+        // Only serialize the conversation_summary - NOT the full ActiveContext
+        // The full ActiveContext includes mcp_tools which can be massive (all tool definitions)
+        let summary_json =
+            serde_json::to_string_pretty(&current_context_val.conversation_summary)
+                .unwrap_or_default();
         let settings_read = settings.read();
 
         // Clone the full config from state to preserve all fields (API key, etc.)
@@ -65,20 +69,20 @@ pub fn ForgetMemoryModal(
 
             let prompt = format!(
                 r#"You are an intelligent memory optimization assistant.
-Your task is to update the current 'ActiveContext' (JSON) based on the user's instructions to 'forget' or 'focus'.
+Your task is to update the conversation summary based on the user's instructions to 'forget' or 'focus'.
 
 User Instruction:
 "{}"
 
-Current Context:
+Current Conversation Summary:
 {}
 
 Return a JSON object with exactly two keys:
-- "optimized_context": The full updated ActiveContext JSON object.
-- "summary": A concise, structured markdown summary (max 3 lines) of what was removed, condensed, or added.
+- "optimized_summary": The updated ConversationSummary JSON object with fields: summary (string), sentiment (string), entities (object with user_name and other key-value pairs).
+- "description": A concise markdown description (max 2 lines) of what was changed.
 
-Ensure the "optimized_context" maintains the correct schema for ActiveContext."#,
-                user_instruction, context_json
+Ensure the "optimized_summary" maintains the correct schema."#,
+                user_instruction, summary_json
             );
 
             let request_body = GeminiRequest {
@@ -109,27 +113,34 @@ Ensure the "optimized_context" maintains the correct schema for ActiveContext."#
 
                             match serde_json::from_str::<serde_json::Value>(json_str) {
                                 Ok(val) => {
-                                    if let (Some(ctx_val), Some(summary_val)) =
-                                        (val.get("optimized_context"), val.get("summary"))
+                                    // Parse the optimized_summary and merge it back into the ActiveContext
+                                    if let (Some(summary_val), Some(desc_val)) =
+                                        (val.get("optimized_summary"), val.get("description"))
                                     {
-                                        match serde_json::from_value::<ActiveContext>(
-                                            ctx_val.clone(),
+                                        match serde_json::from_value::<
+                                            crate::session::ConversationSummary,
+                                        >(
+                                            summary_val.clone()
                                         ) {
-                                            Ok(new_ctx) => {
-                                                let summary = summary_val
+                                            Ok(new_summary) => {
+                                                // Create new ActiveContext with updated summary
+                                                let mut new_ctx = current_context_val.clone();
+                                                new_ctx.conversation_summary = new_summary;
+
+                                                let description = desc_val
                                                     .as_str()
                                                     .unwrap_or("Memory optimized.")
                                                     .to_string();
                                                 // Auto-apply immediately on success
-                                                on_apply.call((new_ctx, summary));
+                                                on_apply.call((new_ctx, description));
                                             }
                                             Err(e) => error_message.set(Some(format!(
-                                                "Failed to parse optimized context: {}",
+                                                "Failed to parse optimized summary: {}",
                                                 e
                                             ))),
                                         }
                                     } else {
-                                        error_message.set(Some("LLM response missing 'optimized_context' or 'summary' keys.".to_string()));
+                                        error_message.set(Some("LLM response missing 'optimized_summary' or 'description' keys.".to_string()));
                                     }
                                 }
                                 Err(e) => error_message

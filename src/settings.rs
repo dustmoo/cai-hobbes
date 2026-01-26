@@ -46,6 +46,10 @@ pub struct HotkeySettings {
     pub toggle_scroll_to_bottom: String,
     #[serde(default = "default_toggle_focus_chat")]
     pub toggle_focus_chat: String,
+    #[serde(default = "default_submit_chat")]
+    pub submit_chat: String,
+    #[serde(default = "default_cancel_generation")]
+    pub cancel_generation: String,
 }
 
 impl Default for HotkeySettings {
@@ -61,6 +65,8 @@ impl Default for HotkeySettings {
             toggle_new_chat_with_memory: default_toggle_new_chat_with_memory(),
             toggle_scroll_to_bottom: default_toggle_scroll_to_bottom(),
             toggle_focus_chat: default_toggle_focus_chat(),
+            submit_chat: default_submit_chat(),
+            cancel_generation: default_cancel_generation(),
         }
     }
 }
@@ -94,6 +100,12 @@ fn default_toggle_focus_chat() -> String {
 }
 fn default_toggle_scroll_to_bottom() -> String {
     "CmdOrCtrl+Shift+ArrowDown".to_string()
+}
+fn default_submit_chat() -> String {
+    "CmdOrCtrl+Enter".to_string()
+}
+fn default_cancel_generation() -> String {
+    "CmdOrCtrl+.".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -351,7 +363,7 @@ impl Default for Settings {
             gemini_config: GeminiConfig {
                 api_key: None,
                 chat_model: "gemini-2.5-pro".to_string(),
-                summary_model: "gemini-1.5-flash-latest".to_string(),
+                summary_model: "gemini-2.5-flash".to_string(),
                 thinking_enabled: false,
                 thinking_level: "high".to_string(),
                 thinking_budget: None,
@@ -632,6 +644,14 @@ impl SettingsManager {
             }
             if let Some(uid) = value.get("composio_user_id").and_then(|v| v.as_str()) {
                 settings.composio_user_id = Some(uid.to_string());
+            }
+
+            // AUTO-MIGRATION: Deprecated Model Check (Jan 2026)
+            // If the summary model is still the old default "gemini-1.5-flash-latest",
+            // automatically upgrade it to "gemini-2.5-flash".
+            if settings.gemini_config.summary_model == "gemini-1.5-flash-latest" {
+                tracing::info!("Migrating deprecated summary_model to gemini-2.5-flash");
+                settings.gemini_config.summary_model = "gemini-2.5-flash".to_string();
             }
         }
 

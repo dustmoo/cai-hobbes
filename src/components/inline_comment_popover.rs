@@ -1,3 +1,5 @@
+use crate::hotkey::matches_hotkey;
+use crate::settings::Settings;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
@@ -10,6 +12,7 @@ pub fn InlineCommentPopover(
     position_left: f64,
 ) -> Element {
     let mut comment_text = use_signal(|| initial_value.unwrap_or_default());
+    let settings = use_context::<Signal<Settings>>();
 
     rsx! {
         div {
@@ -29,17 +32,13 @@ pub fn InlineCommentPopover(
                 value: "{comment_text}",
                 oninput: move |e| comment_text.set(e.value()),
                 onkeydown: move |evt: KeyboardEvent| {
-                    if evt.key() == Key::Enter {
-                        let modifiers = evt.modifiers();
-                        // CMD+Enter or Shift+Enter = newline (don't submit)
-                        if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::SHIFT) {
-                            return;
-                        }
-                        // Plain Enter = submit
-                        if !comment_text().trim().is_empty() {
-                            evt.prevent_default();
-                            on_save.call(comment_text());
-                        }
+                    let hotkeys = settings.read().hotkeys.clone();
+                    let is_force_submit = matches_hotkey(&evt, &hotkeys.submit_chat);
+                    let is_standard_submit = evt.key() == Key::Enter && !evt.modifiers().contains(Modifiers::SHIFT);
+
+                    if (is_force_submit || is_standard_submit) && !comment_text().trim().is_empty() {
+                        evt.prevent_default();
+                        on_save.call(comment_text());
                     }
                 },
                 autofocus: true,

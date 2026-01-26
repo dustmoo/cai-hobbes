@@ -8,6 +8,7 @@ pub mod models;
 pub mod utils;
 
 use serde_json::Value;
+use crate::mcp::composio_client::discovery::DiscoveryResult;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -136,7 +137,7 @@ impl ComposioClient {
 
     // --- Discovery Module Delegates ---
 
-    pub async fn list_tools(&self) -> Result<Vec<ComposioTool>, String> {
+    pub async fn list_tools(&self) -> Result<DiscoveryResult, String> {
         discovery::list_tools(self).await
     }
 
@@ -187,14 +188,14 @@ impl ComposioClient {
     pub async fn list_tools_for_session(
         &self,
         force_load_slugs: &[String],
-    ) -> Result<Vec<ComposioTool>, String> {
+    ) -> Result<discovery::DiscoveryResult, String> {
         discovery::list_tools_for_session(self, force_load_slugs).await
     }
 
     pub async fn list_tools_filtered(
         &self,
         apps: Option<&[String]>,
-    ) -> Result<Vec<ComposioTool>, String> {
+    ) -> Result<discovery::DiscoveryResult, String> {
         discovery::list_tools_filtered(self, apps).await
     }
 

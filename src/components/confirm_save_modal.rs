@@ -1,4 +1,6 @@
 #![allow(non_snake_case)]
+use crate::hotkey::matches_hotkey;
+use crate::settings::Settings;
 use dioxus::prelude::*;
 
 #[derive(Props, PartialEq, Clone)]
@@ -13,6 +15,7 @@ pub struct ConfirmSaveModalProps {
 #[component]
 pub fn ConfirmSaveModal(props: ConfirmSaveModalProps) -> Element {
     let mut remember_choice = use_signal(|| false);
+    let settings = use_context::<Signal<Settings>>();
 
     if *props.is_visible.read() {
         rsx! {
@@ -34,12 +37,9 @@ pub fn ConfirmSaveModal(props: ConfirmSaveModalProps) -> Element {
                     move |evt: KeyboardEvent| {
                         if evt.key() == Key::Escape {
                             on_cancel.call(());
-                        } else if evt.key() == Key::Enter {
-                            let modifiers = evt.modifiers();
-                            if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
-                                evt.prevent_default();
-                                on_confirm.call(*remember_choice.read());
-                            }
+                        } else if matches_hotkey(&evt, &settings.read().hotkeys.submit_chat) {
+                            evt.prevent_default();
+                            on_confirm.call(*remember_choice.read());
                         }
                     }
                 },
@@ -55,12 +55,9 @@ pub fn ConfirmSaveModal(props: ConfirmSaveModalProps) -> Element {
                         move |evt: KeyboardEvent| {
                             if evt.key() == Key::Escape {
                                 on_cancel.call(());
-                            } else if evt.key() == Key::Enter {
-                                let modifiers = evt.modifiers();
-                                if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
-                                    evt.prevent_default();
-                                    on_confirm.call(*remember_choice.read());
-                                }
+                            } else if matches_hotkey(&evt, &settings.read().hotkeys.submit_chat) {
+                                evt.prevent_default();
+                                on_confirm.call(*remember_choice.read());
                             }
                         }
                     },

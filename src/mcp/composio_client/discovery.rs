@@ -3,8 +3,14 @@ use super::models::*;
 use super::utils::write_to_debug_file;
 use super::ComposioClient;
 
+#[derive(Debug, Default, Clone)]
+pub struct DiscoveryResult {
+    pub tools: Vec<ComposioTool>,
+    pub warning: Option<String>,
+}
+
 /// List all available tools from Composio (via MCP Protocol endpoint)
-pub async fn list_tools(client: &ComposioClient) -> Result<Vec<ComposioTool>, String> {
+pub async fn list_tools(client: &ComposioClient) -> Result<DiscoveryResult, String> {
     // Use the MCP Protocol endpoint - returns only tools configured for this specific server
     // CRITICAL: Do NOT include x-api-key header - the URL itself (containing server UUID) is the auth
     // See KI troubleshooting item #58 for details on why x-api-key causes 401 errors here
@@ -13,59 +19,118 @@ pub async fn list_tools(client: &ComposioClient) -> Result<Vec<ComposioTool>, St
 
     tracing::debug!("Fetching tools via MCP Protocol from {}", mcp_url);
 
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "tools/list",
-        "id": "1",
-        "params": {}
-    });
+    let mut all_tools = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut page_count = 0;
+    // Safety limit to prevent infinite loops
+    const MAX_PAGES: i32 = 100;
+    let mut warning_message = None;
 
-    let response = client
-        .client
-        .post(&mcp_url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        // No x-api-key header - MCP URL is the authentication (see troubleshooting #58)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        tracing::error!(
-            "Failed to fetch tools via MCP Protocol. Status: {}, Body: {}",
-            status,
-            text
-        );
-        return Err(format!("MCP Protocol error ({}): {}", status, text));
-    }
-
-    tracing::debug!(
-        "Got MCP Protocol response with status: {}",
-        response.status()
-    );
-
-    // Get the response body as text
-    let response_text = response.text().await.map_err(|e| e.to_string())?;
-
-    // Write the response to a file for detailed analysis
-    if let Err(e) = write_to_debug_file("composio_tools_response.json", &response_text) {
-        tracing::error!("Failed to write response to debug file: {}", e);
-    } else {
-        tracing::debug!("Wrote response to debug_logs/composio_tools_response.json");
-    }
-
-    // Parse tool response and cache - parse_tools_response handles SSE format
-    match parse_tools_response(client, &response_text) {
-        Ok(tools) => {
-            tracing::trace!("Loaded {} tools from MCP Protocol", tools.len());
-            cache_tools(client, &tools);
-            Ok(tools)
+    loop {
+        page_count += 1;
+        if page_count > MAX_PAGES {
+            tracing::warn!("Hit max page limit ({}) while fetching tools, stopping.", MAX_PAGES);
+            warning_message = Some(format!("Tool limit reached ({} pages). Some tools may be missing - please narrow your scope.", MAX_PAGES));
+            break;
         }
-        Err(e) => Err(e),
+
+        let mut params = serde_json::Map::new();
+        // Pagination logic: add limit and cursor if present
+        params.insert("limit".to_string(), serde_json::Value::Number(50.into()));
+        if let Some(c) = &cursor {
+            params.insert("cursor".to_string(), serde_json::Value::String(c.clone()));
+        }
+
+        // CRITICAL: Pure MCP Payload Mandate - do NOT inject user_id into params here.
+        // It is handled by the URL query parameter.
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/list",
+            "id": "1",
+            "params": params
+        });
+
+        let response = client
+            .client
+            .post(&mcp_url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            // No x-api-key header - MCP URL is the authentication (see troubleshooting #58)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            tracing::error!(
+                "Failed to fetch tools via MCP Protocol. Status: {}, Body: {}",
+                status,
+                text
+            );
+            return Err(format!("MCP Protocol error ({}): {}", status, text));
+        }
+
+        tracing::debug!(
+            "Got MCP Protocol response (page {}) with status: {}",
+            page_count,
+            response.status()
+        );
+
+        // Get the response body as text
+        let response_text = response.text().await.map_err(|e| e.to_string())?;
+
+        // Write the response to a file for detailed analysis (only first page to avoid spam)
+        if page_count == 1 {
+            if let Err(e) = write_to_debug_file("composio_tools_response.json", &response_text) {
+                tracing::error!("Failed to write response to debug file: {}", e);
+            } else {
+                tracing::debug!("Wrote response to debug_logs/composio_tools_response.json");
+            }
+        }
+
+        // Parse tool response and cache - parse_tools_response handles SSE format
+        // We need a way to extract the cursor from the response.
+        // Since `parse_tools_response` returns Vec<ComposioTool>, we need to inspect the raw response first
+        // or modify `parse_tools_response`.
+        // Ideally we refactor `parse_tools_response` to return a `PaginatedToolResult` but that breaks other callers.
+        // Instead, let's parse the raw JSON here for the cursor, then use `parse_tools_response` for the tools.
+
+        // Quick parse for next_cursor using the helper we added to models
+        let next_cursor = match parse_pagination_cursor(client, &response_text) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to parse pagination cursor: {}", e);
+                None
+            }
+        };
+
+        match parse_tools_response(client, &response_text) {
+            Ok(tools) => {
+                tracing::trace!("Loaded {} tools from page {}", tools.len(), page_count);
+                if tools.is_empty() {
+                    // If no tools returned, stop pagination even if cursor exists (prevent empty loops)
+                    break;
+                }
+                all_tools.extend(tools);
+            }
+            Err(e) => return Err(e),
+        }
+
+        cursor = next_cursor;
+        if cursor.is_none() {
+            break;
+        }
     }
+
+    tracing::info!("Total tools loaded from MCP Protocol: {}", all_tools.len());
+    cache_tools(client, &all_tools);
+    Ok(DiscoveryResult {
+        tools: all_tools,
+        warning: warning_message,
+    })
 }
 
 /// Get information about connected toolkits for UI display
@@ -86,7 +151,7 @@ pub async fn list_connected_toolkits(client: &ComposioClient) -> Result<Vec<Tool
 
     // MCP-First: Get tools from MCP endpoint (profile-scoped)
     let all_tools = match list_tools(client).await {
-        Ok(tools) => tools,
+        Ok(result) => result.tools,
         Err(e) => return Err(format!("Failed to list tools: {}", e)),
     };
 
@@ -292,7 +357,7 @@ pub async fn get_connected_toolkit_slugs(
     client: &ComposioClient,
 ) -> Result<std::collections::HashSet<String>, String> {
     // MCP-First: Get tools from MCP endpoint (profile-scoped)
-    let tools = list_tools(client).await?;
+    let tools = list_tools(client).await?.tools;
 
     let slugs: std::collections::HashSet<String> = tools
         .iter()
@@ -415,18 +480,23 @@ pub async fn get_toolkit_tools_detailed(
 pub async fn list_tools_filtered(
     client: &ComposioClient,
     toolkit_filter: Option<&[String]>,
-) -> Result<Vec<ComposioTool>, String> {
-    let all_tools = match list_tools(client).await {
-        Ok(tools) => tools,
-        Err(e) => return Err(format!("Failed to list tools: {}", e)),
-    };
+) -> Result<DiscoveryResult, String> {
+    // DiscoveryResult contains tools and warning
+    let discovery_result = list_tools(client).await?;
+    let all_tools = discovery_result.tools;
 
     let Some(filter_slugs) = toolkit_filter else {
-        return Ok(all_tools);
+        return Ok(DiscoveryResult {
+            tools: all_tools,
+            warning: discovery_result.warning,
+        });
     };
 
     if filter_slugs.is_empty() {
-        return Ok(all_tools);
+        return Ok(DiscoveryResult {
+            tools: all_tools,
+            warning: discovery_result.warning,
+        });
     }
 
     // Filter tools to only those from specified toolkits
@@ -456,7 +526,10 @@ pub async fn list_tools_filtered(
         })
         .collect();
 
-    Ok(filtered)
+    Ok(DiscoveryResult {
+        tools: filtered,
+        warning: discovery_result.warning,
+    })
 }
 
 /// Search for tools matching a natural language query within specified toolkits
@@ -531,8 +604,9 @@ pub async fn search_tools(
 pub async fn list_tools_for_session(
     client: &ComposioClient,
     force_load_slugs: &[String],
-) -> Result<Vec<ComposioTool>, String> {
+) -> Result<DiscoveryResult, String> {
     let mut tools = Vec::new();
+    let mut warning = None;
 
     // 1. Add meta-tools for on-demand discovery (these are always included)
     tools.extend(get_meta_tools());
@@ -543,12 +617,13 @@ pub async fn list_tools_for_session(
             "Loading tools from force-loaded toolkits: {:?}",
             force_load_slugs
         );
-        let force_loaded = list_tools_filtered(client, Some(force_load_slugs)).await?;
+        let result = list_tools_filtered(client, Some(force_load_slugs)).await?;
+        warning = result.warning;
         tracing::trace!(
             "Loaded {} tools from force-loaded toolkits",
-            force_loaded.len()
+            result.tools.len()
         );
-        tools.extend(force_loaded);
+        tools.extend(result.tools);
     } else {
         tracing::info!("No force-loaded toolkits configured - only meta-tools available");
     }
@@ -558,7 +633,7 @@ pub async fn list_tools_for_session(
         tools.len(),
         2
     );
-    Ok(tools)
+    Ok(DiscoveryResult { tools, warning })
 }
 
 fn cache_tools(client: &ComposioClient, tools: &[ComposioTool]) {
@@ -669,6 +744,11 @@ fn parse_tools_response(
                         }) {
                             return Ok(tools);
                         }
+                        if let Ok(paginated) = serde_json::from_value::<PaginatedToolResult>(result.clone()) {
+                            if let Some(tools) = paginated.tools {
+                                return Ok(tools);
+                            }
+                        }
                     }
                     if let Some(tools) = json_obj
                         .get("tools")
@@ -699,5 +779,47 @@ fn parse_tools_response(
             Err(e) => return Err(e.to_string()),
         }
         Err("Failed to parse Composio response into a usable format".to_string())
+    }
+}
+
+fn parse_pagination_cursor(
+    _client: &ComposioClient,
+    response_text: &str,
+) -> Result<Option<String>, String> {
+    // Check if the response is in SSE format
+    let trimmed_response = response_text.trim();
+    let json_text = if trimmed_response.starts_with("event:") || trimmed_response.starts_with("data:") {
+        let data_start = response_text.find("data:").unwrap_or(0) + "data:".len();
+        response_text[data_start..].trim()
+    } else {
+        response_text
+    };
+
+    match serde_json::from_str::<serde_json::Value>(json_text) {
+        Ok(json_value) => {
+            if json_value.is_object() {
+                let json_obj = json_value.clone();
+                // Check standard JSON-RPC response
+                if json_obj.get("jsonrpc").is_some() {
+                    if let Ok(rpc_response) = serde_json::from_value::<
+                        JsonRpcResponse<PaginatedToolResult>,
+                    >(json_obj.clone())
+                    {
+                        if let Some(result) = rpc_response.result {
+                            return Ok(result.next_cursor);
+                        }
+                    }
+                }
+                // Check direct result object (fallback)
+                if let Some(result) = json_obj.get("result") {
+                    if let Ok(paginated) = serde_json::from_value::<PaginatedToolResult>(result.clone()) {
+                        return Ok(paginated.next_cursor);
+                    }
+                }
+            }
+            // Array responses don't support pagination
+            Ok(None)
+        }
+        Err(e) => Err(e.to_string()),
     }
 }

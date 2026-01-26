@@ -64,3 +64,6 @@ block2 = "0.6"
 core-foundation = "0.10"
 security-framework-sys = "2.11.0"
 objc2-security = { version = "0.3", features = ["SecAccessControl", "SecItem"] }
+
+[dev-dependencies]
+wiremock = "0.6.5"

@@ -1210,6 +1210,15 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                         if !status.description.is_empty() {
                             p { class: "text-sm text-gray-400 mt-1", "{status.description}" }
                         }
+                        if let Some(ref warning) = status.warning_message {
+                            div {
+                                class: "mt-2 p-2 bg-yellow-900/20 rounded border border-yellow-800",
+                                p {
+                                    class: "text-sm text-yellow-300 font-mono whitespace-pre-wrap break-all",
+                                    "⚠️ {warning}"
+                                }
+                            }
+                        }
                         if let Some(ref error) = status.error_message {
                             div {
                                 class: "mt-2 p-2 bg-red-900/20 rounded border border-red-800",
@@ -1501,12 +1510,14 @@ fn McpServerCard(
     let mcp_clone_for_add = mcp.clone();
     let mcp_manager = use_context::<Signal<McpManager>>();
     let settings = use_context::<Signal<Settings>>();
+    let mut mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
 
     // Connection state for Composio Connect button
     let mut is_connecting = use_signal(|| false);
     let mut connection_status: Signal<String> = use_signal(|| "Connect".to_string());
     let mut connection_error: Signal<Option<String>> = use_signal(|| None);
     let mut connection_task = use_signal(|| Option::<Task>::None);
+
 
     // Source-aware install detection:
     // - Composio: check if toolkit slug is in connected_slugs
@@ -1738,9 +1749,16 @@ fn McpServerCard(
                                                                     tracing::warn!("Failed to reload Composio tools after connection: {}", e);
                                                                 }
 
+                                                                // Update mcp_context with new tools (Pattern 150: MCP-First Status Mandate)
+                                                                let new_context = mcp_manager.read().get_mcp_context().await;
+                                                                mcp_context.set(new_context);
+                                                                // Invalidate cache for status display
+                                                                mcp_manager.read().invalidate_status_cache();
+
                                                                 // Trigger UI refresh
                                                                 let current = *trigger_search.peek();
                                                                 trigger_search.set(current + 1);
+
 
                                                                 // Update connected_slugs immediately so button shows "Connected"
                                                                 {

@@ -286,3 +286,11 @@ pub struct ToolExecuteResponse {
     #[serde(rename = "session_info")]
     pub session_info: Option<Value>,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct PaginatedToolResult {
+    #[serde(alias = "items")]
+    pub tools: Option<Vec<ComposioTool>>,
+    #[serde(alias = "nextCursor", alias = "next_cursor")]
+    pub next_cursor: Option<String>,
+}

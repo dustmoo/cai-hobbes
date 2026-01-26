@@ -75,6 +75,8 @@ These calls use the `x-api-key` header for authentication and are used for admin
 | `get_toolkit_tools()` | GET | `/api/v3/tools/enum` | Get tool names for a specific toolkit |
 | `get_toolkit_tools_detailed()` | GET | `/api/v3/tools/enum` | Get tool names + descriptions for smart selection |
 | `add_toolkit_to_server()` | PATCH | `/api/v3/mcp/{server_id}` | Add toolkit + auth_config binding to MCP server |
+| `list_mcp_servers()` | GET | `/api/v3/mcp/servers` | List available servers (Dynamic Lookup) |
+| `generate_mcp_user()` | POST | `/api/v3/mcp/servers/generate` | Bind user_id to server (Mandatory User Generation) |
 | `initiate_connection()` | POST | `/api/v3/connected_accounts/link` | Generate OAuth link URL for user authentication |
 
 ---
@@ -127,3 +129,5 @@ Output: https://backend.composio.dev/v3/mcp/0a4474b3-d8e6-4417-a848-0d0c867b20f4
    - `toolkits`: Array of **strings** (e.g., `["gmail", "slack"]`) - NOT objects
    - `auth_config_ids`: Array of auth config IDs to bind (e.g., `["ac_abc123"]`)
    - `allowed_tools`: Array of tool names to enable (accumulate, don't replace)
+
+6. **Mandatory User Generation** (Pattern 110): After patching a server, you MUST call `POST /api/v3/mcp/servers/generate` to bind the `user_id` to that server instance. Without this, tools will not be visible to the LLM.

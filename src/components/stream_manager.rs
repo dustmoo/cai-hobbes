@@ -27,6 +27,7 @@ pub struct StreamManagerContext {
     permission_manager: Signal<crate::context::permissions::PermissionManager>,
     pub stream_activity: Signal<u64>,
     pub is_sending: Signal<bool>,
+    pub content_generated: Signal<std::collections::HashSet<Uuid>>,
 }
 
 impl StreamManagerContext {
@@ -36,6 +37,10 @@ impl StreamManagerContext {
 
     pub fn is_generating(self, message_id: &Uuid) -> bool {
         self.active_stream_handles.read().contains_key(message_id)
+    }
+
+    pub fn has_generated_content(self, message_id: &Uuid) -> bool {
+        self.content_generated.read().contains(message_id)
     }
 
     pub fn is_any_generating(self) -> bool {
@@ -86,6 +91,11 @@ impl StreamManagerContext {
                         thought_signature,
                         thought_summary,
                     } => {
+                        // Mark as having generated content on first text chunk
+                        if !content.is_empty() {
+                            self.content_generated.write().insert(message_id);
+                        }
+                        
                         // Append the content to the buffer
                         let was_empty = final_text_for_this_turn.is_empty();
                         final_text_for_this_turn.push_str(&content);
@@ -180,6 +190,9 @@ impl StreamManagerContext {
                         break;
                     }
                     StreamMessage::ToolCall(mut tool_call) => {
+                        // Mark as generated since we got a tool call
+                        self.content_generated.write().insert(message_id);
+
                         // Attach any accumulated thinking summary to this tool call
                         if tool_call.thought_summary.is_none()
                             && thought_summary_for_this_turn.is_some()
@@ -467,6 +480,7 @@ impl StreamManagerContext {
                             .extend(collected_records.clone());
                     }
                     self.active_stream_handles.write().remove(&message_id);
+                    self.content_generated.write().remove(&message_id); // Cleanup
                     if let Err(e) = self.session_state.write().save() {
                         tracing::error!(
                             "Failed to save session state after permission request: {}",
@@ -490,6 +504,7 @@ impl StreamManagerContext {
                 // The continuation will spawn a NEW task with a NEW message ID.
                 // If we don't remove this one, is_any_generating() will remain true forever because this task never "completes" normally.
                 self.active_stream_handles.write().remove(&message_id);
+                self.content_generated.write().remove(&message_id); // Cleanup
 
                 if let Err(e) = self.session_state.write().save() {
                     tracing::error!("Failed to save session state before continuation: {}", e);
@@ -530,6 +545,7 @@ impl StreamManagerContext {
 
             // Remove the handle from the map upon completion
             self.active_stream_handles.write().remove(&message_id);
+            self.content_generated.write().remove(&message_id); // Cleanup
             tracing::info!(message_id = %message_id, "Active stream handle removed.");
         });
 
@@ -547,6 +563,9 @@ impl StreamManagerContext {
             handle.cancel();
             tracing::info!(message_id = %message_id, "Aborted stream task handle.");
         }
+        
+        // Cleanup generated state
+        self.content_generated.write().remove(message_id);
 
         // 2. Remove the message from the session state
         self.session_state.write().remove_message(message_id);
@@ -599,6 +618,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         permission_manager,
         stream_activity: Signal::new(0),
         is_sending: Signal::new(false),
+        content_generated: Signal::new(std::collections::HashSet::new()),
     });
 
     // Provide the context to children.
@@ -647,6 +667,7 @@ mod tests {
                 permission_manager,
                 stream_activity: Signal::new(0),
                 is_sending: Signal::new(false),
+                content_generated: Signal::new(std::collections::HashSet::new()),
             });
 
             let message_id = Uuid::new_v4();
@@ -710,6 +731,7 @@ mod tests {
                 permission_manager,
                 stream_activity: Signal::new(0),
                 is_sending: Signal::new(false),
+                content_generated: Signal::new(std::collections::HashSet::new()),
             });
 
             let message_id = Uuid::new_v4();

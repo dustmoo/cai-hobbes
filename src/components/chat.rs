@@ -651,7 +651,21 @@ pub fn ChatWindow(
             OptimizationTarget::NewChatModal => {
                 // Update the New Chat Modal's initial context signal
                 // This triggers the use_effect in NewChatMemoryModal to update the JSON editor
-                modal_initial_context.set(new_context);
+                
+                // CRITICAL: The new_context coming back might be stripped of tools (because we stripped them before sending to optimization).
+                // We must preserve the tools from the *existing* modal_initial_context.
+                let mut preserved_context = new_context;
+                let current_modal_context = modal_initial_context.read();
+                
+                if preserved_context.mcp_tools.is_none() {
+                    preserved_context.mcp_tools = current_modal_context.mcp_tools.clone();
+                }
+                if preserved_context.tools.is_none() {
+                    preserved_context.tools = current_modal_context.tools.clone();
+                }
+
+                drop(current_modal_context); // Release verification read lock before write
+                modal_initial_context.set(preserved_context);
                 modal_optimization_summary.set(Some(summary));
             }
         }
@@ -895,6 +909,11 @@ pub fn MessageBubble(
             let mut editing_comment_id = use_signal(|| None::<String>);
             let mut is_mouse_over_toolbar = use_signal(|| false);
 
+            // State tracking for "Thinking" vs "Generating"
+            let is_streaming = stream_manager.is_generating(&message.id);
+            let has_content = stream_manager.has_generated_content(&message.id);
+            let is_thinking = is_streaming && !has_content;
+
             // Setup eval for text selection
             let message_id_str = message.id.to_string();
 
@@ -1005,10 +1024,12 @@ pub fn MessageBubble(
                 }
             });
 
-            let is_thinking = !is_user && stream_manager.is_generating(&message.id);
+            let is_thinking = is_streaming && !has_content;
             let thinking_mode_enabled = settings.read().gemini_config.thinking_enabled;
 
-            let bubble_classes = if is_user {
+            let bubble_classes = if is_thinking {
+                 "bg-transparent border border-dashed border-gray-600 animate-pulse self-start mr-auto"
+            } else if is_user {
                 "bg-primary-500 text-white self-end ml-auto"
             } else {
                 "bg-dark-card text-dark-text self-start mr-auto"
@@ -1046,7 +1067,32 @@ pub fn MessageBubble(
                         div {
                             class: "px-4 py-3 text-sm leading-relaxed break-words",
                             if is_thinking {
-                                ThinkingIndicator { thinking_mode_enabled, thought_summary: local_thought_summary.read().clone() }
+                                div {
+                                    class: "flex flex-col space-y-2",
+                                    button {
+                                        class: "flex items-center space-x-2 text-gray-400 text-sm py-1 hover:text-gray-200 transition-colors focus:outline-none cursor-pointer",
+                                        onclick: move |_| show_thinking.toggle(),
+                                        if *show_thinking.read() {
+                                            Icon { width: 14, height: 14, icon: fi_icons::FiChevronDown }
+                                        } else {
+                                            Icon { width: 14, height: 14, icon: fi_icons::FiChevronRight }
+                                        }
+                                        div { class: "flex items-center space-x-1 ml-1",
+                                             div { class: "w-1.5 h-1.5 bg-current rounded-full animate-bounce [animation-delay:-0.3s]" }
+                                             div { class: "w-1.5 h-1.5 bg-current rounded-full animate-bounce [animation-delay:-0.15s]" }
+                                             div { class: "w-1.5 h-1.5 bg-current rounded-full animate-bounce" }
+                                        }
+                                        span { class: "ml-2 font-medium", "Thinking..." }
+                                    }
+                                    if *show_thinking.read() {
+                                        div {
+                                            class: "pl-6 text-sm text-gray-300",
+                                            if let Some(summary) = local_thought_summary.read().as_ref() {
+                                                 ThinkingMarkdownRenderer { content: summary.clone(), compact: false }
+                                            }
+                                        }
+                                    }
+                                }
                             } else {
                                 MarkdownRenderer {
                                     content: content(),

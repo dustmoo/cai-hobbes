@@ -69,6 +69,7 @@ pub struct McpServerStatus {
     pub description: String,
     pub status: ServerStatus,
     pub error_message: Option<String>,
+    pub warning_message: Option<String>,
     pub tools: usize,
     pub resources: usize,
     pub prompts: usize,
@@ -91,6 +92,7 @@ pub struct ActiveMcpClient {
     pub config: McpServerConfig,
     pub service: McpClientType,
     pub tools: Vec<Tool>,
+    pub warning_message: Option<String>,
 }
 
 /// Information about a server that requires authentication
@@ -234,12 +236,13 @@ impl McpManager {
             .list_tools_for_session(&force_load_slugs)
             .await
         {
-            Ok(composio_tools) => {
-                let tools = composio_tools.iter().map(composio_to_rmcp_tool).collect();
+            Ok(discovery_result) => {
+                let tools = discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
                 let active_client = ActiveMcpClient {
                     config: composio_config,
                     service: McpClientType::NativeComposio(composio_client),
                     tools,
+                    warning_message: discovery_result.warning,
                 };
 
                 // ATOMIC SWAP: Replace the old client with the new one cleanly
@@ -435,13 +438,14 @@ impl McpManager {
                             .list_tools_for_session(&force_load_slugs)
                             .await
                         {
-                            Ok(composio_tools) => {
+                            Ok(discovery_result) => {
                                 let tools =
-                                    composio_tools.iter().map(composio_to_rmcp_tool).collect();
+                                    discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
                                 let active_client = ActiveMcpClient {
                                     config: composio_config,
                                     service: McpClientType::NativeComposio(composio_client),
                                     tools,
+                                    warning_message: discovery_result.warning,
                                 };
                                 if tx_clone.send(active_client).is_err() {
                                     tracing::error!(
@@ -533,15 +537,16 @@ impl McpManager {
                                 .list_tools_for_session(&force_load_slugs)
                                 .await
                             {
-                                Ok(composio_tools) => {
+                                Ok(discovery_result) => {
                                     let tools =
-                                        composio_tools.iter().map(composio_to_rmcp_tool).collect();
+                                        discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
                                     let active_client = ActiveMcpClient {
                                         config: server_config_clone.clone(),
                                         service: McpClientType::NativeComposio(
                                             composio_client.clone(),
                                         ),
                                         tools,
+                                        warning_message: discovery_result.warning,
                                     };
                                     if tx_clone.send(active_client).is_err() {
                                         tracing::error!(
@@ -879,6 +884,7 @@ impl McpManager {
                             config: server_config_clone.clone(),
                             service: McpClientType::Service(Arc::new(service)),
                             tools: all_tools,
+                            warning_message: None,
                         };
                         if tx_clone.send(active_client).is_err() {
                             tracing::error!(
@@ -1140,8 +1146,8 @@ impl McpManager {
                                 .list_tools_filtered(Some(&[app_name.to_string()]))
                                 .await
                             {
-                                Ok(tools) => {
-                                    let results: Vec<serde_json::Value> = tools
+                                Ok(discovery_result) => {
+                                    let results: Vec<serde_json::Value> = discovery_result.tools
                                         .iter()
                                         .map(|t| {
                                             serde_json::json!({
@@ -1679,9 +1685,10 @@ impl McpManager {
                     .list_tools_for_session(&force_load_slugs)
                     .await
                 {
-                    Ok(composio_tools) => {
-                        let tools = composio_tools.iter().map(composio_to_rmcp_tool).collect();
+                    Ok(discovery_result) => {
+                        let tools = discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
                         active_client.tools = tools;
+                        active_client.warning_message = discovery_result.warning;
                         tracing::info!(
                             "Reloaded Composio tools with force_load_slugs: {:?}",
                             force_load_slugs
@@ -1778,6 +1785,7 @@ impl McpManager {
                     is_loaded: false,
                     auth_url: None,
                     uri: config.uri.clone(),
+                    warning_message: None,
                 }
             } else if config.disabled {
                 McpServerStatus {
@@ -1792,6 +1800,7 @@ impl McpManager {
                     is_loaded: false, // Disabled servers are always "unloaded"
                     auth_url: None,
                     uri: config.uri.clone(),
+                    warning_message: None,
                 }
             } else if servers.contains_key(&config.name) {
                 let client = servers.get(&config.name).unwrap();
@@ -1807,6 +1816,7 @@ impl McpManager {
                     is_loaded: true,
                     auth_url: None,
                     uri: config.uri.clone(),
+                    warning_message: client.warning_message.clone(),
                 }
             } else if let Some(auth_info) = auth_required.get(&config.name) {
                 // Server requires OAuth authentication
@@ -1822,6 +1832,7 @@ impl McpManager {
                     is_loaded: false, // NeedsAuth servers are not loaded
                     auth_url: auth_info.auth_url.clone(),
                     uri: config.uri.clone(),
+                    warning_message: None,
                 }
             } else if let Some((_, error)) = failed.get(&config.name) {
                 McpServerStatus {
@@ -1836,6 +1847,7 @@ impl McpManager {
                     is_loaded: false, // Error servers are not loaded
                     auth_url: None,
                     uri: config.uri.clone(),
+                    warning_message: None,
                 }
             } else {
                 // Server is still initializing or hasn't been attempted yet
@@ -1851,6 +1863,7 @@ impl McpManager {
                     is_loaded: false, // Initializing servers are not loaded
                     auth_url: None,
                     uri: config.uri.clone(),
+                    warning_message: None,
                 }
             };
             statuses.push(status);
@@ -1877,6 +1890,7 @@ impl McpManager {
                     is_loaded: composio_is_loaded,
                     auth_url: None,
                     uri: None,
+                    warning_message: client.warning_message.clone(),
                 });
             }
             // Check if native Composio failed to initialize
@@ -1893,6 +1907,7 @@ impl McpManager {
                     is_loaded: false,
                     auth_url: None,
                     uri: None,
+                    warning_message: None,
                 });
             }
         }
@@ -2012,13 +2027,14 @@ impl McpManager {
                         let client_for_tools = composio_client.clone();
 
                         match client_for_tools.list_tools().await {
-                            Ok(composio_tools) => {
+                            Ok(discovery_result) => {
                                 let tools =
-                                    composio_tools.iter().map(composio_to_rmcp_tool).collect();
+                                    discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
                                 let active_client = ActiveMcpClient {
                                     config: server_config_clone,
                                     service: McpClientType::NativeComposio(composio_client),
                                     tools,
+                                    warning_message: discovery_result.warning,
                                 };
                                 servers_clone
                                     .lock()
@@ -2280,6 +2296,7 @@ impl McpManager {
                         config: server_config_clone.clone(),
                         service: McpClientType::Service(Arc::new(service)),
                         tools: all_tools,
+                        warning_message: None,
                     };
                     servers_clone
                         .lock()

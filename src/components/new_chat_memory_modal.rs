@@ -1,6 +1,8 @@
 use crate::components::focus_context::FocusContext;
 use crate::components::syntax_highlighter::highlight_json;
+use crate::hotkey::matches_hotkey;
 use crate::session::ActiveContext;
+use crate::settings::Settings;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fi_icons;
 use dioxus_free_icons::Icon;
@@ -17,18 +19,26 @@ pub fn NewChatMemoryModal(
     let mut json_content = use_signal(String::new);
     let mut error_message = use_signal(|| Option::<String>::None);
     let mut focus_context = use_context::<Signal<FocusContext>>();
+    let settings = use_context::<Signal<Settings>>();
 
     // Track previous context to detect external updates (like from optimization)
     let mut last_processed_context = use_signal(String::new);
 
-    // Initialize content when modal becomes visible or initial context changes
+    // Initialize content when modal becomes visible or initial context
+    let initial_context_effect = initial_context.clone();
     use_effect(move || {
         if *is_visible.read() {
+            tracing::info!("NewChatMemoryModal became visible");
             // Claim focus ownership
             focus_context.set(FocusContext::NewChatMemoryModal);
 
             // Check if context has changed externally (e.g. returning from optimization)
-            let new_json = serde_json::to_string_pretty(&initial_context).unwrap_or_default();
+            // Create a view-only context that excludes tool definitions for the JSON editor
+            let mut display_context = initial_context_effect.clone();
+            display_context.mcp_tools = None;
+            display_context.tools = None;
+
+            let new_json = serde_json::to_string_pretty(&display_context).unwrap_or_default();
             if *last_processed_context.read() != new_json {
                 json_content.set(new_json.clone());
                 last_processed_context.set(new_json);
@@ -52,8 +62,19 @@ pub fn NewChatMemoryModal(
         let content = json_content.read().clone();
         tracing::debug!("NewChatMemoryModal::submit_session called");
         match serde_json::from_str::<ActiveContext>(&content) {
-            Ok(valid_context) => {
-                tracing::info!("NewChatMemoryModal::submit_session - valid context parsed, calling on_start_chat");
+            Ok(mut valid_context) => {
+                tracing::info!("NewChatMemoryModal::submit_session - valid context parsed, restoring tools");
+                
+                // Restore logic: usage state (mcp_tools/tools) must optionally persist from source
+                // if not present in the editor (which we explicitly stripped above).
+                // If the user *manually* added tools in the JSON (unlikely but possible), we accept them.
+                if valid_context.mcp_tools.is_none() {
+                    valid_context.mcp_tools = initial_context.mcp_tools.clone();
+                }
+                if valid_context.tools.is_none() {
+                    valid_context.tools = initial_context.tools.clone();
+                }
+
                 on_start_chat.call(valid_context);
             }
             Err(e) => {
@@ -72,6 +93,9 @@ pub fn NewChatMemoryModal(
             }
         }
     };
+    
+    // Clone for the onclick handler
+    let mut submit_session_click = submit_session.clone();
 
     if !*is_visible.read() {
         return rsx! {};
@@ -85,13 +109,10 @@ pub fn NewChatMemoryModal(
                 tracing::debug!("NewChatMemoryModal (Outer) onkeydown - Key: {:?}, Modifiers: {:?}", evt.key(), evt.modifiers());
                 if evt.key() == Key::Escape {
                     on_cancel.call(());
-                } else if evt.key() == Key::Enter {
-                    let modifiers = evt.modifiers();
-                    if modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) {
-                        tracing::info!("NewChatMemoryModal (Outer) submitting via Cmd+Enter");
-                        evt.prevent_default();
-                        submit_session();
-                    }
+                } else if matches_hotkey(&evt, &settings.read().hotkeys.submit_chat) {
+                    tracing::info!("NewChatMemoryModal (Outer) submitting via Hotkey");
+                    evt.prevent_default();
+                    submit_session();
                 }
             },
             div {
@@ -257,7 +278,7 @@ pub fn NewChatMemoryModal(
                         }
                         button {
                             class: "px-6 py-2 bg-primary-600 hover:bg-primary-500 text-white rounded-md font-semibold shadow-lg shadow-primary-900/20 transition-all hover:scale-105 active:scale-95",
-                            onclick: move |_| submit_session(),
+                            onclick: move |_| submit_session_click(),
                             "Start New Session"
                         }
                     }

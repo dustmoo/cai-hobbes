@@ -1984,6 +1984,33 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-gray-300", "Submit Message" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.submit_chat.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.submit_chat = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-gray-300", "Cancel Generation" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.cancel_generation.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.cancel_generation = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-gray-300", "Focus Chat Input" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_focus_chat.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_focus_chat = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
                                         label { class: "text-sm text-gray-300", "Toggle Settings" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_settings.clone(),
