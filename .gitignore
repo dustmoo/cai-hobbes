@@ -46,3 +46,10 @@ connected_accounts.json
 bootstrap_*.json
 tools.json
 docs/
+
+# Security - Local Keys
+*.p12
+*.key
+*.certSigningRequest
+*.pem
+*.provisionprofile
