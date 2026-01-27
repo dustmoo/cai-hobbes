@@ -131,6 +131,17 @@ impl McpManager {
         }
     }
 
+    /// Helper: Inject custom credentials from SecretManager (BYOA)
+    fn inject_custom_credentials(client: &ComposioClient) {
+        // Inject Custom Tool Credentials (BYOA)
+        let mut secret_manager = crate::secret_manager::SecretManager::new();
+        secret_manager.load_all_from_keychain();
+        let custom_creds = secret_manager.get_custom_tool_credentials();
+        if !custom_creds.is_empty() {
+             client.set_custom_creds(custom_creds);
+        }
+    }
+
     /// Initialize unloaded servers from persisted state
     pub async fn set_initial_unloaded_servers(&self, servers: Vec<String>) {
         let mut unloaded = self.unloaded_servers.lock().await;
@@ -216,6 +227,9 @@ impl McpManager {
         let composio_client = Arc::new(ComposioClient::new(
             api_key, base_url, entity_id, user_id, profile_id,
         ));
+
+        Self::inject_custom_credentials(&composio_client);
+
         let client_for_tools = composio_client.clone();
 
         let composio_config = McpServerConfig {
@@ -429,6 +443,9 @@ impl McpManager {
                             user_id,
                             profile.id.clone(),
                         ));
+
+                        McpManager::inject_custom_credentials(&composio_client);
+
                         let client_for_tools = composio_client.clone();
 
                         // Tool Router pattern: only load force-loaded toolkit tools + meta-tools
@@ -528,6 +545,9 @@ impl McpManager {
                                 user_id,
                                 profile.id.clone(),
                             ));
+
+                            McpManager::inject_custom_credentials(&composio_client);
+
                             let client_for_tools = composio_client.clone();
 
                             // Tool Router pattern: only load force-loaded toolkit tools + meta-tools

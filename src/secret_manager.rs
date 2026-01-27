@@ -65,10 +65,118 @@ impl SecretManager {
             }
         }
 
+        // Feature: Dynamic Tool Credentials via Index Key
+        // We maintain a comma-separated list of custom keys in `composio_custom_keys_index`.
+        match keychain_ffi::find_generic_password("composio_custom_keys_index") {
+            Ok(index_csv) => {
+                tracing::info!("Found custom tools index, loading credentials...");
+                for key in index_csv.split(',') {
+                    let key = key.trim();
+                    if !key.is_empty() {
+                         match keychain_ffi::find_generic_password(key) {
+                            Ok(value) => {
+                                self.secrets.insert(key.to_string(), value);
+                                tracing::debug!("Loaded custom tool secret: {}", key);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to load indexed secret '{}': {}", key, e);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::debug!("No custom tools index found (composio_custom_keys_index).");
+            }
+        }
+
         tracing::info!(
             "SecretManager loaded {} secrets from keychain",
             self.secrets.len()
         );
+    }
+
+    /// Retrieve all loaded custom tool credentials formatted as:
+    /// Map<ToolkitSlug, Map<FieldName, Value>>
+    /// Keys are expected to be in format: `composio_tool_{slug}__{field}`
+    pub fn get_custom_tool_credentials(&self) -> HashMap<String, HashMap<String, String>> {
+        let mut result: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let prefix = "composio_tool_";
+        let separator = "__";
+
+        for (key, value) in &self.secrets {
+            if let Some(rest) = key.strip_prefix(prefix) {
+                // Split by separator
+                if let Some((slug, field)) = rest.split_once(separator) {
+                    if !slug.is_empty() && !field.is_empty() {
+                        result
+                            .entry(slug.to_string())
+                            .or_default()
+                            .insert(field.to_string(), value.clone());
+                    }
+                } else {
+                    tracing::warn!("Ignored malformed custom tool key: {}", key);
+                }
+            }
+        }
+        result
+    }
+
+    /// Set a custom tool credential and update the index
+    pub fn set_custom_tool_credential(&mut self, slug: &str, field: &str, value: String) -> Result<(), String> {
+        let key = format!("composio_tool_{}__{}", slug, field);
+        
+        // 1. Save the actual secret
+        self.set(&key, value.clone())?;
+
+        // 2. Update Index
+        let index_key = "composio_custom_keys_index";
+        let current_index = keychain_ffi::find_generic_password(index_key).unwrap_or_default();
+
+        // Check if key exists in index
+        let key_exists = current_index.split(',').any(|k| k.trim() == key);
+        
+        if !key_exists {
+            let new_index = if current_index.is_empty() {
+                key.clone()
+            } else {
+                format!("{},{}", current_index, key)
+            };
+            
+            // Save new index
+             self.set(index_key, new_index)?;
+             tracing::info!("Updated custom tool index with new key: {}", key);
+        }
+
+        Ok(())
+    }
+
+    /// Delete a custom tool credential and update the index
+    pub fn delete_custom_tool_credential(&mut self, slug: &str, field: &str) -> Result<(), String> {
+        let key = format!("composio_tool_{}__{}", slug, field);
+        
+        // 1. Delete the actual secret
+        let _ = self.delete(&key);
+
+        // 2. Update Index
+        let index_key = "composio_custom_keys_index";
+        let current_index = keychain_ffi::find_generic_password(index_key).unwrap_or_default();
+
+        if !current_index.is_empty() {
+             let new_index_parts: Vec<&str> = current_index
+                .split(',')
+                .map(|k| k.trim())
+                .filter(|k| *k != key && !k.is_empty())
+                .collect();
+            
+            let new_index = new_index_parts.join(",");
+            
+            // Save new index
+             self.set(index_key, new_index)?;
+             tracing::info!("Removed custom tool key from index: {}", key);
+        }
+
+        Ok(())
     }
 
     /// Get a secret by key
@@ -299,3 +407,5 @@ impl SecretManager {
         deleted
     }
 }
+
+

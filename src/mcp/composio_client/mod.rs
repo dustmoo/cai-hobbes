@@ -35,6 +35,8 @@ pub struct ComposioClient {
     pub(crate) toolkit_account_map: Arc<RwLock<HashMap<String, String>>>,
     // Secure Context Store for tool-specific keys
     pub(crate) context_store: Arc<ContextStore>,
+    /// Custom auth credentials map: Toolkit Slug -> Map of field names to values (ClientID, Secret, etc.)
+    pub(crate) custom_auth_creds: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
     /// Cached connected toolkit info for Status panel (ephemeral, invalidated on profile change)
     pub(crate) cached_toolkit_info: Arc<RwLock<Option<Vec<ToolkitInfo>>>>,
 }
@@ -73,8 +75,19 @@ impl ComposioClient {
             tool_toolkit_map: Arc::new(RwLock::new(HashMap::new())),
             toolkit_account_map: Arc::new(RwLock::new(HashMap::new())),
             auth_config_cache: Arc::new(RwLock::new(HashMap::new())),
+            custom_auth_creds: Arc::new(RwLock::new(HashMap::new())),
             context_store,
             cached_toolkit_info: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Set custom authentication credentials for BYOA toolkits.
+    pub fn set_custom_creds(&self, creds: HashMap<String, HashMap<String, String>>) {
+        if let Ok(mut lock) = self.custom_auth_creds.write() {
+            *lock = creds;
+            tracing::info!("Updated custom auth credentials for {} toolkits", lock.len());
+        } else {
+            tracing::error!("Failed to acquire write lock for custom_auth_creds");
         }
     }
 

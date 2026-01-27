@@ -294,7 +294,43 @@ pub(crate) async fn create_auth_config(
 
     // Build the payload based on auth type
     // IMPORTANT: The field is "auth_config" not "options" - matches Composio Python SDK
-    let payload = if use_managed {
+    // Check for custom credentials first (BYOA - Local Primacy)
+    let custom_creds = {
+        let lock = client.custom_auth_creds.read().unwrap_or_else(|e| e.into_inner());
+        lock.get(toolkit_slug).cloned()
+    };
+
+    // Determine the strategy:
+    // 1. If we have custom credentials, ALWAYS use them (User override).
+    // 2. If explicitly asked for managed auth, try that (unless overridden by #1? No, explicit flag wins if we want to force it).
+    //    Actually, for now, if custom creds exist, we assume the user WANTS to use them.
+    // 3. Fallback to managed or basic.
+
+    let payload = if let Some(creds) = custom_creds {
+        tracing::info!(
+            "Using custom credentials for toolkit '{}' (Fields: {:?})",
+            toolkit_slug,
+            creds.keys()
+        );
+        
+        // Convert HashMap<String, String> to Map<String, Value>
+        let mut credentials_json = serde_json::Map::new();
+        for (k, v) in creds {
+            credentials_json.insert(k, serde_json::Value::String(v));
+        }
+
+        serde_json::json!({
+            "toolkit": { "slug": toolkit_slug },
+            "auth_config": {
+                "type": "use_custom_auth",
+                 // Default to OAUTH2 if not specified, but usually custom auth implies protocol awareness.
+                 // Ideally we should know the scheme. For now, we trust the API to infer or we assume OAUTH2/API_KEY based on content?
+                 // The `auth_scheme` param might give us a hint if provided.
+                "authScheme": auth_scheme.unwrap_or("OAUTH2").to_uppercase(),
+                "credentials": credentials_json
+            }
+        })
+    } else if use_managed {
         // Try Composio managed auth (OAuth apps that Composio has pre-configured)
         tracing::info!(
             "Creating managed auth config for toolkit '{}'",
@@ -305,9 +341,11 @@ pub(crate) async fn create_auth_config(
             "auth_config": { "type": "use_composio_managed_auth" }
         })
     } else if let Some(scheme) = auth_scheme {
-        // Use custom auth with explicit scheme (API_KEY, BEARER_TOKEN, etc.)
+        // Use custom auth with explicit scheme (API_KEY, BEARER_TOKEN, etc.) but NO credentials provided?
+        // This path is likely for when the user hasn't set up keys yet, or we want to trigger a flow that asks for them?
+        // Or maybe for "Basic" auth where we just need the scheme setup.
         tracing::info!(
-            "Creating custom auth config for toolkit '{}' with scheme '{}'",
+            "Creating custom auth config for toolkit '{}' with scheme '{}' (No local credentials found)",
             toolkit_slug,
             scheme
         );

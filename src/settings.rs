@@ -684,6 +684,7 @@ pub enum SettingsTab {
     Data,
     Permissions,
     Hotkeys,
+    Credentials,
     About,
 }
 

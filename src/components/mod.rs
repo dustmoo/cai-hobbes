@@ -26,3 +26,4 @@ pub mod onboarding;
 pub mod quick_fix;
 pub mod shared;
 pub mod smithery_registry;
+pub mod tool_credentials;

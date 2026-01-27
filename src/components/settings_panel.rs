@@ -1,6 +1,7 @@
 use crate::components::confirm_save_modal::ConfirmSaveModal;
 use crate::components::conflict_modal::ConflictModal;
 use crate::components::hotkey_recorder::HotkeyRecorder;
+use crate::components::tool_credentials::ToolCredentials;
 use crate::mcp::composio_client::validate_composio_api_key;
 use crate::settings::{is_sandboxed, HotkeySettings, Settings, SettingsManager};
 use crate::{context::permissions::ToolCategory, session::SessionState};
@@ -451,6 +452,17 @@ pub fn SettingsPanel() -> Element {
                     },
                     Icon { width: 18, height: 18, icon: fi_icons::FiCommand }
                     "Hotkeys"
+                }
+                button {
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Credentials { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    onclick: move |_| {
+                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Credentials;
+                        let state = (*ui_state.read()).clone();
+                        let manager = (*ui_state_manager.read()).clone();
+                        spawn(async move { let _ = manager.save(&state); });
+                    },
+                    Icon { width: 18, height: 18, icon: fi_icons::FiKey }
+                    "Credentials"
                 }
                 button {
                     class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::About { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
@@ -2107,7 +2119,10 @@ pub fn SettingsPanel() -> Element {
                             }
                         }
                     },
-                   crate::settings::SettingsTab::About => rsx! {
+                    crate::settings::SettingsTab::Credentials => rsx! {
+                         ToolCredentials {}
+                    },
+                    crate::settings::SettingsTab::About => rsx! {
                 // About & Legal Section
                 div {
                     class: "border border-primary-700 rounded-lg mb-4",

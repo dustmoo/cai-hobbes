@@ -862,7 +862,7 @@ pub fn MessageBubble(
     let is_user = message.author == "User";
 
     // Get necessary contexts
-    let settings = consume_context::<Signal<Settings>>();
+    let _settings = consume_context::<Signal<Settings>>();
     let stream_manager = consume_context::<StreamManagerContext>();
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let mut chat_input_draft = consume_context::<Signal<String>>();
@@ -912,7 +912,7 @@ pub fn MessageBubble(
             // State tracking for "Thinking" vs "Generating"
             let is_streaming = stream_manager.is_generating(&message.id);
             let has_content = stream_manager.has_generated_content(&message.id);
-            let is_thinking = is_streaming && !has_content;
+
 
             // Setup eval for text selection
             let message_id_str = message.id.to_string();
@@ -1025,7 +1025,6 @@ pub fn MessageBubble(
             });
 
             let is_thinking = is_streaming && !has_content;
-            let thinking_mode_enabled = settings.read().gemini_config.thinking_enabled;
 
             let bubble_classes = if is_thinking {
                  "bg-transparent border border-dashed border-gray-600 animate-pulse self-start mr-auto"
@@ -1571,43 +1570,6 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                     },
                     Icon { width: 14, height: 14, icon: fi_icons::FiFileText }
                 }
-            }
-        }
-    }
-}
-
-#[component]
-fn ThinkingIndicator(thinking_mode_enabled: bool, thought_summary: Option<String>) -> Element {
-    rsx! {
-        if thinking_mode_enabled {
-            div {
-                class: "flex flex-col space-y-2",
-                div {
-                    class: "flex items-center space-x-2",
-                    Icon {
-                        width: 16,
-                        height: 16,
-                        icon: fi_icons::FiCpu,
-                        class: "text-primary-400 animate-pulse"
-                    }
-                    span {
-                        class: "text-sm text-primary-400 animate-pulse",
-                        "Generating..."
-                    }
-                }
-                if let Some(summary) = thought_summary {
-                    div {
-                        class: "text-xs text-gray-400 ml-6",
-                        ThinkingMarkdownRenderer { content: summary, compact: true }
-                    }
-                }
-            }
-        } else {
-            div {
-                class: "flex items-center space-x-1",
-                span { class: "w-2.5 h-2.5 bg-white rounded-full animate-pulse-fast" },
-                span { class: "w-2.5 h-2.5 bg-white rounded-full animate-pulse-medium" },
-                span { class: "w-2.5 h-2.5 bg-white rounded-full animate-pulse-slow" },
             }
         }
     }
