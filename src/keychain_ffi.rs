@@ -66,7 +66,7 @@ const ERR_SEC_USER_CANCELED: i32 = -128;
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
 
 /// The keychain access group - must match the keychain-access-groups in entitlements.
-/// Format: <TeamID>.<BundleID>
+/// Format: `TeamID`.`BundleID`
 /// Only used for sandboxed (App Store/TestFlight) builds - PRO builds use default access.
 const KEYCHAIN_ACCESS_GROUP: &str = "ABXVW6PWCW.ai.clearmirror.cai-hobbes";
 

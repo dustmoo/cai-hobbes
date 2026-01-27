@@ -396,7 +396,7 @@ pub enum ThinkingConfigStyle {
 
 impl GeminiModel {
     /// Returns true if this model supports thinking/reasoning features
-    /// Source: https://ai.google.dev/gemini-api/docs/thinking
+    /// Source: <https://ai.google.dev/gemini-api/docs/thinking>
     #[allow(dead_code)] // Used in tests and available for future UI integration
     pub fn supports_thinking(&self) -> bool {
         !matches!(self.thinking_config_style(), ThinkingConfigStyle::None)

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Gemini's supported schema types.
-/// See: https://ai.google.dev/api/caching#Type
+/// See: <https://ai.google.dev/api/caching#Type>
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum SchemaType {

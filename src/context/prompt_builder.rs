@@ -9,7 +9,7 @@ use chrono::Local;
 use serde_json::{self, json};
 
 /// Gemini API has a limit of 128 function declarations per request.
-/// See: https://ai.google.dev/gemini-api/docs/function-calling#best-practices
+/// See: <https://ai.google.dev/gemini-api/docs/function-calling#best-practices>
 const GEMINI_TOOL_LIMIT: usize = 128;
 
 #[cfg(test)]

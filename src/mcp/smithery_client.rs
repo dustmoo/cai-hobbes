@@ -54,7 +54,7 @@ pub enum SmitheryOAuthError {
 /// Configuration for the OAuth client
 #[derive(Debug, Clone)]
 pub struct SmitheryOAuthConfig {
-    /// Smithery server URL (e.g., "https://server.smithery.ai/googlecalendar/mcp")
+    /// Smithery server URL (e.g., "<https://server.smithery.ai/googlecalendar/mcp>")
     pub server_url: String,
     /// Client metadata for OAuth registration
     pub client_metadata: OAuthClientMetadata,
