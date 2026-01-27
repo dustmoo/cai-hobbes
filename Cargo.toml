@@ -1,6 +1,6 @@
 [package]
 name = "Hobbes"
-version = "0.9.41"
+version = "0.9.42"
 authors = ["Dustin Moore <dustin@clearmirror.ai>", "Gemini 2.5/3 Pro and Flash (and a touch of Claude 3.7/4.5 Sonnet)"]
 edition = "2024"
 license-file = "LICENSE"
