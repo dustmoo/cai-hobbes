@@ -455,12 +455,12 @@ impl Settings {
             new_profile.id = Uuid::new_v4().to_string();
         }
 
+        // Capture the name before moving ownership
+        let new_name = new_profile.name.clone();
         self.composio_profiles.push(new_profile);
 
-        // If this is the first profile, make it active
-        if self.active_composio_profile.is_none() && self.composio_profiles.len() == 1 {
-            self.active_composio_profile = Some(self.composio_profiles[0].name.clone());
-        }
+        // Always activate newly added profiles so the UI switches to them
+        self.active_composio_profile = Some(new_name);
     }
 
     /// Remove a Composio profile by name
