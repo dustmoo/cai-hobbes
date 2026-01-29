@@ -31,6 +31,7 @@ mod secret_manager;
 mod services;
 mod session;
 mod settings;
+mod skills;
 mod tray;
 
 use tray::{APP_QUIT, WINDOW_VISIBLE};
@@ -151,7 +152,12 @@ fn app() -> Element {
     let mut session_state = use_context_provider(|| {
         let mut state = SessionState::load().unwrap_or_else(|e| {
             tracing::error!("Failed to load session state during startup: {}", e);
-            SessionState::default()
+            // Create default state with save DISABLED to protect backup
+            let fallback = SessionState {
+                save_disabled: true,
+                ..Default::default()
+            };
+            fallback
         });
         if state.sessions.is_empty() {
             tracing::info!("No sessions found, creating new default session.");
@@ -180,6 +186,53 @@ fn app() -> Element {
 
     // Global focus context for keyboard event coordination
     use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
+
+    // Skills registry - initialize empty, load async to avoid blocking UI
+    let mut skill_registry = use_context_provider(|| Signal::new(skills::SkillRegistry::new()));
+    let mut skills_loaded = use_signal(|| false);
+
+    // Asynchronously load skills from ~/.hobbes/skills
+    use_effect(move || {
+        if !skills_loaded() {
+            spawn(async move {
+                let skills_dir = dirs::home_dir()
+                    .map(|h| h.join(".hobbes/skills"))
+                    .unwrap_or_default();
+
+                if skills_dir.exists() {
+                    let loaded = tokio::task::spawn_blocking(move || {
+                        let temp_registry = skills::SkillRegistry::new();
+                        match temp_registry.load_from_directory(&skills_dir) {
+                            Ok(names) => Some((temp_registry, names)),
+                            Err(e) => {
+                                tracing::warn!("Failed to load skills: {}", e);
+                                None
+                            }
+                        }
+                    })
+                    .await;
+
+                    if let Ok(Some((loaded_registry, names))) = loaded {
+                        // Merge loaded skills into the context signal
+                        let loaded_skills = loaded_registry
+                            .skills
+                            .read()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        *skill_registry
+                            .write()
+                            .skills
+                            .write()
+                            .unwrap_or_else(|p| p.into_inner()) = loaded_skills;
+                        tracing::info!("Loaded {} skills: {:?}", names.len(), names);
+                    }
+                } else {
+                    tracing::debug!("Skills directory not found: {:?}", skills_dir);
+                }
+                skills_loaded.set(true);
+            });
+        }
+    });
 
     // Asynchronously load secrets from keychain using biometric authentication
     // This prompts once for Touch ID/password, then uses that context for all secrets
@@ -801,7 +854,7 @@ fn app() -> Element {
                                 on_content_resize: move |_| {},
                                 on_interaction: move |_| {},
                                 on_toggle_sessions: move |_| {
-                                    let new_show_state = !*show_session_manager.read();
+                                    let new_show_state = !*show_session_manager.peek();
                                     show_session_manager.set(new_show_state);
                                     if new_show_state {
                                         show_settings_panel.set(false); // Hide settings if showing sessions
@@ -809,7 +862,7 @@ fn app() -> Element {
                                     }
                                 },
                                 on_toggle_settings: move |_| {
-                                    let new_show_state = !*show_settings_panel.read();
+                                    let new_show_state = !*show_settings_panel.peek();
                                     show_settings_panel.set(new_show_state);
                                     if new_show_state {
                                         show_session_manager.set(false); // Hide sessions if showing settings
@@ -817,7 +870,7 @@ fn app() -> Element {
                                     }
                                 },
                                 on_toggle_mcp_manager: move |_| {
-                                    let new_show_state = !*show_mcp_manager.read();
+                                    let new_show_state = !*show_mcp_manager.peek();
                                     show_mcp_manager.set(new_show_state);
                                     if new_show_state {
                                         show_session_manager.set(false); // Hide sessions if showing MCP manager

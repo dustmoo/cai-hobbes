@@ -129,3 +129,23 @@ pub fn composio_to_rmcp_tool(composio_tool: &super::models::ComposioTool) -> rmc
         meta,
     }
 }
+
+/// Convert a snake_case string to camelCase.
+/// Example: "workspace_id" -> "workspaceId", "connected_account_id" -> "connectedAccountId"
+pub fn snake_to_camel(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut capitalize_next = false;
+
+    for c in s.chars() {
+        if c == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.push(c.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}

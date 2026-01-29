@@ -37,6 +37,7 @@ pub fn SettingsPanel() -> Element {
         use_signal(Vec::<crate::services::gemini_models::GeminiModel>::new);
     let mut models_loading = use_signal(|| false);
     let mut models_error = use_signal(|| Option::<String>::None);
+    let skill_registry = use_context::<Signal<crate::skills::registry::SkillRegistry>>();
     let mut models_fetch_trigger = use_signal(|| 0u32);
 
     // Effect to fetch models when API key is available or refresh is triggered
@@ -1495,6 +1496,65 @@ pub fn SettingsPanel() -> Element {
                                 }
                             }
 
+                            // 4b. Skill Display Defaults
+                            div {
+                                class: "pt-4 border-t border-primary-700",
+                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Skill Display Defaults" }
+                                p { class: "text-xs text-gray-500 mb-3", "Set initial state for collapsible sections in skill call bubbles." }
+
+                                div {
+                                    class: "space-y-3",
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Expand Arguments by Default" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{ui_state.read().default_skill_arguments_open}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.default_skill_arguments_open = e.value() == "true";
+                                                let state_clone = state.clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Expand Output / Payload by Default" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{ui_state.read().default_skill_response_open}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.default_skill_response_open = e.value() == "true";
+                                                let state_clone = state.clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-gray-300", "Expand Instructions by Default" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            checked: "{ui_state.read().default_skill_instructions_open}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.default_skill_instructions_open = e.value() == "true";
+                                                let state_clone = state.clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             // 5. AI Behavior
                             div {
                                 class: "pt-4 border-t border-primary-700",
@@ -1901,7 +1961,85 @@ pub fn SettingsPanel() -> Element {
                     }
                 }
 
-                   }, // End Permissions
+            // Skill Permissions Section
+            div {
+                class: "border border-primary-700 rounded-lg mb-4",
+                div {
+                    class: "p-4 bg-dark-section rounded-lg",
+                    h3 { class: "text-md font-semibold mb-4", "Skill Permissions" }
+                    p { class: "text-xs text-gray-400 mb-4",
+                        "Manage auto-approval for specific skills. When enabled, these skills will execute without prompting."
+                    }
+                    
+                    {
+                        let skills_map = local_settings.read().permission_settings.skill_permissions.clone();
+                        if skills_map.is_empty() {
+                            rsx! {
+                                div {
+                                    class: "flex items-center justify-center p-8 border border-dashed border-primary-800 rounded-lg",
+                                    p { class: "text-sm text-gray-500", "No specific skill permissions saved yet." }
+                                }
+                            }
+                        } else {
+                            // Sort skills alphabetically for cleaner UI
+                            let mut sorted_skills: Vec<_> = skills_map.into_iter().collect();
+                            sorted_skills.sort_by(|a, b| a.0.cmp(&b.0));
+
+                            rsx! {
+                                div {
+                                    class: "space-y-3",
+                                    for (skill_name, is_allowed) in sorted_skills {
+                                        {
+                                            // Metadata Lookup
+                                            let registry = skill_registry.read();
+                                        let skill_opt = registry.get_skill(&skill_name);
+                                        let description = skill_opt.as_ref()
+                                            .map(|s| s.metadata.description.clone())
+                                            .unwrap_or_else(|| "No description available.".to_string());
+                                        
+                                            rsx! {
+                                                div {
+                                            class: "flex items-center justify-between p-4 bg-dark-input rounded-lg border border-primary-800 hover:border-primary-600 transition-colors",
+                                            div {
+                                                class: "flex flex-col max-w-[70%]",
+                                                div {
+                                                    class: "flex items-center gap-2",
+                                                    span { class: "text-sm font-bold text-white", "/{skill_name}" }
+                                                    if is_allowed {
+                                                        span { class: "px-1.5 py-0.5 text-[10px] font-bold bg-green-900/50 text-green-400 rounded", "ALLOWED" }
+                                                    }
+                                                }
+                                                span { class: "text-xs text-gray-400 mt-1 line-clamp-2", "{description}" }
+                                            }
+                                            div {
+                                                class: "relative inline-block w-10 h-5 align-middle select-none transition duration-200 ease-in",
+                                                input {
+                                                    r#type: "checkbox",
+                                                    class: "toggle-checkbox absolute block w-5 h-5 rounded-full bg-white border-4 appearance-none cursor-pointer",
+                                                    checked: is_allowed,
+                                                    oninput: {
+                                                        let skill_name = skill_name.clone();
+                                                        move |event: Event<FormData>| {
+                                                            if let Ok(checked) = event.value().parse() {
+                                                                // Use write() to trigger signal notification (Pattern 33)
+                                                                local_settings.write().permission_settings.skill_permissions.insert(skill_name.clone(), checked);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                div { class: if is_allowed { "toggle-switch-sm active" } else { "toggle-switch-sm" } }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            }
+            }
+        }, // End Permissions
                     crate::settings::SettingsTab::Hotkeys => rsx! {
                         div {
                             class: "border border-primary-700 rounded-lg mb-4",

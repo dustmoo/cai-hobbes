@@ -26,6 +26,8 @@ pub struct PermissionSettings {
     pub granular_permissions: HashMap<ToolCategory, bool>,
     #[serde(default)]
     pub mcp_server_permissions: HashMap<String, bool>,
+    #[serde(default)]
+    pub skill_permissions: HashMap<String, bool>,
     pub max_ai_turns: u32,
 }
 
@@ -35,6 +37,7 @@ impl Default for PermissionSettings {
             auto_approval_enabled: false,
             granular_permissions: HashMap::new(),
             mcp_server_permissions: HashMap::new(),
+            skill_permissions: HashMap::new(),
             max_ai_turns: 10,
         }
     }
@@ -103,6 +106,34 @@ impl PermissionManager {
     pub fn is_turn_limit_reached(&self) -> bool {
         let settings = self.settings.read();
         *self.turn_count.read() >= settings.permission_settings.max_ai_turns
+    }
+
+    /// Check if skill execution is allowed based on permission settings.
+    #[allow(dead_code)]
+    pub fn check_skill_permission(&self, skill_name: &str) -> PermissionStatus {
+        let settings = self.settings.read();
+
+        // 1. Per-Skill Toggle (Specific Rule Priority)
+        if let Some(&allowed) = settings
+            .permission_settings
+            .skill_permissions
+            .get(skill_name)
+        {
+            if allowed {
+                return PermissionStatus::Allowed;
+            } else {
+                return PermissionStatus::RequiresPrompt;
+            }
+        }
+
+        // 2. Global Auto-Approval Check (Fallback)
+        if settings.permission_settings.auto_approval_enabled {
+            return PermissionStatus::Allowed;
+        }
+
+        // 3. Default: Auto-proceed for skills
+        // Skills only inject context; actual tool calls have their own permission controls.
+        PermissionStatus::Allowed
     }
 }
 

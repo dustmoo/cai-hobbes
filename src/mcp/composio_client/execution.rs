@@ -343,47 +343,27 @@ pub async fn execute_tool(
             tk_slug
         );
 
-        // Fetch connected accounts and check for ACTIVE status
-        let has_active_connection = match list_connected_accounts(client).await {
-            Ok(accounts) => {
-                // Find an ACTIVE account for this toolkit
-                let active = accounts.iter().find(|acc| {
-                    let matches_toolkit = acc
-                        .toolkit
-                        .as_ref()
-                        .map(|t| t.slug.eq_ignore_ascii_case(tk_slug))
-                        .unwrap_or(false)
-                        || acc
-                            .app_name
-                            .as_ref()
-                            .map(|n| n.eq_ignore_ascii_case(tk_slug))
-                            .unwrap_or(false);
-                    let is_active = acc.status.eq_ignore_ascii_case("ACTIVE");
-                    matches_toolkit && is_active
-                });
-                if let Some(acc) = active {
-                    tracing::debug!(
-                        "[AUTH] Found ACTIVE connection '{}' for toolkit '{}'",
-                        acc.id,
-                        tk_slug
-                    );
-
-                    true
-                } else {
-                    tracing::info!("[AUTH] No ACTIVE connection found for toolkit '{}'. Available accounts: {:?}",
-                        tk_slug,
-                        accounts.iter()
-                            .filter(|a| a.toolkit.as_ref().map(|t| t.slug.eq_ignore_ascii_case(tk_slug)).unwrap_or(false))
-                            .map(|a| format!("{}:{}", a.id, a.status))
-                            .collect::<Vec<_>>()
-                    );
-                    false
+        // OPTIMIZED PATTERN 122: Check cache first, then fetch
+        let has_active_connection = {
+            // 1. Check Cache
+            let cached = client.toolkit_account_map.read().ok().and_then(|map| map.get(tk_slug).cloned());
+            
+            if let Some(acc_id) = cached {
+                tracing::debug!("[AUTH] Found cached ACTIVE connection '{}' for toolkit '{}'", acc_id, tk_slug);
+                true
+            } else {
+                // 2. Cache Miss - Fetch & Refresh
+                tracing::debug!("[AUTH] Cache miss for toolkit '{}'. Fetching connected accounts...", tk_slug);
+                match list_connected_accounts(client).await {
+                    Ok(_) => {
+                        // 3. Check Cache Again (populated by list_connected_accounts)
+                         client.toolkit_account_map.read().ok().map(|map| map.contains_key(tk_slug)).unwrap_or(false)
+                    },
+                    Err(e) => {
+                        tracing::warn!("[AUTH] Failed to fetch connected accounts: {}", e);
+                        false
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!("[AUTH] Failed to fetch connected accounts: {}", e);
-                // Assume no connection to be safe
-                false
             }
         };
 

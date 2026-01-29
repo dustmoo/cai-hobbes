@@ -12,6 +12,8 @@ pub enum MessageContent {
     },
     ToolCall(ToolCall),
     PermissionRequest(ToolCall),
+    SkillCall(SkillCall),
+    SkillPermissionRequest(SkillCall),
     Error {
         message: String,
     },
@@ -109,6 +111,83 @@ impl std::fmt::Display for ToolCallStatus {
     }
 }
 
+// ============================================================================
+// Skill Types (mirrors Tool types for Claude Skills integration)
+// ============================================================================
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Copy, Debug, Default)]
+pub enum SkillCallStatus {
+    #[default]
+    Pending,    // Awaiting user permission
+    Running,    // Currently executing
+    Completed,  // Successfully finished
+    Error,      // Execution failed
+}
+
+impl std::fmt::Display for SkillCallStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkillCallStatus::Pending => write!(f, "Pending"),
+            SkillCallStatus::Running => write!(f, "Running"),
+            SkillCallStatus::Completed => write!(f, "Completed"),
+            SkillCallStatus::Error => write!(f, "Error"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct SkillCall {
+    pub execution_id: String,
+    pub skill_name: String,
+    pub arguments: String,
+    pub status: SkillCallStatus,
+    pub response: String,
+    pub instructions: String,  // Processed skill instructions
+    #[serde(default)]
+    pub path: std::path::PathBuf,     // Path to skill file
+    #[serde(default)]
+    pub has_scripts: bool,             // Whether skill has executable scripts
+    #[serde(default)]
+    pub raw_output: Option<String>,    // Clean output for use_result
+    #[serde(default)]
+    pub profile_color: Option<String>, // Historical profile color for rendering
+}
+
+impl SkillCall {
+    #[allow(dead_code)]
+    pub fn new(skill_name: String, arguments: String, instructions: String) -> Self {
+        Self {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            skill_name,
+            arguments,
+            status: SkillCallStatus::Pending,
+            response: String::new(),
+            instructions,
+            path: std::path::PathBuf::new(),
+            has_scripts: false,
+            raw_output: None,
+            profile_color: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SkillEnvironment {
+    pub root_path: std::path::PathBuf,
+    pub scripts: Vec<String>,
+    pub resources: Vec<String>,
+    pub user_args: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CapabilityContextPayload {
+    pub skill: String,
+    pub instruction_manual: String,
+    pub environment: SkillEnvironment,
+    pub resolved_tools: std::collections::HashMap<String, String>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolResult {
     pub status: ToolCallStatus,
@@ -119,6 +198,8 @@ pub struct ToolResult {
 pub struct ToolCallRecord {
     pub call: ToolCall,
     pub result: ToolResult,
+    #[serde(default)]
+    pub profile_color: Option<String>, // Historical profile color for rendering
 }
 
 /// Helper to extract JSON content from an LLM response string.

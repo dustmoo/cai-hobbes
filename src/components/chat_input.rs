@@ -15,8 +15,10 @@ use hobbes_core::models::Attachment;
 
 use crate::components::focus_context::FocusContext;
 use crate::components::shared::ChatBarIconButton;
+use crate::components::skill_autocomplete::SkillAutocomplete;
 use crate::hotkey::matches_hotkey;
 use crate::processing::summarization_scheduler::SchedulerSignal;
+use crate::skills::{Skill, SkillRegistry};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChatCommand {
@@ -31,6 +33,8 @@ pub enum ChatCommand {
     FocusChat,
     DeleteSession,
     CancelGeneration,
+    CopyToDraft(String),
+    TriggerAiAnalysis,
 }
 
 #[component]
@@ -47,7 +51,7 @@ pub fn ChatInput(
     on_new_chat_with_memory: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let mut _settings = use_context::<Signal<Settings>>();
+    let mut settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
@@ -62,6 +66,12 @@ pub fn ChatInput(
     let focus_context = use_context::<Signal<FocusContext>>();
     let mut textarea_mounted =
         use_signal(|| Option::<std::rc::Rc<dioxus::html::MountedData>>::None);
+
+    // Skill Autocomplete State
+    let skill_registry = use_context::<Signal<SkillRegistry>>();
+    let mut show_skill_autocomplete = use_signal(|| false);
+    let mut skill_autocomplete_index = use_signal(|| 0usize);
+    let mut filtered_skills = use_signal(Vec::<Skill>::new);
 
     // Active Focus Management: Reclaim focus when context reverts to ChatInput
     use_effect(move || {
@@ -167,6 +177,15 @@ pub fn ChatInput(
                         on_cancel.call(());
                     }
                 }
+                ChatCommand::CopyToDraft(text) => {
+                    tracing::info!("ChatCommand::CopyToDraft triggered: {} chars", text.len());
+                    draft.set(text);
+                }
+                ChatCommand::TriggerAiAnalysis => {
+                    tracing::info!("ChatCommand::TriggerAiAnalysis triggered");
+                    has_pending_approvals.set(true);
+                    on_send.call((String::new(), Vec::new()));
+                }
             }
             // Reset command to avoid re-triggering
             spawn(async move {
@@ -188,6 +207,137 @@ pub fn ChatInput(
         {
             return;
         }
+
+        // Skill Command Detection
+        if user_message.starts_with('/') {
+            let parts: Vec<&str> = user_message.split_whitespace().collect();
+            if !parts.is_empty() {
+                let skill_name = parts[0].trim_start_matches('/');
+                let skill_registry = use_context::<Signal<crate::skills::registry::SkillRegistry>>();
+                
+                if let Some(skill) = skill_registry.read().get_skill(skill_name) {
+                    let arguments = parts[1..].join(" ");
+                    let permission_manager = use_context::<Signal<crate::context::permissions::PermissionManager>>();
+                    let permission_status = permission_manager.read().check_skill_permission(&skill.metadata.name);
+
+                    let skill_call = crate::components::shared::SkillCall {
+                        execution_id: uuid::Uuid::new_v4().to_string(),
+                        skill_name: skill.metadata.name.clone(),
+                        arguments,
+                        status: if permission_status == crate::context::permissions::PermissionStatus::Allowed {
+                            crate::components::shared::SkillCallStatus::Running
+                        } else {
+                            crate::components::shared::SkillCallStatus::Pending
+                        },
+                        response: String::new(),
+                        instructions: skill.instructions.clone(),
+                        path: skill.path.clone(),
+                        has_scripts: !skill.scripts.is_empty(),
+                        raw_output: None,
+                        profile_color: Some(settings.read().get_active_profile().map(|p| p.color.clone()).unwrap_or_default()),
+                    };
+                    
+                    // First, push a normal user text bubble showing the command (history parity)
+                    let user_bubble = crate::components::chat::Message {
+                        id: uuid::Uuid::new_v4(),
+                        author: "User".to_string(),
+                        content: crate::components::shared::MessageContent::Text {
+                            content: user_message.clone(),
+                            thought_signature: None,
+                            thought_summary: None,
+                        },
+                        attachments: attachments.read().clone(),
+                        comments: Vec::new(),
+                        created_at: chrono::Utc::now(),
+                        usage: None,
+                    };
+
+                    if permission_status == crate::context::permissions::PermissionStatus::Allowed {
+                        // AUTO-EXECUTE PATH
+                        if cfg!(debug_assertions) {
+                            tracing::info!("[Auto-executing: /{}]", skill_name);
+                        }
+
+                        let skill_message = crate::components::chat::Message {
+                            id: uuid::Uuid::new_v4(),
+                            author: "User".to_string(),
+                            content: crate::components::shared::MessageContent::SkillCall(skill_call.clone()),
+                            attachments: Vec::new(),
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+
+                        let msg_id = skill_message.id;
+                        let mut state = session_state.write();
+                        if let Some(session) = state.get_active_session_mut() {
+                            session.messages.push(user_bubble);
+                            session.messages.push(skill_message);
+                        }
+                        drop(state); // Drop lock before async
+
+                        // Spawn Execution
+                        let mut sc_clone = skill_call.clone();
+                        let mut session_state = session_state; // move clone into closure
+                        let mcp_context = _mcp_context.read().clone();
+
+                        spawn(async move {
+                            match crate::skills::execute_skill(&mut sc_clone, Some(&mcp_context)).await {
+                                Ok(result) => {
+                                    // Update message with completed SkillCall
+                                    let mut state = session_state.write();
+                                    if let Some(session) = state.get_active_session_mut() {
+                                        if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
+                                            sc_clone.status = result.status;
+                                            sc_clone.response = result.output;
+                                            msg.content = crate::components::shared::MessageContent::SkillCall(sc_clone);
+                                        }
+                                    }
+                                    drop(state); // Release lock before triggering
+                                    // Auto-trigger LLM to respond with the injected skill context
+                                    chat_command.set(Some(ChatCommand::TriggerAiAnalysis));
+                                }
+                                Err(e) => {
+                                    tracing::error!("Skill execution failed: {}", e);
+                                    let mut state = session_state.write();
+                                    if let Some(session) = state.get_active_session_mut() {
+                                        if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
+                                            sc_clone.status = crate::components::shared::SkillCallStatus::Error;
+                                            sc_clone.response = format!("Error: {}", e);
+                                            msg.content = crate::components::shared::MessageContent::SkillCall(sc_clone);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+
+                    } else {
+                        // PROMPT PATH (Existing Logic)
+                        let skill_message = crate::components::chat::Message {
+                            id: uuid::Uuid::new_v4(),
+                            author: "User".to_string(),
+                            content: crate::components::shared::MessageContent::SkillPermissionRequest(skill_call),
+                            attachments: Vec::new(),
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        
+                        let mut state = session_state.write();
+                        if let Some(session) = state.get_active_session_mut() {
+                            session.messages.push(user_bubble);
+                            session.messages.push(skill_message);
+                        }
+                    }
+                    
+                    draft.set(String::new());
+                    attachments.set(Vec::new());
+                    return;
+                }
+            }
+        }
+
         on_send.call((user_message, attachments.read().clone()));
         draft.set("".to_string());
         attachments.set(Vec::new());
@@ -295,7 +445,7 @@ pub fn ChatInput(
                 // Composio Profile Selector
                 { if ui_state.read().show_profile_selector {
                     {
-                        let settings_read = _settings.read();
+                        let settings_read = settings.read();
                         let profiles = &settings_read.composio_profiles;
 
                         if profiles.len() > 1 {
@@ -321,9 +471,9 @@ pub fn ChatInput(
                                                         onclick: {
                                                             let new_profile_name = profile.name.clone();
                                                             move |_| {
-                                                                _settings.write().active_composio_profile = Some(new_profile_name.clone());
+                                                                settings.write().active_composio_profile = Some(new_profile_name.clone());
                                                                 // Auto-save changes
-                                                                if let Err(e) = settings_manager.read().save(&_settings.read()) {
+                                                                if let Err(e) = settings_manager.read().save(&settings.read()) {
                                                                     tracing::error!("Failed to save profile change: {}", e);
                                                                 }
                                                                 // Trigger summary refresh
@@ -434,6 +584,26 @@ pub fn ChatInput(
                         "#);
 
                         draft.set(event.value());
+
+                        // Skill Autocomplete Detection
+                        let val = event.value();
+                        if val.starts_with('/') {
+                            let query = &val[1..];
+                            let registry = skill_registry.read();
+                            let all_skills = registry.list_skills();
+                            let matches: Vec<Skill> = all_skills
+                                .into_iter()
+                                .filter(|s| {
+                                    query.is_empty() || s.metadata.name.to_lowercase().contains(&query.to_lowercase())
+                                })
+                                .collect();
+                            filtered_skills.set(matches);
+                            skill_autocomplete_index.set(0);
+                            show_skill_autocomplete.set(true);
+                        } else {
+                            show_skill_autocomplete.set(false);
+                            filtered_skills.set(Vec::new());
+                        }
                     },
                     onkeydown: move |event| {
                         tracing::debug!("ChatInput::onkeydown - Key: {:?}, Modifiers: {:?}, Context: {:?}", event.key(), event.data.modifiers(), *focus_context.read());
@@ -445,7 +615,7 @@ pub fn ChatInput(
 
                         scheduler.send(SchedulerSignal::Activity);
                         let modifiers = event.data.modifiers();
-                        let hotkeys = _settings.read().hotkeys.clone();
+                        let hotkeys = settings.read().hotkeys.clone();
 
                         // 1. Check Configurable Hotkeys
                         if matches_hotkey(&event, &hotkeys.cancel_generation) {
@@ -503,7 +673,68 @@ pub fn ChatInput(
                             return;
                         }
 
-                        // 4. Submit Handling
+                        // 4. Skill Autocomplete Navigation
+                        if *show_skill_autocomplete.read() {
+                            let skills = filtered_skills.read();
+                            let current_idx = *skill_autocomplete_index.read();
+
+                            match event.key() {
+                                Key::ArrowDown => {
+                                    event.prevent_default();
+                                    if current_idx < skills.len().saturating_sub(1) {
+                                        skill_autocomplete_index.set(current_idx + 1);
+                                    }
+                                    return;
+                                }
+                                Key::ArrowUp => {
+                                    event.prevent_default();
+                                    if current_idx > 0 {
+                                        skill_autocomplete_index.set(current_idx - 1);
+                                    }
+                                    return;
+                                }
+                                Key::Escape => {
+                                    event.prevent_default();
+                                    show_skill_autocomplete.set(false);
+                                    return;
+                                }
+                                Key::Enter | Key::Tab => {
+                                    if !skills.is_empty() {
+                                        event.prevent_default();
+                                        let selected = skills.get(current_idx).cloned();
+                                        drop(skills); // Release borrow before mutating
+                                        if let Some(skill) = selected {
+                                            // Preserve existing text as arguments
+                                            // Current draft looks like: "/tim args" or "/timestamp +%s"
+                                            // We want to: replace the "/query" part with "/skillname" but keep args
+                                            let current_draft = draft.read().clone();
+                                            let args = if current_draft.starts_with('/') {
+                                                // Extract everything after the first space (the arguments)
+                                                current_draft.split_once(' ')
+                                                    .map(|(_, args_part)| args_part.to_string())
+                                                    .unwrap_or_default()
+                                            } else {
+                                                String::new()
+                                            };
+                                            
+                                            let skill_command = if args.is_empty() {
+                                                format!("/{} ", skill.metadata.name)
+                                            } else {
+                                                format!("/{} {}", skill.metadata.name, args)
+                                            };
+                                            draft.set(skill_command.clone());
+                                            show_skill_autocomplete.set(false);
+                                            on_interaction.call(());
+                                            tracing::info!("Populated draft with skill command: {}", skill_command);
+                                        }
+                                        return;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // 5. Submit Handling
                         let is_standard_submit = event.key() == Key::Enter && !modifiers.contains(Modifiers::SHIFT);
 
                         // Submit if standard Enter (no shift) OR Force Submit matches
@@ -533,7 +764,21 @@ pub fn ChatInput(
                             }
                         }
                     },
-                },
+                }
+
+                // Skill Autocomplete Component
+                if *show_skill_autocomplete.read() {
+                    SkillAutocomplete {
+                        skills: filtered_skills.read().clone(),
+                        selected_index: *skill_autocomplete_index.read(),
+                        on_select: move |skill: Skill| {
+                            draft.set(format!("/{} ", skill.metadata.name));
+                            show_skill_autocomplete.set(false);
+                            on_interaction.call(());
+                            tracing::info!("Selected skill from autocomplete: {}", skill.metadata.name);
+                        }
+                    }
+                }
                 div {
                     class: "flex items-center space-x-3",
                     {
@@ -558,7 +803,7 @@ pub fn ChatInput(
                                                             session_for_debug.active_context.mcp_tools = Some(mcp_context);
                                                         }
 
-                                                        let settings_reader = _settings.read();
+                                                        let settings_reader = settings.read();
                                                         let builder = PromptBuilder::new(&session_for_debug, &settings_reader, &state);
                                                         let prompt_data = builder.build_prompt("[DEBUG USER MESSAGE]".to_string(), None);
                                                         format!("{:#?}", prompt_data)
@@ -627,7 +872,7 @@ pub fn ChatInput(
                                     }
                                     span {
                                         class: "text-xs text-gray-500 font-mono",
-                                        "{format_hotkey(&_settings.read().hotkeys.toggle_new_chat)}"
+                                        "{format_hotkey(&settings.read().hotkeys.toggle_new_chat)}"
                                     }
                                 }
                                 // New Chat with Memory
@@ -649,7 +894,7 @@ pub fn ChatInput(
                                     }
                                     span {
                                         class: "text-xs text-gray-500 font-mono",
-                                        "{format_hotkey(&_settings.read().hotkeys.toggle_new_chat_with_memory)}"
+                                        "{format_hotkey(&settings.read().hotkeys.toggle_new_chat_with_memory)}"
                                     }
                                 }
                             }

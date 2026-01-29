@@ -378,6 +378,7 @@ impl Default for Settings {
                 auto_approval_enabled: true,
                 granular_permissions,
                 mcp_server_permissions: HashMap::new(),
+                skill_permissions: HashMap::new(),
                 max_ai_turns: 25,
             },
             confirm_on_delete: true,
@@ -706,6 +707,15 @@ pub struct UiState {
     /// Default state for tool call Thinking Process section (expanded or collapsed)
     #[serde(default, alias = "show_tool_thought")]
     pub default_tool_thought_open: bool,
+    /// Default state for skill call Arguments section (expanded or collapsed)
+    #[serde(default = "default_true")]
+    pub default_skill_arguments_open: bool,
+    /// Default state for skill call Response section (expanded or collapsed)
+    #[serde(default = "default_true")]
+    pub default_skill_response_open: bool,
+    /// Default state for skill Instructions section (expanded or collapsed)
+    #[serde(default)]
+    pub default_skill_instructions_open: bool,
     /// MCP servers that are unloaded (tools hidden from AI)
     #[serde(default)]
     pub unloaded_mcp_servers: Vec<String>,
@@ -750,6 +760,9 @@ impl Default for UiState {
             default_tool_arguments_open: true,
             default_tool_response_open: false,
             default_tool_thought_open: false,
+            default_skill_arguments_open: true,
+            default_skill_response_open: true,
+            default_skill_instructions_open: true,
             unloaded_mcp_servers: Vec::new(),
             active_settings_tab: SettingsTab::default(),
             llm_config_collapsed: false,

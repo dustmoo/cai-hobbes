@@ -18,9 +18,12 @@ pub fn MessageList(
     on_delete: EventHandler<Uuid>,
     on_comment: EventHandler<()>,
 ) -> Element {
-    let session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let ui_state = consume_context::<Signal<crate::settings::UiState>>();
-    let chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    let settings = use_context::<Signal<crate::settings::Settings>>();
+    let active_profile = settings.read().get_active_profile().cloned().unwrap_or_default();
+    let profile_color = active_profile.color.clone();
+    let mut chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
     let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     let _ = stream_update_trigger.read();
 
@@ -222,6 +225,141 @@ pub fn MessageList(
                                                         move |_| on_delete.call(msg_id)
                                                     },
                                                     on_comment: move |_| on_comment.call(()),
+                                                }
+                                            }
+                                        }
+                                        MessageContent::SkillCall(skill_call) => {
+                                            let container_classes = "flex justify-end text-white";
+                                            let author_classes = "text-xs text-gray-500 mt-1 px-2 text-right";
+                                            rsx! {
+                                                div {
+                                                    key: "{message.id}",
+                                                    class: "{container_classes} w-full",
+                                                    div {
+                                                        class: "flex flex-col max-w-2/3 min-w-0",
+                                                        div {
+                                                            class: format!("relative group rounded-2xl {} shadow-md overflow-hidden", skill_call.profile_color.clone().unwrap_or_else(|| profile_color.clone())),
+                                                            div {
+                                                                class: "px-4 pt-3 pb-1 text-[10px] font-bold opacity-60 uppercase tracking-[0.2em]",
+                                                                "> SKILL EXECUTION"
+                                                            }
+                                                            crate::components::skill_call_display::SkillCallDisplay {
+                                                                skill_call: skill_call.clone(),
+                                                                on_use_result: move |output: String| {
+                                                                    chat_command.set(Some(crate::components::chat_input::ChatCommand::CopyToDraft(output)));
+                                                                },
+                                                                on_analyze: move |_| {
+                                                                    // Trigger AI continuation via Command Bridge
+                                                                    chat_command.set(Some(crate::components::chat_input::ChatCommand::TriggerAiAnalysis));
+                                                                },
+                                                            }
+                                                        }
+                                                        div {
+                                                            class: "{author_classes}",
+                                                            "User"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        MessageContent::SkillPermissionRequest(skill_call) => {
+                                            let container_classes = "flex justify-end text-white";
+                                            let author_classes = "text-xs text-gray-500 mt-1 px-2 text-right";
+                                            let execution_id = skill_call.execution_id.clone();
+                                            let message_id = message.id;
+                                            rsx! {
+                                                div {
+                                                    key: "{message.id}",
+                                                    class: "{container_classes} w-full",
+                                                    div {
+                                                        class: "flex flex-col max-w-2/3 min-w-0",
+                                                        div {
+                                                            class: format!("relative group rounded-2xl {} shadow-md overflow-hidden", skill_call.profile_color.clone().unwrap_or_else(|| profile_color.clone())),
+                                                            div {
+                                                                class: "px-4 pt-3 pb-1 text-[10px] font-bold opacity-60 uppercase tracking-[0.2em]",
+                                                                "> SKILL COMMAND"
+                                                            }
+                                                            crate::components::skill_call_display::SkillCallDisplay {
+                                                                skill_call: skill_call.clone(),
+                                                                show_permission_prompt: true,
+                                                                on_approve: move |_exec_id: String| {
+                                                                    let msg_id = message_id;
+                                                                    spawn(async move {
+                                                                        // Find and execute the skill
+                                                                        let (mut skill_call_clone, mcp_context) = {
+                                                                            let state = session_state.read();
+                                                                            if let Some(session) = state.get_active_session() {
+                                                                                let sc = session.messages.iter()
+                                                                                    .find(|m| m.id == msg_id)
+                                                                                    .and_then(|m| match &m.content {
+                                                                                        MessageContent::SkillPermissionRequest(sc) => Some(sc.clone()),
+                                                                                        _ => None,
+                                                                                    });
+                                                                                let mcp = session.active_context.mcp_tools.clone();
+                                                                                (sc, mcp)
+                                                                            } else { (None, None) }
+                                                                        };
+                                                                        
+                                                                        if let Some(mut sc) = skill_call_clone.take() {
+                                                                            // unwrap outer option, flatten inner if needed, but here mcp_context is Option<McpContext>
+                                                                            // actually `active_context.mcp_tools` is likely `McpContext` or `Option<McpContext>`?
+                                                                            // Assuming mcp_context is Option<McpContext> based on usage. 
+                                                                            // Wait, let's verify type if possible. 
+                                                                            // If session.active_context.mcp_tools is distinct, we treat it as the context.
+                                                                            
+                                                                            tracing::info!("Executing skill: {}", sc.skill_name);
+                                                                            match crate::skills::execute_skill(&mut sc, mcp_context.as_ref()).await {
+                                                                                Ok(result) => {
+                                                                                    tracing::info!("Skill executed: {:?}", result.status);
+                                                                                    // Update message with completed SkillCall
+                                                                                    let mut state = session_state.write();
+                                                                                    if let Some(session) = state.get_active_session_mut() {
+                                                                                        if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
+                                                                                            msg.content = MessageContent::SkillCall(sc);
+                                                                                        }
+                                                                                    }
+                                                                                    drop(state);
+                                                                                    // Trigger continuation so LLM responds to skill output
+                                                                                    chat_command.set(Some(crate::components::chat_input::ChatCommand::TriggerAiAnalysis));
+                                                                                }
+                                                                                Err(e) => {
+                                                                                    tracing::error!("Skill execution failed: {}", e);
+                                                                                    sc.status = crate::components::shared::SkillCallStatus::Error;
+                                                                                    sc.response = e.to_string();
+                                                                                    let mut state = session_state.write();
+                                                                                    if let Some(session) = state.get_active_session_mut() {
+                                                                                        if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
+                                                                                            msg.content = MessageContent::SkillCall(sc);
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    });
+                                                                },
+                                                                on_deny: move |_exec_id: String| {
+                                                                    let msg_id = message_id;
+                                                                    // Mark skill as denied
+                                                                    let mut state = session_state.write();
+                                                                    if let Some(session) = state.get_active_session_mut() {
+                                                                        if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
+                                                                            if let MessageContent::SkillPermissionRequest(sc) = &msg.content {
+                                                                                let mut denied_sc = sc.clone();
+                                                                                denied_sc.status = crate::components::shared::SkillCallStatus::Error;
+                                                                                denied_sc.response = "Permission denied by user.".to_string();
+                                                                                msg.content = MessageContent::SkillCall(denied_sc);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    tracing::info!("Skill permission denied for execution_id: {}", execution_id);
+                                                                }
+                                                            }
+                                                        }
+                                                        div {
+                                                            class: "{author_classes}",
+                                                            "User"
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }

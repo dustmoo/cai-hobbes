@@ -117,6 +117,20 @@ pub fn ChatWindow(
     let on_interaction = move || {
         show_scroll_button.set(false);
     };
+
+    // Sync mcp_context signal changes to the active session's mcp_tools
+    // This ensures the UI updates immediately when tools are loaded/unloaded
+    use_effect(move || {
+        let current_context = _mcp_context.read().clone();
+        let mut state = session_state.write();
+        if let Some(session) = state.get_active_session_mut() {
+            if !current_context.servers.is_empty() {
+                session.active_context.mcp_tools = Some(current_context);
+            } else {
+                session.active_context.mcp_tools = None;
+            }
+        }
+    });
     use_effect(move || {
         // By reading the session state here, the effect becomes dependent on it.
         // Any change to messages will cause this to re-run.
@@ -225,7 +239,8 @@ pub fn ChatWindow(
                 }
 
                 if tools_to_run.is_empty() {
-                    stream_manager_is_sending.set(false);
+                    // This could be a Skill continuation (no tools to run)
+                    continuation_controller.read().trigger_continuation();
                     return;
                 }
 
@@ -274,6 +289,7 @@ pub fn ChatWindow(
                                     status,
                                     response: response_str,
                                 },
+                                profile_color: Some(settings.read().get_active_profile().map(|p| p.color.clone()).unwrap_or_default()),
                             });
                     }
                 }
@@ -551,9 +567,13 @@ pub fn ChatWindow(
 
                 let prompt_data = {
                     let state = session_state.read();
-                    let session = state.get_active_session().unwrap();
-                    let builder = PromptBuilder::new(session, &settings, &state);
-                    builder.build_prompt("".to_string(), None)
+                    if let Some(session) = state.get_active_session() {
+                        let builder = PromptBuilder::new(session, &settings, &state);
+                        builder.build_prompt("".to_string(), None)
+                    } else {
+                        tracing::error!("Active session lost during continuation flow - aborting prompt build");
+                        return;
+                    }
                 };
 
                 if let Err(e) = session_state.read().save() {

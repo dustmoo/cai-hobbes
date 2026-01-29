@@ -114,6 +114,36 @@ pub async fn list_connected_accounts(
         page_count
     );
 
+    // PATTERN 122: Proactive Cache Hydration
+    // Populate the toolkit_account_map used by execution.rs for "Proactive Verification"
+    if let Ok(mut map) = client.toolkit_account_map.write() {
+        // Clear old entries to ensure freshness
+        // map.clear(); // Optional: Clearing might delete valid entries if we fetched a partial list (though we fetch all here)
+
+        for acc in &all_accounts {
+            // Only cache ACTIVE connections
+            if !acc.status.eq_ignore_ascii_case("ACTIVE") {
+                continue;
+            }
+
+            if let Some(_uid) = &acc.user_id {
+                let account_id = acc.id.clone();
+                
+                // Map both Toolkit Slug and App Name if available
+                if let Some(toolkit) = &acc.toolkit {
+                    map.insert(toolkit.slug.clone(), account_id.clone());
+                }
+                
+                if let Some(app_name) = &acc.app_name {
+                    map.insert(app_name.clone(), account_id.clone());
+                }
+            }
+        }
+        tracing::debug!("Hydrated toolkit_account_map with {} entries", map.len());
+    } else {
+        tracing::warn!("Failed to acquire write lock for toolkit_account_map");
+    }
+
     // Debug: Log all accounts after pagination
     let all_slugs: Vec<String> = all_accounts
         .iter()
@@ -724,6 +754,40 @@ pub async fn initiate_connection(
         );
     }
 
+    // SAFETY CHECK: After pruning, verify if we already have an ACTIVE connection.
+    // If so, skip the OAuth flow entirely to prevent unnecessary re-initiation loops.
+    match list_connected_accounts(client).await {
+        Ok(accounts) => {
+            let has_active = accounts.iter().any(|acc| {
+                let matches_toolkit = acc
+                    .toolkit
+                    .as_ref()
+                    .map(|t| t.slug.eq_ignore_ascii_case(toolkit_slug))
+                    .unwrap_or(false)
+                    || acc
+                        .app_name
+                        .as_ref()
+                        .map(|n| n.eq_ignore_ascii_case(toolkit_slug))
+                        .unwrap_or(false);
+                let matches_user = acc.user_id.as_deref() == Some(&final_user_id);
+                let is_active = acc.status.eq_ignore_ascii_case("ACTIVE");
+                matches_toolkit && matches_user && is_active
+            });
+
+            if has_active {
+                tracing::info!(
+                    "[AUTH] Active connection already exists for toolkit '{}' (user: {}). Skipping OAuth flow.",
+                    toolkit_slug,
+                    final_user_id
+                );
+                return Ok("Connection already active. No re-authentication needed.".to_string());
+            }
+        }
+        Err(e) => {
+            tracing::warn!("[AUTH] Failed to check for active connections: {}. Proceeding with OAuth.", e);
+        }
+    }
+
     // We need the auth_config_id to tell the API WHICH toolkit to link.
     let auth_config_id = get_auth_config_id(client, toolkit_slug).await?;
 
@@ -849,29 +913,22 @@ pub async fn initiate_connection(
                             // KEY NORMALIZATION (Pattern 123 Extension)
                             // Some tools (like ClickUp) expect camelCase context keys, but OAuth callbacks often return snake_case.
                             // We save BOTH to ensure dynamic injection works regardless of the tool's schema.
-                            match key.as_str() {
-                                "connected_account_id" => {
+                            // GENERIC: Convert any snake_case key to camelCase automatically.
+                            if key.contains('_') {
+                                let camel_key = super::utils::snake_to_camel(key);
+                                if camel_key != *key {
                                     tracing::info!(
-                                        "[CONTEXT] Normalizing '{}' -> 'connectedAccountId'",
-                                        key
+                                        "[CONTEXT] Normalizing '{}' -> '{}'",
+                                        key,
+                                        camel_key
                                     );
                                     client.context_store.save_param(
                                         toolkit_slug,
                                         &final_user_id,
-                                        "connectedAccountId",
+                                        &camel_key,
                                         value,
                                     );
                                 }
-                                "team_id" => {
-                                    tracing::info!("[CONTEXT] Normalizing '{}' -> 'teamId'", key);
-                                    client.context_store.save_param(
-                                        toolkit_slug,
-                                        &final_user_id,
-                                        "teamId",
-                                        value,
-                                    );
-                                }
-                                _ => {}
                             }
                         }
                     }

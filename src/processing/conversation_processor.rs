@@ -48,6 +48,10 @@ impl ConversationProcessor {
                     MessageContent::PermissionRequest(tc) => {
                         format!("[Permission Request for Tool: {}]", tc.tool_name)
                     }
+                    MessageContent::SkillCall(sc) => format!("[Skill Call: {}]", sc.skill_name),
+                    MessageContent::SkillPermissionRequest(sc) => {
+                        format!("[Permission Request for Skill: {}]", sc.skill_name)
+                    }
                     MessageContent::Error { message } => format!("[Error: {}]", message),
                 };
                 format!("{}: {}", m.author, content_str)

@@ -71,6 +71,26 @@ impl From<Message> for Content {
                     parts: vec![],
                 }
             }
+            MessageContent::SkillCall(sc) => {
+                let mut parts = Vec::new();
+                let status_str = match sc.status {
+                    crate::components::shared::SkillCallStatus::Completed => "output",
+                    crate::components::shared::SkillCallStatus::Error => "error",
+                    _ => return Content { role, parts: vec![] }, // Skip pending/running
+                };
+                parts.push(Part::Text {
+                    text: format!("[Skill '{}' {}]:\n{}", sc.skill_name, status_str, sc.response),
+                    thought: None,
+                });
+                Content { role, parts }
+            }
+            MessageContent::SkillPermissionRequest(_) => {
+                // Skill permission requests are UI-only.
+                Content {
+                    role,
+                    parts: vec![],
+                }
+            }
             MessageContent::Error { .. } => {
                 // Error messages are UI-only and should not be in the prompt history.
                 Content {
@@ -227,7 +247,7 @@ impl<'a> PromptBuilder<'a> {
                 .is_some_and(|m| matches!(m.content, MessageContent::ToolCall(_)));
 
             if last_message_was_tool {
-                let tool_completion_instruction = "\n\nTOOL COMPLETION INSTRUCTION: The tool execution has completed. Use the tool output above to answer the user's request. Do not ask the user for the tool output again.";
+                let tool_completion_instruction = "\n\nTOOL COMPLETION INSTRUCTION: The tool execution has completed. Use the tool output above to answer the user's request. Do not ask the user for the tool output again. When reporting specific values from tool outputs (like dates, IDs, or file paths), present them exactly as returned. Do not transform, reformat, or convert them (e.g. date conversion) unless explicitly requested by the user.";
                 persona.push_str(tool_completion_instruction);
             } else {
                 let continuation_instruction = "\n\nCONTINUATION INSTRUCTION: You were the last one to speak. The user has not replied. Continue the conversation based on the existing context. Do not repeat yourself. Provide new information or ask a clarifying question.";
@@ -330,6 +350,36 @@ impl<'a> PromptBuilder<'a> {
                     "instruction": format!("The currently active profile determining your available tool connections is: '{}'.", active_profile_name)
                 })
             );
+        }
+
+        // Extract active skill context from messages and inject into system instruction
+        // This ensures resolved tool mappings have high priority in the model's context
+        for message in &self.session.messages {
+            if let MessageContent::SkillCall(sc) = &message.content {
+                if matches!(sc.status, crate::components::shared::SkillCallStatus::Completed) {
+                    // Parse the response to extract the CapabilityContextPayload
+                    if let Ok(payload) = serde_json::from_str::<crate::components::shared::CapabilityContextPayload>(&sc.response) {
+                        if !payload.resolved_tools.is_empty() {
+                            let tool_mappings: Vec<serde_json::Value> = payload.resolved_tools.iter()
+                                .map(|(capability, tool_name)| json!({
+                                    "capability": capability,
+                                    "use_tool": tool_name
+                                }))
+                                .collect();
+                            
+                            system_context_map.insert(
+                                "active_skill".to_string(),
+                                json!({
+                                    "name": sc.skill_name,
+                                    "instruction": format!("PRIORITY: Use these specific tools for the '{}' skill. Do NOT use Composio discovery tools.", sc.skill_name),
+                                    "resolved_tools": tool_mappings,
+                                    "arguments": sc.arguments
+                                })
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         let persona = system_context_map
@@ -530,15 +580,19 @@ impl<'a> PromptBuilder<'a> {
                             ));
                         }
 
-                        let result_value: serde_json::Value = serde_json::from_str(&result_string)
-                            .unwrap_or_else(|_| json!(result_string));
+                        // Ensure we always send a JSON Object as required by Gemini FunctionResponse
+                        let result_value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&result_string) {
+                            Ok(val) if val.is_object() => val,
+                            Ok(val) => json!({ "result": val }),
+                            Err(_) => json!({ "result": result_string }),
+                        };
 
                         add_to_prompt(
                             "user",
                             Part::FunctionResponse {
                                 function_response: FunctionResponsePart {
                                     name: sanitized_tool_name,
-                                    response: json!({ "result": result_value }),
+                                    response: result_value,
                                 },
                             },
                         );
@@ -564,12 +618,50 @@ impl<'a> PromptBuilder<'a> {
                             );
                         }
                     }
-                    MessageContent::PermissionRequest(_) => {
-                        // Skip permission requests in the prompt
+                    MessageContent::SkillCall(sc) => {
+                        // Inject completed skill context as structured text.
+                        // We avoid synthetic FunctionCall which requires thought_signature.
+                        
+                        if let crate::components::shared::SkillCallStatus::Completed = sc.status {
+                            // Format the skill context as a clear text block
+                            let context_text = format!(
+                                "[SKILL CONTEXT INJECTED]\nSkill: {}\nArguments: {}\nContext Payload:\n{}\n[END SKILL CONTEXT]",
+                                sc.skill_name,
+                                sc.arguments,
+                                sc.response
+                            );
+
+                            add_to_prompt(
+                                "user",
+                                Part::Text {
+                                    text: context_text,
+                                    thought: None,
+                                },
+                            );
+
+                            // Handle comments as separate user messages
+                            if !message.comments.is_empty() {
+                                let mut comment_text =
+                                    String::from("[User comments on the above message:");
+                                for comment in &message.comments {
+                                    comment_text.push_str(&format!(
+                                        "\n- On \"{}\": {}",
+                                        comment.text_selection, comment.comment
+                                    ));
+                                }
+                                comment_text.push(']');
+
+                                add_to_prompt(
+                                    "user",
+                                    Part::Text {
+                                        text: comment_text,
+                                        thought: None,
+                                    },
+                                );
+                            }
+                        }
                     }
-                    MessageContent::Error { .. } => {
-                        // Skip error messages in the prompt
-                    }
+                    _ => {}
                 }
             }
         }
@@ -590,186 +682,6 @@ impl<'a> PromptBuilder<'a> {
             system_instruction,
             contents,
             tools,
-        }
-    }
-}
-
-/// Recursively traverses a serde_json::Value and removes specified keys.
-#[allow(dead_code)]
-fn recursively_remove_keys(value: &mut serde_json::Value, keys_to_remove: &[&str]) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for key in keys_to_remove {
-                map.remove(*key);
-            }
-
-            // Check properties for string values and remove them
-            // This catches the 'value': 'OBJECT' case specifically requested by the user logic
-            if let Some(props_val) = map.get_mut("properties") {
-                if let Some(props_map) = props_val.as_object_mut() {
-                    let keys_to_strip: Vec<String> = props_map
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            if v.as_str().is_some() {
-                                return Some(k.clone());
-                            }
-                            None
-                        })
-                        .collect();
-                    for k in keys_to_strip {
-                        props_map.remove(&k);
-                    }
-                }
-            }
-
-            for (_, val) in map.iter_mut() {
-                recursively_remove_keys(val, keys_to_remove);
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for val in arr.iter_mut() {
-                recursively_remove_keys(val, keys_to_remove);
-            }
-        }
-        _ => {}
-    }
-}
-
-#[allow(dead_code)]
-fn recursively_sanitize_schema(value: &mut serde_json::Value) {
-    // Pass 1: Simplify complex structures first.
-    simplify_schema(value);
-    // Pass 2: Fix types and remove invalid keys from the simplified structure.
-    fix_and_remove_invalid_fields(value);
-}
-
-/// Pass 1: Recursively simplifies complex schema structures like `oneOf` and `items` arrays.
-fn simplify_schema(value: &mut serde_json::Value) {
-    if let serde_json::Value::Object(map) = value {
-        // Simplify `oneOf`, `anyOf`, `allOf` by taking the first element.
-        for key in ["oneOf", "anyOf", "allOf"].iter() {
-            if let Some(arr_val) = map.remove(*key) {
-                if let Some(arr) = arr_val.as_array() {
-                    if let Some(first_item) = arr.first() {
-                        // If the first item is an object, merge its properties into the current map.
-                        if let Some(obj) = first_item.as_object() {
-                            for (k, v) in obj {
-                                map.insert(k.clone(), v.clone());
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        // If `items` is an array, replace it with its first element.
-        if let Some(items_val) = map.get_mut("items") {
-            if let Some(arr) = items_val.as_array() {
-                if let Some(first_item) = arr.first() {
-                    *items_val = first_item.clone();
-                } else {
-                    // If the array is empty, replace it with an empty object to satisfy the API.
-                    *items_val = json!({});
-                }
-            }
-        }
-
-        // Recurse into all child values.
-        for (_, val) in map.iter_mut() {
-            simplify_schema(val);
-        }
-    } else if let serde_json::Value::Array(arr) = value {
-        for val in arr.iter_mut() {
-            simplify_schema(val);
-        }
-    }
-}
-
-/// Pass 2: Recursively fixes enums, enforces object types, and removes invalid keys.
-fn fix_and_remove_invalid_fields(value: &mut serde_json::Value) {
-    if let serde_json::Value::Object(map) = value {
-        // Rule 1: Convert numeric enums to strings.
-        if let Some(enum_val) = map.get_mut("enum") {
-            if let serde_json::Value::Array(arr) = enum_val {
-                if arr.iter().any(|v| v.is_number() || v.is_null()) {
-                    let new_arr: Vec<serde_json::Value> = arr
-                        .iter()
-                        .map(|v| serde_json::Value::String(v.to_string().replace('\"', "")))
-                        .collect();
-                    *enum_val = serde_json::Value::Array(new_arr);
-                    // If we converted a numeric enum, we must also change the type to STRING.
-                    map.insert("type".to_string(), json!("STRING"));
-                }
-            }
-        }
-
-        // Rule 2: Enforce `type: "object"` if `properties` or `required` exist.
-        if map.contains_key("properties") || map.contains_key("required") {
-            map.insert("type".to_string(), json!("OBJECT"));
-        }
-
-        // Rule 3: Convert type values to uppercase for Gemini compatibility.
-        if let Some(type_val) = map.get_mut("type") {
-            if let serde_json::Value::Array(arr) = type_val {
-                // If type is an array (e.g., ["string", "number"]), take the first type.
-                if let Some(first) = arr.first() {
-                    if let Some(s) = first.as_str() {
-                        *type_val = serde_json::Value::String(s.to_string());
-                    }
-                }
-            }
-            if let serde_json::Value::String(s) = type_val {
-                *type_val = serde_json::Value::String(s.to_uppercase());
-            }
-        }
-
-        // Rule 4: Remove globally invalid keys.
-        let keys_to_remove = [
-            "exclusiveMaximum",
-            "exclusiveMinimum",
-            "ge",
-            "le",
-            "additionalProperties",
-            "$ref",
-            "_meta",
-            "minimum",
-            "maximum",
-            "title",
-            "default",
-        ];
-        for key in &keys_to_remove {
-            map.remove(*key);
-        }
-
-        // Rule 5: Remove any property inside `properties` that is a string value.
-        // This catches malformed schemas like {"properties": {"type": "OBJECT", ...}}
-        // where "type" is incorrectly a property name instead of a schema field.
-        if let Some(props_val) = map.get_mut("properties") {
-            if let Some(props_map) = props_val.as_object_mut() {
-                let keys_to_strip: Vec<String> = props_map
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        if v.as_str().is_some() {
-                            Some(k.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                for k in keys_to_strip {
-                    props_map.remove(&k);
-                }
-            }
-        }
-
-        // Recurse into all child values after processing the current level.
-        for (_, val) in map.iter_mut() {
-            fix_and_remove_invalid_fields(val);
-        }
-    } else if let serde_json::Value::Array(arr) = value {
-        for val in arr.iter_mut() {
-            fix_and_remove_invalid_fields(val);
         }
     }
 }

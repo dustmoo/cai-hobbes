@@ -31,7 +31,6 @@ pub struct ComposioClient {
     // Cache of toolkit slug -> auth_config_id for dynamic per-toolkit lookups
     pub(crate) auth_config_cache: Arc<RwLock<HashMap<String, String>>>,
     // Cache of toolkit slug -> account_id for dynamic per-toolkit lookups
-    #[allow(dead_code)]
     pub(crate) toolkit_account_map: Arc<RwLock<HashMap<String, String>>>,
     // Secure Context Store for tool-specific keys
     pub(crate) context_store: Arc<ContextStore>,

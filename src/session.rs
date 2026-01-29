@@ -167,6 +167,9 @@ pub struct SessionState {
     pub window_height: f64,
     #[serde(default)]
     pub tool_call_history: Vec<crate::components::shared::ToolCallRecord>,
+    /// When true, save() will no-op to protect backup data after load failure
+    #[serde(skip)]
+    pub save_disabled: bool,
 }
 
 fn get_sessions_path() -> Option<PathBuf> {
@@ -275,13 +278,86 @@ impl SessionState {
                             }
                         }
                     }
+
+                    // Migrate ToolCall/SkillCall fields
+                    if let Some(messages) = session_val
+                        .get_mut("messages")
+                        .and_then(|v| v.as_array_mut())
+                    {
+                        for message in messages.iter_mut() {
+                            if let Some(content) = message.get_mut("content") {
+                                // Helper closure to migrate common fields
+                                let migrate_tool_fields = |obj: &mut serde_json::Map<String, serde_json::Value>| {
+                                    // id -> execution_id
+                                    if obj.contains_key("id") && !obj.contains_key("execution_id") {
+                                        if let Some(val) = obj.remove("id") {
+                                            obj.insert("execution_id".to_string(), val);
+                                            tracing::debug!("Migrated id -> execution_id");
+                                        }
+                                    }
+                                    // name -> tool_name
+                                    if obj.contains_key("name") && !obj.contains_key("tool_name") {
+                                        if let Some(val) = obj.remove("name") {
+                                            obj.insert("tool_name".to_string(), val);
+                                            tracing::debug!("Migrated name -> tool_name");
+                                        }
+                                    }
+                                };
+                                
+                                let migrate_skill_fields = |obj: &mut serde_json::Map<String, serde_json::Value>| {
+                                    // id -> execution_id
+                                    if obj.contains_key("id") && !obj.contains_key("execution_id") {
+                                        if let Some(val) = obj.remove("id") {
+                                            obj.insert("execution_id".to_string(), val);
+                                            tracing::debug!("Migrated id -> execution_id");
+                                        }
+                                    }
+                                    // name -> skill_name
+                                    if obj.contains_key("name") && !obj.contains_key("skill_name") {
+                                        if let Some(val) = obj.remove("name") {
+                                            obj.insert("skill_name".to_string(), val);
+                                            tracing::debug!("Migrated name -> skill_name");
+                                        }
+                                    }
+                                };
+
+                                // Check for ToolCall
+                                if let Some(tool_call) = content.get_mut("ToolCall").and_then(|v| v.as_object_mut()) {
+                                    migrate_tool_fields(tool_call);
+                                }
+                                // Check for PermissionRequest (structure similar to ToolCall)
+                                if let Some(perm_req) = content.get_mut("PermissionRequest").and_then(|v| v.as_object_mut()) {
+                                    migrate_tool_fields(perm_req);
+                                }
+                                // Check for SkillCall
+                                if let Some(skill_call) = content.get_mut("SkillCall").and_then(|v| v.as_object_mut()) {
+                                    migrate_skill_fields(skill_call);
+                                }
+                                // Check for SkillPermissionRequest
+                                if let Some(skill_perm) = content.get_mut("SkillPermissionRequest").and_then(|v| v.as_object_mut()) {
+                                    migrate_skill_fields(skill_perm);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
             // Now deserialize the migrated value
             if let Some(sessions_val) = value.get("sessions") {
-                if let Ok(sessions) = serde_json::from_value(sessions_val.clone()) {
-                    state.sessions = sessions;
+                match serde_json::from_value(sessions_val.clone()) {
+                    Ok(sessions) => {
+                        state.sessions = sessions;
+                        tracing::info!("Migration recovered {} sessions", state.sessions.len());
+                    }
+                    Err(e) => {
+                        tracing::error!("Migration failed to deserialize sessions: {}. NOT overwriting backup.", e);
+                        // Return error so caller doesn't use empty state
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Migration failed: {}. Your data backup is at sessions.json.bak", e)
+                        ));
+                    }
                 }
             }
             if let Some(active_id) = value.get("active_session_id").and_then(|v| v.as_str()) {
@@ -300,15 +376,25 @@ impl SessionState {
             }
         }
 
-        // Save the migrated state
-        if let Err(e) = state.save() {
-            tracing::error!("Failed to save migrated session state: {}", e);
+        // Only save the migrated state if we actually recovered sessions
+        if !state.sessions.is_empty() {
+            if let Err(e) = state.save() {
+                tracing::error!("Failed to save migrated session state: {}", e);
+            }
+        } else {
+            tracing::warn!("Migration produced empty sessions - NOT saving to preserve backup");
         }
 
         Ok(state)
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
+        // If save is disabled (due to load failure), protect the backup
+        if self.save_disabled {
+            tracing::warn!("Save disabled due to prior load failure - protecting backup data");
+            return Ok(());
+        }
+
         use std::io::Write;
 
         let path = get_sessions_path().ok_or_else(|| {
@@ -484,6 +570,7 @@ impl Default for SessionState {
             window_width: 1440.0, // 16:9 ratio default
             window_height: 810.0,
             tool_call_history: Vec::new(),
+            save_disabled: false,
         }
     }
 }

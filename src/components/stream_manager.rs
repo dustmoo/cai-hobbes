@@ -404,6 +404,7 @@ impl StreamManagerContext {
                                         status,
                                         response: response_str,
                                     },
+                                    profile_color: Some(self.settings.read().get_active_profile().map(|p| p.color.clone()).unwrap_or_default()),
                                 };
                                 let _ = tool_results_tx_clone.send(record);
                             }
