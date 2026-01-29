@@ -12,6 +12,15 @@ ENTITLEMENTS="Hobbes.entitlements"
 IDENTITY="${HOBBES_SIGNING_ID:-Apple Distribution: DUSTIN ALAN MOORE (ABXVW6PWCW)}"
 export MACOSX_DEPLOYMENT_TARGET=12.0
 
+# Auto-resolve identity to a fingerprint to avoid "ambiguous" errors if duplicates exist
+# security find-identity -v only lists VALID identities, effectively ignoring revoked ones
+# explicitly exclude REVOKED ones just in case they show up in the valid list (occasional macOS behavior)
+RESOLVED_FINGERPRINT=$(security find-identity -v -p codesigning | grep "$IDENTITY" | grep -v "CSSMERR_TP_CERT_REVOKED" | head -1 | awk '{print $2}')
+if [ -n "$RESOLVED_FINGERPRINT" ]; then
+    echo "  ✅ Resolved '$IDENTITY' to fingerprint: $RESOLVED_FINGERPRINT"
+    IDENTITY="$RESOLVED_FINGERPRINT"
+fi
+
 echo "=== Building Release App Package ==="
 dx build --release
 
@@ -132,8 +141,13 @@ if [ "$CI" = "true" ]; then
     codesign --force --deep --sign - --entitlements "$ENTITLEMENTS" "$APP_PATH"
     echo "  ✅ Ad-hoc signed"
 else
-    echo "  🔐 Signing with Developer Certificate..."
-    codesign --force --deep --sign "$IDENTITY" --entitlements "$ENTITLEMENTS" "$APP_PATH"
+    # Sign the binary explicitly first to ensure entitlements stick to the executable
+    echo "  🔐 Signing binary executable (hardened runtime)..."
+    codesign --force --sign "$IDENTITY" --entitlements "$ENTITLEMENTS" --options runtime "$BINARY"
+
+    # Then sign the whole bundle
+    echo "  🔐 Signing app bundle (hardened runtime)..."
+    codesign --force --deep --sign "$IDENTITY" --entitlements "$ENTITLEMENTS" --options runtime "$APP_PATH"
     echo "  ✅ Signed with: $IDENTITY"
 fi
 
@@ -143,7 +157,21 @@ if [ "$CI" = "true" ]; then
     echo "  ⚠️  CI Mode: Skipping strict verification."
     codesign -dvvv "$APP_PATH" 2>&1 | grep -E "(Identifier=)"
 else
+    # Verify the signature details
     codesign -dvvv "$APP_PATH" 2>&1 | grep -E "(TeamIdentifier|Authority|Identifier=)" | head -5
+    
+    echo ""
+    echo "=== Verifying Entitlements ==="
+    # Check if the binary actually has the sandbox entitlement
+    ENTITLEMENTS_DUMP=$(codesign -d --entitlements :- "$BINARY" 2>/dev/null)
+    if echo "$ENTITLEMENTS_DUMP" | grep -q "com.apple.security.app-sandbox"; then
+        echo "  ✅ Application is Sandboxed"
+    else
+        echo -e "\033[0;31m  ❌ CRITICAL: Application is NOT Sandboxed (Missing Entitlement)\033[0m"
+        echo "     Dumping valid entitlements found:"
+        echo "$ENTITLEMENTS_DUMP"
+        exit 1
+    fi
 fi
 
 echo ""
