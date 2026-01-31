@@ -3,206 +3,133 @@
 ![Version](https://img.shields.io/github/v/tag/dustmoo/cai-hobbes?label=version)
 ![Build Status](https://github.com/dustmoo/cai-hobbes/actions/workflows/ci.yml/badge.svg)
 ![Clippy](https://github.com/dustmoo/cai-hobbes/actions/workflows/clippy.yml/badge.svg)
-
 ![License](https://img.shields.io/badge/License-FSL%201.1-blue.svg)
 
-## Welcome to Hobbes!
+## What is Hobbes?
 
-I started playing around with Google Gemini Pro 2.5 last year and was amazed at how _smart_ it was. Being a long-time Claude user, I missed the "personability" of the model, even though 2.5 was a fantastic writer, coder, and assistant (approaching Sonnet performance for a fraction of the price 😅). So, as part of my 2025 journey, I decided to use [Dioxus 0.6.3](https://dioxuslabs.com/) to create my very own useful assistant.
+**Hobbes is a private, local-first key-running AI assistant built in Rust and Dioxus, designed to master context composition.**
 
-### What is Hobbes?
-
--   **Private & Local-First:** Hobbes is a FOSS chatbot built in **Rust** and **Tailwind**, designed to be **more private** than standard web interfaces. Conversations are stored securely on your Mac, and it uses Google's Generative API to access models directly.
--   **Context Composition Experiment:** Tired of hitting "New Chat" when the AI gets confused by too much context? Hobbes combines a set limit for past conversation (defaults to 75 messages) with a **Summary Model** that maintains an up-to-date "Memory Object". This passive summarization keeps the AI on track, allowing you to chat all day in a single session.
--   **Educational Project:** I built Hobbes to dust off my dev hat and learn Rust (loving it!). While I haven't used Dioxus to its absolute theoretical limit, the app is functional and fast. It is currently highly optimized for **macOS**, but Windows and Linux are on the roadmap. (Have ideas? [Contribute!](CONTRIBUTING.md))
--   **For AI Enthusiasts:** Hobbes integrates local **MCP (Model Context Protocol)** execution and features integration with [**Composio**](https://composio.dev/) (via OAuth) for extended capabilities.
-    > **Note:** The Composio integration is currently tightly coupled to Hobbes and is custom-built.
+Unlike standard web chats that lose the thread after a few turns, Hobbes treats context as a composed product. It combines a "Safe Agent" philosophy with advanced memory architecture to keep your AI useful, grounded, and secure all day long.
 
 ![Hobbes Interface](assets/hobbes-mcp.png)
 
-**Note:** Hobbes needs some setup. You will need to obtain your own API keys. If you prefer a zero-setup experience, web-based options might be better for now.
+### Why Hobbes?
+
+-   **Context Composition**: Hobbes doesn't just "remember." It actively composes a "Memory Object" using a background Summary Model, allowing you to maintain a coherent workspace all day without hitting "New Chat."
+-   **Local & Private**: All data is stored locally on your machine. We use Google's Generative API (or your provider of choice) *only* for inference. You own the prompt lifecycle.
+-   **Native MCP & Composio**: Seamlessly integrates Model Context Protocol (MCP) tools. Connect to hundreds of apps (GitHub, Slack, etc.) via our custom [Composio](https://composio.dev/) integration without exposing keys to third-party wrappers.
+-   **Advanced Reasoning**: Native support for Gemini 2.5/3.0 "Thinking" models with "The Baton Pattern" for maintaining thought signatures across turns.
 
 ---
 
-## Hobbes Features
-
-- **Local-First:** All user data, including chat history and context, is stored locally and securely on the user's machine.
-- **Clear Memory Separation:** The system maintains a clear distinction between long-term strategic memory and short-term, session-specific active context.
-    - **Strategic Memory:** Hobbes creates a local semantic graph. I personally use [ConPort (Context Portal)](https://github.com/GreatScottyMac/context-portal) from the Roo Code community for task-specific memory, combined with [Zep's Graphiti](https://github.com/getzep/graphiti) for long-term knowledge graphs.
-- **Native Composio Integration:** Features a custom, native integration with [Composio](https://composio.dev/), allowing for OAuth-based connection to hundreds of external tools (GitHub, Slack, Maps, etc.) without exposing your keys to a third-party wrapper.
-    -   **Smart Composio Tool Selection:** Managing MCP toolkits can be overwhelming—the GitHub MCP alone has over 700 tools, and knowing where to start is a challenge. Hobbes solves this by using AI to automatically select the most relevant core tools (top ~25) to get you started immediately without the headache. You can always customize your toolset further at [platform.composio.dev](https://platform.composio.dev).
-    - *See the in-app onboarding for setup instructions.*
-- **Advanced Reasoning Engine:** Built-in support for Gemini 2.5/3.0 "Thinking" models, with robust thought signature persistence ("The Baton Pattern") and automatic error correction for tool hallucinations.
-- **Reactive State Management:** Internal, short-term context is managed via Dioxus Signals, allowing for efficient, declarative updates to the UI.
-
-### For Power Users: A "Safe" Agent
-
-Hobbes is designed for enthusiasts who want to learn AI at all levels. It is **not** trying to compete directly with ChatGPT, Claude, or Gemini's web interfaces. Instead, it offers a **"Safe" Agent experience**:
-- **You control the prompt lifecycle:** See exactly what system prompt is sent.
-- **You control the tools:** Tools run locally or via direct API connections you approve.
-- **You own the data:** No chat history is sent to a cloud SaaS database (other than the LLM provider for inference).
-
-Clearmirror.ai is about teaching the humans. I hope Hobbes helps you understand the *composition* of modern AI agents.
-
 ## Getting Started
 
-This project is built with Dioxus and Rust.
-
-> **Note on Porting:** This codebase is heavily optimized for macOS (using native APIs for Biometrics and Accessibility). While porting is encouraged, standard `cargo run` will likely fail without OS-specific adaptation or stripping of these features. Use the provided build scripts for the intended experience.
+Hobbes is built with **Dioxus 0.6** and **Rust**.
 
 ### Prerequisites
-- Rust toolchain
-- Dioxus CLI (`dx`)
-- For production builds: Apple Developer certificate and provisioning profile
+-   Rust toolchain
+-   Dioxus CLI (`dx`)
 
-### Development Workflows
+### Running Locally
 
-Hobbes has two primary development modes depending on what you are working on.
+For UI development and standard testing:
 
-#### 1. UI & Frontend (Fast)
-For iterating on the Dioxus UI, layout, and reactive state:
 ```bash
 dx serve --platform desktop
 ```
-*Note: Some system features (Touch ID, Keychain) may crash or fail in this mode due to missing entitlements.*
+*Note: Some macOS-specific features (like Biometric TouchID) may be disabled in this mode.*
 
-#### 2. Full System & Permissions (Robust)
-**⚠️ The "Auth Black Hole" Warning:**
-Hobbes uses advanced macOS features (Biometrics, Keychain, Local Entitlements) that are strictly sandboxed by the OS. Running via standard `cargo run` often results in **immediate crashes (`Killed: 9`)** because the binary lacks the necessary entitlements and embedded provisioning profile.
+### Production Build
 
-To run the full app with working permissions (Touch ID, Terminal, MCPs):
-```bash
-./scripts/dev_launcher.sh
-```
-This script packages a valid `.app` bundle, embeds your provisioning profile, and signs it, preventing the "Auth Black Hole" issues.
-
-### Release Build
-
-To build an unsigned release:
+To build the full release version:
 
 ```bash
 dx build --release
 ```
+The app will be located at `target/dx/Hobbes/release/macos/Hobbes.app`.
 
-The app will be at `target/dx/Hobbes/release/macos/Hobbes.app`
+*(For signing and distribution workflows, see `scripts/build_release.sh`)*
 
-### Production Build (Code Signed)
-
-For production builds with biometric keychain access, use the build script:
-
-```bash
-./scripts/build_release.sh
-```
-
-This script:
-1. Builds the release binary
-2. Patches `Info.plist` with `NSFaceIDUsageDescription` for Touch ID
-3. Embeds the provisioning profile
-4. Code signs with your Developer certificate
-
-> **Note:** Edit `scripts/build_release.sh` to set your own `IDENTITY` (signing certificate) before running.
+---
 
 ## Architecture
 
-The architecture is designed to integrate both external long-term memory and internal short-term memory seamlessly, with a robust feedback loop for handling tool calls. For a more detailed breakdown, please see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+Hobbes creates a robust feedback loop between the User, the LLM, and external Tools:
 
 ```mermaid
 graph TD
-    subgraph "MCP Servers (Launched as Child Processes)"
-        A[ConPort/Graphiti MCP] -- "Provides strategic context" --> L;
-        B[Composio Embedded MCP] -- "Provides access to tools defined by Admins" --> L;
-        C[Filesystem MCP] -- "Provides workspace data" --> L;
+    subgraph "External Context"
+        A[ConPort/Graphiti] -- "Strategic Memory" --> L;
+        B[Composio] -- "Auth & Tools" --> L;
     end
 
-    subgraph "Internal Short-Term Memory & Core Logic"
-        subgraph "Core Application"
-            M[main.rs] -->|Spawns on startup| L[McpManager];
-            M -->|Initializes| SS[SummarizationScheduler];
-            L -->|Updates available tools via Signal| F[SessionState];
-            
-            G[ChatWindow] -->|Reads from Active Session| F;
-            G -->|Sends Activity Signal| SS;
-
-            SS -->|On Inactivity Timeout, Triggers| J[ConversationProcessor];
-            J -->|"Updates Active Session (Dialogue Summary)"| F;
-
-            G -->|Builds Prompt| H[PromptBuilder];
-            H -->|Gets Active Context, Tools & Tool History| F;
-            M -->|Initializes| I[LlmConnector];
-            H -->|Formats Prompt| I;
-
-            J -- "Generates Summary" --> I2["Summary LLM (e.g., Gemini Flash)"];
-
-            subgraph "Tool Call Feedback Loop"
-                I -- "Responds with Full Stream" --> K[StreamManager];
-                K -- "Executes Tool(s) via" --> L;
-                L -- "Returns Result(s)" --> K;
-                K -- "Sends Buffered Text to UI" --> G;
-                K -- "Updates Message State" --> F;
-                K -- "Sends Activity Signal" --> SS;
-                K -- "Stores (Call, Result) pairs in" --> TCH[ToolCallHistory];
-                K -- "Builds new prompt via" --> H;
-                K -- "Sends feedback to" --> I;
-
-                I -- "Responds with Final Text" --> K;
-                K -- "Triggers at end of turn" --> TCS[ToolCallSummarizer];
-                TCS -- "Summarizes pairs from" --> TCH;
-                TCS -- "Writes 'Snapshot' to" --> F;
-                TCS -- "Clears" --> TCH;
-            end
-        end
+    subgraph "Core Loop"
+        G[ChatWindow] -->|Msg| F[SessionState];
+        F -->|Context| H[PromptBuilder];
+        H -->|Prompt| I[LlmConnector];
+        I -->|Stream| K[StreamManager];
+        
+        K -->|Tool Call| L[McpManager];
+        L -->|Result| K;
+        K -->|Update| F;
+        K -->|Render| G;
     end
-
-    F -.-> TCH;
-    style TCH fill:#2d3748,stroke:#a0aec0,stroke-width:2px,color:#fff
-    style TCS fill:#4a5568,stroke:#a0aec0,stroke-width:2px,color:#fff
-    style SS fill:#2b6cb0,stroke:#90cdf4,stroke-width:2px,color:#fff
-    style J fill:#805ad5,stroke:#d6bcfa,stroke-width:2px,color:#fff
-    style F fill:#2c7a7b,stroke:#81e6d9,stroke-width:2px,color:#fff
-    style I fill:#c53030,stroke:#fc8181,stroke-width:2px,color:#fff
-    style I2 fill:#9c4221,stroke:#fbd38d,stroke-width:2px,color:#fff
-    style L fill:#2b6cb0,stroke:#90cdf4,stroke-width:2px,color:#fff
+    
+    style K fill:#2d3748,stroke:#a0aec0,color:#fff
+    style L fill:#2b6cb0,stroke:#90cdf4,color:#fff
 ```
 
-### Core Components
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for a deep dive.
 
--   **Memory & State**:
-    -   **Local Long-Term Memory:** A local MCP providing access to the project's strategic memory (goals, decisions, etc.).
-    -   **Short-Term Memory (`SessionState`):** The core of the "live" context, managed internally and stored securely in `sessions.json`. It holds messages, tool call history, and the active context for each conversation.
--   **Services & Processors**:
-    -   **`McpManager`**: Manages the lifecycle of all MCP servers, launching them as child processes and discovering their available tools.
-    -   **`StreamManager`**: Orchestrates the entire tool-call lifecycle, from detecting the LLM's request to executing the tool and feeding the result back in a robust feedback loop.
-    -   **`ConversationProcessor`**: Summarizes dialogue using a dedicated Summary LLM to maintain conversational memory. (Note: Manual "Zap" optimization is now handled via the "New Chat with Memory" modal flow).
-    -   **`ToolCallSummarizer`**: A dedicated service that creates concise "snapshots" of tool interactions for the active context after a tool loop concludes.
+---
 
-## Using Hobbes for your Projects
+## Key Features
 
-I plan on keeping Hobbes under the **Functional Source License (FSL 1.1)**. This ensures the project remains sustainable while allowing you to use, study, and modify the code freely.
-- **Free to Use:** You can run Hobbes for yourself, your business, or your friends without restriction.
-- **Protection:** The only restriction is that you cannot offer a commercial SaaS version of Hobbes that competes with Clear Mirror LLC for 2 years.
-- **Open Future:** On **2028-01-20**, this version automatically converts to the permissive **Apache 2.0** license.
+### 🧠 Advanced Memory Architecture
+- **Context Composition**: Hobbes maintains a "Memory Object" that actively summarizes conversation threads. Chat all day in a single session without the AI forgetting the first message.
+- **Strategic vs. Active Memory**: Distinct layers for long-term knowledge (Graphiti/ConPort integration) and short-term session context.
+- **"The Baton" Pattern**: Preserves AI "Thinking" signatures across turns, allowing the model to self-correct and maintain complex reasoning chains.
 
-I built Hobbes to help my AI expertise, and it has been fruitful for that. I am now a beginner in Rust (great stack team!) and have the agent I've always wanted, allowing me to fully control what I refer to as the **"Prompt Composition Lifecycle"**—from system prompt through chat flow and execution. This was an experiment in _context composition_, not just another wrapper. Try it, and I would LOVE to see different approaches to our short-term memory usages.
+### 🛠️ Integrations & Tools
+- **Native Composio Support**: Connect to 100+ apps (GitHub, Slack, Google Calendar) via OAuth. Hobbes auto-discovers and manages these tools locally.
+- **BYOA (Bring Your Own App)**: Security-first approach to credentials. Your API keys are stored in the macOS Keychain, not on our servers.
+- **McpManager**: A robust local orchestra for the Model Context Protocol. Run any standard MCP server as a child process.
+- **Dynamic Tool Selection**: Automatically identifies and loads the most relevant tools for the current context to optimize token usage.
 
-I designed Hobbes to be quick, private, and secure. I hope you like it.
+### ⚡ Performance & UX
+- **Desktop Native**: Built with Rust and Dioxus 0.6 for 60fps performance and low memory footprint.
+- **"Thinking" UI**: First-class support for Gemini 2.5/3.0 reasoning models. Watch the model "think" in real-time with collapsible thought blocks.
+- **Skill System**: Extend Hobbes with simple Markdown files. Define new "Skills" (sets of instructions and tools) that the agent can dynamically adopt.
 
-## FAQ
+### 🔒 Privacy & Security
+- **Local-First**: Conversations and vector indices live on your SSD.
+- **Unified Permission Lifecycle**: Every tool call and external request requires your explicit verification (unless you white-list it).
+- **Audit Trails**: Clear logs of exactly what data was sent to the LLM and what tools were executed.
 
-### Did you "Vibe Code" this?
-Depends on what you mean. If you mean "Did I use AI to code this?", absolutely. Here was my toolkit:
-- **VS Code**
-- **Roo Code**
-- **Roo Flow + Conport**
-- **Gemini + Claude models** (Mainly because I paid for enterprise models for privacy)
+## Philosophy & Origin
 
-### Did you review the code?
-Yes. I picked Rust precisely because I didn't know it. I knew TypeScript (but clearly was rusty when I tried to interview and forgot a simple `=>` map pattern, those poor interviewees haha). I wanted to lean on AI but not have to learn from scratch, so I used **Dioxus 0.6** (React patterns in Rust) and **Tailwind**. AI is so well-trained on this stack that it's literally killing their training business. Full disclosure: I already knew Tailwind and you can see that I didn't modify it much (mainly because I want to pay for Pro rather than layer in another UX framework—I gotcha [Tailwind UI](https://tailwindui.com/)).
+Hobbes started as an experiment in **Context Composition**: *How do we make an AI that doesn't get dumber as the conversation gets longer?*
 
-### Will there be a Free Version of Hobbes?
-You're looking at it. For now, I'm grappling with the ethical implications of using LLMs trained on humanity's work on the internet to build my product, combined with the fact that I *paid* enterprise models (Google, AWS) to build this code. On one hand, I don't think it should always be free. I have code ready to start on a "Pro" build of Hobbes, but most of this stuff is still new. Composio has competitors for "MCP OAUTH BRIDGE". I fully expect this stack to change a lot this year. Time will tell, but for now, I'm recouping costs via the App Store and my Pro build. Since this is a combination of my experience AND the collective experience included in Google's and other LLM trainers' datasets, I'm releasing under the **Functional Source License (FSL)** to balance openness with sustainability. Enjoy and please contribute if you like what we are doing here.
+### AI-Native Development
+Hobbes was built using an **AI-Augmented** workflow. We treat modern LLMs (Gemini, Claude) as "Pair Programmers" rather than magic wands. This allows us to:
+1.  **Accelerate Learning**: Rapidly adopt new stacks like Dioxus and Rust.
+2.  **Enforce Architecture**: Use AI to rigidly check against our `ARCHITECTURE.md` before every commit.
+3.  **Maintain Quality**: Ensure every line of code is reviewed and understood by the human in the loop.
 
-— @dustmoo
+We believe this "Human-in-the-Loop" model is the future of software engineering—using AI to amplify capability, not replace understanding.
+
+## License
+
+Hobbes is released under the **Functional Source License (FSL 1.1)**.
+-   **Free for personal and non-competing business use.**
+-   **Converts to Apache 2.0 on 2028-01-20.**
+
+We believe in open source sustainability. This model protects the project's ability to fund itself in the short term while guaranteeing a fully open future.
 
 ## Contributing
 
-Please see [`CONTRIBUTING.md`](CONTRIBUTING.md) for details on how to contribute to the project.
+Please see [`CONTRIBUTING.md`](CONTRIBUTING.md) for details on how to contribute.
+
+---
+
+*Authored by @dustmoo & The Clear Mirror Team*

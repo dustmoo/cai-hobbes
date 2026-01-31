@@ -1440,8 +1440,8 @@ mod tests {
 
         let response_body = format!(
             "data: {}\n\ndata: {}\n\n",
-            thought_json.to_string(),
-            content_json.to_string()
+            thought_json,
+            content_json
         );
 
         // Configure the mock server
@@ -1529,7 +1529,7 @@ mod tests {
             }]
         });
 
-        let response_body = format!("data: {}\n\n", response_json.to_string());
+        let response_body = format!("data: {}\n\n", response_json);
 
         Mock::given(method("POST"))
             .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
@@ -1595,7 +1595,7 @@ mod tests {
             }]
         });
 
-        let response_body = format!("data: {}\n\n", response_json.to_string());
+        let response_body = format!("data: {}\n\n", response_json);
 
         Mock::given(method("POST"))
             .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
@@ -1665,7 +1665,7 @@ mod tests {
             }]
         });
 
-        let response_body = format!("data: {}\n\n", response_json.to_string());
+        let response_body = format!("data: {}\n\n", response_json);
 
         Mock::given(method("POST"))
             .and(path("/models/gemini-2.5-pro:streamGenerateContent"))

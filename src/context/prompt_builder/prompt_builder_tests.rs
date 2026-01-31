@@ -3,7 +3,6 @@ use crate::session::ActiveContext;
 use crate::session::Session;
 use crate::settings::Settings;
 use chrono::Utc;
-use serde_json::json; // Needed for Session last_updated
 
 // Obsolete tests removed. Schema sanitization is now handled in `src/gemini/convert.rs`.
 

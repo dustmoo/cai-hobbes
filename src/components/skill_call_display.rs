@@ -80,7 +80,7 @@ pub fn SkillPermissionPrompt(props: SkillPermissionPromptProps) -> Element {
                     onclick: {
                         let execution_id = skill_call.execution_id.clone();
                         let skill_name = skill_call.skill_name.clone();
-                        let on_deny = props.on_deny.clone();
+                        let on_deny = props.on_deny;
                         move |_| {
                             let remember = *remember_choice.read();
                             if remember {
@@ -98,7 +98,7 @@ pub fn SkillPermissionPrompt(props: SkillPermissionPromptProps) -> Element {
                     onclick: {
                         let execution_id = skill_call.execution_id.clone();
                         let skill_name = skill_call.skill_name.clone();
-                        let on_approve = props.on_approve.clone();
+                        let on_approve = props.on_approve;
                         move |_| {
                             let remember = *remember_choice.read();
                             if remember {

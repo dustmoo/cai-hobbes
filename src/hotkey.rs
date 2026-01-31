@@ -309,7 +309,6 @@ pub fn matches_hotkey_internal(modifiers: Modifiers, key: &Key, hotkey_str: &str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dioxus::prelude::*;
 
     #[test]
     fn test_simple_hotkeys() {

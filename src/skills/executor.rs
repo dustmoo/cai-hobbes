@@ -209,8 +209,6 @@ pub async fn execute_skill(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::path::PathBuf;
     // We would need to mock McpContext here to test validation logic rigorously.
     // For now, these placeholders confirm the structural changes.
     

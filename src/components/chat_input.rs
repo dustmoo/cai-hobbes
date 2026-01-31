@@ -591,8 +591,7 @@ pub fn ChatInput(
 
                         // Skill Autocomplete Detection
                         let val = event.value();
-                        if val.starts_with('/') {
-                            let query = &val[1..];
+                        if let Some(query) = val.strip_prefix('/') {
                             let registry = skill_registry.read();
                             let all_skills = registry.list_skills();
                             let matches: Vec<Skill> = all_skills

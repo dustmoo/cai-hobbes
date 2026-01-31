@@ -79,8 +79,8 @@ pub async fn fetch_gemini_models(
 ) -> Result<Vec<GeminiModel>, ModelFetchError> {
     // Check if we have a valid cached result
     {
-        let cache = MODELS_CACHE.lock().unwrap();
-        if let Some(cached) = cache.as_ref() {
+        let cache = MODELS_CACHE.lock().ok();
+        if let Some(cached) = cache.as_ref().and_then(|c| c.as_ref()) {
             if cached.fetched_at.elapsed() < CACHE_TTL {
                 tracing::debug!("Returning cached models list");
                 return Ok(cached.models.clone());
@@ -140,8 +140,7 @@ pub async fn fetch_gemini_models(
     );
 
     // Update cache
-    {
-        let mut cache = MODELS_CACHE.lock().unwrap();
+    if let Ok(mut cache) = MODELS_CACHE.lock() {
         *cache = Some(ModelsCache {
             models: filtered_models.clone(),
             fetched_at: Instant::now(),
@@ -153,8 +152,9 @@ pub async fn fetch_gemini_models(
 
 /// Clear the models cache, forcing a fresh fetch on next request
 pub fn clear_models_cache() {
-    let mut cache = MODELS_CACHE.lock().unwrap();
-    *cache = None;
+    if let Ok(mut cache) = MODELS_CACHE.lock() {
+        *cache = None;
+    }
     tracing::debug!("Cleared models cache");
 }
 
