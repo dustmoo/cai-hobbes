@@ -169,7 +169,7 @@ pub fn McpMarketplace() -> Element {
     let mcp_manager = use_context::<Signal<McpManager>>();
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let settings = use_context::<Signal<Settings>>();
-    let settings_manager = use_context::<Signal<SettingsManager>>();
+
     let filter_verified = use_signal(|| true);
     let filter_deployed = use_signal(|| false);
     let sort_by = use_signal(|| "usage".to_string());

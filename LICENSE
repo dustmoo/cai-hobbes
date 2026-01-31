@@ -1,21 +1,46 @@
-MIT License
+Functional Source License, Version 1.1, Apache-2.0 Future License
 
-Copyright (c) 2025 Clear Mirror AI
+Copyright (c) 2026 Clear Mirror LLC
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Licensor grants you a license to the Software under the Permissive License (as defined below)
+effective on the Change Date (as defined below).
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Prior to the Change Date, Licensor grants you a license to the Software under the
+Functional Source License, Version 1.1, (the "Standard License"), but with the
+following condition: the Permitted Purpose is any purpose other than a Competing Use.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+"Competing Use" means making the Software available to others in a commercial product or service
+that: (i) substitutes for the Software; (ii) substitutes for any other product or service
+Licensor offers using the Software; or (iii) is otherwise a direct competitor to the
+Software or other Clear Mirror LLC offerings.
+
+"Change Date" means 2028-01-20.
+
+"Permissive License" means the Apache License, Version 2.0.
+
+TERMS AND CONDITIONS
+
+1. Definitions
+   "Licensor" means the entity offering the license to the Software.
+   "Software" means the source code, object code, and documentation made available under this license.
+
+2. License Grant
+   Subject to the terms and conditions of this License, Licensor hereby grants you a
+   worldwide, non-exclusive, no-charge, royalty-free, copyright license to reproduce,
+   prepare derivative works of, publicly display, publicly perform, sublicense, and
+   distribute the Software and such derivative works.
+
+3. Conditions
+   A.  Reference. You must include a copy of this license with every copy of the Software.
+   B.  Redistribution. You may redistribute the Software and derivative works thereof,
+       provided that:
+       (i) You meet the conditions of this license; and
+       (ii) You include a copy of this license with every copy of the Software.
+
+4. Disclaimer of Warranty
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+   INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+   PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+   HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+   OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

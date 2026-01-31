@@ -4,7 +4,7 @@
 ![Build Status](https://github.com/dustmoo/cai-hobbes/actions/workflows/ci.yml/badge.svg)
 ![Clippy](https://github.com/dustmoo/cai-hobbes/actions/workflows/clippy.yml/badge.svg)
 
-![License](https://img.shields.io/badge/License-MIT-blue.svg)
+![License](https://img.shields.io/badge/License-FSL%201.1-blue.svg)
 
 ## Welcome to Hobbes!
 
