@@ -21,13 +21,18 @@ mod context;
 mod gemini;
 mod hotkey;
 mod keychain_ffi;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod keychain_tests;
 mod mcp;
 mod menu;
 mod permissions;
 mod processing;
+#[cfg(target_os = "macos")]
 mod secret_manager;
+#[cfg(not(target_os = "macos"))]
+mod secret_manager_generic;
+#[cfg(not(target_os = "macos"))]
+use secret_manager_generic as secret_manager;
 mod services;
 mod session;
 mod settings;
@@ -236,6 +241,7 @@ fn app() -> Element {
 
     // Asynchronously load secrets from keychain using biometric authentication
     // This prompts once for Touch ID/password, then uses that context for all secrets
+    #[cfg(target_os = "macos")]
     use_effect(move || {
         if !secrets_loaded() {
             // Capture profile names before entering the blocking task
@@ -335,6 +341,54 @@ fn app() -> Element {
                     tracing::debug!("Secrets loaded from keychain successfully");
                 } else {
                     tracing::error!("Failed to load secrets from keychain");
+                }
+                secrets_loaded.set(true);
+            });
+        }
+    });
+
+    // Simple secret loading for non-macOS platforms (no biometrics)
+    #[cfg(not(target_os = "macos"))]
+    use_effect(move || {
+        if !secrets_loaded() {
+            let profile_names: Vec<String> = settings
+                .read()
+                .composio_profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+
+            spawn(async move {
+                let loaded_secrets = tokio::task::spawn_blocking(move || {
+                    let mut sm = secret_manager::SecretManager::new();
+                    sm.load_all_from_keychain();
+                    for profile_name in &profile_names {
+                        sm.load_composio_key(profile_name);
+                    }
+                    sm
+                }).await;
+
+                if let Ok(sm) = loaded_secrets {
+                    secret_manager.set(sm);
+                    let sm_read = secret_manager.read();
+                    let mut current_settings = settings.write();
+
+                    if let Some(api_key) = sm_read.get("api_key") {
+                        current_settings.gemini_config.api_key = Some(api_key.clone());
+                    }
+                    if let Some(smithery_api_key) = sm_read.get("smithery_api_key") {
+                        current_settings.smithery_api_key = Some(smithery_api_key.clone());
+                    }
+                    if let Some(composio_api_key) = sm_read.get("composio_api_key") {
+                        current_settings.composio_api_key = Some(composio_api_key.clone());
+                    }
+
+                    for profile in &mut current_settings.composio_profiles {
+                        if let Some(api_key) = sm_read.get_composio_key(&profile.name) {
+                            profile.api_key = Some(api_key.clone());
+                        }
+                    }
+                    tracing::debug!("Secrets loaded from generic keychain successfully");
                 }
                 secrets_loaded.set(true);
             });

@@ -1,6 +1,6 @@
 [package]
 name = "Hobbes"
-version = "0.9.44"
+version = "0.9.45"
 authors = ["Dustin Moore <dustin@clearmirror.ai>", "Gemini 2.5/3 Pro and Flash (and a touch of Claude 3.7/4.5 Sonnet)"]
 edition = "2024"
 license-file = "LICENSE"
@@ -123,3 +123,5 @@ wiremock = "0.6.5"
 
 
 
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+keyring = "2"

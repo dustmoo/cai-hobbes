@@ -58,6 +58,7 @@ rand = "0.9.2"
 open = "5.3.3"
 tempfile = "3.14"
 dirs = "5.0"
+keyring = "2"
 
 [dev-dependencies]
 wiremock = "0.6.5"
