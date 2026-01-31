@@ -7,19 +7,23 @@
 use dioxus::desktop::tao::dpi::PhysicalSize;
 use dioxus::desktop::tao::event::{Event, WindowEvent};
 use dioxus::desktop::{
-    muda::MenuEvent, tao::platform::macos::WindowBuilderExtMacOS, use_window,
+    muda::MenuEvent, use_window,
     use_wry_event_handler, Config, WindowBuilder,
 };
+#[cfg(target_os = "macos")]
+use dioxus::desktop::tao::platform::macos::WindowBuilderExtMacOS;
 use dioxus::prelude::*;
 use dotenvy::dotenv;
 use futures_util::StreamExt;
 
+#[cfg(target_os = "macos")]
 mod biometric_auth;
 mod components;
 mod constants;
 mod context;
 mod gemini;
 mod hotkey;
+#[cfg(target_os = "macos")]
 mod keychain_ffi;
 #[cfg(all(test, target_os = "macos"))]
 mod keychain_tests;
@@ -72,11 +76,14 @@ fn main() {
                             .with_visible(true)
                             .with_resizable(true)
                             .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(initial_width, initial_height));
+
                         #[cfg(target_os = "macos")]
                         {
                             window = window
                                 .with_titlebar_transparent(true);
                         }
+                        #[cfg(not(target_os = "macos"))]
+                        let window = window;
                         window
                     }
                 )

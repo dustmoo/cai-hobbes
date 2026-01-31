@@ -18,6 +18,48 @@ pub const COMPOSIO_KEY_PREFIX: &str = "composio_api_key_";
 #[derive(Clone, Debug)]
 pub struct AuthContext;
 
+/// Error types for keychain operations (API parity with macOS)
+#[derive(Debug, Clone)]
+pub enum KeychainError {
+    NotFound,
+    AuthCancelled,
+    AuthRequired,
+    DecodingError(String),
+    SecurityError(i32),
+}
+
+impl std::fmt::Display for KeychainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeychainError::NotFound => write!(f, "Item not found in keychain"),
+            KeychainError::AuthCancelled => write!(f, "Authentication was cancelled"),
+            KeychainError::AuthRequired => write!(f, "Authentication is required"),
+            KeychainError::DecodingError(msg) => write!(f, "Failed to decode: {}", msg),
+            KeychainError::SecurityError(code) => write!(f, "Security error: {}", code),
+        }
+    }
+}
+
+impl std::error::Error for KeychainError {}
+
+/// Stub for set_generic_password_with_biometric_protection (API parity)
+pub fn set_generic_password_with_biometric_protection(
+    account: &str,
+    password: &str,
+) -> Result<(), KeychainError> {
+    set_generic_password(account, password)
+}
+
+/// Stub for set_generic_password (API parity)
+pub fn set_generic_password(account: &str, password: &str) -> Result<(), KeychainError> {
+    if let Ok(entry) = Entry::new(SERVICE_NAME, account) {
+        entry.set_password(password).map_err(|_| KeychainError::SecurityError(-1))?;
+        Ok(())
+    } else {
+        Err(KeychainError::SecurityError(-1))
+    }
+}
+
 /// Centralized secret manager that caches secrets in memory
 /// and provides efficient batch loading from platform-native keychains.
 #[derive(Clone, Debug)]
@@ -49,7 +91,7 @@ impl SecretManager {
                         self.secrets.insert(key.to_string(), value);
                         tracing::debug!("Loaded secret: {}", key);
                     }
-                    Err(keyring::Error::NoPasswordFound) => {
+                    Err(keyring::Error::NoEntry) => {
                         tracing::debug!("Secret not found: {}", key);
                     }
                     Err(e) => {

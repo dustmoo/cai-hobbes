@@ -335,18 +335,18 @@ pub fn SettingsPanel() -> Element {
                                 for (key_name, key_value) in final_secret_updates {
                                     let save_result = if use_biometric {
                                         // Biometric mode: device-only, Touch ID protected
-                                        crate::keychain_ffi::set_generic_password_with_biometric_protection(&key_name, &key_value)
+                                        crate::secret_manager::set_generic_password_with_biometric_protection(&key_name, &key_value)
                                             .or_else(|e| {
-                                                if let crate::keychain_ffi::KeychainError::SecurityError(-34018) = e {
+                                                if let crate::secret_manager::KeychainError::SecurityError(-34018) = e {
                                                     // Fall back to regular save if entitlements missing
-                                                    crate::keychain_ffi::set_generic_password(&key_name, &key_value)
+                                                    crate::secret_manager::set_generic_password(&key_name, &key_value)
                                                 } else {
                                                     Err(e)
                                                 }
                                             })
                                     } else {
                                         // iCloud sync mode: syncs across devices, no biometric
-                                        crate::keychain_ffi::set_generic_password(&key_name, &key_value)
+                                        crate::secret_manager::set_generic_password(&key_name, &key_value)
                                     };
 
                                     if let Err(e) = save_result {
@@ -2333,10 +2333,10 @@ pub fn SettingsPanel() -> Element {
                                 let results = tokio::task::spawn_blocking(move || {
                                     let mut saved = Vec::new();
                                     for (key_name, key_value) in final_secret_updates {
-                                        let save_result = crate::keychain_ffi::set_generic_password_with_biometric_protection(&key_name, &key_value)
+                                        let save_result = crate::secret_manager::set_generic_password_with_biometric_protection(&key_name, &key_value)
                                             .or_else(|e| {
-                                                if let crate::keychain_ffi::KeychainError::SecurityError(-34018) = e {
-                                                    crate::keychain_ffi::set_generic_password(&key_name, &key_value)
+                                                if let crate::secret_manager::KeychainError::SecurityError(-34018) = e {
+                                                    crate::secret_manager::set_generic_password(&key_name, &key_value)
                                                 } else {
                                                     Err(e)
                                                 }

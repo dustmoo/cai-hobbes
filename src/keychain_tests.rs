@@ -1,3 +1,4 @@
+#![cfg(target_os = "macos")]
 #[cfg(test)]
 mod tests {
     use crate::keychain_ffi;

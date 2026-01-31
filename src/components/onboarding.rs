@@ -47,15 +47,15 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                         move || {
                             if use_biometric {
                                 // Biometric: device-only, Touch ID protected
-                                crate::keychain_ffi::set_generic_password_with_biometric_protection(
+                                crate::secret_manager::set_generic_password_with_biometric_protection(
                                     "api_key", &api_key,
                                 )
                                 .or_else(|e| {
-                                    if let crate::keychain_ffi::KeychainError::SecurityError(
+                                    if let crate::secret_manager::KeychainError::SecurityError(
                                         -34018,
                                     ) = e
                                     {
-                                        crate::keychain_ffi::set_generic_password(
+                                        crate::secret_manager::set_generic_password(
                                             "api_key", &api_key,
                                         )
                                     } else {
@@ -64,14 +64,14 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                                 })
                             } else {
                                 // iCloud sync or Local Keychain: regular keychain save
-                                crate::keychain_ffi::set_generic_password("api_key", &api_key)
+                                crate::secret_manager::set_generic_password("api_key", &api_key)
                             }
                         }
                     })
                     .await;
 
                     if let Err(e) = save_result
-                        .unwrap_or(Err(crate::keychain_ffi::KeychainError::SecurityError(-1)))
+                        .unwrap_or(Err(crate::secret_manager::KeychainError::SecurityError(-1)))
                     {
                         error_message.set(format!("Failed to save API key: {}", e));
                         is_validating.set(false);

@@ -1,5 +1,10 @@
 #![cfg(target_os = "macos")]
 
+#[allow(unused_imports)]
+pub use crate::keychain_ffi::{
+    delete_generic_password, find_generic_password, find_generic_password_with_context,
+    set_generic_password, set_generic_password_with_biometric_protection, KeychainError,
+};
 use crate::biometric_auth::AuthContext;
 use crate::keychain_ffi;
 use std::collections::HashMap;
