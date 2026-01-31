@@ -3,7 +3,7 @@
 use crate::components::mcp_search_form::McpSearchForm;
 use crate::components::smithery_registry::{SmitheryClient, SmitheryServer};
 use crate::components::syntax_highlighter::highlight_json;
-use crate::mcp::composio_client::{ComposioCategory, ComposioClient, ComposioToolkitListing};
+use crate::mcp::composio_client::{ComposioCategory, ComposioClient, ComposioToolkitListing, ResolvedAuth};
 use crate::mcp::manager::{McpManager, McpServerStatus, ServerStatus};
 use crate::settings::{McpSource, Settings, SettingsManager};
 use dioxus::prelude::*;
@@ -33,7 +33,24 @@ struct FeaturedMcp {
     auth_scheme: Option<String>,
     /// Whether Composio managed auth is available (true for OAuth apps Composio supports)
     #[serde(default)]
-    use_managed_auth: bool,
+    pub use_managed_auth: bool,
+    /// Whether the toolkit requires no authentication
+    #[serde(default)]
+    pub no_auth: bool,
+}
+
+impl FeaturedMcp {
+    pub fn resolve_auth(&self, has_local_creds: bool) -> ResolvedAuth {
+        if has_local_creds {
+            ResolvedAuth::Byoa
+        } else if self.no_auth {
+            ResolvedAuth::NoAuth
+        } else if self.use_managed_auth {
+            ResolvedAuth::Managed
+        } else {
+            ResolvedAuth::RequiresSetup
+        }
+    }
 }
 
 impl From<SmitheryServer> for FeaturedMcp {
@@ -53,6 +70,7 @@ impl From<SmitheryServer> for FeaturedMcp {
             homepage: server.homepage,
             auth_scheme: None, // Not applicable for Smithery
             use_managed_auth: false,
+            no_auth: false,
         }
     }
 }
@@ -65,6 +83,7 @@ impl From<ComposioToolkitListing> for FeaturedMcp {
             .unwrap_or_else(|| format!("https://app.composio.dev/app/{}", toolkit.slug));
         let use_managed_auth = toolkit.supports_managed_auth();
         let auth_scheme = toolkit.primary_auth_scheme();
+        let no_auth = toolkit.no_auth.unwrap_or(false);
         FeaturedMcp {
             name: toolkit.slug,
             display_name: toolkit.name,
@@ -75,6 +94,7 @@ impl From<ComposioToolkitListing> for FeaturedMcp {
             homepage,
             auth_scheme,
             use_managed_auth,
+            no_auth,
         }
     }
 }
@@ -96,6 +116,7 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             homepage: "".to_string(),
             auth_scheme: None,
             use_managed_auth: false,
+            no_auth: false,
         },
         FeaturedMcp {
             name: "brave-search".to_string(),
@@ -110,6 +131,7 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             homepage: "".to_string(),
             auth_scheme: None,
             use_managed_auth: false,
+            no_auth: false,
         },
         FeaturedMcp {
             name: "github".to_string(),
@@ -125,6 +147,7 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             homepage: "".to_string(),
             auth_scheme: None,
             use_managed_auth: false,
+            no_auth: false,
         },
         FeaturedMcp {
             name: "postgres".to_string(),
@@ -140,6 +163,7 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             homepage: "".to_string(),
             auth_scheme: None,
             use_managed_auth: false,
+            no_auth: false,
         },
         FeaturedMcp {
             name: "google-maps".to_string(),
@@ -154,6 +178,7 @@ fn get_featured_mcps() -> Vec<FeaturedMcp> {
             homepage: "".to_string(),
             auth_scheme: None,
             use_managed_auth: false,
+            no_auth: false,
         },
     ]
 }
@@ -1602,14 +1627,20 @@ fn McpServerCard(
         ),
     };
 
-    let byoa_required = is_composio_tool && !mcp.use_managed_auth && mcp.auth_scheme.is_some();
     let has_custom_creds = if is_composio_tool {
         let sm = secret_manager.read();
         sm.has_custom_tool_credentials(&mcp.name)
     } else {
         false
     };
-    let show_setup_credentials = byoa_required && !has_custom_creds;
+
+    let resolved_auth = if is_composio_tool {
+        mcp.resolve_auth(has_custom_creds)
+    } else {
+        ResolvedAuth::NoAuth // Default for non-Composio
+    };
+    
+    let show_setup_credentials = resolved_auth == ResolvedAuth::RequiresSetup;
 
     rsx! {
         div {

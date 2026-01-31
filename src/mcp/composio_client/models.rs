@@ -2,6 +2,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Resolved authentication strategy for a toolkit
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ResolvedAuth {
+    /// No authentication required (Instant Connect)
+    NoAuth,
+    /// Connect via Managed OAuth (Preferred Fallback)
+    Managed,
+    /// Connect via Local Credentials (BYOA Primacy)
+    Byoa,
+    /// Requires Setup (BYOA mandatory, no local keys)
+    RequiresSetup,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ComposioTool {
     pub name: String,
@@ -207,7 +220,12 @@ impl ComposioToolkitListing {
 
     /// Get the primary auth scheme for this toolkit (uppercase, e.g., "OAUTH2", "API_KEY")
     pub fn primary_auth_scheme(&self) -> Option<String> {
-        self.auth_schemes.as_ref()?.first().cloned()
+        let scheme = self.auth_schemes.as_ref()?.first().cloned();
+        if scheme.as_deref() == Some("NO_AUTH") {
+            None
+        } else {
+            scheme
+        }
     }
 
     /// Check if this toolkit requires no authentication
