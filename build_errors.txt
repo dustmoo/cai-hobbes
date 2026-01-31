@@ -1,0 +1,142 @@
+   Compiling Hobbes v0.9.42 (/Users/dustmoo/Sites/cai-hobbes)
+error[E0603]: struct import `Comment` is private
+  --> src/components/comment_modal.rs:1:31
+   |
+ 1 | use crate::components::chat::{Comment, Message};
+   |                               ^^^^^^^ private struct import
+   |
+note: the struct import `Comment` is defined here...
+  --> src/components/chat.rs:53:5
+   |
+53 | use crate::components::shared::Comment;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: ...and refers to the struct `Comment` which is defined here
+  --> src/components/shared.rs:5:1
+   |
+ 5 | pub struct Comment {
+   | ^^^^^^^^^^^^^^^^^^ you could import this directly
+help: import `Comment` through the re-export
+   |
+ 1 | use crate::components::chat::{components::shared::Comment, Message};
+   |                               ++++++++++++++++++++
+
+error[E0603]: struct import `Comment` is private
+  --> src/components/markdown_renderer.rs:1:42
+   |
+ 1 | use crate::components::chat::{CodeBlock, Comment, LinkWithControls};
+   |                                          ^^^^^^^ private struct import
+   |
+note: the struct import `Comment` is defined here...
+  --> src/components/chat.rs:53:5
+   |
+53 | use crate::components::shared::Comment;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: ...and refers to the struct `Comment` which is defined here
+  --> src/components/shared.rs:5:1
+   |
+ 5 | pub struct Comment {
+   | ^^^^^^^^^^^^^^^^^^ you could import this directly
+help: import `Comment` through the re-export
+   |
+ 1 | use crate::components::chat::{CodeBlock, components::shared::Comment, LinkWithControls};
+   |                                          ++++++++++++++++++++
+
+warning: unused imports: `MessageContent` and `PermissionRequestPayload`
+  --> src/components/skill_call_display.rs:10:61
+   |
+10 | use crate::components::shared::{SkillCall, SkillCallStatus, PermissionRequestPayload, MessageContent};
+   |                                                             ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `crate::state::SessionStateController`
+  --> src/main.rs:95:5
+   |
+95 | use crate::state::SessionStateController;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> src/components/chat.rs:198:21
+    |
+198 |                 let mut session_state = session_state;
+    |                     ----^^^^^^^^^^^^^
+    |                     |
+    |                     help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: variable does not need to be mutable
+   --> src/components/chat.rs:337:17
+    |
+337 |             let mut session_state = session_state;
+    |                 ----^^^^^^^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/components/chat.rs:598:21
+    |
+598 |                 let mut session_state = session_state;
+    |                     ----^^^^^^^^^^^^^
+    |                     |
+    |                     help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> src/components/chat_input.rs:52:9
+   |
+52 |     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
+   |         ----^^^^^^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> src/components/session_manager.rs:13:9
+   |
+13 |     let mut session_state = use_context::<Signal<SessionState>>();
+   |         ----^^^^^^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> src/components/settings_panel.rs:23:9
+   |
+23 |     let mut session_state = use_context::<Signal<SessionState>>();
+   |         ----^^^^^^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> src/components/skill_call_display.rs:22:9
+   |
+22 |     let mut has_pending_approvals = consume_context::<Signal<bool>>();
+   |         ----^^^^^^^^^^^^^^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused variable: `session_state`
+   --> src/main.rs:654:21
+    |
+654 |             let mut session_state = session_state;
+    |                     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_session_state`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+   --> src/main.rs:654:17
+    |
+654 |             let mut session_state = session_state;
+    |                 ----^^^^^^^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/main.rs:154:9
+    |
+154 |     let mut session_state = use_context_provider(|| {
+    |         ----^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+For more information about this error, try `rustc --explain E0603`.
+warning: `Hobbes` (bin "Hobbes") generated 12 warnings
+error: could not compile `Hobbes` (bin "Hobbes") due to 2 previous errors; 12 warnings emitted

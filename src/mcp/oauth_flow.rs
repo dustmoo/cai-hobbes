@@ -619,6 +619,11 @@ fn build_error_response(error: &str) -> String {
 }
 
 /// Open a URL in the default browser
-pub fn open_browser(url: &str) -> Result<(), String> {
-    open::that(url).map_err(|e| format!("Failed to open browser: {}", e))
+pub async fn open_browser(url: &str) -> Result<(), String> {
+    let url_clone = url.to_string();
+    tokio::task::spawn_blocking(move || {
+        open::that(&url_clone).map_err(|e| format!("Failed to open browser: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Browser task panicked: {}", e))?
 }

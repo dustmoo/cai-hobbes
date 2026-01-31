@@ -519,9 +519,10 @@ pub fn ChatWindow(
                 }
             };
 
-            if let Err(e) = session_state.read().save() {
-                tracing::error!("Failed to save session state: {}", e);
-            }
+            spawn(async move {
+                let state_snapshot = session_state.read().clone();
+                let _ = tokio::task::spawn_blocking(move || state_snapshot.save()).await;
+            });
 
             let mcp_context = session_state
                 .read()
@@ -576,9 +577,10 @@ pub fn ChatWindow(
                     }
                 };
 
-                if let Err(e) = session_state.read().save() {
-                    tracing::error!("Failed to save session state before continuation: {}", e);
-                }
+                spawn(async move {
+                    let state_snapshot = session_state.read().clone();
+                    let _ = tokio::task::spawn_blocking(move || state_snapshot.save()).await;
+                });
 
                 let mcp_context = session_state
                     .read()
@@ -662,9 +664,10 @@ pub fn ChatWindow(
                         });
                     }
                 }
-                if let Err(e) = session_state.read().save() {
-                    tracing::error!("Failed to save session after optimization: {}", e);
-                }
+                spawn(async move {
+                    let state_snapshot = session_state.read().clone();
+                    let _ = tokio::task::spawn_blocking(move || state_snapshot.save()).await;
+                });
                 // Force refresh messagelist
                 stream_update_trigger.set(stream_update_trigger() + 1);
             }

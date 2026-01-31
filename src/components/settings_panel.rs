@@ -122,6 +122,8 @@ pub fn SettingsPanel() -> Element {
 
     // Composio URL warning
     let mut composio_url_warning = use_signal(|| Option::<String>::None);
+    // Advanced mode toggle for Composio profile (hides User ID and Server URL by default)
+    let mut show_composio_advanced = use_signal(|| false);
 
     rsx! {
         div {
@@ -861,19 +863,12 @@ pub fn SettingsPanel() -> Element {
                                                 ol {
                                                     class: "list-decimal list-inside text-sm text-gray-300 space-y-1.5",
                                                     li {
-                                                        "Create an account at "
-                                                        a { class: "text-primary-400 hover:text-primary-300 underline", href: "https://platform.composio.dev", target: "_blank", "platform.composio.dev" }
-                                                        " (Google SSO recommended)"
+                                                        "Get your API key from "
+                                                        a { class: "text-primary-400 hover:text-primary-300 underline", href: "https://composio.dev/settings", target: "_blank", "composio.dev/settings" }
                                                     }
-                                                    li { "Create a new MCP Config" }
-                                                    li { "Click \"+ Add Profile\" below to create a local profile" }
-                                                    li { "Copy your User ID (UUID) and add it to your MCP config setup" }
-                                                    li { "Name, save our MCP config, then use the Install button to get your Link, User ID (part of the URL) and the API Key." }
-                                                    li { "Connect your desired accounts (Gmail, GitHub, etc.) [It's easier to add them through the MCP Marketplace, but the admin is best for managing available tools.]" }
-                                                    li { "Add the URL and API Key to your Composio Native profile." }
-                                                    li { "Save your Settings. You should be able to use Composio Native."}
-                                                    li { "Check the MCP Status window for connection status and Toolkit availability."}
-                                                    li { "If you can't use Composio Native, try restarting the app. If that doesn't work check your user id and server URLs"}
+                                                    li { "Click \"+ Add Profile\" and paste your API key" }
+                                                    li { "Use the MCP Marketplace to connect your first tool (Gmail, GitHub, etc.)" }
+                                                    li { "Your Server URL will be automatically created - you're done!" }
                                                 }
                                                 div {
                                                     class: "mt-3 pt-3 border-t border-primary-700/30",
@@ -1015,121 +1010,14 @@ pub fn SettingsPanel() -> Element {
                                                     }
                                                 }
 
-                                                // User ID (Read-only + Copy/Regenerate)
-                                                div {
-                                                    class: "mb-3",
-                                                    label { class: "block text-xs font-medium text-gray-400 mb-1", "User ID" }
-                                                    div {
-                                                        class: "flex gap-2",
-                                                        input {
-                                                            class: "flex-1 px-3 py-2 bg-dark-bg border border-primary-700 rounded-md text-sm text-gray-400 cursor-not-allowed",
-                                                            readonly: true,
-                                                            value: "{local_settings.read().get_active_profile().and_then(|p| p.user_id.clone()).unwrap_or_else(|| \"Not Generated\".to_string())}"
-                                                        }
-                                                        // Copy Button
-                                                        button {
-                                                            class: "px-3 py-2 bg-dark-input hover:bg-white/10 border border-primary-600 rounded-md text-gray-300 transition-colors",
-                                                            title: "Copy User ID",
-                                                            onclick: {
-                                                                let user_id = local_settings.read().get_active_profile().map(|p| p.user_id.clone()).unwrap_or_default();
-                                                                move |_| {
-                                                                    if user_id.as_ref().is_none_or(|s| !s.is_empty()) {
-                                                                        use std::process::Command;
-                                                                         let _ = Command::new("pbcopy")
-                                                                             .stdin(std::process::Stdio::piped())
-                                                                             .spawn()
-                                                                             .map(|mut child| {
-                                                                                 use std::io::Write;
-                                                                                 if let Some(mut stdin) = child.stdin.take() {
-                                                                                     let _ = stdin.write_all(user_id.as_deref().unwrap_or("").as_bytes());
-                                                                                 }
-                                                                             });
-                                                                    }
-                                                                }
-                                                            },
-                                                            Icon { width: 16, height: 16, icon: fi_icons::FiCopy }
-                                                        }
-                                                        // Regenerate Button
-                                                        button {
-                                                            class: "px-3 py-2 bg-dark-input hover:bg-white/10 border border-primary-600 rounded-md text-gray-300 transition-colors",
-                                                            title: "Regenerate User ID",
-                                                            onclick: {
-                                                                let name = active_name.clone();
-                                                                move |_| {
-                                                                    let mut settings = local_settings.write();
-                                                                    if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
-                                                                        profile.user_id = Some(uuid::Uuid::new_v4().to_string().to_lowercase());
-                                                                    }
-                                                                }
-                                                            },
-                                                            Icon { width: 16, height: 16, icon: fi_icons::FiRefreshCw }
-                                                        }
-                                                    }
-                                                }
-
-                                                // Server URL
-                                                div {
-                                                    class: "mb-3",
-                                                    label { class: "block text-xs font-medium text-gray-400 mb-1", "Server URL" }
-                                                    input {
-                                                        class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm",
-                                                        placeholder: "https://backend.composio.dev/v3/mcp/0a4474b3-d8...",
-                                                        value: "{local_settings.read().get_active_profile().and_then(|p| p.base_url.clone()).unwrap_or_default()}",
-                                                        oninput: {
-                                                            let name = active_name.clone();
-                                                            move |event: Event<FormData>| {
-                                                                let val = event.value();
-                                                                let mut clean_val = val.clone();
-                                                                let mut warning = None;
-
-                                                                // Sanitize URL if it contains user_id
-                                                                if let Ok(mut url) = url::Url::parse(&val) {
-                                                                    if url.query_pairs().any(|(k, _)| k == "user_id") {
-                                                                        let pairs: Vec<(String, String)> = url.query_pairs()
-                                                                            .filter(|(k, _)| k != "user_id")
-                                                                            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                                                                            .collect();
-
-                                                                        url.query_pairs_mut().clear();
-                                                                        for (k, v) in pairs {
-                                                                            url.query_pairs_mut().append_pair(&k, &v);
-                                                                        }
-
-                                                                        // Clean up if query is empty (Url::to_string might leave ?)
-                                                                        if url.query() == Some("") {
-                                                                            url.set_query(None);
-                                                                        }
-
-                                                                        clean_val = url.to_string();
-                                                                        warning = Some("Note: Embedded User ID removed. Using the app-generated User ID below.".to_string());
-                                                                    }
-                                                                }
-
-                                                                composio_url_warning.set(warning);
-
-                                                                let mut settings = local_settings.write();
-                                                                if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
-                                                                    profile.base_url = if clean_val.is_empty() { None } else { Some(clean_val) };
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    if let Some(msg) = composio_url_warning.read().as_ref() {
-                                                        p { class: "text-xs text-yellow-400 mt-1 flex items-center gap-1",
-                                                            Icon { width: 12, height: 12, icon: fi_icons::FiAlertCircle }
-                                                            "{msg}"
-                                                        }
-                                                    }
-                                                }
-
-                                                // API Key
+                                                // API Key - FIRST (this is the required entry point)
                                                 div {
                                                     class: "mb-3",
                                                     label { class: "block text-xs font-medium text-gray-400 mb-1", "API Key" }
                                                     input {
                                                         r#type: "password",
                                                         class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm",
-                                                        placeholder: "Enter Composio API key",
+                                                        placeholder: "Enter your Composio API key from composio.dev/settings",
                                                         value: "{local_settings.read().get_active_profile().and_then(|p| p.api_key.clone()).unwrap_or_default()}",
                                                         oninput: {
                                                             let name = active_name.clone();
@@ -1140,6 +1028,139 @@ pub fn SettingsPanel() -> Element {
                                                                     profile.api_key = if val.is_empty() { None } else { Some(val) };
                                                                 }
                                                             }
+                                                        }
+                                                    }
+                                                    p {
+                                                        class: "text-xs text-gray-500 mt-1",
+                                                        "Get your API key from "
+                                                        a { class: "text-primary-400 hover:text-primary-300 underline", href: "https://composio.dev/settings", target: "_blank", "composio.dev/settings" }
+                                                    }
+                                                }
+
+                                                // Advanced Settings Toggle
+                                                div {
+                                                    class: "mb-3 pt-3 border-t border-primary-700/50",
+                                                    button {
+                                                        class: "flex items-center gap-2 text-xs text-gray-400 hover:text-gray-300 transition-colors",
+                                                        onclick: move |_| {
+                                                            show_composio_advanced.set(!show_composio_advanced());
+                                                        },
+                                                        span { if show_composio_advanced() { "▼" } else { "▶" } }
+                                                        span { "Advanced Settings" }
+                                                        span { class: "text-gray-500", "(User ID, Server URL)" }
+                                                    }
+                                                }
+
+                                                // Advanced Section (hidden by default)
+                                                if show_composio_advanced() {
+                                                    div {
+                                                        class: "space-y-3 p-3 bg-dark-bg/50 rounded-lg border border-primary-700/30",
+
+                                                        // User ID (Read-only + Copy/Regenerate)
+                                                        div {
+                                                            label { class: "block text-xs font-medium text-gray-400 mb-1", "User ID" }
+                                                            div {
+                                                                class: "flex gap-2",
+                                                                input {
+                                                                    class: "flex-1 px-3 py-2 bg-dark-bg border border-primary-700 rounded-md text-sm text-gray-400 cursor-not-allowed",
+                                                                    readonly: true,
+                                                                    value: "{local_settings.read().get_active_profile().and_then(|p| p.user_id.clone()).unwrap_or_else(|| \"Auto-generated\".to_string())}"
+                                                                }
+                                                                // Copy Button
+                                                                button {
+                                                                    class: "px-3 py-2 bg-dark-input hover:bg-white/10 border border-primary-600 rounded-md text-gray-300 transition-colors",
+                                                                    title: "Copy User ID",
+                                                                    onclick: {
+                                                                        let user_id = local_settings.read().get_active_profile().map(|p| p.user_id.clone()).unwrap_or_default();
+                                                                        move |_| {
+                                                                            if user_id.as_ref().is_none_or(|s| !s.is_empty()) {
+                                                                                use std::process::Command;
+                                                                                 let _ = Command::new("pbcopy")
+                                                                                     .stdin(std::process::Stdio::piped())
+                                                                                     .spawn()
+                                                                                     .map(|mut child| {
+                                                                                         use std::io::Write;
+                                                                                         if let Some(mut stdin) = child.stdin.take() {
+                                                                                             let _ = stdin.write_all(user_id.as_deref().unwrap_or("").as_bytes());
+                                                                                         }
+                                                                                     });
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    Icon { width: 16, height: 16, icon: fi_icons::FiCopy }
+                                                                }
+                                                                // Regenerate Button
+                                                                button {
+                                                                    class: "px-3 py-2 bg-dark-input hover:bg-white/10 border border-primary-600 rounded-md text-gray-300 transition-colors",
+                                                                    title: "Regenerate User ID",
+                                                                    onclick: {
+                                                                        let name = active_name.clone();
+                                                                        move |_| {
+                                                                            let mut settings = local_settings.write();
+                                                                            if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                                profile.user_id = Some(uuid::Uuid::new_v4().to_string().to_lowercase());
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    Icon { width: 16, height: 16, icon: fi_icons::FiRefreshCw }
+                                                                }
+                                                            }
+                                                            p { class: "text-xs text-gray-500 mt-1", "Auto-generated on profile creation. Only change if troubleshooting." }
+                                                        }
+
+                                                        // Server URL
+                                                        div {
+                                                            label { class: "block text-xs font-medium text-gray-400 mb-1", "Server URL (Optional)" }
+                                                            input {
+                                                                class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm",
+                                                                placeholder: "Auto-created when you connect your first tool",
+                                                                value: "{local_settings.read().get_active_profile().and_then(|p| p.base_url.clone()).unwrap_or_default()}",
+                                                                oninput: {
+                                                                    let name = active_name.clone();
+                                                                    move |event: Event<FormData>| {
+                                                                        let val = event.value();
+                                                                        let mut clean_val = val.clone();
+                                                                        let mut warning = None;
+
+                                                                        // Sanitize URL if it contains user_id
+                                                                        if let Ok(mut url) = url::Url::parse(&val) {
+                                                                            if url.query_pairs().any(|(k, _)| k == "user_id") {
+                                                                                let pairs: Vec<(String, String)> = url.query_pairs()
+                                                                                    .filter(|(k, _)| k != "user_id")
+                                                                                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                                                                                    .collect();
+
+                                                                                url.query_pairs_mut().clear();
+                                                                                for (k, v) in pairs {
+                                                                                    url.query_pairs_mut().append_pair(&k, &v);
+                                                                                }
+
+                                                                                // Clean up if query is empty (Url::to_string might leave ?)
+                                                                                if url.query() == Some("") {
+                                                                                    url.set_query(None);
+                                                                                }
+
+                                                                                clean_val = url.to_string();
+                                                                                warning = Some("Note: Embedded User ID removed. Using the app-generated User ID.".to_string());
+                                                                            }
+                                                                        }
+
+                                                                        composio_url_warning.set(warning);
+
+                                                                        let mut settings = local_settings.write();
+                                                                        if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                            profile.base_url = if clean_val.is_empty() { None } else { Some(clean_val) };
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            if let Some(msg) = composio_url_warning.read().as_ref() {
+                                                                p { class: "text-xs text-yellow-400 mt-1 flex items-center gap-1",
+                                                                    Icon { width: 12, height: 12, icon: fi_icons::FiAlertCircle }
+                                                                    "{msg}"
+                                                                }
+                                                            }
+                                                            p { class: "text-xs text-gray-500 mt-1", "Leave empty to auto-create on first tool connection." }
                                                         }
                                                     }
                                                 }

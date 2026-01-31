@@ -6,12 +6,13 @@ use super::ComposioClient;
 use serde_json::Value;
 
 /// Add a toolkit to the MCP server configuration via PATCH API.
+/// Returns the new server URL if a server was created, so caller can save it.
 pub async fn add_toolkit_to_server(
     client: &ComposioClient,
     toolkit_slug: &str,
     auth_config_id: &str,
     selected_tools: Option<Vec<String>>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     // Extract target server ID from base_url/settings for verification
     let target_server_id = client
         .base_url
@@ -29,7 +30,8 @@ pub async fn add_toolkit_to_server(
 
     // CRITICAL FIX: Use V3 Registry API to LIST and discover the correct server
     // Endpoint: GET /api/v3/mcp/servers
-    let registry_base_url = "https://backend.composio.dev/api/v3/mcp/servers";
+    let api_base = client.get_api_base_url();
+    let registry_base_url = format!("{}/mcp/servers", api_base);
 
     tracing::debug!("Discovering servers via Registry: {}", registry_base_url);
 
@@ -57,17 +59,77 @@ pub async fn add_toolkit_to_server(
         .and_then(|i| i.as_array())
         .ok_or("Invalid server list response")?;
 
-    // Find matching server or use the first one
-    let server_obj = items
-        .iter()
-        .find(|s| s.get("id").and_then(|id| id.as_str()) == Some(target_server_id))
-        .or_else(|| items.first())
-        .ok_or("No MCP servers found for this account")?;
+    // Find matching server or use the first one, OR CREATE if none exist
+    let (server_id, server_obj_owned, newly_created_url): (String, Value, Option<String>) = if items.is_empty() {
+        // No servers exist - create one and an instance for this user
+        tracing::info!("No MCP servers found. Creating new server for first toolkit connection.");
+        
+        let new_server = create_mcp_server(client, toolkit_slug, auth_config_id).await?;
+        let new_server_id = new_server
+            .get("id")
+            .and_then(|s| s.as_str())
+            .ok_or("Created server missing ID")?
+            .to_string();
+        
+        // Construct the new MCP URL for the caller to save
+        let base_domain = api_base.replace("/api/v3", "");
+        let new_url = format!("{}/v3/mcp/{}/mcp", base_domain, new_server_id);
+        tracing::info!("Created new server with URL: {}", new_url);
+        
+        // Create instance to bind user to this server
+        if let Some(ref user_id) = client.user_id {
+            if let Err(e) = create_mcp_instance(client, &new_server_id, user_id).await {
+                tracing::warn!("Failed to create instance (user may already exist): {}", e);
+            }
+        }
+        
+        (new_server_id, new_server, Some(new_url))
+    } else {
+        // MATCHING LOGIC: Prioritize the exact target_server_id if provided
+        let mut target_server = None;
+        if !target_server_id.is_empty() {
+            target_server = items
+                .iter()
+                .find(|s| s.get("id").and_then(|id| id.as_str()) == Some(target_server_id));
+        }
 
-    let server_id = server_obj
-        .get("id")
-        .and_then(|s| s.as_str())
-        .ok_or("Server object missing ID")?;
+        // Fallback to first if not found, or matching by toolkit if possible? 
+        // For now, let's just be more logging-heavy about the choice.
+        let found = target_server
+            .or_else(|| {
+                if !target_server_id.is_empty() {
+                    tracing::warn!("Target server ID '{}' not found in Registry list. Falling back to first available.", target_server_id);
+                }
+                items.first()
+            })
+            .ok_or_else(|| {
+                tracing::error!("Registry returned empty items list after successful list call");
+                "No MCP servers found for this account".to_string()
+            })?;
+        
+        let id = found
+            .get("id")
+            .and_then(|s| s.as_str())
+            .ok_or("Server object missing ID")?
+            .to_string();
+            
+        // Return URL for settings update
+        let base_domain = api_base.replace("/api/v3", "");
+        let existing_url = format!("{}/v3/mcp/{}/mcp", base_domain, id);
+        
+        (id, found.clone(), Some(existing_url))
+    };
+    
+    // Ensure user is bound to the server (required for tool visibility)
+    // Call this regardless of whether the server is new or existing.
+    if let Some(ref user_id) = client.user_id {
+        if let Err(e) = create_mcp_instance(client, &server_id, user_id).await {
+            // Log but don't fail - user may already be bound
+            tracing::debug!("Instance binding note (likely already exists): {}", e);
+        }
+    }
+
+    let server_obj = &server_obj_owned;
 
     tracing::info!("Resolved MCP Server ID: {}", server_id);
 
@@ -75,7 +137,7 @@ pub async fn add_toolkit_to_server(
     // Endpoint: GET/PATCH /api/v3/mcp/{server_id}
     // NOTE: The endpoint for CONFIGURATION is /api/v3/mcp/{id} (singular 'mcp', no 'servers')
     // The endpoint for LISTING is /api/v3/mcp/servers
-    let config_url = format!("https://backend.composio.dev/api/v3/mcp/{}", server_id);
+    let config_url = format!("{}/mcp/{}", api_base, server_id);
 
     // Extract existing toolkits as strings (API requires string format)
     let mut final_toolkits: Vec<String> = server_obj
@@ -95,8 +157,8 @@ pub async fn add_toolkit_to_server(
         })
         .unwrap_or_default();
 
-    // Extract existing auth_config_ids and add the new one
-    let mut auth_config_ids: Vec<String> = server_obj
+    // Extract existing auth_config_ids
+    let existing_auth_ids: Vec<String> = server_obj
         .get("auth_config_ids")
         .and_then(|a| a.as_array())
         .map(|arr| {
@@ -106,10 +168,65 @@ pub async fn add_toolkit_to_server(
         })
         .unwrap_or_default();
 
-    // Bind the new auth_config_id to the server if not already present
-    if !auth_config_ids.iter().any(|id| id == auth_config_id) {
+    // RECONCILIATION STEP: Fetch actual active auth configs to prune stale IDs
+    // We must do this to avoid sending deleted IDs back to the server, which causes 400 Bad Request.
+    let mut auth_config_ids = Vec::new();
+    let mut auth_updated = false;
+
+    // 1. Fetch all active auth configs for this user/client
+    // This gives us the "source of truth" for which IDs are valid.
+    tracing::debug!("Fetching active auth configs for reconciliation...");
+    match list_auth_configs(client).await {
+        Ok(active_configs) => {
+            // Build a map of valid IDs and which toolkit they belong to
+            // Map<AuthConfigID, ToolkitSlug>
+            let valid_id_map: std::collections::HashMap<String, String> = active_configs
+                .iter()
+                .filter_map(|ac| {
+                    ac.toolkit.as_ref().map(|t| (ac.id.clone(), t.slug.clone().to_lowercase()))
+                })
+                .collect();
+            
+            let target_slug_lower = toolkit_slug.to_lowercase();
+
+            // 2. Filter existing IDs
+            for existing_id in existing_auth_ids {
+                // Keep the ID if:
+                // A) It is present in our list of active configs (it's valid)
+                // AND
+                // B) It matches a DIFFERENT toolkit OR it is the specific one we are trying to add (unlikely, but safe)
+                // effectively removing all OLD configs for THIS toolkit.
+                if let Some(associated_slug) = valid_id_map.get(&existing_id) {
+                    if associated_slug == &target_slug_lower {
+                        // This is an config for OUR target toolkit.
+                        // We will be adding the NEW authoritative one below.
+                        // So we drop this one (pruning old configs for this tool).
+                        tracing::debug!("Pruning stale/old auth config '{}' for current toolkit '{}'", existing_id, target_slug_lower);
+                        auth_updated = true; // We changed the list
+                    } else {
+                        // It belongs to another toolkit, keep it.
+                        auth_config_ids.push(existing_id);
+                    }
+                } else {
+                    // ID not found in active list -> it's stale/deleted. Drop it.
+                    tracing::warn!("Pruning invalid/deleted auth config ID '{}'", existing_id);
+                    auth_updated = true;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch active auth configs for reconciliation: {}. Falling back to append-only (risky).", e);
+            auth_config_ids = existing_auth_ids;
+        }
+    }
+
+    // 3. Add the NEW authoritative auth config for this toolkit
+    if !auth_config_ids.contains(&auth_config_id.to_string()) {
         auth_config_ids.push(auth_config_id.to_string());
-        tracing::info!("Binding auth_config '{}' to MCP server", auth_config_id);
+        tracing::info!("Binding new auth_config '{}' for toolkit '{}'", auth_config_id, toolkit_slug);
+        auth_updated = true;
+    } else {
+         tracing::debug!("Auth config '{}' already present in reconciled list", auth_config_id);
     }
 
     // Check if toolkit already exists
@@ -137,6 +254,7 @@ pub async fn add_toolkit_to_server(
         .unwrap_or_default();
 
     // Determine which tools to add: use pre-selected or fetch all
+    let mut use_all_tools = false;
     let tools_added = if let Some(pre_selected) = selected_tools {
         // Use pre-selected tools (from LLM smart selection)
         let mut added = 0;
@@ -156,7 +274,7 @@ pub async fn add_toolkit_to_server(
     } else {
         // Fetch all tools for the toolkit and add any missing ones
         match get_toolkit_tools(client, toolkit_slug).await {
-            Ok(new_tools) => {
+            Ok(new_tools) if !new_tools.is_empty() => {
                 let mut added = 0;
                 for tool in new_tools {
                     if !custom_tools.contains(&tool) {
@@ -172,58 +290,74 @@ pub async fn add_toolkit_to_server(
                 );
                 added
             }
+            Ok(_) => {
+                // THE VACUUM FIX: If prefix matching returned 0 tools, do NOT patch an empty list.
+                // Setting use_all_tools=true will cause us to OMIT the allowed_tools field.
+                tracing::info!(
+                    "No tools found via prefix for toolkit '{}'. Defaulting to ALL tools to prevent vacuum.",
+                    toolkit_slug
+                );
+                use_all_tools = true;
+                0
+            }
             Err(e) => {
-                // Log warning but continue - tools can be added manually later
                 tracing::warn!(
-                    "Could not auto-fetch tools for toolkit '{}': {}",
+                    "Could not auto-fetch tools for toolkit '{}': {}. Defaulting to ALL.",
                     toolkit_slug,
                     e
                 );
+                use_all_tools = true;
                 0
             }
         }
     };
 
     // Skip PATCH if no changes needed (toolkit exists, auth bound, and no new tools)
-    if toolkit_already_exists
-        && tools_added == 0
-        && auth_config_ids.contains(&auth_config_id.to_string())
-    {
-        tracing::info!(
-            "Toolkit '{}' already configured with auth_config, skipping PATCH",
+    // CRITICAL FIX: We must check `!auth_updated` instead of checking if the ID exists in the list
+    // because we just added it to the list above!
+    let should_patch = !toolkit_already_exists || tools_added > 0 || auth_updated || use_all_tools;
+
+    if should_patch {
+        // Build PATCH payload with strict String Array types as per Mandate 5
+        let mut patch_payload = serde_json::json!({
+            "toolkits": final_toolkits,
+            "auth_config_ids": auth_config_ids
+        });
+
+        // Only include allowed_tools if we are NOT in "all" mode
+        if !use_all_tools {
+            if let Some(obj) = patch_payload.as_object_mut() {
+                obj.insert("allowed_tools".to_string(), serde_json::json!(custom_tools));
+            }
+        }
+
+        tracing::debug!("PATCH {} with payload: {:?}", config_url, patch_payload);
+
+        let patch_response = client
+            .client
+            .patch(&config_url)
+            .header("x-api-key", &client.api_key)
+            .header("Content-Type", "application/json")
+            .json(&patch_payload)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to update MCP server: {}", e))?;
+
+        if !patch_response.status().is_success() {
+            let status = patch_response.status();
+            let text = patch_response.text().await.unwrap_or_default();
+            
+            // FAIL FAST: This configuration is critical. If it fails, tools won't work correctly.
+            // This prevents "hollow" user generation and the "0 tools" vacuum.
+            return Err(format!("Failed to configure toolkit on server ({}): {}", status, text));
+        }
+    } else {
+         tracing::info!(
+            "Toolkit '{}' already configured, skipping PATCH",
             toolkit_slug
         );
-        // Still proceed to user generation step
     }
-
-    // Build PATCH payload with string-based toolkits and auth_config_ids binding
-    let patch_payload = serde_json::json!({
-        "toolkits": final_toolkits,
-        "auth_config_ids": auth_config_ids,
-        "allowed_tools": custom_tools
-    });
-
-    tracing::debug!("PATCH {} with payload: {:?}", config_url, patch_payload);
-
-    let patch_response = client
-        .client
-        .patch(&config_url) // Using Registry URL
-        .header("x-api-key", &client.api_key)
-        .header("Content-Type", "application/json")
-        .json(&patch_payload)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to update MCP server: {}", e))?;
-
-    if !patch_response.status().is_success() {
-        let status = patch_response.status();
-        let text = patch_response.text().await.unwrap_or_default();
-        return Err(format!(
-            "Failed to add toolkit to server ({}): {}",
-            status, text
-        ));
-    }
-
+    
     // Step 4: Generate/register user with the MCP server
     // This is required for the user to see the tools
     // API: POST /api/v3/mcp/servers/generate
@@ -231,9 +365,13 @@ pub async fn add_toolkit_to_server(
     // However, 'generate' implies runtime credential creation. Let's keep it as is unless it fails.
     if let Some(ref user_id) = client.user_id {
         let generate_url = format!("{}/mcp/servers/generate", client.get_api_base_url());
+        // CRITICAL: API requires user_ids (plural, array) NOT user_id (singular)
+        // SDK pattern: user_ids=[user_id], managed_auth_by_composio=True
+        // Pattern 110: Ensure managed_auth_by_composio is explicitly true
         let generate_payload = serde_json::json!({
-            "user_id": user_id,
-            "mcp_server_id": server_id
+            "user_ids": [user_id],
+            "mcp_server_id": server_id,
+            "managed_auth_by_composio": true
         });
 
         tracing::debug!(
@@ -270,7 +408,120 @@ pub async fn add_toolkit_to_server(
         toolkit_slug,
         custom_tools.len()
     );
-    Ok(())
+    Ok(newly_created_url)
+}
+
+/// Create a new MCP server for the user's first toolkit.
+/// Called when no servers exist for the account.
+/// Endpoint: POST /api/v3/mcp/servers/custom
+async fn create_mcp_server(
+    client: &ComposioClient,
+    toolkit_slug: &str,
+    auth_config_id: &str,
+) -> Result<Value, String> {
+    let api_base = client.get_api_base_url();
+    let url = format!("{}/mcp/servers/custom", api_base);
+
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let server_name = format!("hobbes-mcp-{}", epoch);
+
+    // Build payload with initial toolkit binding
+    // CRITICAL: Use String Arrays for toolkits and auth_config_ids
+    // Object binding ([{toolkit:..., auth_config:...}]) is FORBIDDEN by API
+    let payload = serde_json::json!({
+        "name": server_name,
+        "toolkits": [toolkit_slug.to_lowercase()],
+        "auth_config_ids": [auth_config_id]
+    });
+
+    tracing::info!(
+        "Creating new MCP server with initial toolkit '{}': {}",
+        toolkit_slug,
+        url
+    );
+    tracing::debug!("POST {} with payload: {:?}", url, payload);
+
+    let response = client
+        .client
+        .post(&url)
+        .header("x-api-key", &client.api_key)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to create MCP server: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Failed to create MCP server ({}): {}", status, text));
+    }
+
+    let server: Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse create server response: {}", e))?;
+
+    let server_id = server
+        .get("id")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown");
+
+    tracing::info!("Created new MCP server with ID: {}", server_id);
+    Ok(server)
+}
+
+/// Create an MCP instance to bind a user to a server.
+/// This is required for the user to see tools on the operational proxy.
+/// Endpoint: POST /api/v3/mcp/servers/{id}/instances
+async fn create_mcp_instance(
+    client: &ComposioClient,
+    server_id: &str,
+    user_id: &str,
+) -> Result<Value, String> {
+    let api_base = client.get_api_base_url();
+    let url = format!("{}/mcp/servers/{}/instances", api_base, server_id);
+
+    let payload = serde_json::json!({
+        "user_id": user_id
+    });
+
+    tracing::info!(
+        "Creating MCP instance for user '{}' on server '{}': {}",
+        user_id,
+        server_id,
+        url
+    );
+
+    let response = client
+        .client
+        .post(&url)
+        .header("x-api-key", &client.api_key)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to create MCP instance: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Failed to create MCP instance ({}): {}",
+            status, text
+        ));
+    }
+
+    let instance: Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse create instance response: {}", e))?;
+
+    tracing::info!("Created MCP instance for user '{}'", user_id);
+    Ok(instance)
 }
 
 /// Execute a Composio tool via the MCP server.

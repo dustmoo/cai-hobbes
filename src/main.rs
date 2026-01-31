@@ -422,6 +422,7 @@ fn app() -> Element {
         Signal::new(McpManager::new(
             get_mcp_config_path(),
             permission_manager,
+            secret_manager,
         ))
     });
     let mcp_context = use_context_provider(|| {
@@ -456,7 +457,6 @@ fn app() -> Element {
     // Reinitialize Composio client when active profile changes
     // This use_effect subscribes to changes in active_composio_profile
     {
-
         // Track key profile properties to detect changes (API key, base URL, etc.)
         let mut prev_profile_signature: Signal<Option<String>> = use_signal(|| None);
 
@@ -497,6 +497,7 @@ fn app() -> Element {
             prev_profile_signature.set(current_signature);
         });
     }
+
 
     let mut show_session_manager = use_signal(|| false);
     let mut show_settings_panel = use_signal(|| false);
@@ -697,6 +698,32 @@ fn app() -> Element {
                 // Save asynchronously on a background thread to avoid blocking the UI
                 SessionState::save_async(session_state.read().clone());
             });
+        }
+    });
+
+    // Handle global SwitchToSettingsTab command
+    use_effect(move || {
+        if let Some(cmd) = chat_command.read().clone() {
+            match cmd {
+                ChatCommand::SwitchToSettingsTab(tab, slug) => {
+                    tracing::info!("App handling SwitchToSettingsTab: {:?}, slug: {:?}", tab, slug);
+                    // 1. Show Settings Panel
+                    show_settings_panel.set(true);
+                    show_session_manager.set(false);
+                    show_mcp_manager.set(false);
+
+                    // 2. Update UiState
+                    let mut state = ui_state.write();
+                    state.active_settings_tab = tab;
+                    state.selected_byoa_slug = slug;
+
+                    // 3. Clear command
+                    spawn(async move {
+                        chat_command.set(None);
+                    });
+                }
+                _ => {}
+            }
         }
     });
 

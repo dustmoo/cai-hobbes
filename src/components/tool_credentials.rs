@@ -26,11 +26,25 @@ fn refresh_credentials(
 pub fn ToolCredentials() -> Element {
     let mut secret_manager = use_context::<Signal<SecretManager>>();
     let settings = use_context::<Signal<Settings>>();
+    let mut ui_state = use_context::<Signal<crate::settings::UiState>>();
 
     // Local state for the form
     let mut selected_slug = use_signal(String::new);
     let mut new_field = use_signal(String::new);
     let mut new_value = use_signal(String::new);
+
+    // Sync from global UI state (redirection)
+    use_effect(move || {
+        if let Some(slug) = ui_state.read().selected_byoa_slug.clone() {
+            if !slug.is_empty() {
+                selected_slug.set(slug);
+                // Clear the trigger after consuming
+                spawn(async move {
+                    ui_state.write().selected_byoa_slug = None;
+                });
+            }
+        }
+    });
 
     // State for the list of credentials
     let credentials = use_signal(HashMap::<String, Vec<(String, String)>>::new);
@@ -46,6 +60,42 @@ pub fn ToolCredentials() -> Element {
     // Combobox state
     let mut dropdown_open = use_signal(|| false);
     let mut highlighted_index = use_signal(|| 0usize);
+
+    // State for schema discovery
+    let mut selected_toolkit_listing = use_signal(|| Option::<crate::mcp::composio_client::models::ComposioToolkitListing>::None);
+    let mut listing_loading = use_signal(|| false);
+
+    // Fetch toolkit listing when slug is selected
+    use_effect(move || {
+        let slug = selected_slug.read().clone();
+        if slug.is_empty() {
+            selected_toolkit_listing.set(None);
+            return;
+        }
+
+        let settings_snapshot = settings.peek().clone();
+        spawn(async move {
+            listing_loading.set(true);
+            if let Some(profile) = settings_snapshot.get_active_profile() {
+                if let Some(api_key) = &profile.api_key {
+                    let base_url = profile.base_url.clone().unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
+                    let client = ComposioClient::new(api_key.clone(), base_url, profile.entity_id.clone(), profile.user_id.clone(), profile.id.clone());
+                    
+                    match crate::mcp::composio_client::discovery::get_toolkit_metadata(&client, &slug).await {
+                        Ok(listing) => {
+                            tracing::info!("Discovered schema for toolkit {}: {:?}", slug, listing.auth_config);
+                            selected_toolkit_listing.set(Some(listing));
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch metadata for toolkit {}: {}", slug, e);
+                            selected_toolkit_listing.set(None);
+                        }
+                    }
+                }
+            }
+            listing_loading.set(false);
+        });
+    });
 
     // Initial load of existing credentials
     use_effect(move || {
@@ -194,6 +244,26 @@ pub fn ToolCredentials() -> Element {
                 p { class: "text-sm text-gray-400",
                     "Add your own Client IDs and Secrets for tools that require custom authentication (e.g., LinkedIn, Google)."
                 }
+                
+                // LinkedIn-specific guidance (Pattern 25: Security Master)
+                if selected_slug.read().to_lowercase().contains("linkedin") {
+                    div { class: "mt-3 p-3 bg-blue-900/30 border border-blue-700/50 rounded-md",
+                        h5 { class: "text-xs font-semibold text-blue-300 mb-1", "LinkedIn App Limits Detected?" }
+                        p { class: "text-xs text-blue-100/70 leading-relaxed",
+                            "If you hit 'App Level Rate Limits', you should create your own LinkedIn App at "
+                            a { 
+                                class: "text-blue-400 hover:underline", 
+                                href: "https://www.linkedin.com/developers/apps",
+                                "LinkedIn Developers"
+                            }
+                            ". Then add your "
+                            span { class: "font-mono text-blue-300", "client_id" }
+                            " and "
+                            span { class: "font-mono text-blue-300", "client_secret" }
+                            " below to use 'Bring Your Own App' (BYOA) mode."
+                        }
+                    }
+                }
             }
 
             div {
@@ -326,6 +396,32 @@ pub fn ToolCredentials() -> Element {
                     }
                     div {
                         label { class: "block text-xs font-medium text-gray-500 mb-1", "Field Name (e.g. client_id)" }
+                        
+                        // Dynamic field suggestions based on schema
+                        if let Some(listing) = selected_toolkit_listing.read().as_ref() {
+                            if let Some(auth_config) = &listing.auth_config {
+                                if let Some(fields) = &auth_config.expected_input_fields {
+                                    div { class: "flex flex-wrap gap-1 mb-2",
+                                        for field in fields {
+                                            button {
+                                                class: "px-2 py-0.5 bg-primary-900/40 hover:bg-primary-800/60 border border-primary-700 rounded text-[10px] text-primary-300 transition-colors",
+                                                title: field.description.as_deref().unwrap_or("Click to use this field name"),
+                                                onclick: {
+                                                    let field_name = field.name.clone();
+                                                    move |_| {
+                                                        new_field.set(field_name.clone());
+                                                    }
+                                                },
+                                                "{field.name}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if *listing_loading.read() {
+                            div { class: "text-[10px] text-gray-500 italic mb-2", "Fetching suggested fields..." }
+                        }
+
                         input {
                             class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm text-white focus:ring-1 focus:ring-primary-500",
                             placeholder: "client_id",

@@ -226,7 +226,7 @@ impl ComposioClient {
         toolkit_slug: &str,
         auth_config_id: &str,
         selected_tools: Option<Vec<String>>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         execution::add_toolkit_to_server(self, toolkit_slug, auth_config_id, selected_tools).await
     }
 

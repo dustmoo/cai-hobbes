@@ -35,6 +35,7 @@ pub enum ChatCommand {
     CancelGeneration,
     CopyToDraft(String),
     TriggerAiAnalysis,
+    SwitchToSettingsTab(crate::settings::SettingsTab, Option<String>),
 }
 
 #[component]
@@ -99,6 +100,9 @@ pub fn ChatInput(
                 }
                 ChatCommand::ToggleSettings => {
                     on_toggle_settings.call(());
+                }
+                ChatCommand::SwitchToSettingsTab(_, _) => {
+                    // Handled globally in main.rs
                 }
                 ChatCommand::ToggleHistory => {
                     on_toggle_sessions.call(());

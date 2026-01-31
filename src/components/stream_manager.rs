@@ -632,6 +632,7 @@ mod tests {
     use super::*;
     use crate::context::permissions::PermissionManager;
     use crate::mcp::manager::McpManager;
+    use crate::secret_manager::SecretManager;
     use crate::settings::Settings;
     use dioxus_signals::Signal;
     use std::path::PathBuf;
@@ -643,8 +644,13 @@ mod tests {
             let settings = use_context_provider(|| Signal::new(Settings::default()));
             let permission_manager =
                 use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+            let secret_manager = use_context_provider(|| Signal::new(SecretManager::new()));
             let mcp_manager = use_context_provider(|| {
-                Signal::new(McpManager::new(PathBuf::new(), permission_manager))
+                Signal::new(McpManager::new(
+                    PathBuf::new(),
+                    permission_manager,
+                    secret_manager,
+                ))
             });
             let continuation_controller =
                 use_context_provider(|| Signal::new(ContinuationController::new()));
@@ -707,8 +713,13 @@ mod tests {
             let settings = use_context_provider(|| Signal::new(Settings::default()));
             let permission_manager =
                 use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+            let secret_manager = use_context_provider(|| Signal::new(SecretManager::new()));
             let mcp_manager = use_context_provider(|| {
-                Signal::new(McpManager::new(PathBuf::new(), permission_manager))
+                Signal::new(McpManager::new(
+                    PathBuf::new(),
+                    permission_manager,
+                    secret_manager,
+                ))
             });
             let continuation_controller =
                 use_context_provider(|| Signal::new(ContinuationController::new()));

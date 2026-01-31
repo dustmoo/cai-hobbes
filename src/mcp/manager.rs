@@ -8,6 +8,9 @@ use dioxus::prelude::Signal;
 use dioxus_signals::{Readable, Writable};
 use rmcp::model::{CallToolRequestParam, CallToolResult, PaginatedRequestParam, Tool};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
+use crate::mcp::tool_selection::{TOOL_SELECTION_THRESHOLD, ToolSelectionRequest, ToolCandidate};
+use crate::components::llm::GeminiConnector;
+use crate::settings::{Settings, SettingsManager};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::sse_client::SseTransportError;
 use serde::{Deserialize, Serialize};
@@ -56,10 +59,11 @@ pub struct McpServerContext {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum ServerStatus {
-    Loaded,    // Green - fully working
-    Error,     // Red - configured but failed to load
-    Disabled,  // Gray - configured but disabled
-    NeedsAuth, // Yellow - server requires OAuth authentication
+    Loaded,        // Green - fully working
+    Error,         // Red - configured but failed to load
+    Disabled,      // Gray - configured but disabled
+    NeedsAuth,     // Yellow - server requires OAuth authentication
+    NotConfigured, // Blue - needs initial setup (e.g., missing API key)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -116,10 +120,16 @@ pub struct McpManager {
     permission_manager: Signal<PermissionManager>,
     /// Cached server statuses for Status panel (ephemeral, invalidated on profile change)
     cached_server_statuses: Arc<Mutex<Option<Vec<McpServerStatus>>>>,
+    /// Shared SecretManager for non-blocking credential access
+    secret_manager: Signal<crate::secret_manager::SecretManager>,
 }
 
 impl McpManager {
-    pub fn new(config_path: PathBuf, permission_manager: Signal<PermissionManager>) -> Self {
+    pub fn new(
+        config_path: PathBuf,
+        permission_manager: Signal<PermissionManager>,
+        secret_manager: Signal<crate::secret_manager::SecretManager>,
+    ) -> Self {
         Self {
             servers: Arc::new(Mutex::new(HashMap::new())),
             failed_servers: Arc::new(Mutex::new(HashMap::new())),
@@ -128,18 +138,68 @@ impl McpManager {
             permission_manager,
             config_path: Some(config_path),
             cached_server_statuses: Arc::new(Mutex::new(None)),
+            secret_manager,
         }
     }
 
     /// Helper: Inject custom credentials from SecretManager (BYOA)
-    fn inject_custom_credentials(client: &ComposioClient) {
-        // Inject Custom Tool Credentials (BYOA)
-        let mut secret_manager = crate::secret_manager::SecretManager::new();
-        secret_manager.load_all_from_keychain();
-        let custom_creds = secret_manager.get_custom_tool_credentials();
+    fn inject_custom_credentials(client: &ComposioClient, secret_manager: &Signal<crate::secret_manager::SecretManager>) {
+        // Inject Custom Tool Credentials (BYOA) - Read from memory cache (INSTANT)
+        // This avoids blocking keychain I/O on the main thread
+        let custom_creds = secret_manager.peek().get_custom_tool_credentials();
+        
         if !custom_creds.is_empty() {
              client.set_custom_creds(custom_creds);
         }
+    }
+
+    /// Helper: Initialize a native Composio client from settings.
+    async fn initialize_native_composio(&self, settings: &Settings) -> Result<ActiveMcpClient, String> {
+        let Some(profile) = settings.get_active_profile() else {
+            return Err("No active Composio profile found".to_string());
+        };
+
+        let Some(api_key) = profile.api_key.clone() else {
+            return Err("No Composio API key configured".to_string());
+        };
+
+        let base_url = profile.base_url.clone()
+            .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
+        let entity_id = profile.entity_id.clone();
+        let user_id = profile.user_id.clone();
+        let force_load_slugs = profile.get_force_load_toolkit_slugs();
+        let profile_id = profile.id.clone();
+
+        let composio_client = Arc::new(ComposioClient::new(
+            api_key, base_url, entity_id, user_id, profile_id,
+        ));
+
+        Self::inject_custom_credentials(&composio_client, &self.secret_manager);
+
+        let description = "Composio Integration Hub - provides access to 100+ external apps (Gmail, GitHub, Slack, etc.) via a Tool Router workflow. Use COMPOSIO_DISCOVER_APPS to search for apps, then COMPOSIO_GET_APP_TOOLS to list that app's tools, then COMPOSIO_EXECUTE_TOOL to run a specific action. Force-loaded toolkits have their tools available directly.".to_string();
+
+        let composio_config = McpServerConfig {
+            name: "composio-native".to_string(),
+            command: None,
+            uri: None,
+            args: None,
+            description,
+            env: HashMap::new(),
+            disabled: false,
+            always_allow: Vec::new(),
+        };
+
+        let discovery_result = composio_client.list_tools_for_session(&force_load_slugs).await
+            .map_err(|e| format!("Failed to list Composio tools: {}", e))?;
+
+        let tools = discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
+
+        Ok(ActiveMcpClient {
+            config: composio_config,
+            service: McpClientType::NativeComposio(composio_client),
+            tools,
+            warning_message: discovery_result.warning,
+        })
     }
 
     /// Initialize unloaded servers from persisted state
@@ -191,110 +251,36 @@ impl McpManager {
         mcp_context_signal: dioxus::prelude::Signal<McpContext>,
         settings: crate::settings::Settings,
     ) {
-        // Check if we have an active profile to initialize
-        let Some(profile) = settings.get_active_profile() else {
-            tracing::warn!("No active Composio profile found during reinitialization");
-            // If no profile is active, we should ensure no composio client is running
-            self.servers.lock().await.remove("composio-native");
-            self.failed_servers.lock().await.remove("composio-native");
-            return;
-        };
-
-        let Some(api_key) = profile.api_key.clone() else {
-            tracing::warn!("Active Composio profile has no API key");
-            self.servers.lock().await.remove("composio-native");
-            return;
-        };
-
-        let base_url = profile
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
-        let entity_id = profile.entity_id.clone();
-        let user_id = profile.user_id.clone();
-        let force_load_slugs = profile.get_force_load_toolkit_slugs();
-        let profile_name = profile.name.clone();
-        let profile_id = profile.id.clone();
-
-        tracing::info!(
-            "Reinitializing Composio client for profile '{}' ({}) with user_id: {:?}",
-            profile_name,
-            profile_id,
-            user_id
-        );
-
-        // Pattern 123: Pass profile_id for Context isolation
-        let composio_client = Arc::new(ComposioClient::new(
-            api_key, base_url, entity_id, user_id, profile_id,
-        ));
-
-        Self::inject_custom_credentials(&composio_client);
-
-        let client_for_tools = composio_client.clone();
-
-        let composio_config = McpServerConfig {
-            name: "composio-native".to_string(),
-            command: None,
-            uri: None,
-            args: None,
-            description: "Composio Integration Hub - provides access to 100+ external apps via a Tool Router workflow.".to_string(),
-            env: HashMap::new(),
-            disabled: false,
-            always_allow: Vec::new(),
-        };
-
-        // NOTE: We do NOT remove the old client yet. We wait until the new one is ready
-        // to perform an ATOMIC SWAP. This prevents the "Flash -> Blank" gap in the UI.
-
-        match client_for_tools
-            .list_tools_for_session(&force_load_slugs)
-            .await
-        {
-            Ok(discovery_result) => {
-                let tools = discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
-                let active_client = ActiveMcpClient {
-                    config: composio_config,
-                    service: McpClientType::NativeComposio(composio_client),
-                    tools,
-                    warning_message: discovery_result.warning,
-                };
-
+        match self.initialize_native_composio(&settings).await {
+            Ok(active_client) => {
                 // ATOMIC SWAP: Replace the old client with the new one cleanly
                 {
                     let mut servers = self.servers.lock().await;
                     servers.insert("composio-native".to_string(), active_client);
-                    // Also clear from failed servers just in case
                     self.failed_servers.lock().await.remove("composio-native");
                 }
 
-                // CRITICAL: Clear any intermediate/poisoned cache before signaling UI (Pattern 150.7)
                 self.invalidate_status_cache_async().await;
-
-                // Update the context signal
                 let new_context = self.get_mcp_context().await;
                 let mut signal = mcp_context_signal;
                 signal.set(new_context);
 
-                tracing::info!(
-                    "Successfully reinitialized Composio client for profile '{}'",
-                    profile_name
-                );
+                tracing::info!("Successfully reinitialized Composio client");
             }
             Err(e) => {
-                let error_msg = format!("Failed to list Composio tools during reinit: {}", e);
-                tracing::error!("{}", error_msg);
-
-                // FAIL SAFETY: If initialization fails, we MUST remove the old client
-                // to avoid leaving the user on the wrong profile (Zombie Profile)
+                let error_msg = format!("Failed to reinitialize Composio: {}", e);
                 {
                     let mut servers = self.servers.lock().await;
                     servers.remove("composio-native");
                 }
 
-                self.failed_servers
-                    .lock()
-                    .await
-                    .insert("composio-native".to_string(), (composio_config, error_msg));
+                if Self::is_needs_setup_error(&error_msg) {
+                    tracing::debug!("Composio needs setup: {}", e);
+                } else {
+                    tracing::error!("{}", error_msg);
+                    // We don't have the config here easily to put in failed_servers, 
+                    // but reinit is usually called after profiles change.
+                }
             }
         }
     }
@@ -307,6 +293,18 @@ impl McpManager {
             || lower_msg.contains("invalid_token")
             || lower_msg.contains("authentication required")
             || lower_msg.contains("not authenticated")
+    }
+
+    /// Check if an error indicates the user needs to complete initial setup
+    /// (e.g., connect their first tool through the marketplace)
+    fn is_needs_setup_error(error_msg: &str) -> bool {
+        let lower_msg = error_msg.to_lowercase();
+        // 405 Method Not Allowed often means no tools/server configured yet
+        lower_msg.contains("405")
+            || lower_msg.contains("method not allowed")
+            || lower_msg.contains("no tools")
+            || lower_msg.contains("empty server")
+            || lower_msg.contains("server not found")
     }
 
     /// Construct a sane PATH for child processes, including common dev directories
@@ -409,99 +407,26 @@ impl McpManager {
         if settings.get_active_profile().is_some() {
             let tx_clone = tx.clone();
             let settings_clone = settings.clone();
-            let failed_servers_clone = self.failed_servers.clone();
-
-            // Create a virtual config for Composio
-            let composio_config = McpServerConfig {
-                name: "composio-native".to_string(),
-                command: None,
-                uri: None,
-                args: None,
-                description: "Composio Integration Hub - provides access to 100+ external apps (Gmail, GitHub, Slack, etc.) via a Tool Router workflow. Use COMPOSIO_DISCOVER_APPS to search for apps, then COMPOSIO_GET_APP_TOOLS to list that app's tools, then COMPOSIO_EXECUTE_TOOL to run a specific action. Force-loaded toolkits have their tools available directly.".to_string(),
-                env: HashMap::new(),
-                disabled: false,
-                always_allow: Vec::new(),
-            };
+            let self_clone = self.clone();
 
             spawn(async move {
                 tracing::info!("Initializing virtual Composio client");
-
-                if let Some(profile) = settings_clone.get_active_profile() {
-                    if let Some(api_key) = &profile.api_key {
-                        let base_url = profile
-                            .base_url
-                            .clone()
-                            .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
-
-                        let entity_id = profile.entity_id.clone();
-                        let user_id = profile.user_id.clone();
-                        // Pattern 123: Pass profile_id for Context isolation
-                        let composio_client = Arc::new(ComposioClient::new(
-                            api_key.clone(),
-                            base_url,
-                            entity_id,
-                            user_id,
-                            profile.id.clone(),
-                        ));
-
-                        McpManager::inject_custom_credentials(&composio_client);
-
-                        let client_for_tools = composio_client.clone();
-
-                        // Tool Router pattern: only load force-loaded toolkit tools + meta-tools
-                        let force_load_slugs = profile.get_force_load_toolkit_slugs();
-
-                        match client_for_tools
-                            .list_tools_for_session(&force_load_slugs)
-                            .await
-                        {
-                            Ok(discovery_result) => {
-                                let tools =
-                                    discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
-                                let active_client = ActiveMcpClient {
-                                    config: composio_config,
-                                    service: McpClientType::NativeComposio(composio_client),
-                                    tools,
-                                    warning_message: discovery_result.warning,
-                                };
-                                if tx_clone.send(active_client).is_err() {
-                                    tracing::error!(
-                                        "Failed to send initialized virtual Composio client"
-                                    );
-                                }
-
-                                if !force_load_slugs.is_empty() {
-                                    tracing::trace!(
-                                        "Force-loaded toolkits for virtual Composio: {:?}",
-                                        force_load_slugs
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                let error_msg = format!("Failed to list Composio tools: {}", e);
-                                tracing::error!("{}", error_msg);
-                                failed_servers_clone.lock().await.insert(
-                                    "composio-native".to_string(),
-                                    (composio_config, error_msg),
-                                );
-                            }
+                match self_clone.initialize_native_composio(&settings_clone).await {
+                    Ok(active_client) => {
+                        if tx_clone.send(active_client).is_err() {
+                            tracing::error!("Failed to send initialized virtual Composio client");
                         }
-                    } else {
-                        let error_msg =
-                            "Composio API key not configured for active profile".to_string();
-                        tracing::error!("{}", error_msg);
-                        failed_servers_clone
-                            .lock()
-                            .await
-                            .insert("composio-native".to_string(), (composio_config, error_msg));
                     }
-                } else {
-                    let error_msg = "No active Composio profile found".to_string();
-                    tracing::error!("{}", error_msg);
-                    failed_servers_clone
-                        .lock()
-                        .await
-                        .insert("composio-native".to_string(), (composio_config, error_msg));
+                    Err(e) => {
+                        let error_msg = format!("Failed to initialize Composio: {}", e);
+                        if McpManager::is_needs_setup_error(&error_msg) {
+                            tracing::debug!("Composio needs initial setup: {}", e);
+                        } else {
+                            tracing::error!("{}", error_msg);
+                            // Failed servers insertion omitted because we don't have config here easily,
+                            // but status builder handles missing native client.
+                        }
+                    }
                 }
             });
         }
@@ -523,6 +448,7 @@ impl McpManager {
             let settings_clone = settings.clone();
             let failed_servers_clone = self.failed_servers.clone();
             let auth_required_servers_clone = self.auth_required_servers.clone();
+            let secret_manager = self.secret_manager; // Capture signal (Copy) for the closure
 
             spawn(async move {
                 let server_name = server_config_clone.name.clone();
@@ -546,7 +472,7 @@ impl McpManager {
                                 profile.id.clone(),
                             ));
 
-                            McpManager::inject_custom_credentials(&composio_client);
+                            McpManager::inject_custom_credentials(&composio_client, &secret_manager);
 
                             let client_for_tools = composio_client.clone();
 
@@ -583,21 +509,21 @@ impl McpManager {
                                 }
                                 Err(e) => {
                                     let error_msg = format!("Failed to list Composio tools: {}", e);
-                                    tracing::error!("{}", error_msg);
-                                    failed_servers_clone
-                                        .lock()
-                                        .await
-                                        .insert(server_name, (server_config_clone, error_msg));
+                                    // Check if this is a "needs setup" error (405, no tools, etc.)
+                                    if McpManager::is_needs_setup_error(&error_msg) {
+                                        tracing::debug!("Composio needs initial setup (connect first tool via Marketplace): {}", e);
+                                    } else {
+                                        tracing::error!("{}", error_msg);
+                                        failed_servers_clone
+                                            .lock()
+                                            .await
+                                            .insert(server_name, (server_config_clone, error_msg));
+                                    }
                                 }
                             }
                         } else {
-                            let error_msg =
-                                "Composio API key not configured for active profile".to_string();
-                            tracing::error!("{}", error_msg);
-                            failed_servers_clone
-                                .lock()
-                                .await
-                                .insert(server_name, (server_config_clone, error_msg));
+                            // API key not configured - skip silently, status builder will show NotConfigured
+                            tracing::debug!("Composio API key not configured for active profile - skipping initialization");
                         }
                     } else {
                         let error_msg = "No active Composio profile found".to_string();
@@ -1041,7 +967,10 @@ impl McpManager {
         let content = serde_json::to_string_pretty(&wrapper)
             .map_err(|e| format!("Failed to serialize MCP servers: {}", e))?;
 
-        fs::write(config_path, content)
+        let path = config_path.clone();
+        tokio::task::spawn_blocking(move || fs::write(path, content))
+            .await
+            .map_err(|e| format!("Save task panicked: {}", e))?
             .map_err(|e| format!("Failed to write to mcp_servers.json: {}", e))
     }
 
@@ -1555,7 +1484,7 @@ impl McpManager {
             if let Some(url) = oauth_url {
                 // Start callback server and open browser
                 let _callback_rx = crate::mcp::oauth_flow::start_callback_server(port);
-                crate::mcp::oauth_flow::open_browser(&url)?;
+                crate::mcp::oauth_flow::open_browser(&url).await?;
 
                 Ok(format!(
                     "OAuth flow started. Callback server on port {}",
@@ -1727,6 +1656,205 @@ impl McpManager {
         } else {
             Err("Composio client not found".to_string())
         }
+    }
+
+    /// Connect a toolkit to the natively managed Composio server.
+    /// Encapsulates the 5-step lifecycle: AuthConfig, Registry (PATCH/Create),
+    /// OAuth, and User Binding.
+    pub async fn connect_toolkit(
+        &self,
+        toolkit_slug: String,
+        auth_scheme: Option<String>,
+        use_managed_auth: bool,
+        mut mcp_context_signal: Signal<McpContext>,
+        mut settings_signal: Signal<Settings>,
+        settings_manager: SettingsManager,
+        mut is_connecting: Signal<bool>,
+        mut connection_status: Signal<String>,
+        mut connection_error: Signal<Option<String>>,
+        mut trigger_search: Signal<i32>,
+        mut connected_slugs: Signal<HashSet<String>>,
+    ) -> Result<(), String> {
+        tracing::info!("Consolidated 5-Point Connection: toolkit_slug={} (auth_scheme: {:?}, managed: {})", 
+            toolkit_slug, auth_scheme, use_managed_auth);
+
+        is_connecting.set(true);
+        connection_status.set("Connecting...".to_string());
+        connection_error.set(None);
+
+        let settings_snapshot = settings_signal.peek().clone();
+        let Some(profile) = settings_snapshot.get_active_profile() else {
+            let err = "No active Composio profile found".to_string();
+            connection_error.set(Some(err.clone()));
+            is_connecting.set(false);
+            return Err(err);
+        };
+
+        let Some(api_key) = &profile.api_key else {
+            let err = "No Composio API key configured".to_string();
+            connection_error.set(Some(err.clone()));
+            is_connecting.set(false);
+            return Err(err);
+        };
+
+        let base_url = profile.base_url.clone()
+            .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
+        let user_id = profile.user_id.clone()
+            .or(profile.entity_id.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let profile_id = profile.id.clone();
+
+        let mut client = ComposioClient::new(
+            api_key.clone(),
+            base_url,
+            profile.entity_id.clone(),
+            Some(user_id.clone()),
+            profile_id.clone(),
+        );
+
+        // Step 1: Create auth config
+        tracing::info!("[Step 1/5] Creating Auth Config...");
+        let auth_config_id = match client.create_auth_config(&toolkit_slug, auth_scheme.as_deref(), use_managed_auth).await {
+            Ok(id) => {
+                tracing::info!("Created auth config '{}' for toolkit '{}'", id, toolkit_slug);
+                id
+            },
+            Err(e) => {
+                let msg = format!("Failed to create auth config: {}", e);
+                tracing::error!("{}", msg);
+                connection_error.set(Some(msg.clone()));
+                is_connecting.set(false);
+                return Err(msg);
+            }
+        };
+
+        // Step 2: Initiate OAuth (Proxy Link) - AUTH FIRST
+        tracing::info!("[Step 2/5] Initiating OAuth...");
+        connection_status.set("Authenticating...".to_string());
+        
+        match client.initiate_connection(&toolkit_slug, &user_id).await {
+            Ok(result_msg) => {
+                 tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
+                 // Wait implied by await
+            },
+            Err(e) => {
+                 let msg = format!("Authentication failed: {}", e);
+                 tracing::error!("{}", msg);
+                 connection_error.set(Some(msg.clone()));
+                 is_connecting.set(false);
+                 return Err(msg);
+            }
+        }
+
+        // Step 3: Add Toolkit to Server (PATCH Registry)
+        tracing::info!("[Step 3/5] Patching MCP Server...");
+        connection_status.set("Configuring Server...".to_string());
+        
+        // We initially pass None for selected_tools to just get the toolkit bound first
+        let patch_result = client.add_toolkit_to_server(&toolkit_slug, &auth_config_id, None).await;
+        
+        match patch_result {
+            Ok(Some(new_server_url)) => {
+                tracing::info!("New MCP server created/updated: {}. Syncing client base URL.", new_server_url);
+                
+                // SYNC FIX: Update client internal URL
+                client.base_url = new_server_url.clone();
+
+                {
+                    let mut s = settings_signal.write();
+                    if let Some(p) = s.composio_profiles.iter_mut().find(|p| p.id == profile_id) {
+                        p.base_url = Some(new_server_url.clone());
+                    }
+                }
+                let updated = settings_signal.peek().clone();
+                let sm = settings_manager.clone();
+                spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || sm.save(&updated)).await;
+                });
+            }
+            Ok(None) => tracing::debug!("Used existing MCP server for toolkit '{}'", toolkit_slug),
+            Err(e) => {
+                let msg = format!("Failed to configure server: {}", e);
+                tracing::error!("{}", msg);
+                connection_error.set(Some(msg.clone()));
+                is_connecting.set(false);
+                return Err(msg);
+            }
+        }
+
+        // Step 4: Smart Selection & Binding
+        tracing::info!("[Step 4/5] optimizing Tool Selection...");
+        connection_status.set("Optimizing Tools...".to_string());
+        
+        let selected_tools: Option<Vec<String>> = match client.get_toolkit_tools_detailed(&toolkit_slug).await {
+            Ok(tools) if tools.len() > TOOL_SELECTION_THRESHOLD => {
+                connection_status.set(format!("Selecting from {} tools...", tools.len()));
+                let candidates: Vec<ToolCandidate> = tools.into_iter()
+                    .map(|(name, desc)| ToolCandidate { name, description: desc })
+                    .collect();
+
+                let request = ToolSelectionRequest::new(toolkit_slug.clone(), None, candidates);
+                let llm_connector = GeminiConnector::new(settings_snapshot.gemini_config.clone());
+
+                match llm_connector.select_tools_for_toolkit(&request).await {
+                    Ok(selection) => Some(selection.selected_tools),
+                    Err(e) => {
+                        tracing::warn!("LLM tool selection failed: {}. Using default.", e);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        
+        // If selected_tools is present, re-patch to apply filter
+        if let Some(tools) = selected_tools.clone() {
+             tracing::info!("Applying smart selection of {} tools", tools.len());
+             if let Err(e) = client.add_toolkit_to_server(&toolkit_slug, &auth_config_id, Some(tools)).await {
+                 tracing::warn!("Failed to apply smart tool selection: {}", e);
+             }
+        }
+
+        // Step 5: Final Reload
+        tracing::info!("[Step 5/5] Finalizing Configuration...");
+        {
+            let mut s = settings_signal.write();
+            if let Some(profile) = s.get_active_profile_mut() {
+                if !profile.toolkit_configs.iter().any(|c| c.slug == toolkit_slug) {
+                    profile.toolkit_configs.push(crate::settings::ComposioToolkitConfig {
+                        slug: toolkit_slug.clone(),
+                        display_name: toolkit_slug.clone(),
+                        tool_count: 0,
+                        force_load: true,
+                    });
+                }
+            }
+            let updated = s.clone();
+            let sm = settings_manager.clone();
+            spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || sm.save(&updated)).await;
+            });
+        }
+
+        // Reload tools
+        let updated_settings = settings_signal.peek().clone();
+        if let Err(e) = self.reload_composio_tools(&updated_settings).await {
+            tracing::warn!("Failed to reload tools: {}", e);
+        }
+
+        // Update Context
+        mcp_context_signal.set(self.get_mcp_context().await);
+        self.invalidate_status_cache();
+        
+        let current_trigger = *trigger_search.peek();
+        trigger_search.set(current_trigger + 1);
+        connected_slugs.write().insert(toolkit_slug.to_lowercase());
+        
+        is_connecting.set(false);
+        connection_status.set("Connected".to_string());
+        tracing::info!("5-Point Connection Flow Complete for '{}'", toolkit_slug);
+        
+        Ok(())
     }
     pub async fn get_client(&self, server_name: &str) -> Result<ActiveMcpClient, String> {
         let servers = self.servers.lock().await; // Lock held only for this lookup
@@ -1930,6 +2058,23 @@ impl McpManager {
                     warning_message: None,
                 });
             }
+            // Not loaded, not failed = API key not configured (NotConfigured state)
+            else {
+                statuses.push(McpServerStatus {
+                    name: native_composio_name.clone(),
+                    display_name: "Composio (Native)".to_string(),
+                    description: "Connect external tools like Gmail, GitHub, Slack".to_string(),
+                    status: ServerStatus::NotConfigured,
+                    error_message: Some("Use the Marketplace to connect your first tool, or add your API key in Settings".to_string()),
+                    tools: 0,
+                    resources: 0,
+                    prompts: 0,
+                    is_loaded: false,
+                    auth_url: None,
+                    uri: None,
+                    warning_message: None,
+                });
+            }
         }
 
         // Cache the result before returning
@@ -2067,11 +2212,16 @@ impl McpManager {
                             Err(e) => {
                                 let error_msg =
                                     format!("Failed to list Composio tools on retry: {}", e);
-                                tracing::error!("{}", error_msg);
-                                failed_servers_clone
-                                    .lock()
-                                    .await
-                                    .insert(server_name, (server_config_clone, error_msg));
+                                // Check if this is a "needs setup" error (405, no tools, etc.)
+                                if McpManager::is_needs_setup_error(&error_msg) {
+                                    tracing::debug!("Composio needs initial setup (connect first tool via Marketplace): {}", e);
+                                } else {
+                                    tracing::error!("{}", error_msg);
+                                    failed_servers_clone
+                                        .lock()
+                                        .await
+                                        .insert(server_name, (server_config_clone, error_msg));
+                                }
                             }
                         }
                     } else {

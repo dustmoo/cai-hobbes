@@ -540,6 +540,7 @@ fn default_thinking_level() -> String {
     "high".to_string()
 }
 
+#[derive(Clone)]
 pub struct SettingsManager {
     settings_path: PathBuf,
 }
@@ -747,6 +748,9 @@ pub struct UiState {
     pub show_profile_selector: bool,
     #[serde(default = "default_true")]
     pub show_attachments_icon: bool,
+    /// Slug of the toolkit currently selected for BYOA credential setup
+    #[serde(default)]
+    pub selected_byoa_slug: Option<String>,
 }
 
 fn default_token_display_mode() -> String {
@@ -768,6 +772,7 @@ impl Default for UiState {
             llm_config_collapsed: false,
             mcp_instructions_collapsed: false,
             composio_toolkit_expanded: false,
+            selected_byoa_slug: None,
             show_session_cost_icon: true,
             token_display_mode: "all".to_string(),
             show_history_icon: true,

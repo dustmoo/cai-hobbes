@@ -48,7 +48,7 @@ impl SecretManager {
                     tracing::debug!("Secret not found: {}", key);
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to load secret '{}': {}", key, e);
+                    tracing::debug!("Failed to load secret '{}': {}", key, e);
                 }
             }
         }
@@ -61,7 +61,7 @@ impl SecretManager {
             }
             Err(keychain_ffi::KeychainError::NotFound) => {}
             Err(e) => {
-                tracing::warn!("Failed to load legacy composio_api_key: {}", e);
+                tracing::debug!("Failed to load legacy composio_api_key: {}", e);
             }
         }
 
@@ -120,6 +120,12 @@ impl SecretManager {
             }
         }
         result
+    }
+
+    /// Check if there are any custom credentials for a specific toolkit slug
+    pub fn has_custom_tool_credentials(&self, slug: &str) -> bool {
+        let prefix = format!("composio_tool_{}__", slug);
+        self.secrets.keys().any(|k| k.starts_with(&prefix))
     }
 
     /// Set a custom tool credential and update the index

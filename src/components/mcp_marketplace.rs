@@ -10,6 +10,7 @@ use dioxus::prelude::*;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use dioxus_free_icons::{icons::fi_icons, Icon};
 
 #[derive(Clone, PartialEq)]
 enum ActiveTab {
@@ -168,6 +169,7 @@ pub fn McpMarketplace() -> Element {
     let mcp_manager = use_context::<Signal<McpManager>>();
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let settings = use_context::<Signal<Settings>>();
+    let settings_manager = use_context::<Signal<SettingsManager>>();
     let filter_verified = use_signal(|| true);
     let filter_deployed = use_signal(|| false);
     let sort_by = use_signal(|| "usage".to_string());
@@ -273,15 +275,13 @@ pub fn McpMarketplace() -> Element {
         move || {
             let mut connected_slugs = connected_slugs;
             // Track settings changes
-            let settings_snapshot = settings.read().clone();
+                // Track settings changes
+                let settings_snapshot = settings.read().clone();
 
-            async move {
-                if settings_snapshot.preferred_mcp_source != McpSource::Composio {
-                    return; // Only fetch for Composio
-                }
-
-                if let Some(profile) = settings_snapshot.get_active_profile() {
-                    if let Some(api_key) = &profile.api_key {
+                async move {
+                    // Check if we have a profile with an API key
+                    if let Some(profile) = settings_snapshot.get_active_profile() {
+                        if let Some(api_key) = &profile.api_key {
                         let base_url = profile
                             .base_url
                             .clone()
@@ -591,10 +591,21 @@ pub fn McpMarketplace() -> Element {
                             }
                         }
                         crate::settings::McpSource::Composio => {
-                            // Composio integration is now handled via SSE in Settings
-                            tracing::warn!("Attempted to add Composio tool via legacy path");
+                            // ------------------------------------------------------------------
+                            // COMPOSIO INSTALLATION PATH
+                            // ------------------------------------------------------------------
+                            // Note: Interactive installation of Composio tools is handled directly
+                            // in `McpServerCard` via `McpManager::connect_toolkit` because it
+                            // requires local UI state signals (spinners, status updates) that
+                            // are not available in this top-level closure.
+                            //
+                            // If this branch is hit, it means we are in a mixed state (e.g. Smithery
+                            // source selected but clicking a Composio tool).
+                            // ------------------------------------------------------------------
+                            
+                            tracing::warn!("Delegating Composio install to McpServerCard logic.");
                             error_msg.set(Some(
-                                "Please manage Composio tools via your Composio Dashboard."
+                                "Please switch to 'Composio' source in settings to install this tool."
                                     .to_string(),
                             ));
                             return;
@@ -1066,6 +1077,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
         ServerStatus::Error => ("bg-red-500", "Error", "bg-red-900/20"),
         ServerStatus::Disabled => ("bg-gray-500", "Disabled", "bg-gray-900/20"),
         ServerStatus::NeedsAuth => ("bg-yellow-500", "Needs Auth", "bg-yellow-900/20"),
+        ServerStatus::NotConfigured => ("bg-blue-500", "Not Configured", "bg-blue-900/20"),
     };
 
     let status_clone = status.clone();
@@ -1510,13 +1522,16 @@ fn McpServerCard(
     let mcp_clone_for_add = mcp.clone();
     let mcp_manager = use_context::<Signal<McpManager>>();
     let settings = use_context::<Signal<Settings>>();
-    let mut mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let settings_manager = use_context::<Signal<SettingsManager>>();
+    let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let mut chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    let secret_manager = use_context::<Signal<crate::secret_manager::SecretManager>>();
 
     // Connection state for Composio Connect button
     let mut is_connecting = use_signal(|| false);
     let mut connection_status: Signal<String> = use_signal(|| "Connect".to_string());
     let mut connection_error: Signal<Option<String>> = use_signal(|| None);
-    let mut connection_task = use_signal(|| Option::<Task>::None);
+    let connection_task = use_signal(|| Option::<Task>::None);
 
 
     // Source-aware install detection:
@@ -1531,10 +1546,11 @@ fn McpServerCard(
             let mcp_manager = mcp_manager;
             let mcp_name = mcp.name.clone();
             let connected = connected_slugs.read().clone();
-            let is_composio = settings.peek().preferred_mcp_source == McpSource::Composio;
+            // Per-tool detection: Composio tools have no command
+            let is_composio_tool = mcp.command.is_empty();
 
             async move {
-                if is_composio {
+                if is_composio_tool {
                     // For Composio: check if toolkit is connected
                     let is_connected = connected.contains(&mcp_name.to_lowercase());
                     tracing::debug!(
@@ -1569,22 +1585,31 @@ fn McpServerCard(
     });
 
     // Source-aware status display
-    let is_composio = settings.read().preferred_mcp_source == McpSource::Composio;
+    let is_composio_tool = mcp.command.is_empty();
     let (status_class, _status_text) = match install_status.read().as_ref() {
         Some((true, false)) => (
             "h-2 w-2 rounded-full bg-green-500",
-            if is_composio { "Connected" } else { "Loaded" },
+            if is_composio_tool { "Connected" } else { "Loaded" },
         ),
         Some((true, true)) => ("h-2 w-2 rounded-full bg-red-500", "Error"),
         _ => (
             "h-2 w-2 rounded-full bg-gray-500",
-            if is_composio {
+            if is_composio_tool {
                 "Not Connected"
             } else {
                 "Not Installed"
             },
         ),
     };
+
+    let byoa_required = is_composio_tool && !mcp.use_managed_auth && mcp.auth_scheme.is_some();
+    let has_custom_creds = if is_composio_tool {
+        let sm = secret_manager.read();
+        sm.has_custom_tool_credentials(&mcp.name)
+    } else {
+        false
+    };
+    let show_setup_credentials = byoa_required && !has_custom_creds;
 
     rsx! {
         div {
@@ -1596,224 +1621,105 @@ fn McpServerCard(
                     span { class: "{status_class}" },
                     h3 { class: "font-bold text-lg", "{mcp.display_name}" }
                 }
-                if let Some((installed, _)) = install_status.read().as_ref() {
+                if *is_connecting.read() {
+                    // Step 4 Priority: Show "Authenticating..." or "Connecting..." even if registry thinks it's installed
+                    button {
+                        class: "px-3 py-1 bg-gray-600 rounded text-sm font-medium cursor-wait flex items-center gap-2",
+                        disabled: true,
+                        span { class: "inline-block animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full" }
+                        "{connection_status.read()}"
+                    }
+                } else if let Some((installed, _)) = install_status.read().as_ref() {
                     if *installed {
                         button {
                             class: "px-3 py-1 bg-gray-600 rounded text-sm font-medium cursor-not-allowed",
                             disabled: true,
-                            if is_composio { "Connected" } else { "Installed" }
+                            if is_composio_tool { "Connected" } else { "Installed" }
                         }
                     } else {
-                        if settings.read().preferred_mcp_source == McpSource::Composio {
-                            // Composio Connect button with loading state
+                        if is_composio_tool {
+                            // Composio Connect or Setup button
                             div {
                                 class: "flex flex-col items-end gap-1",
-                                button {
-                                    class: if *is_connecting.read() {
-                                        "px-3 py-1 bg-gray-600 rounded text-sm font-medium cursor-wait flex items-center gap-2"
-                                    } else {
-                                        "px-3 py-1 bg-primary-600 hover:bg-primary-500 rounded text-sm font-medium transition-colors"
-                                    },
-                                    disabled: *is_connecting.read(),
-                                    onclick: {
-                                        if mcp.name == "news_api" {
-                                            tracing::error!("DEBUG: Rendering Connect button for news_api. Auth: {:?}, Managed: {}", mcp.auth_scheme, mcp.use_managed_auth);
-                                        }
-                                        let toolkit_slug = mcp.name.clone();
-                                        let auth_scheme = mcp.auth_scheme.clone();
-                                        let use_managed_auth = mcp.use_managed_auth;
-                                        // Redundant locals removed
-                                        move |_| {
-                                            let toolkit_slug = toolkit_slug.clone();
-                                            let auth_scheme = auth_scheme.clone();
-                                            // Redundant locals removed
-                                            let mut trigger_search = trigger_search; // mut needed? check below. If mut needed, keep it but no clone. Wait, if outer is not mut, we need let mut = outer. But outer is Signal, internal mutability.
-                                            // The code does trigger_search += 1 or set(). set() is interior mutability.
-                                            // The error says "redundant redefinition of a binding".
-                                            // If I need to mutate the VARIABLE (e.g. reassign it), I need mut.
-                                            // But trigger_search is Signal, we use .write() or .set(). We don't reassign the signal variable itself.
-                                            // Let's remove them all.
-                                            let mut connection_task = connection_task;
-                                            is_connecting.set(true);
-                                            connection_status.set("Connecting...".to_string());
-                                            connection_error.set(None);
+                                if show_setup_credentials {
+                                    button {
+                                        class: "px-3 py-1 bg-amber-600 hover:bg-amber-500 rounded text-sm font-medium transition-colors flex items-center gap-1",
+                                        title: "This tool requires your own API Key/Secret. Click to setup in Settings.",
+                                        onclick: move |_| {
+                                            tracing::info!("Redirecting to BYOA setup for toolkit: {}", mcp.name);
+                                            chat_command.set(Some(crate::components::chat_input::ChatCommand::SwitchToSettingsTab(
+                                                crate::settings::SettingsTab::Credentials,
+                                                Some(mcp.name.clone())
+                                            )));
+                                        },
+                                        Icon { width: 14, height: 14, icon: fi_icons::FiSettings }
+                                        "Setup Credentials"
+                                    }
+                                } else {
+                                    button {
+                                        class: "px-3 py-1 bg-primary-600 hover:bg-primary-500 rounded text-sm font-medium transition-colors",
+                                        onclick: {
+                                            if mcp.name == "news_api" {
+                                                tracing::error!("DEBUG: Rendering Connect button for news_api. Auth: {:?}, Managed: {}", mcp.auth_scheme, mcp.use_managed_auth);
+                                            }
+                                            let toolkit_slug = mcp.name.clone();
+                                            let auth_scheme = mcp.auth_scheme.clone();
+                                            let use_managed_auth = mcp.use_managed_auth;
+                                            move |_| {
+                                                let toolkit_slug = toolkit_slug.clone();
+                                                let auth_scheme = auth_scheme.clone();
+                                                let trigger_search = trigger_search;
+                                                let mut connection_task = connection_task;
+                                                is_connecting.set(true);
+                                                connection_status.set("Connecting...".to_string());
+                                                connection_error.set(None);
 
-                                            let task = spawn(async move {
-                                                tracing::info!("Initiating Composio connection for toolkit: {} (auth_scheme: {:?}, managed: {})",
-                                                    toolkit_slug, auth_scheme, use_managed_auth);
+                                                let task = spawn(async move {
+                                                    tracing::info!("Initiating Composio connection for toolkit: {} (auth_scheme: {:?}, managed: {})", 
+                                                        toolkit_slug, auth_scheme, use_managed_auth);
 
-                                                let settings_snapshot = settings.peek().clone();
-                                                if let Some(profile) = settings_snapshot.get_active_profile() {
-                                                    if let Some(api_key) = &profile.api_key {
-                                                        let base_url = profile.base_url.clone()
-                                                            .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
-                                                        let user_id = profile.user_id.clone()
-                                                            .or(profile.entity_id.clone())
-                                                            .unwrap_or_else(|| "default".to_string());
-
-                                                        let client = ComposioClient::new(
-                                                            api_key.clone(),
-                                                            base_url,
-                                                            profile.entity_id.clone(),
-                                                            profile.user_id.clone(),
-                                                            profile.id.clone(),
-                                                        );
-
-                                                        // Step 1: Create auth config with correct auth scheme
-                                                        let auth_config_id = match client.create_auth_config(
-                                                            &toolkit_slug,
-                                                            auth_scheme.as_deref(),
-                                                            use_managed_auth,
-                                                        ).await {
-                                                            Ok(id) => {
-                                                                tracing::info!("Created auth config '{}' for toolkit '{}'", id, toolkit_slug);
-                                                                id
-                                                            }
-                                                            Err(e) => {
-                                                                connection_error.set(Some(format!("Failed to create auth config: {}", e)));
-                                                                tracing::error!("Failed to create auth config for {}: {}", toolkit_slug, e);
-                                                                is_connecting.set(false);
-                                                                return;
-                                                            }
-                                                        };
-
-                                                        // Step 2: Smart tool selection for large toolkits
-                                                        // Get tool details and use LLM to select if > threshold
-                                                        use crate::mcp::tool_selection::{TOOL_SELECTION_THRESHOLD, ToolSelectionRequest, ToolCandidate};
-
-                                                        let selected_tools: Option<Vec<String>> = match client.get_toolkit_tools_detailed(&toolkit_slug).await {
-                                                            Ok(tools) if tools.len() > TOOL_SELECTION_THRESHOLD => {
-                                                                // Update status with tool count so user understands the wait
-                                                                connection_status.set(format!("Selecting from {} tools...", tools.len()));
-
-                                                                tracing::info!("Toolkit '{}' has {} tools (> {}), using smart selection",
-                                                                    toolkit_slug, tools.len(), TOOL_SELECTION_THRESHOLD);
-
-                                                                // Build tool candidates for LLM
-                                                                let candidates: Vec<ToolCandidate> = tools.into_iter()
-                                                                    .map(|(name, desc)| ToolCandidate { name, description: desc })
-                                                                    .collect();
-
-                                                                let request = ToolSelectionRequest::new(
-                                                                    toolkit_slug.clone(),
-                                                                    None, // No toolkit description available here
-                                                                    candidates,
-                                                                );
-
-                                                                // Call LLM for tool selection
-                                                                let settings_snap = settings.peek().clone();
-                                                                let llm_connector = crate::components::llm::GeminiConnector::new(
-                                                                    settings_snap.gemini_config.clone()
-                                                                );
-
-                                                                match llm_connector.select_tools_for_toolkit(&request).await {
-                                                                    Ok(selection) => {
-                                                                        tracing::info!("Smart selection for '{}': {} tools - {}",
-                                                                            toolkit_slug, selection.selected_tools.len(), selection.reasoning);
-                                                                        Some(selection.selected_tools)
-                                                                    }
-                                                                    Err(e) => {
-                                                                        tracing::warn!("LLM tool selection failed for '{}': {}. Falling back to first {} tools.",
-                                                                            toolkit_slug, e, TOOL_SELECTION_THRESHOLD);
-                                                                        // Fallback: use first N tools alphabetically
-                                                                        None
-                                                                    }
+                                                    let settings_snapshot = settings.peek().clone();
+                                                    if let Some(profile) = settings_snapshot.get_active_profile() {
+                                                        if let Some(_api_key) = &profile.api_key {
+                                                            let mcp_manager_val = mcp_manager.read().clone();
+                                                            let settings_manager_val = settings_manager.peek().clone();
+                                                            
+                                                            spawn(async move {
+                                                                if let Err(e) = mcp_manager_val.connect_toolkit(
+                                                                    toolkit_slug,
+                                                                    auth_scheme,
+                                                                    use_managed_auth,
+                                                                    mcp_context,
+                                                                    settings,
+                                                                    settings_manager_val,
+                                                                    is_connecting,
+                                                                    connection_status,
+                                                                    connection_error,
+                                                                    trigger_search,
+                                                                    connected_slugs,
+                                                                ).await {
+                                                                    tracing::error!("Consolidated connection failed: {}", e);
                                                                 }
-                                                            }
-                                                            Ok(_) => {
-                                                                // Small toolkit - enable all tools
-                                                                tracing::debug!("Toolkit '{}' has <= {} tools, enabling all", toolkit_slug, TOOL_SELECTION_THRESHOLD);
-                                                                None
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!("Failed to get toolkit tools for '{}': {}. Will use default behavior.", toolkit_slug, e);
-                                                                None
-                                                            }
-                                                        };
-
-                                                        // Step 3: Add toolkit to MCP server with optional pre-selected tools
-                                                        if let Err(e) = client.add_toolkit_to_server(&toolkit_slug, &auth_config_id, selected_tools).await {
-                                                            tracing::error!("Failed to add toolkit to MCP server: {}", e);
-                                                            // Continue anyway - OAuth might still work if server already has it
-                                                        }
-
-                                                        // Step 4: Initiate OAuth/connection flow
-                                                        connection_status.set("Authenticating...".to_string());
-                                                        match client.initiate_connection(&toolkit_slug, &user_id).await {
-                                                            Ok(result_msg) => {
-                                                                tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
-
-                                                                // Reload Composio tools to pick up newly enabled tools
-                                                                let updated_settings = settings.peek().clone();
-                                                                if let Err(e) = mcp_manager.read().reload_composio_tools(&updated_settings).await {
-                                                                    tracing::warn!("Failed to reload Composio tools after connection: {}", e);
-                                                                }
-
-                                                                // Update mcp_context with new tools (Pattern 150: MCP-First Status Mandate)
-                                                                let new_context = mcp_manager.read().get_mcp_context().await;
-                                                                mcp_context.set(new_context);
-                                                                // Invalidate cache for status display
-                                                                mcp_manager.read().invalidate_status_cache();
-
-                                                                // Trigger UI refresh
-                                                                let current = *trigger_search.peek();
-                                                                trigger_search.set(current + 1);
-
-
-                                                                // Update connected_slugs immediately so button shows "Connected"
-                                                                {
-                                                                    let mut slugs = connected_slugs.write();
-                                                                    slugs.insert(toolkit_slug.to_lowercase());
-                                                                }
-
-                                                                is_connecting.set(false);
-                                                            }
-                                                            Err(e) => {
-                                                                connection_error.set(Some(e.clone()));
-                                                                tracing::error!("Failed to initiate connection for {}: {}", toolkit_slug, e);
-                                                                is_connecting.set(false);
-                                                            }
+                                                            });
+                                                        } else {
+                                                            connection_error.set(Some("No Composio API key configured".to_string()));
+                                                            tracing::warn!("No Composio API key configured");
+                                                            is_connecting.set(false);
                                                         }
                                                     } else {
-                                                        connection_error.set(Some("No Composio API key configured".to_string()));
-                                                        tracing::warn!("No Composio API key configured");
+                                                        connection_error.set(Some("No Composio profile configured".to_string()));
+                                                        tracing::warn!("No Composio profile configured");
                                                         is_connecting.set(false);
                                                     }
-                                                } else {
-                                                    connection_error.set(Some("No Composio profile configured".to_string()));
-                                                    tracing::warn!("No Composio profile configured");
-                                                    is_connecting.set(false);
-                                                }
-                                                // Clear task on completion
-                                                connection_task.set(None);
-                                            });
-                                            connection_task.set(Some(task));
-                                        }
-                                    },
-
-                                    if *is_connecting.read() {
-                                        // Spinner icon (CSS animation)
-                                        span {
-                                            class: "inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"
-                                        }
-                                        "{connection_status}"
-                                    } else {
-                                        "Connect"
-                                    }
-                                }
-                                if *is_connecting.read() {
-                                    button {
-                                        class: "ml-2 text-xs text-red-400 hover:text-red-300 underline",
-                                        onclick: move |_| {
-                                            if let Some(task) = connection_task.write().take() {
-                                                task.cancel();
+                                                    connection_task.set(None);
+                                                });
+                                                connection_task.set(Some(task));
                                             }
-                                            is_connecting.set(false);
-                                            connection_status.set("Cancelled".to_string());
                                         },
-                                        "Cancel"
+                                        if is_connecting() { "{connection_status}" } else { "Connect" }
                                     }
-                                }
+                                } // end if/else show_setup_credentials
+
                                 // Show error message if present
                                 if let Some(error) = connection_error.read().as_ref() {
                                     span {
@@ -1821,7 +1727,7 @@ fn McpServerCard(
                                         "{error}"
                                     }
                                 }
-                            }
+                            } // end div
                         } else {
                             button {
                                 class: "px-3 py-1 bg-primary-600 hover:bg-primary-500 rounded text-sm font-medium transition-colors",
@@ -1829,7 +1735,7 @@ fn McpServerCard(
                                 "Add"
                             }
                         }
-                    }
+                    } // end if *installed else
                 } else {
                     button {
                         class: "px-3 py-1 bg-gray-600 rounded text-sm font-medium cursor-not-allowed",
@@ -1849,7 +1755,7 @@ fn McpServerCard(
                         class: "text-sm text-primary-400 hover:text-primary-300",
                         href: "{mcp.homepage}",
                         target: "_blank",
-                        title: if is_composio { "View on Composio" } else { "View on Smithery" },
+                        title: if is_composio_tool { "View on Composio" } else { "View on Smithery" },
                         dioxus_free_icons::Icon {
                             icon: dioxus_free_icons::icons::fi_icons::FiExternalLink
                         }

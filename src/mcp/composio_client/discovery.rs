@@ -65,6 +65,22 @@ pub async fn list_tools(client: &ComposioClient) -> Result<DiscoveryResult, Stri
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
+
+            // RELAXED ERROR HANDLING:
+            // 405 Method Not Allowed / 404 Not Found often means the server is created but has no tools configured yet.
+            // In this case, we should treat it as a valid "empty" state so the client can initialize
+            // and expose the meta-tools (like COMPOSIO_DISCOVER_APPS) to allow the user to continue setup.
+            let status_code = status.as_u16();
+            if status_code == 405 || status_code == 404 || status_code == 204 {
+                tracing::debug!(
+                    "MCP Protocol returned {} (Body: {}). Treating as empty tool set.",
+                    status,
+                    text
+                );
+                warning_message = Some("Server initialized but has no tools configured. Use /discover to add tools.".to_string());
+                break; // Exit loop, returning whatever we have (likely empty) + warning
+            }
+
             tracing::error!(
                 "Failed to fetch tools via MCP Protocol. Status: {}, Body: {}",
                 status,
@@ -356,36 +372,50 @@ pub async fn list_toolkit_categories(
 pub async fn get_connected_toolkit_slugs(
     client: &ComposioClient,
 ) -> Result<std::collections::HashSet<String>, String> {
-    // MCP-First: Get tools from MCP endpoint (profile-scoped)
+    // Step 1: Get tools from MCP endpoint (profile-scoped)
     let tools = list_tools(client).await?.tools;
+
+    // Step 2: Ensure we have the latest account status from REST API
+    // This populates/refreshes the client.toolkit_account_map (Pattern 122)
+    let _ = super::auth::list_connected_accounts(client).await;
+    let account_map_lock = client.toolkit_account_map.read();
 
     let slugs: std::collections::HashSet<String> = tools
         .iter()
         .filter_map(|tool| {
-            tool.toolkit
+            let slug = tool
+                .toolkit
                 .as_ref()
                 .map(|t| t.slug.to_lowercase())
                 .or_else(|| tool.app.as_ref().map(|a| a.slug.to_lowercase()))
                 .or_else(|| {
                     // Infer from tool name: TOOLKIT_ACTION -> toolkit
                     tool.name.split('_').next().map(|s| s.to_lowercase())
-                })
+                })?;
+
+            // Only include if there is an ACTIVE account mapping for this toolkit
+            // This prevents toolkits from showing as "Connected" during the OAuth flow (Step 4)
+            let is_active = account_map_lock
+                .as_ref()
+                .map(|m| m.contains_key(&slug))
+                .unwrap_or(false);
+
+            if is_active {
+                Some(slug)
+            } else {
+                tracing::trace!("[AUTH] Tool '{}' found in registry but no active connection mapping yet. Filtering from connected slugs.", slug);
+                None
+            }
         })
         .collect();
     Ok(slugs)
 }
 
-/// Fetch all tool slugs for a specific toolkit from Composio API.
-pub async fn get_toolkit_tools(
-    client: &ComposioClient,
-    toolkit_slug: &str,
-) -> Result<Vec<String>, String> {
+/// Helper to fetch the raw tools enum from the API
+async fn fetch_tool_enum(client: &ComposioClient) -> Result<Vec<String>, String> {
     let url = format!("{}/tools/enum", client.get_api_base_url());
 
-    tracing::debug!(
-        "Fetching tools enum to filter for toolkit '{}'",
-        toolkit_slug
-    );
+    tracing::debug!("Fetching tools enum from {}", url);
 
     let response = client
         .client
@@ -402,10 +432,18 @@ pub async fn get_toolkit_tools(
         return Err(format!("Failed to fetch tools enum ({}): {}", status, body));
     }
 
-    let all_tools: Vec<String> = response
+    response
         .json()
         .await
-        .map_err(|e| format!("Failed to parse tools enum response: {}", e))?;
+        .map_err(|e| format!("Failed to parse tools enum response: {}", e))
+}
+
+/// Fetch all tool slugs for a specific toolkit from Composio API.
+pub async fn get_toolkit_tools(
+    client: &ComposioClient,
+    toolkit_slug: &str,
+) -> Result<Vec<String>, String> {
+    let all_tools = fetch_tool_enum(client).await?;
 
     // Filter tools by toolkit prefix convention: TOOLKIT_SLUG_UPPERCASE_*
     let prefix = format!("{}_", toolkit_slug.to_uppercase());
@@ -429,34 +467,7 @@ pub async fn get_toolkit_tools_detailed(
     client: &ComposioClient,
     toolkit_slug: &str,
 ) -> Result<Vec<(String, Option<String>)>, String> {
-    // NOTE: The /tools?appNames= endpoint has issues returning wrong toolkit's tools.
-    // Instead, use /tools/enum which correctly returns all tool slugs, then filter by prefix.
-    let url = format!("{}/tools/enum", client.get_api_base_url());
-
-    tracing::debug!(
-        "Fetching tools enum for detailed list, filtering for toolkit '{}'",
-        toolkit_slug
-    );
-
-    let response = client
-        .client
-        .get(&url)
-        .header("x-api-key", &client.api_key)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch tools enum: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch tools enum ({}): {}", status, body));
-    }
-
-    let all_tools: Vec<String> = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse tools enum response: {}", e))?;
+    let all_tools = fetch_tool_enum(client).await?;
 
     // Filter tools by toolkit prefix convention: TOOLKIT_SLUG_UPPERCASE_*
     let prefix = format!("{}_", toolkit_slug.to_uppercase());
@@ -780,6 +791,37 @@ fn parse_tools_response(
         }
         Err("Failed to parse Composio response into a usable format".to_string())
     }
+}
+
+/// Get detailed metadata for a specific toolkit, including auth schemes and descriptions.
+pub async fn get_toolkit_metadata(
+    client: &ComposioClient,
+    slug: &str,
+) -> Result<ComposioToolkitListing, String> {
+    let url = format!("{}/toolkits/{}", client.get_api_base_url(), slug);
+
+    let response = client
+        .client
+        .get(&url)
+        .header("x-api-key", &client.api_key)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch toolkit metadata: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Composio API error ({}): {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
+    }
+
+    let toolkit: ComposioToolkitListing = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse toolkit metadata: {}", e))?;
+
+    Ok(toolkit)
 }
 
 fn parse_pagination_cursor(

@@ -1,0 +1,28 @@
+{
+  "data": {
+    "googledocs": {
+      "52c1811e-d36b-482a-80c2-559f9a1c0e72": {
+        "connectedAccountId": "ca_-LqVcPlW3dmv",
+        "connected_account_id": "ca_-LqVcPlW3dmv"
+      }
+    },
+    "gmail": {
+      "52c1811e-d36b-482a-80c2-559f9a1c0e72": {
+        "connected_account_id": "ca_YP-Hj8FEaOls",
+        "connectedAccountId": "ca_YP-Hj8FEaOls"
+      }
+    },
+    "googlecalendar": {
+      "52c1811e-d36b-482a-80c2-559f9a1c0e72": {
+        "connected_account_id": "ca_saYt0DkBgYCw",
+        "connectedAccountId": "ca_saYt0DkBgYCw"
+      }
+    },
+    "googleslides": {
+      "52c1811e-d36b-482a-80c2-559f9a1c0e72": {
+        "connectedAccountId": "ca_XOv3vM1JYKSP",
+        "connected_account_id": "ca_XOv3vM1JYKSP"
+      }
+    }
+  }
+}

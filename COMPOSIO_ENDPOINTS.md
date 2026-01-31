@@ -74,6 +74,8 @@ These calls use the `x-api-key` header for authentication and are used for admin
 | `list_toolkit_categories()` | GET | `/api/v3/toolkits/categories` | Fetch category list for marketplace filtering |
 | `get_toolkit_tools()` | GET | `/api/v3/tools/enum` | Get tool names for a specific toolkit |
 | `get_toolkit_tools_detailed()` | GET | `/api/v3/tools/enum` | Get tool names + descriptions for smart selection |
+| `create_mcp_server()` | POST | `/api/v3/mcp/servers/custom` | Create new MCP server. **Payload**: `toolkits` (string[]), `auth_config_ids` (string[]) |
+| `create_mcp_instance()` | POST | `/api/v3/mcp/servers/{id}/instances` | Bind user to server (required for tools visibility) |
 | `add_toolkit_to_server()` | PATCH | `/api/v3/mcp/{server_id}` | Add toolkit + auth_config binding to MCP server |
 | `list_mcp_servers()` | GET | `/api/v3/mcp/servers` | List available servers (Dynamic Lookup) |
 | `generate_mcp_user()` | POST | `/api/v3/mcp/servers/generate` | Bind user_id to server (Mandatory User Generation) |
@@ -125,9 +127,9 @@ Output: https://backend.composio.dev/v3/mcp/0a4474b3-d8e6-4417-a848-0d0c867b20f4
 
 4. **Accept Header**: MCP Proxy calls MUST include `Accept: application/json, text/event-stream` header for SSE responses.
 
-5. **PATCH Payload Format** (Jan 2026): When adding toolkits via `PATCH /api/v3/mcp/{server_id}`, the payload MUST include:
-   - `toolkits`: Array of **strings** (e.g., `["gmail", "slack"]`) - NOT objects
-   - `auth_config_ids`: Array of auth config IDs to bind (e.g., `["ac_abc123"]`)
-   - `allowed_tools`: Array of tool names to enable (accumulate, don't replace)
+5. **Payload Format Mandate** (Unified Jan 2026): Both `PATCH /api/v3/mcp/{server_id}` and `POST /api/v3/mcp/servers/custom` MUST use **String Arrays**:
+   - `toolkits`: Array of Strings (slags) e.g., `["gmail", "slack"]`
+   - `auth_config_ids`: Array of Strings (IDs) e.g., `["ac_123", "ac_456"]`
+   - **FORBIDDEN**: Do NOT use Object-based binding (`[{ "toolkit": "slug", "auth_config": "id" }]`). This fails validation.
 
 6. **Mandatory User Generation** (Pattern 110): After patching a server, you MUST call `POST /api/v3/mcp/servers/generate` to bind the `user_id` to that server instance. Without this, tools will not be visible to the LLM.

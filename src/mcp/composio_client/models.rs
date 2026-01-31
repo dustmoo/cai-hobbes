@@ -55,6 +55,25 @@ pub struct ConnectedAccountsResponse {
     pub items: Vec<ConnectedAccount>,
 }
 
+/// Expected input field for authentication schema
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedInputField {
+    /// Field name (e.g., "api_key", "client_id")
+    pub name: String,
+    /// Human-readable description
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Whether the field is mandatory
+    #[serde(default)]
+    pub required: bool,
+    /// Field type (e.g., "string", "password")
+    #[serde(rename = "type", default)]
+    pub field_type: Option<String>,
+    /// Default value if any
+    #[serde(default)]
+    pub default: Option<Value>,
+}
+
 /// Auth config information from GET /api/v3/auth_configs
 /// Represents an authentication blueprint for a toolkit
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +95,9 @@ pub struct AuthConfigInfo {
     /// Number of active connections using this config
     #[serde(default)]
     pub no_of_connections: Option<i32>,
+    /// Expected input fields for this auth config (BYOA schema)
+    #[serde(default)]
+    pub expected_input_fields: Option<Vec<ExpectedInputField>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +170,9 @@ pub struct ComposioToolkitListing {
     /// True if toolkit requires no authentication
     #[serde(default)]
     pub no_auth: Option<bool>,
+    /// Authentication configuration (schema/inputs)
+    #[serde(default)]
+    pub auth_config: Option<AuthConfigInfo>,
 }
 
 impl ComposioToolkitListing {

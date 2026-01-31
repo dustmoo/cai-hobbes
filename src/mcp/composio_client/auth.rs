@@ -30,6 +30,7 @@ pub async fn list_connected_accounts(
 
         let mut params: HashMap<&str, String> = HashMap::new();
         if let Some(ref uid) = user_uuid {
+            params.insert("user_id", uid.clone());
             params.insert("user_uuid", uid.clone());
         }
         if let Some(ref c) = cursor {
@@ -466,12 +467,34 @@ pub(crate) async fn create_auth_config(
     Ok(auth_config_id.to_string())
 }
 
-/// Fetch the auth config ID for a given toolkit from Composio API.
+/// Fetch the auth_config_id for a given toolkit, prioritizing local custom credentials.
 pub(crate) async fn get_auth_config_id(
     client: &ComposioClient,
     toolkit_slug: &str,
 ) -> Result<String, String> {
-    // Check cache first
+    // Check for custom credentials first (BYOA - Local Primacy)
+    // If local keys exist, we MUST ensure they are used by calling create_auth_config.
+    let has_custom_creds = {
+        let lock = match client.custom_auth_creds.read() {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("Failed to acquire read lock on custom_auth_creds: {}", e);
+                e.into_inner()
+            }
+        };
+        lock.contains_key(toolkit_slug)
+    };
+
+    if has_custom_creds {
+        tracing::info!(
+            "Custom credentials detected locally for toolkit '{}'. bypassing lookup to ensure BYOA primacy.",
+            toolkit_slug
+        );
+        // create_auth_config will detect the custom credentials and use them.
+        return create_auth_config(client, toolkit_slug, None, false).await;
+    }
+
+    // fallback to existing cache/API lookup for managed or existing configs
     {
         match client.auth_config_cache.read() {
             Ok(cache) => {
@@ -558,6 +581,11 @@ pub(crate) async fn get_auth_config_id(
                     });
 
                 if let Some(slug) = item_slug {
+                    tracing::trace!(
+                        "[AUTH CONFIG] Comparing API slug '{}' with requested '{}'",
+                        slug,
+                        toolkit_slug
+                    );
                     if slug.eq_ignore_ascii_case(toolkit_slug) {
                         if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
                             tracing::info!(
@@ -857,7 +885,7 @@ pub async fn initiate_connection(
         let mut rx = start_callback_server(port);
 
         // Open the browser for user to authenticate
-        if let Err(e) = open_browser(&auth_url) {
+        if let Err(e) = open_browser(&auth_url).await {
             tracing::error!("Failed to open browser: {}", e);
             return Ok(format!(
                 "Please visit this URL to authenticate: {}",
