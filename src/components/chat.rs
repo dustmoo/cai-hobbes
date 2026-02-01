@@ -340,7 +340,6 @@ pub fn ChatWindow(
         spawn(async move {
             let mut session_state = session_state;
             let settings = settings.read().clone();
-            let mcp_manager = mcp_manager;
             let send_prompt_to_llm = send_prompt_to_llm;
             let mut permission_manager = permission_manager;
             let mut has_new_comments = has_new_comments;
@@ -489,7 +488,6 @@ pub fn ChatWindow(
             }
 
             let prompt_data = {
-                let mcp_context = mcp_manager.read().get_mcp_context().await;
                 let user_prompt = user_message.clone();
 
                 // Safely get conversation summary
@@ -503,9 +501,6 @@ pub fn ChatWindow(
                     let mut state = session_state.write();
                     if let Some(session) = state.get_active_session_mut() {
                         session.active_context.conversation_summary = conversation_summary;
-                        if !mcp_context.servers.is_empty() {
-                            session.active_context.mcp_tools = Some(mcp_context);
-                        }
                     }
                 }
 
