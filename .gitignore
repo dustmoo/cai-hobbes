@@ -53,3 +53,9 @@ docs/
 *.certSigningRequest
 *.pem
 *.provisionprofile
+
+# Clippy and debug artifacts
+clippy_messages.json
+clippy_output.json
+clippy_report.json
+context_store.json
