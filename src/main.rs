@@ -480,10 +480,22 @@ fn app() -> Element {
 
     let needs_onboarding = use_memo(move || {
         let settings = settings.read();
+        
+        // Check TOS acceptance (compare against current version)
+        let tos_accepted = settings
+            .tos_accepted_version
+            .as_ref()
+            .map(|v| v == crate::settings::CURRENT_TOS_VERSION)
+            .unwrap_or(false);
+        
+        // Check API key presence
         let key_present =
             settings.gemini_config.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok();
-        !key_present
+        
+        // Need onboarding if either TOS not accepted or API key missing
+        !tos_accepted || !key_present
     });
+
     let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
     let mcp_manager = use_context_provider(|| {
         Signal::new(McpManager::new(
