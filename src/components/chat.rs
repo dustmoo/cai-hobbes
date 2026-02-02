@@ -35,6 +35,8 @@ use uuid::Uuid;
 struct SelectionData {
     text: String,
     #[serde(default)]
+    markdown: String,
+    #[serde(default)]
     top: f64,
     #[serde(default)]
     left: f64,
@@ -875,6 +877,14 @@ enum SelectionMode {
     CommentEdit,
 }
 
+#[derive(Clone, Default)]
+struct SelectionState {
+    text: String,
+    markdown: String,
+    top: f64,
+    left: f64,
+}
+
 #[component]
 pub fn MessageBubble(
     message: Message,
@@ -929,7 +939,7 @@ pub fn MessageBubble(
 
             // Inline comment state
             let mut selection_mode = use_signal(|| SelectionMode::None);
-            let mut selection_data = use_signal(|| (String::new(), 0.0, 0.0)); // text, top, left
+            let mut selection_data = use_signal(SelectionState::default);
             let mut editing_comment_id = use_signal(|| None::<String>);
             let mut is_mouse_over_toolbar = use_signal(|| false);
 
@@ -946,6 +956,47 @@ pub fn MessageBubble(
                 spawn(async move {
                     let mut eval = document::eval(&format!(
                         r#"
+                        // Markdown reconstruction: walk DOM nodes and rebuild markdown from HTML tags
+                        function reconstructMarkdown(range) {{
+                            const fragment = range.cloneContents();
+                            return walkNode(fragment);
+                        }}
+                        
+                        function walkNode(node) {{
+                            // Text nodes: return content directly
+                            if (node.nodeType === Node.TEXT_NODE) {{
+                                return node.textContent || '';
+                            }}
+                            
+                            // Element nodes: wrap children based on tag
+                            const tag = node.tagName?.toLowerCase();
+                            const children = Array.from(node.childNodes).map(walkNode).join('');
+                            
+                            switch (tag) {{
+                                case 'strong':
+                                case 'b':
+                                    return `**${{children}}**`;
+                                case 'em':
+                                case 'i':
+                                    return `*${{children}}*`;
+                                case 'code':
+                                    return `\`${{children}}\``;
+                                case 'a':
+                                    return `[${{children}}](${{node.href || ''}})`;
+                                case 'h1': return `# ${{children}}\n`;
+                                case 'h2': return `## ${{children}}\n`;
+                                case 'h3': return `### ${{children}}\n`;
+                                case 'h4': return `#### ${{children}}\n`;
+                                case 'h5': return `##### ${{children}}\n`;
+                                case 'h6': return `###### ${{children}}\n`;
+                                case 'li': return `- ${{children}}\n`;
+                                case 'p': return `${{children}}\n\n`;
+                                case 'br': return '\n';
+                                default:
+                                    return children;
+                            }}
+                        }}
+                        
                         const bubble = document.getElementById('message-bubble-{}');
                         if (bubble) {{
                             bubble.addEventListener('mouseup', (e) => {{
@@ -954,6 +1005,7 @@ pub fn MessageBubble(
                                     const range = selection.getRangeAt(0);
                                     const rect = range.getBoundingClientRect();
                                     const text = selection.toString();
+                                    const markdown = reconstructMarkdown(range);
                                     
                                     // Smart positioning: PREFER BELOW, then above
                                     const popoverHeight = 160; // Approx height including padding
@@ -971,7 +1023,8 @@ pub fn MessageBubble(
                                     }}
 
                                     dioxus.send({{ 
-                                        text: text, 
+                                        text: text,
+                                        markdown: markdown,
                                         top: top, 
                                         left: rect.left + window.scrollX, 
                                         hide: false 
@@ -984,7 +1037,7 @@ pub fn MessageBubble(
                         document.addEventListener('selectionchange', () => {{
                             const selection = window.getSelection();
                             if (selection.isCollapsed) {{
-                                dioxus.send({{ text: "", top: 0, left: 0, hide: true }});
+                                dioxus.send({{ text: "", markdown: "", top: 0, left: 0, hide: true }});
                             }}
                         }});
 
@@ -992,7 +1045,7 @@ pub fn MessageBubble(
                             const selection = window.getSelection();
                             const toolbar = document.getElementById('selection-toolbar');
                             if (bubble && !bubble.contains(e.target) && (!toolbar || !toolbar.contains(e.target))) {{
-                                dioxus.send({{ text: "", top: 0, left: 0, hide: true }});
+                                dioxus.send({{ text: "", markdown: "", top: 0, left: 0, hide: true }});
                             }}
                         }});
                     "#,
@@ -1006,7 +1059,7 @@ pub fn MessageBubble(
                                     selection_mode.set(SelectionMode::None);
                                 }
                             } else if !data.text.trim().is_empty() {
-                                selection_data.set((data.text.clone(), data.top, data.left));
+                                selection_data.set(SelectionState { text: data.text.clone(), markdown: data.markdown.clone(), top: data.top, left: data.left });
                                 selection_mode.set(SelectionMode::Toolbar);
                             }
                         }
@@ -1121,7 +1174,7 @@ pub fn MessageBubble(
                                     content: content(),
                                     comments: message.comments.clone(),
                                     pending_highlight: if *selection_mode.read() != SelectionMode::None && *selection_mode.read() != SelectionMode::CommentEdit {
-                                        Some(selection_data.read().0.clone())
+                                        Some(selection_data.read().text.clone())
                                     } else {
                                         None
                                     },
@@ -1131,7 +1184,7 @@ pub fn MessageBubble(
                                             // Find the comment to get its current text
                                             if let Some(comment) = message_comments.iter().find(|c| c.id == comment_id) {
                                                 editing_comment_id.set(Some(comment_id));
-                                                selection_data.set((comment.text_selection.clone(), 100.0, 100.0));
+                                                selection_data.set(SelectionState { text: comment.text_selection.clone(), markdown: comment.text_selection.clone(), top: 100.0, left: 100.0 });
                                                 selection_mode.set(SelectionMode::CommentEdit);
                                             }
                                         }
@@ -1204,15 +1257,16 @@ pub fn MessageBubble(
 
                         if *selection_mode.read() == SelectionMode::Toolbar {
                             SelectionToolbar {
-                                position_top: selection_data.read().1,
-                                position_left: selection_data.read().2,
+                                position_top: selection_data.read().top,
+                                position_left: selection_data.read().left,
                                 on_mouseenter: move |_| is_mouse_over_toolbar.set(true),
                                 on_mouseleave: move |_| is_mouse_over_toolbar.set(false),
                                 on_copy: move |_| {
-                                    let text = selection_data.read().0.clone();
+                                    // Use reconstructed markdown for copy to preserve formatting
+                                    let markdown = selection_data.read().markdown.clone();
                                     spawn(async move {
                                         // Security: Use serde_json::to_string to safely escape the string for JS
-                                        let json_text = serde_json::to_string(&text).unwrap_or_else(|_| "null".to_string());
+                                        let json_text = serde_json::to_string(&markdown).unwrap_or_else(|_| "null".to_string());
                                         let mut eval = document::eval(&format!("navigator.clipboard.writeText({});", json_text));
                                         let _: Result<serde_json::Value, _> = eval.recv().await;
                                     });
@@ -1220,17 +1274,17 @@ pub fn MessageBubble(
                                 },
                                 on_comment: move |_| {
                                     selection_mode.set(SelectionMode::CommentInput);
-                                    on_selection.call((selection_data.read().0.clone(), selection_data.read().1, selection_data.read().2));
+                                    on_selection.call((selection_data.read().text.clone(), selection_data.read().top, selection_data.read().left));
                                 }
                             }
                         }
 
                         if *selection_mode.read() == SelectionMode::CommentInput {
                             crate::components::inline_comment_popover::InlineCommentPopover {
-                                position_top: selection_data.read().1,
-                                position_left: selection_data.read().2,
+                                position_top: selection_data.read().top,
+                                position_left: selection_data.read().left,
                                 on_save: move |comment_text: String| {
-                                    let text = selection_data.read().0.clone();
+                                    let text = selection_data.read().text.clone();
                                     let new_comment = Comment {
                                         id: Uuid::new_v4().to_string(),
                                         text_selection: text,
