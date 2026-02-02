@@ -6,6 +6,7 @@ use crate::mcp::composio_client::validate_composio_api_key;
 use crate::settings::{is_sandboxed, HotkeySettings, Settings, SettingsManager};
 use crate::{context::permissions::ToolCategory, session::SessionState};
 use dioxus::prelude::*;
+use crate::SecretManagerTrait;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use rfd;
 use std::io::Write;
@@ -127,7 +128,7 @@ pub fn SettingsPanel() -> Element {
 
     rsx! {
         div {
-            class: "flex h-full bg-dark-bg text-white",
+            class: "flex h-full bg-app text-fg",
             if show_conflict_modal() {
                 if let Some((id, _)) = conflicting_sessions.read().first() {
                     ConflictModal {
@@ -177,15 +178,15 @@ pub fn SettingsPanel() -> Element {
                         }
                     },
                     div {
-                        class: "bg-dark-section border border-primary-700 rounded-lg p-6 max-w-md mx-4",
+                        class: "bg-section border border-subtle rounded-lg p-6 max-w-md mx-4",
                         onclick: move |e| e.stop_propagation(),
-                        h3 { class: "text-lg font-bold text-white mb-3", "⚠️ Change API Key Storage?" }
-                        p { class: "text-gray-300 mb-4",
+                        h3 { class: "text-lg font-bold text-fg mb-3", "⚠️ Change API Key Storage?" }
+                        p { class: "text-fg-muted mb-4",
                             "Switching storage modes will "
                             strong { class: "text-red-400", "clear all your saved API keys" }
                             ". You'll need to re-enter them after switching."
                         }
-                        p { class: "text-sm text-gray-400 mb-4",
+                        p { class: "text-sm text-fg-muted mb-4",
                             if pending_keychain_mode.read().as_ref() == Some(&crate::settings::KeychainStorageMode::Biometric) {
                                 "Biometric mode stores keys on this device only, protected by Touch ID/passcode."
                             } else {
@@ -194,7 +195,7 @@ pub fn SettingsPanel() -> Element {
                         }
                         div { class: "flex gap-3 justify-end",
                             button {
-                                class: "px-4 py-2 rounded-md text-gray-400 hover:text-white",
+                                class: "px-4 py-2 rounded-md text-fg-muted hover:text-fg",
                                 onclick: move |_| {
                                     pending_keychain_mode.set(None);
                                     show_keychain_mode_confirm.set(false);
@@ -202,7 +203,7 @@ pub fn SettingsPanel() -> Element {
                                 "Cancel"
                             }
                             button {
-                                class: "px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-md font-semibold",
+                                class: "px-4 py-2 bg-red-600 hover:bg-red-700 text-fg rounded-md font-semibold",
                                 onclick: move |_| {
                                     if let Some(new_mode) = pending_keychain_mode.read().clone() {
                                         // Clear all keychain secrets
@@ -335,18 +336,18 @@ pub fn SettingsPanel() -> Element {
                                 for (key_name, key_value) in final_secret_updates {
                                     let save_result = if use_biometric {
                                         // Biometric mode: device-only, Touch ID protected
-                                        crate::keychain_ffi::set_generic_password_with_biometric_protection(&key_name, &key_value)
+                                        crate::secret_manager::set_generic_password_with_biometric_protection(&key_name, &key_value)
                                             .or_else(|e| {
-                                                if let crate::keychain_ffi::KeychainError::SecurityError(-34018) = e {
+                                                if let crate::secret_manager::KeychainError::SecurityError(-34018) = e {
                                                     // Fall back to regular save if entitlements missing
-                                                    crate::keychain_ffi::set_generic_password(&key_name, &key_value)
+                                                    crate::secret_manager::set_generic_password(&key_name, &key_value)
                                                 } else {
                                                     Err(e)
                                                 }
                                             })
                                     } else {
                                         // iCloud sync mode: syncs across devices, no biometric
-                                        crate::keychain_ffi::set_generic_password(&key_name, &key_value)
+                                        crate::secret_manager::set_generic_password(&key_name, &key_value)
                                     };
 
                                     if let Err(e) = save_result {
@@ -387,11 +388,11 @@ pub fn SettingsPanel() -> Element {
             }
             // Sidebar (shrink-0 to not affect content width)
             div {
-                class: "w-48 shrink-0 flex flex-col border-r border-primary-700 bg-dark-section",
-                h2 { class: "text-lg font-bold p-4 border-b border-primary-700", "Settings" }
+                class: "w-48 shrink-0 flex flex-col border-r border-subtle bg-section",
+                h2 { class: "text-lg font-bold p-4 border-b border-subtle", "Settings" }
                 // Tabs
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::General { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::General { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::General;
                         let state = (*ui_state.read()).clone();
@@ -402,7 +403,7 @@ pub fn SettingsPanel() -> Element {
                     "General"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Mcp { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Mcp { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Mcp;
                         let state = (*ui_state.read()).clone();
@@ -413,7 +414,7 @@ pub fn SettingsPanel() -> Element {
                     "MCP Tools"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Behavior { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Behavior { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Behavior;
                         let state = (*ui_state.read()).clone();
@@ -424,7 +425,7 @@ pub fn SettingsPanel() -> Element {
                     "Behavior"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Data { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Data { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Data;
                         let state = (*ui_state.read()).clone();
@@ -435,7 +436,7 @@ pub fn SettingsPanel() -> Element {
                     "Data"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Permissions { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Permissions { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Permissions;
                         let state = (*ui_state.read()).clone();
@@ -446,7 +447,7 @@ pub fn SettingsPanel() -> Element {
                     "Permissions"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Hotkeys { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Hotkeys { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Hotkeys;
                         let state = (*ui_state.read()).clone();
@@ -457,7 +458,7 @@ pub fn SettingsPanel() -> Element {
                     "Hotkeys"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Credentials { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Credentials { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Credentials;
                         let state = (*ui_state.read()).clone();
@@ -468,7 +469,7 @@ pub fn SettingsPanel() -> Element {
                     "Credentials"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::About { "flex items-center gap-3 p-3 bg-primary-700/50 text-white border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-gray-400 hover:bg-white/5 hover:text-gray-200 border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::About { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::About;
                         let state = (*ui_state.read()).clone();
@@ -490,9 +491,9 @@ pub fn SettingsPanel() -> Element {
 
                 // LLM Configuration Section
                 div {
-                    class: "border border-primary-700 rounded-lg mb-4",
+                    class: "border border-subtle rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-section rounded-t-lg",
                         onclick: toggle_llm_collapsed,
                         h3 { class: "text-md font-semibold", "LLM Configuration" }
                         span { if ui_state.read().llm_config_collapsed { "▶" } else { "▼" } }
@@ -502,20 +503,20 @@ pub fn SettingsPanel() -> Element {
                             class: "p-4",
                             div {
                                 class: "mb-4",
-                                label { class: "block text-sm font-medium text-gray-300", "LLM Provider" }
+                                label { class: "block text-sm font-medium text-fg-muted", "LLM Provider" }
                                 select {
-                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                    class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
                                     option { value: "Gemini", "Gemini" }
                                 }
                             }
                             if local_settings.read().active_llm == crate::settings::LlmProvider::Gemini {
                                 div {
-                                    class: "pl-4 border-l-2 border-primary-700",
+                                    class: "pl-4 border-l-2 border-subtle",
                                     div {
                                         class: "mb-4",
-                                        label { class: "block text-sm font-medium text-gray-300", "API Key" }
+                                        label { class: "block text-sm font-medium text-fg-muted", "API Key" }
                                         input {
-                                            class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                            class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
                                             r#type: "password",
                                             placeholder: "Enter your Gemini API key",
                                             value: "{local_settings.read().gemini_config.api_key.as_deref().unwrap_or(\"\")}",
@@ -524,8 +525,8 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     // Keychain Storage Mode - conditional based on environment
                                     div {
-                                        class: "mb-4 p-3 bg-dark-bg rounded-lg border border-primary-700",
-                                        label { class: "block text-sm font-medium text-gray-300 mb-2", "API Key Storage" }
+                                        class: "mb-4 p-3 bg-app rounded-lg border border-subtle",
+                                        label { class: "block text-sm font-medium text-fg-muted mb-2", "API Key Storage" }
 
                                         if is_sandboxed() {
                                             // App Store/TestFlight: Show Biometric and iCloud options
@@ -533,9 +534,9 @@ pub fn SettingsPanel() -> Element {
                                                 class: "flex gap-2",
                                                 button {
                                                     class: if local_settings.read().keychain_storage_mode == crate::settings::KeychainStorageMode::Biometric {
-                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white"
+                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-btn-primary text-fg"
                                                     } else {
-                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-dark-input text-gray-400 hover:text-white"
+                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-input text-fg-muted hover:text-fg"
                                                     },
                                                     onclick: move |_| {
                                                         if local_settings.read().keychain_storage_mode != crate::settings::KeychainStorageMode::Biometric {
@@ -547,9 +548,9 @@ pub fn SettingsPanel() -> Element {
                                                 }
                                                 button {
                                                     class: if local_settings.read().keychain_storage_mode == crate::settings::KeychainStorageMode::ICloudSync {
-                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white"
+                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-btn-primary text-fg"
                                                     } else {
-                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-dark-input text-gray-400 hover:text-white"
+                                                        "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-input text-fg-muted hover:text-fg"
                                                     },
                                                     onclick: move |_| {
                                                         if local_settings.read().keychain_storage_mode != crate::settings::KeychainStorageMode::ICloudSync {
@@ -561,7 +562,7 @@ pub fn SettingsPanel() -> Element {
                                                 }
                                             }
                                             p {
-                                                class: "text-xs text-gray-400 mt-2",
+                                                class: "text-xs text-fg-muted mt-2",
                                                 if local_settings.read().keychain_storage_mode == crate::settings::KeychainStorageMode::Biometric {
                                                     "Keys require Touch ID/passcode. Device-only, more secure."
                                                 } else {
@@ -573,12 +574,12 @@ pub fn SettingsPanel() -> Element {
                                             div {
                                                 class: "flex gap-2",
                                                 div {
-                                                    class: "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white text-center",
+                                                    class: "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-btn-primary text-fg text-center",
                                                     "🔑 Local Keychain"
                                                 }
                                             }
                                             p {
-                                                class: "text-xs text-gray-400 mt-2",
+                                                class: "text-xs text-fg-muted mt-2",
                                                 "API keys stored securely in your local keychain. (PRO build)"
                                             }
                                         }
@@ -587,10 +588,10 @@ pub fn SettingsPanel() -> Element {
                                         class: "mb-4",
                                         div {
                                             class: "flex justify-between items-center mb-1",
-                                            label { class: "block text-sm font-medium text-gray-300", "Chat Model" }
+                                            label { class: "block text-sm font-medium text-fg-muted", "Chat Model" }
                                             if local_settings.read().gemini_config.api_key.is_some() {
                                                 button {
-                                                    class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-gray-500 disabled:cursor-not-allowed",
+                                                    class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-fg-muted disabled:cursor-not-allowed",
                                                     disabled: *models_loading.read(),
                                                     onclick: move |_| {
                                                         crate::services::gemini_models::clear_models_cache();
@@ -602,12 +603,12 @@ pub fn SettingsPanel() -> Element {
                                         }
                                         if local_settings.read().gemini_config.api_key.is_none() {
                                             p {
-                                                class: "mt-1 text-sm text-gray-400 italic",
+                                                class: "mt-1 text-sm text-fg-muted italic",
                                                 "Please configure your API key above to load available models"
                                             }
                                         } else if *models_loading.read() {
                                             p {
-                                                class: "mt-1 text-sm text-gray-400 italic",
+                                                class: "mt-1 text-sm text-fg-muted italic",
                                                 "Loading available models..."
                                             }
                                         } else if let Some(error) = models_error.read().as_ref() {
@@ -617,7 +618,7 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         } else {
                                             select {
-                                                class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
                                                 onchange: move |event| {
                                                     local_settings.write().gemini_config.chat_model = event.value();
                                                 },
@@ -635,10 +636,10 @@ pub fn SettingsPanel() -> Element {
                                         class: "mb-4",
                                         div {
                                             class: "flex justify-between items-center mb-1",
-                                            label { class: "block text-sm font-medium text-gray-300", "Summary Model" }
+                                            label { class: "block text-sm font-medium text-fg-muted", "Summary Model" }
                                             if local_settings.read().gemini_config.api_key.is_some() {
                                                 button {
-                                                    class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-gray-500 disabled:cursor-not-allowed",
+                                                    class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-fg-muted disabled:cursor-not-allowed",
                                                     disabled: *models_loading.read(),
                                                     onclick: move |_| {
                                                         crate::services::gemini_models::clear_models_cache();
@@ -650,12 +651,12 @@ pub fn SettingsPanel() -> Element {
                                         }
                                         if local_settings.read().gemini_config.api_key.is_none() {
                                             p {
-                                                class: "mt-1 text-sm text-gray-400 italic",
+                                                class: "mt-1 text-sm text-fg-muted italic",
                                                 "Please configure your API key above to load available models"
                                             }
                                         } else if *models_loading.read() {
                                             p {
-                                                class: "mt-1 text-sm text-gray-400 italic",
+                                                class: "mt-1 text-sm text-fg-muted italic",
                                                 "Loading available models..."
                                             }
                                         } else if let Some(error) = models_error.read().as_ref() {
@@ -665,7 +666,7 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         } else {
                                             select {
-                                                class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
                                                 onchange: move |event| {
                                                     local_settings.write().gemini_config.summary_model = event.value();
                                                 },
@@ -682,10 +683,10 @@ pub fn SettingsPanel() -> Element {
 
                                     // Thinking Mode Section
                                     div {
-                                        class: "mb-4 pt-4 border-t border-primary-700",
+                                        class: "mb-4 pt-4 border-t border-subtle",
                                         div {
                                             class: "flex items-center justify-between mb-2",
-                                            label { class: "block text-sm font-medium text-gray-300", "Thinking Mode" }
+                                            label { class: "block text-sm font-medium text-fg-muted", "Thinking Mode" }
                                             label {
                                                 class: "relative inline-flex items-center cursor-pointer",
                                                 input {
@@ -696,11 +697,11 @@ pub fn SettingsPanel() -> Element {
                                                         local_settings.write().gemini_config.thinking_enabled = event.checked();
                                                     }
                                                 }
-                                                div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
+                                                div { class: "w-11 h-6 bg-input peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
                                             }
                                         }
                                         p {
-                                            class: "text-xs text-gray-400 mb-3",
+                                            class: "text-xs text-fg-muted mb-3",
                                             "Enable extended reasoning for complex tasks. Gemini 3 Pro uses thinking level, Gemini 2.5 uses thinking budget."
                                         }
 
@@ -715,9 +716,9 @@ pub fn SettingsPanel() -> Element {
                                                         rsx! {
                                                             div {
                                                                 class: "mb-3",
-                                                                label { class: "block text-sm font-medium text-gray-300 mb-1", "Thinking Level" }
+                                                                label { class: "block text-sm font-medium text-fg-muted mb-1", "Thinking Level" }
                                                                 select {
-                                                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                                    class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
                                                                     onchange: move |event| {
                                                                         local_settings.write().gemini_config.thinking_level = event.value();
                                                                     },
@@ -729,7 +730,7 @@ pub fn SettingsPanel() -> Element {
                                                                         }
                                                                     }
                                                                 }
-                                                                p { class: "text-xs text-gray-400 mt-1", "Controls reasoning depth." }
+                                                                p { class: "text-xs text-fg-muted mt-1", "Controls reasoning depth." }
                                                             }
                                                         }
                                                     },
@@ -737,9 +738,9 @@ pub fn SettingsPanel() -> Element {
                                                         rsx! {
                                                             div {
                                                                 class: "mb-3",
-                                                                label { class: "block text-sm font-medium text-gray-300 mb-1", "Thinking Budget (Web 2.5)" }
+                                                                label { class: "block text-sm font-medium text-fg-muted mb-1", "Thinking Budget (Web 2.5)" }
                                                                 input {
-                                                                    class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                                    class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
                                                                     r#type: "number",
                                                                     placeholder: "Leave empty for model default",
                                                                     value: "{local_settings.read().gemini_config.thinking_budget.map(|v| v.to_string()).unwrap_or_default()}",
@@ -753,7 +754,7 @@ pub fn SettingsPanel() -> Element {
                                                                     }
                                                                 }
                                                                 p {
-                                                                    class: "text-xs text-gray-400 mt-1",
+                                                                    class: "text-xs text-fg-muted mt-1",
                                                                     "Higher values allow more reasoning tokens (increases cost)"
                                                                 }
                                                             }
@@ -779,19 +780,19 @@ pub fn SettingsPanel() -> Element {
                    }, // End General
                    crate::settings::SettingsTab::Mcp => rsx! {
                 div {
-                    class: "border border-primary-700 rounded-lg mb-4",
+                    class: "border border-subtle rounded-lg mb-4",
                     div {
                         class: "p-4",
                         div {
                             class: "mb-4",
-                            label { class: "block text-sm font-medium text-gray-300 mb-2", "Preferred MCP Source" }
+                            label { class: "block text-sm font-medium text-fg-muted mb-2", "Preferred MCP Source" }
                             div {
                                 class: "flex space-x-4",
                                 button {
                                     class: if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
-                                        "flex-1 px-4 py-2 rounded-md bg-primary-600 text-white font-medium shadow-sm ring-2 ring-primary-400"
+                                        "flex-1 px-4 py-2 rounded-md bg-btn-primary text-fg font-medium shadow-sm ring-2 ring-primary-400"
                                     } else {
-                                        "flex-1 px-4 py-2 rounded-md bg-dark-input text-gray-400 font-medium hover:bg-gray-700 hover:text-white transition-colors"
+                                        "flex-1 px-4 py-2 rounded-md bg-input text-fg-muted font-medium hover:bg-input hover:text-fg transition-colors"
                                     },
                                     onclick: move |_| {
                                         local_settings.write().preferred_mcp_source = crate::settings::McpSource::Composio;
@@ -802,7 +803,7 @@ pub fn SettingsPanel() -> Element {
                                     class: if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
                                         "flex-1 px-4 py-2 rounded-md bg-red-900/50 text-red-200 font-medium shadow-sm ring-2 ring-red-700 border border-red-700"
                                     } else {
-                                        "flex-1 px-4 py-2 rounded-md bg-dark-input text-gray-400 font-medium hover:bg-gray-700 hover:text-white transition-colors"
+                                        "flex-1 px-4 py-2 rounded-md bg-input text-fg-muted font-medium hover:bg-input hover:text-fg transition-colors"
                                     },
                                     onclick: move |_| {
                                         local_settings.write().preferred_mcp_source = crate::settings::McpSource::Smithery;
@@ -822,24 +823,24 @@ pub fn SettingsPanel() -> Element {
                                 }
                             }
                                 p {
-                                class: "text-xs text-gray-400 mt-2",
+                                class: "text-xs text-fg-muted mt-2",
                                 "Choose which registry to use when installing new MCP servers. Smithery uses a hosted proxy (requires API key), while Composio runs locally."
                             }
 
                             // Smithery API Key - shown when Smithery is selected
                             if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
                                 div {
-                                    class: "mt-4 pt-4 border-t border-primary-700",
-                                    label { class: "block text-sm font-medium text-gray-300 mb-1", "Smithery API Key" }
+                                    class: "mt-4 pt-4 border-t border-subtle",
+                                    label { class: "block text-sm font-medium text-fg-muted mb-1", "Smithery API Key" }
                                     input {
-                                        class: "mt-1 block w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                        class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
                                         r#type: "password",
                                         placeholder: "Enter your Smithery.ai API key",
                                         value: "{local_settings.read().smithery_api_key.as_deref().unwrap_or(\"\")}",
                                         oninput: move |event| local_settings.write().smithery_api_key = Some(event.value().trim().to_string())
                                     }
                                     p {
-                                        class: "text-xs text-gray-400 mt-1",
+                                        class: "text-xs text-fg-muted mt-1",
                                         "Required for Smithery.ai marketplace access"
                                     }
                                 }
@@ -847,21 +848,21 @@ pub fn SettingsPanel() -> Element {
 
                             if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
                                 div {
-                                    class: "mt-4 pt-4 border-t border-primary-700",
+                                    class: "mt-4 pt-4 border-t border-subtle",
                                     // Instructions
                                     div {
-                                        class: "mb-6 bg-dark-bg/50 rounded-lg border border-primary-700/50 overflow-hidden",
+                                        class: "mb-6 bg-app/50 rounded-lg border border-subtle/50 overflow-hidden",
                                         div {
-                                            class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section/50 hover:bg-dark-section transition-colors",
+                                            class: "flex justify-between items-center p-4 cursor-pointer bg-section/50 hover:bg-section transition-colors",
                                             onclick: toggle_mcp_instructions_collapsed,
-                                            h4 { class: "text-sm font-semibold text-white", "Setup Instructions" }
+                                            h4 { class: "text-sm font-semibold text-fg", "Setup Instructions" }
                                             span { if ui_state.read().mcp_instructions_collapsed { "▶" } else { "▼" } }
                                         }
                                         if !ui_state.read().mcp_instructions_collapsed {
                                             div {
-                                                class: "p-4 border-t border-primary-700/30",
+                                                class: "p-4 border-t border-subtle/30",
                                                 ol {
-                                                    class: "list-decimal list-inside text-sm text-gray-300 space-y-1.5",
+                                                    class: "list-decimal list-inside text-sm text-fg-muted space-y-1.5",
                                                     li {
                                                         "Get your API key from "
                                                         a { class: "text-primary-400 hover:text-primary-300 underline", href: "https://composio.dev/settings", target: "_blank", "composio.dev/settings" }
@@ -871,7 +872,7 @@ pub fn SettingsPanel() -> Element {
                                                     li { "Your Server URL will be automatically created - you're done!" }
                                                 }
                                                 div {
-                                                    class: "mt-3 pt-3 border-t border-primary-700/30",
+                                                    class: "mt-3 pt-3 border-t border-subtle/30",
                                                     a {
                                                         class: "text-xs text-primary-400 hover:text-primary-300 flex items-center gap-1",
                                                         href: "https://docs.composio.dev/docs/welcome",
@@ -887,9 +888,9 @@ pub fn SettingsPanel() -> Element {
                                         // Profile list header
                                         div {
                                             class: "flex justify-between items-center mb-3",
-                                            label { class: "block text-sm font-medium text-gray-300", "Composio Profiles" }
+                                            label { class: "block text-sm font-medium text-fg-muted", "Composio Profiles" }
                                             button {
-                                                class: "px-3 py-1 bg-primary-500 rounded-md text-white text-sm font-medium hover:bg-primary-600",
+                                                class: "px-3 py-1 bg-btn-primary rounded-md text-fg text-sm font-medium hover:bg-btn-primary-hover",
                                                 onclick: move |_| {
                                                     let new_profile = crate::settings::ComposioProfile::default();
                                                     local_settings.write().add_profile(new_profile);
@@ -909,12 +910,12 @@ pub fn SettingsPanel() -> Element {
                                                     rsx! {
                                                         div {
                                                             class: format!("flex items-center justify-between p-2 rounded-md transition-all {}",
-                                                                if is_active { "bg-dark-input border border-primary-500 ring-1 ring-primary-500/20" } else { "bg-dark-input/50 border border-transparent hover:bg-dark-input" }),
+                                                                if is_active { "bg-input border border-primary-500 ring-1 ring-primary-500/20" } else { "bg-input/50 border border-transparent hover:bg-input" }),
                                                             div {
                                                                 class: "flex items-center gap-3",
                                                                 input {
                                                                     r#type: "radio",
-                                                                    class: "w-4 h-4 text-primary-500 focus:ring-primary-500 bg-transparent border-gray-600",
+                                                                    class: "w-4 h-4 text-primary-500 focus:ring-primary-500 bg-transparent border-faint",
                                                                     name: "active_profile",
                                                                     checked: is_active,
                                                                     onchange: {
@@ -929,12 +930,12 @@ pub fn SettingsPanel() -> Element {
                                                                     }
                                                                 }
                                                                 span {
-                                                                    class: format!("text-sm font-medium {}", if is_active { "text-white" } else { "text-gray-300" }),
+                                                                    class: format!("text-sm font-medium {}", if is_active { "text-fg" } else { "text-fg-muted" }),
                                                                     "{profile_name}"
                                                                 }
                                                                 if is_active {
                                                                     span {
-                                                                        class: "px-2 py-0.5 bg-blue-600 text-white rounded text-[10px] font-bold uppercase tracking-wider",
+                                                                        class: "px-2 py-0.5 bg-blue-600 text-fg rounded text-[10px] font-bold uppercase tracking-wider",
                                                                         "Active"
                                                                     }
                                                                 }
@@ -958,15 +959,15 @@ pub fn SettingsPanel() -> Element {
                                         // Edit active profile
                                         if let Some(active_name) = local_settings.read().active_composio_profile.clone() {
                                             div {
-                                                class: "border border-primary-700 rounded-lg p-3",
-                                                h4 { class: "text-sm font-medium text-gray-300 mb-3", "Edit Profile: {active_name}" }
+                                                class: "border border-subtle rounded-lg p-3",
+                                                h4 { class: "text-sm font-medium text-fg-muted mb-3", "Edit Profile: {active_name}" }
 
                                                 // Profile Name
                                                 div {
                                                     class: "mb-3",
-                                                    label { class: "block text-xs font-medium text-gray-400 mb-1", "Profile Name" }
+                                                    label { class: "block text-xs font-medium text-fg-muted mb-1", "Profile Name" }
                                                     input {
-                                                        class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm",
+                                                        class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm",
                                                         value: "{active_name}",
                                                         oninput: {
                                                             let old_name = active_name.clone();
@@ -987,14 +988,14 @@ pub fn SettingsPanel() -> Element {
                                                 // Profile Color
                                                 div {
                                                     class: "mb-3",
-                                                    label { class: "block text-xs font-medium text-gray-400 mb-1", "Profile Color" }
+                                                    label { class: "block text-xs font-medium text-fg-muted mb-1", "Profile Color" }
                                                     div {
                                                         class: "flex gap-2 flex-wrap",
-                                                        for color in ["bg-blue-600", "bg-purple-600", "bg-green-600", "bg-red-600", "bg-orange-600", "bg-pink-600", "bg-teal-600", "bg-gray-600"] {
+                                                        for color in ["bg-blue-600", "bg-purple-600", "bg-green-600", "bg-red-600", "bg-orange-600", "bg-pink-600", "bg-teal-600", "bg-input"] {
                                                             button {
                                                                 class: format!("w-6 h-6 rounded-full cursor-pointer transition-transform hover:scale-110 {} {}",
                                                                     color,
-                                                                    if local_settings.read().get_active_profile().map(|p| p.color.as_str()) == Some(color) { "ring-2 ring-white scale-110 border border-transparent shadow-md" } else { "border border-gray-600 hover:border-white" }
+                                                                    if local_settings.read().get_active_profile().map(|p| p.color.as_str()) == Some(color) { "ring-2 ring-white scale-110 border border-transparent shadow-md" } else { "border border-faint hover:border-white" }
                                                                 ),
                                                                 onclick: {
                                                                     let color = color.to_string();
@@ -1013,10 +1014,10 @@ pub fn SettingsPanel() -> Element {
                                                 // API Key - FIRST (this is the required entry point)
                                                 div {
                                                     class: "mb-3",
-                                                    label { class: "block text-xs font-medium text-gray-400 mb-1", "API Key" }
+                                                    label { class: "block text-xs font-medium text-fg-muted mb-1", "API Key" }
                                                     input {
                                                         r#type: "password",
-                                                        class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm",
+                                                        class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm",
                                                         placeholder: "Enter your Composio API key from composio.dev/settings",
                                                         value: "{local_settings.read().get_active_profile().and_then(|p| p.api_key.clone()).unwrap_or_default()}",
                                                         oninput: {
@@ -1031,7 +1032,7 @@ pub fn SettingsPanel() -> Element {
                                                         }
                                                     }
                                                     p {
-                                                        class: "text-xs text-gray-500 mt-1",
+                                                        class: "text-xs text-fg-muted mt-1",
                                                         "Get your API key from "
                                                         a { class: "text-primary-400 hover:text-primary-300 underline", href: "https://composio.dev/settings", target: "_blank", "composio.dev/settings" }
                                                     }
@@ -1039,36 +1040,36 @@ pub fn SettingsPanel() -> Element {
 
                                                 // Advanced Settings Toggle
                                                 div {
-                                                    class: "mb-3 pt-3 border-t border-primary-700/50",
+                                                    class: "mb-3 pt-3 border-t border-subtle/50",
                                                     button {
-                                                        class: "flex items-center gap-2 text-xs text-gray-400 hover:text-gray-300 transition-colors",
+                                                        class: "flex items-center gap-2 text-xs text-fg-muted hover:text-fg-muted transition-colors",
                                                         onclick: move |_| {
                                                             show_composio_advanced.set(!show_composio_advanced());
                                                         },
                                                         span { if show_composio_advanced() { "▼" } else { "▶" } }
                                                         span { "Advanced Settings" }
-                                                        span { class: "text-gray-500", "(User ID, Server URL)" }
+                                                        span { class: "text-fg-muted", "(User ID, Server URL)" }
                                                     }
                                                 }
 
                                                 // Advanced Section (hidden by default)
                                                 if show_composio_advanced() {
                                                     div {
-                                                        class: "space-y-3 p-3 bg-dark-bg/50 rounded-lg border border-primary-700/30",
+                                                        class: "space-y-3 p-3 bg-app/50 rounded-lg border border-subtle/30",
 
                                                         // User ID (Read-only + Copy/Regenerate)
                                                         div {
-                                                            label { class: "block text-xs font-medium text-gray-400 mb-1", "User ID" }
+                                                            label { class: "block text-xs font-medium text-fg-muted mb-1", "User ID" }
                                                             div {
                                                                 class: "flex gap-2",
                                                                 input {
-                                                                    class: "flex-1 px-3 py-2 bg-dark-bg border border-primary-700 rounded-md text-sm text-gray-400 cursor-not-allowed",
+                                                                    class: "flex-1 px-3 py-2 bg-app border border-subtle rounded-md text-sm text-fg-muted cursor-not-allowed",
                                                                     readonly: true,
                                                                     value: "{local_settings.read().get_active_profile().and_then(|p| p.user_id.clone()).unwrap_or_else(|| \"Auto-generated\".to_string())}"
                                                                 }
                                                                 // Copy Button
                                                                 button {
-                                                                    class: "px-3 py-2 bg-dark-input hover:bg-white/10 border border-primary-600 rounded-md text-gray-300 transition-colors",
+                                                                    class: "px-3 py-2 bg-input hover:bg-white/10 border border-primary-600 rounded-md text-fg-muted transition-colors",
                                                                     title: "Copy User ID",
                                                                     onclick: {
                                                                         let user_id = local_settings.read().get_active_profile().map(|p| p.user_id.clone()).unwrap_or_default();
@@ -1091,7 +1092,7 @@ pub fn SettingsPanel() -> Element {
                                                                 }
                                                                 // Regenerate Button
                                                                 button {
-                                                                    class: "px-3 py-2 bg-dark-input hover:bg-white/10 border border-primary-600 rounded-md text-gray-300 transition-colors",
+                                                                    class: "px-3 py-2 bg-input hover:bg-white/10 border border-primary-600 rounded-md text-fg-muted transition-colors",
                                                                     title: "Regenerate User ID",
                                                                     onclick: {
                                                                         let name = active_name.clone();
@@ -1105,14 +1106,14 @@ pub fn SettingsPanel() -> Element {
                                                                     Icon { width: 16, height: 16, icon: fi_icons::FiRefreshCw }
                                                                 }
                                                             }
-                                                            p { class: "text-xs text-gray-500 mt-1", "Auto-generated on profile creation. Only change if troubleshooting." }
+                                                            p { class: "text-xs text-fg-muted mt-1", "Auto-generated on profile creation. Only change if troubleshooting." }
                                                         }
 
                                                         // Server URL
                                                         div {
-                                                            label { class: "block text-xs font-medium text-gray-400 mb-1", "Server URL (Optional)" }
+                                                            label { class: "block text-xs font-medium text-fg-muted mb-1", "Server URL (Optional)" }
                                                             input {
-                                                                class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm",
+                                                                class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm",
                                                                 placeholder: "Auto-created when you connect your first tool",
                                                                 value: "{local_settings.read().get_active_profile().and_then(|p| p.base_url.clone()).unwrap_or_default()}",
                                                                 oninput: {
@@ -1160,7 +1161,7 @@ pub fn SettingsPanel() -> Element {
                                                                     "{msg}"
                                                                 }
                                                             }
-                                                            p { class: "text-xs text-gray-500 mt-1", "Leave empty to auto-create on first tool connection." }
+                                                            p { class: "text-xs text-fg-muted mt-1", "Leave empty to auto-create on first tool connection." }
                                                         }
                                                     }
                                                 }
@@ -1172,7 +1173,7 @@ pub fn SettingsPanel() -> Element {
                                                     span { class: "text-sm text-green-400", "Connected" }
                                                 }
                                                 p {
-                                                    class: "text-xs text-gray-400 mt-2",
+                                                    class: "text-xs text-fg-muted mt-2",
                                                     "Connection happens automatically when you select a profile."
                                                 }
                                             }
@@ -1187,9 +1188,9 @@ pub fn SettingsPanel() -> Element {
                    crate::settings::SettingsTab::Behavior => rsx! {
                 // Application Behavior Section
                 div {
-                    class: "border border-primary-700 rounded-lg mb-4",
+                    class: "border border-subtle rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-section rounded-t-lg",
                         onclick: move |_| app_behavior_collapsed.set(!app_behavior_collapsed()),
                         h3 { class: "text-md font-semibold", "Application Behavior" }
                         span { if *app_behavior_collapsed.read() { "▶" } else { "▼" } }
@@ -1198,19 +1199,43 @@ pub fn SettingsPanel() -> Element {
                         div {
                             class: "p-4 space-y-6",
 
+                            // 0. Appearance
+                            div {
+                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Appearance" }
+                                div {
+                                    class: "flex flex-col gap-1",
+                                    label { class: "text-sm font-medium text-fg-muted", "Theme" }
+                                    p { class: "text-xs text-fg-muted", "Choose application color theme" }
+                                    select {
+                                        class: "bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                        onchange: move |e| {
+                                            let theme = match e.value().as_str() {
+                                                "Light" => crate::settings::Theme::Light,
+                                                "System" => crate::settings::Theme::System,
+                                                _ => crate::settings::Theme::Dark,
+                                            };
+                                            local_settings.write().theme = theme;
+                                        },
+                                        option { value: "Dark", selected: local_settings.read().theme == crate::settings::Theme::Dark, "Dark" }
+                                        option { value: "Light", selected: local_settings.read().theme == crate::settings::Theme::Light, "Light" }
+                                        option { value: "System", selected: local_settings.read().theme == crate::settings::Theme::System, "System" }
+                                    }
+                                }
+                            }
+
                             // 1. Context & History
                             div {
-                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Context & History" }
+                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Context & History" }
                                 div {
                                     class: "space-y-3",
                                     // Chat History Length
                                     div {
                                         class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-gray-300", "Chat History Length" }
-                                        p { class: "text-xs text-gray-500", "Number of past messages included in context window" }
+                                        label { class: "text-sm font-medium text-fg-muted", "Chat History Length" }
+                                        p { class: "text-xs text-fg-muted", "Number of past messages included in context window" }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
                                             value: "{local_settings.read().chat_history_length}",
                                             oninput: move |e| {
                                                 if let Ok(value) = e.value().parse::<usize>() {
@@ -1223,11 +1248,11 @@ pub fn SettingsPanel() -> Element {
                                     // Max Tool Output Length
                                     div {
                                         class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-gray-300", "Max Tool Output Length" }
-                                        p { class: "text-xs text-gray-500", "Maximum characters displayed in tool outputs (0 for unlimited)" }
+                                        label { class: "text-sm font-medium text-fg-muted", "Max Tool Output Length" }
+                                        p { class: "text-xs text-fg-muted", "Maximum characters displayed in tool outputs (0 for unlimited)" }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
                                             value: "{local_settings.read().max_tool_output_length}",
                                             oninput: move |e| {
                                                 if let Ok(value) = e.value().parse::<usize>() {
@@ -1240,11 +1265,11 @@ pub fn SettingsPanel() -> Element {
                                     // Max Active Tool Output Length
                                     div {
                                         class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-gray-300", "Max Active Tool Output Length" }
-                                        p { class: "text-xs text-gray-500", "Maximum characters persisted for tool context" }
+                                        label { class: "text-sm font-medium text-fg-muted", "Max Active Tool Output Length" }
+                                        p { class: "text-xs text-fg-muted", "Maximum characters persisted for tool context" }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
                                             value: "{local_settings.read().max_active_tool_output_length}",
                                             oninput: move |e| {
                                                 if let Ok(value) = e.value().parse::<usize>() {
@@ -1257,11 +1282,11 @@ pub fn SettingsPanel() -> Element {
                                     // Max Memory Summary Length
                                     div {
                                         class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-gray-300", "Max Memory Summary Length" }
-                                        p { class: "text-xs text-gray-500", "Character limit for conversation summary (~4 chars = 1 token)" }
+                                        label { class: "text-sm font-medium text-fg-muted", "Max Memory Summary Length" }
+                                        p { class: "text-xs text-fg-muted", "Character limit for conversation summary (~4 chars = 1 token)" }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
                                             value: "{local_settings.read().max_summary_chars}",
                                             oninput: move |e| {
                                                 if let Ok(value) = e.value().parse::<usize>() {
@@ -1274,11 +1299,11 @@ pub fn SettingsPanel() -> Element {
                                     // Max Stored Entities
                                     div {
                                         class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-gray-300", "Max Stored Entities" }
-                                        p { class: "text-xs text-gray-500", "Maximum entities retained in memory (topics, facts, goals)" }
+                                        label { class: "text-sm font-medium text-fg-muted", "Max Stored Entities" }
+                                        p { class: "text-xs text-fg-muted", "Maximum entities retained in memory (topics, facts, goals)" }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
                                             value: "{local_settings.read().max_entity_count}",
                                             oninput: move |e| {
                                                 if let Ok(value) = e.value().parse::<usize>() {
@@ -1292,18 +1317,18 @@ pub fn SettingsPanel() -> Element {
 
                             // 2. Chat Bar Icons
                             div {
-                                class: "pt-4 border-t border-primary-700",
-                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Chat Bar Icons" }
+                                class: "pt-4 border-t border-subtle",
+                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Chat Bar Icons" }
                                 div {
                                     class: "grid grid-cols-2 gap-3",
 
                                     // History Icon
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Show History Icon" }
+                                        label { class: "text-sm text-fg-muted", "Show History Icon" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{ui_state.read().show_history_icon}",
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
@@ -1318,10 +1343,10 @@ pub fn SettingsPanel() -> Element {
                                     // MCP Tools Icon
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Show MCP Tools Icon" }
+                                        label { class: "text-sm text-fg-muted", "Show MCP Tools Icon" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{ui_state.read().show_mcp_icon}",
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
@@ -1336,10 +1361,10 @@ pub fn SettingsPanel() -> Element {
                                     // Session Cost Icon
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Show Session Cost" }
+                                        label { class: "text-sm text-fg-muted", "Show Session Cost" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{ui_state.read().show_session_cost_icon}",
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
@@ -1354,10 +1379,10 @@ pub fn SettingsPanel() -> Element {
                                     // Profile Selector
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Show Profile Selector" }
+                                        label { class: "text-sm text-fg-muted", "Show Profile Selector" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{ui_state.read().show_profile_selector}",
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
@@ -1372,10 +1397,10 @@ pub fn SettingsPanel() -> Element {
                                     // Attachments Icon
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Show Attachments Icon" }
+                                        label { class: "text-sm text-fg-muted", "Show Attachments Icon" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{ui_state.read().show_attachments_icon}",
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
@@ -1391,16 +1416,16 @@ pub fn SettingsPanel() -> Element {
 
                             // 3. Confirmation Dialogs
                             div {
-                                class: "pt-4 border-t border-primary-700",
-                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Confirmation Dialogs" }
+                                class: "pt-4 border-t border-subtle",
+                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Confirmation Dialogs" }
                                 div {
                                     class: "space-y-3",
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Confirm before deleting sessions" }
+                                        label { class: "text-sm text-fg-muted", "Confirm before deleting sessions" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{local_settings.read().confirm_on_delete}",
                                             onchange: move |e| {
                                                 local_settings.write().confirm_on_delete = e.value() == "true";
@@ -1409,10 +1434,10 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Confirm before saving settings" }
+                                        label { class: "text-sm text-fg-muted", "Confirm before saving settings" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{local_settings.read().confirm_on_save}",
                                             onchange: move |e| {
                                                 local_settings.write().confirm_on_save = e.value() == "true";
@@ -1421,10 +1446,10 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Confirm before deleting messages" }
+                                        label { class: "text-sm text-fg-muted", "Confirm before deleting messages" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{local_settings.read().confirm_on_message_delete}",
                                             onchange: move |e| {
                                                 local_settings.write().confirm_on_message_delete = e.value() == "true";
@@ -1433,10 +1458,10 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Confirm before optimizing memory" }
+                                        label { class: "text-sm text-fg-muted", "Confirm before optimizing memory" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{local_settings.read().confirm_forget_memory}",
                                             onchange: move |e| {
                                                 local_settings.write().confirm_forget_memory = e.value() == "true";
@@ -1445,10 +1470,10 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Show System Tray Icon" }
+                                        label { class: "text-sm text-fg-muted", "Show System Tray Icon" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{local_settings.read().show_tray_icon}",
                                             onchange: move |e| {
                                                 local_settings.write().show_tray_icon = e.value() == "true";
@@ -1460,18 +1485,18 @@ pub fn SettingsPanel() -> Element {
 
                             // 4. Tool Display Defaults
                             div {
-                                class: "pt-4 border-t border-primary-700",
-                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Tool Display Defaults" }
-                                p { class: "text-xs text-gray-500 mb-3", "Set initial state for collapsible sections in tool call bubbles." }
+                                class: "pt-4 border-t border-subtle",
+                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Tool Display Defaults" }
+                                p { class: "text-xs text-fg-muted mb-3", "Set initial state for collapsible sections in tool call bubbles." }
 
                                 div {
                                     class: "space-y-3",
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Expand Arguments by Default" }
+                                        label { class: "text-sm text-fg-muted", "Expand Arguments by Default" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{ui_state.read().default_tool_arguments_open}",
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
@@ -1484,10 +1509,10 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Expand Response by Default" }
+                                        label { class: "text-sm text-fg-muted", "Expand Response by Default" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{ui_state.read().default_tool_response_open}",
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
@@ -1500,10 +1525,10 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Expand Thinking Process by Default" }
+                                        label { class: "text-sm text-fg-muted", "Expand Thinking Process by Default" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{ui_state.read().default_tool_thought_open}",
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
@@ -1519,18 +1544,18 @@ pub fn SettingsPanel() -> Element {
 
                             // 4b. Skill Display Defaults
                             div {
-                                class: "pt-4 border-t border-primary-700",
-                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Skill Display Defaults" }
-                                p { class: "text-xs text-gray-500 mb-3", "Set initial state for collapsible sections in skill call bubbles." }
+                                class: "pt-4 border-t border-subtle",
+                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Skill Display Defaults" }
+                                p { class: "text-xs text-fg-muted mb-3", "Set initial state for collapsible sections in skill call bubbles." }
 
                                 div {
                                     class: "space-y-3",
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Expand Arguments by Default" }
+                                        label { class: "text-sm text-fg-muted", "Expand Arguments by Default" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{ui_state.read().default_skill_arguments_open}",
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
@@ -1543,10 +1568,10 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Expand Output / Payload by Default" }
+                                        label { class: "text-sm text-fg-muted", "Expand Output / Payload by Default" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{ui_state.read().default_skill_response_open}",
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
@@ -1559,10 +1584,10 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-gray-300", "Expand Instructions by Default" }
+                                        label { class: "text-sm text-fg-muted", "Expand Instructions by Default" }
                                         input {
                                             r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-gray-600 bg-dark-input",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                             checked: "{ui_state.read().default_skill_instructions_open}",
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
@@ -1578,17 +1603,17 @@ pub fn SettingsPanel() -> Element {
 
                             // 5. AI Behavior
                             div {
-                                class: "pt-4 border-t border-primary-700",
-                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "AI Behavior" }
+                                class: "pt-4 border-t border-subtle",
+                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "AI Behavior" }
                                 div {
                                     class: "space-y-3",
                                     // Max AI Turns
                                     div {
                                         class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-gray-300", "Max AI Turns" }
-                                        p { class: "text-xs text-gray-500", "Maximum consecutive responses allowed" }
+                                        label { class: "text-sm font-medium text-fg-muted", "Max AI Turns" }
+                                        p { class: "text-xs text-fg-muted", "Maximum consecutive responses allowed" }
                                         select {
-                                            class: "bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            class: "bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
                                             onchange: move |e| {
                                                 if let Ok(value) = e.value().parse::<u32>() {
                                                     local_settings.write().permission_settings.max_ai_turns = value;
@@ -1604,10 +1629,10 @@ pub fn SettingsPanel() -> Element {
                                     // User Name
                                     div {
                                         class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-gray-300", "What should Hobbes call you?" }
+                                        label { class: "text-sm font-medium text-fg-muted", "What should Hobbes call you?" }
                                         input {
                                             r#type: "text",
-                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
                                             placeholder: "Dr. Calvin",
                                             value: "{local_settings.read().user_name.clone().unwrap_or_default()}",
                                             oninput: move |e| {
@@ -1621,16 +1646,16 @@ pub fn SettingsPanel() -> Element {
 
                             // 6. Persona & Instructions
                             div {
-                                class: "pt-4 border-t border-primary-700",
-                                h4 { class: "text-sm font-semibold text-gray-200 mb-3", "Persona & Instructions" }
+                                class: "pt-4 border-t border-subtle",
+                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Persona & Instructions" }
                                 div {
                                     class: "space-y-3",
                                     // Persona
                                     div {
                                         class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-gray-300", "Persona" }
+                                        label { class: "text-sm font-medium text-fg-muted", "Persona" }
                                         textarea {
-                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white h-24 focus:border-blue-500 focus:outline-none",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg h-24 focus:border-blue-500 focus:outline-none",
                                             value: "{local_settings.read().persona}",
                                             oninput: move |e| local_settings.write().persona = e.value()
                                         }
@@ -1639,10 +1664,10 @@ pub fn SettingsPanel() -> Element {
                                     // Force Tool Use Instruction
                                     div {
                                         class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-gray-300", "Force Tool Use Instruction" }
-                                        p { class: "text-xs text-gray-500", "Appended to system prompt to encourage specific behaviors" }
+                                        label { class: "text-sm font-medium text-fg-muted", "Force Tool Use Instruction" }
+                                        p { class: "text-xs text-fg-muted", "Appended to system prompt to encourage specific behaviors" }
                                         textarea {
-                                            class: "w-full bg-dark-bg border border-gray-600 rounded p-2 text-white h-24 focus:border-blue-500 focus:outline-none",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg h-24 focus:border-blue-500 focus:outline-none",
                                             value: "{local_settings.read().force_tool_use_instruction.clone().unwrap_or_default()}",
                                             oninput: move |e| local_settings.write().force_tool_use_instruction = Some(e.value())
                                         }
@@ -1651,17 +1676,17 @@ pub fn SettingsPanel() -> Element {
                                     // Project Folder
                                     div {
                                         class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-gray-300", "Project Folder" }
+                                        label { class: "text-sm font-medium text-fg-muted", "Project Folder" }
                                         div {
                                             class: "flex gap-2",
                                             input {
                                                 r#type: "text",
-                                                class: "flex-1 bg-dark-bg border border-gray-600 rounded p-2 text-white focus:border-blue-500 focus:outline-none",
+                                                class: "flex-1 bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
                                                 value: "{local_settings.read().project_folder.clone().unwrap_or_default()}",
                                                 readonly: true,
                                             }
                                             button {
-                                                class: "px-3 py-2 bg-dark-card hover:bg-gray-700 rounded border border-gray-600 transition-colors",
+                                                class: "px-3 py-2 bg-card hover:bg-input rounded border border-faint transition-colors",
                                                 onclick: move |_| {
                                                     spawn(async move {
                                                         if let Some(folder_path) = rfd::AsyncFileDialog::new().pick_folder().await {
@@ -1683,9 +1708,9 @@ pub fn SettingsPanel() -> Element {
                    crate::settings::SettingsTab::Data => rsx! {
                 // Data Management Section
                 div {
-                    class: "border border-primary-700 rounded-lg mb-4",
+                    class: "border border-subtle rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-section rounded-t-lg",
                         onclick: move |_| data_management_collapsed.set(!data_management_collapsed()),
                         h3 { class: "text-md font-semibold", "Data Management" }
                         span { if *data_management_collapsed.read() { "▶" } else { "▼" } }
@@ -1696,7 +1721,7 @@ pub fn SettingsPanel() -> Element {
                             div {
                                 class: "flex space-x-2",
                                 button {
-                                    class: "px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600",
+                                    class: "px-4 py-2 bg-btn-primary rounded-md text-fg font-semibold hover:bg-btn-primary-hover",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_settings.zip").save_file().await {
@@ -1717,7 +1742,7 @@ pub fn SettingsPanel() -> Element {
                                     "Export Settings"
                                 }
                                 button {
-                                    class: "px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600",
+                                    class: "px-4 py-2 bg-btn-primary rounded-md text-fg font-semibold hover:bg-btn-primary-hover",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_settings.zip").pick_file().await {
@@ -1765,7 +1790,7 @@ pub fn SettingsPanel() -> Element {
                             div {
                                 class: "flex space-x-2 mt-2",
                                 button {
-                                    class: "px-4 py-2 bg-secondary-500 rounded-md text-white font-semibold hover:bg-secondary-600",
+                                    class: "px-4 py-2 bg-secondary-500 rounded-md text-fg font-semibold hover:bg-secondary-600",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_history.zip").save_file().await {
@@ -1786,7 +1811,7 @@ pub fn SettingsPanel() -> Element {
                                     "Export History"
                                 }
                                 button {
-                                    class: "px-4 py-2 bg-secondary-500 rounded-md text-white font-semibold hover:bg-secondary-600",
+                                    class: "px-4 py-2 bg-secondary-500 rounded-md text-fg font-semibold hover:bg-secondary-600",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_history.zip").pick_file().await {
@@ -1851,14 +1876,14 @@ pub fn SettingsPanel() -> Element {
                             }
                             // Keychain Management
                             div {
-                                class: "mt-4 pt-4 border-t border-primary-700",
-                                h4 { class: "text-sm font-medium text-gray-300 mb-2", "Keychain Management" }
+                                class: "mt-4 pt-4 border-t border-subtle",
+                                h4 { class: "text-sm font-medium text-fg-muted mb-2", "Keychain Management" }
                                 p {
-                                    class: "text-xs text-gray-400 mb-3",
+                                    class: "text-xs text-fg-muted mb-3",
                                     "Manually reset all stored API keys. You'll need to re-enter them after resetting."
                                 }
                                 button {
-                                    class: "px-4 py-2 bg-red-600 rounded-md text-white font-semibold hover:bg-red-700",
+                                    class: "px-4 py-2 bg-red-600 rounded-md text-fg font-semibold hover:bg-red-700",
                                     onclick: move |_| {
                                         // Delete all keychain items
                                         let deleted_keys = secret_manager.write().delete_all();
@@ -1883,9 +1908,9 @@ pub fn SettingsPanel() -> Element {
                    crate::settings::SettingsTab::Permissions => rsx! {
                 // Permissions Section
                 div {
-                    class: "border border-primary-700 rounded-lg mb-4",
+                    class: "border border-subtle rounded-lg mb-4",
                     div {
-                        class: "flex justify-between items-center p-4 cursor-pointer bg-dark-section rounded-t-lg",
+                        class: "flex justify-between items-center p-4 cursor-pointer bg-section rounded-t-lg",
                         onclick: move |_| permissions_collapsed.set(!permissions_collapsed()),
                         h3 { class: "text-md font-semibold", "Permissions" }
                         span { if *permissions_collapsed.read() { "▶" } else { "▼" } }
@@ -1895,7 +1920,7 @@ pub fn SettingsPanel() -> Element {
                             class: "p-4",
                             div {
                                 class: "flex items-center justify-between mb-4",
-                                label { class: "block text-sm font-medium text-gray-300", "Enable Auto-Approval" }
+                                label { class: "block text-sm font-medium text-fg-muted", "Enable Auto-Approval" }
                                 label {
                                     class: "relative inline-flex items-center cursor-pointer",
                                     input {
@@ -1908,15 +1933,15 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
-                                    div { class: "w-11 h-6 bg-gray-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
+                                    div { class: "w-11 h-6 bg-input peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
                                 }
                             }
                             if local_settings.read().permission_settings.auto_approval_enabled {
                                 div {
-                                    class: "pl-4 border-l-2 border-primary-700 space-y-2",
+                                    class: "pl-4 border-l-2 border-subtle space-y-2",
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm font-medium text-gray-300", "MCP Tools (Global)" }
+                                        label { class: "text-sm font-medium text-fg-muted", "MCP Tools (Global)" }
                                         label {
                                             class: "relative inline-flex items-center cursor-pointer",
                                             input {
@@ -1935,8 +1960,8 @@ pub fn SettingsPanel() -> Element {
 
                                     if local_settings.read().permission_settings.granular_permissions.get(&ToolCategory::Mcp).copied().unwrap_or(false) {
                                         div {
-                                            class: "mt-2 pl-4 border-l border-gray-700 space-y-2",
-                                            h4 { class: "text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2", "Granular MCP Permissions" }
+                                            class: "mt-2 pl-4 border-l border-faint space-y-2",
+                                            h4 { class: "text-xs font-semibold text-fg-muted uppercase tracking-wider mb-2", "Granular MCP Permissions" }
                                             for server in _mcp_context.read().servers.iter() {
                                                 {
                                                     let server_name = server.name.clone();
@@ -1948,9 +1973,9 @@ pub fn SettingsPanel() -> Element {
                                                             class: "flex items-center justify-between",
                                                             div {
                                                                 class: "flex flex-col",
-                                                                span { class: "text-sm text-gray-300", "{server_name}" }
+                                                                span { class: "text-sm text-fg-muted", "{server_name}" }
                                                                 if !server.description.is_empty() {
-                                                                    span { class: "text-[10px] text-gray-500", "{server.description}" }
+                                                                    span { class: "text-[10px] text-fg-muted", "{server.description}" }
                                                                 }
                                                             }
                                                             label {
@@ -1984,26 +2009,46 @@ pub fn SettingsPanel() -> Element {
 
             // Skill Permissions Section
             div {
-                class: "border border-primary-700 rounded-lg mb-4",
+                class: "border border-subtle rounded-lg mb-4",
                 div {
-                    class: "p-4 bg-dark-section rounded-lg",
+                    class: "p-4 bg-section rounded-lg",
                     h3 { class: "text-md font-semibold mb-4", "Skill Permissions" }
-                    p { class: "text-xs text-gray-400 mb-4",
+                    p { class: "text-xs text-fg-muted mb-4",
                         "Manage auto-approval for specific skills. When enabled, these skills will execute without prompting."
                     }
                     
                     {
-                        let skills_map = local_settings.read().permission_settings.skill_permissions.clone();
-                        if skills_map.is_empty() {
+                        // Get all skills from registry AND saved permissions
+                        let registry = skill_registry.read();
+                        let saved_permissions = local_settings.read().permission_settings.skill_permissions.clone();
+                        
+                        // Build merged map: registry skills + any saved permissions
+                        let mut all_skills: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+                        
+                        // Add all registered skills (default to false if no saved permission)
+                        for skill in registry.list_skills() {
+                            let is_allowed = saved_permissions.get(&skill.metadata.name).copied().unwrap_or(false);
+                            all_skills.insert(skill.metadata.name.clone(), is_allowed);
+                        }
+                        
+                        // Also include any saved permissions for skills not currently in registry
+                        // (in case a skill was removed but permission was saved)
+                        for (name, allowed) in &saved_permissions {
+                            if !all_skills.contains_key(name) {
+                                all_skills.insert(name.clone(), *allowed);
+                            }
+                        }
+                        
+                        if all_skills.is_empty() {
                             rsx! {
                                 div {
                                     class: "flex items-center justify-center p-8 border border-dashed border-primary-800 rounded-lg",
-                                    p { class: "text-sm text-gray-500", "No specific skill permissions saved yet." }
+                                    p { class: "text-sm text-fg-muted", "No skills discovered. Add skills to ~/.hobbes/skills/ to see them here." }
                                 }
                             }
                         } else {
                             // Sort skills alphabetically for cleaner UI
-                            let mut sorted_skills: Vec<_> = skills_map.into_iter().collect();
+                            let mut sorted_skills: Vec<_> = all_skills.into_iter().collect();
                             sorted_skills.sort_by(|a, b| a.0.cmp(&b.0));
 
                             rsx! {
@@ -2012,7 +2057,6 @@ pub fn SettingsPanel() -> Element {
                                     for (skill_name, is_allowed) in sorted_skills {
                                         {
                                             // Metadata Lookup
-                                            let registry = skill_registry.read();
                                         let skill_opt = registry.get_skill(&skill_name);
                                         let description = skill_opt.as_ref()
                                             .map(|s| s.metadata.description.clone())
@@ -2020,17 +2064,17 @@ pub fn SettingsPanel() -> Element {
                                         
                                             rsx! {
                                                 div {
-                                            class: "flex items-center justify-between p-4 bg-dark-input rounded-lg border border-primary-800 hover:border-primary-600 transition-colors",
+                                            class: "flex items-center justify-between p-4 bg-input rounded-lg border border-primary-800 hover:border-primary-600 transition-colors",
                                             div {
                                                 class: "flex flex-col max-w-[70%]",
                                                 div {
                                                     class: "flex items-center gap-2",
-                                                    span { class: "text-sm font-bold text-white", "/{skill_name}" }
+                                                    span { class: "text-sm font-bold text-fg", "/{skill_name}" }
                                                     if is_allowed {
-                                                        span { class: "px-1.5 py-0.5 text-[10px] font-bold bg-green-900/50 text-green-400 rounded", "ALLOWED" }
+                                                        span { class: "px-1.5 py-0.5 text-[10px] font-bold bg-action-success text-action-success-text rounded", "ALLOWED" }
                                                     }
                                                 }
-                                                span { class: "text-xs text-gray-400 mt-1 line-clamp-2", "{description}" }
+                                                span { class: "text-xs text-fg-muted mt-1 line-clamp-2", "{description}" }
                                             }
                                             div {
                                                 class: "relative inline-block w-10 h-5 align-middle select-none transition duration-200 ease-in",
@@ -2063,11 +2107,11 @@ pub fn SettingsPanel() -> Element {
         }, // End Permissions
                     crate::settings::SettingsTab::Hotkeys => rsx! {
                         div {
-                            class: "border border-primary-700 rounded-lg mb-4",
+                            class: "border border-subtle rounded-lg mb-4",
                             div {
-                                class: "p-4 bg-dark-section rounded-lg",
+                                class: "p-4 bg-section rounded-lg",
                                 h3 { class: "text-md font-semibold mb-4", "Keyboard Shortcuts" }
-                                p { class: "text-xs text-gray-400 mb-4",
+                                p { class: "text-xs text-fg-muted mb-4",
                                     "Customize global shortcuts using the format: "
                                     code { class: "bg-black/30 px-1 rounded", "CmdOrCtrl+Shift+Key" }
                                 ". Changes apply immediately after saving."
@@ -2091,7 +2135,7 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-gray-300", "Submit Message" }
+                                        label { class: "text-sm text-fg-muted", "Submit Message" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.submit_chat.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.submit_chat = v,
@@ -2100,7 +2144,7 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-gray-300", "Cancel Generation" }
+                                        label { class: "text-sm text-fg-muted", "Cancel Generation" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.cancel_generation.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.cancel_generation = v,
@@ -2109,7 +2153,7 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-gray-300", "Focus Chat Input" }
+                                        label { class: "text-sm text-fg-muted", "Focus Chat Input" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_focus_chat.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_focus_chat = v,
@@ -2118,7 +2162,7 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-gray-300", "Toggle Settings" }
+                                        label { class: "text-sm text-fg-muted", "Toggle Settings" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_settings.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_settings = v,
@@ -2127,7 +2171,7 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-gray-300", "Toggle History" }
+                                        label { class: "text-sm text-fg-muted", "Toggle History" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_history.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_history = v,
@@ -2136,7 +2180,7 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-gray-300", "Toggle MCP Config" }
+                                        label { class: "text-sm text-fg-muted", "Toggle MCP Config" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_mcp.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_mcp = v,
@@ -2145,7 +2189,7 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-gray-300", "Open Profile Selector" }
+                                        label { class: "text-sm text-fg-muted", "Open Profile Selector" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_profile.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_profile = v,
@@ -2154,7 +2198,7 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-gray-300", "Add Attachments" }
+                                        label { class: "text-sm text-fg-muted", "Add Attachments" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_attachments.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_attachments = v,
@@ -2163,7 +2207,7 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-gray-300", "Global Toggle (Show/Hide)" }
+                                        label { class: "text-sm text-fg-muted", "Global Toggle (Show/Hide)" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_tray.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_tray = v,
@@ -2172,7 +2216,7 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-gray-300", "New Chat (No Memory)" }
+                                        label { class: "text-sm text-fg-muted", "New Chat (No Memory)" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_new_chat.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_new_chat = v,
@@ -2181,7 +2225,7 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-gray-300", "New Chat with Memory" }
+                                        label { class: "text-sm text-fg-muted", "New Chat with Memory" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_new_chat_with_memory.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_new_chat_with_memory = v,
@@ -2192,7 +2236,7 @@ pub fn SettingsPanel() -> Element {
                                     div {
                                         class: "pt-4 border-t border-gray-800",
                                         button {
-                                            class: "px-4 py-2 bg-gray-700 rounded-md text-sm text-gray-300 hover:bg-gray-600 hover:text-white transition-colors",
+                                            class: "px-4 py-2 bg-input rounded-md text-sm text-fg-muted hover:bg-input hover:text-fg transition-colors",
                                             onclick: move |_| {
                                                 local_settings.write().hotkeys = HotkeySettings::default();
                                             },
@@ -2205,10 +2249,10 @@ pub fn SettingsPanel() -> Element {
 
                                         div {
                                             class: "flex justify-between items-center text-sm",
-                                            span { class: "text-gray-400", "Switch Profile (1-9)" }
-                                            span { class: "font-mono text-gray-500", "CmdOrCtrl + [1-9]" }
+                                            span { class: "text-fg-muted", "Switch Profile (1-9)" }
+                                            span { class: "font-mono text-fg-muted", "CmdOrCtrl + [1-9]" }
                                         }
-                                        p { class: "text-[10px] text-gray-500 mt-1", "Profile switching hotkeys are currently fixed." }
+                                        p { class: "text-[10px] text-fg-muted mt-1", "Profile switching hotkeys are currently fixed." }
                                     }
                                 }
                             }
@@ -2220,16 +2264,16 @@ pub fn SettingsPanel() -> Element {
                     crate::settings::SettingsTab::About => rsx! {
                 // About & Legal Section
                 div {
-                    class: "border border-primary-700 rounded-lg mb-4",
+                    class: "border border-subtle rounded-lg mb-4",
                     div {
-                        class: "p-4 bg-dark-section rounded-lg",
+                        class: "p-4 bg-section rounded-lg",
                         h3 { class: "text-md font-semibold mb-3", "About & Legal" }
 
                         // Version and app name
                         div {
                             class: "flex items-center gap-2 mb-3",
-                            span { class: "text-sm text-gray-300", "{app_name}" }
-                            span { class: "text-xs text-gray-500", "{app_version}" }
+                            span { class: "text-sm text-fg-muted", "{app_name}" }
+                            span { class: "text-xs text-fg-muted", "{app_version}" }
                         }
 
                         // Privacy statement
@@ -2240,7 +2284,7 @@ pub fn SettingsPanel() -> Element {
 
                         // Attribution
                         p {
-                            class: "text-xs text-gray-400 mb-4",
+                            class: "text-xs text-fg-muted mb-4",
                             "{crate::settings::APP_ATTRIBUTION}"
                         }
 
@@ -2268,12 +2312,12 @@ pub fn SettingsPanel() -> Element {
 
                 // Footer (Sticky)
                 div {
-                    class: "p-4 border-t border-primary-700 bg-dark-section",
+                    class: "p-4 border-t border-subtle bg-section",
                     button {
                 class: if has_unsaved_changes() {
-                    "mt-4 px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors"
+                    "mt-4 px-4 py-2 bg-btn-primary rounded-md text-fg font-semibold hover:bg-btn-primary-hover focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors"
                 } else {
-                    "mt-4 px-4 py-2 bg-gray-600 rounded-md text-white font-semibold cursor-not-allowed"
+                    "mt-4 px-4 py-2 bg-input rounded-md text-fg font-semibold cursor-not-allowed"
                 },
                 disabled: !has_unsaved_changes(),
                 onclick: move |_| {
@@ -2333,10 +2377,10 @@ pub fn SettingsPanel() -> Element {
                                 let results = tokio::task::spawn_blocking(move || {
                                     let mut saved = Vec::new();
                                     for (key_name, key_value) in final_secret_updates {
-                                        let save_result = crate::keychain_ffi::set_generic_password_with_biometric_protection(&key_name, &key_value)
+                                        let save_result = crate::secret_manager::set_generic_password_with_biometric_protection(&key_name, &key_value)
                                             .or_else(|e| {
-                                                if let crate::keychain_ffi::KeychainError::SecurityError(-34018) = e {
-                                                    crate::keychain_ffi::set_generic_password(&key_name, &key_value)
+                                                if let crate::secret_manager::KeychainError::SecurityError(-34018) = e {
+                                                    crate::secret_manager::set_generic_password(&key_name, &key_value)
                                                 } else {
                                                     Err(e)
                                                 }

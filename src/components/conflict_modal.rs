@@ -35,7 +35,7 @@ pub fn ConflictModal(props: ConflictModalProps) -> Element {
                 }
             },
             div {
-                class: "bg-gray-800 rounded-lg p-6 max-w-sm w-full",
+                class: "bg-section rounded-lg p-6 max-w-sm w-full",
                 tabindex: "0",
                 onkeydown: {
                     let on_resolve = props.on_resolve;
@@ -56,9 +56,9 @@ pub fn ConflictModal(props: ConflictModalProps) -> Element {
                     "Conflict Detected"
                 }
                 p {
-                    class: "mb-4 text-gray-300",
+                    class: "mb-4 text-fg-muted",
                     "A session with ID "
-                    span { class: "font-mono bg-gray-700 px-1 rounded", "{props.session_id}" }
+                    span { class: "font-mono bg-input px-1 rounded", "{props.session_id}" }
                     " already exists. Would you like to overwrite it?"
                 }
                 div {
@@ -66,7 +66,7 @@ pub fn ConflictModal(props: ConflictModalProps) -> Element {
                     input {
                         r#type: "checkbox",
                         id: "apply_all",
-                        class: "h-4 w-4 text-indigo-600 bg-gray-700 border-gray-600 rounded focus:ring-indigo-500",
+                        class: "h-4 w-4 text-indigo-600 bg-input border-faint rounded focus:ring-indigo-500",
                         oninput: move |event| {
                             if let Ok(checked) = event.value().parse() {
                                 apply_to_all.set(checked);
@@ -75,19 +75,19 @@ pub fn ConflictModal(props: ConflictModalProps) -> Element {
                     }
                     label {
                         r#for: "apply_all",
-                        class: "ml-2 block text-sm text-gray-300",
+                        class: "ml-2 block text-sm text-fg-muted",
                         "Apply to all conflicts"
                     }
                 }
                 div {
                     class: "flex justify-end space-x-4",
                     button {
-                        class: "px-4 py-2 bg-gray-600 rounded-md text-white font-semibold hover:bg-gray-700",
+                        class: "px-4 py-2 bg-input rounded-md text-fg font-semibold hover:bg-input",
                         onclick: move |_| props.on_resolve.call((false, *apply_to_all.read())),
                         "Skip"
                     }
                     button {
-                        class: "px-4 py-2 bg-red-600 rounded-md text-white font-semibold hover:bg-red-700",
+                        class: "px-4 py-2 bg-red-600 rounded-md text-fg font-semibold hover:bg-red-700",
                         onclick: move |_| props.on_resolve.call((true, *apply_to_all.read())),
                         "Overwrite"
                     }

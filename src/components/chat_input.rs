@@ -356,16 +356,16 @@ pub fn ChatInput(
     rsx! {
         if !attachments.read().is_empty() {
             div {
-                class: "flex items-center space-x-2 p-2 bg-dark-section rounded-t-lg",
+                class: "flex items-center space-x-2 p-2 bg-section rounded-t-lg",
                 for (index, attachment) in attachments.read().iter().enumerate() {
                     div {
-                        class: "flex items-center space-x-2 bg-dark-card p-1 rounded",
+                        class: "flex items-center space-x-2 bg-card p-1 rounded",
                         span {
-                            class: "text-sm text-gray-300",
+                            class: "text-sm text-fg-muted",
                             "{attachment.file_name}"
                         }
                         button {
-                            class: "p-1 rounded-full text-gray-400 hover:bg-dark-input hover:text-white",
+                            class: "p-1 rounded-full text-fg-muted hover:bg-input hover:text-fg",
                             onclick: move |_| {
                                 attachments.write().remove(index);
                             },
@@ -381,9 +381,9 @@ pub fn ChatInput(
         }
         div {
             class: if *is_dragging.read() {
-                "bg-dark-bg p-4 border-t-2 border-dashed border-primary-500"
+                "bg-app p-4 border-t-2 border-dashed border-primary-500"
             } else {
-                "bg-dark-bg p-4 border-t border-primary-700"
+                "bg-app p-4 border-t border-subtle"
             },
             onmousedown: |e| e.stop_propagation(),
             ondragover: move |event| {
@@ -460,18 +460,18 @@ pub fn ChatInput(
                                 div {
                                     class: "relative",
                                     button {
-                                        class: format!("w-8 h-8 rounded-full {} border border-primary-700 flex items-center justify-center text-xs font-bold text-white hover:brightness-110 hover:border-primary-500 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600 shadow-md", active_profile.color),
+                                        class: format!("w-8 h-8 rounded-full {} border border-subtle flex items-center justify-center text-xs font-bold text-fg hover:brightness-110 hover:border-primary-500 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600 shadow-md", active_profile.color),
                                         onclick: move |_| show_profile_selector.set(!show_profile_selector()),
                                         "{active_initial}"
                                     }
 
                                     if show_profile_selector() {
                                         div {
-                                            class: "absolute bottom-10 left-0 w-56 bg-dark-card border border-primary-700 rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                                            class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
                                             for (index, profile) in profiles.iter().enumerate() {
                                                 if profile.name != active_profile.name {
                                                     button {
-                                                        class: "w-full text-left px-4 py-2 text-sm text-gray-300 hover:bg-primary-900/50 hover:text-white transition-colors flex items-center justify-between",
+                                                        class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
                                                         onclick: {
                                                             let new_profile_name = profile.name.clone();
                                                             move |_| {
@@ -488,7 +488,7 @@ pub fn ChatInput(
                                                         div {
                                                             class: "flex items-center space-x-2",
                                                             span {
-                                                                class: format!("w-6 h-6 rounded-full {} border border-gray-700 flex items-center justify-center text-[10px] text-white font-bold shadow-sm", profile.color),
+                                                                class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm", profile.color),
                                                                 "{profile.name.chars().next().unwrap_or('?').to_uppercase()}"
                                                             }
                                                             span { class: "truncate", "{profile.name}" }
@@ -496,7 +496,7 @@ pub fn ChatInput(
                                                         // Hotkey hint (1-indexed)
                                                         if index < 9 {
                                                             span {
-                                                                class: "text-xs text-gray-500 font-mono",
+                                                                class: "text-xs text-fg-muted font-mono",
                                                                 "⌘{index + 1}"
                                                             }
                                                         }
@@ -567,7 +567,7 @@ pub fn ChatInput(
                 }
                 textarea {
                     id: "chat-textarea",
-                    class: "flex-1 py-2 px-4 rounded-xl bg-dark-input border border-primary-700 text-dark-text placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 resize-none overflow-y-auto",
+                    class: "flex-1 py-2 px-4 rounded-xl bg-input border border-subtle text-fg placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 resize-none overflow-y-auto",
                     style: "max-height: 50vh;",
                     rows: "1",
                     placeholder: "Type your message...",
@@ -789,7 +789,7 @@ pub fn ChatInput(
                             if #[cfg(debug_assertions)] {
                                 rsx! {
                                     button {
-                                        class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                                        class: "p-2 rounded-full text-fg-muted hover:bg-card hover:text-fg focus:outline-none focus:ring-2 focus:ring-gray-600",
                                         onclick: move |_| {
                                             spawn(async move {
                                                 let mcp_context = {
@@ -843,7 +843,7 @@ pub fn ChatInput(
                     div {
                         class: "relative",
                         button {
-                            class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600",
+                            class: "p-2 rounded-full text-fg-muted hover:bg-card hover:text-fg focus:outline-none focus:ring-2 focus:ring-gray-600",
                             title: "New Chat",
                             onclick: move |_| show_new_chat_menu.set(!show_new_chat_menu()),
                             Icon {
@@ -855,10 +855,10 @@ pub fn ChatInput(
 
                         if show_new_chat_menu() {
                             div {
-                                class: "absolute bottom-10 right-0 w-64 bg-dark-card border border-primary-700 rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                                class: "absolute bottom-10 right-0 w-64 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
                                 // New Chat (No Memory)
                                 button {
-                                    class: "w-full text-left px-4 py-2 text-sm text-gray-300 hover:bg-primary-900/50 hover:text-white transition-colors flex items-center justify-between",
+                                    class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
                                     onclick: move |_| {
                                         session_state.write().create_session();
                                         show_new_chat_menu.set(false);
@@ -869,18 +869,18 @@ pub fn ChatInput(
                                             width: 16,
                                             height: 16,
                                             icon: fi_icons::FiPlus,
-                                            class: "text-gray-400"
+                                            class: "text-fg-muted"
                                         }
                                         span { "New Chat" }
                                     }
                                     span {
-                                        class: "text-xs text-gray-500 font-mono",
+                                        class: "text-xs text-fg-muted font-mono",
                                         "{format_hotkey(&settings.read().hotkeys.toggle_new_chat)}"
                                     }
                                 }
                                 // New Chat with Memory
                                 button {
-                                    class: "w-full text-left px-4 py-2 text-sm text-gray-300 hover:bg-primary-900/50 hover:text-white transition-colors flex items-center justify-between",
+                                    class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
                                     onclick: move |_| {
                                         on_new_chat_with_memory.call(());
                                         show_new_chat_menu.set(false);
@@ -896,7 +896,7 @@ pub fn ChatInput(
                                         span { "New Chat with Memory" }
                                     }
                                     span {
-                                        class: "text-xs text-gray-500 font-mono",
+                                        class: "text-xs text-fg-muted font-mono",
                                         "{format_hotkey(&settings.read().hotkeys.toggle_new_chat_with_memory)}"
                                     }
                                 }
@@ -912,7 +912,7 @@ pub fn ChatInput(
                     }
                     if !*is_sending.read() {
                         button {
-                            class: "px-5 py-2 bg-primary-500 rounded-full text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors disabled:bg-gray-500",
+                            class: "px-5 py-2 bg-btn-primary rounded-full text-fg font-semibold hover:bg-btn-primary-hover focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors disabled:bg-gray-500",
                             disabled: *is_processing_attachments.read(),
                             onclick: move |_| {
                                 on_interaction.call(());
@@ -922,7 +922,7 @@ pub fn ChatInput(
                         }
                     } else {
                         button {
-                            class: "px-4 py-2 bg-red-600 rounded-full text-white font-semibold hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-opacity-50 transition-colors flex items-center space-x-2",
+                            class: "px-4 py-2 bg-red-600 rounded-full text-fg font-semibold hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-opacity-50 transition-colors flex items-center space-x-2",
                             onclick: move |_| on_cancel.call(()),
                             Icon {
                                 width: 20,
@@ -1058,7 +1058,7 @@ fn SessionCostIcon() -> Element {
         div {
             class: "relative",
             button {
-                class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-green-400 focus:outline-none focus:ring-2 focus:ring-gray-600 flex items-center space-x-1 transition-colors",
+                class: "p-2 rounded-full text-fg-muted hover:bg-card hover:text-green-400 focus:outline-none focus:ring-2 focus:ring-gray-600 flex items-center space-x-1 transition-colors",
                 onclick: move |_| {
                     let current = *show_popover.read();
                     show_popover.set(!current);
@@ -1077,25 +1077,25 @@ fn SessionCostIcon() -> Element {
 
             if *show_popover.read() {
                 div {
-                    class: "absolute bottom-full left-0 mb-2 w-64 bg-dark-card border border-gray-700 rounded-lg shadow-xl p-3 z-50",
+                    class: "absolute bottom-full left-0 mb-2 w-64 bg-card border border-faint rounded-lg shadow-xl p-3 z-50",
 
-                    div { class: "text-sm font-semibold text-gray-200 mb-2 border-b border-gray-700 pb-1", "Session Usage" }
+                    div { class: "text-sm font-semibold text-gray-200 mb-2 border-b border-faint pb-1", "Session Usage" }
 
                     div { class: "space-y-2 text-xs",
-                        div { class: "flex justify-between text-gray-400",
+                        div { class: "flex justify-between text-fg-muted",
                             span { "Total Cost:" }
                             span { class: "text-green-400 font-mono", {format!("${:.4}", total_cost)} }
                         }
-                        div { class: "flex justify-between text-gray-400",
+                        div { class: "flex justify-between text-fg-muted",
                             span { "Total Tokens:" }
-                            span { class: "text-white font-mono", "{total_tokens}" }
+                            span { class: "text-fg font-mono", "{total_tokens}" }
                         }
-                        div { class: "flex justify-between text-gray-400",
+                        div { class: "flex justify-between text-fg-muted",
                             span { "Avg Tokens/Turn:" }
-                            span { class: "text-white font-mono", {format!("{:.0}", avg_tokens)} }
+                            span { class: "text-fg font-mono", {format!("{:.0}", avg_tokens)} }
                         }
                     }
-                    div { class: "mt-2 pt-2 border-t border-gray-700 text-[10px] text-gray-500 text-center",
+                    div { class: "mt-2 pt-2 border-t border-faint text-[10px] text-fg-muted text-center",
                         "Estimates based on Gemini pricing"
                     }
                 }

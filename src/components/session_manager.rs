@@ -83,14 +83,14 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
     rsx! {
     // Main content of the session manager
     div {
-        class: "flex flex-col bg-dark-bg text-white h-full w-full p-4",
+        class: "flex flex-col bg-app text-fg h-full w-full p-4",
             h2 { class: "text-lg font-bold mb-4", "Sessions" }
 
             // Search Input
             div {
                 class: "mb-4 relative",
                 input {
-                    class: "w-full bg-dark-input text-white border border-primary-600 rounded-md py-2 pl-10 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 placeholder-gray-400",
+                    class: "w-full bg-input text-fg border border-primary-600 rounded-md py-2 pl-10 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 placeholder-gray-400",
                     placeholder: "Search chats...",
                     value: "{filter_query}",
                     oninput: move |evt| {
@@ -99,7 +99,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                     }
                 }
                 div {
-                    class: "absolute left-2.5 top-2.5 text-gray-400",
+                    class: "absolute left-2.5 top-2.5 text-fg-muted",
                     Icon {
                         icon: fi_icons::FiSearch,
                         width: 14,
@@ -112,7 +112,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                 ul {
                     class: "space-y-2",
                     {paginated_sessions.iter().map(|session| {
-                        let active_class = if session.id == active_id { "bg-primary-500" } else { "" };
+                        let active_class = if session.id == active_id { "bg-btn-primary" } else { "" };
                         let session_id = session.id.clone();
                         let session_name = session.name.clone();
 
@@ -125,7 +125,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 
                         rsx! {
                             li {
-                                class: "flex items-center justify-between p-2 rounded-md cursor-pointer hover:bg-dark-card {active_class}",
+                                class: "flex items-center justify-between p-2 rounded-md cursor-pointer hover:bg-card {active_class}",
                                 key: "{session_id}",
                                 onclick: move |_| {
                                     if editing_session_id.read().is_none() {
@@ -135,7 +135,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                 },
                                 if editing_session_id.read().as_ref() == Some(&session_id) {
                                     input {
-                                        class: "flex-grow bg-dark-input text-white rounded-md p-1 focus:outline-none focus:ring-2 focus:ring-primary-500",
+                                        class: "flex-grow bg-input text-fg rounded-md p-1 focus:outline-none focus:ring-2 focus:ring-primary-500",
                                         value: "{temp_session_name.read()}",
                                         oninput: move |evt| temp_session_name.set(evt.value()),
                                         onkeydown: move |evt| {
@@ -157,7 +157,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                 div {
                                     class: "flex items-center ml-2",
                                     button {
-                                        class: "p-1 rounded-md text-gray-400 hover:bg-gray-600 hover:text-white mr-1",
+                                        class: "p-1 rounded-md text-fg-muted hover:bg-input hover:text-fg mr-1",
                                         onclick: move |event| {
                                             event.stop_propagation();
                                             temp_session_name.set(name_edit.clone());
@@ -170,7 +170,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                         }
                                     }
                                     button {
-                                        class: "p-1 rounded-md text-gray-400 hover:bg-red-600 hover:text-white",
+                                        class: "p-1 rounded-md text-fg-muted hover:bg-red-600 hover:text-fg",
                                         onclick: move |event| {
                                             event.stop_propagation();
                                             if settings.read().confirm_on_delete {
@@ -191,7 +191,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 
             // Footer Section: Pagination + New Chat
             div {
-                class: "mt-auto pt-4 border-t border-gray-700",
+                class: "mt-auto pt-4 border-t border-faint",
 
                 // Controls Container
                 div {
@@ -199,9 +199,9 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 
                     // Pagination Controls
                     div {
-                        class: "flex justify-between items-center px-2 text-sm text-gray-400",
+                        class: "flex justify-between items-center px-2 text-sm text-fg-muted",
                         button {
-                            class: "p-2 rounded hover:bg-dark-card disabled:opacity-50 disabled:cursor-not-allowed transition-colors",
+                            class: "p-2 rounded hover:bg-card disabled:opacity-50 disabled:cursor-not-allowed transition-colors",
                             disabled: *current_page.read() == 0,
                             onclick: move |_| {
                                 let p = *current_page.read();
@@ -214,7 +214,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                             "Page {*current_page.read() + 1} of {total_pages}"
                         }
                         button {
-                            class: "p-2 rounded hover:bg-dark-card disabled:opacity-50 disabled:cursor-not-allowed transition-colors",
+                            class: "p-2 rounded hover:bg-card disabled:opacity-50 disabled:cursor-not-allowed transition-colors",
                             disabled: *current_page.read() >= total_pages - 1,
                             onclick: move |_| {
                                 let p = *current_page.read();
@@ -226,10 +226,10 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 
                     // Items Per Page Selector
                     div {
-                        class: "flex justify-between items-center px-2 text-xs text-gray-400",
+                        class: "flex justify-between items-center px-2 text-xs text-fg-muted",
                         span { "Sessions per page:" }
                         select {
-                            class: "bg-dark-input border border-primary-600 rounded px-2 py-1 text-white text-xs focus:outline-none focus:ring-1 focus:ring-primary-500 cursor-pointer",
+                            class: "bg-input border border-primary-600 rounded px-2 py-1 text-fg text-xs focus:outline-none focus:ring-1 focus:ring-primary-500 cursor-pointer",
                             value: "{items_per_page.read()}",
                             onchange: move |evt| {
                                 if let Ok(val) = evt.value().parse::<usize>() {
@@ -246,7 +246,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                 }
 
                 button {
-                    class: "w-full px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 transition-colors",
+                    class: "w-full px-4 py-2 bg-btn-primary rounded-md text-fg font-semibold hover:bg-btn-primary-hover focus:outline-none focus:ring-2 focus:ring-primary-500 transition-colors",
                     onclick: move |_| {
                         session_state.write().create_session();
                         permission_manager.write().reset_turn_count();

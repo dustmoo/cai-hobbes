@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "feat/**" ]
     paths-ignore:
       - '**.md'
   pull_request:
@@ -15,9 +15,49 @@ env:
   CI: true
 
 jobs:
-  build:
+  # Cross-platform build check (fast, no tests or full build)
+  build-check:
+    name: Build Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install System Dependencies (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libglib2.0-dev libsecret-1-dev pkg-config libwebkit2gtk-4.1-dev
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install NPM dependencies
+      # Required for tailwindcss used in build.rs
+      run: npm ci
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+
+    - name: Cargo Check
+      run: cargo check --release
+
+  # Full build and test (macOS only)
+  build-macos:
     name: Build & Test (macOS)
     runs-on: macos-latest
+    needs: build-check  # Only run after build-check passes
 
     steps:
     - uses: actions/checkout@v4
@@ -33,12 +73,10 @@ jobs:
     - name: Install Dioxus CLI
       run: cargo install dioxus-cli
 
-
     - name: Security Audit
       run: |
         cargo install cargo-audit
         cargo audit
-
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -46,14 +84,10 @@ jobs:
         node-version: '20'
 
     - name: Install NPM dependencies
-      # Required for tailwindcss
       run: npm ci
 
-
     - name: Run Tests
-      # Run tests in release mode to match production
       run: cargo test --release
 
     - name: Build Release (CI Mode)
-      # This runs our build script which now checks for $CI to skip signing
       run: ./scripts/build_release.sh

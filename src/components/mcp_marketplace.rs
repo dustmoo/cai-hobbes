@@ -7,6 +7,7 @@ use crate::mcp::composio_client::{ComposioCategory, ComposioClient, ComposioTool
 use crate::mcp::manager::{McpManager, McpServerStatus, ServerStatus};
 use crate::settings::{McpSource, Settings, SettingsManager};
 use dioxus::prelude::*;
+use crate::SecretManagerTrait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -654,15 +655,15 @@ pub fn McpMarketplace() -> Element {
 
     rsx! {
         div {
-            class: "flex flex-col h-full bg-dark-bg text-white",
+            class: "flex flex-col h-full bg-app text-fg",
             div {
-                class: "p-4 border-b border-gray-700",
+                class: "p-4 border-b border-faint",
                 div {
                     class: "flex items-center justify-between mb-2",
                     h2 { class: "text-xl font-bold", "MCP Servers" }
                     if *active_tab.read() == ActiveTab::Marketplace {
                         div {
-                            class: "text-xs px-2 py-1 rounded bg-gray-700 text-gray-300",
+                            class: "text-xs px-2 py-1 rounded bg-input text-fg-muted",
                             if is_loading {
                                 "Loading..."
                             } else {
@@ -677,7 +678,7 @@ pub fn McpMarketplace() -> Element {
                         class: if *active_tab.read() == ActiveTab::Status {
                             "px-3 py-1 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
                         } else {
-                            "px-3 py-1 text-sm font-medium text-gray-400 hover:text-white"
+                            "px-3 py-1 text-sm font-medium text-fg-muted hover:text-fg"
                         },
                         onclick: move |_| active_tab.set(ActiveTab::Status),
                         "Status"
@@ -686,7 +687,7 @@ pub fn McpMarketplace() -> Element {
                         class: if *active_tab.read() == ActiveTab::Marketplace {
                             "px-3 py-1 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
                         } else {
-                            "px-3 py-1 text-sm font-medium text-gray-400 hover:text-white"
+                            "px-3 py-1 text-sm font-medium text-fg-muted hover:text-fg"
                         },
                         onclick: move |_| active_tab.set(ActiveTab::Marketplace),
                         "Marketplace"
@@ -695,7 +696,7 @@ pub fn McpMarketplace() -> Element {
                         class: if *active_tab.read() == ActiveTab::Installed {
                             "px-3 py-1 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
                         } else {
-                            "px-3 py-1 text-sm font-medium text-gray-400 hover:text-white"
+                            "px-3 py-1 text-sm font-medium text-fg-muted hover:text-fg"
                         },
                         onclick: move |_| active_tab.set(ActiveTab::Installed),
                         "Installed / Config"
@@ -745,7 +746,7 @@ pub fn McpMarketplace() -> Element {
                         div {
                             class: "flex justify-between items-center mt-4",
                             button {
-                                class: "px-3 py-1 bg-primary-600 hover:bg-primary-500 rounded text-sm font-medium transition-colors disabled:bg-gray-600 disabled:cursor-not-allowed",
+                                class: "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors disabled:bg-input disabled:cursor-not-allowed",
                                 // Disable if no previous cursors (we're on first page)
                                 disabled: cursor_stack.read().is_empty(),
                                 onclick: move |_| {
@@ -771,11 +772,11 @@ pub fn McpMarketplace() -> Element {
                                 "Previous"
                             }
                             span {
-                                class: "text-sm text-gray-400",
+                                class: "text-sm text-fg-muted",
                                 "Page {current_page} of {total_pages}"
                             }
                             button {
-                                class: "px-3 py-1 bg-primary-600 hover:bg-primary-500 rounded text-sm font-medium transition-colors disabled:bg-gray-600 disabled:cursor-not-allowed",
+                                class: "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors disabled:bg-input disabled:cursor-not-allowed",
                                 // Disable if no next cursor
                                 disabled: next_cursor.read().is_none(),
                                 onclick: move |_| {
@@ -805,11 +806,11 @@ pub fn McpMarketplace() -> Element {
                     ActiveTab::Installed => rsx! {
                         div {
                             class: "flex-1 flex flex-col min-h-0",
-                            p { class: "text-sm text-gray-400 mb-2", "Directly edit the JSON configuration for your MCP servers." }
+                            p { class: "text-sm text-fg-muted mb-2", "Directly edit the JSON configuration for your MCP servers." }
 
                             // Syntax highlighted editor
                             div {
-                                class: "flex-1 relative bg-dark-section rounded-md border border-gray-700",
+                                class: "flex-1 relative bg-section rounded-md border border-faint",
                                 id: "json-editor-container",
 
                                 // Highlighted background layer
@@ -849,7 +850,7 @@ pub fn McpMarketplace() -> Element {
                             div {
                                 class: "mt-4 flex justify-end gap-2",
                                 button {
-                                    class: "px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded font-medium transition-colors",
+                                    class: "px-4 py-2 bg-input hover:bg-gray-500 rounded font-medium transition-colors",
                                     onclick: move |_| {
                                         let content = config_content.read().clone();
                                         match serde_json::from_str::<serde_json::Value>(&content) {
@@ -868,7 +869,7 @@ pub fn McpMarketplace() -> Element {
                                     "Format JSON"
                                 }
                                 button {
-                                    class: "px-4 py-2 bg-primary-600 hover:bg-primary-500 rounded font-medium transition-colors",
+                                    class: "px-4 py-2 bg-btn-primary hover:bg-btn-primary-hover rounded font-medium transition-colors",
                                     onclick: move |_| {
                                         let content_to_save = config_content.read().clone();
                                         // Validate JSON before sending to coroutine
@@ -947,7 +948,7 @@ fn StatusView() -> Element {
     } else if above_optimal {
         "text-xs px-2 py-0.5 rounded bg-yellow-900/50 text-yellow-300 border border-yellow-600"
     } else {
-        "text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-300"
+        "text-xs px-2 py-0.5 rounded bg-input text-fg-muted"
     };
 
     rsx! {
@@ -957,7 +958,7 @@ fn StatusView() -> Element {
                 class: "flex items-center justify-between mb-4",
                 div {
                     class: "flex flex-col gap-1",
-                    p { class: "text-sm text-gray-400", "Status of all configured MCP servers." }
+                    p { class: "text-sm text-fg-muted", "Status of all configured MCP servers." }
                     // Aggregate tool count with warnings
                     div {
                         class: "flex items-center gap-2 flex-wrap",
@@ -980,7 +981,7 @@ fn StatusView() -> Element {
                     }
                 }
                 button {
-                    class: "px-3 py-1 bg-primary-600 hover:bg-primary-500 rounded text-sm font-medium transition-colors",
+                    class: "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors",
                     onclick: refresh_statuses,
                     "Refresh"
                 }
@@ -990,7 +991,7 @@ fn StatusView() -> Element {
                 Some(statuses) => rsx! {
                     if statuses.is_empty() {
                         div {
-                            class: "text-center text-gray-500 py-8",
+                            class: "text-center text-fg-muted py-8",
                             "No MCP servers configured. Add servers from the Marketplace tab."
                         }
                     } else {
@@ -1006,7 +1007,7 @@ fn StatusView() -> Element {
                     }
                 },
                 None => rsx! {
-                    div { class: "text-center text-gray-500 py-8", "Loading server status..." }
+                    div { class: "text-center text-fg-muted py-8", "Loading server status..." }
                 }
             }
         }
@@ -1100,7 +1101,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let (status_color, status_text, status_bg) = match status.status {
         ServerStatus::Loaded => ("bg-green-500", "Loaded", "bg-green-900/20"),
         ServerStatus::Error => ("bg-red-500", "Error", "bg-red-900/20"),
-        ServerStatus::Disabled => ("bg-gray-500", "Disabled", "bg-gray-900/20"),
+        ServerStatus::Disabled => ("bg-gray-500", "Disabled", "bg-app/20"),
         ServerStatus::NeedsAuth => ("bg-yellow-500", "Needs Auth", "bg-yellow-900/20"),
         ServerStatus::NotConfigured => ("bg-blue-500", "Not Configured", "bg-blue-900/20"),
     };
@@ -1160,7 +1161,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
 
     rsx! {
         div {
-            class: "bg-dark-section p-4 rounded-lg border border-gray-700 {status_bg}",
+            class: "bg-section p-4 rounded-lg border border-faint {status_bg}",
             div {
                 class: "flex items-start justify-between",
                 div {
@@ -1170,15 +1171,15 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                         class: "flex-1",
                         div {
                             class: "flex items-center gap-x-2 flex-wrap",
-                            h3 { class: "font-bold text-base", "{status.name}" }
+                            h3 { class: "font-bold text-fg", "{status.name}" }
                             span {
-                                class: "text-xs px-2 py-0.5 rounded {status_color} bg-opacity-20 text-white",
+                                class: "text-xs px-2 py-0.5 rounded {status_color} bg-opacity-20 text-fg",
                                 "{status_text}"
                             }
                             // Tool count badge for loaded servers
                             if status.status == ServerStatus::Loaded && status.tools > 0 {
                                 span {
-                                    class: "text-xs px-2 py-0.5 rounded bg-primary-900/30 text-primary-300 border border-primary-700",
+                                    class: "text-xs px-2 py-0.5 rounded bg-badge text-badge-text border border-subtle",
                                     "{status.tools} tools"
                                 }
                             }
@@ -1193,9 +1194,9 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     rsx! {
                                         button {
                                             class: if current_is_loaded {
-                                                "text-xs px-2 py-0.5 rounded bg-yellow-900/30 text-yellow-300 border border-yellow-700 hover:bg-yellow-900/50 transition-colors"
+                                                "text-xs px-2 py-0.5 rounded bg-action-warn text-action-warn-text border border-action-warn-border hover:opacity-80 transition-colors"
                                             } else {
-                                                "text-xs px-2 py-0.5 rounded bg-green-900/30 text-green-300 border border-green-700 hover:bg-green-900/50 transition-colors"
+                                                "text-xs px-2 py-0.5 rounded bg-action-success text-action-success-text border border-action-success-border hover:opacity-80 transition-colors"
                                             },
                                             onclick: move |_| {
                                                 let server_name = server_name.clone();
@@ -1245,7 +1246,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                             }
                         }
                         if !status.description.is_empty() {
-                            p { class: "text-sm text-gray-400 mt-1", "{status.description}" }
+                            p { class: "text-sm text-fg-muted mt-1", "{status.description}" }
                         }
                         if let Some(ref warning) = status.warning_message {
                             div {
@@ -1274,9 +1275,9 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                         class: "mt-4 flex justify-end gap-2",
                         button {
                             class: if *is_retrying.read() {
-                                "px-3 py-1 bg-gray-600 rounded text-sm font-medium cursor-not-allowed"
+                                "px-3 py-1 bg-input rounded text-sm font-medium cursor-not-allowed"
                             } else {
-                                "px-3 py-1 bg-primary-600 hover:bg-primary-500 rounded text-sm font-medium transition-colors"
+                                "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors"
                             },
                             disabled: *is_retrying.read(),
                             onclick: retry_server,
@@ -1382,9 +1383,9 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
             // Composio toolkit configuration section
             if is_composio && status.status == ServerStatus::Loaded {
                 div {
-                    class: "mt-4 border-t border-gray-600 pt-4",
+                    class: "mt-4 border-t border-faint pt-4",
                     div {
-                        class: "flex items-center justify-between cursor-pointer hover:bg-gray-700/50 rounded p-2 -m-2",
+                        class: "flex items-center justify-between cursor-pointer hover:bg-input/50 rounded p-2 -m-2",
                         onclick: {
                             let mut ui_state = ui_state;
                             // ui_state_manager captured by move
@@ -1397,11 +1398,11 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                             }
                         },
                         h4 {
-                            class: "text-sm font-semibold text-gray-300",
+                            class: "text-sm font-semibold text-fg-muted",
                             "Toolkit Loading Configuration"
                         }
                         span {
-                            class: "text-gray-400",
+                            class: "text-fg-muted",
                             if ui_state.read().composio_toolkit_expanded { "▼" } else { "▶" }
                         }
                     }
@@ -1411,7 +1412,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                             class: "mt-3 space-y-2",
                             if *toolkits_loading.read() {
                                 p {
-                                    class: "text-sm text-gray-400 italic",
+                                    class: "text-sm text-fg-muted italic",
                                     "Loading toolkits..."
                                 }
                             } else if let Some(error) = toolkits_error.read().as_ref() {
@@ -1421,7 +1422,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                 }
                             } else if toolkits.read().is_empty() {
                                 p {
-                                    class: "text-sm text-gray-400 italic",
+                                    class: "text-sm text-fg-muted italic",
                                     "No toolkits found. Connect toolkits via Composio."
                                 }
                             } else {
@@ -1438,11 +1439,11 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
 
                                         rsx! {
                                             div {
-                                                class: "flex items-center justify-between p-2 bg-dark-input rounded border border-gray-600",
+                                                class: "flex items-center justify-between p-2 bg-input rounded border border-faint",
                                                 div {
                                                     class: "flex items-center gap-2",
                                                     span {
-                                                        class: if toolkit.is_connected { "text-green-400" } else { "text-gray-500" },
+                                                        class: if toolkit.is_connected { "text-green-400" } else { "text-fg-muted" },
                                                         if toolkit.is_connected { "✓" } else { "○" }
                                                     }
                                                     span {
@@ -1450,13 +1451,13 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                         "{toolkit.display_name}"
                                                     }
                                                     span {
-                                                        class: "text-xs text-gray-400",
+                                                        class: "text-xs text-fg-muted",
                                                         "({toolkit.tool_count} tools)"
                                                     }
                                                 }
                                                 if toolkit.is_connected {
                                                     select {
-                                                        class: "px-2 py-1 bg-dark-section border border-gray-600 rounded text-xs",
+                                                        class: "px-2 py-1 bg-section border border-faint rounded text-xs",
                                                         value: if is_force_load { "force" } else { "ondemand" },
                                                         onchange: {
                                                             let slug = toolkit_slug.clone();
@@ -1516,7 +1517,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                     }
                                                 } else {
                                                     span {
-                                                        class: "text-xs text-gray-500",
+                                                        class: "text-xs text-fg-muted",
                                                         "Not connected"
                                                     }
                                                 }
@@ -1525,7 +1526,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     }
                                 }
                                 p {
-                                    class: "text-xs text-gray-400 mt-2",
+                                    class: "text-xs text-fg-muted mt-2",
                                     "On-demand uses Tool Router's search→execute pattern. Force load makes all tools available upfront."
                                 }
                             }
@@ -1644,7 +1645,7 @@ fn McpServerCard(
 
     rsx! {
         div {
-            class: "bg-dark-section p-4 rounded-lg border border-gray-700 hover:border-gray-600 transition-colors flex flex-col",
+            class: "bg-section p-4 rounded-lg border border-faint hover:border-faint transition-colors flex flex-col",
             div {
                 class: "flex justify-between items-start",
                 div {
@@ -1655,7 +1656,7 @@ fn McpServerCard(
                 if *is_connecting.read() {
                     // Step 4 Priority: Show "Authenticating..." or "Connecting..." even if registry thinks it's installed
                     button {
-                        class: "px-3 py-1 bg-gray-600 rounded text-sm font-medium cursor-wait flex items-center gap-2",
+                        class: "px-3 py-1 bg-input rounded text-sm font-medium cursor-wait flex items-center gap-2",
                         disabled: true,
                         span { class: "inline-block animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full" }
                         "{connection_status.read()}"
@@ -1663,7 +1664,7 @@ fn McpServerCard(
                 } else if let Some((installed, _)) = install_status.read().as_ref() {
                     if *installed {
                         button {
-                            class: "px-3 py-1 bg-gray-600 rounded text-sm font-medium cursor-not-allowed",
+                            class: "px-3 py-1 bg-input rounded text-sm font-medium cursor-not-allowed",
                             disabled: true,
                             if is_composio_tool { "Connected" } else { "Installed" }
                         }
@@ -1688,7 +1689,7 @@ fn McpServerCard(
                                     }
                                 } else {
                                     button {
-                                        class: "px-3 py-1 bg-primary-600 hover:bg-primary-500 rounded text-sm font-medium transition-colors",
+                                        class: "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors",
                                         onclick: {
                                             if mcp.name == "news_api" {
                                                 tracing::error!("DEBUG: Rendering Connect button for news_api. Auth: {:?}, Managed: {}", mcp.auth_scheme, mcp.use_managed_auth);
@@ -1761,7 +1762,7 @@ fn McpServerCard(
                             } // end div
                         } else {
                             button {
-                                class: "px-3 py-1 bg-primary-600 hover:bg-primary-500 rounded text-sm font-medium transition-colors",
+                                class: "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors",
                                 onclick: move |_| add_mcp.call(mcp_clone_for_add.clone()),
                                 "Add"
                             }
@@ -1769,7 +1770,7 @@ fn McpServerCard(
                     } // end if *installed else
                 } else {
                     button {
-                        class: "px-3 py-1 bg-gray-600 rounded text-sm font-medium cursor-not-allowed",
+                        class: "px-3 py-1 bg-input rounded text-sm font-medium cursor-not-allowed",
                         disabled: true,
                         "Loading..."
                     }
@@ -1777,7 +1778,7 @@ fn McpServerCard(
             }
             div {
                 class: "flex-grow mt-2",
-                p { class: "text-sm text-gray-400", "{mcp.description}" }
+                p { class: "text-sm text-fg-muted", "{mcp.description}" }
             }
             if !mcp.homepage.is_empty() {
                 div {

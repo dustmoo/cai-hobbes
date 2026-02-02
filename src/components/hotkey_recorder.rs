@@ -121,9 +121,9 @@ pub fn HotkeyRecorder(props: HotkeyRecorderProps) -> Element {
         "border-primary-600"
     };
     let bg_color = if *recording.read() {
-        "bg-dark-section"
+        "bg-section"
     } else {
-        "bg-dark-input"
+        "bg-input"
     };
     let text_color = if *recording.read() {
         "text-primary-300"
@@ -144,7 +144,7 @@ pub fn HotkeyRecorder(props: HotkeyRecorderProps) -> Element {
                     span { class: "text-xs text-primary-400 animate-pulse", "REC" }
                 } else {
                     // Edit icon or generic suggestion
-                     span { class: "text-xs text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity", "Click to Edit" }
+                     span { class: "text-xs text-fg-muted opacity-0 group-hover:opacity-100 transition-opacity", "Click to Edit" }
                 }
             }
         }

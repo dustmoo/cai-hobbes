@@ -635,7 +635,7 @@ pub fn MarkdownRenderer(
                 }
                 RenderNode::Code(text) => rsx! {
                     code {
-                        class: "bg-gray-800 text-gray-200 font-mono rounded-md px-2 py-1",
+                        class: "bg-input text-fg font-mono rounded-md px-2 py-1",
                         "{text}"
                     }
                 },
@@ -680,7 +680,7 @@ pub fn MarkdownRenderer(
                             div {
                                 class: "absolute top-full left-1/2 transform -translate-x-1/2 pt-2 z-50 opacity-0 pointer-events-none group-hover/comment:opacity-100 group-hover/comment:pointer-events-auto transition-opacity min-w-max",
                                 div {
-                                    class: "bg-gray-900 text-white text-xs rounded shadow-lg px-3 py-2",
+                                    class: "bg-app text-fg text-xs rounded shadow-lg px-3 py-2",
                                     div {
                                         class: "flex flex-col gap-1",
                                         // Comment text
@@ -690,16 +690,16 @@ pub fn MarkdownRenderer(
                                         }
                                         // Controls row
                                         div {
-                                            class: "flex justify-end gap-2 mt-1 pt-1 border-t border-gray-700",
+                                            class: "flex justify-end gap-2 mt-1 pt-1 border-t border-faint",
                                             "data-comment-id": "{comment.id}",
                                             span {
-                                                class: "p-1 hover:bg-gray-700 rounded cursor-pointer text-gray-400 hover:text-white transition-colors",
+                                                class: "p-1 hover:bg-input rounded cursor-pointer text-fg-muted hover:text-fg transition-colors",
                                                 title: "Edit comment",
                                                 "data-action": "edit",
                                                 Icon { width: 12, height: 12, icon: fi_icons::FiEdit2 }
                                             }
                                             span {
-                                                class: "p-1 hover:bg-gray-700 rounded cursor-pointer text-gray-400 hover:text-red-400 transition-colors",
+                                                class: "p-1 hover:bg-input rounded cursor-pointer text-fg-muted hover:text-red-400 transition-colors",
                                                 title: "Delete comment",
                                                 "data-action": "delete",
                                                 Icon { width: 12, height: 12, icon: fi_icons::FiTrash2 }
@@ -778,7 +778,7 @@ pub fn MarkdownRenderer(
                         table {
                             class: "table-auto w-full my-4",
                             thead {
-                                class: "bg-gray-800",
+                                class: "bg-section",
                                 tr {
                                     for header_cell in headers {
                                         th {
@@ -793,7 +793,7 @@ pub fn MarkdownRenderer(
                             tbody {
                                 for row in rows {
                                     tr {
-                                        class: "border-b border-gray-700",
+                                        class: "border-b border-faint",
                                         for cell in row {
                                             td {
                                                 class: "px-4 py-2",
@@ -1050,7 +1050,7 @@ pub fn ThinkingMarkdownRenderer(
                 Inline::Text(text) => rsx! { span { dangerous_inner_html: "{text}" } },
                 Inline::Code(text) => rsx! {
                     code {
-                        class: "bg-gray-800 text-gray-200 font-mono rounded px-1",
+                        class: "bg-section text-gray-200 font-mono rounded px-1",
                         "{text}"
                     }
                 },
@@ -1095,7 +1095,7 @@ pub fn ThinkingMarkdownRenderer(
                         // Compact: simple inline code styling
                         rsx! {
                             code {
-                                class: "bg-gray-800 text-gray-200 font-mono text-xs px-1 rounded",
+                                class: "bg-section text-gray-200 font-mono text-xs px-1 rounded",
                                 "{code}"
                             }
                         }
@@ -1125,7 +1125,7 @@ pub fn ThinkingMarkdownRenderer(
     } else {
         rsx! {
             div {
-                class: "thinking-content-full text-gray-300",
+                class: "thinking-content-full text-fg-muted",
                 for el in elements.iter() { {el.clone()} }
             }
         }

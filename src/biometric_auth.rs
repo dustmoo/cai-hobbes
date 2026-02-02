@@ -8,8 +8,6 @@
 //! The authenticated LAContext can be passed to keychain operations via
 //! kSecUseAuthenticationContext to avoid repeated password prompts.
 
-#![cfg(target_os = "macos")]
-
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2_foundation::NSString;

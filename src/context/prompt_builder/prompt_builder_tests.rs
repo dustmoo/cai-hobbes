@@ -35,14 +35,16 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
     let session = create_test_session();
     let session_state = create_test_session_state();
 
-    let mut settings = Settings::default();
-    settings.composio_profiles = vec![ComposioProfile {
-        name: "Test Profile".to_string(),
-        user_id: Some("test-user-id-123".to_string()),
-        api_key: Some("sk-test-api-key".to_string()),
+    let settings = Settings {
+        composio_profiles: vec![ComposioProfile {
+            name: "Test Profile".to_string(),
+            user_id: Some("test-user-id-123".to_string()),
+            api_key: Some("sk-test-api-key".to_string()),
+            ..Default::default()
+        }],
+        active_composio_profile: Some("Test Profile".to_string()),
         ..Default::default()
-    }];
-    settings.active_composio_profile = Some("Test Profile".to_string());
+    };
 
     let builder = PromptBuilder::new(&session, &settings, &session_state);
     let prompt = builder.build_prompt("Hello".to_string(), None);
@@ -86,13 +88,15 @@ fn test_composio_context_not_injected_when_profile_missing_api_key() {
     let session = create_test_session();
     let session_state = create_test_session_state();
 
-    let mut settings = Settings::default();
-    settings.composio_profiles = vec![ComposioProfile {
-        name: "Incomplete Profile".to_string(),
-        user_id: Some("test-user-id-123".to_string()),
-        api_key: None, // Missing API key
+    let settings = Settings {
+        composio_profiles: vec![ComposioProfile {
+            name: "Incomplete Profile".to_string(),
+            user_id: Some("test-user-id-123".to_string()),
+            api_key: None, // Missing API key
+            ..Default::default()
+        }],
         ..Default::default()
-    }];
+    };
 
     let builder = PromptBuilder::new(&session, &settings, &session_state);
     let prompt = builder.build_prompt("Hello".to_string(), None);
@@ -127,13 +131,15 @@ fn test_composio_context_not_injected_when_profile_missing_user_id() {
     let session = create_test_session();
     let session_state = create_test_session_state();
 
-    let mut settings = Settings::default();
-    settings.composio_profiles = vec![ComposioProfile {
-        name: "Incomplete Profile".to_string(),
-        user_id: None, // Missing User ID
-        api_key: Some("sk-test-api-key".to_string()),
+    let settings = Settings {
+        composio_profiles: vec![ComposioProfile {
+            name: "Incomplete Profile".to_string(),
+            user_id: None, // Missing User ID
+            api_key: Some("sk-test-api-key".to_string()),
+            ..Default::default()
+        }],
         ..Default::default()
-    }];
+    };
 
     let builder = PromptBuilder::new(&session, &settings, &session_state);
     let prompt = builder.build_prompt("Hello".to_string(), None);

@@ -238,7 +238,7 @@ pub fn ChatBarIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + Partia
 
     rsx! {
         button {
-            class: "p-2 rounded-full text-gray-400 hover:bg-dark-card hover:text-white focus:outline-none focus:ring-2 focus:ring-gray-600 transition-colors",
+            class: "p-2 rounded-full text-fg-muted hover:bg-card hover:text-fg focus:outline-none focus:ring-2 focus:ring-gray-600 transition-colors",
             onclick: move |evt| onclick.call(evt),
             title: "{title}",
             dioxus_free_icons::Icon {

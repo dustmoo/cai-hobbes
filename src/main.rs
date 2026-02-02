@@ -7,31 +7,44 @@
 use dioxus::desktop::tao::dpi::PhysicalSize;
 use dioxus::desktop::tao::event::{Event, WindowEvent};
 use dioxus::desktop::{
-    muda::MenuEvent, tao::platform::macos::WindowBuilderExtMacOS, use_window,
+    muda::MenuEvent, use_window,
     use_wry_event_handler, Config, WindowBuilder,
 };
+#[cfg(target_os = "macos")]
+use dioxus::desktop::tao::platform::macos::WindowBuilderExtMacOS;
 use dioxus::prelude::*;
 use dotenvy::dotenv;
 use futures_util::StreamExt;
 
+#[cfg(target_os = "macos")]
 mod biometric_auth;
 mod components;
 mod constants;
 mod context;
 mod gemini;
 mod hotkey;
+#[cfg(target_os = "macos")]
 mod keychain_ffi;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod keychain_tests;
 mod mcp;
 mod menu;
 mod permissions;
 mod processing;
+mod secret_types;
+#[cfg(target_os = "macos")]
 mod secret_manager;
+#[cfg(not(target_os = "macos"))]
+mod secret_manager_generic;
+#[cfg(not(target_os = "macos"))]
+use secret_manager_generic as secret_manager;
+
+pub use secret_types::SecretManagerTrait;
 mod services;
 mod session;
 mod settings;
 mod skills;
+mod theme;
 mod tray;
 
 use tray::{APP_QUIT, WINDOW_VISIBLE};
@@ -67,11 +80,14 @@ fn main() {
                             .with_visible(true)
                             .with_resizable(true)
                             .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(initial_width, initial_height));
+
                         #[cfg(target_os = "macos")]
                         {
                             window = window
                                 .with_titlebar_transparent(true);
                         }
+                        #[cfg(not(target_os = "macos"))]
+                        let window = window;
                         window
                     }
                 )
@@ -80,7 +96,7 @@ fn main() {
                     + r#"<link rel="preconnect" href="https://fonts.googleapis.com">"#
                     + r#"<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>"#
                     + r#"<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">"#
-                    + r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #1A1A1A; font-family: 'Inter', system-ui, sans-serif; }</style>"#
+                    + r#"<style>html, body { height: 100%; margin: 0; padding: 0; font-family: 'Inter', system-ui, sans-serif; }</style>"#
                     + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"#
                     + r#"<style>"# + include_str!("../assets/main.css") + r#"</style>"#
                 )
@@ -139,10 +155,10 @@ use crate::components::chat_input::ChatCommand;
 fn RestartRequired() -> Element {
     rsx! {
         div {
-            class: "dark flex flex-col items-center justify-center h-screen bg-gray-900 text-white text-center p-8",
+            class: "flex flex-col items-center justify-center h-screen bg-app text-fg text-center p-8",
             h1 { class: "text-2xl font-bold mb-4", "Permissions Granted" }
             p { class: "mb-6", "Hobbes needs to be restarted for the changes to take effect." }
-            p { class: "text-sm text-gray-400", "Please quit and reopen the application." }
+            p { class: "text-sm text-fg-muted", "Please quit and reopen the application." }
         }
     }
 }
@@ -153,11 +169,10 @@ fn app() -> Element {
         let mut state = SessionState::load().unwrap_or_else(|e| {
             tracing::error!("Failed to load session state during startup: {}", e);
             // Create default state with save DISABLED to protect backup
-            let fallback = SessionState {
+            SessionState {
                 save_disabled: true,
                 ..Default::default()
-            };
-            fallback
+            }
         });
         if state.sessions.is_empty() {
             tracing::info!("No sessions found, creating new default session.");
@@ -190,6 +205,9 @@ fn app() -> Element {
     // Skills registry - initialize empty, load async to avoid blocking UI
     let mut skill_registry = use_context_provider(|| Signal::new(skills::SkillRegistry::new()));
     let mut skills_loaded = use_signal(|| false);
+
+    // Sync theme to DOM (class on <html> element)
+    theme::use_theme_sync(settings);
 
     // Asynchronously load skills from ~/.hobbes/skills
     use_effect(move || {
@@ -236,6 +254,7 @@ fn app() -> Element {
 
     // Asynchronously load secrets from keychain using biometric authentication
     // This prompts once for Touch ID/password, then uses that context for all secrets
+    #[cfg(target_os = "macos")]
     use_effect(move || {
         if !secrets_loaded() {
             // Capture profile names before entering the blocking task
@@ -341,16 +360,64 @@ fn app() -> Element {
         }
     });
 
+    // Simple secret loading for non-macOS platforms (no biometrics)
+    #[cfg(not(target_os = "macos"))]
+    use_effect(move || {
+        if !secrets_loaded() {
+            let profile_names: Vec<String> = settings
+                .read()
+                .composio_profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+
+            spawn(async move {
+                let loaded_secrets = tokio::task::spawn_blocking(move || {
+                    let mut sm = secret_manager::SecretManager::new();
+                    sm.load_all_from_keychain();
+                    for profile_name in &profile_names {
+                        sm.load_composio_key(profile_name);
+                    }
+                    sm
+                }).await;
+
+                if let Ok(sm) = loaded_secrets {
+                    secret_manager.set(sm);
+                    let sm_read = secret_manager.read();
+                    let mut current_settings = settings.write();
+
+                    if let Some(api_key) = sm_read.get("api_key") {
+                        current_settings.gemini_config.api_key = Some(api_key.clone());
+                    }
+                    if let Some(smithery_api_key) = sm_read.get("smithery_api_key") {
+                        current_settings.smithery_api_key = Some(smithery_api_key.clone());
+                    }
+                    if let Some(composio_api_key) = sm_read.get("composio_api_key") {
+                        current_settings.composio_api_key = Some(composio_api_key.clone());
+                    }
+
+                    for profile in &mut current_settings.composio_profiles {
+                        if let Some(api_key) = sm_read.get_composio_key(&profile.name) {
+                            profile.api_key = Some(api_key.clone());
+                        }
+                    }
+                    tracing::debug!("Secrets loaded from generic keychain successfully");
+                }
+                secrets_loaded.set(true);
+            });
+        }
+    });
+
     // Show loading screen while waiting for keychain secrets
     if !secrets_loaded() {
         return rsx! {
             div {
-                class: "dark flex flex-col items-center justify-center h-screen bg-gray-900 text-white text-center p-8",
+                class: "flex flex-col items-center justify-center h-screen bg-app text-fg text-center p-8",
                 div {
-                    class: "animate-spin rounded-full h-12 w-12 border-b-2 border-white mb-4"
+                    class: "animate-spin rounded-full h-12 w-12 border-b-2 border-fg mb-4"
                 }
                 h1 { class: "text-xl font-semibold mb-2", "Loading..." }
-                p { class: "text-sm text-gray-400", "Authenticate to access your saved credentials..." }
+                p { class: "text-sm text-fg-muted", "Authenticate to access your saved credentials..." }
             }
         };
     }
@@ -413,10 +480,22 @@ fn app() -> Element {
 
     let needs_onboarding = use_memo(move || {
         let settings = settings.read();
+        
+        // Check TOS acceptance (compare against current version)
+        let tos_accepted = settings
+            .tos_accepted_version
+            .as_ref()
+            .map(|v| v == crate::settings::CURRENT_TOS_VERSION)
+            .unwrap_or(false);
+        
+        // Check API key presence
         let key_present =
             settings.gemini_config.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok();
-        !key_present
+        
+        // Need onboarding if either TOS not accepted or API key missing
+        !tos_accepted || !key_present
     });
+
     let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
     let mcp_manager = use_context_provider(|| {
         Signal::new(McpManager::new(
@@ -703,27 +782,22 @@ fn app() -> Element {
 
     // Handle global SwitchToSettingsTab command
     use_effect(move || {
-        if let Some(cmd) = chat_command.read().clone() {
-            match cmd {
-                ChatCommand::SwitchToSettingsTab(tab, slug) => {
-                    tracing::info!("App handling SwitchToSettingsTab: {:?}, slug: {:?}", tab, slug);
-                    // 1. Show Settings Panel
-                    show_settings_panel.set(true);
-                    show_session_manager.set(false);
-                    show_mcp_manager.set(false);
+        if let Some(ChatCommand::SwitchToSettingsTab(tab, slug)) = chat_command.read().clone() {
+            tracing::info!("App handling SwitchToSettingsTab: {:?}, slug: {:?}", tab, slug);
+            // 1. Show Settings Panel
+            show_settings_panel.set(true);
+            show_session_manager.set(false);
+            show_mcp_manager.set(false);
 
-                    // 2. Update UiState
-                    let mut state = ui_state.write();
-                    state.active_settings_tab = tab;
-                    state.selected_byoa_slug = slug;
+            // 2. Update UiState
+            let mut state = ui_state.write();
+            state.active_settings_tab = tab;
+            state.selected_byoa_slug = slug;
 
-                    // 3. Clear command
-                    spawn(async move {
-                        chat_command.set(None);
-                    });
-                }
-                _ => {}
-            }
+            // 3. Clear command
+            spawn(async move {
+                chat_command.set(None);
+            });
         }
     });
 
@@ -732,7 +806,7 @@ fn app() -> Element {
             RestartRequired {}
         } else if *needs_onboarding.read() {
             div {
-                class: "dark flex items-center justify-center h-screen bg-dark-bg text-white",
+                class: "flex items-center justify-center h-screen bg-app text-fg",
                 components::onboarding::Onboarding {
                     needs_onboarding,
                 }
@@ -762,7 +836,7 @@ fn app() -> Element {
                     },
                 }
                     div {
-                        class: "dark flex flex-col h-screen", // Changed to flex-col
+                        class: "flex flex-col h-screen bg-app text-fg", // Removed forced 'dark' class to allow global theme inheritance
                         // The draggable header has been removed as per user request.
                         // Main content area
                         div {
@@ -780,7 +854,7 @@ fn app() -> Element {
                                 div {
                                     id: "session-manager-panel",
                                     style: "width: {settings_panel_width}px;",
-                                    class: "bg-dark-section text-white h-full",
+                                    class: "bg-section text-fg h-full",
                                     components::session_manager::SessionManager {}
                                 }
                                 // Draggable Divider
@@ -802,7 +876,7 @@ fn app() -> Element {
                                 div {
                                     id: "settings-panel",
                                     style: "width: {settings_panel_width}px;",
-                                    class: "bg-dark-section text-white h-full",
+                                    class: "bg-section text-fg h-full",
                                     // This is the correct location for the settings panel component
                                     components::settings_panel::SettingsPanel {}
                                 }
@@ -825,7 +899,7 @@ fn app() -> Element {
                                 div {
                                     id: "mcp-manager-panel",
                                     style: "width: {settings_panel_width}px;",
-                                    class: "bg-dark-section text-white h-full",
+                                    class: "bg-section text-fg h-full",
                                     components::mcp_marketplace::McpMarketplace {}
                                 }
                                 // Draggable Divider

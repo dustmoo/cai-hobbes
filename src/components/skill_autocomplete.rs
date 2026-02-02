@@ -48,12 +48,12 @@ pub fn SkillAutocomplete(props: SkillAutocompleteProps) -> Element {
 
     rsx! {
         div {
-            class: "fixed w-72 bg-dark-card border border-primary-700 rounded-lg shadow-xl z-[100] overflow-hidden py-1 max-h-64 overflow-y-auto transition-opacity duration-150 {opacity}",
+            class: "fixed w-72 bg-card border border-subtle rounded-lg shadow-xl z-[100] overflow-hidden py-1 max-h-64 overflow-y-auto transition-opacity duration-150 {opacity}",
             style: "bottom: {bottom}px; left: {left}px;",
             
             // Keyboard navigation hint
             div {
-                class: "px-3 py-1 text-[10px] text-gray-500 border-b border-primary-800 flex items-center gap-2",
+                class: "px-3 py-1 text-[10px] text-fg-muted border-b border-primary-800 flex items-center gap-2",
                 span { "↑↓ Navigate" }
                 span { "•" }
                 span { "Enter Select" }
@@ -65,9 +65,9 @@ pub fn SkillAutocomplete(props: SkillAutocompleteProps) -> Element {
                 button {
                     key: "{skill.metadata.name}",
                     class: if i == props.selected_index {
-                        "w-full text-left px-4 py-2 text-sm text-white bg-primary-700 flex flex-col items-start gap-0.5"
+                        "w-full text-left px-4 py-2 text-sm text-fg bg-primary-700 flex flex-col items-start gap-0.5"
                     } else {
-                        "w-full text-left px-4 py-2 text-sm text-gray-300 hover:bg-primary-900/50 hover:text-white transition-colors flex flex-col items-start gap-0.5 group"
+                        "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex flex-col items-start gap-0.5 group"
                     },
                     onclick: {
                         let s = skill.clone();
@@ -89,7 +89,7 @@ pub fn SkillAutocomplete(props: SkillAutocompleteProps) -> Element {
                         }
                     }
                     if !skill.metadata.description.is_empty() {
-                         span { class: "text-xs text-gray-400 truncate w-full", "{skill.metadata.description}" }
+                         span { class: "text-xs text-fg-muted truncate w-full", "{skill.metadata.description}" }
                     }
                 }
             }

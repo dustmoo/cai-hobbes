@@ -10,6 +10,15 @@ pub enum LlmProvider {
     Gemini,
 }
 
+/// Application color theme
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+    System,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GeminiConfig {
     #[serde(skip)]
@@ -157,6 +166,13 @@ pub struct Settings {
     pub composio_api_key: Option<String>,
     #[serde(skip_serializing)]
     pub composio_user_id: Option<String>,
+    /// Application color theme (Dark, Light, or System)
+    #[serde(default)]
+    pub theme: Theme,
+    /// Version of Terms of Service the user accepted (e.g., "1.0")
+    /// None means TOS has never been accepted. Compare against CURRENT_TOS_VERSION.
+    #[serde(default)]
+    pub tos_accepted_version: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -243,6 +259,14 @@ pub fn get_app_name() -> &'static str {
 /// Attribution line for About screens (applies to both variants)
 pub const APP_ATTRIBUTION: &str =
     "Made w/ ❤️ by Clear Mirror LLC, Gemini 2.5, 3 and Claude model families.";
+
+// ============================================================================
+// TERMS OF SERVICE VERSION
+// ============================================================================
+// Bump this version string when TOS content changes to force re-acceptance.
+// Users who accepted an older version will see the TOS screen again.
+// ============================================================================
+pub const CURRENT_TOS_VERSION: &str = "1.0";
 
 /// Configuration for a single Composio toolkit's loading behavior
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -400,6 +424,8 @@ impl Default for Settings {
             composio_entity_id: None,
             composio_api_key: None,
             composio_user_id: None,
+            theme: Theme::default(),
+            tos_accepted_version: None,
         }
     }
 }

@@ -1,7 +1,9 @@
+#![cfg(target_os = "macos")]
 #[cfg(test)]
 mod tests {
     use crate::keychain_ffi;
     use crate::secret_manager::{SecretManager, COMPOSIO_KEY_PREFIX};
+    use crate::SecretManagerTrait;
 
     // Mock constants
     const PROFILE_NAME: &str = "ReproProfile";
