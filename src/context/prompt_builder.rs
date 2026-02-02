@@ -701,6 +701,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    #[allow(clippy::approx_constant)]
     fn create_mock_session_with_tools() -> Session {
         let tool1: Tool = serde_json::from_value(json!({
             "name": "get_weather",
@@ -1005,7 +1006,7 @@ mod tests {
         // 3. Verify System Instruction contains TOOL COMPLETION INSTRUCTION
         // The current implementation will likely FAIL this because it looks at the last message (placeholder)
         let system_instruction = if let Some(crate::components::llm::Part::Text { text, .. }) =
-            prompt.system_instruction.as_ref().unwrap().parts.get(0)
+            prompt.system_instruction.as_ref().unwrap().parts.first()
         {
             text
         } else {
@@ -1019,7 +1020,7 @@ mod tests {
         // 4. Verify the contents do NOT contain the empty placeholder
         // The current implementation will likely FAIL this
         let last_content = prompt.contents.last().unwrap();
-        if let Some(crate::components::llm::Part::Text { text, .. }) = last_content.parts.get(0) {
+        if let Some(crate::components::llm::Part::Text { text, .. }) = last_content.parts.first() {
             assert!(
                 !text.is_empty(),
                 "Last content should not be empty placeholder"

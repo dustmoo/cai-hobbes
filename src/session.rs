@@ -588,9 +588,11 @@ mod tests {
         let test_path = temp_dir.path().join("test_sessions.json");
 
         // Create a test SessionState
-        let mut state = SessionState::default();
-        state.window_width = 800.0;
-        state.window_height = 600.0;
+        let state = SessionState {
+            window_width: 800.0,
+            window_height: 600.0,
+            ..Default::default()
+        };
 
         // Manually save to our test path (bypassing get_sessions_path)
         let data = serde_json::to_string_pretty(&state).expect("Failed to serialize");

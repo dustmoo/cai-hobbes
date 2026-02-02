@@ -102,7 +102,7 @@ mod tests {
 
         // Verify we made requests (connected_accounts + tool execution)
         let requests = mock_server.received_requests().await.unwrap();
-        assert!(requests.len() >= 1, "Expected at least 1 request");
+        assert!(!requests.is_empty(), "Expected at least 1 request");
 
         // Find the tool execution request
         let tool_req = requests

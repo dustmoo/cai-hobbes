@@ -157,7 +157,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
 
     // If we need to show permission prompt, render that instead
     if props.show_permission_prompt && skill_call.status == SkillCallStatus::Pending {
-        if let (Some(on_approve), Some(on_deny)) = (props.on_approve.clone(), props.on_deny) {
+        if let (Some(on_approve), Some(on_deny)) = (props.on_approve, props.on_deny) {
             return rsx! {
                 SkillPermissionPrompt {
                     skill_call: skill_call.clone(),

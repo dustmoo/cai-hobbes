@@ -6,6 +6,7 @@ use crate::mcp::composio_client::validate_composio_api_key;
 use crate::settings::{is_sandboxed, HotkeySettings, Settings, SettingsManager};
 use crate::{context::permissions::ToolCategory, session::SessionState};
 use dioxus::prelude::*;
+use crate::SecretManagerTrait;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use rfd;
 use std::io::Write;

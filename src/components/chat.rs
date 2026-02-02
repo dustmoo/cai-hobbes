@@ -488,6 +488,8 @@ pub fn ChatWindow(
             }
 
             let prompt_data = {
+                // Fetch fresh MCP context to ensure tools are available for this request
+                let mcp_context = mcp_manager.read().get_mcp_context().await;
                 let user_prompt = user_message.clone();
 
                 // Safely get conversation summary
@@ -501,6 +503,10 @@ pub fn ChatWindow(
                     let mut state = session_state.write();
                     if let Some(session) = state.get_active_session_mut() {
                         session.active_context.conversation_summary = conversation_summary;
+                        // Inject fresh MCP tools into session context for prompt building
+                        if !mcp_context.servers.is_empty() {
+                            session.active_context.mcp_tools = Some(mcp_context);
+                        }
                     }
                 }
 

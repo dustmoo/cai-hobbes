@@ -6,6 +6,7 @@ use crate::mcp::composio_client::{composio_to_rmcp_tool, ComposioClient};
 use dioxus::prelude::spawn;
 use dioxus::prelude::Signal;
 use dioxus_signals::{Readable, Writable};
+use crate::SecretManagerTrait;
 use rmcp::model::{CallToolRequestParam, CallToolResult, PaginatedRequestParam, Tool};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use crate::mcp::tool_selection::{TOOL_SELECTION_THRESHOLD, ToolSelectionRequest, ToolCandidate};
@@ -934,10 +935,10 @@ impl McpManager {
     #[allow(dead_code)]
     pub async fn add_or_update_mcp_server(
         &self,
-        config_path: &PathBuf,
+        config_path: &std::path::Path,
         new_config: McpServerConfig,
     ) -> Result<(), String> {
-        let mut configs = self.load_configs(config_path.clone()).await;
+        let mut configs = self.load_configs(config_path.to_path_buf()).await;
 
         if let Some(existing_config) = configs.iter_mut().find(|c| c.name == new_config.name) {
             *existing_config = new_config;
@@ -951,7 +952,7 @@ impl McpManager {
     #[allow(dead_code)]
     async fn save_configs(
         &self,
-        config_path: &PathBuf,
+        config_path: &std::path::Path,
         configs: Vec<McpServerConfig>,
     ) -> Result<(), String> {
         let mcp_servers_map: HashMap<String, McpServerConfig> = configs
@@ -967,7 +968,7 @@ impl McpManager {
         let content = serde_json::to_string_pretty(&wrapper)
             .map_err(|e| format!("Failed to serialize MCP servers: {}", e))?;
 
-        let path = config_path.clone();
+        let path = config_path.to_path_buf();
         tokio::task::spawn_blocking(move || fs::write(path, content))
             .await
             .map_err(|e| format!("Save task panicked: {}", e))?
@@ -1014,6 +1015,12 @@ impl McpManager {
             Some(t) => t.clone(),
             None => return Err(format!("Tool not found: {}", tool_name)),
         };
+
+        // BYOA FIX: Re-inject custom credentials before tool execution (Pattern 25)
+        // This ensures any credentials updated via the UI are used immediately.
+        if let McpClientType::NativeComposio(ref composio_client) = client.service {
+            Self::inject_custom_credentials(composio_client, &self.secret_manager);
+        }
 
         let (tx, rx) = mpsc::unbounded_channel();
         let service = client.service.clone();
@@ -1661,6 +1668,7 @@ impl McpManager {
     /// Connect a toolkit to the natively managed Composio server.
     /// Encapsulates the 5-step lifecycle: AuthConfig, Registry (PATCH/Create),
     /// OAuth, and User Binding.
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect_toolkit(
         &self,
         toolkit_slug: String,

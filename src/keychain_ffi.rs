@@ -5,8 +5,6 @@
 //! LAContext to avoid repeated password prompts. This is the key integration point
 //! between LocalAuthentication and Security frameworks.
 
-#![cfg(target_os = "macos")]
-
 use crate::biometric_auth::AuthContext;
 use core_foundation::base::{CFTypeRef, TCFType};
 use core_foundation::boolean::CFBoolean;

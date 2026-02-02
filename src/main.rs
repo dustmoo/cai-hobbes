@@ -31,12 +31,15 @@ mod mcp;
 mod menu;
 mod permissions;
 mod processing;
+mod secret_types;
 #[cfg(target_os = "macos")]
 mod secret_manager;
 #[cfg(not(target_os = "macos"))]
 mod secret_manager_generic;
 #[cfg(not(target_os = "macos"))]
 use secret_manager_generic as secret_manager;
+
+pub use secret_types::SecretManagerTrait;
 mod services;
 mod session;
 mod settings;
@@ -165,11 +168,10 @@ fn app() -> Element {
         let mut state = SessionState::load().unwrap_or_else(|e| {
             tracing::error!("Failed to load session state during startup: {}", e);
             // Create default state with save DISABLED to protect backup
-            let fallback = SessionState {
+            SessionState {
                 save_disabled: true,
                 ..Default::default()
-            };
-            fallback
+            }
         });
         if state.sessions.is_empty() {
             tracing::info!("No sessions found, creating new default session.");
@@ -764,27 +766,22 @@ fn app() -> Element {
 
     // Handle global SwitchToSettingsTab command
     use_effect(move || {
-        if let Some(cmd) = chat_command.read().clone() {
-            match cmd {
-                ChatCommand::SwitchToSettingsTab(tab, slug) => {
-                    tracing::info!("App handling SwitchToSettingsTab: {:?}, slug: {:?}", tab, slug);
-                    // 1. Show Settings Panel
-                    show_settings_panel.set(true);
-                    show_session_manager.set(false);
-                    show_mcp_manager.set(false);
+        if let Some(ChatCommand::SwitchToSettingsTab(tab, slug)) = chat_command.read().clone() {
+            tracing::info!("App handling SwitchToSettingsTab: {:?}, slug: {:?}", tab, slug);
+            // 1. Show Settings Panel
+            show_settings_panel.set(true);
+            show_session_manager.set(false);
+            show_mcp_manager.set(false);
 
-                    // 2. Update UiState
-                    let mut state = ui_state.write();
-                    state.active_settings_tab = tab;
-                    state.selected_byoa_slug = slug;
+            // 2. Update UiState
+            let mut state = ui_state.write();
+            state.active_settings_tab = tab;
+            state.selected_byoa_slug = slug;
 
-                    // 3. Clear command
-                    spawn(async move {
-                        chat_command.set(None);
-                    });
-                }
-                _ => {}
-            }
+            // 3. Clear command
+            spawn(async move {
+                chat_command.set(None);
+            });
         }
     });
 

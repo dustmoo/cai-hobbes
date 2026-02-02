@@ -1,5 +1,6 @@
 use crate::mcp::composio_client::ComposioClient;
 use crate::secret_manager::SecretManager;
+use crate::SecretManagerTrait;
 use crate::settings::Settings;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};

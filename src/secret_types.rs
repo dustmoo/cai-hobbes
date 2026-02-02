@@ -1,0 +1,330 @@
+//! Shared types and helpers for secret management across platforms.
+//!
+//! This module is unconditionally compiled and contains no platform-specific code.
+
+use std::collections::HashMap;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+/// Known secret keys used by the application (Gemini, Smithery)
+pub const KNOWN_KEYS: &[&str] = &[
+    "api_key",          // Gemini API key
+    "smithery_api_key", // Smithery API key
+];
+
+/// Prefix for Composio profile API keys (e.g., "composio_api_key_default")
+pub const COMPOSIO_KEY_PREFIX: &str = "composio_api_key_";
+
+/// Prefix for custom tool credentials (e.g., "composio_tool_slack__api_key")
+pub const CUSTOM_TOOL_PREFIX: &str = "composio_tool_";
+
+/// Separator between slug and field in custom tool keys
+pub const CUSTOM_TOOL_SEPARATOR: &str = "__";
+
+/// Key name for the CSV index of all custom tool keys
+pub const CUSTOM_KEYS_INDEX_KEY: &str = "composio_custom_keys_index";
+
+// ============================================================================
+// CUSTOM TOOL KEY HELPERS
+// ============================================================================
+
+/// Format a custom tool credential key from its components.
+///
+/// # Example
+/// ```
+/// assert_eq!(format_custom_tool_key("slack", "api_key"), "composio_tool_slack__api_key");
+/// ```
+pub fn format_custom_tool_key(slug: &str, field: &str) -> String {
+    format!("{}{}{}{}", CUSTOM_TOOL_PREFIX, slug, CUSTOM_TOOL_SEPARATOR, field)
+}
+
+/// Parse a custom tool credential key into its slug and field components.
+///
+/// Returns `None` if the key doesn't match the expected format.
+pub fn parse_custom_tool_key(key: &str) -> Option<(&str, &str)> {
+    let rest = key.strip_prefix(CUSTOM_TOOL_PREFIX)?;
+    let (slug, field) = rest.split_once(CUSTOM_TOOL_SEPARATOR)?;
+    if slug.is_empty() || field.is_empty() {
+        return None;
+    }
+    Some((slug, field))
+}
+
+/// Generate the prefix used to check if any credentials exist for a toolkit.
+pub fn toolkit_key_prefix(slug: &str) -> String {
+    format!("{}{}{}", CUSTOM_TOOL_PREFIX, slug, CUSTOM_TOOL_SEPARATOR)
+}
+
+/// Check if a given key belongs to a specific toolkit slug.
+pub fn key_belongs_to_toolkit(key: &str, slug: &str) -> bool {
+    key.starts_with(&toolkit_key_prefix(slug))
+}
+
+// ============================================================================
+// INDEX MANIPULATION HELPERS
+// ============================================================================
+
+/// Parse the comma-separated index string into a list of keys.
+pub fn parse_index_csv(csv_string: &str) -> Vec<&str> {
+    csv_string
+        .split(',')
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .collect()
+}
+
+/// Add a key to the index CSV string if it doesn't already exist.
+///
+/// Returns the new index string.
+pub fn add_to_index_csv(current_index: &str, new_key: &str) -> String {
+    let keys = parse_index_csv(current_index);
+    if keys.contains(&new_key) {
+        return current_index.to_string();
+    }
+    if current_index.is_empty() {
+        new_key.to_string()
+    } else {
+        format!("{},{}", current_index, new_key)
+    }
+}
+
+/// Remove a key from the index CSV string.
+///
+/// Returns the new index string.
+pub fn remove_from_index_csv(current_index: &str, key_to_remove: &str) -> String {
+    parse_index_csv(current_index)
+        .into_iter()
+        .filter(|k| *k != key_to_remove)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+// ============================================================================
+// TRAIT DEFINITION
+// ============================================================================
+
+/// Common trait for secret management across platforms.
+///
+/// This trait formalizes the API parity between macOS and generic implementations.
+/// Methods with default implementations reduce duplication; platform-specific
+/// implementations only need to provide the core keychain operations.
+pub trait SecretManagerTrait {
+    // -------------------------------------------------------------------------
+    // REQUIRED METHODS (platform-specific)
+    // -------------------------------------------------------------------------
+
+    /// Load all known secrets from the platform keychain.
+    fn load_all_from_keychain(&mut self);
+
+    /// Get a secret by key from the in-memory cache.
+    fn get(&self, key: &str) -> Option<&String>;
+
+    /// Set a secret (updates cache and saves to keychain).
+    fn set(&mut self, key: &str, value: String) -> Result<(), String>;
+
+    /// Delete a secret (removes from cache and keychain).
+    fn delete(&mut self, key: &str) -> Result<(), String>;
+
+    /// Load a specific Composio key into the cache from keychain.
+    fn load_composio_key(&mut self, profile_name: &str);
+
+    /// Manually update a secret in the cache without keychain write.
+    fn update_cache(&mut self, key: String, value: String);
+
+    /// Delete all loaded secrets from the platform keychain.
+    fn delete_all(&mut self) -> Vec<String>;
+
+    /// Get the current index value directly from keychain (for index updates).
+    fn get_index_from_keychain(&self) -> Option<String>;
+
+    /// Get a reference to the secrets cache for credential extraction.
+    fn secrets_ref(&self) -> &std::collections::HashMap<String, String>;
+
+    /// Check if a key exists in the secrets cache.
+    fn has_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    // -------------------------------------------------------------------------
+    // DEFAULT IMPLEMENTATIONS (shared logic)
+    // -------------------------------------------------------------------------
+
+    /// Retrieve all loaded custom tool credentials.
+    ///
+    /// Returns a nested map: `Map<ToolkitSlug, Map<FieldName, Value>>`.
+    fn get_custom_tool_credentials(&self) -> HashMap<String, HashMap<String, String>> {
+        extract_custom_tool_credentials(self.secrets_ref())
+    }
+
+    /// Check if there are any custom credentials for a specific toolkit slug.
+    fn has_custom_tool_credentials(&self, slug: &str) -> bool {
+        self.secrets_ref().keys().any(|k| key_belongs_to_toolkit(k, slug))
+    }
+
+    /// Set a custom tool credential and update the index.
+    fn set_custom_tool_credential(&mut self, slug: &str, field: &str, value: String) -> Result<(), String> {
+        let key = format_custom_tool_key(slug, field);
+        
+        // 1. Save the actual secret
+        self.set(&key, value)?;
+
+        // 2. Update Index
+        let current_index = self.get_index_from_keychain().unwrap_or_default();
+        let new_index = add_to_index_csv(&current_index, &key);
+        
+        if new_index != current_index {
+            self.set(CUSTOM_KEYS_INDEX_KEY, new_index)?;
+            tracing::info!("Updated custom tool index with new key: {}", key);
+        }
+
+        Ok(())
+    }
+
+    /// Delete a custom tool credential and update the index.
+    fn delete_custom_tool_credential(&mut self, slug: &str, field: &str) -> Result<(), String> {
+        let key = format_custom_tool_key(slug, field);
+        
+        // 1. Delete the actual secret
+        let _ = self.delete(&key);
+
+        // 2. Update Index
+        let current_index = self.get_index_from_keychain().unwrap_or_default();
+
+        if !current_index.is_empty() {
+            let new_index = remove_from_index_csv(&current_index, &key);
+            self.set(CUSTOM_KEYS_INDEX_KEY, new_index)?;
+            tracing::info!("Removed custom tool key from index: {}", key);
+        }
+
+        Ok(())
+    }
+
+    /// Get a Composio API key for a specific profile.
+    fn get_composio_key(&self, profile_name: &str) -> Option<&String> {
+        let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
+        self.get(&key)
+    }
+
+    /// Set a Composio API key for a specific profile.
+    fn set_composio_key(&mut self, profile_name: &str, value: String) -> Result<(), String> {
+        let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
+        self.set(&key, value)
+    }
+
+    /// Delete a Composio API key for a specific profile.
+    fn delete_composio_key(&mut self, profile_name: &str) -> Result<(), String> {
+        let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
+        self.delete(&key)
+    }
+}
+
+// ============================================================================
+// CREDENTIAL EXTRACTION HELPER
+// ============================================================================
+
+/// Extract custom tool credentials from a secrets map.
+///
+/// Returns a nested map: `Map<ToolkitSlug, Map<FieldName, Value>>`.
+pub fn extract_custom_tool_credentials(
+    secrets: &HashMap<String, String>,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut result: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+    for (key, value) in secrets {
+        if let Some((slug, field)) = parse_custom_tool_key(key) {
+            result
+                .entry(slug.to_string())
+                .or_default()
+                .insert(field.to_string(), value.clone());
+        }
+    }
+    result
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_custom_tool_key() {
+        assert_eq!(
+            format_custom_tool_key("slack", "api_key"),
+            "composio_tool_slack__api_key"
+        );
+        assert_eq!(
+            format_custom_tool_key("gmail", "client_secret"),
+            "composio_tool_gmail__client_secret"
+        );
+    }
+
+    #[test]
+    fn test_parse_custom_tool_key_valid() {
+        let result = parse_custom_tool_key("composio_tool_slack__api_key");
+        assert_eq!(result, Some(("slack", "api_key")));
+    }
+
+    #[test]
+    fn test_parse_custom_tool_key_invalid() {
+        assert_eq!(parse_custom_tool_key("api_key"), None);
+        assert_eq!(parse_custom_tool_key("composio_tool_slack"), None); // No separator
+        assert_eq!(parse_custom_tool_key("composio_tool___field"), None); // Empty slug
+        assert_eq!(parse_custom_tool_key("composio_tool_slug__"), None); // Empty field
+    }
+
+    #[test]
+    fn test_toolkit_key_prefix() {
+        assert_eq!(toolkit_key_prefix("slack"), "composio_tool_slack__");
+    }
+
+    #[test]
+    fn test_key_belongs_to_toolkit() {
+        assert!(key_belongs_to_toolkit("composio_tool_slack__api_key", "slack"));
+        assert!(!key_belongs_to_toolkit("composio_tool_gmail__api_key", "slack"));
+        assert!(!key_belongs_to_toolkit("api_key", "slack"));
+    }
+
+    #[test]
+    fn test_parse_index_csv() {
+        let keys = parse_index_csv("key1, key2 ,key3");
+        assert_eq!(keys, vec!["key1", "key2", "key3"]);
+
+        let empty_keys = parse_index_csv("");
+        assert!(empty_keys.is_empty());
+    }
+
+    #[test]
+    fn test_add_to_index_csv() {
+        assert_eq!(add_to_index_csv("", "key1"), "key1");
+        assert_eq!(add_to_index_csv("key1", "key2"), "key1,key2");
+        assert_eq!(add_to_index_csv("key1,key2", "key1"), "key1,key2"); // No duplicate
+    }
+
+    #[test]
+    fn test_remove_from_index_csv() {
+        assert_eq!(remove_from_index_csv("key1,key2,key3", "key2"), "key1,key3");
+        assert_eq!(remove_from_index_csv("key1", "key1"), "");
+        assert_eq!(remove_from_index_csv("key1,key2", "key3"), "key1,key2"); // Key not found
+    }
+
+    #[test]
+    fn test_extract_custom_tool_credentials() {
+        let mut secrets = HashMap::new();
+        secrets.insert("composio_tool_slack__api_key".to_string(), "sk-123".to_string());
+        secrets.insert("composio_tool_slack__secret".to_string(), "sec-456".to_string());
+        secrets.insert("composio_tool_gmail__token".to_string(), "tok-789".to_string());
+        secrets.insert("api_key".to_string(), "gemini-key".to_string()); // Not a tool cred
+
+        let result = extract_custom_tool_credentials(&secrets);
+
+        assert_eq!(result.len(), 2); // slack and gmail
+        assert_eq!(result.get("slack").unwrap().get("api_key").unwrap(), "sk-123");
+        assert_eq!(result.get("slack").unwrap().get("secret").unwrap(), "sec-456");
+        assert_eq!(result.get("gmail").unwrap().get("token").unwrap(), "tok-789");
+    }
+}

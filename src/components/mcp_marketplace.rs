@@ -7,6 +7,7 @@ use crate::mcp::composio_client::{ComposioCategory, ComposioClient, ComposioTool
 use crate::mcp::manager::{McpManager, McpServerStatus, ServerStatus};
 use crate::settings::{McpSource, Settings, SettingsManager};
 use dioxus::prelude::*;
+use crate::SecretManagerTrait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
