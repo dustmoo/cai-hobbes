@@ -23,7 +23,7 @@ pub fn QuickFix(suggestions: Vec<String>, on_select: EventHandler<String>) -> El
                 class: "flex flex-wrap gap-2",
                 for suggestion in suggestions {
                     button {
-                        class: "px-3 py-1.5 text-sm bg-primary-600/80 hover:bg-primary-500 text-white rounded transition-colors flex items-center space-x-1 shadow-sm",
+                        class: "px-3 py-1.5 text-sm bg-btn-primary/80 hover:bg-btn-primary-hover text-fg rounded transition-colors flex items-center space-x-1 shadow-sm",
                         onclick: move |_| on_select.call(suggestion.clone()),
                         span { "{suggestion}" }
                         Icon {

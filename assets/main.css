@@ -1,7 +1,102 @@
-/* App-wide styling */
+/* ==========================================================================
+   Theme Variables
+   ========================================================================== */
+:root {
+    /* Base Application Colors (Default: Dark Theme) */
+    --color-bg-app: #1A1A1A;
+    --color-bg-section: #242424;
+    --color-bg-card: #2D2D2D;
+    --color-bg-input: #242424;
+    --color-text-primary: #FFFFFF;
+    --color-text-muted: #9CA3AF;
+    /* gray-400 */
+    --color-border-primary: #23355C;
+    /* primary-700 */
+    --color-border-muted: #4B5563;
+    /* gray-600 */
+    --color-bubble-user: #3B5998;
+    /* primary-500 (YinMn Blue) */
+    --color-btn-primary: #2F477A;
+    /* primary-600 */
+    --color-btn-primary-hover: #3B5998;
+    /* primary-500 */
+    --color-badge-bg: rgba(11, 17, 32, 0.3);
+    /* primary-900/30 */
+    --color-badge-text: #84A4D1;
+    /* primary-300 */
+    /* Action buttons - Load (success) and Unload (warning) */
+    --color-action-success-bg: rgba(22, 101, 52, 0.3);
+    --color-action-success-text: #86efac;
+    --color-action-success-border: #166534;
+    --color-action-warn-bg: rgba(113, 63, 18, 0.3);
+    --color-action-warn-text: #fde047;
+    --color-action-warn-border: #854d0e;
+}
+
+/* Explicit dark mode (same as root, for class-based switching) */
+.dark {
+    --color-bg-app: #1A1A1A;
+    --color-bg-section: #242424;
+    --color-bg-card: #2D2D2D;
+    --color-bg-input: #242424;
+    --color-text-primary: #FFFFFF;
+    --color-text-muted: #9CA3AF;
+    --color-border-primary: #23355C;
+    --color-border-muted: #4B5563;
+    --color-bubble-user: #3B5998;
+    --color-btn-primary: #2F477A;
+    --color-btn-primary-hover: #3B5998;
+    --color-badge-bg: rgba(11, 17, 32, 0.3);
+    --color-badge-text: #84A4D1;
+    --color-action-success-bg: rgba(22, 101, 52, 0.3);
+    --color-action-success-text: #86efac;
+    --color-action-success-border: #166534;
+    --color-action-warn-bg: rgba(113, 63, 18, 0.3);
+    --color-action-warn-text: #fde047;
+    --color-action-warn-border: #854d0e;
+}
+
+/* Light mode overrides */
+.light {
+    --color-bg-app: #F3F4F6;
+    /* gray-100 */
+    --color-bg-section: #FFFFFF;
+    --color-bg-card: #FFFFFF;
+    --color-bg-input: #E5E7EB;
+    /* gray-200 */
+    --color-text-primary: #111827;
+    /* gray-900 */
+    --color-text-muted: #6B7280;
+    /* gray-500 */
+    --color-border-primary: #ADC2E0;
+    /* primary-200 */
+    --color-border-muted: #D1D5DB;
+    /* gray-300 */
+    --color-bubble-user: #84A4D1;
+    /* primary-300 (lighter blue for light mode) */
+    --color-btn-primary: #5B86C1;
+    /* primary-400 */
+    --color-btn-primary-hover: #84A4D1;
+    /* primary-300 */
+    --color-badge-bg: rgba(173, 194, 224, 0.3);
+    /* primary-200/30 - lighter bg for light mode */
+    --color-badge-text: #2F477A;
+    /* primary-600 - darker text for light mode */
+    /* Action buttons - more saturated for light mode */
+    --color-action-success-bg: rgba(22, 163, 74, 0.2);
+    --color-action-success-text: #166534;
+    --color-action-success-border: #22c55e;
+    --color-action-warn-bg: rgba(234, 179, 8, 0.2);
+    --color-action-warn-text: #854d0e;
+    --color-action-warn-border: #eab308;
+}
+
+/* ==========================================================================
+   App-wide styling
+   ========================================================================== */
 body {
-    background-color: #0f1116;
-    color: #ffffff;
+    background-color: var(--color-bg-app);
+    color: var(--color-text-primary);
 }
 
 #hero {
@@ -16,23 +111,23 @@ body {
     width: 400px;
     text-align: left;
     font-size: x-large;
-    color: white;
+    color: var(--color-text-primary);
     display: flex;
     flex-direction: column;
 }
 
 #links a {
-    color: white;
+    color: var(--color-text-primary);
     text-decoration: none;
     margin-top: 20px;
     margin: 10px 0px;
-    border: white 1px solid;
+    border: var(--color-border-primary) 1px solid;
     border-radius: 5px;
     padding: 10px;
 }
 
 #links a:hover {
-    background-color: #1f1f1f;
+    background-color: var(--color-bg-section);
     cursor: pointer;
 }
 
@@ -47,7 +142,7 @@ body {
 }
 
 #navbar a {
-    color: #ffffff;
+    color: var(--color-text-primary);
     margin-right: 20px;
     text-decoration: none;
     transition: color 0.2s ease;
@@ -64,7 +159,7 @@ body {
 }
 
 #blog a {
-    color: #ffffff;
+    color: var(--color-text-primary);
     margin-top: 50px;
 }
 
@@ -74,7 +169,7 @@ body {
     margin-left: auto;
     margin-right: auto;
     margin-top: 50px;
-    background-color: #1e222d;
+    background-color: var(--color-bg-section);
     padding: 20px;
     border-radius: 10px;
 }
@@ -86,9 +181,9 @@ body {
 
 #echo>input {
     border: none;
-    border-bottom: 1px white solid;
+    border-bottom: 1px var(--color-text-primary) solid;
     background-color: transparent;
-    color: #ffffff;
+    color: var(--color-text-primary);
     transition: border-bottom-color 0.2s ease;
     outline: none;
     display: block;

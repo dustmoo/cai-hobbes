@@ -167,10 +167,10 @@ pub fn MessageList(
                                             }
                                         },
                                         MessageContent::ToolCall(tool_call) => {
-                                            let bubble_classes = "bg-gray-700 text-gray-200 self-start mr-auto";
+                                            let bubble_classes = "bg-input text-fg self-start mr-auto";
                                             let container_classes = "flex justify-start";
                                             let author_classes = format!(
-                                                "text-xs text-gray-500 mt-1 px-2 {}",
+                                                "text-xs text-fg-muted mt-1 px-2 {}",
                                                 "text-left"
                                             );
                                             rsx! {
@@ -197,7 +197,7 @@ pub fn MessageList(
                                         }
                                         MessageContent::PermissionRequest(tool_call) => {
                                             let container_classes = "flex justify-start";
-                                            let author_classes = "text-xs text-gray-500 mt-1 px-2 text-left";
+                                            let author_classes = "text-xs text-fg-muted mt-1 px-2 text-left";
                                             rsx! {
                                                 div {
                                                     key: "{message.id}",
@@ -229,8 +229,8 @@ pub fn MessageList(
                                             }
                                         }
                                         MessageContent::SkillCall(skill_call) => {
-                                            let container_classes = "flex justify-end text-white";
-                                            let author_classes = "text-xs text-gray-500 mt-1 px-2 text-right";
+                                            let container_classes = "flex justify-end text-fg";
+                                            let author_classes = "text-xs text-fg-muted mt-1 px-2 text-right";
                                             rsx! {
                                                 div {
                                                     key: "{message.id}",
@@ -263,8 +263,8 @@ pub fn MessageList(
                                             }
                                         }
                                         MessageContent::SkillPermissionRequest(skill_call) => {
-                                            let container_classes = "flex justify-end text-white";
-                                            let author_classes = "text-xs text-gray-500 mt-1 px-2 text-right";
+                                            let container_classes = "flex justify-end text-fg";
+                                            let author_classes = "text-xs text-fg-muted mt-1 px-2 text-right";
                                             let execution_id = skill_call.execution_id.clone();
                                             let message_id = message.id;
                                             rsx! {
@@ -373,7 +373,7 @@ pub fn MessageList(
                 }
                 if *show_scroll_button.read() {
                     button {
-                        class: "absolute bottom-4 right-4 z-10 p-2 bg-primary-500 text-white rounded-full shadow-lg hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 transition-opacity duration-300 ease-in-out",
+                        class: "absolute bottom-4 right-4 z-10 p-2 bg-btn-primary text-fg rounded-full shadow-lg hover:bg-btn-primary-hover focus:outline-none focus:ring-2 focus:ring-btn-primary transition-opacity duration-300 ease-in-out",
                         onclick: move |_| {
                             let _ = document::eval(r#"
                                 const el = document.getElementById('message-list');

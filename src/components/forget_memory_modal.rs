@@ -174,20 +174,20 @@ Ensure the "optimized_summary" maintains the correct schema."#,
                 }
             },
             div {
-                class: "bg-dark-card border border-primary-700 rounded-lg shadow-xl w-[600px] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200",
+                class: "bg-card border border-subtle rounded-lg shadow-xl w-[600px] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200",
 
                 // Header
                 div {
-                    class: "p-4 border-b border-primary-700 flex justify-between items-center bg-dark-section",
+                    class: "p-4 border-b border-subtle flex justify-between items-center bg-section",
                     div {
-                        h2 { class: "text-lg font-semibold text-white flex items-center gap-2",
+                        h2 { class: "text-lg font-semibold text-fg flex items-center gap-2",
                             Icon { width: 20, height: 20, icon: fi_icons::FiZap, class: "text-yellow-400" }
                             "Optimize Memory"
                         }
-                        p { class: "text-xs text-gray-400 mt-1", "Instruct Hobbes to forget or focus on specific topics." }
+                        p { class: "text-xs text-fg-muted mt-1", "Instruct Hobbes to forget or focus on specific topics." }
                     }
                     button {
-                        class: "text-gray-400 hover:text-white transition-colors",
+                        class: "text-fg-muted hover:text-fg transition-colors",
                         onclick: move |_| on_cancel.call(()),
                         Icon { width: 24, height: 24, icon: fi_icons::FiX }
                     }
@@ -195,12 +195,12 @@ Ensure the "optimized_summary" maintains the correct schema."#,
 
                 // Body
                 div {
-                    class: "p-6 bg-dark-bg flex flex-col gap-4",
+                    class: "p-6 bg-app flex flex-col gap-4",
 
                     div {
-                        label { class: "block text-sm font-medium text-gray-300 mb-2", "Instructions" }
+                        label { class: "block text-sm font-medium text-fg-muted mb-2", "Instructions" }
                         textarea {
-                            class: "w-full h-24 bg-dark-input border border-gray-600 rounded p-3 text-sm text-white focus:border-primary-500 focus:outline-none resize-none",
+                            class: "w-full h-24 bg-input border border-faint rounded p-3 text-sm text-fg focus:border-primary-500 focus:outline-none resize-none",
                             placeholder: "e.g., 'Forget the previous discussion about deployment and focus on the new UI design.'",
                             value: "{instruction}",
                             oninput: move |e| instruction.set(e.value()),
@@ -221,15 +221,15 @@ Ensure the "optimized_summary" maintains the correct schema."#,
 
                 // Footer
                 div {
-                    class: "p-4 border-t border-primary-700 bg-dark-section flex justify-end gap-3",
+                    class: "p-4 border-t border-subtle bg-section flex justify-end gap-3",
 
                     button {
-                        class: "px-4 py-2 text-gray-300 hover:text-white transition-colors",
+                        class: "px-4 py-2 text-fg-muted hover:text-fg transition-colors",
                         onclick: move |_| on_cancel.call(()),
                         "Cancel"
                     }
                     button {
-                        class: "px-6 py-2 bg-primary-600 hover:bg-primary-500 text-white rounded font-medium shadow-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                        class: "px-6 py-2 bg-btn-primary hover:bg-btn-primary-hover text-fg rounded font-medium shadow-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                         disabled: "{is_generating}",
                         onclick: move |_| handle_generate(),
                         "Optimize"

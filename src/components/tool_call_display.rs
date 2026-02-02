@@ -39,9 +39,9 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
 
     rsx! {
         div {
-            class: "flex flex-col p-4 border rounded-lg shadow-sm bg-gray-800 overflow-hidden", // overflow-hidden prevents stretching
+            class: "flex flex-col p-4 border rounded-lg shadow-sm bg-section overflow-hidden", // overflow-hidden prevents stretching
             div {
-                class: "flex items-center gap-2 text-lg font-semibold text-gray-100", // Adjusted text color
+                class: "flex items-center gap-2 text-lg font-semibold text-fg",
                 Icon {
                     width: 20,
                     height: 20,
@@ -60,7 +60,7 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                 if let Some(usage) = &props.usage {
                     if props.token_display_mode != "none" {
                        div {
-                            class: "ml-auto text-xs text-gray-400 font-mono flex items-center gap-2",
+                            class: "ml-auto text-xs text-fg-muted font-mono flex items-center gap-2",
                             if let Some(cost) = usage.cost {
                                 span { class: "text-green-400", {format!("${:.6}", cost)} }
                             }
@@ -70,11 +70,11 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                 }
             }
             div {
-                class: "mt-4 pt-4 border-t border-gray-600 space-y-2", // Adjusted border color
+                class: "mt-4 pt-4 border-t border-faint space-y-2", // Adjusted border color
                 div {
                     class: "flex items-center gap-2",
-                    span { class: "font-semibold text-gray-300", "Tool:" }
-                    span { class: "font-mono text-sm text-gray-300", "{props.tool_call.tool_name}" }
+                    span { class: "font-semibold text-fg-muted", "Tool:" }
+                    span { class: "font-mono text-sm text-fg-muted", "{props.tool_call.tool_name}" }
                 }
 
                 // Thinking Process collapsible section (if present)
@@ -82,7 +82,7 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                     div {
                         class: "flex flex-col",
                         button {
-                            class: "flex items-center gap-1 text-sm font-semibold text-gray-400 hover:text-gray-200",
+                            class: "flex items-center gap-1 text-sm font-semibold text-fg-muted hover:text-fg",
                             onclick: move |_| show_thought.toggle(),
                             if *show_thought.read() {
                                 Icon {
@@ -101,7 +101,7 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                         }
                         if *show_thought.read() {
                             div {
-                                class: "text-sm p-2 bg-gray-900 rounded mt-1",
+                                class: "text-sm p-2 bg-app rounded mt-1",
                                 ThinkingMarkdownRenderer {
                                     content: thought_content.clone(),
                                     compact: false,
@@ -115,7 +115,7 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                 div {
                     class: "flex flex-col",
                     button {
-                        class: "flex items-center gap-1 text-sm font-semibold text-gray-400 hover:text-gray-200",
+                        class: "flex items-center gap-1 text-sm font-semibold text-fg-muted hover:text-fg",
                         onclick: move |_| show_arguments.toggle(),
                         if *show_arguments.read() {
                             Icon {
@@ -147,7 +147,7 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                 div {
                     class: "flex flex-col",
                     button {
-                        class: "flex items-center gap-1 text-sm font-semibold text-gray-400 hover:text-gray-200",
+                        class: "flex items-center gap-1 text-sm font-semibold text-fg-muted hover:text-fg",
                         onclick: move |_| show_response.toggle(),
                         if *show_response.read() {
                             Icon {
@@ -167,7 +167,7 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                     if *show_response.read() {
                          if status == ToolCallStatus::AuthRequired {
                             div {
-                                class: "flex flex-col gap-3 p-3 bg-gray-900 rounded mt-2 border border-yellow-700/50",
+                                class: "flex flex-col gap-3 p-3 bg-app rounded mt-2 border border-yellow-700/50",
                                 div {
                                     class: "flex items-center gap-2 text-yellow-500",
                                     Icon {
@@ -177,9 +177,9 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                                     }
                                     span { class: "font-medium", "Authentication Required" }
                                 }
-                                p { class: "text-sm text-gray-300", "Please connect your account to proceed with this tool." }
+                                p { class: "text-sm text-fg-muted", "Please connect your account to proceed with this tool." }
                                 a {
-                                    class: "px-4 py-2 bg-yellow-600 text-white rounded hover:bg-yellow-500 text-center text-sm font-medium transition-colors w-fit flex items-center gap-2",
+                                    class: "px-4 py-2 bg-yellow-600 text-fg rounded hover:bg-yellow-500 text-center text-sm font-medium transition-colors w-fit flex items-center gap-2",
                                     href: "{response}",
                                     target: "_blank",
                                     "Connect Account"
@@ -244,7 +244,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
             div {
                 class: "mt-4 flex justify-end gap-4",
                 button {
-                    class: "px-4 py-2 rounded-md bg-gray-600 text-white hover:bg-gray-500",
+                    class: "px-4 py-2 rounded-md bg-input text-fg hover:bg-gray-500",
                     onclick: move |_| {
                         // Deny: Convert to error/skipped state so UI can clean up
                         spawn({
@@ -268,7 +268,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                     "Deny"
                 }
                 button {
-                    class: "px-4 py-2 rounded-md bg-green-600 text-white hover:bg-green-500",
+                    class: "px-4 py-2 rounded-md bg-green-600 text-fg hover:bg-green-500",
                     onclick: move |_| {
                         // Approve: Mark as ready for execution, signal pending approvals
                         // The lifecycle (Submit button) will handle actual execution

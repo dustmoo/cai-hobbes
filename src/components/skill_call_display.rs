@@ -30,9 +30,9 @@ pub fn SkillPermissionPrompt(props: SkillPermissionPromptProps) -> Element {
 
     rsx! {
         div {
-            class: "flex flex-col p-4 bg-black/20 border-t border-white/10 space-y-3",
+            class: "flex flex-col p-4 bg-black/20 border-t border-faint space-y-3",
             div {
-                class: "flex items-center gap-2 text-base font-bold text-white",
+                class: "flex items-center gap-2 text-fg font-bold text-fg",
                 Icon {
                     width: 18,
                     height: 18,
@@ -41,22 +41,22 @@ pub fn SkillPermissionPrompt(props: SkillPermissionPromptProps) -> Element {
                 "Permission Required"
             }
             div {
-                class: "space-y-2 text-sm text-white/90 font-medium",
+                class: "space-y-2 text-sm text-fg/90 font-medium",
                 p {
                     "The skill "
-                    span { class: "font-mono font-bold bg-white/20 px-1 rounded", "{skill_call.skill_name}" }
+                    span { class: "font-mono font-bold bg-input px-1 rounded", "{skill_call.skill_name}" }
                     " wants to execute commands."
                 }
                 if !skill_call.arguments.is_empty() {
                     div {
-                        class: "p-2 bg-black/30 rounded font-mono text-xs break-all border border-white/5",
+                        class: "p-2 bg-black/30 rounded font-mono text-xs break-all border border-faint/5",
                         "Args: {skill_call.arguments}"
                     }
                 }
             }
             // "Always allow" checkbox
             div {
-                class: "flex items-center gap-2 text-white/80",
+                class: "flex items-center gap-2 text-fg/80",
                 input {
                     r#type: "checkbox",
                     id: "remember-skill-permission",
@@ -76,7 +76,7 @@ pub fn SkillPermissionPrompt(props: SkillPermissionPromptProps) -> Element {
             div {
                 class: "flex justify-end gap-2",
                 button {
-                    class: "px-3 py-1.5 rounded text-sm font-bold bg-white/10 hover:bg-white/20 transition-colors uppercase tracking-wider",
+                    class: "px-3 py-1.5 rounded text-sm font-bold bg-input hover:bg-input/80 transition-colors uppercase tracking-wider",
                     onclick: {
                         let execution_id = skill_call.execution_id.clone();
                         let skill_name = skill_call.skill_name.clone();
@@ -94,7 +94,7 @@ pub fn SkillPermissionPrompt(props: SkillPermissionPromptProps) -> Element {
                     "Deny"
                 }
                 button {
-                    class: "px-3 py-1.5 rounded text-sm font-bold bg-white text-black hover:bg-white/90 transition-colors uppercase tracking-wider",
+                    class: "px-3 py-1.5 rounded text-sm font-bold bg-btn-primary text-fg hover:bg-btn-primary-hover transition-colors uppercase tracking-wider",
                     onclick: {
                         let execution_id = skill_call.execution_id.clone();
                         let skill_name = skill_call.skill_name.clone();
@@ -178,7 +178,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
 
     rsx! {
         div {
-            class: "flex flex-col p-4 bg-black/20 border-t border-white/10 space-y-2",
+            class: "flex flex-col p-4 bg-black/20 border-t border-faint space-y-2",
             div {
                 class: "flex items-center gap-2",
                 match skill_call.status {
@@ -223,7 +223,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                     }
                     if *show_arguments.read() {
                         div {
-                            class: "mt-1 p-2 bg-black/30 rounded font-mono text-[11px] break-all border border-white/5 opacity-80",
+                            class: "mt-1 p-2 bg-black/30 rounded font-mono text-[11px] break-all border border-faint/5 opacity-80",
                             "{skill_call.arguments}"
                         }
                     }
@@ -252,13 +252,13 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                     }
                     if *show_response.read() {
                         div {
-                            class: "mt-1 p-3 bg-black/40 rounded-lg text-xs border border-white/5 break-words max-h-96 overflow-y-auto custom-scrollbar",
+                            class: "mt-1 p-3 bg-black/40 rounded-lg text-xs border border-faint/5 break-words max-h-96 overflow-y-auto custom-scrollbar",
                             if let Some(payload) = &context_payload {
                                 // Structured Display for Capability Payload
                                 div {
                                     class: "flex flex-col gap-2",
                                     div {
-                                        class: "text-xs font-bold text-white/60 mb-1",
+                                        class: "text-xs font-bold text-fg/60 mb-1",
                                         "SKILL CONTEXT INJECTED"
                                     }
                                     div {
@@ -278,7 +278,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                                         div {
                                             class: "mt-2 bg-black/20 rounded overflow-hidden",
                                             button {
-                                                class: "w-full flex items-center justify-between p-2 hover:bg-white/5 transition-colors group/tools",
+                                                class: "w-full flex items-center justify-between p-2 hover:bg-input transition-colors group/tools",
                                                 onclick: move |_| show_tools_detail.toggle(),
                                                 div {
                                                     class: "flex items-center gap-2",
@@ -301,7 +301,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                                                         tools.sort_by(|a, b| a.0.cmp(b.0));
                                                         rsx! {
                                                             for (req, text) in tools {
-                                                                div { class: "flex justify-between text-[11px] py-0.5 border-b border-white/5 last:border-0",
+                                                                div { class: "flex justify-between text-[11px] py-0.5 border-b border-faint last:border-0",
                                                                     span { class: "opacity-70", "{req}" }
                                                                     span { class: "opacity-40 mx-1", "→" }
                                                                     span { class: "font-mono opacity-80", "{text}" }
@@ -343,7 +343,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                         }
                         if *show_instructions.read() {
                             div {
-                                class: "mt-1 p-3 bg-black/40 rounded-lg text-xs border border-white/5 break-words max-h-96 overflow-y-auto custom-scrollbar",
+                                class: "mt-1 p-3 bg-black/40 rounded-lg text-xs border border-faint/5 break-words max-h-96 overflow-y-auto custom-scrollbar",
                                 crate::components::markdown_renderer::ThinkingMarkdownRenderer {
                                     content: payload.instruction_manual.clone(),
                                     compact: false,

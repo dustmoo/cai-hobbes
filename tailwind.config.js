@@ -56,10 +56,42 @@ module.exports = {
         // Semantic Text
         'light-text': '#1A1A1A',
         'dark-text': '#FFFFFF',
+
+        // ===== Theme-Aware Semantic Colors =====
+        // These map to CSS variables defined in assets/main.css
+        // Use these instead of the hardcoded 'dark-*' colors above.
+        // Background colors: bg-app, bg-section, bg-card, bg-input
+        'app': 'var(--color-bg-app)',
+        'section': 'var(--color-bg-section)',
+        'card': 'var(--color-bg-card)',
+        'input': 'var(--color-bg-input)',
+        // Text colors: text-fg, text-fg-muted
+        'fg': 'var(--color-text-primary)',
+        'fg-muted': 'var(--color-text-muted)',
+        // User bubble background: bg-bubble-user
+        'bubble-user': 'var(--color-bubble-user)',
+        // Button backgrounds: bg-btn-primary, bg-btn-primary-hover
+        'btn-primary': 'var(--color-btn-primary)',
+        'btn-primary-hover': 'var(--color-btn-primary-hover)',
+        // Badge: bg-badge, text-badge
+        'badge': 'var(--color-badge-bg)',
+        'badge-text': 'var(--color-badge-text)',
+        // Action buttons: success (load) and warn (unload)
+        'action-success': 'var(--color-action-success-bg)',
+        'action-success-text': 'var(--color-action-success-text)',
+        'action-success-border': 'var(--color-action-success-border)',
+        'action-warn': 'var(--color-action-warn-bg)',
+        'action-warn-text': 'var(--color-action-warn-text)',
+        'action-warn-border': 'var(--color-action-warn-border)',
       },
       fontFamily: {
         'inter-logo': ['"Inter"', 'sans-serif'],
         'sans': ['"Inter"', 'system-ui', 'sans-serif'],
+      },
+      // Border colors: border-subtle, border-faint
+      borderColor: {
+        'subtle': 'var(--color-border-primary)',
+        'faint': 'var(--color-border-muted)',
       },
       typography: ({ theme }) => ({
         DEFAULT: {

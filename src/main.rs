@@ -44,6 +44,7 @@ mod services;
 mod session;
 mod settings;
 mod skills;
+mod theme;
 mod tray;
 
 use tray::{APP_QUIT, WINDOW_VISIBLE};
@@ -95,7 +96,7 @@ fn main() {
                     + r#"<link rel="preconnect" href="https://fonts.googleapis.com">"#
                     + r#"<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>"#
                     + r#"<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">"#
-                    + r#"<style>html, body { height: 100%; margin: 0; padding: 0; background-color: #1A1A1A; font-family: 'Inter', system-ui, sans-serif; }</style>"#
+                    + r#"<style>html, body { height: 100%; margin: 0; padding: 0; font-family: 'Inter', system-ui, sans-serif; }</style>"#
                     + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"#
                     + r#"<style>"# + include_str!("../assets/main.css") + r#"</style>"#
                 )
@@ -154,10 +155,10 @@ use crate::components::chat_input::ChatCommand;
 fn RestartRequired() -> Element {
     rsx! {
         div {
-            class: "dark flex flex-col items-center justify-center h-screen bg-gray-900 text-white text-center p-8",
+            class: "flex flex-col items-center justify-center h-screen bg-app text-fg text-center p-8",
             h1 { class: "text-2xl font-bold mb-4", "Permissions Granted" }
             p { class: "mb-6", "Hobbes needs to be restarted for the changes to take effect." }
-            p { class: "text-sm text-gray-400", "Please quit and reopen the application." }
+            p { class: "text-sm text-fg-muted", "Please quit and reopen the application." }
         }
     }
 }
@@ -204,6 +205,9 @@ fn app() -> Element {
     // Skills registry - initialize empty, load async to avoid blocking UI
     let mut skill_registry = use_context_provider(|| Signal::new(skills::SkillRegistry::new()));
     let mut skills_loaded = use_signal(|| false);
+
+    // Sync theme to DOM (class on <html> element)
+    theme::use_theme_sync(settings);
 
     // Asynchronously load skills from ~/.hobbes/skills
     use_effect(move || {
@@ -408,12 +412,12 @@ fn app() -> Element {
     if !secrets_loaded() {
         return rsx! {
             div {
-                class: "dark flex flex-col items-center justify-center h-screen bg-gray-900 text-white text-center p-8",
+                class: "flex flex-col items-center justify-center h-screen bg-app text-fg text-center p-8",
                 div {
-                    class: "animate-spin rounded-full h-12 w-12 border-b-2 border-white mb-4"
+                    class: "animate-spin rounded-full h-12 w-12 border-b-2 border-fg mb-4"
                 }
                 h1 { class: "text-xl font-semibold mb-2", "Loading..." }
-                p { class: "text-sm text-gray-400", "Authenticate to access your saved credentials..." }
+                p { class: "text-sm text-fg-muted", "Authenticate to access your saved credentials..." }
             }
         };
     }
@@ -790,7 +794,7 @@ fn app() -> Element {
             RestartRequired {}
         } else if *needs_onboarding.read() {
             div {
-                class: "dark flex items-center justify-center h-screen bg-dark-bg text-white",
+                class: "flex items-center justify-center h-screen bg-app text-fg",
                 components::onboarding::Onboarding {
                     needs_onboarding,
                 }
@@ -820,7 +824,7 @@ fn app() -> Element {
                     },
                 }
                     div {
-                        class: "dark flex flex-col h-screen", // Changed to flex-col
+                        class: "flex flex-col h-screen bg-app text-fg", // Removed forced 'dark' class to allow global theme inheritance
                         // The draggable header has been removed as per user request.
                         // Main content area
                         div {
@@ -838,7 +842,7 @@ fn app() -> Element {
                                 div {
                                     id: "session-manager-panel",
                                     style: "width: {settings_panel_width}px;",
-                                    class: "bg-dark-section text-white h-full",
+                                    class: "bg-section text-fg h-full",
                                     components::session_manager::SessionManager {}
                                 }
                                 // Draggable Divider
@@ -860,7 +864,7 @@ fn app() -> Element {
                                 div {
                                     id: "settings-panel",
                                     style: "width: {settings_panel_width}px;",
-                                    class: "bg-dark-section text-white h-full",
+                                    class: "bg-section text-fg h-full",
                                     // This is the correct location for the settings panel component
                                     components::settings_panel::SettingsPanel {}
                                 }
@@ -883,7 +887,7 @@ fn app() -> Element {
                                 div {
                                     id: "mcp-manager-panel",
                                     style: "width: {settings_panel_width}px;",
-                                    class: "bg-dark-section text-white h-full",
+                                    class: "bg-section text-fg h-full",
                                     components::mcp_marketplace::McpMarketplace {}
                                 }
                                 // Draggable Divider

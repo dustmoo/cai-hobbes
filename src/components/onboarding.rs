@@ -104,12 +104,12 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
 
     rsx! {
         div {
-            class: "px-8 py-10 bg-dark-section rounded-lg shadow-lg max-w-md flex flex-col gap-y-6 min-h-[450px]",
+            class: "px-8 py-10 bg-section rounded-lg shadow-lg max-w-md flex flex-col gap-y-6 min-h-[450px]",
             // Header
             div {
                 class: "text-center",
                 h1 { class: "text-2xl font-bold mb-2", "Welcome to Hobbes" }
-                p { class: "mb-6 text-gray-400", "Please configure your settings to get started." }
+                p { class: "mb-6 text-fg-muted", "Please configure your settings to get started." }
             }
 
             // Form Content
@@ -130,15 +130,15 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                 }
 
                 div { class: "mb-6",
-                    label { class: "block mb-2 text-sm font-medium text-gray-300", "Gemini API Key" }
+                    label { class: "block mb-2 text-sm font-medium text-fg-muted", "Gemini API Key" }
                     input {
-                        class: "w-full p-2 bg-dark-input border border-primary-600 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500",
+                        class: "w-full p-2 bg-input border border-primary-600 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500",
                         r#type: "password",
                         value: "{gemini_api_key}",
                         oninput: move |event| gemini_api_key.set(event.value())
                     }
                     p {
-                        class: "mt-2 text-xs text-gray-500",
+                        class: "mt-2 text-xs text-fg-muted",
                         "Get your API key from "
                         a {
                             class: "text-primary-400 hover:underline",
@@ -151,8 +151,8 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
 
                 // Keychain Storage Mode - conditional based on environment
                 div {
-                    class: "mb-6 p-3 bg-dark-bg rounded-lg border border-primary-700",
-                    label { class: "block text-sm font-medium text-gray-300 mb-2", "API Key Storage" }
+                    class: "mb-6 p-3 bg-app rounded-lg border border-subtle",
+                    label { class: "block text-sm font-medium text-fg-muted mb-2", "API Key Storage" }
 
                     if sandboxed {
                         // App Store/TestFlight: Show Biometric and iCloud options
@@ -160,25 +160,25 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                             class: "flex gap-2",
                             button {
                                 class: if *keychain_mode.read() == KeychainStorageMode::Biometric {
-                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white"
+                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-btn-primary text-fg"
                                 } else {
-                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-dark-input text-gray-400 hover:text-white"
+                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-input text-fg-muted hover:text-fg"
                                 },
                                 onclick: move |_| keychain_mode.set(KeychainStorageMode::Biometric),
                                 "🔐 Biometric"
                             }
                             button {
                                 class: if *keychain_mode.read() == KeychainStorageMode::ICloudSync {
-                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white"
+                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-btn-primary text-fg"
                                 } else {
-                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-dark-input text-gray-400 hover:text-white"
+                                    "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-input text-fg-muted hover:text-fg"
                                 },
                                 onclick: move |_| keychain_mode.set(KeychainStorageMode::ICloudSync),
                                 "☁️ iCloud Sync"
                             }
                         }
                         p {
-                            class: "text-xs text-gray-400 mt-2",
+                            class: "text-xs text-fg-muted mt-2",
                             if *keychain_mode.read() == KeychainStorageMode::Biometric {
                                 "Keys require Touch ID/passcode. Device-only, more secure."
                             } else {
@@ -190,12 +190,12 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                         div {
                             class: "flex gap-2",
                             div {
-                                class: "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-primary-600 text-white text-center",
+                                class: "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-btn-primary text-fg text-center",
                                 "🔑 Local Keychain"
                             }
                         }
                         p {
-                            class: "text-xs text-gray-400 mt-2",
+                            class: "text-xs text-fg-muted mt-2",
                             "API key stored securely in your local keychain."
                         }
                     }
@@ -209,7 +209,7 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                     class: if *is_validating.read() {
                         "w-full py-2 px-4 bg-gray-500 rounded-md font-bold cursor-not-allowed"
                     } else {
-                        "w-full py-2 px-4 bg-primary-500 hover:bg-primary-600 rounded-md font-bold transition-colors"
+                        "w-full py-2 px-4 bg-btn-primary hover:bg-btn-primary-hover rounded-md font-bold transition-colors"
                     },
                     disabled: *is_validating.read(),
                     onclick: save_settings,

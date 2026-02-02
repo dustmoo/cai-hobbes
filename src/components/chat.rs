@@ -599,7 +599,7 @@ pub fn ChatWindow(
             .register_callback(continue_prompt_flow.clone());
     });
 
-    let root_classes = "relative flex flex-col bg-dark-bg text-dark-text rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
+    let root_classes = "relative flex flex-col bg-app text-fg rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
 
     let delete_message = move |message_id: Uuid| {
         let confirm = settings.read().confirm_on_message_delete;
@@ -832,9 +832,9 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
 
     rsx! {
         div {
-            class: "code-block-wrapper relative bg-dark-section rounded-lg my-2 overflow-hidden min-w-0",
+            class: "code-block-wrapper relative bg-section rounded-lg my-2 overflow-hidden min-w-0",
             button {
-                class: "absolute top-2 right-2 p-1.5 rounded text-gray-400 hover:bg-dark-card hover:text-white transition-colors z-10",
+                class: "absolute top-2 right-2 p-1.5 rounded text-fg-muted hover:bg-card hover:text-fg transition-colors z-10",
                 onclick: move |evt| {
                     evt.stop_propagation();
                     copy_onclick(evt);
@@ -1051,11 +1051,11 @@ pub fn MessageBubble(
             let is_thinking = is_streaming && !has_content;
 
             let bubble_classes = if is_thinking {
-                 "bg-transparent border border-dashed border-gray-600 animate-pulse self-start mr-auto"
+                 "bg-transparent border border-dashed border-faint animate-pulse self-start mr-auto"
             } else if is_user {
-                "bg-primary-500 text-white self-end ml-auto"
+                "bg-bubble-user text-white self-end ml-auto"
             } else {
-                "bg-dark-card text-dark-text self-start mr-auto"
+                "bg-card text-fg self-start mr-auto"
             };
             let container_classes = if is_user {
                 "flex justify-end"
@@ -1063,7 +1063,7 @@ pub fn MessageBubble(
                 "flex justify-start"
             };
             let author_classes = format!(
-                "text-xs text-gray-500 mt-1 px-2 {}",
+                "text-xs text-fg-muted mt-1 px-2 {}",
                 if is_user { "text-right" } else { "text-left" }
             );
 
@@ -1093,7 +1093,7 @@ pub fn MessageBubble(
                                 div {
                                     class: "flex flex-col space-y-2",
                                     button {
-                                        class: "flex items-center space-x-2 text-gray-400 text-sm py-1 hover:text-gray-200 transition-colors focus:outline-none cursor-pointer",
+                                        class: "flex items-center space-x-2 text-fg-muted text-sm py-1 hover:text-fg transition-colors focus:outline-none cursor-pointer",
                                         onclick: move |_| show_thinking.toggle(),
                                         if *show_thinking.read() {
                                             Icon { width: 14, height: 14, icon: fi_icons::FiChevronDown }
@@ -1109,7 +1109,7 @@ pub fn MessageBubble(
                                     }
                                     if *show_thinking.read() {
                                         div {
-                                            class: "pl-6 text-sm text-gray-300",
+                                            class: "pl-6 text-sm text-fg-muted",
                                             if let Some(summary) = local_thought_summary.read().as_ref() {
                                                  ThinkingMarkdownRenderer { content: summary.clone(), compact: false }
                                             }
@@ -1191,7 +1191,7 @@ pub fn MessageBubble(
                                                 rsx! {
                                                     img {
                                                         src: format!("data:{};base64,{}", safe_mime, attachment.data),
-                                                        class: "w-20 h-20 object-cover rounded-lg hover:opacity-80 transition-opacity cursor-pointer border border-gray-700",
+                                                        class: "w-20 h-20 object-cover rounded-lg hover:opacity-80 transition-opacity cursor-pointer border border-faint",
                                                         alt: attachment.file_name.clone(),
                                                     }
                                                 }
@@ -1299,9 +1299,9 @@ pub fn MessageBubble(
 
                         if !is_thinking {
                             div {
-                                class: "absolute {controls_position_class} opacity-0 group-hover:opacity-100 transition-opacity flex items-center space-x-2 bg-dark-card rounded-lg p-1 shadow-lg border border-gray-700 z-10",
+                                class: "absolute {controls_position_class} opacity-0 group-hover:opacity-100 transition-opacity flex items-center space-x-2 bg-card rounded-lg p-1 shadow-lg border border-faint z-10",
                                 button {
-                                    class: "p-1.5 text-gray-400 hover:text-white rounded transition-colors",
+                                    class: "p-1.5 text-fg-muted hover:text-fg rounded transition-colors",
                                     onclick: move |_| {
                                         let raw_markdown = message.content.get_text_content().unwrap_or_default();
                                         spawn(async move {
@@ -1324,7 +1324,7 @@ pub fn MessageBubble(
                                 }
 
                                 button {
-                                    class: "p-1.5 text-gray-400 hover:text-red-400 rounded transition-colors",
+                                    class: "p-1.5 text-fg-muted hover:text-red-400 rounded transition-colors",
                                     onclick: move |_| on_delete.call(()),
                                     title: "Delete message",
                                     Icon { width: 14, height: 14, icon: fi_icons::FiTrash2 }
@@ -1348,7 +1348,7 @@ pub fn MessageBubble(
                                             class: "flex flex-col",
                                             if has_thinking {
                                                 button {
-                                                    class: "flex items-center text-xs text-gray-500 hover:text-gray-300 focus:outline-none transition-colors",
+                                                    class: "flex items-center text-xs text-fg-muted hover:text-fg-muted focus:outline-none transition-colors",
                                                     onclick: move |_| {
                                                         let current = *show_thinking.read();
                                                         show_thinking.set(!current);
@@ -1371,13 +1371,13 @@ pub fn MessageBubble(
                                                     span { class: "opacity-70", "Thinking Process" }
                                                     if !*show_thinking.read() {
                                                         if let Some(summary) = local_thought_summary.read().as_ref().and_then(|s| extract_bold_blocks(s)) {
-                                                            span { class: "ml-2 text-gray-500 truncate max-w-[200px]", "— {summary}" }
+                                                            span { class: "ml-2 text-fg-muted truncate max-w-[200px]", "— {summary}" }
                                                         }
                                                     }
                                                 }
                                                 if *show_thinking.read() {
                                                     div {
-                                                        class: "mt-2 p-3 bg-dark-bg rounded-lg text-xs text-gray-300",
+                                                        class: "mt-2 p-3 bg-app rounded-lg text-xs text-fg-muted",
                                                         if let Some(summary) = local_thought_summary.read().as_ref() {
                                                             ThinkingMarkdownRenderer { content: summary.clone(), compact: false }
                                                         } else if let Some(sig) = &thought_signature {
@@ -1395,7 +1395,7 @@ pub fn MessageBubble(
                                             if let Some(usage) = &usage_data {
                                                 if display_mode != "none" {
                                                     button {
-                                                        class: "flex items-center text-xs text-gray-500 hover:text-gray-300 focus:outline-none transition-colors",
+                                                        class: "flex items-center text-xs text-fg-muted hover:text-fg-muted focus:outline-none transition-colors",
                                                         onclick: move |_| {
                                                             let current = *show_usage.read();
                                                             show_usage.set(!current);
@@ -1420,7 +1420,7 @@ pub fn MessageBubble(
                                                     }
                                                     if *show_usage.read() {
                                                         div {
-                                                            class: "mt-2 p-3 bg-dark-bg rounded-lg text-xs text-gray-300 font-mono",
+                                                            class: "mt-2 p-3 bg-app rounded-lg text-xs text-fg-muted font-mono",
                                                             div { class: "flex justify-between gap-4",
                                                                 span { "Prompt:" }
                                                                 span { "{usage.prompt_tokens}" }
@@ -1435,7 +1435,7 @@ pub fn MessageBubble(
                                                                     span { "{thoughts}" }
                                                                 }
                                                             }
-                                                            div { class: "flex justify-between gap-4 mt-1 pt-1 border-t border-gray-700",
+                                                            div { class: "flex justify-between gap-4 mt-1 pt-1 border-t border-faint",
                                                                 span { "Cost:" }
                                                                 span { {format!("${:.6}", usage.cost.unwrap_or(0.0))} }
                                                             }
@@ -1461,8 +1461,8 @@ pub fn MessageBubble(
         }
         MessageContent::Error { message: error_msg } => {
             let container_classes = "flex justify-start";
-            let bubble_classes = "bg-red-900 border border-red-700 text-white self-start mr-auto";
-            let author_classes = "text-xs text-gray-500 mt-1 px-2 text-left";
+            let bubble_classes = "bg-red-900 border border-red-700 text-fg self-start mr-auto";
+            let author_classes = "text-xs text-fg-muted mt-1 px-2 text-left";
 
             rsx! {
                 div {
@@ -1553,13 +1553,13 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                 "{text}"
             }
             span {
-                class: format!("inline-flex items-center absolute {} z-10 {} transition-opacity duration-200 bg-dark-card rounded-lg p-1 shadow-lg border border-gray-700 space-x-2",
+                class: format!("inline-flex items-center absolute {} z-10 {} transition-opacity duration-200 bg-card rounded-lg p-1 shadow-lg border border-faint space-x-2",
                     if *pop_left.read() { "right-full mr-1" } else { "left-full ml-1" },
                     if *is_hovered.read() { "opacity-100" } else { "opacity-0" }
                 ),
 
                 button {
-                    class: "p-1.5 text-gray-400 hover:text-white rounded transition-colors",
+                    class: "p-1.5 text-fg-muted hover:text-fg rounded transition-colors",
                     onclick: move |evt| {
                         evt.stop_propagation();
                         let href_clone = href_clone_for_copy.clone();
@@ -1578,7 +1578,7 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                     }
                 }
                 button {
-                    class: "p-1.5 text-gray-400 hover:text-white rounded transition-colors",
+                    class: "p-1.5 text-fg-muted hover:text-fg rounded transition-colors",
                     onclick: move |evt| {
                         evt.stop_propagation();
                         let summary_prompt = format!("Please fetch {} and summarize.", href_clone_for_summarize);
@@ -1621,7 +1621,7 @@ fn extract_bold_blocks(content: &str) -> Option<String> {
 pub fn WelcomeMessage() -> Element {
     rsx! {
         div {
-            class: "flex flex-col items-center justify-center h-full text-gray-500",
+            class: "flex flex-col items-center justify-center h-full text-fg-muted",
             svg {
                 class: "w-24 h-24 mb-4",
                 fill: "none",

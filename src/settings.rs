@@ -10,6 +10,15 @@ pub enum LlmProvider {
     Gemini,
 }
 
+/// Application color theme
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+    System,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GeminiConfig {
     #[serde(skip)]
@@ -157,6 +166,9 @@ pub struct Settings {
     pub composio_api_key: Option<String>,
     #[serde(skip_serializing)]
     pub composio_user_id: Option<String>,
+    /// Application color theme (Dark, Light, or System)
+    #[serde(default)]
+    pub theme: Theme,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -400,6 +412,7 @@ impl Default for Settings {
             composio_entity_id: None,
             composio_api_key: None,
             composio_user_id: None,
+            theme: Theme::default(),
         }
     }
 }

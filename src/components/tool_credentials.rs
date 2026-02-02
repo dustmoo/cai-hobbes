@@ -240,9 +240,9 @@ pub fn ToolCredentials() -> Element {
             class: "flex flex-col space-y-4",
 
             div {
-                class: "p-4 bg-dark-section border border-primary-700 rounded-lg",
-                h3 { class: "text-md font-semibold text-white mb-2", "Custom Tool Credentials (BYOA)" }
-                p { class: "text-sm text-gray-400",
+                class: "p-4 bg-section border border-subtle rounded-lg",
+                h3 { class: "text-md font-semibold text-fg mb-2", "Custom Tool Credentials (BYOA)" }
+                p { class: "text-sm text-fg-muted",
                     "Add your own Client IDs and Secrets for tools that require custom authentication (e.g., LinkedIn, Google)."
                 }
                 
@@ -268,8 +268,8 @@ pub fn ToolCredentials() -> Element {
             }
 
             div {
-                class: "p-4 bg-dark-section border border-primary-700 rounded-lg",
-                h4 { class: "text-sm font-semibold text-gray-300 mb-3", "Add New Credential" }
+                class: "p-4 bg-section border border-subtle rounded-lg",
+                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Add New Credential" }
 
                 // Error message for toolkit loading
                 if let Some(err) = toolkits_error.read().as_ref() {
@@ -281,16 +281,16 @@ pub fn ToolCredentials() -> Element {
 
                 div { class: "grid grid-cols-1 md:grid-cols-3 gap-3 mb-3",
                     div { class: "relative",
-                        label { class: "block text-xs font-medium text-gray-500 mb-1", "Toolkit" }
+                        label { class: "block text-xs font-medium text-fg-muted mb-1", "Toolkit" }
                         if *toolkits_loading.read() {
                             div {
-                                class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm text-gray-400",
+                                class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm text-fg-muted",
                                 "Loading toolkits..."
                             }
                         } else {
                             // Combobox input
                             input {
-                                class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm text-white focus:ring-1 focus:ring-primary-500",
+                                class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm text-fg focus:ring-1 focus:ring-primary-500",
                                 placeholder: "Select toolkit...",
                                 value: if selected_slug.read().is_empty() {
                                     toolkit_filter.read().clone()
@@ -358,14 +358,14 @@ pub fn ToolCredentials() -> Element {
                             // Floating dropdown menu
                             if *dropdown_open.read() && !filtered_toolkits.is_empty() {
                                 div {
-                                    class: "absolute z-50 w-full mt-1 bg-dark-card border border-primary-600 rounded-md shadow-lg max-h-48 overflow-y-auto",
+                                    class: "absolute z-50 w-full mt-1 bg-card border border-primary-600 rounded-md shadow-lg max-h-48 overflow-y-auto",
                                     for (idx, (slug, name, _is_connected)) in filtered_toolkits.iter().enumerate() {
                                         div {
                                             key: "{slug}",
                                             class: if idx == *highlighted_index.read() {
-                                                "px-3 py-2 text-sm cursor-pointer bg-primary-600 text-white"
+                                                "px-3 py-2 text-sm cursor-pointer bg-btn-primary text-fg"
                                             } else {
-                                                "px-3 py-2 text-sm cursor-pointer hover:bg-primary-700 text-gray-300"
+                                                "px-3 py-2 text-sm cursor-pointer hover:bg-primary-700 text-fg-muted"
                                             },
                                             onmousedown: {
                                                 let slug_clone = slug.clone();
@@ -389,14 +389,14 @@ pub fn ToolCredentials() -> Element {
                             }
                             if *dropdown_open.read() && filtered_toolkits.is_empty() && !toolkit_filter.read().is_empty() {
                                 div {
-                                    class: "absolute z-50 w-full mt-1 bg-dark-card border border-primary-600 rounded-md shadow-lg p-3",
-                                    span { class: "text-xs text-gray-500 italic", "No toolkits match filter" }
+                                    class: "absolute z-50 w-full mt-1 bg-card border border-primary-600 rounded-md shadow-lg p-3",
+                                    span { class: "text-xs text-fg-muted italic", "No toolkits match filter" }
                                 }
                             }
                         }
                     }
                     div {
-                        label { class: "block text-xs font-medium text-gray-500 mb-1", "Field Name (e.g. client_id)" }
+                        label { class: "block text-xs font-medium text-fg-muted mb-1", "Field Name (e.g. client_id)" }
                         
                         // Dynamic field suggestions based on schema
                         if let Some(listing) = selected_toolkit_listing.read().as_ref() {
@@ -405,7 +405,7 @@ pub fn ToolCredentials() -> Element {
                                     div { class: "flex flex-wrap gap-1 mb-2",
                                         for field in fields {
                                             button {
-                                                class: "px-2 py-0.5 bg-primary-900/40 hover:bg-primary-800/60 border border-primary-700 rounded text-[10px] text-primary-300 transition-colors",
+                                                class: "px-2 py-0.5 bg-primary-900/40 hover:bg-primary-800/60 border border-subtle rounded text-[10px] text-primary-300 transition-colors",
                                                 title: field.description.as_deref().unwrap_or("Click to use this field name"),
                                                 onclick: {
                                                     let field_name = field.name.clone();
@@ -420,20 +420,20 @@ pub fn ToolCredentials() -> Element {
                                 }
                             }
                         } else if *listing_loading.read() {
-                            div { class: "text-[10px] text-gray-500 italic mb-2", "Fetching suggested fields..." }
+                            div { class: "text-[10px] text-fg-muted italic mb-2", "Fetching suggested fields..." }
                         }
 
                         input {
-                            class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm text-white focus:ring-1 focus:ring-primary-500",
+                            class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm text-fg focus:ring-1 focus:ring-primary-500",
                             placeholder: "client_id",
                             value: "{new_field}",
                             oninput: move |e| new_field.set(e.value())
                         }
                     }
                     div {
-                        label { class: "block text-xs font-medium text-gray-500 mb-1", "Value" }
+                        label { class: "block text-xs font-medium text-fg-muted mb-1", "Value" }
                         input {
-                            class: "w-full px-3 py-2 bg-dark-input border border-primary-600 rounded-md text-sm text-white focus:ring-1 focus:ring-primary-500",
+                            class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm text-fg focus:ring-1 focus:ring-primary-500",
                             r#type: "password",
                             placeholder: "Enter secret...",
                             value: "{new_value}",
@@ -443,7 +443,7 @@ pub fn ToolCredentials() -> Element {
                 }
                 div { class: "flex justify-end",
                     button {
-                        class: "px-4 py-2 bg-primary-600 hover:bg-primary-500 text-white rounded-md text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                        class: "px-4 py-2 bg-btn-primary hover:bg-btn-primary-hover text-fg rounded-md text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                         disabled: selected_slug.read().is_empty() || new_field.read().is_empty() || new_value.read().is_empty(),
                         onclick: handle_add,
                         Icon { width: 16, height: 16, icon: fi_icons::FiPlus, class: "mr-2 inline-block" }
@@ -457,8 +457,8 @@ pub fn ToolCredentials() -> Element {
                 for (slug, fields) in credentials.read().iter() {
                     div {
                         key: "{slug}",
-                        class: "border border-gray-700 rounded-lg overflow-hidden",
-                        div { class: "bg-gray-800/50 px-4 py-2 border-b border-gray-700 flex items-center",
+                        class: "border border-faint rounded-lg overflow-hidden",
+                        div { class: "bg-section/50 px-4 py-2 border-b border-faint flex items-center",
                             Icon { width: 16, height: 16, icon: fi_icons::FiTool, class: "text-primary-400 mr-2" }
                             span { class: "font-medium text-gray-200", "{slug}" }
                         }
@@ -468,10 +468,10 @@ pub fn ToolCredentials() -> Element {
                                     key: "{field}",
                                     class: "flex items-center justify-between px-4 py-3 border-b border-gray-800 last:border-0 hover:bg-white/5 transition-colors group",
                                     div { class: "flex items-center space-x-4 flex-1 min-w-0",
-                                        span { class: "text-sm text-gray-400 font-mono shrink-0", "{field}" }
-                                        div { class: "flex items-center space-x-2 flex-1 min-w-0 bg-dark-bg/50 px-2 py-1.5 rounded border border-gray-800",
+                                        span { class: "text-sm text-fg-muted font-mono shrink-0", "{field}" }
+                                        div { class: "flex items-center space-x-2 flex-1 min-w-0 bg-app/50 px-2 py-1.5 rounded border border-gray-800",
                                             span {
-                                                class: "text-xs font-mono text-gray-300 truncate flex-1",
+                                                class: "text-xs font-mono text-fg-muted truncate flex-1",
                                                 {
                                                     let key = format!("{}__{}", slug, field);
                                                     let is_visible = *show_values.read().get(&key).unwrap_or(&false);
@@ -479,7 +479,7 @@ pub fn ToolCredentials() -> Element {
                                                 }
                                             }
                                             button {
-                                                class: "text-gray-500 hover:text-gray-300 p-1 rounded transition-colors",
+                                                class: "text-fg-muted hover:text-fg-muted p-1 rounded transition-colors",
                                                 onclick: {
                                                     let key = format!("{}__{}", slug, field);
                                                     move |_| {
@@ -497,7 +497,7 @@ pub fn ToolCredentials() -> Element {
                                         }
                                     }
                                     button {
-                                        class: "ml-4 text-gray-500 hover:text-red-400 p-1.5 rounded transition-colors opacity-0 group-hover:opacity-100",
+                                        class: "ml-4 text-fg-muted hover:text-red-400 p-1.5 rounded transition-colors opacity-0 group-hover:opacity-100",
                                         title: "Delete credential",
                                         onclick: {
                                             let s = slug.clone();
@@ -512,7 +512,7 @@ pub fn ToolCredentials() -> Element {
                     }
                 }
                 if credentials.read().is_empty() {
-                    div { class: "text-center py-8 text-gray-500 italic", "No custom credentials configured." }
+                    div { class: "text-center py-8 text-fg-muted italic", "No custom credentials configured." }
                 }
             }
         }

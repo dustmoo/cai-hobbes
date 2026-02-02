@@ -46,7 +46,7 @@ pub fn ConfirmSaveModal(props: ConfirmSaveModalProps) -> Element {
 
                 // The modal "card" with distinct styling
                 div {
-                    class: "bg-dark-section border border-primary-700 rounded-lg shadow-xl p-4 w-sm",
+                    class: "bg-section border border-subtle rounded-lg shadow-xl p-4 w-sm",
                     tabindex: "0",
                     onclick: |event| event.stop_propagation(), // Prevent clicks inside from closing the modal
                     onkeydown: {
@@ -62,21 +62,21 @@ pub fn ConfirmSaveModal(props: ConfirmSaveModalProps) -> Element {
                         }
                     },
 
-                    h2 { class: "text-xl font-bold text-white m-4", "{props.title}" }
-                    p { class: "text-gray-300 m-4", "{props.message}" }
+                    h2 { class: "text-xl font-bold text-fg m-4", "{props.title}" }
+                    p { class: "text-fg-muted m-4", "{props.message}" }
 
                     div {
                         class: "flex items-center m-4",
                         input {
                             id: "remember_choice",
                             "type": "checkbox",
-                            class: "h-4 w-4 text-primary-600 bg-dark-input border-primary-600 rounded focus:ring-primary-500",
+                            class: "h-4 w-4 text-primary-600 bg-input border-primary-600 rounded focus:ring-primary-500",
                             checked: *remember_choice.read(),
                             onchange: move |evt| remember_choice.set(evt.checked()),
                         }
                         label {
                             "for": "remember_choice",
-                            class: "ml-2 text-sm font-medium text-gray-400 select-none",
+                            class: "ml-2 text-sm font-medium text-fg-muted select-none",
                             "Remember my choice"
                         }
                     }
@@ -85,12 +85,12 @@ pub fn ConfirmSaveModal(props: ConfirmSaveModalProps) -> Element {
                     div {
                         class: "flex justify-end space-x-4",
                         button {
-                            class: "px-4 py-2 bg-dark-card rounded-md text-white font-semibold hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-500",
+                            class: "px-4 py-2 bg-card rounded-md text-fg font-semibold hover:bg-input focus:outline-none focus:ring-2 focus:ring-gray-500",
                             onclick: move |_| props.on_cancel.call(()),
                             "Cancel"
                         }
                         button {
-                            class: "px-4 py-2 bg-primary-500 rounded-md text-white font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500",
+                            class: "px-4 py-2 bg-btn-primary rounded-md text-fg font-semibold hover:bg-btn-primary-hover focus:outline-none focus:ring-2 focus:ring-primary-500",
                             onclick: move |_| props.on_confirm.call(*remember_choice.read()),
                             "Yes, Save"
                         }

@@ -116,17 +116,17 @@ pub fn NewChatMemoryModal(
                 }
             },
             div {
-                class: "bg-dark-card border border-primary-700 rounded-lg shadow-xl w-[800px] h-[80vh] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200",
+                class: "bg-card border border-subtle rounded-lg shadow-xl w-[800px] h-[80vh] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200",
 
                 // Header
                 div {
-                    class: "p-4 border-b border-primary-700 flex justify-between items-center bg-dark-section",
+                    class: "p-4 border-b border-subtle flex justify-between items-center bg-section",
                     div {
-                        h2 { class: "text-lg font-semibold text-white flex items-center gap-2",
+                        h2 { class: "text-lg font-semibold text-fg flex items-center gap-2",
                             Icon { width: 20, height: 20, icon: fi_icons::FiCpu }
                             "New Chat with Memory"
                         }
-                        p { class: "text-xs text-gray-400 mt-1",
+                        p { class: "text-xs text-fg-muted mt-1",
                             "Edit the short-term memory (persona, instructions, etc.) for the new session."
                         }
                         {
@@ -134,14 +134,14 @@ pub fn NewChatMemoryModal(
                             let estimated_tokens = context_size / 4;
                             rsx! {
                                 p {
-                                    class: "text-xs text-gray-500 mt-1",
+                                    class: "text-xs text-fg-muted mt-1",
                                     "Context size: ~{estimated_tokens} tokens ({context_size} chars)"
                                 }
                             }
                         }
                     }
                     button {
-                        class: "text-gray-400 hover:text-white transition-colors",
+                        class: "text-fg-muted hover:text-fg transition-colors",
                         onclick: move |_| on_cancel.call(()),
                         Icon { width: 24, height: 24, icon: fi_icons::FiX }
                     }
@@ -150,7 +150,7 @@ pub fn NewChatMemoryModal(
                 // Optimization Summary Banner (if present)
                 if let Some(summary) = optimization_summary.read().as_ref() {
                     div {
-                        class: "mx-4 my-3 p-3 bg-primary-900/30 border border-primary-700/50 rounded-lg flex items-start gap-2 animate-in slide-in-from-top-2",
+                        class: "mx-4 my-3 p-3 bg-primary-900/30 border border-subtle/50 rounded-lg flex items-start gap-2 animate-in slide-in-from-top-2",
                         div { class: "text-primary-400 mt-0.5", "✨" }
                         div {
                             class: "flex-1",
@@ -158,7 +158,7 @@ pub fn NewChatMemoryModal(
                             p { class: "text-sm text-gray-200", "{summary}" }
                         }
                         button {
-                            class: "text-gray-400 hover:text-white transition-colors p-1",
+                            class: "text-fg-muted hover:text-fg transition-colors p-1",
                             onclick: move |_| optimization_summary.set(None),
                             Icon { width: 14, height: 14, icon: fi_icons::FiX }
                         }
@@ -167,7 +167,7 @@ pub fn NewChatMemoryModal(
 
                 // Body
                 div {
-                    class: "flex-1 flex flex-col p-4 overflow-hidden bg-dark-bg",
+                    class: "flex-1 flex flex-col p-4 overflow-hidden bg-app",
 
                     // Toolbar
                     div {
@@ -175,7 +175,7 @@ pub fn NewChatMemoryModal(
                         div {
                             class: "flex gap-2",
                             button {
-                                class: "text-xs px-2 py-1 bg-dark-input hover:bg-primary-900 border border-primary-700 rounded text-gray-300 transition-colors",
+                                class: "text-xs px-2 py-1 bg-input hover:bg-primary-900 border border-subtle rounded text-fg-muted transition-colors",
                                 onclick: move |_| {
                                     let content = json_content.read().clone();
                                     match serde_json::from_str::<serde_json::Value>(&content) {
@@ -204,7 +204,7 @@ pub fn NewChatMemoryModal(
 
                     // Editor
                     div {
-                        class: "flex-1 relative bg-dark-section rounded-md border border-gray-700 overflow-hidden",
+                        class: "flex-1 relative bg-section rounded-md border border-faint overflow-hidden",
                         id: "memory-json-editor-container",
 
                         // Highlighted layer
@@ -259,7 +259,7 @@ pub fn NewChatMemoryModal(
 
                 // Footer
                 div {
-                    class: "p-4 border-t border-primary-700 bg-dark-section flex justify-between items-center",
+                    class: "p-4 border-t border-subtle bg-section flex justify-between items-center",
 
                     // Left Side: Optimization Control
                     button {
@@ -272,12 +272,12 @@ pub fn NewChatMemoryModal(
                     div {
                         class: "flex gap-3",
                         button {
-                            class: "px-4 py-2 text-gray-300 hover:text-white font-medium transition-colors",
+                            class: "px-4 py-2 text-fg-muted hover:text-fg font-medium transition-colors",
                             onclick: move |_| on_cancel.call(()),
                             "Cancel"
                         }
                         button {
-                            class: "px-6 py-2 bg-primary-600 hover:bg-primary-500 text-white rounded-md font-semibold shadow-lg shadow-primary-900/20 transition-all hover:scale-105 active:scale-95",
+                            class: "px-6 py-2 bg-btn-primary hover:bg-btn-primary-hover text-fg rounded-md font-semibold shadow-lg shadow-primary-900/20 transition-all hover:scale-105 active:scale-95",
                             onclick: move |_| submit_session_click(),
                             "Start New Session"
                         }
