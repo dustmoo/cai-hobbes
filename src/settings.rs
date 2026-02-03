@@ -263,10 +263,11 @@ pub const APP_ATTRIBUTION: &str =
 // ============================================================================
 // TERMS OF SERVICE VERSION
 // ============================================================================
-// Bump this version string when TOS content changes to force re-acceptance.
+// Bump this version string when assets/legal/terms_of_service.md changes.
+// The version should match the "Version X.X" in the markdown file header.
 // Users who accepted an older version will see the TOS screen again.
 // ============================================================================
-pub const CURRENT_TOS_VERSION: &str = "1.0";
+pub const CURRENT_TOS_VERSION: &str = "1.1";
 
 /// Configuration for a single Composio toolkit's loading behavior
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]

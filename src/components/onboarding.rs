@@ -1,3 +1,4 @@
+use crate::components::markdown_renderer::MarkdownRenderer;
 use crate::services::gemini_models::validate_gemini_api_key;
 use crate::settings::{is_sandboxed, KeychainStorageMode, Settings, SettingsManager, CURRENT_TOS_VERSION};
 use dioxus::prelude::*;
@@ -14,57 +15,10 @@ enum OnboardingStep {
     Declined,
 }
 
-/// Embedded Terms of Service content
-const TOS_CONTENT: &str = r#"HOBBES TERMS OF SERVICE
-Version 1.0 | Effective Date: February 2026
-
-By using Hobbes ("the Software"), you agree to these terms.
-
-1. ACCEPTANCE OF TERMS
-By clicking "I Accept" or using the Software, you agree to be bound by these Terms of Service and our Privacy Policy.
-
-2. LICENSE GRANT
-Clear Mirror LLC grants you a limited, non-exclusive, non-transferable license to use the Software for personal or internal business purposes, subject to these terms.
-
-3. AI-GENERATED CONTENT DISCLAIMER
-The Software uses third-party AI services (including Google Gemini) to generate responses. You acknowledge that:
-• AI-generated content may be inaccurate, incomplete, or inappropriate
-• You are solely responsible for reviewing and verifying any AI output before use
-• Clear Mirror LLC does not guarantee the accuracy, reliability, or suitability of AI-generated content for any purpose
-
-4. YOUR RESPONSIBILITIES
-You agree to:
-• Provide your own API keys for third-party services
-• Not use the Software for any unlawful purpose
-• Not attempt to reverse engineer, modify, or redistribute the Software
-• Take responsibility for all actions performed through the Software
-
-5. DATA & PRIVACY
-• All conversation data is stored locally on your device
-• API keys are stored in your system keychain
-• We do not collect telemetry or transmit your data to our servers
-• Third-party AI providers may process your prompts according to their terms
-
-6. DISCLAIMER OF WARRANTIES
-THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND. CLEAR MIRROR LLC DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
-
-7. LIMITATION OF LIABILITY
-IN NO EVENT SHALL CLEAR MIRROR LLC BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR ANY LOSS OF PROFITS OR REVENUE, WHETHER INCURRED DIRECTLY OR INDIRECTLY, OR ANY LOSS OF DATA, USE, GOODWILL, OR OTHER INTANGIBLE LOSSES.
-
-8. BETA SOFTWARE
-You acknowledge this Software is in beta. Features may change, and bugs may exist. Your use during beta helps improve the product.
-
-9. TERMINATION
-We may terminate or suspend your access immediately, without prior notice, for any breach of these Terms.
-
-10. CHANGES TO TERMS
-We reserve the right to modify these terms. Continued use after changes constitutes acceptance.
-
-11. GOVERNING LAW
-These terms are governed by the laws of the State of California, without regard to conflict of law principles.
-
-Contact: support@clearmirror.ai
-"#;
+/// Terms of Service content loaded from external markdown file.
+/// Edit assets/legal/terms_of_service.md to update without code changes.
+/// Remember to bump CURRENT_TOS_VERSION in settings.rs when content changes.
+pub const TOS_CONTENT: &str = include_str!("../../assets/legal/terms_of_service.md");
 
 #[component]
 pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
@@ -219,8 +173,12 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
 
                     // Scrollable TOS content
                     div {
-                        class: "flex-grow bg-app border border-subtle rounded-lg p-4 overflow-y-auto max-h-[300px] text-sm text-fg-muted whitespace-pre-wrap font-mono",
-                        "{TOS_CONTENT}"
+                        class: "flex-grow bg-app border border-subtle rounded-lg p-4 overflow-y-auto max-h-[300px] text-sm prose prose-sm dark:prose-invert max-w-none",
+                        MarkdownRenderer {
+                            content: TOS_CONTENT.to_string(),
+                            comments: None,
+                            pending_highlight: None,
+                        }
                     }
 
                     // Checkbox

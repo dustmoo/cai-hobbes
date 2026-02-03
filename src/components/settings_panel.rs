@@ -1,6 +1,8 @@
 use crate::components::confirm_save_modal::ConfirmSaveModal;
 use crate::components::conflict_modal::ConflictModal;
 use crate::components::hotkey_recorder::HotkeyRecorder;
+use crate::components::markdown_renderer::MarkdownRenderer;
+use crate::components::onboarding::TOS_CONTENT;
 use crate::components::tool_credentials::ToolCredentials;
 use crate::mcp::composio_client::validate_composio_api_key;
 use crate::settings::{is_sandboxed, HotkeySettings, Settings, SettingsManager};
@@ -90,6 +92,7 @@ pub fn SettingsPanel() -> Element {
     let mut permissions_collapsed = use_signal(|| false);
     let mut show_conflict_modal = use_signal(|| false);
     let mut show_confirm_save_modal = use_signal(|| false);
+    let mut show_tos_modal = use_signal(|| false);
     let mut conflicting_sessions = use_signal(Vec::<(String, crate::session::Session)>::new);
 
     // UI Persistence Helpers
@@ -2291,10 +2294,9 @@ pub fn SettingsPanel() -> Element {
                         // Legal links
                         div {
                             class: "flex gap-4",
-                            a {
-                                class: "text-sm text-primary-400 hover:text-primary-300 underline",
-                                href: "https://clearmirror.ai/terms-of-service",
-                                target: "_blank",
+                            button {
+                                class: "text-sm text-primary-400 hover:text-primary-300 underline cursor-pointer bg-transparent border-none p-0",
+                                onclick: move |_| show_tos_modal.set(true),
                                 "Terms of Service"
                             }
                             a {
@@ -2302,6 +2304,46 @@ pub fn SettingsPanel() -> Element {
                                 href: "https://clearmirror.ai/privacy-policy",
                                 target: "_blank",
                                 "Privacy Policy"
+                            }
+                        }
+
+                        // TOS Modal
+                        if show_tos_modal() {
+                            div {
+                                class: "fixed inset-0 bg-black/60 flex items-center justify-center z-50",
+                                onclick: move |_| show_tos_modal.set(false),
+                                div {
+                                    class: "bg-section rounded-lg shadow-xl max-w-lg w-full mx-4 max-h-[80vh] flex flex-col",
+                                    onclick: move |e| e.stop_propagation(),
+                                    // Header
+                                    div {
+                                        class: "flex justify-between items-center p-4 border-b border-subtle",
+                                        h2 { class: "text-lg font-bold", "Terms of Service" }
+                                        button {
+                                            class: "text-fg-muted hover:text-fg text-xl font-bold w-8 h-8 flex items-center justify-center rounded hover:bg-input transition-colors",
+                                            onclick: move |_| show_tos_modal.set(false),
+                                            "×"
+                                        }
+                                    }
+                                    // Content
+                                    div {
+                                        class: "flex-1 overflow-y-auto p-4 text-sm prose prose-sm dark:prose-invert max-w-none",
+                                        MarkdownRenderer {
+                                            content: TOS_CONTENT.to_string(),
+                                            comments: None,
+                                            pending_highlight: None,
+                                        }
+                                    }
+                                    // Footer
+                                    div {
+                                        class: "p-4 border-t border-subtle",
+                                        button {
+                                            class: "w-full py-2 px-4 bg-btn-primary hover:bg-btn-primary-hover rounded-md font-bold transition-colors",
+                                            onclick: move |_| show_tos_modal.set(false),
+                                            "Close"
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

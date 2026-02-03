@@ -353,30 +353,36 @@ impl<'a> PromptBuilder<'a> {
         }
 
         // Extract active skill context from messages and inject into system instruction
-        // This ensures resolved tool mappings have high priority in the model's context
+        // This ensures skill instructions and resolved tool mappings have high priority in the model's context
         for message in &self.session.messages {
             if let MessageContent::SkillCall(sc) = &message.content {
                 if matches!(sc.status, crate::components::shared::SkillCallStatus::Completed) {
                     // Parse the response to extract the CapabilityContextPayload
                     if let Ok(payload) = serde_json::from_str::<crate::components::shared::CapabilityContextPayload>(&sc.response) {
-                        if !payload.resolved_tools.is_empty() {
-                            let tool_mappings: Vec<serde_json::Value> = payload.resolved_tools.iter()
-                                .map(|(capability, tool_name)| json!({
-                                    "capability": capability,
-                                    "use_tool": tool_name
-                                }))
-                                .collect();
-                            
-                            system_context_map.insert(
-                                "active_skill".to_string(),
-                                json!({
-                                    "name": sc.skill_name,
-                                    "instruction": format!("PRIORITY: Use these specific tools for the '{}' skill. Do NOT use Composio discovery tools.", sc.skill_name),
-                                    "resolved_tools": tool_mappings,
-                                    "arguments": sc.arguments
-                                })
-                            );
-                        }
+                        // Build tool mappings if available
+                        let tool_mappings: Vec<serde_json::Value> = payload.resolved_tools.iter()
+                            .map(|(capability, tool_name)| json!({
+                                "capability": capability,
+                                "use_tool": tool_name
+                            }))
+                            .collect();
+                        
+                        // CRITICAL: Include the instruction_manual - this is the actual skill content!
+                        // Previously this was being ignored, causing skills to not be followed.
+                        system_context_map.insert(
+                            "active_skill".to_string(),
+                            json!({
+                                "name": sc.skill_name,
+                                "priority_instruction": format!(
+                                    "CRITICAL: You are executing the '{}' skill. Follow the instructions below EXACTLY. Do NOT improvise or use generic approaches.",
+                                    sc.skill_name
+                                ),
+                                "instruction_manual": payload.instruction_manual,
+                                "resolved_tools": tool_mappings,
+                                "arguments": sc.arguments,
+                                "warnings": payload.warnings
+                            })
+                        );
                     }
                 }
             }
