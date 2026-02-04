@@ -75,6 +75,7 @@ fn main() {
                 .with_menu(menu)
                 .with_window(
                     {
+                        #[allow(unused_mut)]
                         let mut window = WindowBuilder::new()
                             .with_title(settings::get_app_name())
                             .with_visible(true)

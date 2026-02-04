@@ -3,6 +3,7 @@ use macos_accessibility_client::accessibility;
 
 /// Represents the status of accessibility permissions.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum PermissionStatus {
     Granted,
     JustGranted,

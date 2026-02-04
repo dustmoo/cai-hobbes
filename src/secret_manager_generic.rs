@@ -11,10 +11,12 @@ pub use crate::secret_types::{KNOWN_KEYS, COMPOSIO_KEY_PREFIX};
 /// Dummy AuthContext for non-macOS generic implementation.
 /// This matches the type in the macOS implementation for API parity.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct AuthContext;
 
 /// Error types for keychain operations (API parity with macOS)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum KeychainError {
     NotFound,
     AuthCancelled,
@@ -88,11 +90,13 @@ impl SecretManager {
     // BIOMETRIC AUTHENTICATION STUBS (For API Parity with macOS)
     // =========================================================================
 
+    #[allow(dead_code)]
     pub fn load_all_with_context(&mut self, _context: &AuthContext) {
         tracing::debug!("Generic SecretManager: Ignoring biometric context, loading normally...");
         self.load_all_from_keychain();
     }
 
+    #[allow(dead_code)]
     pub fn load_composio_key_with_context(
         &mut self,
         profile_name: &str,
