@@ -15,6 +15,8 @@ pub mod syntax_highlighter;
 pub mod tool_call_display;
 pub mod skill_autocomplete;
 pub mod skill_call_display;
+pub mod tab_bar;
+
 
 pub mod confirm_delete_modal;
 pub mod confirm_save_modal;

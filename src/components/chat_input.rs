@@ -14,7 +14,7 @@ use crate::settings::{Settings, SettingsManager, UiState};
 use hobbes_core::models::Attachment;
 
 use crate::components::focus_context::FocusContext;
-use crate::components::shared::ChatBarIconButton;
+use crate::components::shared::{ChatBarIconButton, DraftContext, SessionIdContext};
 use crate::components::skill_autocomplete::SkillAutocomplete;
 use crate::hotkey::matches_hotkey;
 use crate::processing::summarization_scheduler::SchedulerSignal;
@@ -36,6 +36,10 @@ pub enum ChatCommand {
     CopyToDraft(String),
     TriggerAiAnalysis,
     SwitchToSettingsTab(crate::settings::SettingsTab, Option<String>),
+    SwitchTab(usize),
+    SwitchToSession(String),
+    /// Switch the current session's profile to the profile at this index.
+    SwitchProfile(usize),
 }
 
 #[component]
@@ -52,14 +56,16 @@ pub fn ChatInput(
     on_new_chat_with_memory: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let mut settings = use_context::<Signal<Settings>>();
-    let settings_manager = use_context::<Signal<SettingsManager>>();
+    let SessionIdContext(_current_session_id) = use_context::<SessionIdContext>();
+    let settings = use_context::<Signal<Settings>>();
+    let _settings_manager = use_context::<Signal<SettingsManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let ui_state = use_context::<Signal<UiState>>();
-    let mut draft = use_context::<Signal<String>>();
+    let DraftContext(mut draft) = use_context::<DraftContext>();
     let mut is_dragging = use_signal(|| false);
     let mut attachments = use_signal(Vec::<Attachment>::new);
+    let mut active_composio_profile_name = consume_context::<Signal<Option<String>>>();
     let mut is_processing_attachments = use_signal(|| false);
     let mut show_profile_selector = use_signal(|| false);
     let mut show_new_chat_menu = use_signal(|| false);
@@ -112,7 +118,7 @@ pub fn ChatInput(
                 }
                 ChatCommand::NewChat => {
                     tracing::info!("ChatCommand::NewChat triggered");
-                    session_state.write().create_session();
+                    session_state.write().create_session(active_composio_profile_name.peek().clone());
                 }
                 ChatCommand::NewChatWithMemory => {
                     tracing::info!("ChatCommand::NewChatWithMemory triggered");
@@ -190,6 +196,15 @@ pub fn ChatInput(
                     has_pending_approvals.set(true);
                     on_send.call((String::new(), Vec::new()));
                 }
+                ChatCommand::SwitchTab(_) => {
+                    // Handled globally in main.rs
+                }
+                ChatCommand::SwitchToSession(_) => {
+                    // Handled globally in main.rs
+                }
+                ChatCommand::SwitchProfile(_) => {
+                    // Handled globally in main.rs
+                }
             }
             // Reset command to avoid re-triggering
             spawn(async move {
@@ -238,7 +253,14 @@ pub fn ChatInput(
                         path: skill.path.clone(),
                         has_scripts: !skill.scripts.is_empty(),
                         raw_output: None,
-                        profile_color: Some(settings.read().get_active_profile().map(|p| p.color.clone()).unwrap_or_default()),
+                        profile_color: {
+                            let settings_read = settings.read();
+                            let profile_name = active_composio_profile_name.read().clone();
+                            profile_name
+                                .and_then(|name| settings_read.composio_profiles.iter().find(|p| p.name == name))
+                                .map(|p| p.color.clone())
+                                .or_else(|| settings_read.get_active_profile().map(|p| p.color.clone()))
+                        },
                     };
                     
                     // First, push a normal user text bubble showing the command (history parity)
@@ -453,7 +475,15 @@ pub fn ChatInput(
                         let profiles = &settings_read.composio_profiles;
 
                         if profiles.len() > 1 {
-                            let active_profile = settings_read.get_active_profile().cloned().unwrap_or_default();
+                            // LIVE AUTHORITY: Use global signal
+                            let active_profile_name = active_composio_profile_name.read().clone();
+                            
+                            let active_profile = profiles.iter()
+                                .find(|p| Some(&p.name) == active_profile_name.as_ref())
+                                .or_else(|| settings_read.get_active_profile())
+                                .cloned()
+                                .unwrap_or_else(|| profiles[0].clone());
+
                             let active_initial = active_profile.name.chars().next().unwrap_or('?').to_uppercase();
 
                             rsx! {
@@ -475,11 +505,15 @@ pub fn ChatInput(
                                                         onclick: {
                                                             let new_profile_name = profile.name.clone();
                                                             move |_| {
-                                                                settings.write().active_composio_profile = Some(new_profile_name.clone());
-                                                                // Auto-save changes
-                                                                if let Err(e) = settings_manager.read().save(&settings.read()) {
-                                                                    tracing::error!("Failed to save profile change: {}", e);
+                                                                // Update GLOBAL signal first
+                                                                active_composio_profile_name.set(Some(new_profile_name.clone()));
+                                                                
+                                                                if let Some(session) = session_state.write().get_active_session_mut() {
+                                                                    session.composio_profile = Some(new_profile_name.clone());
                                                                 }
+                                                                // NOTE: We no longer write to global settings here.
+                                                                // Global settings.active_composio_profile is only the template for NEW chats.
+                                                                
                                                                 // Trigger summary refresh
                                                                 scheduler.send(SchedulerSignal::ForceRefresh);
                                                                 show_profile_selector.set(false);
@@ -794,7 +828,7 @@ pub fn ChatInput(
                                             spawn(async move {
                                                 let mcp_context = {
                                                     let mcp_manager_reader = _mcp_manager.read();
-                                                    mcp_manager_reader.get_mcp_context().await
+                                                    mcp_manager_reader.get_mcp_context(None).await
                                                 };
 
                                                 let context_string = {
@@ -860,7 +894,7 @@ pub fn ChatInput(
                                 button {
                                     class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
                                     onclick: move |_| {
-                                        session_state.write().create_session();
+                                        session_state.write().create_session(active_composio_profile_name.peek().clone());
                                         show_new_chat_menu.set(false);
                                     },
                                     div {

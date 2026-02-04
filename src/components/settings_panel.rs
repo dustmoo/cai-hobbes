@@ -28,6 +28,7 @@ pub fn SettingsPanel() -> Element {
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut secret_manager = use_context::<Signal<crate::secret_manager::SecretManager>>();
+    let mut active_composio_profile_name = use_context::<Signal<Option<String>>>();
 
     // Create a local copy of the settings for editing.
     let mut local_settings = use_signal(|| settings.read().clone());
@@ -927,7 +928,8 @@ pub fn SettingsPanel() -> Element {
                                                                         move |_| {
                                                                             tracing::info!("Switching to profile: {}", name);
                                                                             local_settings.write().active_composio_profile = Some(name.clone());
-                                                                            // RACE CONDITION FIX: Immediately propagate changes to global settings
+                                                                            // RACE CONDITION FIX: Immediately propagate changes to global settings and signal
+                                                                            active_composio_profile_name.set(Some(name.clone()));
                                                                             global_settings.write().active_composio_profile = Some(name.clone());
                                                                         }
                                                                     }
@@ -948,6 +950,9 @@ pub fn SettingsPanel() -> Element {
                                                                 onclick: {
                                                                     let name = profile_name.clone();
                                                                     move |_| {
+                                                                        if local_settings.peek().active_composio_profile.as_ref() == Some(&name) {
+                                                                            active_composio_profile_name.set(None);
+                                                                        }
                                                                         local_settings.write().remove_profile(&name);
                                                                     }
                                                                 },
@@ -981,7 +986,8 @@ pub fn SettingsPanel() -> Element {
                                                                     profile.name = new_name.clone();
                                                                 }
                                                                 if settings.active_composio_profile.as_ref() == Some(&old_name) {
-                                                                    settings.active_composio_profile = Some(new_name);
+                                                                    settings.active_composio_profile = Some(new_name.clone());
+                                                                    active_composio_profile_name.set(Some(new_name));
                                                                 }
                                                             }
                                                         }
@@ -2232,6 +2238,81 @@ pub fn SettingsPanel() -> Element {
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_new_chat_with_memory.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_new_chat_with_memory = v,
+                                        }
+                                    }
+
+                                    div { class: "pt-2 pb-1", h4 { class: "text-xs font-bold text-fg-muted uppercase tracking-wider", "Session Tabs" } }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 1" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_1.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_1 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 2" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_2.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_2 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 3" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_3.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_3 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 4" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_4.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_4 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 5" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_5.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_5 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 6" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_6.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_6 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 7" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_7.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_7 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 8" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_8.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_8 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 9" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_9.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_9 = v,
                                         }
                                     }
 

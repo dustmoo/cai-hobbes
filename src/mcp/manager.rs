@@ -84,6 +84,8 @@ pub struct McpServerStatus {
     pub auth_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[derive(Clone)]
@@ -107,6 +109,8 @@ pub struct AuthRequiredInfo {
     pub config: McpServerConfig,
     pub auth_url: Option<String>,
     pub error_message: String,
+    #[allow(dead_code)]
+    pub profile: Option<String>,
 }
 
 #[derive(Clone)]
@@ -144,22 +148,28 @@ impl McpManager {
     }
 
     /// Helper: Inject custom credentials from SecretManager (BYOA)
-    fn inject_custom_credentials(client: &ComposioClient, secret_manager: &Signal<crate::secret_manager::SecretManager>) {
+    fn inject_custom_credentials(
+        client: &ComposioClient,
+        profile_name: &str,
+        secret_manager: &Signal<crate::secret_manager::SecretManager>,
+    ) {
         // Inject Custom Tool Credentials (BYOA) - Read from memory cache (INSTANT)
         // This avoids blocking keychain I/O on the main thread
-        let custom_creds = secret_manager.peek().get_custom_tool_credentials();
-        
+        // Pattern 153: Scope injected credentials to the target profile
+        let custom_creds = secret_manager.peek().get_custom_tool_credentials(Some(profile_name));
+
         if !custom_creds.is_empty() {
-             client.set_custom_creds(custom_creds);
+            tracing::info!(
+                "Injecting {} custom tool credentials for profile '{}'",
+                custom_creds.len(),
+                profile_name
+            );
+            client.set_custom_creds(custom_creds);
         }
     }
 
-    /// Helper: Initialize a native Composio client from settings.
-    async fn initialize_native_composio(&self, settings: &Settings) -> Result<ActiveMcpClient, String> {
-        let Some(profile) = settings.get_active_profile() else {
-            return Err("No active Composio profile found".to_string());
-        };
-
+    /// Helper: Initialize a native Composio client for a specific profile.
+    pub async fn initialize_native_composio_for_profile(&self, profile: &crate::settings::ComposioProfile) -> Result<ActiveMcpClient, String> {
         let Some(api_key) = profile.api_key.clone() else {
             return Err("No Composio API key configured".to_string());
         };
@@ -171,16 +181,28 @@ impl McpManager {
         let force_load_slugs = profile.get_force_load_toolkit_slugs();
         let profile_id = profile.id.clone();
 
+        tracing::info!(
+            "Initializing native Composio client for profile '{}' (ID: {}). API Key: {}... Entity: {:?}, User: {:?}",
+            profile.name,
+            profile_id,
+            api_key.get(..8).unwrap_or(""),
+            entity_id,
+            user_id
+        );
+
         let composio_client = Arc::new(ComposioClient::new(
             api_key, base_url, entity_id, user_id, profile_id,
         ));
 
-        Self::inject_custom_credentials(&composio_client, &self.secret_manager);
+        // Inject credentials
+        Self::inject_custom_credentials(&composio_client, &profile.name, &self.secret_manager);
 
         let description = "Composio Integration Hub - provides access to 100+ external apps (Gmail, GitHub, Slack, etc.) via a Tool Router workflow. Use COMPOSIO_DISCOVER_APPS to search for apps, then COMPOSIO_GET_APP_TOOLS to list that app's tools, then COMPOSIO_EXECUTE_TOOL to run a specific action. Force-loaded toolkits have their tools available directly.".to_string();
 
+        let server_name = format!("composio-native:{}", profile.name); // Using name for UI display in LLM prompt
+
         let composio_config = McpServerConfig {
-            name: "composio-native".to_string(),
+            name: server_name,
             command: None,
             uri: None,
             args: None,
@@ -201,6 +223,42 @@ impl McpManager {
             tools,
             warning_message: discovery_result.warning,
         })
+    }
+
+    /// Helper: Initialize a native Composio client from settings (legacy/default).
+    // Deprecated: use initialize_native_composio_for_profile
+    #[allow(dead_code)]
+    async fn initialize_native_composio(&self, settings: &Settings) -> Result<ActiveMcpClient, String> {
+        let Some(profile) = settings.get_active_profile() else {
+            return Err("No active Composio profile found".to_string());
+        };
+        self.initialize_native_composio_for_profile(profile).await
+    }
+
+    /// Ensure a native Composio client is loaded for a specific profile name.
+    /// If not loaded, it fetches the profile from settings and initializes it.
+    pub async fn ensure_native_client_for_profile(&self, profile_name: &str, settings: &Settings) -> Result<(), String> {
+        let server_name = format!("composio-native:{}", profile_name);
+        {
+            let servers = self.servers.lock().await;
+            if servers.contains_key(&server_name) {
+                return Ok(());
+            }
+        }
+
+        // Find the profile in settings
+        let profile = settings.composio_profiles.iter()
+            .find(|p| p.name == profile_name)
+            .ok_or_else(|| format!("Profile '{}' not found in settings", profile_name))?;
+
+        let client = self.initialize_native_composio_for_profile(profile).await?;
+        
+        {
+            let mut servers = self.servers.lock().await;
+            servers.insert(server_name, client);
+        }
+
+        Ok(())
     }
 
     /// Initialize unloaded servers from persisted state
@@ -244,44 +302,87 @@ impl McpManager {
         tracing::info!("MCP configuration reload initiated.");
     }
 
-    /// Reinitialize the Composio client when the active profile changes.
-    /// This removes the existing composio-native client and creates a new one
-    /// with the updated profile settings (API key, user_id, base_url).
     pub async fn reinitialize_composio_client(
         &self,
-        mcp_context_signal: dioxus::prelude::Signal<McpContext>,
+        mut mcp_context_signal: dioxus::prelude::Signal<McpContext>,
         settings: crate::settings::Settings,
+        profile_name: Option<String>,
     ) {
-        match self.initialize_native_composio(&settings).await {
+        // Pattern 123: Identity Trinity - force specific profile lookup
+        let profile = if let Some(name) = profile_name {
+            settings.composio_profiles.iter().find(|p| p.name == name).cloned()
+        } else {
+            settings.get_active_profile().cloned()
+        };
+
+        let Some(profile) = profile else {
+            tracing::warn!("Failed to find profile for reinitialization");
+            return;
+        };
+
+        // Use consistent key format with profile suffix (matches initial initialization)
+        let server_key = format!("composio-native:{}", profile.name);
+
+        // EAGER CLEANUP: Remove ALL composio-native clients immediately (Pattern 151)
+        // This ensures that during the initialization window (which may involve network calls),
+        // we are not "accidentally" picking up stale clients from the old profile.
+        {
+            let mut servers = self.servers.lock().await;
+            let native_keys: Vec<String> = servers.keys()
+                .filter(|k| k.starts_with("composio-native"))
+                .cloned()
+                .collect();
+            for key in native_keys {
+                servers.remove(&key);
+            }
+        }
+
+        match self.initialize_native_composio_for_profile(&profile).await {
             Ok(active_client) => {
-                // ATOMIC SWAP: Replace the old client with the new one cleanly
+                // Insert the new client cleanly
                 {
                     let mut servers = self.servers.lock().await;
-                    servers.insert("composio-native".to_string(), active_client);
-                    self.failed_servers.lock().await.remove("composio-native");
+                    servers.insert(server_key.clone(), active_client);
+                    self.failed_servers.lock().await.remove(&server_key);
                 }
 
                 self.invalidate_status_cache_async().await;
-                let new_context = self.get_mcp_context().await;
-                let mut signal = mcp_context_signal;
-                signal.set(new_context);
-
-                tracing::info!("Successfully reinitialized Composio client");
+                mcp_context_signal.set(self.get_mcp_context(Some(profile.name.clone())).await);
+                tracing::info!("Successfully reinitialized Composio client for profile: {}", profile.name);
             }
             Err(e) => {
                 let error_msg = format!("Failed to reinitialize Composio: {}", e);
                 {
                     let mut servers = self.servers.lock().await;
-                    servers.remove("composio-native");
+                    // Remove ALL composio-native clients 
+                    let native_keys: Vec<String> = servers.keys()
+                        .filter(|k| k.starts_with("composio-native"))
+                        .cloned()
+                        .collect();
+                    for key in native_keys {
+                        servers.remove(&key);
+                    }
+                    
+                    let dummy_config = McpServerConfig {
+                        name: server_key.clone(),
+                        command: None,
+                        uri: None,
+                        args: None,
+                        description: "Composio Integration Hub".to_string(),
+                        env: std::collections::HashMap::new(),
+                        disabled: false,
+                        always_allow: Vec::new(),
+                    };
+                    self.failed_servers.lock().await.insert(server_key.clone(), (dummy_config, error_msg.clone()));
                 }
 
                 if Self::is_needs_setup_error(&error_msg) {
                     tracing::debug!("Composio needs setup: {}", e);
                 } else {
                     tracing::error!("{}", error_msg);
-                    // We don't have the config here easily to put in failed_servers, 
-                    // but reinit is usually called after profiles change.
                 }
+                
+                mcp_context_signal.set(self.get_mcp_context(Some(profile.name)).await);
             }
         }
     }
@@ -393,7 +494,7 @@ impl McpManager {
                     .insert(server_name.clone(), active_client);
 
                 // Get the full, updated context and set the signal
-                let new_context = self_clone_for_receiver.get_mcp_context().await;
+                let new_context = self_clone_for_receiver.get_mcp_context(None).await;
                 mcp_context_signal_clone_for_receiver.set(new_context);
                 tracing::info!(
                     "Successfully added '{}' and updated MCP context atomically.",
@@ -473,7 +574,7 @@ impl McpManager {
                                 profile.id.clone(),
                             ));
 
-                            McpManager::inject_custom_credentials(&composio_client, &secret_manager);
+                            McpManager::inject_custom_credentials(&composio_client, &profile.name, &secret_manager);
 
                             let client_for_tools = composio_client.clone();
 
@@ -656,6 +757,7 @@ impl McpManager {
                                             config: server_config_clone,
                                             auth_url,
                                             error_message: error_msg,
+                                            profile: None,
                                         },
                                     );
                                 } else {
@@ -809,6 +911,7 @@ impl McpManager {
                                                 config: server_config_clone,
                                                 auth_url: None, // TODO: Extract from error if available
                                                 error_message: error_msg,
+                                                profile: None,
                                             },
                                         );
                                     } else {
@@ -852,6 +955,7 @@ impl McpManager {
                                     config: server_config_clone,
                                     auth_url: None, // TODO: Extract from error if available
                                     error_message: error_msg,
+                                    profile: None,
                                 },
                             );
                         } else {
@@ -981,19 +1085,53 @@ impl McpManager {
         tool_name: &str,
         args: serde_json::Value,
         bypass_permission_check: bool,
+        profile_name: Option<String>,
     ) -> Result<UnboundedReceiver<Result<CallToolResult, String>>, String> {
         let servers_guard = self.servers.lock().await;
 
-        let client = match servers_guard.get(server_name) {
+        // Resolve composio-native to the actual profile-suffixed key
+        let actual_server_name = if server_name == "composio-native" {
+            // First, try the explicit profile if provided
+            if let Some(ref p) = profile_name {
+                let scoped_key = format!("composio-native:{}", p);
+                if servers_guard.contains_key(&scoped_key) {
+                    scoped_key
+                } else if servers_guard.contains_key("composio-native") {
+                    // Fallback to the legacy singleton if no scoped one exists
+                    "composio-native".to_string()
+                } else {
+                    // No valid client found for this profile
+                    return Err(format!("Composio client not found for profile: {}", p));
+                }
+            } else {
+                // If no profile provided, try singleton. (Pattern 150)
+                // DANGEROUS FALLBACK REMOVED: We no longer pick "any" client.
+                if servers_guard.contains_key("composio-native") {
+                    "composio-native".to_string()
+                } else {
+                    return Err("Composio client not found and no profile specified".to_string());
+                }
+            }
+        } else {
+            server_name.to_string()
+        };
+
+        let client = match servers_guard.get(&actual_server_name) {
             Some(c) => c,
             None => return Err(format!("Server not found: {}", server_name)),
+        };
+
+        let permission_check_name = if server_name.starts_with("composio-native:") {
+            "composio-native"
+        } else {
+            server_name
         };
 
         // Permission Check
         if !bypass_permission_check && !client.config.always_allow.contains(&tool_name.to_string())
         {
             let pm = self.permission_manager.read();
-            match pm.check_mcp_permission(server_name) {
+            match pm.check_mcp_permission(permission_check_name) {
                 PermissionStatus::Allowed => {}
                 PermissionStatus::RequiresPrompt => {
                     let tool_call = crate::components::shared::ToolCall::new(
@@ -1019,7 +1157,21 @@ impl McpManager {
         // BYOA FIX: Re-inject custom credentials before tool execution (Pattern 25)
         // This ensures any credentials updated via the UI are used immediately.
         if let McpClientType::NativeComposio(ref composio_client) = client.service {
-            Self::inject_custom_credentials(composio_client, &self.secret_manager);
+            // Get profile name for scoped injection
+            // Pattern 123: Use resolved profile name strictly
+            let resolved_profile = if actual_server_name.starts_with("composio-native:") {
+                actual_server_name.strip_prefix("composio-native:").map(|s| s.to_string())
+            } else {
+                profile_name.clone()
+            };
+            
+            if let Some(p_name) = resolved_profile {
+                Self::inject_custom_credentials(composio_client, &p_name, &self.secret_manager);
+            } else {
+                 // Fallback to all if no profile known
+                 let all_creds = self.secret_manager.peek().get_all_custom_tool_credentials();
+                 composio_client.set_custom_creds(all_creds);
+            }
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1564,7 +1716,12 @@ impl McpManager {
         &self,
     ) -> Result<Vec<crate::mcp::composio_client::ToolkitInfo>, String> {
         let servers = self.servers.lock().await;
-        if let Some(client) = servers.get("composio-native") {
+        // Find any composio-native client (may have profile suffix)
+        let composio_client = servers.iter()
+            .find(|(k, _)| *k == "composio-native" || k.starts_with("composio-native:"))
+            .map(|(_, v)| v);
+        
+        if let Some(client) = composio_client {
             if let McpClientType::NativeComposio(composio_client) = &client.service {
                 // Use list_connected_toolkits which:
                 // 1. Calls list_connected_accounts() to find connected toolkit slugs
@@ -1576,16 +1733,34 @@ impl McpManager {
         Err("Composio client not initialized or not connected".to_string())
     }
 
-    pub async fn get_mcp_context(&self) -> McpContext {
+    pub async fn get_mcp_context(&self, profile_name: Option<String>) -> McpContext {
         let servers = self.servers.lock().await;
         let unloaded = self.unloaded_servers.lock().await;
         let mut server_contexts = Vec::new();
 
-        for (_, client) in servers.iter() {
+        for (name, client) in servers.iter() {
             // Skip servers that are unloaded (tools hidden from AI)
             if unloaded.contains(&client.config.name) {
                 continue;
             }
+
+            // FILTER: If this is a native client, only include it if it matches the profile
+            if name == "composio-native" || name.starts_with("composio-native:") {
+                let p_name = if name == "composio-native" {
+                    // For the standardized singleton, we treat it as matching any requested profile
+                    // because reinitialize_composio_client ensures it matches the active one.
+                    profile_name.as_deref().unwrap_or("")
+                } else {
+                    name.strip_prefix("composio-native:").unwrap_or_default()
+                };
+
+                if let Some(target_profile) = &profile_name {
+                    if !p_name.is_empty() && p_name != target_profile {
+                        continue;
+                    }
+                }
+            }
+
             let server_context = McpServerContext {
                 name: client.config.name.clone(),
                 description: client.config.description.clone(),
@@ -1851,7 +2026,7 @@ impl McpManager {
         }
 
         // Update Context
-        mcp_context_signal.set(self.get_mcp_context().await);
+        mcp_context_signal.set(self.get_mcp_context(None).await);
         self.invalidate_status_cache();
         
         let current_trigger = *trigger_search.peek();
@@ -1877,8 +2052,15 @@ impl McpManager {
         &self,
         server_name: &str,
         tool_name: &str,
+        profile_name: Option<String>,
     ) -> Result<String, String> {
-        let client_wrapper = self.get_client(server_name).await?;
+        let actual_server_name = if server_name == "composio-native" && profile_name.is_some() {
+            format!("composio-native:{}", profile_name.unwrap())
+        } else {
+            server_name.to_string()
+        };
+
+        let client_wrapper = self.get_client(&actual_server_name).await?;
 
         if let McpClientType::NativeComposio(client) = client_wrapper.service {
             // Heuristic: Extract toolkit slug from tool name.
@@ -1941,6 +2123,7 @@ impl McpManager {
                     is_loaded: false,
                     auth_url: None,
                     uri: config.uri.clone(),
+                    profile: None,
                     warning_message: None,
                 }
             } else if config.disabled {
@@ -1956,6 +2139,7 @@ impl McpManager {
                     is_loaded: false, // Disabled servers are always "unloaded"
                     auth_url: None,
                     uri: config.uri.clone(),
+                    profile: None,
                     warning_message: None,
                 }
             } else if servers.contains_key(&config.name) {
@@ -1972,6 +2156,7 @@ impl McpManager {
                     is_loaded: true,
                     auth_url: None,
                     uri: config.uri.clone(),
+                    profile: None,
                     warning_message: client.warning_message.clone(),
                 }
             } else if let Some(auth_info) = auth_required.get(&config.name) {
@@ -1988,6 +2173,7 @@ impl McpManager {
                     is_loaded: false, // NeedsAuth servers are not loaded
                     auth_url: auth_info.auth_url.clone(),
                     uri: config.uri.clone(),
+                    profile: None,
                     warning_message: None,
                 }
             } else if let Some((_, error)) = failed.get(&config.name) {
@@ -2003,6 +2189,7 @@ impl McpManager {
                     is_loaded: false, // Error servers are not loaded
                     auth_url: None,
                     uri: config.uri.clone(),
+                    profile: None,
                     warning_message: None,
                 }
             } else {
@@ -2019,6 +2206,7 @@ impl McpManager {
                     is_loaded: false, // Initializing servers are not loaded
                     auth_url: None,
                     uri: config.uri.clone(),
+                    profile: None,
                     warning_message: None,
                 }
             };
@@ -2026,16 +2214,22 @@ impl McpManager {
         }
 
         // Special handling for the native Composio client - it's not in configs
-        // but could still be active or failed. Now uses "composio-native" so it can
-        // coexist with an official "composio" MCP server.
+        // but could still be active or failed. Now uses "composio-native:{profile}" format.
         {
-            let native_composio_name = "composio-native".to_string();
-            let composio_is_loaded = !unloaded.contains(&native_composio_name);
-            // Check if we have an active native Composio client
-            if servers.contains_key(&native_composio_name) {
-                let client = servers.get(&native_composio_name).unwrap();
+            // Find any active composio-native client (may have profile suffix)
+            let active_composio: Option<(&String, &ActiveMcpClient)> = servers.iter()
+                .find(|(k, _)| *k == "composio-native" || k.starts_with("composio-native:"));
+            
+            // Find any failed composio-native client
+            let failed_composio: Option<(&String, &(McpServerConfig, String))> = failed.iter()
+                .find(|(k, _)| *k == "composio-native" || k.starts_with("composio-native:"));
+            
+            let display_name = "composio-native".to_string();
+            
+            if let Some((name, client)) = active_composio {
+                let composio_is_loaded = !unloaded.contains(name);
                 statuses.push(McpServerStatus {
-                    name: native_composio_name.clone(),
+                    name: display_name.clone(),
                     display_name: "Composio (Native)".to_string(),
                     description: "Native Composio API client".to_string(),
                     status: ServerStatus::Loaded,
@@ -2046,13 +2240,14 @@ impl McpManager {
                     is_loaded: composio_is_loaded,
                     auth_url: None,
                     uri: None,
+                    profile: None,
                     warning_message: client.warning_message.clone(),
                 });
             }
             // Check if native Composio failed to initialize
-            else if let Some((_, error)) = failed.get(&native_composio_name) {
+            else if let Some((_, (_, error))) = failed_composio {
                 statuses.push(McpServerStatus {
-                    name: native_composio_name.clone(),
+                    name: display_name.clone(),
                     display_name: "Composio (Native)".to_string(),
                     description: "Native Composio API client".to_string(),
                     status: ServerStatus::Error,
@@ -2063,13 +2258,14 @@ impl McpManager {
                     is_loaded: false,
                     auth_url: None,
                     uri: None,
+                    profile: None,
                     warning_message: None,
                 });
             }
             // Not loaded, not failed = API key not configured (NotConfigured state)
             else {
                 statuses.push(McpServerStatus {
-                    name: native_composio_name.clone(),
+                    name: display_name.clone(),
                     display_name: "Composio (Native)".to_string(),
                     description: "Connect external tools like Gmail, GitHub, Slack".to_string(),
                     status: ServerStatus::NotConfigured,
@@ -2080,6 +2276,7 @@ impl McpManager {
                     is_loaded: false,
                     auth_url: None,
                     uri: None,
+                    profile: None,
                     warning_message: None,
                 });
             }
@@ -2213,7 +2410,7 @@ impl McpManager {
                                     .lock()
                                     .await
                                     .insert(server_name.clone(), active_client);
-                                let new_context = self_clone.get_mcp_context().await;
+                                let new_context = self_clone.get_mcp_context(None).await;
                                 mcp_context_signal_clone.set(new_context);
                                 tracing::info!("Successfully reconnected Composio client");
                             }
@@ -2354,6 +2551,7 @@ impl McpManager {
                                     config: server_config_clone,
                                     auth_url,
                                     error_message: error_msg,
+                                    profile: None,
                                 },
                             );
                         } else {
@@ -2452,6 +2650,7 @@ impl McpManager {
                                             config: server_config_clone,
                                             auth_url: None, // TODO: Extract from error if available
                                             error_message: error_msg,
+                                            profile: None,
                                         },
                                     );
                                 } else {
@@ -2482,7 +2681,7 @@ impl McpManager {
                         .insert(server_name.clone(), active_client);
 
                     // Update context
-                    let new_context = self_clone.get_mcp_context().await;
+                    let new_context = self_clone.get_mcp_context(None).await;
                     mcp_context_signal_clone.set(new_context);
                     tracing::info!("Successfully reconnected '{}'", server_name);
                 }
@@ -2497,6 +2696,7 @@ impl McpManager {
                                 config: server_config_clone,
                                 auth_url: None,
                                 error_message: error_msg,
+                                profile: None,
                             },
                         );
                     } else {

@@ -98,6 +98,10 @@ pub struct Session {
     pub accumulated_turns: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_optimization_summary: Option<String>,
+    /// The specific Composio profile bound to this session.
+    /// Acts as the live authority for tool-calling/MCP context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composio_profile: Option<String>,
 }
 
 impl Session {
@@ -435,7 +439,7 @@ impl SessionState {
         Ok(())
     }
 
-    pub fn create_session(&mut self) -> String {
+    pub fn create_session_raw(&mut self, initial_profile: Option<String>) -> String {
         let new_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Local::now();
         let new_session = Session {
@@ -448,16 +452,20 @@ impl SessionState {
             accumulated_tokens: 0,
             accumulated_turns: 0,
             memory_optimization_summary: None,
+            composio_profile: initial_profile,
         };
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id.clone();
-        if let Err(e) = self.save() {
-            tracing::error!("Failed to save session state after creating session: {}", e);
-        }
         new_id
     }
 
-    pub fn delete_session(&mut self, id: &str) {
+    pub fn create_session(&mut self, initial_profile: Option<String>) -> String {
+        let new_id = self.create_session_raw(initial_profile);
+        Self::save_async(self.clone());
+        new_id
+    }
+
+    pub fn delete_session_raw(&mut self, id: &str) {
         self.sessions.remove(id);
 
         if self.active_session_id == id {
@@ -471,10 +479,11 @@ impl SessionState {
         } else if self.sessions.is_empty() {
             self.active_session_id = String::new();
         }
+    }
 
-        if let Err(e) = self.save() {
-            tracing::error!("Failed to save session state after deleting session: {}", e);
-        }
+    pub fn delete_session(&mut self, id: &str) {
+        self.delete_session_raw(id);
+        Self::save_async(self.clone());
     }
 
     pub fn get_active_session(&self) -> Option<&Session> {
@@ -490,15 +499,7 @@ impl SessionState {
             session.last_updated = Utc::now();
         }
     }
-    pub fn set_active_session(&mut self, id: String) {
-        self.active_session_id = id;
-        if let Err(e) = self.save() {
-            tracing::error!(
-                "Failed to save session state after setting active session: {}",
-                e
-            );
-        }
-    }
+
 
     pub fn update_window_size(&mut self, width: f64, height: f64) {
         tracing::debug!("Updating window size in state to: {}x{}", width, height);
@@ -511,23 +512,22 @@ impl SessionState {
     /// Saves the session state to disk on a background thread.
     /// This prevents blocking the main UI thread during file I/O.
     pub fn save_async(state: SessionState) {
-        std::thread::spawn(move || {
-            if let Err(e) = state.save() {
+        tokio::spawn(async move {
+            if let Err(e) = tokio::task::spawn_blocking(move || state.save()).await.unwrap_or_else(|e| Err(std::io::Error::other(e))) {
                 tracing::error!("Failed to save session state async: {}", e);
             }
         });
     }
 
-    pub fn update_session_name(&mut self, id: &str, new_name: String) {
+    pub fn update_session_name_raw(&mut self, id: &str, new_name: String) {
         if let Some(session) = self.sessions.get_mut(id) {
             session.name = new_name;
-            if let Err(e) = self.save() {
-                tracing::error!(
-                    "Failed to save session state after updating session name: {}",
-                    e
-                );
-            }
         }
+    }
+
+    pub fn update_session_name(&mut self, id: &str, new_name: String) {
+        self.update_session_name_raw(id, new_name);
+        Self::save_async(self.clone());
     }
     pub fn get_message_mut(
         &mut self,

@@ -932,7 +932,7 @@ impl LlmConnector for GeminiConnector {
                                                         'server_loop: for server in &context.servers
                                                         {
                                                             for tool in &server.tools {
-                                                                let sanitized_tool_name = crate::gemini::convert::sanitize_function_name(&format!("{}_{}", server.name, tool.name));
+                                                                let sanitized_tool_name = crate::gemini::convert::get_prefixed_tool_name(&server.name, &tool.name);
                                                                 if sanitized_tool_name
                                                                     == function_call.name
                                                                 {

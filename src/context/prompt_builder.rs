@@ -336,10 +336,8 @@ impl<'a> PromptBuilder<'a> {
             .iter()
             .any(|p| p.is_fully_configured())
         {
-            let active_profile_name = self
-                .settings
-                .get_active_profile()
-                .map(|p| p.name.as_str())
+            let active_profile_name = self.session.composio_profile.as_deref()
+                .or(self.settings.active_composio_profile.as_deref())
                 .unwrap_or("Default");
 
             system_context_map.insert(
@@ -499,8 +497,9 @@ impl<'a> PromptBuilder<'a> {
                         }
 
                         // Sanitize tool name - CRITICAL: Must match the sanitized name used in declarations
-                        let sanitized_tool_name = crate::gemini::convert::sanitize_function_name(
-                            &format!("{}_{}", tc.server_name, tc.tool_name),
+                        let sanitized_tool_name = crate::gemini::convert::get_prefixed_tool_name(
+                            &tc.server_name,
+                            &tc.tool_name,
                         );
 
                         // 1. Add the model's function call
@@ -855,6 +854,7 @@ mod tests {
             accumulated_tokens: 0,
             accumulated_turns: 0,
             memory_optimization_summary: None,
+            composio_profile: None,
         }
     }
 
@@ -1079,6 +1079,7 @@ mod tests {
             accumulated_tokens: 0,
             accumulated_turns: 0,
             memory_optimization_summary: None,
+            composio_profile: None,
         };
 
         let settings = Settings::default();
@@ -1288,6 +1289,7 @@ mod tests {
             accumulated_tokens: 0,
             accumulated_turns: 0,
             memory_optimization_summary: None,
+            composio_profile: None,
         };
 
         let settings = Settings::default();

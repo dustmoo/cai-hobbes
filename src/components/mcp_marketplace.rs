@@ -2,6 +2,7 @@
 
 use crate::components::mcp_search_form::McpSearchForm;
 use crate::components::smithery_registry::{SmitheryClient, SmitheryServer};
+use crate::components::shared::SessionIdContext;
 use crate::components::syntax_highlighter::highlight_json;
 use crate::mcp::composio_client::{ComposioCategory, ComposioClient, ComposioToolkitListing, ResolvedAuth};
 use crate::mcp::manager::{McpManager, McpServerStatus, ServerStatus};
@@ -1022,6 +1023,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let settings_manager = use_context::<Signal<SettingsManager>>();
     let ui_state = use_context::<Signal<crate::settings::UiState>>();
     let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
+    let session_state = use_context::<Signal<crate::session::SessionState>>();
+    let current_session_id = use_context::<SessionIdContext>().0;
     let mut local_settings = use_signal(|| settings.read().clone());
     let mut is_retrying = use_signal(|| false);
 
@@ -1046,15 +1049,21 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let mut last_profile_name: Signal<Option<String>> = use_signal(|| None);
     use_effect(move || {
         let _context = mcp_context.read(); // Subscribe to context changes
-        let current_profile = settings.read().active_composio_profile.clone();
+        
+        // Derive the actual profile name for this session (local override or global default)
+        let state = session_state.read();
+        let active_profile_name = state.sessions.get(&*current_session_id.read())
+            .and_then(|s| s.composio_profile.clone())
+            .or_else(|| settings.read().active_composio_profile.clone());
+            
         let previous_profile = last_profile_name.peek().clone();
 
         // Only reset if profile actually changed (not on initial mount with None -> Some)
-        if previous_profile.is_some() && previous_profile != current_profile {
+        if previous_profile.is_some() && previous_profile != active_profile_name {
             tracing::debug!(
                 "Profile changed from {:?} to {:?}, resetting toolkit state",
                 previous_profile,
-                current_profile
+                active_profile_name
             );
             toolkits.set(Vec::new());
             toolkits_error.set(None);
@@ -1062,7 +1071,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
             // ALSO sync local_settings with global settings
             local_settings.set(settings.read().clone());
         }
-        last_profile_name.set(current_profile);
+        last_profile_name.set(active_profile_name);
     });
 
     // Fetch toolkits when show_toolkits is expanded for Composio
@@ -1231,7 +1240,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                     }
 
                                                     // Update mcp_context with filtered tools
-                                                    let new_context = mcp_manager.read().get_mcp_context().await;
+                                                    let new_context = mcp_manager.read().get_mcp_context(None).await;
                                                     mcp_context.set(new_context);
                                                     // Invalidate cache and trigger refresh
                                                     mcp_manager.read().invalidate_status_cache();
@@ -1503,7 +1512,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                         tracing::error!("Failed to reload Composio tools: {}", e);
                                                                     }
                                                                     // Update mcp_context with new tools
-                                                                    let new_context = mcp_manager.read().get_mcp_context().await;
+                                                                    let new_context = mcp_manager.read().get_mcp_context(None).await;
                                                                     mcp_context.set(new_context);
                                                                     // Invalidate cache and trigger refresh
                                                                     mcp_manager.read().invalidate_status_cache();

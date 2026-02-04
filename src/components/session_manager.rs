@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 use crate::{
-    components::chat_input::ChatCommand, context::permissions::PermissionManager,
+    components::{chat_input::ChatCommand, shared::SessionToDeleteContext}, context::permissions::PermissionManager,
     session::SessionState, settings::Settings,
 };
 use dioxus::prelude::*;
@@ -17,7 +17,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
     let mut editing_session_id = use_signal(|| None::<String>);
     let mut temp_session_name = use_signal(String::new);
     let mut show_confirm_modal = use_context::<Signal<bool>>();
-    let mut session_to_delete = use_context::<Signal<String>>();
+    let SessionToDeleteContext(mut session_to_delete) = use_context::<SessionToDeleteContext>();
 
     // Pagination and Filtering State
     let mut filter_query = use_signal(String::new);
@@ -129,7 +129,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                 key: "{session_id}",
                                 onclick: move |_| {
                                     if editing_session_id.read().is_none() {
-                                        session_state.write().set_active_session(id_click.clone());
+                                        chat_command.set(Some(ChatCommand::SwitchToSession(id_click.clone())));
                                         permission_manager.write().reset_turn_count();
                                     }
                                 },
@@ -248,7 +248,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                 button {
                     class: "w-full px-4 py-2 bg-btn-primary rounded-md text-fg font-semibold hover:bg-btn-primary-hover focus:outline-none focus:ring-2 focus:ring-primary-500 transition-colors",
                     onclick: move |_| {
-                        session_state.write().create_session();
+                        chat_command.set(Some(ChatCommand::NewChat));
                         permission_manager.write().reset_turn_count();
                     },
                     "✨ New Chat"

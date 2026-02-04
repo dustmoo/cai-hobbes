@@ -22,7 +22,7 @@ pub enum HotkeyAction {
 pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatus>) {
     let desktop = use_context::<DesktopContext>();
     let settings = use_context::<Signal<Settings>>();
-    let settings_manager = use_context::<Signal<SettingsManager>>();
+    let _settings_manager = use_context::<Signal<SettingsManager>>();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
 
     // Coroutine to handle actions from the Native Global Hotkey (Tray Toggle)
@@ -98,10 +98,15 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 "scroll_bottom" => chat_command.set(Some(ChatCommand::ScrollToBottom)),
                 "delete_session" => chat_command.set(Some(ChatCommand::DeleteSession)),
                 "cancel_generation" => chat_command.set(Some(ChatCommand::CancelGeneration)),
-                // Profile switching
+                // Profile switching (session-local)
                 s if s.starts_with("switch_profile_") => {
                     if let Ok(idx) = s.replace("switch_profile_", "").parse::<usize>() {
-                        switch_profile_by_index(idx, settings, settings_manager);
+                        chat_command.set(Some(ChatCommand::SwitchProfile(idx)));
+                    }
+                }
+                s if s.starts_with("switch_tab_") => {
+                    if let Ok(idx) = s.replace("switch_tab_", "").parse::<usize>() {
+                        chat_command.set(Some(ChatCommand::SwitchTab(idx)));
                     }
                 }
                 _ => tracing::warn!("Unknown JS hotkey action: {}", msg),
@@ -182,7 +187,23 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                             action = "delete_session";
                         }}
                         
+                        else if (check(config.switch_tab_1, event)) action = "switch_tab_0";
+                        else if (check(config.switch_tab_2, event)) action = "switch_tab_1";
+                        else if (check(config.switch_tab_3, event)) action = "switch_tab_2";
+                        else if (check(config.switch_tab_4, event)) action = "switch_tab_3";
+                        else if (check(config.switch_tab_5, event)) action = "switch_tab_4";
+                        else if (check(config.switch_tab_6, event)) action = "switch_tab_5";
+                        else if (check(config.switch_tab_7, event)) action = "switch_tab_6";
+                        else if (check(config.switch_tab_8, event)) action = "switch_tab_7";
+                        else if (check(config.switch_tab_9, event)) action = "switch_tab_8";
+                        // Tab switching: Cmd+1..9 (industry standard, no modifiers required)
                         else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey) {{
+                             if (event.key >= '1' && event.key <= '9') {{
+                                 action = "switch_tab_" + (parseInt(event.key) - 1);
+                             }}
+                        }}
+                        // Profile switching: Cmd+Option+1..9
+                        else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.altKey) {{
                              if (event.key >= '1' && event.key <= '9') {{
                                  action = "switch_profile_" + (parseInt(event.key) - 1);
                              }}
@@ -209,31 +230,6 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
             }
         });
     });
-}
-
-// Helper to switch profile
-fn switch_profile_by_index(
-    index: usize,
-    mut settings: Signal<Settings>,
-    settings_manager: Signal<SettingsManager>,
-) {
-    let mut current_settings = settings.read().clone();
-
-    // Check if we have enough profiles
-    if index < current_settings.composio_profiles.len() {
-        let new_profile_name = current_settings.composio_profiles[index].name.clone();
-
-        // Only if different
-        if current_settings.active_composio_profile.as_deref() != Some(&new_profile_name) {
-            tracing::info!("Switching to profile index {}: {}", index, new_profile_name);
-            current_settings.active_composio_profile = Some(new_profile_name);
-            settings.set(current_settings);
-            // Persist to disk
-            if let Err(e) = settings_manager.read().save(&settings.read()) {
-                tracing::error!("Failed to save profile switch: {}", e);
-            }
-        }
-    }
 }
 
 /// Checks if a Dioxus KeyboardEvent matches a hotkey string (e.g. "CmdOrCtrl+Enter").

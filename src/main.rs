@@ -112,6 +112,7 @@ use crate::{
         confirm_delete_modal::ConfirmDeleteModal,
         llm::{GeminiConnector, LlmConnector},
         stream_manager::StreamManager,
+        shared::{SessionIdContext, SessionToDeleteContext},
     },
     mcp::manager::McpManager,
 };
@@ -176,7 +177,7 @@ fn app() -> Element {
         });
         if state.sessions.is_empty() {
             tracing::info!("No sessions found, creating new default session.");
-            state.create_session();
+            state.create_session(None);
         }
         Signal::new(state)
     });
@@ -202,9 +203,15 @@ fn app() -> Element {
     // Global focus context for keyboard event coordination
     use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
 
-    // Skills registry - initialize empty, load async to avoid blocking UI
     let mut skill_registry = use_context_provider(|| Signal::new(skills::SkillRegistry::new()));
     let mut skills_loaded = use_signal(|| false);
+    
+    // Pattern: Grounded App Initialization
+    // Masks transient desyncs during the first render tick
+    let mut is_app_initialized = use_signal(|| false);
+    use_effect(move || {
+        is_app_initialized.set(true);
+    });
 
     // Sync theme to DOM (class on <html> element)
     theme::use_theme_sync(settings);
@@ -510,6 +517,43 @@ fn app() -> Element {
         })
     });
 
+    // Create a global signal for the active profile name.
+    // This is the ONLY source of truth for what profile is active.
+    let mut active_composio_profile_name: Signal<Option<String>> = use_context_provider(|| {
+        let session_state_read = session_state.peek();
+        let initial = session_state_read.get_active_session()
+            .and_then(|s| s.composio_profile.clone())
+            .or_else(|| settings.peek().active_composio_profile.clone());
+        Signal::new(initial)
+    });
+
+    // Synchronize active_composio_profile_name with session changes
+    use_effect(move || {
+        let session_id = session_state.read().active_session_id.clone();
+        let session_state_read = session_state.read();
+        let profile = session_state_read.sessions.get(&session_id)
+            .and_then(|s| s.composio_profile.clone())
+            .or_else(|| settings.read().active_composio_profile.clone());
+        
+        if active_composio_profile_name.peek().as_ref() != profile.as_ref() {
+            tracing::info!("Syncing active profile signal to: {:?}", profile);
+            active_composio_profile_name.set(profile);
+        }
+    });
+
+    // Pattern 155: Sync signal BACK to settings.active_composio_profile
+    // This closes the cascade loop so get_active_profile() returns the session's profile
+    // and triggers MCP client reinitialization on tab switch.
+    use_effect(move || {
+        let profile_name = active_composio_profile_name.read().clone();
+        let current_setting = settings.read().active_composio_profile.clone();
+        
+        if profile_name != current_setting {
+            tracing::info!("Syncing settings.active_composio_profile to signal: {:?}", profile_name);
+            settings.write().active_composio_profile = profile_name;
+        }
+    });
+
     let _ = use_resource(move || async move {
         // Wait until secrets are loaded before launching MCP servers
         // This ensures profile API keys are populated
@@ -518,18 +562,19 @@ fn app() -> Element {
             return;
         }
 
-        let manager = mcp_manager.read().clone();
+        // Use peek() to avoid accidental reactive dependencies on signals that change frequently (like ui_state)
+        let manager = mcp_manager.peek().clone();
         let mcp_context_signal = mcp_context;
-        let settings_clone = settings.read().clone();
+        let settings_snapshot = settings.peek().clone();
 
         // Restore persisted unloaded servers state before launching
-        let persisted_unloaded = ui_state.read().unloaded_mcp_servers.clone();
+        let persisted_unloaded = ui_state.peek().unloaded_mcp_servers.clone();
         manager
             .set_initial_unloaded_servers(persisted_unloaded)
             .await;
 
         manager
-            .launch_servers(mcp_context_signal, settings_clone)
+            .launch_servers(mcp_context_signal, settings_snapshot)
             .await;
     });
 
@@ -553,10 +598,11 @@ fn app() -> Element {
             });
 
             let previous = prev_profile_signature.peek().clone();
+            let active_profile_name = active_composio_profile_name.read().clone();
 
-            // Only reinitialize if the profile signature actually changed (not on initial render)
-            if previous.is_some() && current_signature != previous {
-                tracing::info!("Active Composio profile properties changed, reinitializing client");
+            // Only reinitialize if the profile signature actually changed
+            if current_signature != previous {
+                tracing::info!("Active Composio profile properties changed, reinitializing client: {:?}", active_profile_name);
 
                 // Invalidate caches - profile changed
                 mcp_manager.read().invalidate_status_cache();
@@ -567,7 +613,7 @@ fn app() -> Element {
                 spawn(async move {
                     mcp_manager
                         .read()
-                        .reinitialize_composio_client(mcp_context_signal, settings_clone)
+                        .reinitialize_composio_client(mcp_context_signal, settings_clone, active_profile_name)
                         .await;
                 });
             }
@@ -588,9 +634,108 @@ fn app() -> Element {
     let mut last_known_size = use_signal(|| PhysicalSize::new(0, 0));
     let mut tray_icon = use_signal::<Option<TrayIcon>>(|| None);
     let mut show_confirm_modal = use_context_provider(|| Signal::new(false));
-    let session_to_delete = use_context_provider(|| Signal::new(String::new()));
+    let session_to_delete = use_context_provider(|| SessionToDeleteContext(Signal::new(String::new())));
 
     let mut chat_command = use_context_provider(|| Signal::new(None::<ChatCommand>));
+
+    // Tab state - initialized from UiState or with current active session
+    let mut open_tabs = use_signal(|| {
+        let ui = ui_state.read();
+        let state = session_state.read();
+        
+        // Filter tabs to ensure they only contain existing session IDs
+        let tabs: Vec<String> = ui.open_tabs.iter()
+            .filter(|id| state.sessions.contains_key(*id))
+            .cloned()
+            .collect();
+
+        if tabs.is_empty() {
+            // Bootstrap: open the currently active session as the first tab
+            vec![state.active_session_id.clone()]
+        } else {
+            tabs
+        }
+    });
+    let mut active_tab_index = use_signal(|| {
+        let ui = ui_state.read();
+        let tabs_len = open_tabs.peek().len();
+        // Ensure index is within bounds
+        ui.active_tab_index.min(tabs_len.saturating_sub(1))
+    });
+
+    // Single source of truth for the currently displayed session - provided via context
+    let mut current_session_id = use_signal(|| {
+        let tabs = open_tabs.read();
+        let idx = *active_tab_index.peek();
+        
+        // Safely get the tab at idx, falling back to first tab, then to active_session_id
+        if let Some(id) = tabs.get(idx) {
+            id.clone()
+        } else if let Some(id) = tabs.first() {
+            id.clone()
+        } else {
+            session_state.read().active_session_id.clone()
+        }
+    });
+    use_context_provider(|| SessionIdContext(current_session_id));
+
+
+    // Persist tab state to UiState (Pattern 12 & 13)
+    use_effect(move || {
+        let mut ui = ui_state.write();
+        ui.open_tabs = open_tabs.read().clone();
+        ui.active_tab_index = *active_tab_index.read();
+        
+        // Snapshot targets for Pattern 12 persistence
+        let ui_snapshot = ui.clone();
+        let manager = ui_state_manager.peek().clone();
+        
+        manager.save_async(ui_snapshot);
+    });
+
+    // Tab switching - use signal copies directly in closures
+    let mut switch_tab_fn = move |idx: usize| {
+        let tabs = open_tabs.read();
+        if idx < tabs.len() {
+            let session_id = tabs[idx].clone();
+            active_tab_index.set(idx);
+            current_session_id.set(session_id.clone());
+            session_state.write().active_session_id = session_id;
+        }
+    };
+
+    let close_tab_fn = move |idx: usize| {
+        let mut tabs = open_tabs.read().clone();
+        if idx < tabs.len() {
+            tabs.remove(idx);
+            let mut new_idx = *active_tab_index.read();
+            if tabs.is_empty() {
+                let new_id = session_state.write().create_session(settings.peek().active_composio_profile.clone());
+                tabs.push(new_id);
+                new_idx = 0;
+            } else if new_idx >= tabs.len() {
+                new_idx = tabs.len().saturating_sub(1);
+            }
+            let new_session_id = tabs[new_idx].clone();
+            
+            // Atomic update
+            open_tabs.set(tabs);
+            active_tab_index.set(new_idx);
+            current_session_id.set(new_session_id.clone());
+            session_state.write().active_session_id = new_session_id;
+        }
+    };
+
+    let mut new_tab_fn = move || {
+        let new_id = session_state.write().create_session(settings.peek().active_composio_profile.clone());
+        let mut tabs = open_tabs.read().clone();
+        tabs.push(new_id.clone());
+        open_tabs.set(tabs.clone());
+        active_tab_index.set(tabs.len() - 1);
+        session_state.write().active_session_id = new_id.clone();
+        current_session_id.set(new_id);
+    };
+
 
     // Call the summarization scheduler hook BEFORE the hotkey manager
     processing::summarization_scheduler::use_summarization_scheduler();
@@ -728,9 +873,7 @@ fn app() -> Element {
                 if current_ui_state.settings_panel_width != new_width {
                     current_ui_state.settings_panel_width = new_width;
                     let uism = ui_state_manager.read();
-                    if let Err(e) = uism.save(&current_ui_state) {
-                        tracing::error!("Failed to save UI state: {}", e);
-                    }
+                    uism.save_async(current_ui_state.clone());
                 }
                 final_width_on_drag_end.set(0.0); // Reset after saving
             });
@@ -783,6 +926,7 @@ fn app() -> Element {
     // Handle global SwitchToSettingsTab command
     use_effect(move || {
         if let Some(ChatCommand::SwitchToSettingsTab(tab, slug)) = chat_command.read().clone() {
+
             tracing::info!("App handling SwitchToSettingsTab: {:?}, slug: {:?}", tab, slug);
             // 1. Show Settings Panel
             show_settings_panel.set(true);
@@ -799,6 +943,95 @@ fn app() -> Element {
                 chat_command.set(None);
             });
         }
+
+        // Global Tab Switching Command
+        if let Some(ChatCommand::SwitchTab(idx)) = chat_command.read().clone() {
+            switch_tab_fn(idx);
+            spawn(async move {
+                chat_command.set(None);
+            });
+        }
+
+        // Profile Switching Command (session-local via Cmd+Option+1..9)
+        if let Some(ChatCommand::SwitchProfile(idx)) = chat_command.read().clone() {
+            // Get profile name from settings by index
+            let profiles = settings.read().composio_profiles.clone();
+            if idx < profiles.len() {
+                let new_profile_name = profiles[idx].name.clone();
+                // Update current session's profile
+                let mut did_change = false;
+                if let Some(session) = session_state.write().sessions.get_mut(&*current_session_id.read()) {
+                    if session.composio_profile.as_deref() != Some(&new_profile_name) {
+                        tracing::info!("Hotkey: Switching session profile to index {}: {}", idx, new_profile_name);
+                        
+                        // Update GLOBAL signal first
+                        active_composio_profile_name.set(Some(new_profile_name.clone()));
+                        
+                        session.composio_profile = Some(new_profile_name.clone());
+                        // Pattern 152.1: Invalidate cached tool list on profile switch 
+                        // to prevent LLM from using stale profile context.
+                        session.active_context.mcp_tools = None;
+                        did_change = true;
+                    }
+                }
+                
+                // Per KI Pattern 134: Operational paths MUST trigger MCP reinit
+                if did_change {
+                    // Persist the session state change (Pattern 12)
+                    SessionState::save_async(session_state.read().clone());
+                    
+                    // Invalidate caches immediately (Pattern 150)
+                    mcp_manager.read().invalidate_status_cache();
+                    
+                    // Trigger async client reinitialization (Pattern 151 - Atomic Lifecycle)
+                    let mcp_context_signal = mcp_context;
+                    let settings_clone = settings.read().clone();
+                    spawn(async move {
+                        mcp_manager
+                            .read()
+                            .reinitialize_composio_client(mcp_context_signal, settings_clone, Some(new_profile_name))
+                            .await;
+                    });
+                }
+            }
+            spawn(async move {
+                chat_command.set(None);
+            });
+        }
+
+        // Session Switching Command (from History panel) - syncs with tab state
+        if let Some(ChatCommand::SwitchToSession(session_id)) = chat_command.read().clone() {
+            // Find if session is already in tabs
+            let tabs = open_tabs.read().clone();
+            if let Some(idx) = tabs.iter().position(|id| id == &session_id) {
+                // Session is already a tab - switch to it atomically
+                active_tab_index.set(idx);
+                current_session_id.set(session_id.clone());
+                session_state.write().active_session_id = session_id;
+            } else {
+                // Add session as a new tab and switch to it atomically
+                let mut new_tabs = tabs;
+                new_tabs.push(session_id.clone());
+                let new_idx = new_tabs.len() - 1;
+                open_tabs.set(new_tabs);
+                active_tab_index.set(new_idx);
+                current_session_id.set(session_id.clone());
+                session_state.write().active_session_id = session_id;
+            }
+            spawn(async move {
+                chat_command.set(None);
+            });
+        }
+
+        // Handle NewChat / NewChatWithMemory
+        if let Some(cmd) = chat_command.read().clone() {
+            if matches!(cmd, ChatCommand::NewChat | ChatCommand::NewChatWithMemory) {
+                new_tab_fn();
+                spawn(async move {
+                    chat_command.set(None);
+                });
+            }
+        }
     });
 
     rsx! {
@@ -813,24 +1046,48 @@ fn app() -> Element {
             }
         } else {
             // SummarizationScheduler component removed; hook called above.
-            StreamManager {
+            if *is_app_initialized.read() {
+                StreamManager {
                 ConfirmDeleteModal {
                     is_visible: show_confirm_modal,
                     title: "Delete Session".to_string(),
                     message: "Are you sure you want to delete this session? This action cannot be undone.".to_string(),
                     on_cancel: move |_| show_confirm_modal.set(false),
                     on_confirm: move |remember| {
-                        let id_to_delete_str = session_to_delete.read().clone();
+                        let id_to_delete_str = session_to_delete.0.read().clone();
                         if !id_to_delete_str.is_empty() {
+                            // 1. Domain delete
                             session_state.write().delete_session(&id_to_delete_str);
+                            
+                            // 2. Tab prune
+                            let mut tabs = open_tabs.read().clone();
+                            if let Some(tab_idx) = tabs.iter().position(|id| id == &id_to_delete_str) {
+                                tabs.remove(tab_idx);
+                                
+                                // 3. Coordinate indices
+                                let mut new_idx = *active_tab_index.read();
+                                if tabs.is_empty() {
+                                    // Bootstrap a new session if we deleted the last tab
+                                    let new_id = session_state.write().create_session(settings.peek().active_composio_profile.clone());
+                                    tabs.push(new_id);
+                                    new_idx = 0;
+                                } else if new_idx >= tabs.len() {
+                                    new_idx = tabs.len().saturating_sub(1);
+                                }
+                                
+                                // 4. Atomic state sync
+                                let new_active_id = tabs[new_idx].clone();
+                                open_tabs.set(tabs);
+                                active_tab_index.set(new_idx);
+                                current_session_id.set(new_active_id.clone());
+                                session_state.write().active_session_id = new_active_id;
+                            }
                         }
                         if remember {
                             let mut current_settings = settings.write();
                             current_settings.confirm_on_delete = false;
                             let sm = settings_manager.read();
-                            if let Err(e) = sm.save(&current_settings) {
-                                tracing::error!("Failed to save settings: {}", e);
-                            }
+                            sm.save_async(current_settings.clone());
                         }
                         show_confirm_modal.set(false);
                     },
@@ -950,7 +1207,15 @@ fn app() -> Element {
 
                         // Main Chat Window
                         div {
-                            class: "flex-1",
+                            class: "flex-1 flex flex-col min-h-0 border-t border-primary-700/50",
+                            components::tab_bar::TabBar {
+                                open_tabs: open_tabs.read().clone(),
+                                active_tab_index: *active_tab_index.read(),
+                                on_select_tab: switch_tab_fn,
+                                on_close_tab: close_tab_fn,
+                                on_new_tab: move |_| new_tab_fn(),
+                            }
+
                             components::chat::ChatWindow {
                                 on_content_resize: move |_| {},
                                 on_interaction: move |_| {},
@@ -958,32 +1223,69 @@ fn app() -> Element {
                                     let new_show_state = !*show_session_manager.peek();
                                     show_session_manager.set(new_show_state);
                                     if new_show_state {
-                                        show_settings_panel.set(false); // Hide settings if showing sessions
-                                        show_mcp_manager.set(false); // Hide MCP manager if showing sessions
+                                        show_settings_panel.set(false);
+                                        show_mcp_manager.set(false);
                                     }
                                 },
                                 on_toggle_settings: move |_| {
                                     let new_show_state = !*show_settings_panel.peek();
                                     show_settings_panel.set(new_show_state);
                                     if new_show_state {
-                                        show_session_manager.set(false); // Hide sessions if showing settings
-                                        show_mcp_manager.set(false); // Hide MCP manager if showing settings
+                                        show_session_manager.set(false);
+                                        show_mcp_manager.set(false);
                                     }
                                 },
                                 on_toggle_mcp_manager: move |_| {
                                     let new_show_state = !*show_mcp_manager.peek();
                                     show_mcp_manager.set(new_show_state);
                                     if new_show_state {
-                                        show_session_manager.set(false); // Hide sessions if showing MCP manager
-                                        show_settings_panel.set(false); // Hide settings if showing MCP manager
+                                        show_session_manager.set(false);
+                                        show_settings_panel.set(false);
                                     }
                                 },
-                                }
                             }
                         }
                     }
                 }
+            }
+        } else {
+            LoadingScreen {}
+        }
+    }
+}
+}
 
+#[component]
+fn LoadingScreen() -> Element {
+    rsx! {
+        div {
+            class: "flex flex-col items-center justify-center h-screen bg-app text-fg",
+            // Branded Loading State
+            div {
+                class: "flex flex-col items-center gap-6 animate-in fade-in duration-700",
+                // Placeholder for Hobbes Logo/Icon
+                div {
+                    class: "w-20 h-20 rounded-2xl bg-primary-600/20 flex items-center justify-center border border-primary-500/30",
+                    svg {
+                        class: "w-12 h-12 text-primary-400 animate-pulse",
+                        fill: "none",
+                        stroke: "currentColor",
+                        view_box: "0 0 24 24",
+                        xmlns: "http://www.w3.org/2000/svg",
+                        path {
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            stroke_width: "1.5",
+                            d: "M13 10V3L4 14h7v7l9-11h-7z"
+                        }
+                    }
+                }
+                div {
+                    class: "space-y-2 text-center",
+                    h2 { class: "text-xl font-medium tracking-tight", "Hobbes Pro" }
+                    p { class: "text-sm text-fg-muted", "Initializing workspace..." }
+                }
+            }
         }
     }
 }

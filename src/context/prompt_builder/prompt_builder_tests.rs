@@ -21,6 +21,7 @@ fn create_test_session() -> Session {
         accumulated_tokens: 0,
         accumulated_turns: 0,
         memory_optimization_summary: None,
+        composio_profile: None,
     }
 }
 

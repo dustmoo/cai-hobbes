@@ -53,6 +53,7 @@ impl StreamManagerContext {
         prompt_data: crate::context::prompt_builder::LlmPrompt,
         on_complete: impl FnOnce() + 'static,
         mcp_context: Option<crate::mcp::manager::McpContext>,
+        profile_name: Option<String>,
     ) {
         self.is_sending.set(true);
         tracing::info!(message_id = %message_id, "'start_stream' entered.");
@@ -265,10 +266,13 @@ impl StreamManagerContext {
                         let mut session_state = self.session_state;
                         let tool_results_tx_clone = tool_results_tx.clone();
                         let completed_tool_tasks_clone = completed_tool_tasks.clone();
+                        let profile_name_inner = profile_name.clone();
                         let _handle = spawn(async move {
                             let args_json: serde_json::Value =
                                 serde_json::from_str(&tool_call.arguments)
                                     .unwrap_or(serde_json::Value::Null);
+                            let profile_name = profile_name_inner;
+
                             let result_receiver = mcp_manager
                                 .read()
                                 .use_mcp_tool(
@@ -276,6 +280,7 @@ impl StreamManagerContext {
                                     &tool_call.tool_name,
                                     args_json,
                                     false,
+                                    profile_name.clone(),
                                 )
                                 .await;
 
@@ -311,6 +316,7 @@ impl StreamManagerContext {
                                                     .initiate_composio_auth(
                                                         &tool_call.server_name,
                                                         &tool_call.tool_name,
+                                                        profile_name.clone(),
                                                     )
                                                     .await
                                                 {
@@ -404,7 +410,16 @@ impl StreamManagerContext {
                                         status,
                                         response: response_str,
                                     },
-                                    profile_color: Some(self.settings.read().get_active_profile().map(|p| p.color.clone()).unwrap_or_default()),
+                                    profile_color: {
+                                        // Derive from session-specific profile (profile_name captured earlier)
+                                        let settings_read = self.settings.read();
+                                        let pname = profile_name.as_ref()
+                                            .or(settings_read.active_composio_profile.as_ref());
+                                        pname
+                                            .and_then(|name| settings_read.composio_profiles.iter().find(|p| &p.name == name))
+                                            .map(|p| p.color.clone())
+                                            .or_else(|| settings_read.get_active_profile().map(|p| p.color.clone()))
+                                    },
                                 };
                                 let _ = tool_results_tx_clone.send(record);
                             }

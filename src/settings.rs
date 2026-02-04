@@ -59,6 +59,24 @@ pub struct HotkeySettings {
     pub submit_chat: String,
     #[serde(default = "default_cancel_generation")]
     pub cancel_generation: String,
+    #[serde(default = "default_switch_tab_1")]
+    pub switch_tab_1: String,
+    #[serde(default = "default_switch_tab_2")]
+    pub switch_tab_2: String,
+    #[serde(default = "default_switch_tab_3")]
+    pub switch_tab_3: String,
+    #[serde(default = "default_switch_tab_4")]
+    pub switch_tab_4: String,
+    #[serde(default = "default_switch_tab_5")]
+    pub switch_tab_5: String,
+    #[serde(default = "default_switch_tab_6")]
+    pub switch_tab_6: String,
+    #[serde(default = "default_switch_tab_7")]
+    pub switch_tab_7: String,
+    #[serde(default = "default_switch_tab_8")]
+    pub switch_tab_8: String,
+    #[serde(default = "default_switch_tab_9")]
+    pub switch_tab_9: String,
 }
 
 impl Default for HotkeySettings {
@@ -76,6 +94,15 @@ impl Default for HotkeySettings {
             toggle_focus_chat: default_toggle_focus_chat(),
             submit_chat: default_submit_chat(),
             cancel_generation: default_cancel_generation(),
+            switch_tab_1: default_switch_tab_1(),
+            switch_tab_2: default_switch_tab_2(),
+            switch_tab_3: default_switch_tab_3(),
+            switch_tab_4: default_switch_tab_4(),
+            switch_tab_5: default_switch_tab_5(),
+            switch_tab_6: default_switch_tab_6(),
+            switch_tab_7: default_switch_tab_7(),
+            switch_tab_8: default_switch_tab_8(),
+            switch_tab_9: default_switch_tab_9(),
         }
     }
 }
@@ -115,6 +142,34 @@ fn default_submit_chat() -> String {
 }
 fn default_cancel_generation() -> String {
     "CmdOrCtrl+.".to_string()
+}
+
+fn default_switch_tab_1() -> String {
+    "CmdOrCtrl+Shift+1".to_string()
+}
+fn default_switch_tab_2() -> String {
+    "CmdOrCtrl+Shift+2".to_string()
+}
+fn default_switch_tab_3() -> String {
+    "CmdOrCtrl+Shift+3".to_string()
+}
+fn default_switch_tab_4() -> String {
+    "CmdOrCtrl+Shift+4".to_string()
+}
+fn default_switch_tab_5() -> String {
+    "CmdOrCtrl+Shift+5".to_string()
+}
+fn default_switch_tab_6() -> String {
+    "CmdOrCtrl+Shift+6".to_string()
+}
+fn default_switch_tab_7() -> String {
+    "CmdOrCtrl+Shift+7".to_string()
+}
+fn default_switch_tab_8() -> String {
+    "CmdOrCtrl+Shift+8".to_string()
+}
+fn default_switch_tab_9() -> String {
+    "CmdOrCtrl+Shift+9".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -439,7 +494,7 @@ impl Settings {
                 .iter()
                 .find(|p| &p.name == active_name)
         } else {
-            self.composio_profiles.first()
+            None
         }
     }
 
@@ -703,6 +758,15 @@ impl SettingsManager {
         }
         fs::write(&self.settings_path, content)
     }
+
+    pub fn save_async(&self, settings: Settings) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tokio::task::spawn_blocking(move || manager.save(&settings)).await.unwrap_or_else(|e| Err(std::io::Error::other(e))) {
+                tracing::error!("Failed to save settings asynchronously: {}", e);
+            }
+        });
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -778,6 +842,12 @@ pub struct UiState {
     /// Slug of the toolkit currently selected for BYOA credential setup
     #[serde(default)]
     pub selected_byoa_slug: Option<String>,
+    /// Currently open session tabs (list of session IDs)
+    #[serde(default)]
+    pub open_tabs: Vec<String>,
+    /// Currently focused tab index (0-based)
+    #[serde(default)]
+    pub active_tab_index: usize,
 }
 
 fn default_token_display_mode() -> String {
@@ -797,6 +867,8 @@ impl Default for UiState {
             unloaded_mcp_servers: Vec::new(),
             active_settings_tab: SettingsTab::default(),
             llm_config_collapsed: false,
+            open_tabs: Vec::new(),
+            active_tab_index: 0,
             mcp_instructions_collapsed: false,
             composio_toolkit_expanded: false,
             selected_byoa_slug: None,
@@ -846,5 +918,14 @@ impl UiStateManager {
             fs::create_dir_all(parent)?;
         }
         fs::write(&self.state_path, content)
+    }
+
+    pub fn save_async(&self, state: UiState) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tokio::task::spawn_blocking(move || manager.save(&state)).await.unwrap_or_else(|e| Err(std::io::Error::other(e))) {
+                tracing::error!("Failed to save UI state asynchronously: {}", e);
+            }
+        });
     }
 }

@@ -1,6 +1,15 @@
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, PartialEq)]
+pub struct SessionIdContext(pub Signal<String>);
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct DraftContext(pub Signal<String>);
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct SessionToDeleteContext(pub Signal<String>);
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum MessageContent {
     Text {
