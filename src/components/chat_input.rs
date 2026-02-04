@@ -233,8 +233,12 @@ pub fn ChatInput(
             if !parts.is_empty() {
                 let skill_name = parts[0].trim_start_matches('/');
                 let skill_registry = use_context::<Signal<crate::skills::registry::SkillRegistry>>();
+                let skill_opt = {
+                    let registry = skill_registry.read();
+                    registry.get_skill(skill_name)
+                };
                 
-                if let Some(skill) = skill_registry.read().get_skill(skill_name) {
+                if let Some(skill) = skill_opt {
                     let arguments = parts[1..].join(" ");
                     let permission_manager = use_context::<Signal<crate::context::permissions::PermissionManager>>();
                     let permission_status = permission_manager.read().check_skill_permission(&skill.metadata.name);
