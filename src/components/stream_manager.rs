@@ -497,12 +497,7 @@ impl StreamManagerContext {
                     }
                     self.active_stream_handles.write().remove(&message_id);
                     self.content_generated.write().remove(&message_id); // Cleanup
-                    if let Err(e) = self.session_state.write().save() {
-                        tracing::error!(
-                            "Failed to save session state after permission request: {}",
-                            e
-                        );
-                    }
+                    crate::session::SessionState::save_async(self.session_state.write().clone());
                     on_complete();
                     self.is_sending.set(false);
                     self.scheduler.send(SchedulerSignal::Activity);
@@ -522,9 +517,7 @@ impl StreamManagerContext {
                 self.active_stream_handles.write().remove(&message_id);
                 self.content_generated.write().remove(&message_id); // Cleanup
 
-                if let Err(e) = self.session_state.write().save() {
-                    tracing::error!("Failed to save session state before continuation: {}", e);
-                }
+                crate::session::SessionState::save_async(self.session_state.write().clone());
 
                 // Clean up the current stream state before triggering the next one
                 on_complete();
@@ -542,11 +535,7 @@ impl StreamManagerContext {
             {
                 let mut state = self.session_state.write();
                 state.touch_active_session();
-                if let Err(e) = state.save() {
-                    tracing::error!("Failed to save session state after stream: {}", e);
-                } else {
-                    tracing::info!(message_id = %message_id, "Session state SAVED successfully.");
-                }
+                crate::session::SessionState::save_async(state.clone());
             }
 
             let settings = self.settings.read().clone();

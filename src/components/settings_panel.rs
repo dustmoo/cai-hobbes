@@ -154,9 +154,7 @@ pub fn SettingsPanel() -> Element {
 
                             if conflicts.is_empty() {
                                 show_conflict_modal.set(false);
-                                if let Err(e) = session_state.write().save() {
-                                    tracing::error!("Failed to save session state after conflict resolution: {}", e);
-                                }
+                                crate::session::SessionState::save_async(session_state.peek().clone());
                             }
                         }
                     }
@@ -1866,11 +1864,8 @@ pub fn SettingsPanel() -> Element {
                                                         if !conflicting_sessions.read().is_empty() {
                                                             show_conflict_modal.set(true);
                                                         } else {
-                                                            if let Err(e) = current_state.save() {
-                                                                tracing::error!("Failed to save updated session state: {}", e);
-                                                            } else {
-                                                                tracing::info!("Successfully imported history with no conflicts.");
-                                                            }
+                                                            crate::session::SessionState::save_async(current_state.clone());
+                                                            tracing::info!("Successfully imported history with no conflicts.");
                                                         }
                                                     },
                                                     Err(e) => {

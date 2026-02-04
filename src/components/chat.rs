@@ -1259,9 +1259,7 @@ pub fn MessageBubble(
                                             if let Some(msg) = state.get_message_mut(&message_id) {
                                                 msg.comments.retain(|c| c.id != comment_id);
                                             }
-                                            if let Err(e) = state.save() {
-                                                tracing::error!("Failed to save after deleting comment: {}", e);
-                                            }
+                                            crate::session::SessionState::save_async(state.clone());
                                         }
                                     }
                                 }
@@ -1360,9 +1358,7 @@ pub fn MessageBubble(
                                     if let Some(msg) = state.get_message_mut(&message.id) {
                                         msg.comments.push(new_comment);
                                     }
-                                    if let Err(e) = state.save() {
-                                        tracing::error!("Failed to save session after adding comment: {}", e);
-                                    }
+                                    crate::session::SessionState::save_async(state.clone());
 
                                     on_comment.call(());
 
@@ -1397,9 +1393,7 @@ pub fn MessageBubble(
                                                         comment.comment = new_comment_text;
                                                     }
                                                 }
-                                                if let Err(e) = state.save() {
-                                                    tracing::error!("Failed to save session after editing comment: {}", e);
-                                                }
+                                                crate::session::SessionState::save_async(state.clone());
                                             }
                                             editing_comment_id.set(None);
                                             selection_mode.set(SelectionMode::None);
