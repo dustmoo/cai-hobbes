@@ -746,7 +746,8 @@ pub fn ChatWindow(
         show_forget_memory_modal.set(false);
     };
 
-    if let Some(_session) = session.read().as_ref() {
+    let session_guard = session.read();
+    if session_guard.is_some() {
         rsx! {
 
         div {
