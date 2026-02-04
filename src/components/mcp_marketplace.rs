@@ -718,7 +718,9 @@ pub fn McpMarketplace() -> Element {
                     div { class: "mb-4 p-2 bg-red-900 text-red-200 rounded text-sm", "{msg}" }
                 }
 
-                match *active_tab.read() {
+                {
+                    let tab = (*active_tab.read()).clone();
+                    match tab {
                     ActiveTab::Marketplace => rsx! {
                         McpSearchForm {
                             search_query: search_query,
@@ -892,6 +894,7 @@ pub fn McpMarketplace() -> Element {
                     ActiveTab::Status => rsx! {
                         StatusView {}
                     }
+                }
                 }
             }
         }

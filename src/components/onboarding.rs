@@ -159,7 +159,8 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
         });
     };
 
-    match *current_step.read() {
+    let step = *current_step.read();
+    match step {
         OnboardingStep::TosAcceptance => {
             rsx! {
                 div {

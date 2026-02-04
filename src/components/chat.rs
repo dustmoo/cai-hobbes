@@ -691,7 +691,8 @@ pub fn ChatWindow(
 
     // Forget Modal Logic
     let on_forget_apply = move |(new_context, summary): (ActiveContext, String)| {
-        match *optimization_target.read() {
+        let routing_target = *optimization_target.read();
+        match routing_target {
             OptimizationTarget::Session => {
                 {
                     let mut state = session_state.write();
