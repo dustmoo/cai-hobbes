@@ -1252,7 +1252,8 @@ pub fn SettingsPanel() -> Element {
                                                                     profile.api_key = if val.is_empty() { None } else { Some(val) };
                                                                 }
                                                             }
-                                                        }
+                                                        },
+                                                        onkeydown: |e| e.stop_propagation(),
                                                     }
                                                     p {
                                                         class: "text-xs text-fg-muted mt-1",

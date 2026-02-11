@@ -151,6 +151,11 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                     window.hobbes_hotkey_listener = function(event) {{
                         // CRITICAL: Respect Scope - If event was already handled (e.g. by ChatInput), ignore.
                         if (event.defaultPrevented) return;
+
+                        // CRITICAL: Focus Check - If focused on an input/textarea, ignore keys unless they have a command modifier (Cmd or Ctrl).
+                        // This prevents global hotkeys from intercepting typing while still allowing shortcuts like Cmd+,
+                        const isInput = ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName) || document.activeElement.isContentEditable;
+                        if (isInput && !event.metaKey && !event.ctrlKey) return;
     
                         let config = window.hobbes_hotkey_config;
                         if (!config) return;
