@@ -14,6 +14,7 @@ pub struct ContextStore {
     profile_id: String,
     file_path: PathBuf,
     // Map<ToolkitSlug, Map<UserId, Map<Key, Value>>>
+    // Deliberate triple-nested map: ToolkitSlug → UserId → Key → Value.
     #[allow(clippy::type_complexity)]
     cache: Arc<RwLock<HashMap<String, HashMap<String, HashMap<String, String>>>>>,
 }

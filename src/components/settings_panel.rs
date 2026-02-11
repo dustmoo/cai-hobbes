@@ -1,11 +1,12 @@
 use crate::components::confirm_save_modal::ConfirmSaveModal;
 use crate::components::conflict_modal::ConflictModal;
 use crate::components::hotkey_recorder::HotkeyRecorder;
+use crate::components::llm::GeminiModel;
 use crate::components::markdown_renderer::MarkdownRenderer;
 use crate::components::onboarding::TOS_CONTENT;
 use crate::components::tool_credentials::ToolCredentials;
 use crate::mcp::composio_client::validate_composio_api_key;
-use crate::settings::{is_sandboxed, HotkeySettings, Settings, SettingsManager};
+use crate::settings::{get_slot_icon, is_sandboxed, HotkeySettings, Settings, SettingsManager};
 use crate::{context::permissions::ToolCategory, session::SessionState};
 use dioxus::prelude::*;
 use crate::SecretManagerTrait;
@@ -29,6 +30,7 @@ pub fn SettingsPanel() -> Element {
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut secret_manager = use_context::<Signal<crate::secret_manager::SecretManager>>();
     let mut active_composio_profile_name = use_context::<Signal<Option<String>>>();
+    let save_error = use_context::<crate::components::shared::SaveErrorContext>().0;
 
     // Create a local copy of the settings for editing.
     let mut local_settings = use_signal(|| settings.read().clone());
@@ -43,6 +45,8 @@ pub fn SettingsPanel() -> Element {
     let mut models_error = use_signal(|| Option::<String>::None);
     let skill_registry = use_context::<Signal<crate::skills::registry::SkillRegistry>>();
     let mut models_fetch_trigger = use_signal(|| 0u32);
+    // show_model_slots is now persisted in UiState (defaults to open)
+    let mut picker_open_for_slot: Signal<Option<usize>> = use_signal(|| None);
 
     // Effect to fetch models when API key is available or refresh is triggered
     use_effect(move || {
@@ -154,7 +158,7 @@ pub fn SettingsPanel() -> Element {
 
                             if conflicts.is_empty() {
                                 show_conflict_modal.set(false);
-                                crate::session::SessionState::save_async(session_state.peek().clone());
+                                crate::session::SessionState::save_async(session_state.peek().clone(), Some(save_error));
                             }
                         }
                     }
@@ -590,7 +594,7 @@ pub fn SettingsPanel() -> Element {
                                         class: "mb-4",
                                         div {
                                             class: "flex justify-between items-center mb-1",
-                                            label { class: "block text-sm font-medium text-fg-muted", "Chat Model" }
+                                            label { class: "block text-sm font-medium text-fg-muted", "Active Chat Model" }
                                             if local_settings.read().gemini_config.api_key.is_some() {
                                                 button {
                                                     class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-fg-muted disabled:cursor-not-allowed",
@@ -621,24 +625,36 @@ pub fn SettingsPanel() -> Element {
                                         } else {
                                             select {
                                                 class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                value: "{local_settings.read().gemini_config.chat_model}",
                                                 onchange: move |event| {
                                                     local_settings.write().gemini_config.chat_model = event.value();
                                                 },
-                                                for model in available_models.read().iter() {
-                                                    option {
-                                                        value: "{model.name}",
-                                                        selected: local_settings.read().gemini_config.chat_model == model.name,
-                                                        "{model.display_name}"
+                                                {
+                                                    let current = local_settings.read().gemini_config.chat_model.clone();
+                                                    let models = available_models.read();
+                                                    let in_list = models.iter().any(|m| m.name == current);
+                                                    rsx! {
+                                                        if !current.is_empty() && !in_list {
+                                                            option { value: "{current}", selected: true, "{GeminiModel::from_slug(&current).display_name()}" }
+                                                        }
+                                                        for model in models.iter() {
+                                                            option {
+                                                                value: "{model.name}",
+                                                                selected: model.name == current,
+                                                                "{model.display_name}"
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
+
                                     div {
                                         class: "mb-4",
                                         div {
                                             class: "flex justify-between items-center mb-1",
-                                            label { class: "block text-sm font-medium text-fg-muted", "Summary Model" }
+                                            label { class: "block text-sm font-medium text-fg-muted", "Active Summary Model" }
                                             if local_settings.read().gemini_config.api_key.is_some() {
                                                 button {
                                                     class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-fg-muted disabled:cursor-not-allowed",
@@ -669,14 +685,25 @@ pub fn SettingsPanel() -> Element {
                                         } else {
                                             select {
                                                 class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                value: "{local_settings.read().gemini_config.summary_model}",
                                                 onchange: move |event| {
                                                     local_settings.write().gemini_config.summary_model = event.value();
                                                 },
-                                                for model in available_models.read().iter() {
-                                                    option {
-                                                        value: "{model.name}",
-                                                        selected: local_settings.read().gemini_config.summary_model == model.name,
-                                                        "{model.display_name}"
+                                                {
+                                                    let current = local_settings.read().gemini_config.summary_model.clone();
+                                                    let models = available_models.read();
+                                                    let in_list = models.iter().any(|m| m.name == current);
+                                                    rsx! {
+                                                        if !current.is_empty() && !in_list {
+                                                            option { value: "{current}", selected: true, "{GeminiModel::from_slug(&current).display_name()}" }
+                                                        }
+                                                        for model in models.iter() {
+                                                            option {
+                                                                value: "{model.name}",
+                                                                selected: model.name == current,
+                                                                "{model.display_name}"
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -769,6 +796,150 @@ pub fn SettingsPanel() -> Element {
                                                                 p { class: "text-sm text-yellow-200", "⚠️ This model does not support thinking mode." }
                                                             }
                                                         }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Model Quick-Switch Slots Section
+                                    div {
+                                        class: "mb-4 pt-4 border-t border-subtle",
+                                        div {
+                                            class: "flex justify-between items-center cursor-pointer mb-2 group",
+                                            onclick: move |_| {
+                                                let mut state = ui_state.write();
+                                                state.show_model_slots = !state.show_model_slots;
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            },
+                                            label { class: "block text-sm font-medium text-fg-muted group-hover:text-fg transition-colors", "Model Quick-Switch Slots" }
+                                            span { class: "text-xs text-fg-muted", if ui_state.read().show_model_slots { "▼" } else { "▶" } }
+                                        }
+                                        if ui_state.read().show_model_slots {
+                                            div {
+                                                class: "space-y-3 pl-2 mb-4",
+                                                for i in 0..10 {
+                                                    div {
+                                                        key: "model-slot-{i}",
+                                                        class: "flex items-center gap-3",
+                                                        {
+                                                            let slot_model = local_settings.read().model_slots.get(i).cloned().unwrap_or_default();
+                                                            let effective_icon = if !slot_model.is_empty() {
+                                                                local_settings.read().model_icons.get(&slot_model).cloned()
+                                                                    .unwrap_or_else(|| get_slot_icon(i))
+                                                            } else {
+                                                                get_slot_icon(i)
+                                                            };
+                                                            let has_model = !slot_model.is_empty();
+                                                            rsx! {
+                                                                div {
+                                                                    class: if has_model {
+                                                                        "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm shrink-0 cursor-pointer hover:border-primary-500 transition-all"
+                                                                    } else {
+                                                                        "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm shrink-0"
+                                                                    },
+                                                                    title: if has_model { "Click to change icon" } else { "" },
+                                                                    onclick: move |_| {
+                                                                        if has_model {
+                                                                            let current = picker_open_for_slot();
+                                                                            if current == Some(i) {
+                                                                                picker_open_for_slot.set(None);
+                                                                            } else {
+                                                                                picker_open_for_slot.set(Some(i));
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    "{effective_icon}"
+                                                                }
+                                                            }
+                                                        }
+                                                        div {
+                                                            class: "flex-1",
+                                                            select {
+                                                                class: "block w-full px-2 py-1 bg-input border border-subtle rounded text-xs",
+                                                                onchange: move |evt| {
+                                                                    let mut settings = local_settings.write();
+                                                                    if i < settings.model_slots.len() {
+                                                                        settings.model_slots[i] = evt.value();
+                                                                    } else {
+                                                                        while settings.model_slots.len() <= i {
+                                                                            settings.model_slots.push("".to_string());
+                                                                        }
+                                                                        settings.model_slots[i] = evt.value();
+                                                                    }
+                                                                },
+                                                                {
+                                                                    let current_slot_value = local_settings.read().model_slots.get(i).cloned().unwrap_or_default();
+                                                                    let models = available_models.read();
+                                                                    let current_in_list = models.iter().any(|m| m.name == current_slot_value);
+
+                                                                    rsx! {
+                                                                        option { value: "", selected: current_slot_value.is_empty(), "None" }
+                                                                        if !current_slot_value.is_empty() && !current_in_list {
+                                                                            option {
+                                                                                value: "{current_slot_value}",
+                                                                                selected: true,
+                                                                                "{GeminiModel::from_slug(&current_slot_value).display_name()}"
+                                                                            }
+                                                                        }
+                                                                        for model in models.iter() {
+                                                                            option {
+                                                                                value: "{model.name}",
+                                                                                selected: model.name == current_slot_value,
+                                                                                "{model.display_name}"
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            // Emoji picker popover — only shown when this slot's icon is clicked
+                                                            if picker_open_for_slot() == Some(i) {
+                                                                {
+                                                                    let slot_model_for_picker = local_settings.read().model_slots.get(i).cloned().unwrap_or_default();
+                                                                    if !slot_model_for_picker.is_empty() {
+                                                                        let current_custom = local_settings.read().model_icons.get(&slot_model_for_picker).cloned().unwrap_or_default();
+                                                                        rsx! {
+                                                                            div {
+                                                                                class: "flex gap-1 flex-wrap mt-1 p-1.5 bg-card border border-subtle rounded-lg shadow-lg",
+                                                                                for emoji in ["\u{26a1}", "\u{1f9e0}", "\u{1f34c}", "\u{1f916}", "\u{1f48e}", "\u{1f525}", "\u{2728}", "\u{1f680}", "\u{1f319}", "\u{2b50}"] {
+                                                                                    button {
+                                                                                        class: format!("w-7 h-7 rounded-full bg-section border flex items-center justify-center text-sm transition-all {}",
+                                                                                            if current_custom == emoji { "border-primary-500 ring-1 ring-primary-500/30 scale-110" } else { "border-subtle hover:border-primary-500 hover:scale-110" }
+                                                                                        ),
+                                                                                        onclick: {
+                                                                                            let model = slot_model_for_picker.clone();
+                                                                                            let icon = emoji.to_string();
+                                                                                            move |_| {
+                                                                                                local_settings.write().model_icons.insert(model.clone(), icon.clone());
+                                                                                                picker_open_for_slot.set(None);
+                                                                                            }
+                                                                                        },
+                                                                                        "{emoji}"
+                                                                                    }
+                                                                                }
+                                                                                button {
+                                                                                    class: "w-7 h-7 rounded-full bg-section border border-subtle flex items-center justify-center text-[10px] text-fg-muted hover:border-red-500 hover:text-red-400 transition-all",
+                                                                                    title: "Reset to default",
+                                                                                    onclick: {
+                                                                                        let model = slot_model_for_picker.clone();
+                                                                                        move |_| {
+                                                                                            local_settings.write().model_icons.remove(&model);
+                                                                                            picker_open_for_slot.set(None);
+                                                                                        }
+                                                                                    },
+                                                                                    "✕"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    } else {
+                                                                        rsx! {}
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        span { class: "text-[10px] text-fg-muted font-mono w-6 text-right", "^{i+1}" }
                                                     }
                                                 }
                                             }
@@ -1017,8 +1188,53 @@ pub fn SettingsPanel() -> Element {
                                                         }
                                                     }
                                                 }
+                                                // Chrome Profile (Auth Security)
+                                                div {
+                                                    class: "mb-3",
+                                                    label { class: "block text-xs font-medium text-fg-muted mb-1", "Chrome Profile for Auth" }
+                                                    div {
+                                                        class: "flex gap-2",
+                                                        select {
+                                                            class: "flex-1 px-3 py-2 bg-input border border-primary-600 rounded-md text-sm",
+                                                            onchange: {
+                                                                let name = active_name.clone();
+                                                                move |evt: Event<FormData>| {
+                                                                    let val = evt.value();
+                                                                    let mut settings = local_settings.write();
+                                                                    if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                        profile.chrome_profile_directory = if val.is_empty() { None } else { Some(val) };
+                                                                    }
+                                                                }
+                                                            },
+                                                            {
+                                                                let current_chrome = local_settings.read().get_active_profile()
+                                                                    .and_then(|p| p.chrome_profile_directory.clone())
+                                                                    .unwrap_or_default();
+                                                                let chrome_profiles = crate::settings::discover_chrome_profiles();
+                                                                rsx! {
+                                                                    option { value: "", selected: current_chrome.is_empty(), "System Default (any window)" }
+                                                                    for cp in chrome_profiles.iter() {
+                                                                        option {
+                                                                            value: "{cp.dir_name}",
+                                                                            selected: current_chrome == cp.dir_name,
+                                                                            if let Some(ref email) = cp.email {
+                                                                                "{cp.display_name} — {email}"
+                                                                            } else {
+                                                                                "{cp.display_name}"
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    p {
+                                                        class: "text-xs text-fg-muted mt-1",
+                                                        "Ensures OAuth opens in the correct Chrome profile window."
+                                                    }
+                                                }
 
-                                                // API Key - FIRST (this is the required entry point)
+
                                                 div {
                                                     class: "mb-3",
                                                     label { class: "block text-xs font-medium text-fg-muted mb-1", "API Key" }
@@ -1412,6 +1628,24 @@ pub fn SettingsPanel() -> Element {
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
                                                 state.show_attachments_icon = e.value() == "true";
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+
+                                    // Model Selector
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-fg-muted", "Show Model Selector" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                            checked: "{ui_state.read().show_model_selector}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.show_model_selector = e.value() == "true";
                                                 let state_clone = (*state).clone();
                                                 let manager = ui_state_manager.read().clone();
                                                 spawn(async move { let _ = manager.save(&state_clone); });
@@ -1851,6 +2085,7 @@ pub fn SettingsPanel() -> Element {
                                                 match serde_json::from_str::<SessionState>(&contents) {
                                                     Ok(imported_state) => {
                                                         let mut current_state = session_state.write();
+                                                        // Intentional: branches have different side effects (insert vs. push to conflict list).
                                                         #[allow(clippy::map_entry)]
                                                         for (id, session) in imported_state.sessions {
                                                             if current_state.sessions.contains_key(&id) {
@@ -1864,7 +2099,7 @@ pub fn SettingsPanel() -> Element {
                                                         if !conflicting_sessions.read().is_empty() {
                                                             show_conflict_modal.set(true);
                                                         } else {
-                                                            crate::session::SessionState::save_async(current_state.clone());
+                                                            crate::session::SessionState::save_async(current_state.clone(), Some(save_error));
                                                             tracing::info!("Successfully imported history with no conflicts.");
                                                         }
                                                     },

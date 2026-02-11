@@ -21,6 +21,7 @@ pub fn MessageList(
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let ui_state = consume_context::<Signal<crate::settings::UiState>>();
     let settings = use_context::<Signal<crate::settings::Settings>>();
+    let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let mut chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
     let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     let _ = stream_update_trigger.read();
@@ -32,17 +33,10 @@ pub fn MessageList(
     let profile_color = {
         let state = session_state.read();
         let settings_read = settings.read();
-        
-        // Get the session's explicit profile, or fall back to global active
-        let profile_name = state.sessions.get(&*session_id.read())
-            .and_then(|s| s.composio_profile.as_ref())
-            .or(settings_read.active_composio_profile.as_ref());
-        
-        // Find the actual profile struct to get its color
-        profile_name
-            .and_then(|name| settings_read.composio_profiles.iter().find(|p| &p.name == name))
-            .map(|p| p.color.clone())
-            .unwrap_or_else(|| settings_read.get_active_profile().map(|p| p.color.clone()).unwrap_or_default())
+        let session_profile = state.sessions.get(&*session_id.read())
+            .and_then(|s| s.composio_profile.as_ref());
+        crate::components::shared::resolve_profile_color(session_profile, &settings_read)
+            .unwrap_or_default()
     };
 
 
@@ -311,8 +305,8 @@ pub fn MessageList(
                                                                                 let msg_id = message_id;
                                                                                 let session_id = session_id.clone();
                                                                                 spawn(async move {
-                                                                                    // Find and execute the skill
-                                                                                    let (mut skill_call_clone, mcp_context) = {
+                                                                                    // Get session's profile for profile-scoped MCP context
+                                                                                    let (skill_call_clone, profile_name) = {
                                                                                         let state = session_state.read();
                                                                                         if let Some(session) = state.sessions.get(&session_id) {
                                                                                             let sc = session.messages.iter()
@@ -321,12 +315,26 @@ pub fn MessageList(
                                                                                                     MessageContent::SkillPermissionRequest(sc) => Some(sc.clone()),
                                                                                                     _ => None,
                                                                                                 });
-                                                                                            let mcp = session.active_context.mcp_tools.clone();
-                                                                                            (sc, mcp)
+                                                                                            // Get session's composio_profile for scoped context
+                                                                                            let profile = session.composio_profile.clone()
+                                                                                                .or_else(|| settings.read().active_composio_profile.clone());
+                                                                                            (sc, profile)
                                                                                         } else { (None, None) }
                                                                                     };
                                                                                     
-                                                                                    if let Some(mut sc) = skill_call_clone.take() {
+                                                                                    // Get FRESH, profile-scoped MCP context using mcp_manager
+                                                                                    // This follows the same lifecycle as chat.rs:539-557
+                                                                                    if let Some(ref name) = profile_name {
+                                                                                        let _ = mcp_manager.read().ensure_native_client_for_profile(name, &settings.read()).await;
+                                                                                    }
+                                                                                    let fresh_mcp_context = mcp_manager.read().get_mcp_context(profile_name).await;
+                                                                                    let mcp_context = if fresh_mcp_context.servers.is_empty() {
+                                                                                        None
+                                                                                    } else {
+                                                                                        Some(fresh_mcp_context)
+                                                                                    };
+                                                                                    
+                                                                                    if let Some(mut sc) = skill_call_clone {
                                                                                         tracing::info!("Executing skill: {}", sc.skill_name);
                                                                                         match crate::skills::execute_skill(&mut sc, mcp_context.as_ref()).await {
                                                                                             Ok(result) => {

@@ -84,6 +84,17 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
 
     // --- Part 2: JavaScript "Local Global" Listener (The Hybrid Bridge) ---
     // Receives events from the WebView when keys are pressed and NOT handled by components.
+    //
+    // RESERVED HOTKEY COMBINATIONS (hardcoded in JS, not user-configurable):
+    //   Cmd+W / Ctrl+W          → Close Tab
+    //   Cmd+Backspace / Delete  → Delete Session
+    //   Cmd+1..9                → Switch Tab (by index)
+    //   Control+1..9            → Switch Model (by index)
+    //   Cmd+Option+1..9         → Switch Profile (by index)
+    //
+    // User-configurable hotkeys (from settings.hotkeys) are checked FIRST in the JS listener.
+    // If a configurable hotkey collides with a reserved one, the configurable one wins (shadows).
+    // This is acceptable because it requires deliberate user misconfiguration.
     let js_action_handler = use_coroutine(move |mut rx: UnboundedReceiver<String>| async move {
         while let Some(msg) = rx.next().await {
             match msg.as_str() {
@@ -98,6 +109,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 "scroll_bottom" => chat_command.set(Some(ChatCommand::ScrollToBottom)),
                 "delete_session" => chat_command.set(Some(ChatCommand::DeleteSession)),
                 "cancel_generation" => chat_command.set(Some(ChatCommand::CancelGeneration)),
+                "close_tab" => chat_command.set(Some(ChatCommand::CloseTab)),
                 // Profile switching (session-local)
                 s if s.starts_with("switch_profile_") => {
                     if let Ok(idx) = s.replace("switch_profile_", "").parse::<usize>() {
@@ -107,6 +119,11 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 s if s.starts_with("switch_tab_") => {
                     if let Ok(idx) = s.replace("switch_tab_", "").parse::<usize>() {
                         chat_command.set(Some(ChatCommand::SwitchTab(idx)));
+                    }
+                }
+                s if s.starts_with("switch_model_") => {
+                    if let Ok(idx) = s.replace("switch_model_", "").parse::<usize>() {
+                        chat_command.set(Some(ChatCommand::SwitchModel(idx)));
                     }
                 }
                 _ => tracing::warn!("Unknown JS hotkey action: {}", msg),
@@ -187,6 +204,11 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                             action = "delete_session";
                         }}
                         
+                        // Close Tab (Cmd+W or Ctrl+W)
+                        else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === 'w') {{
+                            action = "close_tab";
+                        }}
+                        
                         else if (check(config.switch_tab_1, event)) action = "switch_tab_0";
                         else if (check(config.switch_tab_2, event)) action = "switch_tab_1";
                         else if (check(config.switch_tab_3, event)) action = "switch_tab_2";
@@ -196,6 +218,13 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                         else if (check(config.switch_tab_7, event)) action = "switch_tab_6";
                         else if (check(config.switch_tab_8, event)) action = "switch_tab_7";
                         else if (check(config.switch_tab_9, event)) action = "switch_tab_8";
+                        // Model switching: Control+1..9 (Control only, no Cmd/Meta, no Alt, no Shift)
+                        // MUST be checked before Tab fallback which also matches ctrlKey
+                        else if (event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {{
+                             if (event.key >= '1' && event.key <= '9') {{
+                                 action = "switch_model_" + (parseInt(event.key) - 1);
+                             }}
+                        }}
                         // Tab switching: Cmd+1..9 (industry standard, no modifiers required)
                         else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey) {{
                              if (event.key >= '1' && event.key <= '9') {{

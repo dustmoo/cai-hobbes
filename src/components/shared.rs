@@ -10,6 +10,11 @@ pub struct DraftContext(pub Signal<String>);
 #[derive(Clone, Copy, PartialEq)]
 pub struct SessionToDeleteContext(pub Signal<String>);
 
+/// Context for surfacing async save errors to the UI via a dismissible toast.
+/// When `Some(msg)`, the toast is visible with the given error message.
+#[derive(Clone, Copy, PartialEq)]
+pub struct SaveErrorContext(pub Signal<Option<String>>);
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum MessageContent {
     Text {
@@ -209,6 +214,20 @@ pub struct ToolCallRecord {
     pub result: ToolResult,
     #[serde(default)]
     pub profile_color: Option<String>, // Historical profile color for rendering
+}
+
+/// Resolve the profile color from a session-specific profile name,
+/// falling back to the global active profile's color.
+pub fn resolve_profile_color(
+    session_profile: Option<&String>,
+    settings: &crate::settings::Settings,
+) -> Option<String> {
+    let pname = session_profile
+        .or(settings.active_composio_profile.as_ref());
+    pname
+        .and_then(|name| settings.composio_profiles.iter().find(|p| &p.name == name))
+        .map(|p| p.color.clone())
+        .or_else(|| settings.get_active_profile().map(|p| p.color.clone()))
 }
 
 /// Helper to extract JSON content from an LLM response string.

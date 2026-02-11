@@ -82,7 +82,7 @@ pub fn ToolCredentials() -> Element {
             if let Some(profile) = settings_snapshot.get_active_profile() {
                 if let Some(api_key) = &profile.api_key {
                     let base_url = profile.base_url.clone().unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
-                    let client = ComposioClient::new(api_key.clone(), base_url, profile.entity_id.clone(), profile.user_id.clone(), profile.id.clone());
+                    let client = ComposioClient::new(api_key.clone(), base_url, profile.entity_id.clone(), profile.user_id.clone(), profile.id.clone(), None);
                     
                     match crate::mcp::composio_client::discovery::get_toolkit_metadata(&client, &slug).await {
                         Ok(listing) => {
@@ -130,6 +130,7 @@ pub fn ToolCredentials() -> Element {
                         profile.entity_id.clone(),
                         profile.user_id.clone(),
                         profile.id.clone(),
+                        None,
                     );
 
                     // Fetch connected toolkit slugs first
@@ -217,7 +218,6 @@ pub fn ToolCredentials() -> Element {
                     new_field.set(String::new());
                     new_value.set(String::new());
                     toolkit_filter.set(String::new());
-                    let p_name = settings.peek().get_active_profile().map(|p| p.name.clone());
                     refresh_credentials(secret_manager, p_name, credentials);
                 }
                 Err(e) => {
@@ -237,7 +237,6 @@ pub fn ToolCredentials() -> Element {
             if let Err(e) = result {
                 tracing::error!("Failed to delete credential: {}", e);
             } else {
-                let p_name = settings.peek().get_active_profile().map(|p| p.name.clone());
                 refresh_credentials(secret_manager, p_name, credentials);
             }
         });

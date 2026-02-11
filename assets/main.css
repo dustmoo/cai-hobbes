@@ -273,3 +273,20 @@ body {
     transform: translateX(100%);
     border-color: white;
 }
+
+/* Session Cost Ticker Animation */
+@keyframes cost-pulse {
+    0% {
+        text-shadow: 0 0 6px rgba(74, 222, 128, 0.8);
+        color: #4ade80;
+    }
+
+    100% {
+        text-shadow: none;
+        color: inherit;
+    }
+}
+
+.cost-tick {
+    animation: cost-pulse 0.6s ease-out;
+}

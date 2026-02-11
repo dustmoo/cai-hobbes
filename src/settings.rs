@@ -1,9 +1,11 @@
+use crate::components::llm::GeminiModel;
 use crate::context::permissions::{PermissionSettings, ToolCategory};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
+use dioxus_signals::Writable;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LlmProvider {
@@ -144,32 +146,26 @@ fn default_cancel_generation() -> String {
     "CmdOrCtrl+.".to_string()
 }
 
-fn default_switch_tab_1() -> String {
-    "CmdOrCtrl+Shift+1".to_string()
+macro_rules! default_switch_tab {
+    ($($n:literal => $fn_name:ident),+ $(,)?) => {
+        $(
+            fn $fn_name() -> String {
+                format!("CmdOrCtrl+Shift+{}", $n)
+            }
+        )+
+    };
 }
-fn default_switch_tab_2() -> String {
-    "CmdOrCtrl+Shift+2".to_string()
-}
-fn default_switch_tab_3() -> String {
-    "CmdOrCtrl+Shift+3".to_string()
-}
-fn default_switch_tab_4() -> String {
-    "CmdOrCtrl+Shift+4".to_string()
-}
-fn default_switch_tab_5() -> String {
-    "CmdOrCtrl+Shift+5".to_string()
-}
-fn default_switch_tab_6() -> String {
-    "CmdOrCtrl+Shift+6".to_string()
-}
-fn default_switch_tab_7() -> String {
-    "CmdOrCtrl+Shift+7".to_string()
-}
-fn default_switch_tab_8() -> String {
-    "CmdOrCtrl+Shift+8".to_string()
-}
-fn default_switch_tab_9() -> String {
-    "CmdOrCtrl+Shift+9".to_string()
+
+default_switch_tab! {
+    1 => default_switch_tab_1,
+    2 => default_switch_tab_2,
+    3 => default_switch_tab_3,
+    4 => default_switch_tab_4,
+    5 => default_switch_tab_5,
+    6 => default_switch_tab_6,
+    7 => default_switch_tab_7,
+    8 => default_switch_tab_8,
+    9 => default_switch_tab_9,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -228,6 +224,12 @@ pub struct Settings {
     /// None means TOS has never been accepted. Compare against CURRENT_TOS_VERSION.
     #[serde(default)]
     pub tos_accepted_version: Option<String>,
+    /// Custom icons/emojis for each model (key = model slug, value = emoji)
+    #[serde(default)]
+    pub model_icons: HashMap<String, String>,
+    /// Ordered list of model slugs for the quick-switch slots (Control+1-9)
+    #[serde(default = "default_model_slots")]
+    pub model_slots: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -358,6 +360,10 @@ pub struct ComposioProfile {
     /// Profile display color (Tailwind class)
     #[serde(default = "default_profile_color")]
     pub color: String,
+    /// Chrome profile directory name for scoped auth URL launching (e.g., "Default", "Profile 1")
+    /// Prevents OAuth credentials from landing in the wrong Chrome profile.
+    #[serde(default)]
+    pub chrome_profile_directory: Option<String>,
 }
 
 fn default_profile_color() -> String {
@@ -379,6 +385,7 @@ impl Default for ComposioProfile {
             api_key: None,
             toolkit_configs: Vec::new(),
             color: default_profile_color(),
+            chrome_profile_directory: None,
         }
     }
 }
@@ -442,8 +449,8 @@ impl Default for Settings {
             active_llm: LlmProvider::Gemini,
             gemini_config: GeminiConfig {
                 api_key: None,
-                chat_model: "gemini-2.5-pro".to_string(),
-                summary_model: "gemini-2.5-flash".to_string(),
+                chat_model: GeminiModel::Gemini3_0FlashPreview.canonical_slug().to_string(),
+                summary_model: GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
                 thinking_enabled: false,
                 thinking_level: "high".to_string(),
                 thinking_budget: None,
@@ -482,8 +489,75 @@ impl Default for Settings {
             composio_user_id: None,
             theme: Theme::default(),
             tos_accepted_version: None,
+            model_icons: HashMap::new(),
+            model_slots: default_model_slots(),
         }
     }
+}
+
+/// Get a default icon for a model based on its slug
+pub fn get_default_model_icon(model_slug: &str) -> String {
+    let slug = model_slug.to_lowercase();
+    // Match specific variants first for visual distinction
+    if slug.contains("experimental") {
+        "🧪".to_string()
+    } else if slug.contains("image") {
+        "🎨".to_string()
+    } else if slug.contains("lite") {
+        "🪶".to_string()
+    } else if slug.contains("flash-001") || slug.contains("flash_001") {
+        "💫".to_string()
+    } else if slug.contains("2.0-flash") || slug.contains("2.0_flash") {
+        "🔥".to_string()
+    } else if slug.contains("2.5-flash") || slug.contains("2.5_flash") {
+        "⚡".to_string()
+    } else if slug.contains("2.5-pro") || slug.contains("2.5_pro") {
+        "🧠".to_string()
+    } else if slug.contains("pro") {
+        "💎".to_string()
+    } else if slug.contains("nano") {
+        "🔬".to_string()
+    } else if slug.contains("gemma") {
+        "💠".to_string()
+    } else if slug.contains("flash") {
+        "⚡".to_string()
+    } else {
+        "🤖".to_string()
+    }
+}
+
+/// Default model slots — curated list for quick switching.
+/// Derives slugs from GeminiModel::canonical_slug() to prevent version drift.
+fn default_model_slots() -> Vec<String> {
+    vec![
+        GeminiModel::Gemini3_0FlashPreview.canonical_slug().to_string(),
+        GeminiModel::Gemini3_0ProPreview.canonical_slug().to_string(),
+        GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
+        "".to_string(), // Slot 4
+        "".to_string(), // Slot 5
+        "".to_string(), // Slot 6
+        "".to_string(), // Slot 7
+        "".to_string(), // Slot 8
+        "".to_string(), // Slot 9
+        "".to_string(), // Slot 10
+    ]
+}
+
+/// Get the fixed icon for a model slot position (0-indexed)
+/// Each slot has a unique, visually distinct icon regardless of the model assigned to it.
+pub fn get_slot_icon(slot_index: usize) -> String {
+    match slot_index {
+        0 => "⚡",
+        1 => "🧠",
+        2 => "🔥",
+        3 => "🪶",
+        4 => "💎",
+        5 => "🎨",
+        6 => "🧪",
+        7 => "💫",
+        8 => "🔬",
+        _ => "🤖",
+    }.to_string()
 }
 
 impl Settings {
@@ -576,9 +650,28 @@ impl Settings {
                 api_key: self.composio_api_key.take(),
                 toolkit_configs: Vec::new(),
                 color: default_profile_color(),
+                chrome_profile_directory: None,
             };
             self.add_profile(profile);
             self.active_composio_profile = Some("Default".to_string());
+        }
+    }
+
+    /// Ensure chat_model is synced to a configured slot.
+    /// If the current chat_model doesn't match any non-empty slot, set it to slot 1's model.
+    pub fn sync_chat_model_to_slots(&mut self) {
+        let non_empty_slots: Vec<&String> = self.model_slots.iter().filter(|s| !s.is_empty()).collect();
+        if non_empty_slots.is_empty() {
+            return; // No slots configured, leave chat_model as-is
+        }
+        let in_a_slot = non_empty_slots.iter().any(|s| **s == self.gemini_config.chat_model);
+        if !in_a_slot {
+            let first_slot = non_empty_slots[0].clone();
+            tracing::info!(
+                "Syncing chat_model from '{}' to slot 1 model '{}'",
+                self.gemini_config.chat_model, first_slot
+            );
+            self.gemini_config.chat_model = first_slot;
         }
     }
 
@@ -650,6 +743,7 @@ impl SettingsManager {
         // First, try to deserialize directly. If it works, we're done.
         if let Ok(mut settings) = serde_json::from_str::<Settings>(&content) {
             settings.migrate_legacy_composio_settings();
+            settings.sync_chat_model_to_slots();
             return settings;
         }
 
@@ -748,6 +842,7 @@ impl SettingsManager {
             tracing::error!("Failed to save migrated settings.");
         }
 
+        settings.sync_chat_model_to_slots();
         settings
     }
 
@@ -759,13 +854,25 @@ impl SettingsManager {
         fs::write(&self.settings_path, content)
     }
 
-    pub fn save_async(&self, settings: Settings) {
+    pub fn save_async(&self, settings: Settings, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
         let manager = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = tokio::task::spawn_blocking(move || manager.save(&settings)).await.unwrap_or_else(|e| Err(std::io::Error::other(e))) {
-                tracing::error!("Failed to save settings asynchronously: {}", e);
-            }
+        let handle = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || manager.save(&settings)).await.unwrap_or_else(|e| Err(std::io::Error::other(e)))
         });
+        if let Some(mut sig) = error_signal {
+            dioxus::prelude::spawn(async move {
+                if let Ok(Err(e)) = handle.await {
+                    tracing::error!("Failed to save settings asynchronously: {}", e);
+                    *sig.write() = Some(format!("Failed to save settings: {}", e));
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Ok(Err(e)) = handle.await {
+                    tracing::error!("Failed to save settings asynchronously: {}", e);
+                }
+            });
+        }
     }
 }
 
@@ -839,6 +946,11 @@ pub struct UiState {
     pub show_profile_selector: bool,
     #[serde(default = "default_true")]
     pub show_attachments_icon: bool,
+    #[serde(default = "default_true")]
+    pub show_model_selector: bool,
+    /// Whether model quick-switch slots section is expanded in settings
+    #[serde(default = "default_true")]
+    pub show_model_slots: bool,
     /// Slug of the toolkit currently selected for BYOA credential setup
     #[serde(default)]
     pub selected_byoa_slug: Option<String>,
@@ -878,6 +990,8 @@ impl Default for UiState {
             show_mcp_icon: true,
             show_profile_selector: true,
             show_attachments_icon: true,
+            show_model_selector: true,
+            show_model_slots: true,
         }
     }
 }
@@ -920,12 +1034,131 @@ impl UiStateManager {
         fs::write(&self.state_path, content)
     }
 
-    pub fn save_async(&self, state: UiState) {
+    pub fn save_async(&self, state: UiState, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
         let manager = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = tokio::task::spawn_blocking(move || manager.save(&state)).await.unwrap_or_else(|e| Err(std::io::Error::other(e))) {
-                tracing::error!("Failed to save UI state asynchronously: {}", e);
-            }
+        let handle = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || manager.save(&state)).await.unwrap_or_else(|e| Err(std::io::Error::other(e)))
         });
+        if let Some(mut sig) = error_signal {
+            dioxus::prelude::spawn(async move {
+                if let Ok(Err(e)) = handle.await {
+                    tracing::error!("Failed to save UI state asynchronously: {}", e);
+                    *sig.write() = Some(format!("Failed to save UI state: {}", e));
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Ok(Err(e)) = handle.await {
+                    tracing::error!("Failed to save UI state asynchronously: {}", e);
+                }
+            });
+        }
     }
+}
+
+// ============================================================================
+// CHROME PROFILE DISCOVERY
+// ============================================================================
+
+/// Information about a discovered Chrome browser profile
+#[derive(Clone, Debug)]
+pub struct ChromeProfileInfo {
+    /// Chrome's internal directory name (e.g., "Default", "Profile 1")
+    /// This is the value passed to --profile-directory
+    pub dir_name: String,
+    /// User-set display name (e.g., "pugetsystems.com")
+    pub display_name: String,
+    /// Google account email (e.g., "dmoore@pugetsystems.com")
+    pub email: Option<String>,
+}
+
+/// Discover installed Chrome profiles by reading the Local State file.
+/// Returns an empty vec if Chrome is not installed or Local State is unreadable.
+///
+/// TODO(dustmoo): This is called synchronously in the settings panel on every render
+/// when the Chrome Profile dropdown is open — a pattern violation (filesystem I/O on the
+/// main thread). Cache the results in a signal or lazy_static and invalidate on
+/// settings panel open/close. Low-priority: Chrome's Local State is small (~10KB).
+pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
+    let local_state_path = {
+        #[cfg(target_os = "macos")]
+        {
+            dirs::home_dir().map(|h| {
+                h.join("Library/Application Support/Google/Chrome/Local State")
+            })
+        }
+        #[cfg(target_os = "windows")]
+        {
+            dirs::data_local_dir().map(|d| d.join("Google/Chrome/User Data/Local State"))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            dirs::config_dir().map(|c| c.join("google-chrome/Local State"))
+        }
+    };
+
+    let Some(path) = local_state_path else {
+        tracing::debug!("Could not determine Chrome Local State path");
+        return Vec::new();
+    };
+
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("Could not read Chrome Local State: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("Could not parse Chrome Local State: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let Some(info_cache) = json
+        .get("profile")
+        .and_then(|p| p.get("info_cache"))
+        .and_then(|ic| ic.as_object())
+    else {
+        tracing::debug!("No profile.info_cache in Chrome Local State");
+        return Vec::new();
+    };
+
+    let mut profiles: Vec<ChromeProfileInfo> = info_cache
+        .iter()
+        .map(|(dir_name, info)| {
+            let display_name = info
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(dir_name)
+                .to_string();
+            let email = info
+                .get("user_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            ChromeProfileInfo {
+                dir_name: dir_name.clone(),
+                display_name,
+                email,
+            }
+        })
+        .collect();
+
+    // Sort: Default first, then alphabetically by display name
+    profiles.sort_by(|a, b| {
+        if a.dir_name == "Default" {
+            std::cmp::Ordering::Less
+        } else if b.dir_name == "Default" {
+            std::cmp::Ordering::Greater
+        } else {
+            a.display_name.cmp(&b.display_name)
+        }
+    });
+
+    tracing::debug!("Discovered {} Chrome profiles", profiles.len());
+    profiles
 }

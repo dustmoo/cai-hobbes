@@ -38,6 +38,8 @@ pub struct ComposioClient {
     pub(crate) custom_auth_creds: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
     /// Cached connected toolkit info for Status panel (ephemeral, invalidated on profile change)
     pub(crate) cached_toolkit_info: Arc<RwLock<Option<Vec<ToolkitInfo>>>>,
+    /// Chrome profile directory for scoped auth URL launching (e.g., "Default", "Profile 1")
+    pub chrome_profile_directory: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -56,6 +58,7 @@ impl ComposioClient {
         entity_id: Option<String>,
         user_id: Option<String>,
         profile_id: String,
+        chrome_profile_directory: Option<String>,
     ) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -77,6 +80,7 @@ impl ComposioClient {
             custom_auth_creds: Arc::new(RwLock::new(HashMap::new())),
             context_store,
             cached_toolkit_info: Arc::new(RwLock::new(None)),
+            chrome_profile_directory,
         }
     }
 

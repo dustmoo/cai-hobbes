@@ -706,6 +706,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    // 3.14 is a test fixture enum value in the mock JSON schema, not π.
     #[allow(clippy::approx_constant)]
     fn create_mock_session_with_tools() -> Session {
         let tool1: Tool = serde_json::from_value(json!({

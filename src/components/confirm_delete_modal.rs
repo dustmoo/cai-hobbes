@@ -41,7 +41,7 @@ pub fn ConfirmDeleteModal(props: ConfirmDeleteModalProps) -> Element {
                     move |evt: KeyboardEvent| {
                         if evt.key() == Key::Escape {
                             on_cancel.call(());
-                        } else if matches_hotkey(&evt, &settings.read().hotkeys.submit_chat) {
+                        } else if evt.key() == Key::Enter || matches_hotkey(&evt, &settings.read().hotkeys.submit_chat) {
                             evt.prevent_default();
                             on_confirm.call(*remember_choice.read());
                         }
@@ -59,7 +59,7 @@ pub fn ConfirmDeleteModal(props: ConfirmDeleteModalProps) -> Element {
                         move |evt: KeyboardEvent| {
                             if evt.key() == Key::Escape {
                                 on_cancel.call(());
-                            } else if matches_hotkey(&evt, &settings.read().hotkeys.submit_chat) {
+                            } else if evt.key() == Key::Enter || matches_hotkey(&evt, &settings.read().hotkeys.submit_chat) {
                                 evt.prevent_default();
                                 on_confirm.call(*remember_choice.read());
                             }

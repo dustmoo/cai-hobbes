@@ -1,3 +1,4 @@
+// Dioxus Signal types are held across .await — not real locks, just Dioxus marker types.
 #![allow(clippy::await_holding_invalid_type)]
 
 use crate::components::mcp_search_form::McpSearchForm;
@@ -267,6 +268,7 @@ pub fn McpMarketplace() -> Element {
                             profile.entity_id.clone(),
                             profile.user_id.clone(),
                             profile.id.clone(),
+                            None,
                         );
 
                         tracing::debug!("Fetching toolkit categories...");
@@ -319,6 +321,7 @@ pub fn McpMarketplace() -> Element {
                             profile.entity_id.clone(),
                             profile.user_id.clone(),
                             profile.id.clone(),
+                            None,
                         );
 
                         match client.get_connected_toolkit_slugs().await {
@@ -390,6 +393,7 @@ pub fn McpMarketplace() -> Element {
                                     profile.entity_id.clone(),
                                     profile.user_id.clone(),
                                     profile.id.clone(),
+                                    None,
                                 );
 
                                 // Use search query if provided
@@ -1028,6 +1032,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
     let session_state = use_context::<Signal<crate::session::SessionState>>();
     let current_session_id = use_context::<SessionIdContext>().0;
+    let save_error = use_context::<crate::components::shared::SaveErrorContext>().0;
     let mut local_settings = use_signal(|| settings.read().clone());
     let mut is_retrying = use_signal(|| false);
 
@@ -1235,18 +1240,14 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                 state.unloaded_mcp_servers.push(server_name.clone());
                                                             }
                                                         }
-                                                        // Save to disk
-                                                        let uism = ui_state_manager.read();
-                                                        if let Err(e) = uism.save(&state) {
-                                                            tracing::error!("Failed to save UI state after load/unload toggle: {}", e);
-                                                        }
+                                                        // Save to disk (non-blocking)
+                                                        ui_state_manager.read().save_async(state.clone(), Some(save_error));
                                                     }
 
-                                                    // Update mcp_context with filtered tools
+                                                    // Pattern 150.8.3: Cache already invalidated by load_server/unload_server (Pattern 150.8.1)
+                                                    // Update context signal and trigger UI refresh
                                                     let new_context = mcp_manager.read().get_mcp_context(None).await;
                                                     mcp_context.set(new_context);
-                                                    // Invalidate cache and trigger refresh
-                                                    mcp_manager.read().invalidate_status_cache();
                                                     let current = *refresh_trigger.peek();
                                                     refresh_trigger.set(current + 1);
                                                 });
@@ -1344,7 +1345,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                 tracing::info!("Opening OAuth authorization URL: {}", auth_url);
 
                                                 // Open browser for user to authorize
-                                                if let Err(e) = open::that(&auth_url) {
+                                                if let Err(e) = crate::mcp::oauth_flow::open_browser(&auth_url, None).await {
                                                     tracing::error!("Failed to open browser: {}", e);
                                                     return;
                                                 }

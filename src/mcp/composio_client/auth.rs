@@ -885,7 +885,7 @@ pub async fn initiate_connection(
         let mut rx = start_callback_server(port);
 
         // Open the browser for user to authenticate
-        if let Err(e) = open_browser(&auth_url).await {
+        if let Err(e) = open_browser(&auth_url, client.chrome_profile_directory.as_deref()).await {
             tracing::error!("Failed to open browser: {}", e);
             return Ok(format!(
                 "Please visit this URL to authenticate: {}",

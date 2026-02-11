@@ -618,10 +618,46 @@ fn build_error_response(error: &str) -> String {
     )
 }
 
-/// Open a URL in the default browser
-pub async fn open_browser(url: &str) -> Result<(), String> {
+/// Open a URL in the default browser.
+/// If `chrome_profile` is provided (macOS only), launches Chrome with --profile-directory
+/// to ensure auth URLs open in the correct Chrome profile, preventing cross-profile
+/// credential leakage.
+pub async fn open_browser(url: &str, chrome_profile: Option<&str>) -> Result<(), String> {
     let url_clone = url.to_string();
+    let profile_clone = chrome_profile.map(|s| s.to_string());
+
     tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "macos")]
+        if let Some(ref profile_dir) = profile_clone {
+            tracing::info!(
+                "Opening URL in Chrome profile '{}': {}",
+                profile_dir,
+                url_clone
+            );
+            return std::process::Command::new("open")
+                .args([
+                    "-na",
+                    "Google Chrome",
+                    "--args",
+                    &format!("--profile-directory={}", profile_dir),
+                    &url_clone,
+                ])
+                .status()
+                .map_err(|e| format!("Failed to open Chrome with profile: {}", e))
+                .and_then(|status| {
+                    if status.success() {
+                        Ok(())
+                    } else {
+                        // Fallback to default browser if Chrome launch failed
+                        tracing::warn!(
+                            "Chrome profile launch returned non-zero, falling back to default browser"
+                        );
+                        open::that(&url_clone)
+                            .map_err(|e| format!("Failed to open browser: {}", e))
+                    }
+                });
+        }
+
         open::that(&url_clone).map_err(|e| format!("Failed to open browser: {}", e))
     })
     .await

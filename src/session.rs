@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use dioxus_signals::Writable;
 
 use crate::mcp::manager::McpContext;
 use serde_json::Value;
@@ -74,7 +75,7 @@ pub struct ActiveContext {
     pub force_tool_use_instruction: Option<String>,
     pub conversation_summary: ConversationSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mcp_tools: Option<McpContext>, // Keep for now for other potential uses
+    pub mcp_tools: Option<McpContext>, // Fixed: Restored field as it is still used in chat.rs/prompt_builder.rs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolWrapper>>,
     #[serde(flatten)]
@@ -461,7 +462,7 @@ impl SessionState {
 
     pub fn create_session(&mut self, initial_profile: Option<String>) -> String {
         let new_id = self.create_session_raw(initial_profile);
-        Self::save_async(self.clone());
+        Self::save_async(self.clone(), None);
         new_id
     }
 
@@ -483,7 +484,7 @@ impl SessionState {
 
     pub fn delete_session(&mut self, id: &str) {
         self.delete_session_raw(id);
-        Self::save_async(self.clone());
+        Self::save_async(self.clone(), None);
     }
 
     pub fn get_active_session(&self) -> Option<&Session> {
@@ -494,9 +495,41 @@ impl SessionState {
         self.sessions.get_mut(&self.active_session_id)
     }
 
+    #[allow(dead_code)] // Vestigial after session-targeted streaming refactor (v0.9.46); kept for potential future non-streaming callers
     pub fn touch_active_session(&mut self) {
         if let Some(session) = self.sessions.get_mut(&self.active_session_id) {
             session.last_updated = Utc::now();
+        }
+    }
+
+    /// Touch (update `last_updated`) on a specific session by ID.
+    /// Used by stream_manager to target the originating session after a tab switch.
+    pub fn touch_session(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.last_updated = Utc::now();
+        }
+    }
+
+    /// Look up a message by UUID within a specific session (not the active one).
+    /// Used by stream_manager to write streaming data to the originating session.
+    pub fn get_message_mut_in_session(
+        &mut self,
+        session_id: &str,
+        message_id: &uuid::Uuid,
+    ) -> Option<&mut super::components::chat::Message> {
+        self.sessions
+            .get_mut(session_id)
+            .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
+    }
+
+    /// Remove a message from a specific session by ID.
+    /// Used by cancel_stream to target the originating session after a tab switch.
+    pub fn remove_message_in_session(&mut self, session_id: &str, message_id: &uuid::Uuid) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            if let Some(index) = session.messages.iter().position(|m| m.id == *message_id) {
+                session.messages.remove(index);
+                tracing::info!(message_id = %message_id, session_id = %session_id, "Removed message from target session.");
+            }
         }
     }
 
@@ -511,12 +544,33 @@ impl SessionState {
 
     /// Saves the session state to disk on a background thread.
     /// This prevents blocking the main UI thread during file I/O.
-    pub fn save_async(state: SessionState) {
-        tokio::spawn(async move {
-            if let Err(e) = tokio::task::spawn_blocking(move || state.save()).await.unwrap_or_else(|e| Err(std::io::Error::other(e))) {
-                tracing::error!("Failed to save session state async: {}", e);
-            }
+    /// If `error_signal` is provided, save failures will be surfaced to the UI.
+    ///
+    /// **Design Note:** The caller passes a cloned `SessionState` by value (not by reference),
+    /// which means the full state — including all sessions and messages — is cloned before
+    /// being moved into the spawned task. This is an intentional trade-off: serializing on the
+    /// main thread would block the UI for the entire JSON encoding duration, whereas the clone
+    /// cost (proportional to total message count) is typically negligible for normal usage.
+    /// For extremely large states this could become a bottleneck; a future optimization could
+    /// serialize into bytes on the main thread (fast memcpy) and only do file I/O async.
+    pub fn save_async(state: SessionState, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
+        let handle = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || state.save()).await.unwrap_or_else(|e| Err(std::io::Error::other(e)))
         });
+        if let Some(mut sig) = error_signal {
+            dioxus::prelude::spawn(async move {
+                if let Ok(Err(e)) = handle.await {
+                    tracing::error!("Failed to save session state async: {}", e);
+                    *sig.write() = Some(format!("Failed to save session: {}", e));
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Ok(Err(e)) = handle.await {
+                    tracing::error!("Failed to save session state async: {}", e);
+                }
+            });
+        }
     }
 
     pub fn update_session_name_raw(&mut self, id: &str, new_name: String) {
@@ -527,7 +581,7 @@ impl SessionState {
 
     pub fn update_session_name(&mut self, id: &str, new_name: String) {
         self.update_session_name_raw(id, new_name);
-        Self::save_async(self.clone());
+        Self::save_async(self.clone(), None);
     }
     pub fn get_message_mut(
         &mut self,
@@ -537,6 +591,7 @@ impl SessionState {
             .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
     }
 
+    #[allow(dead_code)] // Vestigial after session-targeted streaming refactor (v0.9.46); kept for potential future non-streaming callers
     pub fn remove_message(&mut self, message_id: &uuid::Uuid) {
         if let Some(session) = self.get_active_session_mut() {
             if let Some(index) = session.messages.iter().position(|m| m.id == *message_id) {

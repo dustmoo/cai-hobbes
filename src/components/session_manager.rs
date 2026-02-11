@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 use crate::{
-    components::{chat_input::ChatCommand, shared::SessionToDeleteContext}, context::permissions::PermissionManager,
-    session::SessionState, settings::Settings,
+    components::chat_input::ChatCommand,
+    session::SessionState,
 };
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
@@ -11,42 +11,16 @@ pub struct SessionManagerProps {}
 
 pub fn SessionManager(_props: SessionManagerProps) -> Element {
     let mut session_state = use_context::<Signal<SessionState>>();
-    let mut permission_manager = use_context::<Signal<PermissionManager>>();
-    let settings = use_context::<Signal<Settings>>();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     let mut editing_session_id = use_signal(|| None::<String>);
     let mut temp_session_name = use_signal(String::new);
-    let mut show_confirm_modal = use_context::<Signal<bool>>();
-    let SessionToDeleteContext(mut session_to_delete) = use_context::<SessionToDeleteContext>();
 
     // Pagination and Filtering State
     let mut filter_query = use_signal(String::new);
     let mut current_page = use_signal(|| 0);
     let mut items_per_page = use_signal(|| 10);
 
-    // Listen for Global Commands (e.g., Delete Session Hotkey)
-    use_effect(move || {
-        let should_listen = {
-            let read = chat_command.read();
-            matches!(read.as_ref(), Some(ChatCommand::DeleteSession))
-        };
-
-        if should_listen {
-            // Clone active ID to avoid borrow issues
-            let active_id = session_state.read().active_session_id.clone();
-            if !active_id.is_empty() {
-                tracing::info!("Delete Session Hotkey Triggered for: {}", active_id);
-                if settings.read().confirm_on_delete {
-                    session_to_delete.set(active_id);
-                    show_confirm_modal.set(true);
-                } else {
-                    session_state.write().delete_session(&active_id);
-                }
-            }
-            // Reset command
-            chat_command.set(None);
-        }
-    });
+    // Listen for Global Commands (e.g., Delete Session Hotkey) removed - now handled in main.rs
 
     let sessions = session_state.read();
     let active_id = sessions.active_session_id.clone();
@@ -130,7 +104,6 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                 onclick: move |_| {
                                     if editing_session_id.read().is_none() {
                                         chat_command.set(Some(ChatCommand::SwitchToSession(id_click.clone())));
-                                        permission_manager.write().reset_turn_count();
                                     }
                                 },
                                 if editing_session_id.read().as_ref() == Some(&session_id) {
@@ -173,12 +146,10 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                         class: "p-1 rounded-md text-fg-muted hover:bg-red-600 hover:text-fg",
                                         onclick: move |event| {
                                             event.stop_propagation();
-                                            if settings.read().confirm_on_delete {
-                                                session_to_delete.set(id_delete.clone());
-                                                show_confirm_modal.set(true);
-                                            } else {
-                                                session_state.write().delete_session(&id_delete);
-                                            }
+                                            // Signal to main.rs that we want to delete this specific session
+                                            // Main.rs's DeleteSession cmd path already handles confirmation logic
+                                            session_state.write().active_session_id = id_delete.clone();
+                                            chat_command.set(Some(ChatCommand::DeleteSession));
                                         },
                                         "X"
                                     }
@@ -249,7 +220,6 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                     class: "w-full px-4 py-2 bg-btn-primary rounded-md text-fg font-semibold hover:bg-btn-primary-hover focus:outline-none focus:ring-2 focus:ring-primary-500 transition-colors",
                     onclick: move |_| {
                         chat_command.set(Some(ChatCommand::NewChat));
-                        permission_manager.write().reset_turn_count();
                     },
                     "✨ New Chat"
                 }
