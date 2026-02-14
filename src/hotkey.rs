@@ -5,7 +5,7 @@
 //   This ensures sandbox compatibility while providing "global-like" feel when focused.
 
 use crate::components::chat_input::ChatCommand;
-use crate::settings::{Settings, SettingsManager};
+use crate::settings::Settings;
 use crate::{permissions, tray::WINDOW_VISIBLE};
 use dioxus::prelude::*;
 use dioxus_desktop::{DesktopContext, ShortcutHandle};
@@ -22,7 +22,6 @@ pub enum HotkeyAction {
 pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatus>) {
     let desktop = use_context::<DesktopContext>();
     let settings = use_context::<Signal<Settings>>();
-    let settings_manager = use_context::<Signal<SettingsManager>>();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
 
     // Coroutine to handle actions from the Native Global Hotkey (Tray Toggle)
@@ -84,6 +83,17 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
 
     // --- Part 2: JavaScript "Local Global" Listener (The Hybrid Bridge) ---
     // Receives events from the WebView when keys are pressed and NOT handled by components.
+    //
+    // RESERVED HOTKEY COMBINATIONS (hardcoded in JS, not user-configurable):
+    //   Cmd+W / Ctrl+W          → Close Tab
+    //   Cmd+Backspace / Delete  → Delete Session
+    //   Cmd+1..9                → Switch Tab (by index)
+    //   Control+1..9            → Switch Model (by index)
+    //   Cmd+Option+1..9         → Switch Profile (by index)
+    //
+    // User-configurable hotkeys (from settings.hotkeys) are checked FIRST in the JS listener.
+    // If a configurable hotkey collides with a reserved one, the configurable one wins (shadows).
+    // This is acceptable because it requires deliberate user misconfiguration.
     let js_action_handler = use_coroutine(move |mut rx: UnboundedReceiver<String>| async move {
         while let Some(msg) = rx.next().await {
             match msg.as_str() {
@@ -96,12 +106,29 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 "new_chat_memory" => chat_command.set(Some(ChatCommand::NewChatWithMemory)),
                 "focus_chat" => chat_command.set(Some(ChatCommand::FocusChat)),
                 "scroll_bottom" => chat_command.set(Some(ChatCommand::ScrollToBottom)),
-                "delete_session" => chat_command.set(Some(ChatCommand::DeleteSession)),
+                "delete_session" => {
+                    let session_state = consume_context::<Signal<crate::session::SessionState>>();
+                    let active_id = session_state.read().active_session_id.clone();
+                    if !active_id.is_empty() {
+                        chat_command.set(Some(ChatCommand::DeleteSession(active_id)));
+                    }
+                }
                 "cancel_generation" => chat_command.set(Some(ChatCommand::CancelGeneration)),
-                // Profile switching
+                "close_tab" => chat_command.set(Some(ChatCommand::CloseTab)),
+                // Profile switching (session-local)
                 s if s.starts_with("switch_profile_") => {
                     if let Ok(idx) = s.replace("switch_profile_", "").parse::<usize>() {
-                        switch_profile_by_index(idx, settings, settings_manager);
+                        chat_command.set(Some(ChatCommand::SwitchProfile(idx)));
+                    }
+                }
+                s if s.starts_with("switch_tab_") => {
+                    if let Ok(idx) = s.replace("switch_tab_", "").parse::<usize>() {
+                        chat_command.set(Some(ChatCommand::SwitchTab(idx)));
+                    }
+                }
+                s if s.starts_with("switch_model_") => {
+                    if let Ok(idx) = s.replace("switch_model_", "").parse::<usize>() {
+                        chat_command.set(Some(ChatCommand::SwitchModel(idx)));
                     }
                 }
                 _ => tracing::warn!("Unknown JS hotkey action: {}", msg),
@@ -129,6 +156,11 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                     window.hobbes_hotkey_listener = function(event) {{
                         // CRITICAL: Respect Scope - If event was already handled (e.g. by ChatInput), ignore.
                         if (event.defaultPrevented) return;
+
+                        // CRITICAL: Focus Check - If focused on an input/textarea, ignore keys unless they have a command modifier (Cmd or Ctrl).
+                        // This prevents global hotkeys from intercepting typing while still allowing shortcuts like Cmd+,
+                        const isInput = ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName) || document.activeElement.isContentEditable;
+                        if (isInput && !event.metaKey && !event.ctrlKey) return;
     
                         let config = window.hobbes_hotkey_config;
                         if (!config) return;
@@ -177,12 +209,41 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                         else if (check(config.toggle_scroll_to_bottom, event)) action = "scroll_bottom";
                         else if (check(config.cancel_generation, event)) action = "cancel_generation";
                         
-                        // Delete Session (Cmd+Backspace or Cmd+Delete)
-                        else if ((event.metaKey || event.ctrlKey) && (event.key === 'Backspace' || event.key === 'Delete')) {{
+                        // Delete Session (Cmd+Backspace or Cmd+Delete) — only when NOT focused on an input.
+                        // When focused, Cmd+Backspace is macOS "delete to beginning of line" and must pass through.
+                        else if (!isInput && (event.metaKey || event.ctrlKey) && (event.key === 'Backspace' || event.key === 'Delete')) {{
                             action = "delete_session";
                         }}
                         
+                        // Close Tab (Cmd+W or Ctrl+W)
+                        else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === 'w') {{
+                            action = "close_tab";
+                        }}
+                        
+                        else if (check(config.switch_tab_1, event)) action = "switch_tab_0";
+                        else if (check(config.switch_tab_2, event)) action = "switch_tab_1";
+                        else if (check(config.switch_tab_3, event)) action = "switch_tab_2";
+                        else if (check(config.switch_tab_4, event)) action = "switch_tab_3";
+                        else if (check(config.switch_tab_5, event)) action = "switch_tab_4";
+                        else if (check(config.switch_tab_6, event)) action = "switch_tab_5";
+                        else if (check(config.switch_tab_7, event)) action = "switch_tab_6";
+                        else if (check(config.switch_tab_8, event)) action = "switch_tab_7";
+                        else if (check(config.switch_tab_9, event)) action = "switch_tab_8";
+                        // Model switching: Control+1..9 (Control only, no Cmd/Meta, no Alt, no Shift)
+                        // MUST be checked before Tab fallback which also matches ctrlKey
+                        else if (event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {{
+                             if (event.key >= '1' && event.key <= '9') {{
+                                 action = "switch_model_" + (parseInt(event.key) - 1);
+                             }}
+                        }}
+                        // Tab switching: Cmd+1..9 (industry standard, no modifiers required)
                         else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey) {{
+                             if (event.key >= '1' && event.key <= '9') {{
+                                 action = "switch_tab_" + (parseInt(event.key) - 1);
+                             }}
+                        }}
+                        // Profile switching: Cmd+Option+1..9
+                        else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.altKey) {{
                              if (event.key >= '1' && event.key <= '9') {{
                                  action = "switch_profile_" + (parseInt(event.key) - 1);
                              }}
@@ -209,31 +270,6 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
             }
         });
     });
-}
-
-// Helper to switch profile
-fn switch_profile_by_index(
-    index: usize,
-    mut settings: Signal<Settings>,
-    settings_manager: Signal<SettingsManager>,
-) {
-    let mut current_settings = settings.read().clone();
-
-    // Check if we have enough profiles
-    if index < current_settings.composio_profiles.len() {
-        let new_profile_name = current_settings.composio_profiles[index].name.clone();
-
-        // Only if different
-        if current_settings.active_composio_profile.as_deref() != Some(&new_profile_name) {
-            tracing::info!("Switching to profile index {}: {}", index, new_profile_name);
-            current_settings.active_composio_profile = Some(new_profile_name);
-            settings.set(current_settings);
-            // Persist to disk
-            if let Err(e) = settings_manager.read().save(&settings.read()) {
-                tracing::error!("Failed to save profile switch: {}", e);
-            }
-        }
-    }
 }
 
 /// Checks if a Dioxus KeyboardEvent matches a hotkey string (e.g. "CmdOrCtrl+Enter").

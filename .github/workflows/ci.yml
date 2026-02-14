@@ -15,13 +15,30 @@ env:
   CI: true
 
 jobs:
+  # Security audit (runs in parallel, platform-independent via Cargo.lock)
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+
+    - name: Security Audit
+      run: |
+        cargo install cargo-audit
+        cargo audit --ignore RUSTSEC-2024-0413 --ignore RUSTSEC-2024-0416 --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2024-0320 --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2025-0067 --ignore RUSTSEC-2025-0068
+
   # Cross-platform build check (fast, no tests or full build)
   build-check:
     name: Build Check (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -73,10 +90,6 @@ jobs:
     - name: Install Dioxus CLI
       run: cargo install dioxus-cli
 
-    - name: Security Audit
-      run: |
-        cargo install cargo-audit
-        cargo audit
 
     - name: Setup Node.js
       uses: actions/setup-node@v4

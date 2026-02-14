@@ -2,6 +2,7 @@
 // This module provides explicit, type-safe conversion from MCP tools to Gemini function declarations.
 
 use crate::gemini::types::{GeminiFunctionDeclaration, GeminiSchema, SchemaType};
+use crate::mcp::manager::{COMPOSIO_NATIVE_PREFIX, is_composio_native};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -75,13 +76,25 @@ pub fn sanitize_function_name(name: &str) -> String {
     sanitized
 }
 
+pub fn normalize_server_name(server_name: &str) -> &str {
+    if is_composio_native(server_name) {
+        COMPOSIO_NATIVE_PREFIX
+    } else {
+        server_name
+    }
+}
+
+pub fn get_prefixed_tool_name(server_name: &str, tool_name: &str) -> String {
+    let norm_server = normalize_server_name(server_name);
+    sanitize_function_name(&format!("{}_{}", norm_server, tool_name))
+}
+
 pub fn mcp_tool_to_gemini(
     tool: &rmcp::model::Tool,
     server_name: &str,
 ) -> Result<GeminiFunctionDeclaration, ConversionError> {
     // Create prefixed name and sanitize it for Gemini API requirements
-    let raw_name = format!("{}_{}", server_name, tool.name);
-    let prefixed_name = sanitize_function_name(&raw_name);
+    let prefixed_name = get_prefixed_tool_name(server_name, &tool.name);
 
     // Convert the input_schema (Arc<Map<String, Value>>) to a serde_json::Value
     let schema_value = Value::Object((*tool.input_schema).clone());

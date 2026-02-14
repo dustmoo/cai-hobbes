@@ -8,7 +8,6 @@ use crate::components::shared::{StreamMessage, ToolCall};
 use crate::context::prompt_builder::LlmPrompt;
 use crate::mcp::manager::McpContext;
 use crate::settings::GeminiConfig;
-const BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 use crate::session::Tool;
 
@@ -417,6 +416,44 @@ impl GeminiModel {
         }
     }
 
+    /// Returns the official human-readable name for this model
+    pub fn display_name(&self) -> String {
+        match self {
+            GeminiModel::Gemini3_0ProPreview => "Gemini 3 Pro".to_string(),
+            GeminiModel::Gemini3_0FlashPreview => "Gemini 3 Flash".to_string(),
+            GeminiModel::Gemini2_5Pro => "Gemini 2.5 Pro".to_string(),
+            GeminiModel::Gemini2_5Flash => "Gemini 2.5 Flash".to_string(),
+            GeminiModel::Gemini2_5FlashLite => "Gemini 2.5 Flash Lite".to_string(),
+            GeminiModel::Gemini2_0Flash => "Gemini 2.0 Flash".to_string(),
+            GeminiModel::Gemini2_0FlashLite => "Gemini 2.0 Flash Lite".to_string(),
+            GeminiModel::Gemini2_0FlashThinking => "Gemini 2.0 Flash Thinking".to_string(),
+            GeminiModel::Gemini2_5ComputerUsePreview => "Gemini 2.5 Computer Use".to_string(),
+            GeminiModel::NanoBanana => "Nano Banana (Image · Planned)".to_string(),
+            GeminiModel::NanoBananaPro => "Nano Banana Pro (Image · Planned)".to_string(),
+            GeminiModel::Gemma3 => "Gemma 3".to_string(),
+            GeminiModel::Unknown(slug) => {
+                // Fallback for unknown slugs: 
+                // 1. Strip models/ prefix
+                // 2. Replace - and _ with space
+                // 3. Title case words
+                let clean_slug = slug.strip_prefix("models/").unwrap_or(slug);
+                clean_slug
+                    .replace("-", " ")
+                    .replace("_", " ")
+                    .split_whitespace()
+                    .map(|word| {
+                        let mut c = word.chars();
+                        match c.next() {
+                            None => String::new(),
+                            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        }
+                    })
+                    .collect::<Vec<String>>()
+                    .join(" ")
+            }
+        }
+    }
+
     /// Valid thinking levels for Flash 3 (Pro only supports low/high)
     pub fn valid_thinking_levels(&self) -> &'static [&'static str] {
         match self.thinking_config_style() {
@@ -425,13 +462,41 @@ impl GeminiModel {
             _ => &[],
         }
     }
+
+    /// Returns the canonical API slug for this model.
+    /// This is the authoritative source for model identifiers sent to the API.
+    pub fn canonical_slug(&self) -> &str {
+        match self {
+            GeminiModel::Gemini3_0ProPreview => "gemini-3-pro-preview",
+            GeminiModel::Gemini3_0FlashPreview => "gemini-3-flash-preview",
+            GeminiModel::Gemini2_5Pro => "gemini-2.5-pro",
+            GeminiModel::Gemini2_5Flash => "gemini-2.5-flash",
+            GeminiModel::Gemini2_5FlashLite => "gemini-2.5-flash-lite",
+            GeminiModel::Gemini2_5ComputerUsePreview => "gemini-2.5-computer-use-preview-10-2025",
+            GeminiModel::Gemini2_0Flash => "gemini-2.0-flash",
+            GeminiModel::Gemini2_0FlashLite => "gemini-2.0-flash-lite",
+            GeminiModel::Gemini2_0FlashThinking => "gemini-2.0-flash-thinking-exp",
+            GeminiModel::Gemma3 => "gemma-3",
+            GeminiModel::NanoBanana => "nano-banana",
+            GeminiModel::NanoBananaPro => "nano-banana-pro",
+            GeminiModel::Unknown(slug) => slug,
+        }
+    }
+
+    /// Returns the API version this model requires.
+    /// Centralizes version routing so model-specific overrides are trivial.
+    pub fn api_version(&self) -> &'static str {
+        // Currently all models use v1beta.
+        // When Google migrates models to v1 or v1alpha, update here.
+        "v1beta"
+    }
 }
 
 impl GeminiConnector {
     pub fn new(config: GeminiConfig) -> Self {
         Self {
             config,
-            base_url: BASE_API_URL.to_string(),
+            base_url: "https://generativelanguage.googleapis.com".to_string(),
         }
     }
 
@@ -442,17 +507,20 @@ impl GeminiConnector {
     }
 
     /// Helper to build the correct API endpoint for a given model.
+    /// Derives the API version dynamically from the model via struct-based authority.
     /// If model name already includes "models/" prefix (from API), use it directly.
     /// Otherwise, prepend "models/" for backward compatibility.
     fn build_model_endpoint(&self, model: &str, action: &str, api_key: &str) -> String {
+        let gemini_model = GeminiModel::from_slug(model);
+        let api_version = gemini_model.api_version();
         let model_path = if model.starts_with("models/") {
             model.to_string()
         } else {
             format!("models/{}", model)
         };
         format!(
-            "{}/{}:{}?key={}",
-            self.base_url, model_path, action, api_key
+            "{}/{}/{}:{}?key={}",
+            self.base_url, api_version, model_path, action, api_key
         )
     }
 
@@ -760,17 +828,8 @@ impl LlmConnector for GeminiConnector {
 
         // --- End Synchronous Logging Block ---
 
-        let url = if self.config.chat_model.starts_with("models/")
-            || !self.base_url.contains("generativelanguage.googleapis.com")
-        {
-            // Use the helper for standardizing
-            self.build_model_endpoint(&self.config.chat_model, "streamGenerateContent", &api_key)
-                + "&alt=sse"
-        } else {
-            // Fallback or explicit full path logic if ever needed, but standardizing is safer
-            self.build_model_endpoint(&self.config.chat_model, "streamGenerateContent", &api_key)
-                + "&alt=sse"
-        };
+        let url =
+            self.build_model_endpoint(&model, "streamGenerateContent", &api_key) + "&alt=sse";
 
         for attempt in 0..MAX_RETRIES {
             let response = match client.post(&url).json(&request_body).send().await {
@@ -841,6 +900,7 @@ impl LlmConnector for GeminiConnector {
 
             let mut stream = response.bytes_stream();
             let mut has_sent_data = false;
+            let mut tool_not_found_count: u32 = 0;
             let mut finish_reason: Option<String> = None;
             let mut buffer = Vec::<u8>::new();
             let mut malformed_call_detected = false;
@@ -932,7 +992,7 @@ impl LlmConnector for GeminiConnector {
                                                         'server_loop: for server in &context.servers
                                                         {
                                                             for tool in &server.tools {
-                                                                let sanitized_tool_name = crate::gemini::convert::sanitize_function_name(&format!("{}_{}", server.name, tool.name));
+                                                                let sanitized_tool_name = crate::gemini::convert::get_prefixed_tool_name(&server.name, &tool.name);
                                                                 if sanitized_tool_name
                                                                     == function_call.name
                                                                 {
@@ -965,17 +1025,22 @@ impl LlmConnector for GeminiConnector {
                                                         }
                                                     }
                                                     if !found_tool {
-                                                        tracing::error!("LLM requested tool '{}' which was not found in the provided context.", function_call.name);
-                                                        // Send a user-friendly message about the missing tool
-                                                        let tool_error_msg = format!(
-                                                        "⚠️ **Tool Not Available: `{}`**\n\n\
-                                                        Hobbes tried to use a tool that isn't currently loaded. This can happen if:\n\n\
-                                                        • The MCP server providing this tool is not running\n\
-                                                        • The tool requires authentication that hasn't been set up\n\
-                                                        • The tool list needs to be refreshed\n\n\
-                                                        Please check your MCP Integration settings.",
-                                                        function_call.name
-                                                    );
+                                                        tool_not_found_count += 1;
+                                                        tracing::error!("LLM requested tool '{}' which was not found in the provided context (count: {}).", function_call.name, tool_not_found_count);
+                                                        // After repeated failures, emit the persistent error message that triggers QuickFix buttons
+                                                        let tool_error_msg = if tool_not_found_count >= 2 {
+                                                            format!(
+                                                                "[Hobbes encountered a persistent error ('TOOL_NOT_FOUND') after multiple retries. The model may be hallucinating a tool that does not exist.]")
+                                                        } else {
+                                                            format!(
+                                                            "⚠️ **Tool Not Available: `{}`**\n\n\
+                                                            Hobbes tried to use a tool that isn't currently loaded. This can happen if:\n\n\
+                                                            • The MCP server providing this tool is not running\n\
+                                                            • The tool requires authentication that hasn't been set up\n\
+                                                            • The tool list needs to be refreshed\n\n\
+                                                            Please check your MCP Integration settings.",
+                                                            function_call.name)
+                                                        };
                                                         if tx
                                                             .send(StreamMessage::Text {
                                                                 content: tool_error_msg,
@@ -987,6 +1052,10 @@ impl LlmConnector for GeminiConnector {
                                                             return;
                                                         }
                                                         has_sent_data = true;
+                                                        // Circuit breaker: stop the stream after persistent tool-not-found
+                                                        if tool_not_found_count >= 2 {
+                                                            return;
+                                                        }
                                                     }
                                                 } else if !part.text.is_empty() {
                                                     // Check if the text is structured JSON that needs unwrapping
@@ -1105,8 +1174,8 @@ impl LlmConnector for GeminiConnector {
                                 for server in &context.servers {
                                     for tool in &server.tools {
                                         let sanitized_name =
-                                            crate::gemini::convert::sanitize_function_name(
-                                                &format!("{}_{}", server.name, tool.name),
+                                            crate::gemini::convert::get_prefixed_tool_name(
+                                                &server.name, &tool.name,
                                             );
                                         tools.push(format!("- {}", sanitized_name));
                                     }
@@ -1446,7 +1515,7 @@ mod tests {
 
         // Configure the mock server
         Mock::given(method("POST"))
-            .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
+            .and(path("/v1beta/models/gemini-2.5-pro:streamGenerateContent"))
             .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
             .mount(&mock_server)
             .await;
@@ -1532,7 +1601,7 @@ mod tests {
         let response_body = format!("data: {}\n\n", response_json);
 
         Mock::given(method("POST"))
-            .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
+            .and(path("/v1beta/models/gemini-2.5-pro:streamGenerateContent"))
             .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
             .mount(&mock_server)
             .await;
@@ -1598,7 +1667,7 @@ mod tests {
         let response_body = format!("data: {}\n\n", response_json);
 
         Mock::given(method("POST"))
-            .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
+            .and(path("/v1beta/models/gemini-2.5-pro:streamGenerateContent"))
             .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
             .mount(&mock_server)
             .await;
@@ -1668,7 +1737,7 @@ mod tests {
         let response_body = format!("data: {}\n\n", response_json);
 
         Mock::given(method("POST"))
-            .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
+            .and(path("/v1beta/models/gemini-2.5-pro:streamGenerateContent"))
             .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
             .mount(&mock_server)
             .await;
@@ -1879,5 +1948,63 @@ mod tests {
         let pro_unknown = GeminiModel::from_slug("some-new-pro-model");
         assert_eq!(pro_unknown, GeminiModel::Gemini2_5Pro);
         assert!(pro_unknown.supports_thinking());
+    }
+
+    #[test]
+    fn test_canonical_slug_round_trip() {
+        // Ensure canonical slugs resolve back to the correct model
+        let models = [
+            GeminiModel::Gemini3_0ProPreview,
+            GeminiModel::Gemini3_0FlashPreview,
+            GeminiModel::Gemini2_5Pro,
+            GeminiModel::Gemini2_5Flash,
+            GeminiModel::Gemini2_5FlashLite,
+            GeminiModel::Gemini2_0Flash,
+            GeminiModel::Gemini2_0FlashLite,
+            GeminiModel::Gemini2_0FlashThinking,
+        ];
+        for model in &models {
+            let slug = model.canonical_slug();
+            let resolved = GeminiModel::from_slug(slug);
+            assert_eq!(
+                &resolved, model,
+                "canonical_slug '{}' did not round-trip for {:?}",
+                slug, model
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_model_endpoint_format() {
+        use crate::settings::GeminiConfig;
+        let config = GeminiConfig {
+            api_key: Some("test-key".to_string()),
+            chat_model: "gemini-3-flash-preview".to_string(),
+            summary_model: "gemini-2.5-flash".to_string(),
+            thinking_enabled: false,
+            thinking_level: "high".to_string(),
+            thinking_budget: None,
+        };
+        let connector = GeminiConnector::new(config);
+        let url =
+            connector.build_model_endpoint("gemini-3-pro-preview", "generateContent", "test-key");
+        assert!(
+            url.contains("/v1beta/models/gemini-3-pro-preview:generateContent"),
+            "URL should contain correct model path: {}",
+            url
+        );
+        assert!(
+            url.starts_with("https://generativelanguage.googleapis.com/"),
+            "URL should use correct base: {}",
+            url
+        );
+    }
+
+    #[test]
+    fn test_api_version() {
+        // All known models currently use v1beta
+        assert_eq!(GeminiModel::Gemini3_0ProPreview.api_version(), "v1beta");
+        assert_eq!(GeminiModel::Gemini2_5Flash.api_version(), "v1beta");
+        assert_eq!(GeminiModel::Gemini2_0Flash.api_version(), "v1beta");
     }
 }

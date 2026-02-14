@@ -1,3 +1,4 @@
+// Dioxus Signal types are held across .await — not real locks, just Dioxus marker types.
 #![allow(clippy::await_holding_invalid_type)]
 
 use super::chat_input::ChatInput;
@@ -7,10 +8,11 @@ use super::forget_memory_modal::ForgetMemoryModal;
 use super::message_list::MessageList;
 use super::new_chat_memory_modal::NewChatMemoryModal;
 use super::quick_fix::QuickFix;
-use super::shared::{MessageContent, StreamMessage};
+use super::shared::{DraftContext, MessageContent, SessionIdContext, StreamMessage};
 use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRenderer};
 use crate::components::stream_manager::StreamManagerContext;
 use crate::context::permissions::PermissionManager;
+use crate::mcp::manager::{COMPOSIO_NATIVE_PREFIX, is_composio_native};
 use crate::context::prompt_builder::PromptBuilder;
 use crate::session::ActiveContext;
 use crate::settings::Settings;
@@ -79,25 +81,67 @@ pub struct Message {
 pub fn ChatWindow(
     on_content_resize: EventHandler<Rect<f64, f64>>,
     on_interaction: EventHandler<()>,
-    on_toggle_sessions: EventHandler<()>,
-    on_toggle_settings: EventHandler<()>,
-    on_toggle_mcp_manager: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let mut settings = use_context::<Signal<Settings>>();
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let permission_manager = use_context::<Signal<PermissionManager>>();
+    let mut chat_command = use_context::<Signal<Option<super::chat_input::ChatCommand>>>();
+    
+    // Consume current_session_id from global context
+    let SessionIdContext(current_session_id_signal) = use_context::<SessionIdContext>();
+    let current_target_id = current_session_id_signal;
+    
+    // Now provide draft via a unique context type to avoid collisions
     let draft = use_signal(|| "".to_string());
-    use_context_provider(|| draft);
+    use_context_provider(|| DraftContext(draft));
+    
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
     let stream_manager = consume_context::<StreamManagerContext>();
     let active_message_id = use_signal(|| None::<Uuid>);
+    let active_session_for_stream = use_signal(|| None::<String>);
     let mut continuation_controller = consume_context::<Signal<ContinuationController>>();
     let mut is_initial_load = use_signal(|| true);
     let mut last_session_id = use_signal(|| session_state.read().active_session_id.clone());
     let mut stream_update_trigger = use_signal(|| 0);
     let mut show_scroll_button = use_signal(|| false);
+
+    // Shared helper: fetch fresh MCP context for a session and update its active_context.
+    // Returns the fetched McpContext for downstream use (e.g. passing to send_prompt_to_llm).
+    let fetch_fresh_mcp_context = move |target_id: String, settings_snapshot: Settings| async move {
+        // Pass the profile ID directly (composio_profile is the stable ID)
+        let profile_id = session_state.read()
+            .sessions.get(&target_id)
+            .and_then(|s| s.composio_profile.clone());
+
+        // ensure_native_client_for_profile can accept name or ID — pass the ID
+        if let Some(ref id) = profile_id {
+            let _ = mcp_manager.read()
+                .ensure_native_client_for_profile(id, &settings_snapshot).await;
+        }
+
+        let fresh = mcp_manager.read().get_mcp_context(profile_id).await;
+        {
+            let mut state = session_state.write();
+            if let Some(session) = state.sessions.get_mut(&target_id) {
+                if !fresh.servers.is_empty() {
+                    session.active_context.mcp_tools = Some(fresh.clone());
+                } else {
+                    session.active_context.mcp_tools = None;
+                }
+            }
+        }
+        fresh
+    };
+
+    let session = use_memo(move || {
+        // Explicitly read both signals to establish reactive subscriptions
+        let target_id = current_target_id.read();
+        let state = session_state.read();
+        state.sessions.get(&*target_id).cloned()
+    });
+
 
     // Delete modal state
     let mut show_delete_confirm_modal = use_signal(|| false);
@@ -122,11 +166,33 @@ pub fn ChatWindow(
 
     // Sync mcp_context signal changes to the active session's mcp_tools
     // This ensures the UI updates immediately when tools are loaded/unloaded
+    // We filter tools by the session's active profile to ensure isolation.
     use_effect(move || {
-        let current_context = _mcp_context.read().clone();
+        let mut current_context = _mcp_context.read().clone();
         let mut state = session_state.write();
-        if let Some(session) = state.get_active_session_mut() {
-            if !current_context.servers.is_empty() {
+        if let Some(session) = state.sessions.get_mut(&*current_target_id.read()) {
+            let profile_id = session.composio_profile.clone();
+            
+            // Filter servers to only include non-native or profile-matching native tools
+            // Use the server_name convention: config.name contains the display key,
+            // but we filter by matching the profile_id against the known session profile.
+            current_context.servers.retain(|s| {
+                if is_composio_native(&s.name) {
+                    if let Some(ref target_id) = profile_id {
+                        // Include singleton (legacy) or if name contains the target profile ID/name
+                        let suffix = s.name.strip_prefix("composio-native:").unwrap_or_default();
+                        suffix.is_empty() || suffix == target_id
+                    } else {
+                        // If no profile, only allow the legacy/default composio-native
+                        s.name == COMPOSIO_NATIVE_PREFIX
+                    }
+                } else {
+                    true
+                }
+            });
+
+
+                if !current_context.servers.is_empty() {
                 session.active_context.mcp_tools = Some(current_context);
             } else {
                 session.active_context.mcp_tools = None;
@@ -137,7 +203,7 @@ pub fn ChatWindow(
         // By reading the session state here, the effect becomes dependent on it.
         // Any change to messages will cause this to re-run.
         let _ = stream_update_trigger.read();
-        let current_session_id = session_state.read().active_session_id.clone();
+        let current_session_id = current_target_id.read().clone();
 
         let mut is_session_switch = false;
         last_session_id.with_mut(|last_id| {
@@ -215,7 +281,7 @@ pub fn ChatWindow(
             spawn(async move {
                 let mut session_state = session_state;
                 let mcp_manager = mcp_manager;
-                let active_session_id = session_state.read().active_session_id.clone();
+                let active_session_id = current_target_id.read().clone();
                 let mut tools_to_run = Vec::new();
                 let mut stream_manager_is_sending = stream_manager.is_sending;
 
@@ -224,7 +290,14 @@ pub fn ChatWindow(
                 // Clear the signal so we don't re-trigger loop
                 has_pending_approvals.set(false);
 
-                // 1. Identify tools that need to be run
+                // 1. Identify tools that need to be run and capture profile context
+                let active_session_id_inner = active_session_id.clone();
+                let composio_profile = {
+                    let state = session_state.read();
+                    state.sessions.get(&active_session_id_inner)
+                        .and_then(|s| s.composio_profile.clone())
+                };
+
                 {
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&active_session_id) {
@@ -258,6 +331,7 @@ pub fn ChatWindow(
                             &tool_call.tool_name,
                             args_json,
                             true,
+                            composio_profile.clone(),
                         )
                         .await;
 
@@ -291,7 +365,13 @@ pub fn ChatWindow(
                                     status,
                                     response: response_str,
                                 },
-                                profile_color: Some(settings.read().get_active_profile().map(|p| p.color.clone()).unwrap_or_default()),
+                                profile_color: {
+                                    let settings_read = settings.read();
+                                    crate::components::shared::resolve_profile_color(
+                                        composio_profile.as_ref(),
+                                        &settings_read,
+                                    )
+                                },
                             });
                     }
                 }
@@ -306,28 +386,39 @@ pub fn ChatWindow(
     let send_prompt_to_llm = {
         move |prompt_data: crate::context::prompt_builder::LlmPrompt,
               mcp_context: Option<crate::mcp::manager::McpContext>,
-              hobbes_message_id: Uuid| {
+              hobbes_message_id: Uuid,
+              session_id: String| {
             spawn(async move {
                 let mut active_message_id = active_message_id;
+                let mut active_session_for_stream = active_session_for_stream;
 
                 active_message_id.set(Some(hobbes_message_id));
+                active_session_for_stream.set(Some(session_id.clone()));
                 tracing::debug!("Lock ACQUIRED.");
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<()>();
 
                 let on_complete = {
                     let mut active_message_id = active_message_id;
+                    let mut active_session_for_stream = active_session_for_stream;
                     move || {
                         active_message_id.set(None);
+                        active_session_for_stream.set(None);
                         let _ = tx.send(());
                     }
                 };
 
                 stream_manager.start_stream(
                     hobbes_message_id,
+                    session_id.clone(),
                     prompt_data,
                     on_complete,
                     mcp_context,
+                    {
+                        let state = session_state.read();
+                        state.sessions.get(&session_id)
+                            .and_then(|s| s.composio_profile.clone())
+                    },
                 );
 
                 rx.recv().await;
@@ -338,13 +429,18 @@ pub fn ChatWindow(
         }
     };
 
-    let send_message = move |(user_message, attachments): (String, Vec<Attachment>)| {
-        spawn(async move {
+    let send_message = std::rc::Rc::new(move |(user_message, attachments): (String, Vec<Attachment>)| {
+        spawn({
             let mut session_state = session_state;
-            let settings = settings.read().clone();
+            let settings = settings;
             let send_prompt_to_llm = send_prompt_to_llm;
             let mut permission_manager = permission_manager;
             let mut has_new_comments = has_new_comments;
+            let _target_session_id = current_target_id;
+
+            async move {
+            let settings_read = settings.read().clone();
+            let target_id = current_target_id.read().clone();
 
             // Reset the AI turn count every time the user sends a message.
             permission_manager.write().reset_turn_count();
@@ -353,7 +449,7 @@ pub fn ChatWindow(
             session_state.write().tool_call_history.clear();
 
             // Check if the last message was the turn limit warning.
-            let last_message_was_warning = session_state.read().get_active_session()
+            let last_message_was_warning = session_state.read().sessions.get(&target_id)
                 .and_then(|s| s.messages.last())
                 .is_some_and(|m| {
                     if let MessageContent::Text { content: text, .. } = &m.content {
@@ -368,17 +464,12 @@ pub fn ChatWindow(
             }
 
             if user_message.trim().is_empty() && attachments.is_empty() {
-                // Auto-resume handled by use_effect now.
-
                 if *has_new_comments.read() {
-                    // Submit comments as a turn
                     has_new_comments.set(false);
-
-                    // Trigger LLM generation with empty user message (PromptBuilder will use history + comments)
                     let hobbes_message_id = Uuid::new_v4();
                     {
                         let mut state = session_state.write();
-                        if let Some(session) = state.get_active_session_mut() {
+                        if let Some(session) = state.sessions.get_mut(&target_id) {
                             session.messages.push(Message {
                                 id: hobbes_message_id,
                                 author: "Hobbes".to_string(),
@@ -395,21 +486,24 @@ pub fn ChatWindow(
                         }
                     }
 
+                    let fresh_mcp_context = fetch_fresh_mcp_context(target_id.clone(), settings_read.clone()).await;
+
                     let prompt_data = {
                         let state = session_state.read();
-                        if let Some(session) = state.get_active_session() {
-                            let builder = PromptBuilder::new(session, &settings, &state);
+                        if let Some(session) = state.sessions.get(&target_id) {
+                            let builder = PromptBuilder::new(session, &settings_read, &state);
                             builder.build_prompt("".to_string(), None)
                         } else {
                             return;
                         }
                     };
 
-                    let mcp_context = session_state
-                        .read()
-                        .get_active_session()
-                        .and_then(|s| s.active_context.mcp_tools.clone());
-                    send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
+                    let mcp_context = if fresh_mcp_context.servers.is_empty() {
+                        None
+                    } else {
+                        Some(fresh_mcp_context)
+                    };
+                    send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id, target_id.clone());
                 }
                 return;
             }
@@ -418,7 +512,7 @@ pub fn ChatWindow(
 
             if permission_manager.read().is_turn_limit_reached() {
                 let mut state = session_state.write();
-                if let Some(session) = state.get_active_session_mut() {
+                if let Some(session) = state.sessions.get_mut(&target_id) {
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
                         author: "User".to_string(),
@@ -435,7 +529,7 @@ pub fn ChatWindow(
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
                         author: "Hobbes".to_string(),
-                        content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings.permission_settings.max_ai_turns), thought_signature: None, thought_summary: None },
+                        content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings_read.permission_settings.max_ai_turns), thought_signature: None, thought_summary: None },
                         attachments: Vec::new(),
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
@@ -448,18 +542,7 @@ pub fn ChatWindow(
             let hobbes_message_id = Uuid::new_v4();
             {
                 let mut state = session_state.write();
-
-                // Ensure we have a valid active session.
-                // If active_session_id is set but not found (inconsistent state), or empty, create a new one.
-                if state.get_active_session().is_none() {
-                    tracing::warn!(
-                        "Active session ID '{}' not found in sessions. Creating new session.",
-                        state.active_session_id
-                    );
-                    state.create_session();
-                }
-
-                if let Some(session) = state.get_active_session_mut() {
+                if let Some(session) = state.sessions.get_mut(&target_id) {
                     session.messages.push(Message {
                         id: Uuid::new_v4(),
                         author: "User".to_string(),
@@ -489,32 +572,26 @@ pub fn ChatWindow(
                 }
             }
 
-            let prompt_data = {
-                // Fetch fresh MCP context to ensure tools are available for this request
-                let mcp_context = mcp_manager.read().get_mcp_context().await;
-                let user_prompt = user_message.clone();
+            let _fresh_mcp = fetch_fresh_mcp_context(target_id.clone(), settings_read.clone()).await;
 
-                // Safely get conversation summary
+            // Preserve conversation summary across the send
+            {
                 let conversation_summary = session_state
                     .read()
-                    .get_active_session()
+                    .sessions.get(&target_id)
                     .map(|s| s.active_context.conversation_summary.clone())
                     .unwrap_or_default();
-
-                {
-                    let mut state = session_state.write();
-                    if let Some(session) = state.get_active_session_mut() {
-                        session.active_context.conversation_summary = conversation_summary;
-                        // Inject fresh MCP tools into session context for prompt building
-                        if !mcp_context.servers.is_empty() {
-                            session.active_context.mcp_tools = Some(mcp_context);
-                        }
-                    }
+                let mut state = session_state.write();
+                if let Some(session) = state.sessions.get_mut(&target_id) {
+                    session.active_context.conversation_summary = conversation_summary;
                 }
+            }
 
+            let prompt_data = {
+                let user_prompt = user_message.clone();
                 let state = session_state.read();
-                if let Some(session) = state.get_active_session() {
-                    let builder = PromptBuilder::new(session, &settings, &state);
+                if let Some(session) = state.sessions.get(&target_id) {
+                    let builder = PromptBuilder::new(session, &settings_read, &state);
                     builder.build_prompt(user_prompt, None)
                 } else {
                     tracing::error!("No active session found when building prompt");
@@ -529,15 +606,18 @@ pub fn ChatWindow(
 
             let mcp_context = session_state
                 .read()
-                .get_active_session()
+                .sessions.get(&target_id)
                 .and_then(|s| s.active_context.mcp_tools.clone());
-            send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
-        });
-    };
+            send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id, target_id.clone());
+        }});
+    });
 
     let cancel_message = move || {
         if let Some(id) = *active_message_id.read() {
-            stream_manager.cancel_stream(&id);
+            let session_id = active_session_for_stream.read().clone().unwrap_or_else(|| {
+                current_target_id.read().clone()
+            });
+            stream_manager.cancel_stream(&id, &session_id);
         }
     };
 
@@ -550,9 +630,10 @@ pub fn ChatWindow(
                 let settings = settings.read().clone();
 
                 let hobbes_message_id = Uuid::new_v4();
+                let target_id = current_target_id.read().clone();
                 {
                     let mut state = session_state.write();
-                    if let Some(session) = state.get_active_session_mut() {
+                    if let Some(session) = state.sessions.get_mut(&target_id) {
                         session.messages.push(Message {
                             id: hobbes_message_id,
                             author: "Hobbes".to_string(),
@@ -569,11 +650,13 @@ pub fn ChatWindow(
                     }
                 }
 
-                let prompt_data = {
-                    let state = session_state.read();
-                    if let Some(session) = state.get_active_session() {
-                        let builder = PromptBuilder::new(session, &settings, &state);
-                        builder.build_prompt("".to_string(), None)
+                let fresh_mcp_context = fetch_fresh_mcp_context(target_id.clone(), settings.clone()).await;
+
+            let prompt_data = {
+                let state = session_state.read();
+                if let Some(session) = state.sessions.get(&target_id) {
+                    let builder = PromptBuilder::new(session, &settings, &state);
+                    builder.build_prompt("".to_string(), None)
                     } else {
                         tracing::error!("Active session lost during continuation flow - aborting prompt build");
                         return;
@@ -585,12 +668,13 @@ pub fn ChatWindow(
                     let _ = tokio::task::spawn_blocking(move || state_snapshot.save()).await;
                 });
 
-                let mcp_context = session_state
-                    .read()
-                    .get_active_session()
-                    .and_then(|s| s.active_context.mcp_tools.clone());
+                let mcp_context = if fresh_mcp_context.servers.is_empty() {
+                    None
+                } else {
+                    Some(fresh_mcp_context)
+                };
                 tracing::debug!("Sending continuation prompt to LLM.");
-                send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id);
+                send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id, target_id.clone());
             });
         })
     };
@@ -608,12 +692,12 @@ pub fn ChatWindow(
         if confirm {
             if let Some(index) = session_state
                 .read()
-                .get_active_session()
+                .sessions.get(&*current_target_id.read())
                 .and_then(|s| s.messages.iter().position(|m| m.id == message_id))
             {
                 let session_len = session_state
                     .read()
-                    .get_active_session()
+                    .sessions.get(&*current_target_id.read())
                     .map(|s| s.messages.len())
                     .unwrap_or(0);
                 let count = session_len - index;
@@ -624,7 +708,7 @@ pub fn ChatWindow(
         } else {
             // Delete immediately
             let message_id_str = message_id.to_string();
-            let active_session_id = session_state.read().active_session_id.clone();
+            let active_session_id = current_target_id.read().clone();
             if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
                 session.delete_message_and_after(&message_id_str);
                 // Trigger update
@@ -643,11 +727,12 @@ pub fn ChatWindow(
 
     // Forget Modal Logic
     let on_forget_apply = move |(new_context, summary): (ActiveContext, String)| {
-        match *optimization_target.read() {
+        let routing_target = *optimization_target.read();
+        match routing_target {
             OptimizationTarget::Session => {
                 {
                     let mut state = session_state.write();
-                    if let Some(session) = state.get_active_session_mut() {
+                    if let Some(session) = state.sessions.get_mut(&*current_target_id.read()) {
                         session.active_context = new_context;
                         session.memory_optimization_summary = Some(summary.clone());
 
@@ -698,7 +783,10 @@ pub fn ChatWindow(
         show_forget_memory_modal.set(false);
     };
 
-    rsx! {
+    let session_guard = session.read();
+    if session_guard.is_some() {
+        rsx! {
+
         div {
             class: "{root_classes}",
             onmounted: move |cx| container_element.set(Some(cx.data())),
@@ -712,14 +800,14 @@ pub fn ChatWindow(
                 is_sending: Signal::new(*stream_manager.is_sending.read() || stream_manager.is_any_generating()),
                 has_new_comments: has_new_comments,
                 has_pending_approvals: has_pending_approvals,
-                on_send: move |(msg, attachments)| send_message((msg, attachments)),
+                on_send: {
+                    let send_message = send_message.clone();
+                    move |(msg, attachments)| send_message((msg, attachments))
+                },
                 on_cancel: move |_| cancel_message(),
                 on_interaction: on_interaction,
-                on_toggle_sessions: on_toggle_sessions,
-                on_toggle_settings: on_toggle_settings,
-                on_toggle_mcp_manager: on_toggle_mcp_manager,
                 on_new_chat_with_memory: move |_| {
-                    if let Some(session) = session_state.read().get_active_session() {
+                    if let Some(session) = session_state.read().sessions.get(&*current_target_id.read()) {
                         modal_initial_context.set(session.active_context.clone());
                         show_new_chat_memory_modal.set(true);
                     }
@@ -731,12 +819,14 @@ pub fn ChatWindow(
                 initial_context: modal_initial_context.read().clone(),
                 optimization_summary: modal_optimization_summary,
                 on_start_chat: move |new_context: ActiveContext| {
-                     // Create new session
-                     let new_session_id = session_state.write().create_session();
+                     // Create new session with memory
+                     let new_session_id = session_state.write().create_session(settings.peek().get_active_profile().map(|p| p.id.clone()));
                      // Update context of the new session
                      if let Some(session) = session_state.write().sessions.get_mut(&new_session_id) {
                          session.active_context = new_context;
                      }
+                     // Open the new session in a tab via the command bus
+                     chat_command.set(Some(super::chat_input::ChatCommand::SwitchToSession(new_session_id)));
                      show_new_chat_memory_modal.set(false);
                      modal_optimization_summary.set(None); // Clear summary on close
                 },
@@ -769,7 +859,7 @@ pub fn ChatWindow(
                         settings.write().confirm_on_message_delete = false;
                     }
                     if let Some(id) = pending_delete_message_id.read().as_ref() {
-                        let active_session_id = session_state.read().active_session_id.clone();
+                        let active_session_id = current_target_id.read().clone();
                         if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
                             session.delete_message_and_after(id);
                             // Trigger update
@@ -784,6 +874,11 @@ pub fn ChatWindow(
                     pending_delete_message_id.set(None);
                 }
             }
+        }
+    }
+    } else {
+        rsx! {
+            div { class: "flex-1 flex items-center justify-center text-fg-muted", "Synchronizing..." }
         }
     }
 }
@@ -899,7 +994,8 @@ pub fn MessageBubble(
     let _settings = consume_context::<Signal<Settings>>();
     let stream_manager = consume_context::<StreamManagerContext>();
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let mut chat_input_draft = consume_context::<Signal<String>>();
+    let DraftContext(mut chat_input_draft) = consume_context::<DraftContext>();
+    let save_error = consume_context::<crate::components::shared::SaveErrorContext>().0;
 
     let _is_thinking = false;
     let mut thought_signature: Option<String> = None;
@@ -1136,7 +1232,7 @@ pub fn MessageBubble(
             div {
                 class: "{container_classes} w-full",
                 div {
-                    class: "flex flex-col max-w-2/3 min-w-0 group",
+                    class: "flex flex-col max-w-full min-w-0 group",
                     div {
                         id: "message-bubble-{message.id}",
                         class: "relative rounded-2xl {bubble_classes} max-w-full",
@@ -1190,16 +1286,18 @@ pub fn MessageBubble(
                                         }
                                     },
                                     on_comment_delete: {
-                                        let message_id = message.id;
+                                        // This loop and `session_id` are not defined in this scope.
+                                        // Assuming this is a placeholder for a larger refactor,
+                                        // and the intent is to replace the closure's content.
+                                        // The original `message_id` is captured by the outer scope.
+                                        let message_id = message.id; // Re-capture message_id from the outer scope
                                         move |comment_id: String| {
                                             // Delete the comment from session state
                                             let mut state = session_state.write();
                                             if let Some(msg) = state.get_message_mut(&message_id) {
                                                 msg.comments.retain(|c| c.id != comment_id);
                                             }
-                                            if let Err(e) = state.save() {
-                                                tracing::error!("Failed to save after deleting comment: {}", e);
-                                            }
+                                            crate::session::SessionState::save_async(state.clone(), Some(save_error));
                                         }
                                     }
                                 }
@@ -1298,9 +1396,7 @@ pub fn MessageBubble(
                                     if let Some(msg) = state.get_message_mut(&message.id) {
                                         msg.comments.push(new_comment);
                                     }
-                                    if let Err(e) = state.save() {
-                                        tracing::error!("Failed to save session after adding comment: {}", e);
-                                    }
+                                    crate::session::SessionState::save_async(state.clone(), Some(save_error));
 
                                     on_comment.call(());
 
@@ -1335,9 +1431,7 @@ pub fn MessageBubble(
                                                         comment.comment = new_comment_text;
                                                     }
                                                 }
-                                                if let Err(e) = state.save() {
-                                                    tracing::error!("Failed to save session after editing comment: {}", e);
-                                                }
+                                                crate::session::SessionState::save_async(state.clone(), Some(save_error));
                                             }
                                             editing_comment_id.set(None);
                                             selection_mode.set(SelectionMode::None);
@@ -1565,7 +1659,7 @@ pub fn MessageBubble(
 
 #[component]
 pub fn LinkWithControls(href: String, text: String) -> Element {
-    let mut draft = use_context::<Signal<String>>();
+    let DraftContext(mut draft) = use_context::<DraftContext>();
     let mut copied = use_signal(|| false);
     let mut is_hovered = use_signal(|| false);
     let mut pop_left = use_signal(|| false);

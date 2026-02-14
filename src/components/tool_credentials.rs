@@ -9,10 +9,12 @@ use std::collections::{HashMap, HashSet};
 /// Helper to reload credentials from SecretManager into local state
 fn refresh_credentials(
     secret_manager: Signal<SecretManager>,
+    profile_name: Option<String>,
     mut credentials_signal: Signal<HashMap<String, Vec<(String, String)>>>,
 ) {
     let sm = secret_manager.read();
-    let raw_map = sm.get_custom_tool_credentials();
+    // Pattern 153.1: Only show credentials for the active profile in the UI
+    let raw_map = sm.get_custom_tool_credentials(profile_name.as_deref());
     let mut sorted_map = HashMap::new();
     for (slug, fields) in raw_map {
         let mut field_list: Vec<(String, String)> = fields.into_iter().collect();
@@ -80,7 +82,7 @@ pub fn ToolCredentials() -> Element {
             if let Some(profile) = settings_snapshot.get_active_profile() {
                 if let Some(api_key) = &profile.api_key {
                     let base_url = profile.base_url.clone().unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
-                    let client = ComposioClient::new(api_key.clone(), base_url, profile.entity_id.clone(), profile.user_id.clone(), profile.id.clone());
+                    let client = ComposioClient::new(api_key.clone(), base_url, profile.entity_id.clone(), profile.user_id.clone(), profile.id.clone(), None);
                     
                     match crate::mcp::composio_client::discovery::get_toolkit_metadata(&client, &slug).await {
                         Ok(listing) => {
@@ -100,7 +102,8 @@ pub fn ToolCredentials() -> Element {
 
     // Initial load of existing credentials
     use_effect(move || {
-        refresh_credentials(secret_manager, credentials);
+        let p_name = settings.peek().get_active_profile().map(|p| p.name.clone());
+        refresh_credentials(secret_manager, p_name, credentials);
     });
 
     // Fetch available toolkits AND connected slugs from Composio API
@@ -127,6 +130,7 @@ pub fn ToolCredentials() -> Element {
                         profile.entity_id.clone(),
                         profile.user_id.clone(),
                         profile.id.clone(),
+                        None,
                     );
 
                     // Fetch connected toolkit slugs first
@@ -200,10 +204,12 @@ pub fn ToolCredentials() -> Element {
             return;
         }
 
+        let p_name = settings.peek().get_active_profile().map(|p| p.name.clone());
+
         spawn(async move {
             let result = {
                 let mut sm = secret_manager.write();
-                sm.set_custom_tool_credential(&slug, &field, value)
+                sm.set_custom_tool_credential(p_name.as_deref(), &slug, &field, value)
             };
 
             match result {
@@ -212,7 +218,7 @@ pub fn ToolCredentials() -> Element {
                     new_field.set(String::new());
                     new_value.set(String::new());
                     toolkit_filter.set(String::new());
-                    refresh_credentials(secret_manager, credentials);
+                    refresh_credentials(secret_manager, p_name, credentials);
                 }
                 Err(e) => {
                     tracing::error!("Failed to save credential: {}", e);
@@ -222,15 +228,16 @@ pub fn ToolCredentials() -> Element {
     };
 
     let handle_delete = move |slug: String, field: String| {
+        let p_name = settings.peek().get_active_profile().map(|p| p.name.clone());
         spawn(async move {
             let result = {
                 let mut sm = secret_manager.write();
-                sm.delete_custom_tool_credential(&slug, &field)
+                sm.delete_custom_tool_credential(p_name.as_deref(), &slug, &field)
             };
             if let Err(e) = result {
                 tracing::error!("Failed to delete credential: {}", e);
             } else {
-                refresh_credentials(secret_manager, credentials);
+                refresh_credentials(secret_manager, p_name, credentials);
             }
         });
     };

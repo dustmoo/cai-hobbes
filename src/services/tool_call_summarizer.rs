@@ -14,9 +14,10 @@ impl ToolCallSummarizer {
         &self,
         session_state: &mut SessionState,
         _settings: &Settings,
+        session_id: &str,
     ) {
         let history = std::mem::take(&mut session_state.tool_call_history);
-        if let Some(session) = session_state.get_active_session_mut() {
+        if let Some(session) = session_state.sessions.get_mut(session_id) {
             for record in history {
                 let summary = format!(
                     "Tool call '{}' on server '{}' finished with status '{}'.",

@@ -1,3 +1,4 @@
+// Dioxus Signal types are held across .await — not real locks, just Dioxus marker types.
 #![allow(clippy::await_holding_invalid_type)]
 
 use super::continuation_controller::ContinuationController;
@@ -28,6 +29,7 @@ pub struct StreamManagerContext {
     pub stream_activity: Signal<u64>,
     pub is_sending: Signal<bool>,
     pub content_generated: Signal<std::collections::HashSet<Uuid>>,
+    save_error_signal: Signal<Option<String>>,
 }
 
 impl StreamManagerContext {
@@ -50,12 +52,14 @@ impl StreamManagerContext {
     pub fn start_stream(
         mut self,
         message_id: Uuid,
+        session_id: String,
         prompt_data: crate::context::prompt_builder::LlmPrompt,
         on_complete: impl FnOnce() + 'static,
         mcp_context: Option<crate::mcp::manager::McpContext>,
+        profile_id: Option<String>,
     ) {
         self.is_sending.set(true);
-        tracing::info!(message_id = %message_id, "'start_stream' entered.");
+        tracing::info!(message_id = %message_id, session_id = %session_id, "'start_stream' entered.");
         // Create a channel for the MessageBubble to receive chunks.
         let (stream_tx, stream_rx) = mpsc::unbounded_channel::<StreamMessage>();
 
@@ -129,7 +133,7 @@ impl StreamManagerContext {
                         // ends (e.g., UNEXPECTED_TOOL_CALL), the message has no content AND no thoughts => pruned.
                         if was_empty {
                             let mut state = self.session_state.write();
-                            if let Some(msg) = state.get_message_mut(&message_id) {
+                            if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
                                 if let crate::components::shared::MessageContent::Text {
                                     content: msg_content,
                                     thought_signature: msg_thought_sig,
@@ -153,7 +157,7 @@ impl StreamManagerContext {
                             let mut state = self.session_state.write();
                             if is_first_message {
                                 // Update the placeholder message with the error
-                                if let Some(msg) = state.get_message_mut(&message_id) {
+                                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
                                     msg.content =
                                         crate::components::shared::MessageContent::Error {
                                             message: error_msg.clone(),
@@ -162,7 +166,7 @@ impl StreamManagerContext {
                             } else {
                                 // Create a new error message
                                 let new_id = Uuid::new_v4();
-                                if let Some(session) = state.get_active_session_mut() {
+                                if let Some(session) = state.sessions.get_mut(&session_id) {
                                     session.messages.push(crate::components::chat::Message {
                                         id: new_id,
                                         author: "Hobbes".to_string(),
@@ -234,7 +238,7 @@ impl StreamManagerContext {
                             // received thinking data so far (final_text is empty), we upgrade the existing
                             // placeholder message to a ToolCall instead of splitting into two bubbles.
                             if is_first_message || final_text_for_this_turn.is_empty() {
-                                if let Some(msg) = state.get_message_mut(&message_id) {
+                                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
                                     msg.content =
                                         crate::components::shared::MessageContent::ToolCall(
                                             tool_call.clone(),
@@ -243,7 +247,7 @@ impl StreamManagerContext {
                                 message_id
                             } else {
                                 let new_id = Uuid::new_v4();
-                                if let Some(session) = state.get_active_session_mut() {
+                                if let Some(session) = state.sessions.get_mut(&session_id) {
                                     session.messages.push(crate::components::chat::Message {
                                         id: new_id,
                                         author: "Hobbes".to_string(),
@@ -265,10 +269,14 @@ impl StreamManagerContext {
                         let mut session_state = self.session_state;
                         let tool_results_tx_clone = tool_results_tx.clone();
                         let completed_tool_tasks_clone = completed_tool_tasks.clone();
+                        let profile_id_inner = profile_id.clone();
+                        let session_id_inner = session_id.clone();
                         let _handle = spawn(async move {
                             let args_json: serde_json::Value =
                                 serde_json::from_str(&tool_call.arguments)
                                     .unwrap_or(serde_json::Value::Null);
+                            let profile_id = profile_id_inner;
+
                             let result_receiver = mcp_manager
                                 .read()
                                 .use_mcp_tool(
@@ -276,6 +284,7 @@ impl StreamManagerContext {
                                     &tool_call.tool_name,
                                     args_json,
                                     false,
+                                    profile_id.clone(),
                                 )
                                 .await;
 
@@ -311,6 +320,7 @@ impl StreamManagerContext {
                                                     .initiate_composio_auth(
                                                         &tool_call.server_name,
                                                         &tool_call.tool_name,
+                                                        profile_id.clone(),
                                                     )
                                                     .await
                                                 {
@@ -379,7 +389,7 @@ impl StreamManagerContext {
 
                             let mut state = session_state.write();
 
-                            if let Some(msg) = state.get_message_mut(&tool_call_message_id) {
+                            if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
                                 if is_permission_request {
                                     if let Ok(tc) =
                                         serde_json::from_str::<crate::components::shared::ToolCall>(
@@ -404,7 +414,13 @@ impl StreamManagerContext {
                                         status,
                                         response: response_str,
                                     },
-                                    profile_color: Some(self.settings.read().get_active_profile().map(|p| p.color.clone()).unwrap_or_default()),
+                                    profile_color: {
+                                        let settings_read = self.settings.read();
+                                        crate::components::shared::resolve_profile_color(
+                                            profile_id.as_ref(),
+                                            &settings_read,
+                                        )
+                                    },
                                 };
                                 let _ = tool_results_tx_clone.send(record);
                             }
@@ -417,15 +433,21 @@ impl StreamManagerContext {
                     StreamMessage::Usage(usage_data) => {
                         // Update message with usage data
                         let mut state = self.session_state.write();
-                        if let Some(msg) = state.get_message_mut(&message_id) {
+                        if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
                             msg.usage = Some(usage_data.clone());
                         }
 
-                        // Increment session accumulated usage
-                        if let Some(session) = state.get_active_session_mut() {
-                            session.accumulated_cost += usage_data.cost.unwrap_or(0.0);
-                            session.accumulated_tokens += usage_data.total_tokens;
-                            session.accumulated_turns += 1;
+                        // Recalculate session accumulated usage from authoritative message data.
+                        // Gemini sends usage_metadata on multiple SSE chunks, so we must NOT
+                        // blindly increment — that causes double-counting. Instead, derive
+                        // accumulated values from the message-level totals (which are replaced,
+                        // not accumulated, on each Usage event).
+                        if let Some(session) = state.sessions.get_mut(&session_id) {
+                            session.accumulated_cost = session.total_cost();
+                            session.accumulated_tokens = session.total_tokens();
+                            session.accumulated_turns = session.messages.iter()
+                                .filter(|m| m.usage.is_some())
+                                .count() as i32;
                         }
 
                         // Forward usage to UI
@@ -438,7 +460,7 @@ impl StreamManagerContext {
 
             if !final_text_for_this_turn.is_empty() {
                 let mut state = self.session_state.write();
-                if let Some(msg) = state.get_message_mut(&message_id) {
+                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
                     if let crate::components::shared::MessageContent::Text {
                         content,
                         thought_signature,
@@ -482,12 +504,7 @@ impl StreamManagerContext {
                     }
                     self.active_stream_handles.write().remove(&message_id);
                     self.content_generated.write().remove(&message_id); // Cleanup
-                    if let Err(e) = self.session_state.write().save() {
-                        tracing::error!(
-                            "Failed to save session state after permission request: {}",
-                            e
-                        );
-                    }
+                    crate::session::SessionState::save_async(self.session_state.read().clone(), None);
                     on_complete();
                     self.is_sending.set(false);
                     self.scheduler.send(SchedulerSignal::Activity);
@@ -507,9 +524,7 @@ impl StreamManagerContext {
                 self.active_stream_handles.write().remove(&message_id);
                 self.content_generated.write().remove(&message_id); // Cleanup
 
-                if let Err(e) = self.session_state.write().save() {
-                    tracing::error!("Failed to save session state before continuation: {}", e);
-                }
+                crate::session::SessionState::save_async(self.session_state.read().clone(), None);
 
                 // Clean up the current stream state before triggering the next one
                 on_complete();
@@ -526,18 +541,14 @@ impl StreamManagerContext {
             tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
             {
                 let mut state = self.session_state.write();
-                state.touch_active_session();
-                if let Err(e) = state.save() {
-                    tracing::error!("Failed to save session state after stream: {}", e);
-                } else {
-                    tracing::info!(message_id = %message_id, "Session state SAVED successfully.");
-                }
+                state.touch_session(&session_id);
+                crate::session::SessionState::save_async(state.clone(), Some(self.save_error_signal));
             }
 
             let settings = self.settings.read().clone();
             let summarizer = self.tool_call_summarizer.read();
             summarizer
-                .summarize_and_cleanup(&mut self.session_state.write(), &settings)
+                .summarize_and_cleanup(&mut self.session_state.write(), &settings, &session_id)
                 .await;
             on_complete();
             self.is_sending.set(false);
@@ -556,8 +567,8 @@ impl StreamManagerContext {
             .insert(message_id, master_task_handle);
     }
 
-    pub fn cancel_stream(mut self, message_id: &Uuid) {
-        tracing::info!(message_id = %message_id, "Attempting to cancel stream.");
+    pub fn cancel_stream(mut self, message_id: &Uuid, session_id: &str) {
+        tracing::info!(message_id = %message_id, session_id = %session_id, "Attempting to cancel stream.");
 
         // 1. Remove and abort the task handle
         if let Some(handle) = self.active_stream_handles.write().remove(message_id) {
@@ -568,8 +579,8 @@ impl StreamManagerContext {
         // Cleanup generated state
         self.content_generated.write().remove(message_id);
 
-        // 2. Remove the message from the session state
-        self.session_state.write().remove_message(message_id);
+        // 2. Remove the message from the originating session
+        self.session_state.write().remove_message_in_session(session_id, message_id);
 
         // 3. Remove the stream receiver
         if self.stream_receivers.write().remove(message_id).is_some() {
@@ -620,6 +631,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         stream_activity: Signal::new(0),
         is_sending: Signal::new(false),
         content_generated: Signal::new(std::collections::HashSet::new()),
+        save_error_signal: consume_context::<crate::components::shared::SaveErrorContext>().0,
     });
 
     // Provide the context to children.
@@ -675,6 +687,7 @@ mod tests {
                 stream_activity: Signal::new(0),
                 is_sending: Signal::new(false),
                 content_generated: Signal::new(std::collections::HashSet::new()),
+                save_error_signal: Signal::new(None),
             });
 
             let message_id = Uuid::new_v4();
@@ -744,6 +757,7 @@ mod tests {
                 stream_activity: Signal::new(0),
                 is_sending: Signal::new(false),
                 content_generated: Signal::new(std::collections::HashSet::new()),
+                save_error_signal: Signal::new(None),
             });
 
             let message_id = Uuid::new_v4();

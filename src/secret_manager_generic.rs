@@ -6,15 +6,17 @@ use crate::constants::SERVICE_NAME;
 use crate::secret_types;
 
 // Re-export shared constants for API compatibility
-pub use crate::secret_types::{KNOWN_KEYS, COMPOSIO_KEY_PREFIX};
+pub use crate::secret_types::{KNOWN_KEYS, composio_key_name};
 
 /// Dummy AuthContext for non-macOS generic implementation.
 /// This matches the type in the macOS implementation for API parity.
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Windows/Linux API parity with macOS native Keychain implementation
 pub struct AuthContext;
 
 /// Error types for keychain operations (API parity with macOS)
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Windows/Linux API parity with macOS native Keychain implementation
 pub enum KeychainError {
     NotFound,
     AuthCancelled,
@@ -79,7 +81,7 @@ impl SecretManager {
     }
 
     /// Get a cloned secret value
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used on macOS; kept for cross-platform API parity
     pub fn get_cloned(&self, key: &str) -> Option<String> {
         self.secrets.get(key).cloned()
     }
@@ -88,17 +90,19 @@ impl SecretManager {
     // BIOMETRIC AUTHENTICATION STUBS (For API Parity with macOS)
     // =========================================================================
 
+    #[allow(dead_code)] // Biometric stub for Windows/Linux API parity
     pub fn load_all_with_context(&mut self, _context: &AuthContext) {
         tracing::debug!("Generic SecretManager: Ignoring biometric context, loading normally...");
         self.load_all_from_keychain();
     }
 
+    #[allow(dead_code)] // Biometric stub for Windows/Linux API parity
     pub fn load_composio_key_with_context(
         &mut self,
-        profile_name: &str,
+        profile_id: &str,
         _context: Option<&AuthContext>,
     ) {
-        self.load_composio_key(profile_name);
+        self.load_composio_key(profile_id);
     }
 
     /// Internal helper to pull directly from platform keychain without caching
@@ -197,11 +201,11 @@ impl SecretManagerTrait for SecretManager {
         Ok(())
     }
 
-    fn load_composio_key(&mut self, profile_name: &str) {
-        let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
+    fn load_composio_key(&mut self, profile_id: &str) {
+        let key = composio_key_name(profile_id);
         if let Some(value) = self.get_from_keychain_directly(&key) {
              self.secrets.insert(key, value);
-             tracing::debug!("Loaded Composio key for profile: {}", profile_name);
+             tracing::debug!("Loaded Composio key for profile id: {}", profile_id);
         }
     }
 

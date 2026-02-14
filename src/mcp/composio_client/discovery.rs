@@ -411,7 +411,11 @@ pub async fn get_connected_toolkit_slugs(
     Ok(slugs)
 }
 
-/// Helper to fetch the raw tools enum from the API
+
+/// Helper to fetch the raw tools enum from the REST API (global catalog).
+/// Used for smart tool selection (Step 4) where we need the full list of available
+/// tools for a toolkit, NOT the session-scoped MCP tools/list which may return 0
+/// if tools haven't been loaded into the session yet.
 async fn fetch_tool_enum(client: &ComposioClient) -> Result<Vec<String>, String> {
     let url = format!("{}/tools/enum", client.get_api_base_url());
 
@@ -438,7 +442,11 @@ async fn fetch_tool_enum(client: &ComposioClient) -> Result<Vec<String>, String>
         .map_err(|e| format!("Failed to parse tools enum response: {}", e))
 }
 
-/// Fetch all tool slugs for a specific toolkit from Composio API.
+
+
+/// Fetch all tool slugs for a specific toolkit from the REST API (global catalog).
+/// Uses /tools/enum which returns ALL available tools regardless of session state.
+#[allow(dead_code)]
 pub async fn get_toolkit_tools(
     client: &ComposioClient,
     toolkit_slug: &str,
@@ -463,6 +471,8 @@ pub async fn get_toolkit_tools(
 }
 
 /// Fetch tools for a toolkit with descriptions for LLM-based selection.
+/// Uses REST /tools/enum (global catalog) so Step 4 smart selection sees
+/// the full tool set even before the session has loaded tools.
 pub async fn get_toolkit_tools_detailed(
     client: &ComposioClient,
     toolkit_slug: &str,
@@ -544,73 +554,6 @@ pub async fn list_tools_filtered(
 }
 
 /// Search for tools matching a natural language query within specified toolkits
-pub async fn search_tools(
-    client: &ComposioClient,
-    query: &str,
-    toolkit_slugs: &[String],
-) -> Result<Vec<ComposioTool>, String> {
-    let url = client.build_mcp_url("");
-
-    tracing::info!(
-        "Searching tools via MCP: query='{}', toolkits={:?}",
-        query,
-        toolkit_slugs
-    );
-
-    let mut params = serde_json::Map::new();
-    params.insert(
-        "search".to_string(),
-        serde_json::Value::String(query.to_string()),
-    );
-
-    if !toolkit_slugs.is_empty() {
-        let uppercase_slugs: Vec<serde_json::Value> = toolkit_slugs
-            .iter()
-            .map(|s| serde_json::Value::String(s.to_uppercase()))
-            .collect();
-        params.insert(
-            "toolkits".to_string(),
-            serde_json::Value::Array(uppercase_slugs),
-        );
-    }
-
-    let json_rpc_request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "tools/list",
-        "id": "search_tools",
-        "params": params
-    });
-
-    let response = client
-        .client
-        .post(&url)
-        .header("Accept", "application/json, text/event-stream")
-        .header("Content-Type", "application/json")
-        .json(&json_rpc_request)
-        .send()
-        .await
-        .map_err(|e| format!("Search request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("Search failed with status {}: {}", status, body));
-    }
-
-    let response_text = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read search response: {}", e))?;
-
-    match parse_tools_response(client, &response_text) {
-        Ok(tools) => {
-            tracing::info!("Search returned {} tools", tools.len());
-            Ok(tools)
-        }
-        Err(e) => Err(format!("Failed to parse search response: {}", e)),
-    }
-}
-
 /// List tools for a session with Tool Router pattern
 pub async fn list_tools_for_session(
     client: &ComposioClient,

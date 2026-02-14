@@ -21,6 +21,7 @@ fn create_test_session() -> Session {
         accumulated_tokens: 0,
         accumulated_turns: 0,
         memory_optimization_summary: None,
+        composio_profile: None,
     }
 }
 
@@ -37,12 +38,13 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
 
     let settings = Settings {
         composio_profiles: vec![ComposioProfile {
+            id: "test-profile-id-001".to_string(),
             name: "Test Profile".to_string(),
             user_id: Some("test-user-id-123".to_string()),
             api_key: Some("sk-test-api-key".to_string()),
             ..Default::default()
         }],
-        active_composio_profile: Some("Test Profile".to_string()),
+        active_composio_profile: Some("test-profile-id-001".to_string()),
         ..Default::default()
     };
 

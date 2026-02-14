@@ -1,3 +1,4 @@
+use crate::components::llm::GeminiModel;
 use crate::context::permissions::{PermissionSettings, ToolCategory};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -59,6 +60,24 @@ pub struct HotkeySettings {
     pub submit_chat: String,
     #[serde(default = "default_cancel_generation")]
     pub cancel_generation: String,
+    #[serde(default = "default_switch_tab_1")]
+    pub switch_tab_1: String,
+    #[serde(default = "default_switch_tab_2")]
+    pub switch_tab_2: String,
+    #[serde(default = "default_switch_tab_3")]
+    pub switch_tab_3: String,
+    #[serde(default = "default_switch_tab_4")]
+    pub switch_tab_4: String,
+    #[serde(default = "default_switch_tab_5")]
+    pub switch_tab_5: String,
+    #[serde(default = "default_switch_tab_6")]
+    pub switch_tab_6: String,
+    #[serde(default = "default_switch_tab_7")]
+    pub switch_tab_7: String,
+    #[serde(default = "default_switch_tab_8")]
+    pub switch_tab_8: String,
+    #[serde(default = "default_switch_tab_9")]
+    pub switch_tab_9: String,
 }
 
 impl Default for HotkeySettings {
@@ -76,6 +95,15 @@ impl Default for HotkeySettings {
             toggle_focus_chat: default_toggle_focus_chat(),
             submit_chat: default_submit_chat(),
             cancel_generation: default_cancel_generation(),
+            switch_tab_1: default_switch_tab_1(),
+            switch_tab_2: default_switch_tab_2(),
+            switch_tab_3: default_switch_tab_3(),
+            switch_tab_4: default_switch_tab_4(),
+            switch_tab_5: default_switch_tab_5(),
+            switch_tab_6: default_switch_tab_6(),
+            switch_tab_7: default_switch_tab_7(),
+            switch_tab_8: default_switch_tab_8(),
+            switch_tab_9: default_switch_tab_9(),
         }
     }
 }
@@ -115,6 +143,28 @@ fn default_submit_chat() -> String {
 }
 fn default_cancel_generation() -> String {
     "CmdOrCtrl+.".to_string()
+}
+
+macro_rules! default_switch_tab {
+    ($($n:literal => $fn_name:ident),+ $(,)?) => {
+        $(
+            fn $fn_name() -> String {
+                format!("CmdOrCtrl+Shift+{}", $n)
+            }
+        )+
+    };
+}
+
+default_switch_tab! {
+    1 => default_switch_tab_1,
+    2 => default_switch_tab_2,
+    3 => default_switch_tab_3,
+    4 => default_switch_tab_4,
+    5 => default_switch_tab_5,
+    6 => default_switch_tab_6,
+    7 => default_switch_tab_7,
+    8 => default_switch_tab_8,
+    9 => default_switch_tab_9,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -173,6 +223,12 @@ pub struct Settings {
     /// None means TOS has never been accepted. Compare against CURRENT_TOS_VERSION.
     #[serde(default)]
     pub tos_accepted_version: Option<String>,
+    /// Custom icons/emojis for each model (key = model slug, value = emoji)
+    #[serde(default)]
+    pub model_icons: HashMap<String, String>,
+    /// Ordered list of model slugs for the quick-switch slots (Control+1-9)
+    #[serde(default = "default_model_slots")]
+    pub model_slots: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -263,10 +319,11 @@ pub const APP_ATTRIBUTION: &str =
 // ============================================================================
 // TERMS OF SERVICE VERSION
 // ============================================================================
-// Bump this version string when TOS content changes to force re-acceptance.
+// Bump this version string when assets/legal/terms_of_service.md changes.
+// The version should match the "Version X.X" in the markdown file header.
 // Users who accepted an older version will see the TOS screen again.
 // ============================================================================
-pub const CURRENT_TOS_VERSION: &str = "1.0";
+pub const CURRENT_TOS_VERSION: &str = "1.1";
 
 /// Configuration for a single Composio toolkit's loading behavior
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -302,6 +359,10 @@ pub struct ComposioProfile {
     /// Profile display color (Tailwind class)
     #[serde(default = "default_profile_color")]
     pub color: String,
+    /// Chrome profile directory name for scoped auth URL launching (e.g., "Default", "Profile 1")
+    /// Prevents OAuth credentials from landing in the wrong Chrome profile.
+    #[serde(default)]
+    pub chrome_profile_directory: Option<String>,
 }
 
 fn default_profile_color() -> String {
@@ -323,6 +384,7 @@ impl Default for ComposioProfile {
             api_key: None,
             toolkit_configs: Vec::new(),
             color: default_profile_color(),
+            chrome_profile_directory: None,
         }
     }
 }
@@ -386,8 +448,8 @@ impl Default for Settings {
             active_llm: LlmProvider::Gemini,
             gemini_config: GeminiConfig {
                 api_key: None,
-                chat_model: "gemini-2.5-pro".to_string(),
-                summary_model: "gemini-2.5-flash".to_string(),
+                chat_model: GeminiModel::Gemini3_0FlashPreview.canonical_slug().to_string(),
+                summary_model: GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
                 thinking_enabled: false,
                 thinking_level: "high".to_string(),
                 thinking_budget: None,
@@ -426,30 +488,118 @@ impl Default for Settings {
             composio_user_id: None,
             theme: Theme::default(),
             tos_accepted_version: None,
+            model_icons: HashMap::new(),
+            model_slots: default_model_slots(),
         }
     }
 }
 
+/// Get a default icon for a model based on its slug
+pub fn get_default_model_icon(model_slug: &str) -> String {
+    let slug = model_slug.to_lowercase();
+    // Match specific variants first for visual distinction
+    if slug.contains("experimental") {
+        "🧪".to_string()
+    } else if slug.contains("image") {
+        "🎨".to_string()
+    } else if slug.contains("lite") {
+        "🪶".to_string()
+    } else if slug.contains("flash-001") || slug.contains("flash_001") {
+        "💫".to_string()
+    } else if slug.contains("2.0-flash") || slug.contains("2.0_flash") {
+        "🔥".to_string()
+    } else if slug.contains("2.5-flash") || slug.contains("2.5_flash") {
+        "⚡".to_string()
+    } else if slug.contains("2.5-pro") || slug.contains("2.5_pro") {
+        "🧠".to_string()
+    } else if slug.contains("pro") {
+        "💎".to_string()
+    } else if slug.contains("nano") {
+        "🔬".to_string()
+    } else if slug.contains("gemma") {
+        "💠".to_string()
+    } else if slug.contains("flash") {
+        "⚡".to_string()
+    } else {
+        "🤖".to_string()
+    }
+}
+
+/// Default model slots — curated list for quick switching.
+/// Derives slugs from GeminiModel::canonical_slug() to prevent version drift.
+fn default_model_slots() -> Vec<String> {
+    vec![
+        GeminiModel::Gemini3_0FlashPreview.canonical_slug().to_string(),
+        GeminiModel::Gemini3_0ProPreview.canonical_slug().to_string(),
+        GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
+        "".to_string(), // Slot 4
+        "".to_string(), // Slot 5
+        "".to_string(), // Slot 6
+        "".to_string(), // Slot 7
+        "".to_string(), // Slot 8
+        "".to_string(), // Slot 9
+        "".to_string(), // Slot 10
+    ]
+}
+
+/// Get the fixed icon for a model slot position (0-indexed)
+/// Each slot has a unique, visually distinct icon regardless of the model assigned to it.
+pub fn get_slot_icon(slot_index: usize) -> String {
+    match slot_index {
+        0 => "⚡",
+        1 => "🧠",
+        2 => "🔥",
+        3 => "🪶",
+        4 => "💎",
+        5 => "🎨",
+        6 => "🧪",
+        7 => "💫",
+        8 => "🔬",
+        _ => "🤖",
+    }.to_string()
+}
+
 impl Settings {
-    /// Get the currently active Composio profile
+    /// Get the currently active Composio profile (matched by stable ID)
     pub fn get_active_profile(&self) -> Option<&ComposioProfile> {
-        if let Some(active_name) = &self.active_composio_profile {
+        if let Some(active_id) = &self.active_composio_profile {
             self.composio_profiles
                 .iter()
-                .find(|p| &p.name == active_name)
+                .find(|p| &p.id == active_id)
         } else {
-            self.composio_profiles.first()
+            None
         }
     }
 
-    /// Get a mutable reference to the active Composio profile
+    /// Get a mutable reference to the active Composio profile (matched by stable ID)
     pub fn get_active_profile_mut(&mut self) -> Option<&mut ComposioProfile> {
-        if let Some(active_name) = &self.active_composio_profile {
-            let name = active_name.clone();
-            self.composio_profiles.iter_mut().find(|p| p.name == name)
+        if let Some(active_id) = &self.active_composio_profile {
+            let id = active_id.clone();
+            self.composio_profiles.iter_mut().find(|p| p.id == id)
         } else {
             self.composio_profiles.first_mut()
         }
+    }
+
+    /// Resolve a profile ID to its human-readable name.
+    /// Returns None if the ID doesn't match any profile.
+    pub fn profile_name_for_id(&self, id: &str) -> Option<&str> {
+        self.composio_profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.as_str())
+    }
+
+    /// Resolve a session's composio_profile (ID) to its display name,
+    /// with fallback to the global active profile name.
+    pub fn resolve_session_profile_display_name(
+        &self,
+        session_profile_id: Option<&str>,
+    ) -> Option<String> {
+        session_profile_id
+            .and_then(|id| self.profile_name_for_id(id))
+            .map(|n| n.to_string())
+            .or_else(|| self.get_active_profile().map(|p| p.name.clone()))
     }
 
     /// Add a new Composio profile
@@ -482,21 +632,21 @@ impl Settings {
             new_profile.id = Uuid::new_v4().to_string();
         }
 
-        // Capture the name before moving ownership
-        let new_name = new_profile.name.clone();
+        // Capture the ID before moving ownership
+        let new_id = new_profile.id.clone();
         self.composio_profiles.push(new_profile);
 
         // Always activate newly added profiles so the UI switches to them
-        self.active_composio_profile = Some(new_name);
+        self.active_composio_profile = Some(new_id);
     }
 
-    /// Remove a Composio profile by name
-    pub fn remove_profile(&mut self, name: &str) {
-        self.composio_profiles.retain(|p| p.name != name);
+    /// Remove a Composio profile by its stable ID.
+    pub fn remove_profile(&mut self, id: &str) {
+        self.composio_profiles.retain(|p| p.id != id);
 
         // If we removed the active profile, reset to first available
-        if self.active_composio_profile.as_deref() == Some(name) {
-            self.active_composio_profile = self.composio_profiles.first().map(|p| p.name.clone());
+        if self.active_composio_profile.as_deref() == Some(id) {
+            self.active_composio_profile = self.composio_profiles.first().map(|p| p.id.clone());
         }
     }
 
@@ -520,9 +670,47 @@ impl Settings {
                 api_key: self.composio_api_key.take(),
                 toolkit_configs: Vec::new(),
                 color: default_profile_color(),
+                chrome_profile_directory: None,
             };
+            let profile_id = profile.id.clone();
             self.add_profile(profile);
-            self.active_composio_profile = Some("Default".to_string());
+            self.active_composio_profile = Some(profile_id);
+        }
+    }
+
+    /// Migrate `active_composio_profile` from name-based to ID-based.
+    /// Existing settings may store the profile *name* instead of the stable *id*.
+    /// This checks: if the value doesn't match any profile ID but does match a name, swap it.
+    pub fn migrate_active_profile_name_to_id(&mut self) {
+        if let Some(ref current_value) = self.active_composio_profile {
+            // Already matches an ID — nothing to do
+            if self.composio_profiles.iter().any(|p| &p.id == current_value) {
+                return;
+            }
+            // Try matching by name instead
+            if let Some(profile) = self.composio_profiles.iter().find(|p| &p.name == current_value) {
+                let id = profile.id.clone();
+                tracing::info!("Migrating active_composio_profile from name '{}' to id '{}'", current_value, id);
+                self.active_composio_profile = Some(id);
+            }
+        }
+    }
+
+    /// Ensure chat_model is synced to a configured slot.
+    /// If the current chat_model doesn't match any non-empty slot, set it to slot 1's model.
+    pub fn sync_chat_model_to_slots(&mut self) {
+        let non_empty_slots: Vec<&String> = self.model_slots.iter().filter(|s| !s.is_empty()).collect();
+        if non_empty_slots.is_empty() {
+            return; // No slots configured, leave chat_model as-is
+        }
+        let in_a_slot = non_empty_slots.iter().any(|s| **s == self.gemini_config.chat_model);
+        if !in_a_slot {
+            let first_slot = non_empty_slots[0].clone();
+            tracing::info!(
+                "Syncing chat_model from '{}' to slot 1 model '{}'",
+                self.gemini_config.chat_model, first_slot
+            );
+            self.gemini_config.chat_model = first_slot;
         }
     }
 
@@ -594,6 +782,21 @@ impl SettingsManager {
         // First, try to deserialize directly. If it works, we're done.
         if let Ok(mut settings) = serde_json::from_str::<Settings>(&content) {
             settings.migrate_legacy_composio_settings();
+            settings.ensure_profile_ids();
+            let had_name_migration = settings.active_composio_profile.as_ref()
+                .is_some_and(|v| !settings.composio_profiles.iter().any(|p| p.id == *v));
+            // Happy-path migration: JSON deserialized cleanly but active_composio_profile
+            // may still hold a legacy profile *name*. Convert it to a stable *id*.
+            // This also runs in the fallback path below (L894) for the same reason — both
+            // paths must independently guarantee the value is ID-based before the app boots.
+            settings.migrate_active_profile_name_to_id();
+            settings.sync_chat_model_to_slots();
+            // Persist migration results so the next launch reads corrected IDs
+            if had_name_migration {
+                if self.save(&settings).is_err() {
+                    tracing::error!("Failed to save migrated settings.");
+                }
+            }
             return settings;
         }
 
@@ -686,12 +889,17 @@ impl SettingsManager {
         // Migration: Ensure all composio profiles have an ID
         // This backfills UUIDs for existing profiles that were created before the 'id' field existed.
         settings.ensure_profile_ids();
+        // Fallback-path migration: field-by-field reconstruction may still leave
+        // active_composio_profile as a legacy name. Defensively convert to ID here too.
+        // (Mirrors the happy-path call at L793.)
+        settings.migrate_active_profile_name_to_id();
 
         // After migrating, save the repaired settings file for the next run.
         if self.save(&settings).is_err() {
             tracing::error!("Failed to save migrated settings.");
         }
 
+        settings.sync_chat_model_to_slots();
         settings
     }
 
@@ -701,6 +909,11 @@ impl SettingsManager {
             fs::create_dir_all(parent)?;
         }
         fs::write(&self.settings_path, content)
+    }
+
+    pub fn save_async(&self, settings: Settings, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
+        let manager = self.clone();
+        crate::async_persist::persist_async(move || manager.save(&settings), "settings", error_signal);
     }
 }
 
@@ -774,9 +987,20 @@ pub struct UiState {
     pub show_profile_selector: bool,
     #[serde(default = "default_true")]
     pub show_attachments_icon: bool,
+    #[serde(default = "default_true")]
+    pub show_model_selector: bool,
+    /// Whether model quick-switch slots section is expanded in settings
+    #[serde(default = "default_true")]
+    pub show_model_slots: bool,
     /// Slug of the toolkit currently selected for BYOA credential setup
     #[serde(default)]
     pub selected_byoa_slug: Option<String>,
+    /// Currently open session tabs (list of session IDs)
+    #[serde(default)]
+    pub open_tabs: Vec<String>,
+    /// Currently focused tab index (0-based)
+    #[serde(default)]
+    pub active_tab_index: usize,
 }
 
 fn default_token_display_mode() -> String {
@@ -796,6 +1020,8 @@ impl Default for UiState {
             unloaded_mcp_servers: Vec::new(),
             active_settings_tab: SettingsTab::default(),
             llm_config_collapsed: false,
+            open_tabs: Vec::new(),
+            active_tab_index: 0,
             mcp_instructions_collapsed: false,
             composio_toolkit_expanded: false,
             selected_byoa_slug: None,
@@ -805,6 +1031,8 @@ impl Default for UiState {
             show_mcp_icon: true,
             show_profile_selector: true,
             show_attachments_icon: true,
+            show_model_selector: true,
+            show_model_slots: true,
         }
     }
 }
@@ -846,4 +1074,116 @@ impl UiStateManager {
         }
         fs::write(&self.state_path, content)
     }
+
+    pub fn save_async(&self, state: UiState, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
+        let manager = self.clone();
+        crate::async_persist::persist_async(move || manager.save(&state), "UI state", error_signal);
+    }
+}
+
+// ============================================================================
+// CHROME PROFILE DISCOVERY
+// ============================================================================
+
+/// Information about a discovered Chrome browser profile
+#[derive(Clone, Debug)]
+pub struct ChromeProfileInfo {
+    /// Chrome's internal directory name (e.g., "Default", "Profile 1")
+    /// This is the value passed to --profile-directory
+    pub dir_name: String,
+    /// User-set display name (e.g., "pugetsystems.com")
+    pub display_name: String,
+    /// Google account email (e.g., "dmoore@pugetsystems.com")
+    pub email: Option<String>,
+}
+
+/// Discover installed Chrome profiles by reading the Local State file.
+/// Returns an empty vec if Chrome is not installed or Local State is unreadable.
+///
+/// TODO(dustmoo): This is called synchronously in the settings panel on every render
+/// when the Chrome Profile dropdown is open — a pattern violation (filesystem I/O on the
+/// main thread). Cache the results in a signal or lazy_static and invalidate on
+/// settings panel open/close. Low-priority: Chrome's Local State is small (~10KB).
+pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
+    let local_state_path = {
+        #[cfg(target_os = "macos")]
+        {
+            dirs::home_dir().map(|h| {
+                h.join("Library/Application Support/Google/Chrome/Local State")
+            })
+        }
+        #[cfg(target_os = "windows")]
+        {
+            dirs::data_local_dir().map(|d| d.join("Google/Chrome/User Data/Local State"))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            dirs::config_dir().map(|c| c.join("google-chrome/Local State"))
+        }
+    };
+
+    let Some(path) = local_state_path else {
+        tracing::debug!("Could not determine Chrome Local State path");
+        return Vec::new();
+    };
+
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("Could not read Chrome Local State: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("Could not parse Chrome Local State: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let Some(info_cache) = json
+        .get("profile")
+        .and_then(|p| p.get("info_cache"))
+        .and_then(|ic| ic.as_object())
+    else {
+        tracing::debug!("No profile.info_cache in Chrome Local State");
+        return Vec::new();
+    };
+
+    let mut profiles: Vec<ChromeProfileInfo> = info_cache
+        .iter()
+        .map(|(dir_name, info)| {
+            let display_name = info
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(dir_name)
+                .to_string();
+            let email = info
+                .get("user_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            ChromeProfileInfo {
+                dir_name: dir_name.clone(),
+                display_name,
+                email,
+            }
+        })
+        .collect();
+
+    // Sort: Default first, then alphabetically by display name
+    profiles.sort_by(|a, b| {
+        if a.dir_name == "Default" {
+            std::cmp::Ordering::Less
+        } else if b.dir_name == "Default" {
+            std::cmp::Ordering::Greater
+        } else {
+            a.display_name.cmp(&b.display_name)
+        }
+    });
+
+    tracing::debug!("Discovered {} Chrome profiles", profiles.len());
+    profiles
 }

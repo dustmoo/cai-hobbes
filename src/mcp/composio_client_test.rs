@@ -83,6 +83,7 @@ mod tests {
             Some("default".to_string()),
             None,
             "test-profile-id".to_string(),
+            None,
         );
 
         let result = client
@@ -160,6 +161,7 @@ mod tests {
             Some("default".to_string()),
             None,
             "test-profile-id".to_string(),
+            None,
         );
 
         let result = client.execute_tool("RAW_TOOL", json!({})).await;
@@ -226,6 +228,7 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
             None,
             None,
             "test-profile-id".to_string(),
+            None,
         );
 
         // 1. Mock list_tools response (tools/list)
@@ -334,6 +337,7 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
             Some("default".to_string()),
             None,
             "test-profile-id".to_string(),
+            None,
         );
 
         // Mock Page 1

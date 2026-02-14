@@ -1,3 +1,4 @@
+// Dioxus Signal types are held across .await — not real locks, just Dioxus marker types.
 #![allow(clippy::await_holding_invalid_type)]
 
 use dioxus::prelude::*;

@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-/// Threshold above which we use LLM-based tool selection instead of enabling all tools
-pub const TOOL_SELECTION_THRESHOLD: usize = 25;
+/// Threshold above which we use LLM-based tool selection instead of enabling all tools.
+/// Set to 50 to stay within Gemini's optimized tool limit.
+pub const TOOL_SELECTION_THRESHOLD: usize = 50;
 
-/// Maximum tools to select for a single toolkit to stay well under Composio's ~1000 tool limit
-pub const MAX_TOOLS_PER_TOOLKIT: usize = 25;
+/// Maximum tools to select for a single toolkit to stay within Gemini's optimized tool limit.
+pub const MAX_TOOLS_PER_TOOLKIT: usize = 50;
 
 /// Request structure for LLM tool selection
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -1,9 +1,12 @@
 use crate::components::confirm_save_modal::ConfirmSaveModal;
 use crate::components::conflict_modal::ConflictModal;
 use crate::components::hotkey_recorder::HotkeyRecorder;
+use crate::components::llm::GeminiModel;
+use crate::components::markdown_renderer::MarkdownRenderer;
+use crate::components::onboarding::TOS_CONTENT;
 use crate::components::tool_credentials::ToolCredentials;
 use crate::mcp::composio_client::validate_composio_api_key;
-use crate::settings::{is_sandboxed, HotkeySettings, Settings, SettingsManager};
+use crate::settings::{get_slot_icon, is_sandboxed, HotkeySettings, Settings, SettingsManager};
 use crate::{context::permissions::ToolCategory, session::SessionState};
 use dioxus::prelude::*;
 use crate::SecretManagerTrait;
@@ -26,6 +29,7 @@ pub fn SettingsPanel() -> Element {
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut secret_manager = use_context::<Signal<crate::secret_manager::SecretManager>>();
+    let save_error = use_context::<crate::components::shared::SaveErrorContext>().0;
 
     // Create a local copy of the settings for editing.
     let mut local_settings = use_signal(|| settings.read().clone());
@@ -40,6 +44,8 @@ pub fn SettingsPanel() -> Element {
     let mut models_error = use_signal(|| Option::<String>::None);
     let skill_registry = use_context::<Signal<crate::skills::registry::SkillRegistry>>();
     let mut models_fetch_trigger = use_signal(|| 0u32);
+    // show_model_slots is now persisted in UiState (defaults to open)
+    let mut picker_open_for_slot: Signal<Option<usize>> = use_signal(|| None);
 
     // Effect to fetch models when API key is available or refresh is triggered
     use_effect(move || {
@@ -90,6 +96,7 @@ pub fn SettingsPanel() -> Element {
     let mut permissions_collapsed = use_signal(|| false);
     let mut show_conflict_modal = use_signal(|| false);
     let mut show_confirm_save_modal = use_signal(|| false);
+    let mut show_tos_modal = use_signal(|| false);
     let mut conflicting_sessions = use_signal(Vec::<(String, crate::session::Session)>::new);
 
     // UI Persistence Helpers
@@ -150,9 +157,7 @@ pub fn SettingsPanel() -> Element {
 
                             if conflicts.is_empty() {
                                 show_conflict_modal.set(false);
-                                if let Err(e) = session_state.write().save() {
-                                    tracing::error!("Failed to save session state after conflict resolution: {}", e);
-                                }
+                                crate::session::SessionState::save_async(session_state.peek().clone(), Some(save_error));
                             }
                         }
                     }
@@ -248,9 +253,9 @@ pub fn SettingsPanel() -> Element {
                         let mut settings_to_save = global_settings.clone();
                         let smithery_key_opt = settings_to_save.smithery_api_key.clone();
                         let gemini_key_opt = settings_to_save.gemini_config.api_key.clone();
-                        // Extract Composio keys to save
+                        // Extract Composio keys to save (using profile ID as keychain key)
                         let composio_keys: Vec<(String, String)> = settings_to_save.composio_profiles.iter()
-                            .filter_map(|p| p.api_key.as_ref().map(|k| (p.name.clone(), k.clone())))
+                            .filter_map(|p| p.api_key.as_ref().map(|k| (p.id.clone(), k.clone())))
                             .collect();
 
                         // We also need to update the settings to store "trimmed" keys if we modify them logic-wise,
@@ -292,22 +297,22 @@ pub fn SettingsPanel() -> Element {
                         let mut secret_updates = Vec::new();
                         if let Some(k) = gemini_key_opt { secret_updates.push(("api_key".to_string(), k)); }
                         if let Some(k) = smithery_key_to_save { secret_updates.push(("smithery_api_key".to_string(), k)); }
-                        tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(n, _)| n).collect::<Vec<_>>());
+                        tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(id, _)| id).collect::<Vec<_>>());
 
                         spawn(async move {
                             // Validate Composio API keys before saving
                             let mut validated_composio_keys = Vec::new();
-                            for (profile_name, key) in composio_keys {
+                            for (profile_id, key) in composio_keys {
                                 if key.trim().is_empty() {
                                     continue; // Skip empty keys
                                 }
                                 match validate_composio_api_key(&key).await {
                                     Ok(()) => {
-                                        tracing::info!("Composio API key for profile '{}' validated successfully", profile_name);
-                                        validated_composio_keys.push((profile_name, key));
+                                        tracing::info!("Composio API key for profile id '{}' validated successfully", profile_id);
+                                        validated_composio_keys.push((profile_id, key));
                                     }
                                     Err(e) => {
-                                        tracing::error!("Invalid Composio API key for profile '{}': {}", profile_name, e);
+                                        tracing::error!("Invalid Composio API key for profile id '{}': {}", profile_id, e);
                                         // Don't save invalid keys - they'll remain unchanged in keychain
                                     }
                                 }
@@ -315,8 +320,8 @@ pub fn SettingsPanel() -> Element {
 
                             // Build final secret updates with validated Composio keys
                             let mut final_secret_updates = secret_updates;
-                            for (profile_name, key) in validated_composio_keys {
-                                final_secret_updates.push((format!("{}{}", crate::secret_manager::COMPOSIO_KEY_PREFIX, profile_name), key));
+                            for (profile_id, key) in validated_composio_keys {
+                                final_secret_updates.push((crate::secret_types::composio_key_name(&profile_id), key));
                             }
                             tracing::debug!("Total validated secret updates: {}", final_secret_updates.len());
 
@@ -588,7 +593,7 @@ pub fn SettingsPanel() -> Element {
                                         class: "mb-4",
                                         div {
                                             class: "flex justify-between items-center mb-1",
-                                            label { class: "block text-sm font-medium text-fg-muted", "Chat Model" }
+                                            label { class: "block text-sm font-medium text-fg-muted", "Active Chat Model" }
                                             if local_settings.read().gemini_config.api_key.is_some() {
                                                 button {
                                                     class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-fg-muted disabled:cursor-not-allowed",
@@ -619,24 +624,36 @@ pub fn SettingsPanel() -> Element {
                                         } else {
                                             select {
                                                 class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                value: "{local_settings.read().gemini_config.chat_model}",
                                                 onchange: move |event| {
                                                     local_settings.write().gemini_config.chat_model = event.value();
                                                 },
-                                                for model in available_models.read().iter() {
-                                                    option {
-                                                        value: "{model.name}",
-                                                        selected: local_settings.read().gemini_config.chat_model == model.name,
-                                                        "{model.display_name}"
+                                                {
+                                                    let current = local_settings.read().gemini_config.chat_model.clone();
+                                                    let models = available_models.read();
+                                                    let in_list = models.iter().any(|m| m.name == current);
+                                                    rsx! {
+                                                        if !current.is_empty() && !in_list {
+                                                            option { value: "{current}", selected: true, "{GeminiModel::from_slug(&current).display_name()}" }
+                                                        }
+                                                        for model in models.iter() {
+                                                            option {
+                                                                value: "{model.name}",
+                                                                selected: model.name == current,
+                                                                "{model.display_name}"
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
+
                                     div {
                                         class: "mb-4",
                                         div {
                                             class: "flex justify-between items-center mb-1",
-                                            label { class: "block text-sm font-medium text-fg-muted", "Summary Model" }
+                                            label { class: "block text-sm font-medium text-fg-muted", "Active Summary Model" }
                                             if local_settings.read().gemini_config.api_key.is_some() {
                                                 button {
                                                     class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-fg-muted disabled:cursor-not-allowed",
@@ -667,14 +684,25 @@ pub fn SettingsPanel() -> Element {
                                         } else {
                                             select {
                                                 class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                value: "{local_settings.read().gemini_config.summary_model}",
                                                 onchange: move |event| {
                                                     local_settings.write().gemini_config.summary_model = event.value();
                                                 },
-                                                for model in available_models.read().iter() {
-                                                    option {
-                                                        value: "{model.name}",
-                                                        selected: local_settings.read().gemini_config.summary_model == model.name,
-                                                        "{model.display_name}"
+                                                {
+                                                    let current = local_settings.read().gemini_config.summary_model.clone();
+                                                    let models = available_models.read();
+                                                    let in_list = models.iter().any(|m| m.name == current);
+                                                    rsx! {
+                                                        if !current.is_empty() && !in_list {
+                                                            option { value: "{current}", selected: true, "{GeminiModel::from_slug(&current).display_name()}" }
+                                                        }
+                                                        for model in models.iter() {
+                                                            option {
+                                                                value: "{model.name}",
+                                                                selected: model.name == current,
+                                                                "{model.display_name}"
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -767,6 +795,150 @@ pub fn SettingsPanel() -> Element {
                                                                 p { class: "text-sm text-yellow-200", "⚠️ This model does not support thinking mode." }
                                                             }
                                                         }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Model Quick-Switch Slots Section
+                                    div {
+                                        class: "mb-4 pt-4 border-t border-subtle",
+                                        div {
+                                            class: "flex justify-between items-center cursor-pointer mb-2 group",
+                                            onclick: move |_| {
+                                                let mut state = ui_state.write();
+                                                state.show_model_slots = !state.show_model_slots;
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            },
+                                            label { class: "block text-sm font-medium text-fg-muted group-hover:text-fg transition-colors", "Model Quick-Switch Slots" }
+                                            span { class: "text-xs text-fg-muted", if ui_state.read().show_model_slots { "▼" } else { "▶" } }
+                                        }
+                                        if ui_state.read().show_model_slots {
+                                            div {
+                                                class: "space-y-3 pl-2 mb-4",
+                                                for i in 0..10 {
+                                                    div {
+                                                        key: "model-slot-{i}",
+                                                        class: "flex items-center gap-3",
+                                                        {
+                                                            let slot_model = local_settings.read().model_slots.get(i).cloned().unwrap_or_default();
+                                                            let effective_icon = if !slot_model.is_empty() {
+                                                                local_settings.read().model_icons.get(&slot_model).cloned()
+                                                                    .unwrap_or_else(|| get_slot_icon(i))
+                                                            } else {
+                                                                get_slot_icon(i)
+                                                            };
+                                                            let has_model = !slot_model.is_empty();
+                                                            rsx! {
+                                                                div {
+                                                                    class: if has_model {
+                                                                        "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm shrink-0 cursor-pointer hover:border-primary-500 transition-all"
+                                                                    } else {
+                                                                        "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm shrink-0"
+                                                                    },
+                                                                    title: if has_model { "Click to change icon" } else { "" },
+                                                                    onclick: move |_| {
+                                                                        if has_model {
+                                                                            let current = picker_open_for_slot();
+                                                                            if current == Some(i) {
+                                                                                picker_open_for_slot.set(None);
+                                                                            } else {
+                                                                                picker_open_for_slot.set(Some(i));
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    "{effective_icon}"
+                                                                }
+                                                            }
+                                                        }
+                                                        div {
+                                                            class: "flex-1",
+                                                            select {
+                                                                class: "block w-full px-2 py-1 bg-input border border-subtle rounded text-xs",
+                                                                onchange: move |evt| {
+                                                                    let mut settings = local_settings.write();
+                                                                    if i < settings.model_slots.len() {
+                                                                        settings.model_slots[i] = evt.value();
+                                                                    } else {
+                                                                        while settings.model_slots.len() <= i {
+                                                                            settings.model_slots.push("".to_string());
+                                                                        }
+                                                                        settings.model_slots[i] = evt.value();
+                                                                    }
+                                                                },
+                                                                {
+                                                                    let current_slot_value = local_settings.read().model_slots.get(i).cloned().unwrap_or_default();
+                                                                    let models = available_models.read();
+                                                                    let current_in_list = models.iter().any(|m| m.name == current_slot_value);
+
+                                                                    rsx! {
+                                                                        option { value: "", selected: current_slot_value.is_empty(), "None" }
+                                                                        if !current_slot_value.is_empty() && !current_in_list {
+                                                                            option {
+                                                                                value: "{current_slot_value}",
+                                                                                selected: true,
+                                                                                "{GeminiModel::from_slug(&current_slot_value).display_name()}"
+                                                                            }
+                                                                        }
+                                                                        for model in models.iter() {
+                                                                            option {
+                                                                                value: "{model.name}",
+                                                                                selected: model.name == current_slot_value,
+                                                                                "{model.display_name}"
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            // Emoji picker popover — only shown when this slot's icon is clicked
+                                                            if picker_open_for_slot() == Some(i) {
+                                                                {
+                                                                    let slot_model_for_picker = local_settings.read().model_slots.get(i).cloned().unwrap_or_default();
+                                                                    if !slot_model_for_picker.is_empty() {
+                                                                        let current_custom = local_settings.read().model_icons.get(&slot_model_for_picker).cloned().unwrap_or_default();
+                                                                        rsx! {
+                                                                            div {
+                                                                                class: "flex gap-1 flex-wrap mt-1 p-1.5 bg-card border border-subtle rounded-lg shadow-lg",
+                                                                                for emoji in ["\u{26a1}", "\u{1f9e0}", "\u{1f34c}", "\u{1f916}", "\u{1f48e}", "\u{1f525}", "\u{2728}", "\u{1f680}", "\u{1f319}", "\u{2b50}"] {
+                                                                                    button {
+                                                                                        class: format!("w-7 h-7 rounded-full bg-section border flex items-center justify-center text-sm transition-all {}",
+                                                                                            if current_custom == emoji { "border-primary-500 ring-1 ring-primary-500/30 scale-110" } else { "border-subtle hover:border-primary-500 hover:scale-110" }
+                                                                                        ),
+                                                                                        onclick: {
+                                                                                            let model = slot_model_for_picker.clone();
+                                                                                            let icon = emoji.to_string();
+                                                                                            move |_| {
+                                                                                                local_settings.write().model_icons.insert(model.clone(), icon.clone());
+                                                                                                picker_open_for_slot.set(None);
+                                                                                            }
+                                                                                        },
+                                                                                        "{emoji}"
+                                                                                    }
+                                                                                }
+                                                                                button {
+                                                                                    class: "w-7 h-7 rounded-full bg-section border border-subtle flex items-center justify-center text-[10px] text-fg-muted hover:border-red-500 hover:text-red-400 transition-all",
+                                                                                    title: "Reset to default",
+                                                                                    onclick: {
+                                                                                        let model = slot_model_for_picker.clone();
+                                                                                        move |_| {
+                                                                                            local_settings.write().model_icons.remove(&model);
+                                                                                            picker_open_for_slot.set(None);
+                                                                                        }
+                                                                                    },
+                                                                                    "✕"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    } else {
+                                                                        rsx! {}
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        span { class: "text-[10px] text-fg-muted font-mono w-6 text-right", "^{i+1}" }
                                                     }
                                                 }
                                             }
@@ -905,8 +1077,9 @@ pub fn SettingsPanel() -> Element {
                                             for profile in local_settings.read().composio_profiles.iter() {
                                                 {
                                                     let profile_name = profile.name.clone();
-                                                    let active_name = local_settings.read().active_composio_profile.clone();
-                                                    let is_active = active_name.as_ref() == Some(&profile_name);
+                                                    let profile_id = profile.id.clone();
+                                                    let active_id = local_settings.read().active_composio_profile.clone();
+                                                    let is_active = active_id.as_ref() == Some(&profile_id);
                                                     rsx! {
                                                         div {
                                                             class: format!("flex items-center justify-between p-2 rounded-md transition-all {}",
@@ -919,14 +1092,17 @@ pub fn SettingsPanel() -> Element {
                                                                     name: "active_profile",
                                                                     checked: is_active,
                                                                     onchange: {
-                                                                        let name = profile_name.clone();
+                                                                        let id = profile_id.clone();
                                                                         let mut global_settings = settings;
-                                                                        move |_| {
-                                                                            tracing::info!("Switching to profile: {}", name);
-                                                                            local_settings.write().active_composio_profile = Some(name.clone());
-                                                                            // RACE CONDITION FIX: Immediately propagate changes to global settings
-                                                                            global_settings.write().active_composio_profile = Some(name.clone());
-                                                                        }
+                                                                         move |_| {
+                                                                             tracing::info!("Switching to profile ID: {}", id);
+                                                                             local_settings.write().active_composio_profile = Some(id.clone());
+                                                                             global_settings.write().active_composio_profile = Some(id.clone());
+                                                                             // Update the active session so the sync effect doesn't snap back
+                                                                             if let Some(session) = session_state.write().get_active_session_mut() {
+                                                                                 session.composio_profile = Some(id.clone());
+                                                                             }
+                                                                         }
                                                                     }
                                                                 }
                                                                 span {
@@ -943,10 +1119,10 @@ pub fn SettingsPanel() -> Element {
                                                             button {
                                                                 class: "text-xs font-medium text-red-500 hover:text-red-400 transition-colors uppercase tracking-tight",
                                                                 onclick: {
-                                                                    let name = profile_name.clone();
-                                                                    move |_| {
-                                                                        local_settings.write().remove_profile(&name);
-                                                                    }
+                                                                    let id = profile_id.clone();
+                                                                     move |_| {
+                                                                         local_settings.write().remove_profile(&id);
+                                                                     }
                                                                 },
                                                                 "Remove"
                                                             }
@@ -957,10 +1133,16 @@ pub fn SettingsPanel() -> Element {
                                         }
 
                                         // Edit active profile
-                                        if let Some(active_name) = local_settings.read().active_composio_profile.clone() {
+                                        if let Some((active_id, active_display_name)) = {
+                                            let s = local_settings.read();
+                                            s.active_composio_profile.as_ref()
+                                                .and_then(|id| s.composio_profiles.iter()
+                                                    .find(|p| p.id == *id)
+                                                    .map(|p| (id.clone(), p.name.clone())))
+                                        } {
                                             div {
                                                 class: "border border-subtle rounded-lg p-3",
-                                                h4 { class: "text-sm font-medium text-fg-muted mb-3", "Edit Profile: {active_name}" }
+                                                h4 { class: "text-sm font-medium text-fg-muted mb-3", "Edit Profile: {active_display_name}" }
 
                                                 // Profile Name
                                                 div {
@@ -968,20 +1150,19 @@ pub fn SettingsPanel() -> Element {
                                                     label { class: "block text-xs font-medium text-fg-muted mb-1", "Profile Name" }
                                                     input {
                                                         class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm",
-                                                        value: "{active_name}",
+                                                        value: "{active_display_name}",
                                                         oninput: {
-                                                            let old_name = active_name.clone();
-                                                            move |event: Event<FormData>| {
-                                                                let new_name = event.value();
-                                                                let mut settings = local_settings.write();
-                                                                if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == old_name) {
-                                                                    profile.name = new_name.clone();
-                                                                }
-                                                                if settings.active_composio_profile.as_ref() == Some(&old_name) {
-                                                                    settings.active_composio_profile = Some(new_name);
-                                                                }
-                                                            }
-                                                        }
+                                                            let id = active_id.clone();
+                                                             move |event: Event<FormData>| {
+                                                                 let new_name = event.value();
+                                                                 let mut settings = local_settings.write();
+                                                                 if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.id == id) {
+                                                                     profile.name = new_name.clone();
+                                                                 }
+                                                                 // active_composio_profile stores ID — no update needed on rename
+                                                             }
+                                                        },
+                                                        onkeydown: |e| e.stop_propagation(),
                                                     }
                                                 }
 
@@ -1010,8 +1191,54 @@ pub fn SettingsPanel() -> Element {
                                                         }
                                                     }
                                                 }
+                                                // Chrome Profile (Auth Security)
+                                                div {
+                                                    class: "mb-3",
+                                                    label { class: "block text-xs font-medium text-fg-muted mb-1", "Chrome Profile for Auth" }
+                                                    div {
+                                                        class: "flex gap-2",
+                                                        select {
+                                                            class: "flex-1 px-3 py-2 bg-input border border-primary-600 rounded-md text-sm",
+                                                            onchange: {
+                                                                let id = active_id.clone();
+                                                                move |evt: Event<FormData>| {
+                                                                    let val = evt.value();
+                                                                    let mut settings = local_settings.write();
+                                                                    if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.id == id) {
+                                                                        profile.chrome_profile_directory = if val.is_empty() { None } else { Some(val) };
+                                                                    }
+                                                                }
+                                                            },
+                                                            {
+                                                                let current_chrome = local_settings.read().get_active_profile()
+                                                                    .and_then(|p| p.chrome_profile_directory.clone())
+                                                                    .unwrap_or_default();
+                                                                 let chrome_profiles_signal = use_signal(crate::settings::discover_chrome_profiles);
+                                                                 let chrome_profiles = chrome_profiles_signal.read();
+                                                                rsx! {
+                                                                    option { value: "", selected: current_chrome.is_empty(), "System Default (any window)" }
+                                                                    for cp in chrome_profiles.iter() {
+                                                                        option {
+                                                                            value: "{cp.dir_name}",
+                                                                            selected: current_chrome == cp.dir_name,
+                                                                            if let Some(ref email) = cp.email {
+                                                                                "{cp.display_name} — {email}"
+                                                                            } else {
+                                                                                "{cp.display_name}"
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    p {
+                                                        class: "text-xs text-fg-muted mt-1",
+                                                        "Ensures OAuth opens in the correct Chrome profile window."
+                                                    }
+                                                }
 
-                                                // API Key - FIRST (this is the required entry point)
+
                                                 div {
                                                     class: "mb-3",
                                                     label { class: "block text-xs font-medium text-fg-muted mb-1", "API Key" }
@@ -1021,15 +1248,16 @@ pub fn SettingsPanel() -> Element {
                                                         placeholder: "Enter your Composio API key from composio.dev/settings",
                                                         value: "{local_settings.read().get_active_profile().and_then(|p| p.api_key.clone()).unwrap_or_default()}",
                                                         oninput: {
-                                                            let name = active_name.clone();
+                                                            let id = active_id.clone();
                                                             move |event: Event<FormData>| {
                                                                 let val = event.value();
                                                                 let mut settings = local_settings.write();
-                                                                if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.id == id) {
                                                                     profile.api_key = if val.is_empty() { None } else { Some(val) };
                                                                 }
                                                             }
-                                                        }
+                                                        },
+                                                        onkeydown: |e| e.stop_propagation(),
                                                     }
                                                     p {
                                                         class: "text-xs text-fg-muted mt-1",
@@ -1095,10 +1323,10 @@ pub fn SettingsPanel() -> Element {
                                                                     class: "px-3 py-2 bg-input hover:bg-white/10 border border-primary-600 rounded-md text-fg-muted transition-colors",
                                                                     title: "Regenerate User ID",
                                                                     onclick: {
-                                                                        let name = active_name.clone();
+                                                                        let id = active_id.clone();
                                                                         move |_| {
                                                                             let mut settings = local_settings.write();
-                                                                            if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                            if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.id == id) {
                                                                                 profile.user_id = Some(uuid::Uuid::new_v4().to_string().to_lowercase());
                                                                             }
                                                                         }
@@ -1117,7 +1345,7 @@ pub fn SettingsPanel() -> Element {
                                                                 placeholder: "Auto-created when you connect your first tool",
                                                                 value: "{local_settings.read().get_active_profile().and_then(|p| p.base_url.clone()).unwrap_or_default()}",
                                                                 oninput: {
-                                                                    let name = active_name.clone();
+                                                                    let id = active_id.clone();
                                                                     move |event: Event<FormData>| {
                                                                         let val = event.value();
                                                                         let mut clean_val = val.clone();
@@ -1149,7 +1377,7 @@ pub fn SettingsPanel() -> Element {
                                                                         composio_url_warning.set(warning);
 
                                                                         let mut settings = local_settings.write();
-                                                                        if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                        if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.id == id) {
                                                                             profile.base_url = if clean_val.is_empty() { None } else { Some(clean_val) };
                                                                         }
                                                                     }
@@ -1405,6 +1633,24 @@ pub fn SettingsPanel() -> Element {
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
                                                 state.show_attachments_icon = e.value() == "true";
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+
+                                    // Model Selector
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-fg-muted", "Show Model Selector" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                            checked: "{ui_state.read().show_model_selector}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.show_model_selector = e.value() == "true";
                                                 let state_clone = (*state).clone();
                                                 let manager = ui_state_manager.read().clone();
                                                 spawn(async move { let _ = manager.save(&state_clone); });
@@ -1844,6 +2090,7 @@ pub fn SettingsPanel() -> Element {
                                                 match serde_json::from_str::<SessionState>(&contents) {
                                                     Ok(imported_state) => {
                                                         let mut current_state = session_state.write();
+                                                        // Intentional: branches have different side effects (insert vs. push to conflict list).
                                                         #[allow(clippy::map_entry)]
                                                         for (id, session) in imported_state.sessions {
                                                             if current_state.sessions.contains_key(&id) {
@@ -1857,11 +2104,8 @@ pub fn SettingsPanel() -> Element {
                                                         if !conflicting_sessions.read().is_empty() {
                                                             show_conflict_modal.set(true);
                                                         } else {
-                                                            if let Err(e) = current_state.save() {
-                                                                tracing::error!("Failed to save updated session state: {}", e);
-                                                            } else {
-                                                                tracing::info!("Successfully imported history with no conflicts.");
-                                                            }
+                                                            crate::session::SessionState::save_async(current_state.clone(), Some(save_error));
+                                                            tracing::info!("Successfully imported history with no conflicts.");
                                                         }
                                                     },
                                                     Err(e) => {
@@ -2232,6 +2476,81 @@ pub fn SettingsPanel() -> Element {
                                         }
                                     }
 
+                                    div { class: "pt-2 pb-1", h4 { class: "text-xs font-bold text-fg-muted uppercase tracking-wider", "Session Tabs" } }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 1" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_1.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_1 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 2" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_2.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_2 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 3" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_3.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_3 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 4" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_4.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_4 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 5" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_5.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_5 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 6" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_6.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_6 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 7" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_7.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_7 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 8" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_8.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_8 = v,
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Switch to Tab 9" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.switch_tab_9.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_9 = v,
+                                        }
+                                    }
+
                                     // Reset to Defaults button
                                     div {
                                         class: "pt-4 border-t border-gray-800",
@@ -2291,10 +2610,9 @@ pub fn SettingsPanel() -> Element {
                         // Legal links
                         div {
                             class: "flex gap-4",
-                            a {
-                                class: "text-sm text-primary-400 hover:text-primary-300 underline",
-                                href: "https://clearmirror.ai/terms-of-service",
-                                target: "_blank",
+                            button {
+                                class: "text-sm text-primary-400 hover:text-primary-300 underline cursor-pointer bg-transparent border-none p-0",
+                                onclick: move |_| show_tos_modal.set(true),
                                 "Terms of Service"
                             }
                             a {
@@ -2302,6 +2620,46 @@ pub fn SettingsPanel() -> Element {
                                 href: "https://clearmirror.ai/privacy-policy",
                                 target: "_blank",
                                 "Privacy Policy"
+                            }
+                        }
+
+                        // TOS Modal
+                        if show_tos_modal() {
+                            div {
+                                class: "fixed inset-0 bg-black/60 flex items-center justify-center z-50",
+                                onclick: move |_| show_tos_modal.set(false),
+                                div {
+                                    class: "bg-section rounded-lg shadow-xl max-w-lg w-full mx-4 max-h-[80vh] flex flex-col",
+                                    onclick: move |e| e.stop_propagation(),
+                                    // Header
+                                    div {
+                                        class: "flex justify-between items-center p-4 border-b border-subtle",
+                                        h2 { class: "text-lg font-bold", "Terms of Service" }
+                                        button {
+                                            class: "text-fg-muted hover:text-fg text-xl font-bold w-8 h-8 flex items-center justify-center rounded hover:bg-input transition-colors",
+                                            onclick: move |_| show_tos_modal.set(false),
+                                            "×"
+                                        }
+                                    }
+                                    // Content
+                                    div {
+                                        class: "flex-1 overflow-y-auto p-4 text-sm prose prose-sm dark:prose-invert max-w-none",
+                                        MarkdownRenderer {
+                                            content: TOS_CONTENT.to_string(),
+                                            comments: None,
+                                            pending_highlight: None,
+                                        }
+                                    }
+                                    // Footer
+                                    div {
+                                        class: "p-4 border-t border-subtle",
+                                        button {
+                                            class: "w-full py-2 px-4 bg-btn-primary hover:bg-btn-primary-hover rounded-md font-bold transition-colors",
+                                            onclick: move |_| show_tos_modal.set(false),
+                                            "Close"
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2335,7 +2693,7 @@ pub fn SettingsPanel() -> Element {
                             let smithery_key_opt = settings_to_save.smithery_api_key.clone();
                             let gemini_key_opt = settings_to_save.gemini_config.api_key.clone();
                             let composio_keys: Vec<(String, String)> = settings_to_save.composio_profiles.iter()
-                                .filter_map(|p| p.api_key.as_ref().map(|k| (p.name.clone(), k.clone())))
+                                .filter_map(|p| p.api_key.as_ref().map(|k| (p.id.clone(), k.clone())))
                                 .collect();
 
                             let smithery_key_to_save = smithery_key_opt.map(|k| k.trim().to_string());
@@ -2351,17 +2709,17 @@ pub fn SettingsPanel() -> Element {
                             spawn(async move {
                                 // Validate Composio API keys before saving
                                 let mut validated_composio_keys = Vec::new();
-                                for (profile_name, key) in composio_keys {
+                                for (profile_id, key) in composio_keys {
                                     if key.trim().is_empty() {
                                         continue; // Skip empty keys
                                     }
                                     match validate_composio_api_key(&key).await {
                                         Ok(()) => {
-                                            tracing::info!("Composio API key for profile '{}' validated successfully", profile_name);
-                                            validated_composio_keys.push((profile_name, key));
+                                            tracing::info!("Composio API key for profile id '{}' validated successfully", profile_id);
+                                            validated_composio_keys.push((profile_id, key));
                                         }
                                         Err(e) => {
-                                            tracing::error!("Invalid Composio API key for profile '{}': {}", profile_name, e);
+                                            tracing::error!("Invalid Composio API key for profile id '{}': {}", profile_id, e);
                                             // Don't save invalid keys - they'll remain unchanged in keychain
                                         }
                                     }
@@ -2369,8 +2727,8 @@ pub fn SettingsPanel() -> Element {
 
                                 // Build final secret updates with validated Composio keys
                                 let mut final_secret_updates = secret_updates;
-                                for (profile_name, key) in validated_composio_keys {
-                                    final_secret_updates.push((format!("{}{}", crate::secret_manager::COMPOSIO_KEY_PREFIX, profile_name), key));
+                                for (profile_id, key) in validated_composio_keys {
+                                    final_secret_updates.push((crate::secret_types::composio_key_name(&profile_id), key));
                                 }
                                 tracing::debug!("Total validated secret updates: {}", final_secret_updates.len());
 

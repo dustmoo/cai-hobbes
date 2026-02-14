@@ -74,7 +74,7 @@ pub struct ActiveContext {
     pub force_tool_use_instruction: Option<String>,
     pub conversation_summary: ConversationSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mcp_tools: Option<McpContext>, // Keep for now for other potential uses
+    pub mcp_tools: Option<McpContext>, // Fixed: Restored field as it is still used in chat.rs/prompt_builder.rs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolWrapper>>,
     #[serde(flatten)]
@@ -98,6 +98,10 @@ pub struct Session {
     pub accumulated_turns: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_optimization_summary: Option<String>,
+    /// The specific Composio profile bound to this session.
+    /// Acts as the live authority for tool-calling/MCP context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composio_profile: Option<String>,
 }
 
 impl Session {
@@ -435,7 +439,7 @@ impl SessionState {
         Ok(())
     }
 
-    pub fn create_session(&mut self) -> String {
+    pub fn create_session_raw(&mut self, initial_profile: Option<String>) -> String {
         let new_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Local::now();
         let new_session = Session {
@@ -448,16 +452,20 @@ impl SessionState {
             accumulated_tokens: 0,
             accumulated_turns: 0,
             memory_optimization_summary: None,
+            composio_profile: initial_profile,
         };
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id.clone();
-        if let Err(e) = self.save() {
-            tracing::error!("Failed to save session state after creating session: {}", e);
-        }
         new_id
     }
 
-    pub fn delete_session(&mut self, id: &str) {
+    pub fn create_session(&mut self, initial_profile: Option<String>) -> String {
+        let new_id = self.create_session_raw(initial_profile);
+        Self::save_async(self.clone(), None);
+        new_id
+    }
+
+    pub fn delete_session_raw(&mut self, id: &str) {
         self.sessions.remove(id);
 
         if self.active_session_id == id {
@@ -471,10 +479,11 @@ impl SessionState {
         } else if self.sessions.is_empty() {
             self.active_session_id = String::new();
         }
+    }
 
-        if let Err(e) = self.save() {
-            tracing::error!("Failed to save session state after deleting session: {}", e);
-        }
+    pub fn delete_session(&mut self, id: &str) {
+        self.delete_session_raw(id);
+        Self::save_async(self.clone(), None);
     }
 
     pub fn get_active_session(&self) -> Option<&Session> {
@@ -485,23 +494,40 @@ impl SessionState {
         self.sessions.get_mut(&self.active_session_id)
     }
 
-    pub fn touch_active_session(&mut self) {
-        if let Some(session) = self.sessions.get_mut(&self.active_session_id) {
+
+    /// Touch (update `last_updated`) on a specific session by ID.
+    /// Used by stream_manager to target the originating session after a tab switch.
+    pub fn touch_session(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
             session.last_updated = Utc::now();
         }
     }
-    pub fn set_active_session(&mut self, id: String) {
-        self.active_session_id = id;
-        if let Err(e) = self.save() {
-            tracing::error!(
-                "Failed to save session state after setting active session: {}",
-                e
-            );
+
+    /// Look up a message by UUID within a specific session (not the active one).
+    /// Used by stream_manager to write streaming data to the originating session.
+    pub fn get_message_mut_in_session(
+        &mut self,
+        session_id: &str,
+        message_id: &uuid::Uuid,
+    ) -> Option<&mut super::components::chat::Message> {
+        self.sessions
+            .get_mut(session_id)
+            .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
+    }
+
+    /// Remove a message from a specific session by ID.
+    /// Used by cancel_stream to target the originating session after a tab switch.
+    pub fn remove_message_in_session(&mut self, session_id: &str, message_id: &uuid::Uuid) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            if let Some(index) = session.messages.iter().position(|m| m.id == *message_id) {
+                session.messages.remove(index);
+                tracing::info!(message_id = %message_id, session_id = %session_id, "Removed message from target session.");
+            }
         }
     }
 
+
     pub fn update_window_size(&mut self, width: f64, height: f64) {
-        tracing::debug!("Updating window size in state to: {}x{}", width, height);
         self.window_width = width;
         self.window_height = height;
         // Note: Save is now handled asynchronously by the caller to avoid UI hang.
@@ -510,24 +536,28 @@ impl SessionState {
 
     /// Saves the session state to disk on a background thread.
     /// This prevents blocking the main UI thread during file I/O.
-    pub fn save_async(state: SessionState) {
-        std::thread::spawn(move || {
-            if let Err(e) = state.save() {
-                tracing::error!("Failed to save session state async: {}", e);
-            }
-        });
+    /// If `error_signal` is provided, save failures will be surfaced to the UI.
+    ///
+    /// **Design Note:** The caller passes a cloned `SessionState` by value (not by reference),
+    /// which means the full state — including all sessions and messages — is cloned before
+    /// being moved into the spawned task. This is an intentional trade-off: serializing on the
+    /// main thread would block the UI for the entire JSON encoding duration, whereas the clone
+    /// cost (proportional to total message count) is typically negligible for normal usage.
+    /// For extremely large states this could become a bottleneck; a future optimization could
+    /// serialize into bytes on the main thread (fast memcpy) and only do file I/O async.
+    pub fn save_async(state: SessionState, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
+        crate::async_persist::persist_async(move || state.save(), "session state", error_signal);
+    }
+
+    pub fn update_session_name_raw(&mut self, id: &str, new_name: String) {
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.name = new_name;
+        }
     }
 
     pub fn update_session_name(&mut self, id: &str, new_name: String) {
-        if let Some(session) = self.sessions.get_mut(id) {
-            session.name = new_name;
-            if let Err(e) = self.save() {
-                tracing::error!(
-                    "Failed to save session state after updating session name: {}",
-                    e
-                );
-            }
-        }
+        self.update_session_name_raw(id, new_name);
+        Self::save_async(self.clone(), None);
     }
     pub fn get_message_mut(
         &mut self,
@@ -537,14 +567,6 @@ impl SessionState {
             .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
     }
 
-    pub fn remove_message(&mut self, message_id: &uuid::Uuid) {
-        if let Some(session) = self.get_active_session_mut() {
-            if let Some(index) = session.messages.iter().position(|m| m.id == *message_id) {
-                session.messages.remove(index);
-                tracing::info!(message_id = %message_id, "Removed message from active session.");
-            }
-        }
-    }
     pub fn get_message_mut_by_execution_id(
         &mut self,
         execution_id: &str,
@@ -560,6 +582,31 @@ impl SessionState {
                 _ => false,
             })
         })
+    }
+
+    /// Migrate session composio_profile from name-based to ID-based.
+    /// Any session whose composio_profile matches a profile name (but not an ID)
+    /// gets updated to the corresponding profile ID.
+    pub fn migrate_session_profiles_to_ids(&mut self, settings: &crate::settings::Settings) -> bool {
+        let mut migrated = false;
+        for session in self.sessions.values_mut() {
+            if let Some(ref value) = session.composio_profile {
+                // Already an ID — skip
+                if settings.composio_profiles.iter().any(|p| &p.id == value) {
+                    continue;
+                }
+                // Match by name → replace with ID
+                if let Some(profile) = settings.composio_profiles.iter().find(|p| &p.name == value) {
+                    tracing::info!(
+                        "Migrating session '{}' composio_profile from name '{}' to id '{}'",
+                        session.id, value, profile.id
+                    );
+                    session.composio_profile = Some(profile.id.clone());
+                    migrated = true;
+                }
+            }
+        }
+        migrated
     }
 }
 impl Default for SessionState {

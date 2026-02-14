@@ -1,5 +1,4 @@
 use super::auth::{initiate_connection, list_auth_configs, list_connected_accounts};
-use super::discovery::get_toolkit_tools;
 use super::models::*;
 use super::utils::write_to_debug_file;
 use super::ComposioClient;
@@ -257,6 +256,12 @@ pub async fn add_toolkit_to_server(
     let mut use_all_tools = false;
     let tools_added = if let Some(pre_selected) = selected_tools {
         // Use pre-selected tools (from LLM smart selection)
+        
+        // PRUNING FIX: Remove existing tools for THIS toolkit before adding selection.
+        // This ensures the AI's selection actually replaces the "all tools" default.
+        let prefix = format!("{}_", toolkit_slug.to_uppercase().replace("-", "_"));
+        custom_tools.retain(|t| !t.to_uppercase().starts_with(&prefix));
+
         let mut added = 0;
         for tool in pre_selected {
             if !custom_tools.contains(&tool) {
@@ -272,44 +277,13 @@ pub async fn add_toolkit_to_server(
         );
         added
     } else {
-        // Fetch all tools for the toolkit and add any missing ones
-        match get_toolkit_tools(client, toolkit_slug).await {
-            Ok(new_tools) if !new_tools.is_empty() => {
-                let mut added = 0;
-                for tool in new_tools {
-                    if !custom_tools.contains(&tool) {
-                        custom_tools.push(tool);
-                        added += 1;
-                    }
-                }
-                tracing::info!(
-                    "Auto-enabling {} new tools for toolkit '{}' (total: {})",
-                    added,
-                    toolkit_slug,
-                    custom_tools.len()
-                );
-                added
-            }
-            Ok(_) => {
-                // THE VACUUM FIX: If prefix matching returned 0 tools, do NOT patch an empty list.
-                // Setting use_all_tools=true will cause us to OMIT the allowed_tools field.
-                tracing::info!(
-                    "No tools found via prefix for toolkit '{}'. Defaulting to ALL tools to prevent vacuum.",
-                    toolkit_slug
-                );
-                use_all_tools = true;
-                0
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Could not auto-fetch tools for toolkit '{}': {}. Defaulting to ALL.",
-                    toolkit_slug,
-                    e
-                );
-                use_all_tools = true;
-                0
-            }
-        }
+        // Step 3 path: No tools specified - do NOT fetch/add all tools here.
+        // We set use_all_tools=true to OMIT the allowed_tools field from the PATCH payload,
+        // which lets the Composio backend default to allowing all tools for this toolkit
+        // until Step 4 (Smart Selection) runs and applies a specific filter.
+        tracing::info!("No tools specified for '{}'. Toolkit/auth binding only.", toolkit_slug);
+        use_all_tools = true;
+        0
     };
 
     // Skip PATCH if no changes needed (toolkit exists, auth bound, and no new tools)
@@ -1052,3 +1026,4 @@ pub async fn execute_tool(
         session_info,
     })
 }
+

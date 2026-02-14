@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+// Discovery always uses v1beta — all models are listed here regardless of generation endpoint version
 const MODELS_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 

@@ -23,6 +23,7 @@ pub fn MarkdownRenderer(
 
         // --- Intermediate Representation (IR) ---
         #[derive(Debug, Clone)]
+        // IR naming convention: "Block" suffix aids readability in the parser.
         #[allow(clippy::enum_variant_names)]
         enum Block {
             Header {
@@ -605,6 +606,7 @@ pub fn MarkdownRenderer(
         let comments_ref = comments.as_ref();
         let pending_highlight_ref = pending_highlight.as_ref();
 
+        // False positive: `comments` and `pending_highlight` are used in the Text match arm.
         #[allow(clippy::only_used_in_recursion)]
         fn render_node(
             node: RenderNode,

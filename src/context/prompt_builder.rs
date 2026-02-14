@@ -336,10 +336,10 @@ impl<'a> PromptBuilder<'a> {
             .iter()
             .any(|p| p.is_fully_configured())
         {
-            let active_profile_name = self
-                .settings
-                .get_active_profile()
-                .map(|p| p.name.as_str())
+            let profile_id = self.session.composio_profile.as_deref()
+                .or(self.settings.active_composio_profile.as_deref());
+            let active_profile_name = profile_id
+                .and_then(|id| self.settings.profile_name_for_id(id))
                 .unwrap_or("Default");
 
             system_context_map.insert(
@@ -353,30 +353,36 @@ impl<'a> PromptBuilder<'a> {
         }
 
         // Extract active skill context from messages and inject into system instruction
-        // This ensures resolved tool mappings have high priority in the model's context
+        // This ensures skill instructions and resolved tool mappings have high priority in the model's context
         for message in &self.session.messages {
             if let MessageContent::SkillCall(sc) = &message.content {
                 if matches!(sc.status, crate::components::shared::SkillCallStatus::Completed) {
                     // Parse the response to extract the CapabilityContextPayload
                     if let Ok(payload) = serde_json::from_str::<crate::components::shared::CapabilityContextPayload>(&sc.response) {
-                        if !payload.resolved_tools.is_empty() {
-                            let tool_mappings: Vec<serde_json::Value> = payload.resolved_tools.iter()
-                                .map(|(capability, tool_name)| json!({
-                                    "capability": capability,
-                                    "use_tool": tool_name
-                                }))
-                                .collect();
-                            
-                            system_context_map.insert(
-                                "active_skill".to_string(),
-                                json!({
-                                    "name": sc.skill_name,
-                                    "instruction": format!("PRIORITY: Use these specific tools for the '{}' skill. Do NOT use Composio discovery tools.", sc.skill_name),
-                                    "resolved_tools": tool_mappings,
-                                    "arguments": sc.arguments
-                                })
-                            );
-                        }
+                        // Build tool mappings if available
+                        let tool_mappings: Vec<serde_json::Value> = payload.resolved_tools.iter()
+                            .map(|(capability, tool_name)| json!({
+                                "capability": capability,
+                                "use_tool": tool_name
+                            }))
+                            .collect();
+                        
+                        // CRITICAL: Include the instruction_manual - this is the actual skill content!
+                        // Previously this was being ignored, causing skills to not be followed.
+                        system_context_map.insert(
+                            "active_skill".to_string(),
+                            json!({
+                                "name": sc.skill_name,
+                                "priority_instruction": format!(
+                                    "CRITICAL: You are executing the '{}' skill. Follow the instructions below EXACTLY. Do NOT improvise or use generic approaches.",
+                                    sc.skill_name
+                                ),
+                                "instruction_manual": payload.instruction_manual,
+                                "resolved_tools": tool_mappings,
+                                "arguments": sc.arguments,
+                                "warnings": payload.warnings
+                            })
+                        );
                     }
                 }
             }
@@ -493,8 +499,9 @@ impl<'a> PromptBuilder<'a> {
                         }
 
                         // Sanitize tool name - CRITICAL: Must match the sanitized name used in declarations
-                        let sanitized_tool_name = crate::gemini::convert::sanitize_function_name(
-                            &format!("{}_{}", tc.server_name, tc.tool_name),
+                        let sanitized_tool_name = crate::gemini::convert::get_prefixed_tool_name(
+                            &tc.server_name,
+                            &tc.tool_name,
                         );
 
                         // 1. Add the model's function call
@@ -701,6 +708,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    // 3.14 is a test fixture enum value in the mock JSON schema, not π.
     #[allow(clippy::approx_constant)]
     fn create_mock_session_with_tools() -> Session {
         let tool1: Tool = serde_json::from_value(json!({
@@ -849,6 +857,7 @@ mod tests {
             accumulated_tokens: 0,
             accumulated_turns: 0,
             memory_optimization_summary: None,
+            composio_profile: None,
         }
     }
 
@@ -1073,6 +1082,7 @@ mod tests {
             accumulated_tokens: 0,
             accumulated_turns: 0,
             memory_optimization_summary: None,
+            composio_profile: None,
         };
 
         let settings = Settings::default();
@@ -1282,6 +1292,7 @@ mod tests {
             accumulated_tokens: 0,
             accumulated_turns: 0,
             memory_optimization_summary: None,
+            composio_profile: None,
         };
 
         let settings = Settings::default();

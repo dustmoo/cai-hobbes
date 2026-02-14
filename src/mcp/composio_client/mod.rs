@@ -38,9 +38,10 @@ pub struct ComposioClient {
     pub(crate) custom_auth_creds: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
     /// Cached connected toolkit info for Status panel (ephemeral, invalidated on profile change)
     pub(crate) cached_toolkit_info: Arc<RwLock<Option<Vec<ToolkitInfo>>>>,
+    /// Chrome profile directory for scoped auth URL launching (e.g., "Default", "Profile 1")
+    pub chrome_profile_directory: Option<String>,
 }
 
-#[allow(dead_code)]
 impl ComposioClient {
     /// Initialize a new ComposioClient.
     ///
@@ -56,6 +57,7 @@ impl ComposioClient {
         entity_id: Option<String>,
         user_id: Option<String>,
         profile_id: String,
+        chrome_profile_directory: Option<String>,
     ) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -77,6 +79,7 @@ impl ComposioClient {
             custom_auth_creds: Arc::new(RwLock::new(HashMap::new())),
             context_store,
             cached_toolkit_info: Arc::new(RwLock::new(None)),
+            chrome_profile_directory,
         }
     }
 
@@ -118,25 +121,13 @@ impl ComposioClient {
 
     // --- Auth Module Delegates ---
 
-    pub async fn list_auth_configs(&self) -> Result<Vec<AuthConfigInfo>, String> {
-        auth::list_auth_configs(self).await
-    }
-
-    pub(crate) async fn get_auth_config_id(&self, toolkit_slug: &str) -> Result<String, String> {
-        auth::get_auth_config_id(self, toolkit_slug).await
-    }
-
-    pub(crate) async fn list_connected_accounts(&self) -> Result<Vec<ConnectedAccount>, String> {
-        auth::list_connected_accounts(self).await
-    }
-
-    pub(crate) async fn create_auth_config(
+    /// Get existing auth config ID for a toolkit, or create one if not found.
+    /// Prefers cached/existing configs to avoid duplicates.
+    pub(crate) async fn get_auth_config_id(
         &self,
         toolkit_slug: &str,
-        auth_scheme: Option<&str>,
-        use_managed: bool,
     ) -> Result<String, String> {
-        auth::create_auth_config(self, toolkit_slug, auth_scheme, use_managed).await
+        auth::get_auth_config_id(self, toolkit_slug).await
     }
 
     pub async fn initiate_connection(
@@ -178,23 +169,11 @@ impl ComposioClient {
         discovery::get_connected_toolkit_slugs(self).await
     }
 
-    pub async fn get_toolkit_tools(&self, toolkit_slug: &str) -> Result<Vec<String>, String> {
-        discovery::get_toolkit_tools(self, toolkit_slug).await
-    }
-
     pub async fn get_toolkit_tools_detailed(
         &self,
         toolkit_slug: &str,
     ) -> Result<Vec<(String, Option<String>)>, String> {
         discovery::get_toolkit_tools_detailed(self, toolkit_slug).await
-    }
-
-    pub async fn search_tools(
-        &self,
-        query: &str,
-        toolkit_slugs: &[String],
-    ) -> Result<Vec<ComposioTool>, String> {
-        discovery::search_tools(self, query, toolkit_slugs).await
     }
 
     pub async fn list_tools_for_session(
@@ -244,11 +223,4 @@ impl ComposioClient {
         }
     }
 
-    /// Invalidate the toolkit info cache (call on profile change or toolkit install/remove)
-    pub fn invalidate_toolkit_cache(&self) {
-        if let Ok(mut cache) = self.cached_toolkit_info.write() {
-            *cache = None;
-            tracing::debug!("Invalidated toolkit info cache");
-        }
-    }
 }

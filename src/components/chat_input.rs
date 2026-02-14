@@ -1,3 +1,4 @@
+// Dioxus Signal types are held across .await — not real locks, just Dioxus marker types.
 #![allow(clippy::await_holding_invalid_type)]
 
 use base64::{engine::general_purpose, Engine as _};
@@ -10,11 +11,12 @@ use std::time::SystemTime;
 
 #[cfg(debug_assertions)]
 use crate::context::prompt_builder::PromptBuilder;
-use crate::settings::{Settings, SettingsManager, UiState};
+use crate::components::llm::GeminiModel;
+use crate::settings::{get_default_model_icon, get_slot_icon, Settings, SettingsManager, UiState};
 use hobbes_core::models::Attachment;
 
 use crate::components::focus_context::FocusContext;
-use crate::components::shared::ChatBarIconButton;
+use crate::components::shared::{ChatBarIconButton, DraftContext, SessionIdContext};
 use crate::components::skill_autocomplete::SkillAutocomplete;
 use crate::hotkey::matches_hotkey;
 use crate::processing::summarization_scheduler::SchedulerSignal;
@@ -31,11 +33,21 @@ pub enum ChatCommand {
     NewChatWithMemory,
     ScrollToBottom,
     FocusChat,
-    DeleteSession,
+    DeleteSession(String),
     CancelGeneration,
     CopyToDraft(String),
     TriggerAiAnalysis,
     SwitchToSettingsTab(crate::settings::SettingsTab, Option<String>),
+    SwitchTab(usize),
+    SwitchToSession(String),
+    /// Switch the current session's profile to the profile at this index.
+    SwitchProfile(usize),
+    /// Switch the current session's model to the model at this index in the available models list.
+    SwitchModel(usize),
+    /// Toggle the model selector dropdown in the chat bar.
+    #[allow(dead_code)] // Constructed and consumed locally via signal pattern
+    ToggleModelSelector,
+    CloseTab,
 }
 
 #[component]
@@ -46,22 +58,21 @@ pub fn ChatInput(
     on_send: EventHandler<(String, Vec<Attachment>)>,
     on_cancel: EventHandler<()>,
     on_interaction: EventHandler<()>,
-    on_toggle_sessions: EventHandler<()>,
-    on_toggle_settings: EventHandler<()>,
-    on_toggle_mcp_manager: EventHandler<()>,
     on_new_chat_with_memory: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let SessionIdContext(_current_session_id) = use_context::<SessionIdContext>();
     let mut settings = use_context::<Signal<Settings>>();
-    let settings_manager = use_context::<Signal<SettingsManager>>();
+    let _settings_manager = use_context::<Signal<SettingsManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let ui_state = use_context::<Signal<UiState>>();
-    let mut draft = use_context::<Signal<String>>();
+    let DraftContext(mut draft) = use_context::<DraftContext>();
     let mut is_dragging = use_signal(|| false);
     let mut attachments = use_signal(Vec::<Attachment>::new);
     let mut is_processing_attachments = use_signal(|| false);
     let mut show_profile_selector = use_signal(|| false);
+    let mut show_model_selector = use_signal(|| false);
     let mut show_new_chat_menu = use_signal(|| false);
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
     let focus_context = use_context::<Signal<FocusContext>>();
@@ -98,21 +109,21 @@ pub fn ChatInput(
                 ChatCommand::ToggleProfile => {
                     show_profile_selector.set(!show_profile_selector());
                 }
-                ChatCommand::ToggleSettings => {
-                    on_toggle_settings.call(());
+                ChatCommand::ToggleModelSelector => {
+                    show_model_selector.set(!show_model_selector());
                 }
-                ChatCommand::SwitchToSettingsTab(_, _) => {
+                ChatCommand::ToggleSettings 
+                | ChatCommand::ToggleHistory 
+                | ChatCommand::ToggleMcp 
+                | ChatCommand::SwitchToSettingsTab(_, _)
+                | ChatCommand::SwitchTab(_)
+                | ChatCommand::SwitchToSession(_)
+                | ChatCommand::NewChat 
+                | ChatCommand::DeleteSession(_) 
+                | ChatCommand::SwitchProfile(_)
+                | ChatCommand::SwitchModel(_)
+                | ChatCommand::CloseTab => {
                     // Handled globally in main.rs
-                }
-                ChatCommand::ToggleHistory => {
-                    on_toggle_sessions.call(());
-                }
-                ChatCommand::ToggleMcp => {
-                    on_toggle_mcp_manager.call(());
-                }
-                ChatCommand::NewChat => {
-                    tracing::info!("ChatCommand::NewChat triggered");
-                    session_state.write().create_session();
                 }
                 ChatCommand::NewChatWithMemory => {
                     tracing::info!("ChatCommand::NewChatWithMemory triggered");
@@ -172,9 +183,6 @@ pub fn ChatInput(
                     "#,
                     );
                 }
-                ChatCommand::DeleteSession => {
-                    // Handled by SessionManager
-                }
                 ChatCommand::CancelGeneration => {
                     if *is_sending.read() {
                         tracing::info!("ChatCommand::CancelGeneration triggered");
@@ -191,10 +199,8 @@ pub fn ChatInput(
                     on_send.call((String::new(), Vec::new()));
                 }
             }
-            // Reset command to avoid re-triggering
-            spawn(async move {
-                chat_command.set(None);
-            });
+
+            // Command clearing is handled centrally in main.rs to avoid double-clear race
         }
     });
 
@@ -218,8 +224,12 @@ pub fn ChatInput(
             if !parts.is_empty() {
                 let skill_name = parts[0].trim_start_matches('/');
                 let skill_registry = use_context::<Signal<crate::skills::registry::SkillRegistry>>();
+                let skill_opt = {
+                    let registry = skill_registry.read();
+                    registry.get_skill(skill_name)
+                };
                 
-                if let Some(skill) = skill_registry.read().get_skill(skill_name) {
+                if let Some(skill) = skill_opt {
                     let arguments = parts[1..].join(" ");
                     let permission_manager = use_context::<Signal<crate::context::permissions::PermissionManager>>();
                     let permission_status = permission_manager.read().check_skill_permission(&skill.metadata.name);
@@ -238,7 +248,15 @@ pub fn ChatInput(
                         path: skill.path.clone(),
                         has_scripts: !skill.scripts.is_empty(),
                         raw_output: None,
-                        profile_color: Some(settings.read().get_active_profile().map(|p| p.color.clone()).unwrap_or_default()),
+                        profile_color: {
+                            let settings_read = settings.read();
+                            let profile_name = session_state.read().get_active_session()
+                                .and_then(|s| settings_read.resolve_session_profile_display_name(s.composio_profile.as_deref()));
+                            crate::components::shared::resolve_profile_color(
+                                profile_name.as_ref(),
+                                &settings_read,
+                            )
+                        },
                     };
                     
                     // First, push a normal user text bubble showing the command (history parity)
@@ -429,22 +447,102 @@ pub fn ChatInput(
                 class: "flex items-center space-x-3",
                 ChatBarIconButton {
                     icon: fi_icons::FiSettings,
-                    onclick: move |_| on_toggle_settings.call(()),
+                    onclick: move |_| chat_command.set(Some(ChatCommand::ToggleSettings)),
                     title: "Settings"
                 }
                 ChatBarIconButton {
                     icon: fi_icons::FiClock,
-                    onclick: move |_| on_toggle_sessions.call(()),
+                    onclick: move |_| chat_command.set(Some(ChatCommand::ToggleHistory)),
                     visible: ui_state.read().show_history_icon,
                     title: "History"
                 }
                 ChatBarIconButton {
                     icon: fi_icons::FiPackage,
-                    onclick: move |_| on_toggle_mcp_manager.call(()),
+                    onclick: move |_| chat_command.set(Some(ChatCommand::ToggleMcp)),
                     visible: ui_state.read().show_mcp_icon,
                     title: "MCP Tools"
                 }
                 SessionCostIcon {}
+
+                // Model Selector Dropdown
+                { if ui_state.read().show_model_selector {
+                    let current_model = settings.read().gemini_config.chat_model.clone();
+                    let slots = settings.read().model_slots.clone();
+                    let user_icons = settings.read().model_icons.clone();
+                    // Icon priority: user-set icon > slot position icon > default
+                    let current_slot_idx = slots.iter().position(|s| s == &current_model);
+                    let model_icon = user_icons.get(&current_model).cloned()
+                        .or_else(|| current_slot_idx.map(get_slot_icon))
+                        .unwrap_or_else(|| get_default_model_icon(&current_model));
+
+                    rsx! {
+                        div {
+                            class: "relative",
+                            button {
+                                class: "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm hover:border-primary-500 transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-primary-600",
+                                title: "{GeminiModel::from_slug(&current_model).display_name()}",
+                                onclick: move |_| show_model_selector.set(!show_model_selector()),
+                                "{model_icon}"
+                            }
+
+                            if show_model_selector() && !slots.is_empty() {
+                                div {
+                                    class: "absolute bottom-10 left-0 w-64 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1 max-h-80 overflow-y-auto",
+                                    for (index, model_slug) in slots.iter().enumerate() {
+                                        if !model_slug.is_empty() {
+                                        {
+                                            let is_active = *model_slug == current_model;
+                                            // Icon priority: user-set > slot position > default
+                                            let icon = user_icons.get(model_slug).cloned()
+                                                .unwrap_or_else(|| get_slot_icon(index));
+                                            // Display name: strip common prefixes for readability
+                                            let display_name = GeminiModel::from_slug(model_slug).display_name();
+
+                                            rsx! {
+                                                button {
+                                                    class: if is_active {
+                                                        "w-full text-left px-4 py-2 text-sm text-fg bg-primary-900/50 flex items-center justify-between"
+                                                    } else {
+                                                        "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between"
+                                                    },
+                                                    onclick: {
+                                                        move |_| {
+                                                            chat_command.set(Some(ChatCommand::SwitchModel(index)));
+                                                            show_model_selector.set(false);
+                                                        }
+                                                    },
+                                                    div {
+                                                        class: "flex items-center space-x-2 min-w-0",
+                                                        span {
+                                                            class: "w-6 h-6 rounded-full bg-section border border-faint flex items-center justify-center text-xs shrink-0",
+                                                            "{icon}"
+                                                        }
+                                                        span { class: "truncate", "{display_name}" }
+                                                    }
+                                                    // Hotkey hint (1-indexed, Control+N)
+                                                    if index < 9 {
+                                                        span {
+                                                            class: "text-xs text-fg-muted font-mono shrink-0 ml-2",
+                                                            "^{index + 1}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        }
+                                    }
+                                }
+                            }
+                            // Click outside handler to close dropdown
+                            if show_model_selector() {
+                                div {
+                                    class: "fixed inset-0 z-40",
+                                    onclick: move |_| show_model_selector.set(false)
+                                }
+                            }
+                        }
+                    }
+                } else { rsx!({}) } }
 
                 // Composio Profile Selector
                 { if ui_state.read().show_profile_selector {
@@ -453,7 +551,14 @@ pub fn ChatInput(
                         let profiles = &settings_read.composio_profiles;
 
                         if profiles.len() > 1 {
-                            let active_profile = settings_read.get_active_profile().cloned().unwrap_or_default();
+                            // session.composio_profile stores ID (matching settings.active_composio_profile)
+                            let active_profile = session_state.read().get_active_session()
+                                .and_then(|s| s.composio_profile.as_ref())
+                                .and_then(|id| profiles.iter().find(|p| &p.id == id))  // Match by ID
+                                .or_else(|| settings_read.get_active_profile())
+                                .cloned()
+                                .unwrap_or_else(|| profiles[0].clone());
+
                             let active_initial = active_profile.name.chars().next().unwrap_or('?').to_uppercase();
 
                             rsx! {
@@ -469,37 +574,45 @@ pub fn ChatInput(
                                         div {
                                             class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
                                             for (index, profile) in profiles.iter().enumerate() {
-                                                if profile.name != active_profile.name {
-                                                    button {
-                                                        class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
-                                                        onclick: {
-                                                            let new_profile_name = profile.name.clone();
-                                                            move |_| {
-                                                                settings.write().active_composio_profile = Some(new_profile_name.clone());
-                                                                // Auto-save changes
-                                                                if let Err(e) = settings_manager.read().save(&settings.read()) {
-                                                                    tracing::error!("Failed to save profile change: {}", e);
+                                                {
+                                                    let profile_id = profile.id.clone();
+                                                    let profile_name = profile.name.clone();
+                                                    let profile_color = profile.color.clone();
+                                                    let profile_initial = profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
+                                                    
+                                                    if profile.name != active_profile.name {
+                                                        rsx! {
+                                                            button {
+                                                                class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
+                                                                onclick: move |_| {
+                                                                    if let Some(session) = session_state.write().get_active_session_mut() {
+                                                                        session.composio_profile = Some(profile_id.clone());
+                                                                    }
+                                                                    settings.write().active_composio_profile = Some(profile_id.clone());
+                                                                    
+                                                                    // Trigger summary refresh
+                                                                    scheduler.send(SchedulerSignal::ForceRefresh);
+                                                                    show_profile_selector.set(false);
+                                                                },
+                                                                div {
+                                                                    class: "flex items-center space-x-2",
+                                                                    span {
+                                                                        class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm", profile_color),
+                                                                        "{profile_initial}"
+                                                                    }
+                                                                    span { class: "truncate", "{profile_name}" }
                                                                 }
-                                                                // Trigger summary refresh
-                                                                scheduler.send(SchedulerSignal::ForceRefresh);
-                                                                show_profile_selector.set(false);
-                                                            }
-                                                        },
-                                                        div {
-                                                            class: "flex items-center space-x-2",
-                                                            span {
-                                                                class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm", profile.color),
-                                                                "{profile.name.chars().next().unwrap_or('?').to_uppercase()}"
-                                                            }
-                                                            span { class: "truncate", "{profile.name}" }
-                                                        }
-                                                        // Hotkey hint (1-indexed)
-                                                        if index < 9 {
-                                                            span {
-                                                                class: "text-xs text-fg-muted font-mono",
-                                                                "⌘{index + 1}"
+                                                                // Hotkey hint (1-indexed)
+                                                                if index < 9 {
+                                                                    span {
+                                                                        class: "text-xs text-fg-muted font-mono",
+                                                                        "⌘{index + 1}"
+                                                                    }
+                                                                }
                                                             }
                                                         }
+                                                    } else {
+                                                        rsx! {{}}
                                                     }
                                                 }
                                             }
@@ -794,7 +907,7 @@ pub fn ChatInput(
                                             spawn(async move {
                                                 let mcp_context = {
                                                     let mcp_manager_reader = _mcp_manager.read();
-                                                    mcp_manager_reader.get_mcp_context().await
+                                                    mcp_manager_reader.get_mcp_context(None).await
                                                 };
 
                                                 let context_string = {
@@ -860,7 +973,7 @@ pub fn ChatInput(
                                 button {
                                     class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
                                     onclick: move |_| {
-                                        session_state.write().create_session();
+                                        chat_command.set(Some(ChatCommand::NewChat));
                                         show_new_chat_menu.set(false);
                                     },
                                     div {
@@ -1037,15 +1150,22 @@ fn format_hotkey(hotkey: &str) -> String {
 fn SessionCostIcon() -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
     let ui_state = consume_context::<Signal<UiState>>();
+    // Consume SessionIdContext to ensure this component re-renders on every tab switch
+    let SessionIdContext(current_target_id) = use_context::<SessionIdContext>();
     let mut show_popover = use_signal(|| false);
+    let mut prev_cost = use_signal(|| 0.0_f64);
+    let mut prev_session_id = use_signal(String::new);
+    let mut animation_target = use_signal(|| 0.0_f64);
+    let mut cost_animating = use_signal(|| false);
 
     // Check if we should show the icon
     if !ui_state.read().show_session_cost_icon {
         return rsx! {};
     }
 
+    let current_session_id = current_target_id.read().clone();
     let state = session_state.read();
-    let session = match state.get_active_session() {
+    let session = match state.sessions.get(&current_session_id) {
         Some(s) => s,
         None => return rsx! {},
     };
@@ -1053,6 +1173,39 @@ fn SessionCostIcon() -> Element {
     let total_cost = session.total_cost();
     let total_tokens = session.total_tokens();
     let avg_tokens = session.average_tokens_per_turn();
+
+    // Session switch detection: reset silently (no animation)
+    if *prev_session_id.peek() != current_session_id {
+        prev_session_id.set(current_session_id);
+        prev_cost.set(total_cost);
+        animation_target.set(total_cost);
+    }
+
+    // Trigger CSS animation when cost increases
+    // animation_target prevents strobe: only trigger once per distinct cost value
+    let old_cost = *prev_cost.peek();
+    let last_target = *animation_target.peek();
+    if total_cost > old_cost && (total_cost - old_cost).abs() > 0.0001
+        && (total_cost - last_target).abs() > 0.0001
+    {
+        prev_cost.set(total_cost);
+        animation_target.set(total_cost);
+        cost_animating.set(true);
+        spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+            cost_animating.set(false);
+        });
+    } else if (total_cost - old_cost).abs() > 0.0001 {
+        // Cost decreased (e.g. session switch fallthrough) — silently update
+        prev_cost.set(total_cost);
+        animation_target.set(total_cost);
+    }
+
+    let cost_class = if *cost_animating.peek() {
+        "text-xs font-mono font-medium cost-tick"
+    } else {
+        "text-xs font-mono font-medium"
+    };
 
     rsx! {
         div {
@@ -1070,7 +1223,8 @@ fn SessionCostIcon() -> Element {
                     icon: fi_icons::FiDollarSign
                 }
                 span {
-                    class: "text-xs font-mono font-medium",
+                    id: "session-cost-display",
+                    class: cost_class,
                     {format!("{:.2}", total_cost)}
                 }
             }

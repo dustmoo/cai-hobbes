@@ -1,10 +1,12 @@
+// Dioxus Signal types are held across .await — not real locks, just Dioxus marker types.
 #![allow(clippy::await_holding_invalid_type)]
 
 use crate::components::mcp_search_form::McpSearchForm;
 use crate::components::smithery_registry::{SmitheryClient, SmitheryServer};
+use crate::components::shared::SessionIdContext;
 use crate::components::syntax_highlighter::highlight_json;
 use crate::mcp::composio_client::{ComposioCategory, ComposioClient, ComposioToolkitListing, ResolvedAuth};
-use crate::mcp::manager::{McpManager, McpServerStatus, ServerStatus};
+use crate::mcp::manager::{McpManager, McpServerStatus, ServerStatus, COMPOSIO_NATIVE_PREFIX};
 use crate::settings::{McpSource, Settings, SettingsManager};
 use dioxus::prelude::*;
 use crate::SecretManagerTrait;
@@ -199,7 +201,7 @@ pub fn McpMarketplace() -> Element {
     let filter_verified = use_signal(|| true);
     let filter_deployed = use_signal(|| false);
     let sort_by = use_signal(|| "usage".to_string());
-    let _refresh_signal = use_signal(|| 0);
+
 
     // State for server list
     let mut current_page = use_signal(|| 1i32);
@@ -266,6 +268,7 @@ pub fn McpMarketplace() -> Element {
                             profile.entity_id.clone(),
                             profile.user_id.clone(),
                             profile.id.clone(),
+                            None,
                         );
 
                         tracing::debug!("Fetching toolkit categories...");
@@ -296,13 +299,14 @@ pub fn McpMarketplace() -> Element {
         });
     }
 
-    // Fetch connected toolkits when Composio is selected
+    // Fetch connected toolkits when Composio is selected or after new connections
     let _connected_slugs_resource = use_resource({
         move || {
             let mut connected_slugs = connected_slugs;
-            // Track settings changes
-                // Track settings changes
+            // Subscribe to settings changes (profile switch)
                 let settings_snapshot = settings.read().clone();
+                // Subscribe to search trigger (bumped after connect_toolkit completes)
+                let _trigger = *trigger_search.read();
 
                 async move {
                     // Check if we have a profile with an API key
@@ -318,6 +322,7 @@ pub fn McpMarketplace() -> Element {
                             profile.entity_id.clone(),
                             profile.user_id.clone(),
                             profile.id.clone(),
+                            None,
                         );
 
                         match client.get_connected_toolkit_slugs().await {
@@ -389,6 +394,7 @@ pub fn McpMarketplace() -> Element {
                                     profile.entity_id.clone(),
                                     profile.user_id.clone(),
                                     profile.id.clone(),
+                                    None,
                                 );
 
                                 // Use search query if provided
@@ -523,6 +529,9 @@ pub fn McpMarketplace() -> Element {
         Some(Err(e)) => (vec![], format!("Error: {}", e), false),
         None => (vec![], "Loading...".to_string(), true),
     };
+
+    let is_error = data_source.starts_with("Error:");
+    let error_display = data_source.trim_start_matches("Error: ").to_string();
 
     let save_config_coroutine = use_coroutine(move |mut rx: UnboundedReceiver<String>| {
         let mut config_content = config_content.to_owned();
@@ -717,7 +726,9 @@ pub fn McpMarketplace() -> Element {
                     div { class: "mb-4 p-2 bg-red-900 text-red-200 rounded text-sm", "{msg}" }
                 }
 
-                match *active_tab.read() {
+                {
+                    let tab = (*active_tab.read()).clone();
+                    match tab {
                     ActiveTab::Marketplace => rsx! {
                         McpSearchForm {
                             search_query: search_query,
@@ -731,15 +742,42 @@ pub fn McpMarketplace() -> Element {
                             show_category_dropdown: show_category_dropdown,
                             categories_loading: *categories_loading.read()
                         }
-                        div {
-                            class: "grid grid-cols-1 gap-4",
-                            for mcp in filtered_mcps {
-                                McpServerCard {
-                                    key: "{mcp.name}",
-                                    mcp: mcp.clone(),
-                                    add_mcp: add_mcp,
-                                    trigger_search: trigger_search,
-                                    connected_slugs: connected_slugs
+                        if filtered_mcps.is_empty() && !is_loading {
+                            div {
+                                class: "flex flex-col items-center justify-center py-12 text-center",
+                                if is_error {
+                                    div {
+                                        class: "text-sm text-fg-muted mb-4 max-w-md",
+                                        "{error_display}"
+                                    }
+                                } else {
+                                    p { class: "text-sm text-fg-muted mb-4", "No tools found." }
+                                }
+                                button {
+                                    class: "px-4 py-2 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors",
+                                    onclick: move |_| {
+                                        let mcp_manager = mcp_manager;
+                                        let mut trigger_search = trigger_search;
+                                        spawn(async move {
+                                            mcp_manager.read().invalidate_status_cache_async().await;
+                                            let current = *trigger_search.peek();
+                                            trigger_search.set(current + 1);
+                                        });
+                                    },
+                                    "↻ Retry"
+                                }
+                            }
+                        } else {
+                            div {
+                                class: "grid grid-cols-1 gap-4",
+                                for mcp in filtered_mcps {
+                                    McpServerCard {
+                                        key: "{mcp.name}",
+                                        mcp: mcp.clone(),
+                                        add_mcp: add_mcp,
+                                        trigger_search: trigger_search,
+                                        connected_slugs: connected_slugs
+                                    }
                                 }
                             }
                         }
@@ -889,8 +927,9 @@ pub fn McpMarketplace() -> Element {
                         }
                     },
                     ActiveTab::Status => rsx! {
-                        StatusView {}
+                        StatusView { trigger_search: trigger_search }
                     }
+                }
                 }
             }
         }
@@ -898,12 +937,12 @@ pub fn McpMarketplace() -> Element {
 }
 
 #[component]
-fn StatusView() -> Element {
+fn StatusView(trigger_search: Signal<i32>) -> Element {
     let mcp_manager = use_context::<Signal<McpManager>>();
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
 
     // Trigger signal for forcing resource refresh
-    let mut refresh_trigger = use_signal(|| 0i32);
+    let refresh_trigger = use_signal(|| 0i32);
 
     let server_statuses = use_resource(move || {
         let _trigger = *refresh_trigger.read(); // Subscribe to manual refresh
@@ -917,10 +956,18 @@ fn StatusView() -> Element {
     });
 
     let refresh_statuses = move |_| {
-        // Invalidate cache before refresh
-        mcp_manager.read().invalidate_status_cache();
-        let current = *refresh_trigger.peek();
-        refresh_trigger.set(current + 1);
+        // Use async invalidation to guarantee cache is cleared (try_lock can silently fail)
+        let mcp_manager = mcp_manager;
+        let mut refresh_trigger = refresh_trigger;
+        let mut trigger_search = trigger_search;
+        spawn(async move {
+            mcp_manager.read().invalidate_status_cache_async().await;
+            let current = *refresh_trigger.peek();
+            refresh_trigger.set(current + 1);
+            // Also bump trigger_search to re-fetch connected toolkit slugs in parent
+            let current_search = *trigger_search.peek();
+            trigger_search.set(current_search + 1);
+        });
     };
 
     // Calculate aggregate tool counts
@@ -1022,11 +1069,14 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let settings_manager = use_context::<Signal<SettingsManager>>();
     let ui_state = use_context::<Signal<crate::settings::UiState>>();
     let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
+    let session_state = use_context::<Signal<crate::session::SessionState>>();
+    let current_session_id = use_context::<SessionIdContext>().0;
+    let save_error = use_context::<crate::components::shared::SaveErrorContext>().0;
     let mut local_settings = use_signal(|| settings.read().clone());
     let mut is_retrying = use_signal(|| false);
 
     // Toolkit management state (only relevant for Composio)
-    let is_composio = status.name == "composio-native";
+    let is_composio = status.name == COMPOSIO_NATIVE_PREFIX;
     // NOTE: show_toolkits is read from ui_state.composio_toolkit_expanded instead of local signal
     let mut toolkits: Signal<Vec<crate::mcp::composio_client::ToolkitInfo>> =
         use_signal(Vec::new);
@@ -1043,18 +1093,24 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
 
     // Reset toolkit state when the ACTIVE PROFILE changes (not on every mount)
     // This clears stale data and allows a fresh fetch with the new client
-    let mut last_profile_name: Signal<Option<String>> = use_signal(|| None);
+    let mut last_profile_id: Signal<Option<String>> = use_signal(|| None);
     use_effect(move || {
         let _context = mcp_context.read(); // Subscribe to context changes
-        let current_profile = settings.read().active_composio_profile.clone();
-        let previous_profile = last_profile_name.peek().clone();
+        
+        // Derive the active profile ID for this session (session stores IDs post-migration)
+        let state = session_state.read();
+        let active_profile_id = state.sessions.get(&*current_session_id.read())
+            .and_then(|s| s.composio_profile.clone())
+            .or_else(|| settings.read().active_composio_profile.clone());
+            
+        let previous_profile = last_profile_id.peek().clone();
 
         // Only reset if profile actually changed (not on initial mount with None -> Some)
-        if previous_profile.is_some() && previous_profile != current_profile {
+        if previous_profile.is_some() && previous_profile != active_profile_id {
             tracing::debug!(
                 "Profile changed from {:?} to {:?}, resetting toolkit state",
                 previous_profile,
-                current_profile
+                active_profile_id
             );
             toolkits.set(Vec::new());
             toolkits_error.set(None);
@@ -1062,7 +1118,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
             // ALSO sync local_settings with global settings
             local_settings.set(settings.read().clone());
         }
-        last_profile_name.set(current_profile);
+        last_profile_id.set(active_profile_id);
     });
 
     // Fetch toolkits when show_toolkits is expanded for Composio
@@ -1223,18 +1279,14 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                 state.unloaded_mcp_servers.push(server_name.clone());
                                                             }
                                                         }
-                                                        // Save to disk
-                                                        let uism = ui_state_manager.read();
-                                                        if let Err(e) = uism.save(&state) {
-                                                            tracing::error!("Failed to save UI state after load/unload toggle: {}", e);
-                                                        }
+                                                        // Save to disk (non-blocking)
+                                                        ui_state_manager.read().save_async(state.clone(), Some(save_error));
                                                     }
 
-                                                    // Update mcp_context with filtered tools
-                                                    let new_context = mcp_manager.read().get_mcp_context().await;
+                                                    // Pattern 150.8.3: Cache already invalidated by load_server/unload_server (Pattern 150.8.1)
+                                                    // Update context signal and trigger UI refresh
+                                                    let new_context = mcp_manager.read().get_mcp_context(None).await;
                                                     mcp_context.set(new_context);
-                                                    // Invalidate cache and trigger refresh
-                                                    mcp_manager.read().invalidate_status_cache();
                                                     let current = *refresh_trigger.peek();
                                                     refresh_trigger.set(current + 1);
                                                 });
@@ -1332,7 +1384,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                 tracing::info!("Opening OAuth authorization URL: {}", auth_url);
 
                                                 // Open browser for user to authorize
-                                                if let Err(e) = open::that(&auth_url) {
+                                                if let Err(e) = crate::mcp::oauth_flow::open_browser(&auth_url, None).await {
                                                     tracing::error!("Failed to open browser: {}", e);
                                                     return;
                                                 }
@@ -1503,7 +1555,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                         tracing::error!("Failed to reload Composio tools: {}", e);
                                                                     }
                                                                     // Update mcp_context with new tools
-                                                                    let new_context = mcp_manager.read().get_mcp_context().await;
+                                                                    let new_context = mcp_manager.read().get_mcp_context(None).await;
                                                                     mcp_context.set(new_context);
                                                                     // Invalidate cache and trigger refresh
                                                                     mcp_manager.read().invalidate_status_cache();
