@@ -624,11 +624,11 @@ fn build_error_response(error: &str) -> String {
 /// credential leakage.
 pub async fn open_browser(url: &str, chrome_profile: Option<&str>) -> Result<(), String> {
     let url_clone = url.to_string();
-    let profile_clone = chrome_profile.map(|s| s.to_string());
+    let _profile_clone = chrome_profile.map(|s| s.to_string());
 
     tokio::task::spawn_blocking(move || {
         #[cfg(target_os = "macos")]
-        if let Some(ref profile_dir) = profile_clone {
+        if let Some(ref profile_dir) = _profile_clone {
             tracing::info!(
                 "Opening URL in Chrome profile '{}': {}",
                 profile_dir,

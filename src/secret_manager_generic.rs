@@ -6,7 +6,7 @@ use crate::constants::SERVICE_NAME;
 use crate::secret_types;
 
 // Re-export shared constants for API compatibility
-pub use crate::secret_types::{KNOWN_KEYS, COMPOSIO_KEY_PREFIX, composio_key_name};
+pub use crate::secret_types::{KNOWN_KEYS, composio_key_name};
 
 /// Dummy AuthContext for non-macOS generic implementation.
 /// This matches the type in the macOS implementation for API parity.

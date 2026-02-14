@@ -459,46 +459,67 @@ fn app() -> Element {
 
                 if let Ok(sm) = loaded_secrets {
                     secret_manager.set(sm);
-                    let sm_read = secret_manager.read();
+
+                    // Phase 1: Read all secrets (immutable borrow) and collect migration tasks
+                    let gemini_key;
+                    let smithery_key;
+                    let composio_legacy_key;
+                    // (profile_index, api_key, needs_migration, profile_id)
+                    let mut profile_keys: Vec<(usize, String, bool, String)> = Vec::new();
+
+                    {
+                        let sm_read = secret_manager.read();
+                        gemini_key = sm_read.get("api_key").cloned();
+                        smithery_key = sm_read.get("smithery_api_key").cloned();
+                        composio_legacy_key = sm_read.get("composio_api_key").cloned();
+
+                        let current_settings = settings.read();
+                        for (i, profile) in current_settings.composio_profiles.iter().enumerate() {
+                            if let Some(api_key) = sm_read.get_composio_key(&profile.id) {
+                                profile_keys.push((i, api_key.clone(), false, profile.id.clone()));
+                                tracing::debug!(
+                                    "Loaded API key for Composio profile: {} ({})",
+                                    profile.name, profile.id
+                                );
+                            } else if let Some(api_key) = sm_read.get_composio_key(&profile.name) {
+                                profile_keys.push((i, api_key.clone(), true, profile.id.clone()));
+                                tracing::info!("Migrating Composio key for profile '{}' from name to ID '{}'", profile.name, profile.id);
+                            }
+                        }
+                    } // sm_read dropped here
+
+                    // Phase 2: Apply settings updates
                     let mut current_settings = settings.write();
+                    if let Some(api_key) = gemini_key {
+                        current_settings.gemini_config.api_key = Some(api_key);
+                    }
+                    if let Some(smithery_api_key) = smithery_key {
+                        current_settings.smithery_api_key = Some(smithery_api_key);
+                    }
+                    if let Some(composio_api_key) = composio_legacy_key {
+                        current_settings.composio_api_key = Some(composio_api_key);
+                    }
 
-                    if let Some(api_key) = sm_read.get("api_key") {
-                        current_settings.gemini_config.api_key = Some(api_key.clone());
-                    }
-                    if let Some(smithery_api_key) = sm_read.get("smithery_api_key") {
-                        current_settings.smithery_api_key = Some(smithery_api_key.clone());
-                    }
-                    if let Some(composio_api_key) = sm_read.get("composio_api_key") {
-                        current_settings.composio_api_key = Some(composio_api_key.clone());
-                    }
-
-                    for profile in &mut current_settings.composio_profiles {
-                        // Try ID first, then fallback to Name (migration)
-                        if let Some(api_key) = sm_read.get_composio_key(&profile.id) {
+                    for (idx, api_key, needs_migration, profile_id) in &profile_keys {
+                        if let Some(profile) = current_settings.composio_profiles.get_mut(*idx) {
                             profile.api_key = Some(api_key.clone());
-                        } else if let Some(api_key) = sm_read.get_composio_key(&profile.name) {
-                            tracing::info!("Migrating Composio key for profile '{}' to ID '{}'", profile.name, profile.id);
-                            profile.api_key = Some(api_key.clone());
-                            // Proactively save to the new ID in keychain
+                        }
+                        if *needs_migration {
                             let mut sm_write = secret_manager.write();
-                            if let Err(e) = sm_write.set_composio_key(&profile.id, api_key.clone()) {
+                            if let Err(e) = sm_write.set_composio_key(profile_id, api_key.clone()) {
                                 tracing::error!("Failed to migrate legacy Composio key to ID: {}", e);
                             }
                         }
                     }
 
-                    // Also migrate profile-scoped custom tool credentials from name to ID
-                    // TODO: Remove after migration window — this clones the entire secret store
-                    // to iterate while holding a mutable borrow. For very large stores this could
-                    // be a performance concern; once all users have migrated, this block is dead code.
+                    // Phase 3: Migrate profile-scoped custom tool credentials from name to ID
+                    // TODO: Remove after migration window
                     {
                         let mut sm_write = secret_manager.write();
                         let all_secrets = sm_write.secrets_ref().clone();
                         for (key, val) in all_secrets {
                             if let Some((Some(p_name), slug, field)) = crate::secret_types::parse_custom_tool_key(&key) {
-                                // Find if this p_name is actually a name for one of our profiles
                                 if let Some(profile) = current_settings.composio_profiles.iter().find(|p| p.name == p_name) {
-                                    // If the key uses name but we have an ID, migrate it
                                     let id_key = crate::secret_types::format_custom_tool_key(Some(&profile.id), &slug, &field);
                                     if !sm_write.has_key(&id_key) {
                                         tracing::info!("Migrating custom tool credential for '{}' to ID '{}'", p_name, profile.id);
