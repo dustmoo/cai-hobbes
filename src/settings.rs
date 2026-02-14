@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
-use dioxus_signals::Writable;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LlmProvider {
@@ -561,25 +560,46 @@ pub fn get_slot_icon(slot_index: usize) -> String {
 }
 
 impl Settings {
-    /// Get the currently active Composio profile
+    /// Get the currently active Composio profile (matched by stable ID)
     pub fn get_active_profile(&self) -> Option<&ComposioProfile> {
-        if let Some(active_name) = &self.active_composio_profile {
+        if let Some(active_id) = &self.active_composio_profile {
             self.composio_profiles
                 .iter()
-                .find(|p| &p.name == active_name)
+                .find(|p| &p.id == active_id)
         } else {
             None
         }
     }
 
-    /// Get a mutable reference to the active Composio profile
+    /// Get a mutable reference to the active Composio profile (matched by stable ID)
     pub fn get_active_profile_mut(&mut self) -> Option<&mut ComposioProfile> {
-        if let Some(active_name) = &self.active_composio_profile {
-            let name = active_name.clone();
-            self.composio_profiles.iter_mut().find(|p| p.name == name)
+        if let Some(active_id) = &self.active_composio_profile {
+            let id = active_id.clone();
+            self.composio_profiles.iter_mut().find(|p| p.id == id)
         } else {
             self.composio_profiles.first_mut()
         }
+    }
+
+    /// Resolve a profile ID to its human-readable name.
+    /// Returns None if the ID doesn't match any profile.
+    pub fn profile_name_for_id(&self, id: &str) -> Option<&str> {
+        self.composio_profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.as_str())
+    }
+
+    /// Resolve a session's composio_profile (ID) to its display name,
+    /// with fallback to the global active profile name.
+    pub fn resolve_session_profile_display_name(
+        &self,
+        session_profile_id: Option<&str>,
+    ) -> Option<String> {
+        session_profile_id
+            .and_then(|id| self.profile_name_for_id(id))
+            .map(|n| n.to_string())
+            .or_else(|| self.get_active_profile().map(|p| p.name.clone()))
     }
 
     /// Add a new Composio profile
@@ -612,21 +632,21 @@ impl Settings {
             new_profile.id = Uuid::new_v4().to_string();
         }
 
-        // Capture the name before moving ownership
-        let new_name = new_profile.name.clone();
+        // Capture the ID before moving ownership
+        let new_id = new_profile.id.clone();
         self.composio_profiles.push(new_profile);
 
         // Always activate newly added profiles so the UI switches to them
-        self.active_composio_profile = Some(new_name);
+        self.active_composio_profile = Some(new_id);
     }
 
-    /// Remove a Composio profile by name
-    pub fn remove_profile(&mut self, name: &str) {
-        self.composio_profiles.retain(|p| p.name != name);
+    /// Remove a Composio profile by its stable ID.
+    pub fn remove_profile(&mut self, id: &str) {
+        self.composio_profiles.retain(|p| p.id != id);
 
         // If we removed the active profile, reset to first available
-        if self.active_composio_profile.as_deref() == Some(name) {
-            self.active_composio_profile = self.composio_profiles.first().map(|p| p.name.clone());
+        if self.active_composio_profile.as_deref() == Some(id) {
+            self.active_composio_profile = self.composio_profiles.first().map(|p| p.id.clone());
         }
     }
 
@@ -652,8 +672,27 @@ impl Settings {
                 color: default_profile_color(),
                 chrome_profile_directory: None,
             };
+            let profile_id = profile.id.clone();
             self.add_profile(profile);
-            self.active_composio_profile = Some("Default".to_string());
+            self.active_composio_profile = Some(profile_id);
+        }
+    }
+
+    /// Migrate `active_composio_profile` from name-based to ID-based.
+    /// Existing settings may store the profile *name* instead of the stable *id*.
+    /// This checks: if the value doesn't match any profile ID but does match a name, swap it.
+    pub fn migrate_active_profile_name_to_id(&mut self) {
+        if let Some(ref current_value) = self.active_composio_profile {
+            // Already matches an ID — nothing to do
+            if self.composio_profiles.iter().any(|p| &p.id == current_value) {
+                return;
+            }
+            // Try matching by name instead
+            if let Some(profile) = self.composio_profiles.iter().find(|p| &p.name == current_value) {
+                let id = profile.id.clone();
+                tracing::info!("Migrating active_composio_profile from name '{}' to id '{}'", current_value, id);
+                self.active_composio_profile = Some(id);
+            }
         }
     }
 
@@ -743,7 +782,21 @@ impl SettingsManager {
         // First, try to deserialize directly. If it works, we're done.
         if let Ok(mut settings) = serde_json::from_str::<Settings>(&content) {
             settings.migrate_legacy_composio_settings();
+            settings.ensure_profile_ids();
+            let had_name_migration = settings.active_composio_profile.as_ref()
+                .is_some_and(|v| !settings.composio_profiles.iter().any(|p| p.id == *v));
+            // Happy-path migration: JSON deserialized cleanly but active_composio_profile
+            // may still hold a legacy profile *name*. Convert it to a stable *id*.
+            // This also runs in the fallback path below (L894) for the same reason — both
+            // paths must independently guarantee the value is ID-based before the app boots.
+            settings.migrate_active_profile_name_to_id();
             settings.sync_chat_model_to_slots();
+            // Persist migration results so the next launch reads corrected IDs
+            if had_name_migration {
+                if self.save(&settings).is_err() {
+                    tracing::error!("Failed to save migrated settings.");
+                }
+            }
             return settings;
         }
 
@@ -836,6 +889,10 @@ impl SettingsManager {
         // Migration: Ensure all composio profiles have an ID
         // This backfills UUIDs for existing profiles that were created before the 'id' field existed.
         settings.ensure_profile_ids();
+        // Fallback-path migration: field-by-field reconstruction may still leave
+        // active_composio_profile as a legacy name. Defensively convert to ID here too.
+        // (Mirrors the happy-path call at L793.)
+        settings.migrate_active_profile_name_to_id();
 
         // After migrating, save the repaired settings file for the next run.
         if self.save(&settings).is_err() {
@@ -856,23 +913,7 @@ impl SettingsManager {
 
     pub fn save_async(&self, settings: Settings, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
         let manager = self.clone();
-        let handle = tokio::spawn(async move {
-            tokio::task::spawn_blocking(move || manager.save(&settings)).await.unwrap_or_else(|e| Err(std::io::Error::other(e)))
-        });
-        if let Some(mut sig) = error_signal {
-            dioxus::prelude::spawn(async move {
-                if let Ok(Err(e)) = handle.await {
-                    tracing::error!("Failed to save settings asynchronously: {}", e);
-                    *sig.write() = Some(format!("Failed to save settings: {}", e));
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                if let Ok(Err(e)) = handle.await {
-                    tracing::error!("Failed to save settings asynchronously: {}", e);
-                }
-            });
-        }
+        crate::async_persist::persist_async(move || manager.save(&settings), "settings", error_signal);
     }
 }
 
@@ -1036,23 +1077,7 @@ impl UiStateManager {
 
     pub fn save_async(&self, state: UiState, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
         let manager = self.clone();
-        let handle = tokio::spawn(async move {
-            tokio::task::spawn_blocking(move || manager.save(&state)).await.unwrap_or_else(|e| Err(std::io::Error::other(e)))
-        });
-        if let Some(mut sig) = error_signal {
-            dioxus::prelude::spawn(async move {
-                if let Ok(Err(e)) = handle.await {
-                    tracing::error!("Failed to save UI state asynchronously: {}", e);
-                    *sig.write() = Some(format!("Failed to save UI state: {}", e));
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                if let Ok(Err(e)) = handle.await {
-                    tracing::error!("Failed to save UI state asynchronously: {}", e);
-                }
-            });
-        }
+        crate::async_persist::persist_async(move || manager.save(&state), "UI state", error_signal);
     }
 }
 

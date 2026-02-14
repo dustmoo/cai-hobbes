@@ -900,6 +900,7 @@ impl LlmConnector for GeminiConnector {
 
             let mut stream = response.bytes_stream();
             let mut has_sent_data = false;
+            let mut tool_not_found_count: u32 = 0;
             let mut finish_reason: Option<String> = None;
             let mut buffer = Vec::<u8>::new();
             let mut malformed_call_detected = false;
@@ -1024,17 +1025,22 @@ impl LlmConnector for GeminiConnector {
                                                         }
                                                     }
                                                     if !found_tool {
-                                                        tracing::error!("LLM requested tool '{}' which was not found in the provided context.", function_call.name);
-                                                        // Send a user-friendly message about the missing tool
-                                                        let tool_error_msg = format!(
-                                                        "⚠️ **Tool Not Available: `{}`**\n\n\
-                                                        Hobbes tried to use a tool that isn't currently loaded. This can happen if:\n\n\
-                                                        • The MCP server providing this tool is not running\n\
-                                                        • The tool requires authentication that hasn't been set up\n\
-                                                        • The tool list needs to be refreshed\n\n\
-                                                        Please check your MCP Integration settings.",
-                                                        function_call.name
-                                                    );
+                                                        tool_not_found_count += 1;
+                                                        tracing::error!("LLM requested tool '{}' which was not found in the provided context (count: {}).", function_call.name, tool_not_found_count);
+                                                        // After repeated failures, emit the persistent error message that triggers QuickFix buttons
+                                                        let tool_error_msg = if tool_not_found_count >= 2 {
+                                                            format!(
+                                                                "[Hobbes encountered a persistent error ('TOOL_NOT_FOUND') after multiple retries. The model may be hallucinating a tool that does not exist.]")
+                                                        } else {
+                                                            format!(
+                                                            "⚠️ **Tool Not Available: `{}`**\n\n\
+                                                            Hobbes tried to use a tool that isn't currently loaded. This can happen if:\n\n\
+                                                            • The MCP server providing this tool is not running\n\
+                                                            • The tool requires authentication that hasn't been set up\n\
+                                                            • The tool list needs to be refreshed\n\n\
+                                                            Please check your MCP Integration settings.",
+                                                            function_call.name)
+                                                        };
                                                         if tx
                                                             .send(StreamMessage::Text {
                                                                 content: tool_error_msg,
@@ -1046,6 +1052,10 @@ impl LlmConnector for GeminiConnector {
                                                             return;
                                                         }
                                                         has_sent_data = true;
+                                                        // Circuit breaker: stop the stream after persistent tool-not-found
+                                                        if tool_not_found_count >= 2 {
+                                                            return;
+                                                        }
                                                     }
                                                 } else if !part.text.is_empty() {
                                                     // Check if the text is structured JSON that needs unwrapping
@@ -1164,8 +1174,8 @@ impl LlmConnector for GeminiConnector {
                                 for server in &context.servers {
                                     for tool in &server.tools {
                                         let sanitized_name =
-                                            crate::gemini::convert::sanitize_function_name(
-                                                &format!("{}_{}", server.name, tool.name),
+                                            crate::gemini::convert::get_prefixed_tool_name(
+                                                &server.name, &tool.name,
                                             );
                                         tools.push(format!("- {}", sanitized_name));
                                     }

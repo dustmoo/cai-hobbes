@@ -2,7 +2,7 @@
 #[cfg(test)]
 mod tests {
     use crate::keychain_ffi;
-    use crate::secret_manager::{SecretManager, COMPOSIO_KEY_PREFIX};
+    use crate::secret_manager::{SecretManager, composio_key_name};
     use crate::SecretManagerTrait;
 
     // Mock constants
@@ -12,7 +12,7 @@ mod tests {
     #[test]
     fn test_composio_key_persistence_cycle() {
         // 1. Simulate SettingsPanel Save Logic
-        let key_name = format!("{}{}", COMPOSIO_KEY_PREFIX, PROFILE_NAME);
+        let key_name = composio_key_name(PROFILE_NAME);
 
         println!("Saving secret: {} -> {}", key_name, SECRET_VALUE);
 

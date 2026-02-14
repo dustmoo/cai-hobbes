@@ -147,9 +147,8 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                         onclick: move |event| {
                                             event.stop_propagation();
                                             // Signal to main.rs that we want to delete this specific session
-                                            // Main.rs's DeleteSession cmd path already handles confirmation logic
-                                            session_state.write().active_session_id = id_delete.clone();
-                                            chat_command.set(Some(ChatCommand::DeleteSession));
+                                            // Pass the ID explicitly through the command payload
+                                            chat_command.set(Some(ChatCommand::DeleteSession(id_delete.clone())));
                                         },
                                         "X"
                                     }

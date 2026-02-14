@@ -2,6 +2,7 @@
 // This module provides explicit, type-safe conversion from MCP tools to Gemini function declarations.
 
 use crate::gemini::types::{GeminiFunctionDeclaration, GeminiSchema, SchemaType};
+use crate::mcp::manager::{COMPOSIO_NATIVE_PREFIX, is_composio_native};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -76,8 +77,8 @@ pub fn sanitize_function_name(name: &str) -> String {
 }
 
 pub fn normalize_server_name(server_name: &str) -> &str {
-    if server_name == "composio-native" || server_name.starts_with("composio-native:") {
-        "composio-native"
+    if is_composio_native(server_name) {
+        COMPOSIO_NATIVE_PREFIX
     } else {
         server_name
     }

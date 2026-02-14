@@ -9,7 +9,7 @@ use crate::secret_types;
 use std::collections::HashMap;
 
 // Re-export shared constants for API compatibility
-pub use crate::secret_types::{KNOWN_KEYS, COMPOSIO_KEY_PREFIX};
+pub use crate::secret_types::{KNOWN_KEYS, composio_key_name};
 
 /// Centralized secret manager that caches secrets in memory
 /// and provides efficient batch loading from the macOS Keychain.
@@ -116,14 +116,14 @@ impl SecretManager {
     /// Load a Composio profile key using a pre-authenticated biometric context.
     ///
     /// # Arguments
-    /// * `profile_name` - The name of the Composio profile
+    /// * `profile_id` - The stable ID of the Composio profile
     /// * `context` - Optional authenticated AuthContext; falls back to regular access if None
     pub fn load_composio_key_with_context(
         &mut self,
-        profile_name: &str,
+        profile_id: &str,
         context: Option<&AuthContext>,
     ) {
-        let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
+        let key = composio_key_name(profile_id);
 
         let result = if let Some(ctx) = context {
             match keychain_ffi::find_generic_password_with_context(&key, ctx) {
@@ -145,15 +145,15 @@ impl SecretManager {
         match result {
             Ok(value) => {
                 self.secrets.insert(key, value);
-                tracing::debug!("Loaded Composio key for profile: {}", profile_name);
+                tracing::debug!("Loaded Composio key for profile id: {}", profile_id);
             }
             Err(keychain_ffi::KeychainError::NotFound) => {
-                tracing::debug!("No Composio key found for profile: {}", profile_name);
+                tracing::debug!("No Composio key found for profile id: {}", profile_id);
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to load Composio key for profile '{}': {}",
-                    profile_name,
+                    "Failed to load Composio key for profile id '{}': {}",
+                    profile_id,
                     e
                 );
             }
@@ -275,18 +275,18 @@ impl SecretManagerTrait for SecretManager {
     }
 
     /// Load a Composio profile key from keychain (for dynamically discovered profiles)
-    fn load_composio_key(&mut self, profile_name: &str) {
-        let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
+    fn load_composio_key(&mut self, profile_id: &str) {
+        let key = composio_key_name(profile_id);
 
         // Use our FFI to load (includes access group)
         match keychain_ffi::find_generic_password(&key) {
             Ok(value) => {
                 self.secrets.insert(key, value);
-                tracing::debug!("Loaded Composio key for profile: {}", profile_name);
+                tracing::debug!("Loaded Composio key for profile id: {}", profile_id);
             }
             Err(keychain_ffi::KeychainError::NotFound) => {}
             Err(e) => {
-                tracing::warn!("Failed to load Composio key for '{}': {}", profile_name, e);
+                tracing::warn!("Failed to load Composio key for profile id '{}': {}", profile_id, e);
             }
         }
     }

@@ -17,6 +17,11 @@ pub const KNOWN_KEYS: &[&str] = &[
 /// Prefix for Composio profile API keys (e.g., "composio_api_key_default")
 pub const COMPOSIO_KEY_PREFIX: &str = "composio_api_key_";
 
+/// Build the full keychain key for a Composio profile's API key.
+pub fn composio_key_name(profile_id: &str) -> String {
+    format!("{}{}", COMPOSIO_KEY_PREFIX, profile_id)
+}
+
 /// Prefix for custom tool credentials (e.g., "composio_tool_slack__api_key")
 pub const CUSTOM_TOOL_PREFIX: &str = "composio_tool_";
 
@@ -146,7 +151,7 @@ pub trait SecretManagerTrait {
     fn delete(&mut self, key: &str) -> Result<(), String>;
 
     /// Load a specific Composio key into the cache from keychain.
-    fn load_composio_key(&mut self, profile_name: &str);
+    fn load_composio_key(&mut self, profile_id: &str);
 
     /// Manually update a secret in the cache without keychain write.
     fn update_cache(&mut self, key: String, value: String);
@@ -225,20 +230,20 @@ pub trait SecretManagerTrait {
     }
 
     /// Get a Composio API key for a specific profile.
-    fn get_composio_key(&self, profile_name: &str) -> Option<&String> {
-        let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
+    fn get_composio_key(&self, profile_id: &str) -> Option<&String> {
+        let key = composio_key_name(profile_id);
         self.get(&key)
     }
 
     /// Set a Composio API key for a specific profile.
-    fn set_composio_key(&mut self, profile_name: &str, value: String) -> Result<(), String> {
-        let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
+    fn set_composio_key(&mut self, profile_id: &str, value: String) -> Result<(), String> {
+        let key = composio_key_name(profile_id);
         self.set(&key, value)
     }
 
     /// Delete a Composio API key for a specific profile.
-    fn delete_composio_key(&mut self, profile_name: &str) -> Result<(), String> {
-        let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
+    fn delete_composio_key(&mut self, profile_id: &str) -> Result<(), String> {
+        let key = composio_key_name(profile_id);
         self.delete(&key)
     }
 }

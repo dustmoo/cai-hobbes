@@ -18,6 +18,7 @@ use dioxus::prelude::*;
 use dotenvy::dotenv;
 use futures_util::StreamExt;
 
+mod async_persist;
 #[cfg(target_os = "macos")]
 mod biometric_auth;
 mod components;
@@ -203,6 +204,16 @@ fn app() -> Element {
         Signal::new(settings)
     });
 
+    // Migrate session composio_profile values from names to IDs (one-time migration)
+    // Runs in use_effect to avoid signal write during component render (Dioxus warning)
+    use_effect(move || {
+        let settings_snapshot = settings.peek().clone();
+        let mut state = session_state.write();
+        if state.migrate_session_profiles_to_ids(&settings_snapshot) {
+            SessionState::save_async(state.clone(), None);
+        }
+    });
+
     // Global focus context for keyboard event coordination
     use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
 
@@ -267,12 +278,12 @@ fn app() -> Element {
     #[cfg(target_os = "macos")]
     use_effect(move || {
         if !secrets_loaded() {
-            // Capture profile names before entering the blocking task
-            let profile_names: Vec<String> = settings
+            // Capture profile IDs before entering the blocking task (for keychain loading)
+            let profile_info: Vec<(String, String)> = settings
                 .read()
                 .composio_profiles
                 .iter()
-                .map(|p| p.name.clone())
+                .map(|p| (p.id.clone(), p.name.clone()))
                 .collect();
 
             spawn(async move {
@@ -315,16 +326,24 @@ fn app() -> Element {
                         // Use the authenticated context for all keychain operations
                         sm.load_all_with_context(ctx);
 
-                        // Also load Composio API keys for each known profile
-                        for profile_name in &profile_names {
-                            sm.load_composio_key_with_context(profile_name, Some(ctx));
+                        // TODO(v0.9.48): Remove dual keychain load after migration window.
+                        // MIGRATION: Load Composio keys by both ID and name to bridge the
+                        // transition from name-based to ID-based keychain indexing. Keys found
+                        // by name are used as a fallback for users who haven't yet triggered
+                        // a settings save that would re-store under the ID key.
+                        for (id, name) in &profile_info {
+                            sm.load_composio_key_with_context(id, Some(ctx));
+                            sm.load_composio_key_with_context(name, Some(ctx));
                         }
                     } else {
                         // Fall back to regular keychain access (may prompt multiple times)
                         sm.load_all_from_keychain();
 
-                        for profile_name in &profile_names {
-                            sm.load_composio_key(profile_name);
+                        // TODO(v0.9.48): Remove dual keychain load after migration window.
+                        // MIGRATION: Same dual-load rationale as above (name→ID bridge).
+                        for (id, name) in &profile_info {
+                            sm.load_composio_key(id);
+                            sm.load_composio_key(name);
                         }
                     }
 
@@ -335,32 +354,77 @@ fn app() -> Element {
                     // Update secret manager with loaded secrets
                     secret_manager.set(sm);
 
-                    // Now update settings with loaded API keys
-                    let sm_read = secret_manager.read();
+                    // Phase 1: Read all secrets (immutable borrow) and collect migration tasks
+                    let gemini_key;
+                    let smithery_key;
+                    let composio_legacy_key;
+                    // (profile_index, api_key, needs_migration, profile_id)
+                    let mut profile_keys: Vec<(usize, String, bool, String)> = Vec::new();
+
+                    {
+                        let sm_read = secret_manager.read();
+                        gemini_key = sm_read.get("api_key").cloned();
+                        smithery_key = sm_read.get("smithery_api_key").cloned();
+                        composio_legacy_key = sm_read.get("composio_api_key").cloned();
+
+                        let current_settings = settings.read();
+                        for (i, profile) in current_settings.composio_profiles.iter().enumerate() {
+                            if let Some(api_key) = sm_read.get_composio_key(&profile.id) {
+                                profile_keys.push((i, api_key.clone(), false, profile.id.clone()));
+                                tracing::debug!(
+                                    "Loaded API key for Composio profile: {} ({})",
+                                    profile.name, profile.id
+                                );
+                            } else if let Some(api_key) = sm_read.get_composio_key(&profile.name) {
+                                profile_keys.push((i, api_key.clone(), true, profile.id.clone()));
+                                tracing::info!("Migrating Composio key for profile '{}' from name to ID '{}'", profile.name, profile.id);
+                            }
+                        }
+                    } // sm_read dropped here
+
+                    // Phase 2: Apply settings updates
                     let mut current_settings = settings.write();
-
-                    if let Some(api_key) = sm_read.get("api_key") {
-                        current_settings.gemini_config.api_key = Some(api_key.clone());
+                    if let Some(api_key) = gemini_key {
+                        current_settings.gemini_config.api_key = Some(api_key);
                     }
-                    if let Some(smithery_api_key) = sm_read.get("smithery_api_key") {
-                        current_settings.smithery_api_key = Some(smithery_api_key.clone());
+                    if let Some(smithery_api_key) = smithery_key {
+                        current_settings.smithery_api_key = Some(smithery_api_key);
                     }
-                    // Load Composio API key for active profile (or legacy key)
-                    if let Some(composio_api_key) = sm_read.get("composio_api_key") {
-                        current_settings.composio_api_key = Some(composio_api_key.clone());
+                    if let Some(composio_api_key) = composio_legacy_key {
+                        current_settings.composio_api_key = Some(composio_api_key);
                     }
 
-                    // Load Composio API keys for each profile from the cache
-                    for profile in &mut current_settings.composio_profiles {
-                        if let Some(api_key) = sm_read.get_composio_key(&profile.name) {
+                    for (idx, api_key, needs_migration, profile_id) in &profile_keys {
+                        if let Some(profile) = current_settings.composio_profiles.get_mut(*idx) {
                             profile.api_key = Some(api_key.clone());
-                            tracing::debug!(
-                                "Loaded API key for Composio profile: {}",
-                                profile.name
-                            );
+                        }
+                        if *needs_migration {
+                            let mut sm_write = secret_manager.write();
+                            if let Err(e) = sm_write.set_composio_key(profile_id, api_key.clone()) {
+                                tracing::error!("Failed to migrate legacy Composio key to ID: {}", e);
+                            }
                         }
                     }
 
+                    // Phase 3: Migrate profile-scoped custom tool credentials from name to ID
+                    // TODO: Remove after migration window — this clones the entire secret store
+                    // to iterate while holding a mutable borrow. For very large stores this could
+                    // be a performance concern; once all users have migrated, this block is dead code.
+                    {
+                        let mut sm_write = secret_manager.write();
+                        let all_secrets = sm_write.secrets_ref().clone();
+                        for (key, val) in all_secrets {
+                            if let Some((Some(p_name), slug, field)) = crate::secret_types::parse_custom_tool_key(&key) {
+                                if let Some(profile) = current_settings.composio_profiles.iter().find(|p| p.name == p_name) {
+                                    let id_key = crate::secret_types::format_custom_tool_key(Some(&profile.id), &slug, &field);
+                                    if !sm_write.has_key(&id_key) {
+                                        tracing::info!("Migrating custom tool credential for '{}' to ID '{}'", p_name, profile.id);
+                                        let _ = sm_write.set_custom_tool_credential(Some(&profile.id), &slug, &field, val);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     tracing::debug!("Secrets loaded from keychain successfully");
                 } else {
                     tracing::error!("Failed to load secrets from keychain");
@@ -374,19 +438,21 @@ fn app() -> Element {
     #[cfg(not(target_os = "macos"))]
     use_effect(move || {
         if !secrets_loaded() {
-            let profile_names: Vec<String> = settings
+            let profile_info: Vec<(String, String)> = settings
                 .read()
                 .composio_profiles
                 .iter()
-                .map(|p| p.name.clone())
+                .map(|p| (p.id.clone(), p.name.clone()))
                 .collect();
 
             spawn(async move {
                 let loaded_secrets = tokio::task::spawn_blocking(move || {
                     let mut sm = secret_manager::SecretManager::new();
                     sm.load_all_from_keychain();
-                    for profile_name in &profile_names {
-                        sm.load_composio_key(profile_name);
+                    // TODO(v0.9.48): Remove dual keychain load after migration window.
+                    for (id, name) in &profile_info {
+                        sm.load_composio_key(id);
+                        sm.load_composio_key(name);
                     }
                     sm
                 }).await;
@@ -407,8 +473,39 @@ fn app() -> Element {
                     }
 
                     for profile in &mut current_settings.composio_profiles {
-                        if let Some(api_key) = sm_read.get_composio_key(&profile.name) {
+                        // Try ID first, then fallback to Name (migration)
+                        if let Some(api_key) = sm_read.get_composio_key(&profile.id) {
                             profile.api_key = Some(api_key.clone());
+                        } else if let Some(api_key) = sm_read.get_composio_key(&profile.name) {
+                            tracing::info!("Migrating Composio key for profile '{}' to ID '{}'", profile.name, profile.id);
+                            profile.api_key = Some(api_key.clone());
+                            // Proactively save to the new ID in keychain
+                            let mut sm_write = secret_manager.write();
+                            if let Err(e) = sm_write.set_composio_key(&profile.id, api_key.clone()) {
+                                tracing::error!("Failed to migrate legacy Composio key to ID: {}", e);
+                            }
+                        }
+                    }
+
+                    // Also migrate profile-scoped custom tool credentials from name to ID
+                    // TODO: Remove after migration window — this clones the entire secret store
+                    // to iterate while holding a mutable borrow. For very large stores this could
+                    // be a performance concern; once all users have migrated, this block is dead code.
+                    {
+                        let mut sm_write = secret_manager.write();
+                        let all_secrets = sm_write.secrets_ref().clone();
+                        for (key, val) in all_secrets {
+                            if let Some((Some(p_name), slug, field)) = crate::secret_types::parse_custom_tool_key(&key) {
+                                // Find if this p_name is actually a name for one of our profiles
+                                if let Some(profile) = current_settings.composio_profiles.iter().find(|p| p.name == p_name) {
+                                    // If the key uses name but we have an ID, migrate it
+                                    let id_key = crate::secret_types::format_custom_tool_key(Some(&profile.id), &slug, &field);
+                                    if !sm_write.has_key(&id_key) {
+                                        tracing::info!("Migrating custom tool credential for '{}' to ID '{}'", p_name, profile.id);
+                                        let _ = sm_write.set_custom_tool_credential(Some(&profile.id), &slug, &field, val);
+                                    }
+                                }
+                            }
                         }
                     }
                     tracing::debug!("Secrets loaded from generic keychain successfully");
@@ -520,42 +617,12 @@ fn app() -> Element {
         })
     });
 
-    // Create a global signal for the active profile name.
-    // This is the ONLY source of truth for what profile is active.
-    let mut active_composio_profile_name: Signal<Option<String>> = use_context_provider(|| {
-        let session_state_read = session_state.peek();
-        let initial = session_state_read.get_active_session()
-            .and_then(|s| s.composio_profile.clone())
-            .or_else(|| settings.peek().active_composio_profile.clone());
-        Signal::new(initial)
-    });
 
-    // Synchronize active_composio_profile_name with session changes
-    use_effect(move || {
-        let session_id = session_state.read().active_session_id.clone();
-        let session_state_read = session_state.read();
-        let profile = session_state_read.sessions.get(&session_id)
-            .and_then(|s| s.composio_profile.clone())
-            .or_else(|| settings.read().active_composio_profile.clone());
-        
-        if active_composio_profile_name.peek().as_ref() != profile.as_ref() {
-            tracing::info!("Syncing active profile signal to: {:?}", profile);
-            active_composio_profile_name.set(profile);
-        }
-    });
 
-    // Pattern 155: Sync signal BACK to settings.active_composio_profile
-    // This closes the cascade loop so get_active_profile() returns the session's profile
-    // and triggers MCP client reinitialization on tab switch.
-    use_effect(move || {
-        let profile_name = active_composio_profile_name.read().clone();
-        let current_setting = settings.read().active_composio_profile.clone();
-        
-        if profile_name != current_setting {
-            tracing::info!("Syncing settings.active_composio_profile to signal: {:?}", profile_name);
-            settings.write().active_composio_profile = profile_name;
-        }
-    });
+    // NOTE: The sync-back effect (Pattern 155) was removed.
+    // Profile ID is now written directly to settings.active_composio_profile
+    // at every switch point (hotkey handler + chat_input selector),
+    // so get_active_profile() works immediately without async indirection.
 
     let _ = use_resource(move || async move {
         // Wait until secrets are loaded before launching MCP servers
@@ -588,6 +655,12 @@ fn app() -> Element {
         let mut prev_profile_signature: Signal<Option<String>> = use_signal(|| None);
 
         use_effect(move || {
+            // Don't reinitialize before secrets are loaded — the profile's api_key
+            // won't be hydrated yet, causing a false "No API key" error.
+            if !secrets_loaded() {
+                return;
+            }
+
             // Create a signature of the active profile properties we care about
             let current_signature = settings.read().get_active_profile().map(|p| {
                 format!(
@@ -601,11 +674,10 @@ fn app() -> Element {
             });
 
             let previous = prev_profile_signature.peek().clone();
-            let active_profile_name = active_composio_profile_name.read().clone();
 
             // Only reinitialize if the profile signature actually changed
             if current_signature != previous {
-                tracing::info!("Active Composio profile properties changed, reinitializing client: {:?}", active_profile_name);
+                tracing::info!("Active Composio profile properties changed, reinitializing client: {:?}", current_signature);
 
                 // Invalidate caches - profile changed
                 mcp_manager.read().invalidate_status_cache();
@@ -616,7 +688,7 @@ fn app() -> Element {
                 spawn(async move {
                     mcp_manager
                         .read()
-                        .reinitialize_composio_client(mcp_context_signal, settings_clone, active_profile_name)
+                        .reinitialize_composio_client(mcp_context_signal, settings_clone, None)
                         .await;
                 });
             }
@@ -639,6 +711,7 @@ fn app() -> Element {
     let mut show_confirm_modal = use_context_provider(|| Signal::new(false));
     let mut session_to_delete = use_context_provider(|| SessionToDeleteContext(Signal::new(String::new())));
     let mut save_error = use_context_provider(|| crate::components::shared::SaveErrorContext(Signal::new(None))).0;
+
 
     let mut chat_command = use_context_provider(|| Signal::new(None::<ChatCommand>));
 
@@ -697,6 +770,26 @@ fn app() -> Element {
         manager.save_async(ui_snapshot, Some(save_error));
     });
 
+    let active_profile_id = move || settings.peek().get_active_profile().map(|p| p.id.clone());
+
+    let mut sync_profile_from_session = move |session_id: &str| {
+        let profile_id = session_state.read().sessions.get(session_id)
+            .and_then(|s| s.composio_profile.clone());
+        if let Some(pid) = profile_id {
+            if settings.peek().active_composio_profile.as_deref() != Some(&pid) {
+                settings.write().active_composio_profile = Some(pid);
+            }
+        }
+    };
+
+    // Sync active profile from the initial session on app startup (Pattern 150/151)
+    // Without this, settings.active_composio_profile retains whatever was last
+    // persisted, which may differ from the profile of the tab being displayed.
+    use_effect(move || {
+        let session_id = current_session_id.read().clone();
+        sync_profile_from_session(&session_id);
+    });
+
     // Tab switching - use signal copies directly in closures
     let mut switch_tab_fn = move |idx: usize| {
         let tabs = open_tabs.read();
@@ -704,9 +797,11 @@ fn app() -> Element {
             let session_id = tabs[idx].clone();
             active_tab_index.set(idx);
             current_session_id.set(session_id.clone());
-            session_state.write().active_session_id = session_id;
+            session_state.write().active_session_id = session_id.clone();
+            sync_profile_from_session(&session_id);
         }
     };
+
 
     let mut delete_session_fn = move |id_to_delete: String| {
         let mut state = session_state.write();
@@ -718,7 +813,7 @@ fn app() -> Element {
             tabs.remove(tab_idx);
             let mut new_idx = *active_tab_index.read();
             if tabs.is_empty() {
-                let new_id = session_state.write().create_session(settings.peek().active_composio_profile.clone());
+                let new_id = session_state.write().create_session(active_profile_id());
                 tabs.push(new_id);
                 new_idx = 0;
             } else if new_idx >= tabs.len() {
@@ -729,7 +824,8 @@ fn app() -> Element {
             open_tabs.set(tabs);
             active_tab_index.set(new_idx);
             current_session_id.set(new_session_id.clone());
-            session_state.write().active_session_id = new_session_id;
+            session_state.write().active_session_id = new_session_id.clone();
+            sync_profile_from_session(&new_session_id);
         }
     };
 
@@ -739,7 +835,7 @@ fn app() -> Element {
             tabs.remove(idx);
             let mut new_idx = *active_tab_index.read();
             if tabs.is_empty() {
-                let new_id = session_state.write().create_session(settings.peek().active_composio_profile.clone());
+                let new_id = session_state.write().create_session(active_profile_id());
                 tabs.push(new_id);
                 new_idx = 0;
             } else if new_idx >= tabs.len() {
@@ -750,12 +846,13 @@ fn app() -> Element {
             open_tabs.set(tabs);
             active_tab_index.set(new_idx);
             current_session_id.set(new_session_id.clone());
-            session_state.write().active_session_id = new_session_id;
+            session_state.write().active_session_id = new_session_id.clone();
+            sync_profile_from_session(&new_session_id);
         }
     };
 
     let mut new_tab_fn = move || {
-        let new_id = session_state.write().create_session(settings.peek().active_composio_profile.clone());
+        let new_id = session_state.write().create_session(active_profile_id());
         let mut tabs = open_tabs.read().clone();
         tabs.push(new_id.clone());
         open_tabs.set(tabs.clone());
@@ -974,27 +1071,36 @@ fn app() -> Element {
                 ChatCommand::SwitchProfile(idx) => {
                     let profiles = settings.peek().composio_profiles.clone();
                     if idx < profiles.len() {
+                        let new_profile_id = profiles[idx].id.clone();
                         let new_profile_name = profiles[idx].name.clone();
-                        let mut did_change = false;
-                        if let Some(session) = session_state.write().sessions.get_mut(&*current_session_id.read()) {
-                            if session.composio_profile.as_deref() != Some(&new_profile_name) {
-                                active_composio_profile_name.set(Some(new_profile_name.clone()));
-                                session.composio_profile = Some(new_profile_name.clone());
-                                session.active_context.mcp_tools = None;
-                                did_change = true;
+                        // Determine if Settings are stale
+                        let settings_stale = settings.peek().active_composio_profile.as_deref() != Some(&new_profile_id);
+
+                        let mut session_changed = false;
+                        // Scope the write lock so it's dropped before setting signals
+                        {
+                            let mut state = session_state.write();
+                            if let Some(session) = state.sessions.get_mut(&*current_session_id.read()) {
+                                if session.composio_profile.as_deref() != Some(&new_profile_id) {
+                                    session.composio_profile = Some(new_profile_id.clone());
+                                    session.active_context.mcp_tools = None;
+                                    session_changed = true;
+                                }
                             }
+                        } // write lock dropped here
+
+                        // Set settings AFTER write lock is released to avoid stale reactive reads
+                        if settings_stale || session_changed {
+                            tracing::info!("SwitchProfile: forcing update (stale={} session={}) to {:?}", settings_stale, session_changed, new_profile_name);
+                            // Write ID to settings IMMEDIATELY so get_active_profile() works
+                            // without waiting for an async sync-back effect
+                            settings.write().active_composio_profile = Some(new_profile_id);
+                            // Note: settings update triggers 'signature' effect -> reinitializes MCP client automatically
                         }
-                        if did_change {
+
+                        if session_changed {
                             SessionState::save_async(session_state.read().clone(), Some(save_error));
                             mcp_manager.read().invalidate_status_cache();
-                            let mcp_context_signal = mcp_context;
-                            let settings_clone = settings.peek().clone();
-                            spawn(async move {
-                                mcp_manager
-                                    .read()
-                                    .reinitialize_composio_client(mcp_context_signal, settings_clone, Some(new_profile_name))
-                                    .await;
-                            });
                         }
                     }
                 }
@@ -1025,14 +1131,13 @@ fn app() -> Element {
                     show_mcp_manager.set(!show_mcp_manager());
                     if show_mcp_manager() { show_settings_panel.set(false); show_session_manager.set(false); }
                 }
-                ChatCommand::DeleteSession => {
-                    let active_id = session_state.read().active_session_id.clone();
-                    if !active_id.is_empty() {
+                ChatCommand::DeleteSession(target_id) => {
+                    if !target_id.is_empty() {
                         if settings.peek().confirm_on_delete {
-                            session_to_delete.0.set(active_id);
+                            session_to_delete.0.set(target_id);
                             show_confirm_modal.set(true);
                         } else {
-                            delete_session_fn(active_id);
+                            delete_session_fn(target_id);
                         }
                     }
                 }
@@ -1045,7 +1150,8 @@ fn app() -> Element {
                     if let Some(idx) = tabs.iter().position(|id| id == &session_id) {
                         active_tab_index.set(idx);
                         current_session_id.set(session_id.clone());
-                        session_state.write().active_session_id = session_id;
+                        session_state.write().active_session_id = session_id.clone();
+                        sync_profile_from_session(&session_id);
                     } else {
                         let mut new_tabs = tabs;
                         new_tabs.push(session_id.clone());
@@ -1053,7 +1159,8 @@ fn app() -> Element {
                         open_tabs.set(new_tabs);
                         active_tab_index.set(new_idx);
                         current_session_id.set(session_id.clone());
-                        session_state.write().active_session_id = session_id;
+                        session_state.write().active_session_id = session_id.clone();
+                        sync_profile_from_session(&session_id);
                     }
                 }
                 ChatCommand::NewChat => {
@@ -1238,17 +1345,23 @@ fn app() -> Element {
                         // Main Chat Window
                         div {
                             class: "flex-1 flex flex-col min-h-0 border-t border-primary-700/50",
-                            components::tab_bar::TabBar {
-                                open_tabs: open_tabs.read().clone(),
-                                tab_names: open_tabs.read().iter().map(|id| {
-                                    session_state.read().sessions.get(id)
-                                        .map(|s| s.name.clone())
-                                        .unwrap_or_else(|| "New Session".to_string())
-                                }).collect(),
-                                active_tab_index: *active_tab_index.read(),
-                                on_select_tab: switch_tab_fn,
-                                on_close_tab: close_tab_fn,
-                                on_new_tab: move |_| new_tab_fn(),
+                            {
+                                let tabs = open_tabs.read();
+                                let state = session_state.read();
+                                rsx! {
+                                    components::tab_bar::TabBar {
+                                        open_tabs: tabs.clone(),
+                                        tab_names: tabs.iter().map(|id| {
+                                            state.sessions.get(id)
+                                                .map(|s| s.name.clone())
+                                                .unwrap_or_else(|| "New Session".to_string())
+                                        }).collect(),
+                                        active_tab_index: *active_tab_index.read(),
+                                        on_select_tab: switch_tab_fn,
+                                        on_close_tab: close_tab_fn,
+                                        on_new_tab: move |_| new_tab_fn(),
+                                    }
+                                }
                             }
 
                             components::chat::ChatWindow {

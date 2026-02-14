@@ -306,7 +306,7 @@ pub fn MessageList(
                                                                                 let session_id = session_id.clone();
                                                                                 spawn(async move {
                                                                                     // Get session's profile for profile-scoped MCP context
-                                                                                    let (skill_call_clone, profile_name) = {
+                                                                                    let (skill_call_clone, profile_id) = {
                                                                                         let state = session_state.read();
                                                                                         if let Some(session) = state.sessions.get(&session_id) {
                                                                                             let sc = session.messages.iter()
@@ -315,19 +315,18 @@ pub fn MessageList(
                                                                                                     MessageContent::SkillPermissionRequest(sc) => Some(sc.clone()),
                                                                                                     _ => None,
                                                                                                 });
-                                                                                            // Get session's composio_profile for scoped context
-                                                                                            let profile = session.composio_profile.clone()
-                                                                                                .or_else(|| settings.read().active_composio_profile.clone());
+                                                                                            // Get session's composio_profile (which is the stable ID)
+                                                                                            let profile = session.composio_profile.clone();
                                                                                             (sc, profile)
                                                                                         } else { (None, None) }
                                                                                     };
                                                                                     
                                                                                     // Get FRESH, profile-scoped MCP context using mcp_manager
                                                                                     // This follows the same lifecycle as chat.rs:539-557
-                                                                                    if let Some(ref name) = profile_name {
-                                                                                        let _ = mcp_manager.read().ensure_native_client_for_profile(name, &settings.read()).await;
+                                                                                    if let Some(ref id) = profile_id {
+                                                                                        let _ = mcp_manager.read().ensure_native_client_for_profile(id, &settings.read()).await;
                                                                                     }
-                                                                                    let fresh_mcp_context = mcp_manager.read().get_mcp_context(profile_name).await;
+                                                                                    let fresh_mcp_context = mcp_manager.read().get_mcp_context(profile_id).await;
                                                                                     let mcp_context = if fresh_mcp_context.servers.is_empty() {
                                                                                         None
                                                                                     } else {

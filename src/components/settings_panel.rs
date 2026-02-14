@@ -29,7 +29,6 @@ pub fn SettingsPanel() -> Element {
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut secret_manager = use_context::<Signal<crate::secret_manager::SecretManager>>();
-    let mut active_composio_profile_name = use_context::<Signal<Option<String>>>();
     let save_error = use_context::<crate::components::shared::SaveErrorContext>().0;
 
     // Create a local copy of the settings for editing.
@@ -254,9 +253,9 @@ pub fn SettingsPanel() -> Element {
                         let mut settings_to_save = global_settings.clone();
                         let smithery_key_opt = settings_to_save.smithery_api_key.clone();
                         let gemini_key_opt = settings_to_save.gemini_config.api_key.clone();
-                        // Extract Composio keys to save
+                        // Extract Composio keys to save (using profile ID as keychain key)
                         let composio_keys: Vec<(String, String)> = settings_to_save.composio_profiles.iter()
-                            .filter_map(|p| p.api_key.as_ref().map(|k| (p.name.clone(), k.clone())))
+                            .filter_map(|p| p.api_key.as_ref().map(|k| (p.id.clone(), k.clone())))
                             .collect();
 
                         // We also need to update the settings to store "trimmed" keys if we modify them logic-wise,
@@ -298,22 +297,22 @@ pub fn SettingsPanel() -> Element {
                         let mut secret_updates = Vec::new();
                         if let Some(k) = gemini_key_opt { secret_updates.push(("api_key".to_string(), k)); }
                         if let Some(k) = smithery_key_to_save { secret_updates.push(("smithery_api_key".to_string(), k)); }
-                        tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(n, _)| n).collect::<Vec<_>>());
+                        tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(id, _)| id).collect::<Vec<_>>());
 
                         spawn(async move {
                             // Validate Composio API keys before saving
                             let mut validated_composio_keys = Vec::new();
-                            for (profile_name, key) in composio_keys {
+                            for (profile_id, key) in composio_keys {
                                 if key.trim().is_empty() {
                                     continue; // Skip empty keys
                                 }
                                 match validate_composio_api_key(&key).await {
                                     Ok(()) => {
-                                        tracing::info!("Composio API key for profile '{}' validated successfully", profile_name);
-                                        validated_composio_keys.push((profile_name, key));
+                                        tracing::info!("Composio API key for profile id '{}' validated successfully", profile_id);
+                                        validated_composio_keys.push((profile_id, key));
                                     }
                                     Err(e) => {
-                                        tracing::error!("Invalid Composio API key for profile '{}': {}", profile_name, e);
+                                        tracing::error!("Invalid Composio API key for profile id '{}': {}", profile_id, e);
                                         // Don't save invalid keys - they'll remain unchanged in keychain
                                     }
                                 }
@@ -321,8 +320,8 @@ pub fn SettingsPanel() -> Element {
 
                             // Build final secret updates with validated Composio keys
                             let mut final_secret_updates = secret_updates;
-                            for (profile_name, key) in validated_composio_keys {
-                                final_secret_updates.push((format!("{}{}", crate::secret_manager::COMPOSIO_KEY_PREFIX, profile_name), key));
+                            for (profile_id, key) in validated_composio_keys {
+                                final_secret_updates.push((crate::secret_types::composio_key_name(&profile_id), key));
                             }
                             tracing::debug!("Total validated secret updates: {}", final_secret_updates.len());
 
@@ -1078,8 +1077,9 @@ pub fn SettingsPanel() -> Element {
                                             for profile in local_settings.read().composio_profiles.iter() {
                                                 {
                                                     let profile_name = profile.name.clone();
-                                                    let active_name = local_settings.read().active_composio_profile.clone();
-                                                    let is_active = active_name.as_ref() == Some(&profile_name);
+                                                    let profile_id = profile.id.clone();
+                                                    let active_id = local_settings.read().active_composio_profile.clone();
+                                                    let is_active = active_id.as_ref() == Some(&profile_id);
                                                     rsx! {
                                                         div {
                                                             class: format!("flex items-center justify-between p-2 rounded-md transition-all {}",
@@ -1092,15 +1092,17 @@ pub fn SettingsPanel() -> Element {
                                                                     name: "active_profile",
                                                                     checked: is_active,
                                                                     onchange: {
-                                                                        let name = profile_name.clone();
+                                                                        let id = profile_id.clone();
                                                                         let mut global_settings = settings;
-                                                                        move |_| {
-                                                                            tracing::info!("Switching to profile: {}", name);
-                                                                            local_settings.write().active_composio_profile = Some(name.clone());
-                                                                            // RACE CONDITION FIX: Immediately propagate changes to global settings and signal
-                                                                            active_composio_profile_name.set(Some(name.clone()));
-                                                                            global_settings.write().active_composio_profile = Some(name.clone());
-                                                                        }
+                                                                         move |_| {
+                                                                             tracing::info!("Switching to profile ID: {}", id);
+                                                                             local_settings.write().active_composio_profile = Some(id.clone());
+                                                                             global_settings.write().active_composio_profile = Some(id.clone());
+                                                                             // Update the active session so the sync effect doesn't snap back
+                                                                             if let Some(session) = session_state.write().get_active_session_mut() {
+                                                                                 session.composio_profile = Some(id.clone());
+                                                                             }
+                                                                         }
                                                                     }
                                                                 }
                                                                 span {
@@ -1117,13 +1119,10 @@ pub fn SettingsPanel() -> Element {
                                                             button {
                                                                 class: "text-xs font-medium text-red-500 hover:text-red-400 transition-colors uppercase tracking-tight",
                                                                 onclick: {
-                                                                    let name = profile_name.clone();
-                                                                    move |_| {
-                                                                        if local_settings.peek().active_composio_profile.as_ref() == Some(&name) {
-                                                                            active_composio_profile_name.set(None);
-                                                                        }
-                                                                        local_settings.write().remove_profile(&name);
-                                                                    }
+                                                                    let id = profile_id.clone();
+                                                                     move |_| {
+                                                                         local_settings.write().remove_profile(&id);
+                                                                     }
                                                                 },
                                                                 "Remove"
                                                             }
@@ -1134,10 +1133,16 @@ pub fn SettingsPanel() -> Element {
                                         }
 
                                         // Edit active profile
-                                        if let Some(active_name) = local_settings.read().active_composio_profile.clone() {
+                                        if let Some((active_id, active_display_name)) = {
+                                            let s = local_settings.read();
+                                            s.active_composio_profile.as_ref()
+                                                .and_then(|id| s.composio_profiles.iter()
+                                                    .find(|p| p.id == *id)
+                                                    .map(|p| (id.clone(), p.name.clone())))
+                                        } {
                                             div {
                                                 class: "border border-subtle rounded-lg p-3",
-                                                h4 { class: "text-sm font-medium text-fg-muted mb-3", "Edit Profile: {active_name}" }
+                                                h4 { class: "text-sm font-medium text-fg-muted mb-3", "Edit Profile: {active_display_name}" }
 
                                                 // Profile Name
                                                 div {
@@ -1145,21 +1150,19 @@ pub fn SettingsPanel() -> Element {
                                                     label { class: "block text-xs font-medium text-fg-muted mb-1", "Profile Name" }
                                                     input {
                                                         class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm",
-                                                        value: "{active_name}",
+                                                        value: "{active_display_name}",
                                                         oninput: {
-                                                            let old_name = active_name.clone();
-                                                            move |event: Event<FormData>| {
-                                                                let new_name = event.value();
-                                                                let mut settings = local_settings.write();
-                                                                if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == old_name) {
-                                                                    profile.name = new_name.clone();
-                                                                }
-                                                                if settings.active_composio_profile.as_ref() == Some(&old_name) {
-                                                                    settings.active_composio_profile = Some(new_name.clone());
-                                                                    active_composio_profile_name.set(Some(new_name));
-                                                                }
-                                                            }
-                                                        }
+                                                            let id = active_id.clone();
+                                                             move |event: Event<FormData>| {
+                                                                 let new_name = event.value();
+                                                                 let mut settings = local_settings.write();
+                                                                 if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.id == id) {
+                                                                     profile.name = new_name.clone();
+                                                                 }
+                                                                 // active_composio_profile stores ID — no update needed on rename
+                                                             }
+                                                        },
+                                                        onkeydown: |e| e.stop_propagation(),
                                                     }
                                                 }
 
@@ -1197,11 +1200,11 @@ pub fn SettingsPanel() -> Element {
                                                         select {
                                                             class: "flex-1 px-3 py-2 bg-input border border-primary-600 rounded-md text-sm",
                                                             onchange: {
-                                                                let name = active_name.clone();
+                                                                let id = active_id.clone();
                                                                 move |evt: Event<FormData>| {
                                                                     let val = evt.value();
                                                                     let mut settings = local_settings.write();
-                                                                    if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                    if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.id == id) {
                                                                         profile.chrome_profile_directory = if val.is_empty() { None } else { Some(val) };
                                                                     }
                                                                 }
@@ -1210,7 +1213,8 @@ pub fn SettingsPanel() -> Element {
                                                                 let current_chrome = local_settings.read().get_active_profile()
                                                                     .and_then(|p| p.chrome_profile_directory.clone())
                                                                     .unwrap_or_default();
-                                                                let chrome_profiles = crate::settings::discover_chrome_profiles();
+                                                                 let chrome_profiles_signal = use_signal(crate::settings::discover_chrome_profiles);
+                                                                 let chrome_profiles = chrome_profiles_signal.read();
                                                                 rsx! {
                                                                     option { value: "", selected: current_chrome.is_empty(), "System Default (any window)" }
                                                                     for cp in chrome_profiles.iter() {
@@ -1244,11 +1248,11 @@ pub fn SettingsPanel() -> Element {
                                                         placeholder: "Enter your Composio API key from composio.dev/settings",
                                                         value: "{local_settings.read().get_active_profile().and_then(|p| p.api_key.clone()).unwrap_or_default()}",
                                                         oninput: {
-                                                            let name = active_name.clone();
+                                                            let id = active_id.clone();
                                                             move |event: Event<FormData>| {
                                                                 let val = event.value();
                                                                 let mut settings = local_settings.write();
-                                                                if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.id == id) {
                                                                     profile.api_key = if val.is_empty() { None } else { Some(val) };
                                                                 }
                                                             }
@@ -1319,10 +1323,10 @@ pub fn SettingsPanel() -> Element {
                                                                     class: "px-3 py-2 bg-input hover:bg-white/10 border border-primary-600 rounded-md text-fg-muted transition-colors",
                                                                     title: "Regenerate User ID",
                                                                     onclick: {
-                                                                        let name = active_name.clone();
+                                                                        let id = active_id.clone();
                                                                         move |_| {
                                                                             let mut settings = local_settings.write();
-                                                                            if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                            if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.id == id) {
                                                                                 profile.user_id = Some(uuid::Uuid::new_v4().to_string().to_lowercase());
                                                                             }
                                                                         }
@@ -1341,7 +1345,7 @@ pub fn SettingsPanel() -> Element {
                                                                 placeholder: "Auto-created when you connect your first tool",
                                                                 value: "{local_settings.read().get_active_profile().and_then(|p| p.base_url.clone()).unwrap_or_default()}",
                                                                 oninput: {
-                                                                    let name = active_name.clone();
+                                                                    let id = active_id.clone();
                                                                     move |event: Event<FormData>| {
                                                                         let val = event.value();
                                                                         let mut clean_val = val.clone();
@@ -1373,7 +1377,7 @@ pub fn SettingsPanel() -> Element {
                                                                         composio_url_warning.set(warning);
 
                                                                         let mut settings = local_settings.write();
-                                                                        if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.name == name) {
+                                                                        if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.id == id) {
                                                                             profile.base_url = if clean_val.is_empty() { None } else { Some(clean_val) };
                                                                         }
                                                                     }
@@ -2689,7 +2693,7 @@ pub fn SettingsPanel() -> Element {
                             let smithery_key_opt = settings_to_save.smithery_api_key.clone();
                             let gemini_key_opt = settings_to_save.gemini_config.api_key.clone();
                             let composio_keys: Vec<(String, String)> = settings_to_save.composio_profiles.iter()
-                                .filter_map(|p| p.api_key.as_ref().map(|k| (p.name.clone(), k.clone())))
+                                .filter_map(|p| p.api_key.as_ref().map(|k| (p.id.clone(), k.clone())))
                                 .collect();
 
                             let smithery_key_to_save = smithery_key_opt.map(|k| k.trim().to_string());
@@ -2705,17 +2709,17 @@ pub fn SettingsPanel() -> Element {
                             spawn(async move {
                                 // Validate Composio API keys before saving
                                 let mut validated_composio_keys = Vec::new();
-                                for (profile_name, key) in composio_keys {
+                                for (profile_id, key) in composio_keys {
                                     if key.trim().is_empty() {
                                         continue; // Skip empty keys
                                     }
                                     match validate_composio_api_key(&key).await {
                                         Ok(()) => {
-                                            tracing::info!("Composio API key for profile '{}' validated successfully", profile_name);
-                                            validated_composio_keys.push((profile_name, key));
+                                            tracing::info!("Composio API key for profile id '{}' validated successfully", profile_id);
+                                            validated_composio_keys.push((profile_id, key));
                                         }
                                         Err(e) => {
-                                            tracing::error!("Invalid Composio API key for profile '{}': {}", profile_name, e);
+                                            tracing::error!("Invalid Composio API key for profile id '{}': {}", profile_id, e);
                                             // Don't save invalid keys - they'll remain unchanged in keychain
                                         }
                                     }
@@ -2723,8 +2727,8 @@ pub fn SettingsPanel() -> Element {
 
                                 // Build final secret updates with validated Composio keys
                                 let mut final_secret_updates = secret_updates;
-                                for (profile_name, key) in validated_composio_keys {
-                                    final_secret_updates.push((format!("{}{}", crate::secret_manager::COMPOSIO_KEY_PREFIX, profile_name), key));
+                                for (profile_id, key) in validated_composio_keys {
+                                    final_secret_updates.push((crate::secret_types::composio_key_name(&profile_id), key));
                                 }
                                 tracing::debug!("Total validated secret updates: {}", final_secret_updates.len());
 

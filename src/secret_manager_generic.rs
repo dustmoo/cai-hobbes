@@ -6,7 +6,7 @@ use crate::constants::SERVICE_NAME;
 use crate::secret_types;
 
 // Re-export shared constants for API compatibility
-pub use crate::secret_types::{KNOWN_KEYS, COMPOSIO_KEY_PREFIX};
+pub use crate::secret_types::{KNOWN_KEYS, COMPOSIO_KEY_PREFIX, composio_key_name};
 
 /// Dummy AuthContext for non-macOS generic implementation.
 /// This matches the type in the macOS implementation for API parity.
@@ -99,10 +99,10 @@ impl SecretManager {
     #[allow(dead_code)] // Biometric stub for Windows/Linux API parity
     pub fn load_composio_key_with_context(
         &mut self,
-        profile_name: &str,
+        profile_id: &str,
         _context: Option<&AuthContext>,
     ) {
-        self.load_composio_key(profile_name);
+        self.load_composio_key(profile_id);
     }
 
     /// Internal helper to pull directly from platform keychain without caching
@@ -201,11 +201,11 @@ impl SecretManagerTrait for SecretManager {
         Ok(())
     }
 
-    fn load_composio_key(&mut self, profile_name: &str) {
-        let key = format!("{}{}", COMPOSIO_KEY_PREFIX, profile_name);
+    fn load_composio_key(&mut self, profile_id: &str) {
+        let key = composio_key_name(profile_id);
         if let Some(value) = self.get_from_keychain_directly(&key) {
              self.secrets.insert(key, value);
-             tracing::debug!("Loaded Composio key for profile: {}", profile_name);
+             tracing::debug!("Loaded Composio key for profile id: {}", profile_id);
         }
     }
 

@@ -5,7 +5,7 @@
 //   This ensures sandbox compatibility while providing "global-like" feel when focused.
 
 use crate::components::chat_input::ChatCommand;
-use crate::settings::{Settings, SettingsManager};
+use crate::settings::Settings;
 use crate::{permissions, tray::WINDOW_VISIBLE};
 use dioxus::prelude::*;
 use dioxus_desktop::{DesktopContext, ShortcutHandle};
@@ -22,7 +22,6 @@ pub enum HotkeyAction {
 pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatus>) {
     let desktop = use_context::<DesktopContext>();
     let settings = use_context::<Signal<Settings>>();
-    let _settings_manager = use_context::<Signal<SettingsManager>>();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
 
     // Coroutine to handle actions from the Native Global Hotkey (Tray Toggle)
@@ -107,7 +106,13 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 "new_chat_memory" => chat_command.set(Some(ChatCommand::NewChatWithMemory)),
                 "focus_chat" => chat_command.set(Some(ChatCommand::FocusChat)),
                 "scroll_bottom" => chat_command.set(Some(ChatCommand::ScrollToBottom)),
-                "delete_session" => chat_command.set(Some(ChatCommand::DeleteSession)),
+                "delete_session" => {
+                    let session_state = consume_context::<Signal<crate::session::SessionState>>();
+                    let active_id = session_state.read().active_session_id.clone();
+                    if !active_id.is_empty() {
+                        chat_command.set(Some(ChatCommand::DeleteSession(active_id)));
+                    }
+                }
                 "cancel_generation" => chat_command.set(Some(ChatCommand::CancelGeneration)),
                 "close_tab" => chat_command.set(Some(ChatCommand::CloseTab)),
                 // Profile switching (session-local)
@@ -204,8 +209,9 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                         else if (check(config.toggle_scroll_to_bottom, event)) action = "scroll_bottom";
                         else if (check(config.cancel_generation, event)) action = "cancel_generation";
                         
-                        // Delete Session (Cmd+Backspace or Cmd+Delete)
-                        else if ((event.metaKey || event.ctrlKey) && (event.key === 'Backspace' || event.key === 'Delete')) {{
+                        // Delete Session (Cmd+Backspace or Cmd+Delete) — only when NOT focused on an input.
+                        // When focused, Cmd+Backspace is macOS "delete to beginning of line" and must pass through.
+                        else if (!isInput && (event.metaKey || event.ctrlKey) && (event.key === 'Backspace' || event.key === 'Delete')) {{
                             action = "delete_session";
                         }}
                         

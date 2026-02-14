@@ -216,16 +216,18 @@ pub struct ToolCallRecord {
     pub profile_color: Option<String>, // Historical profile color for rendering
 }
 
-/// Resolve the profile color from a session-specific profile name,
+/// Resolve the profile color from a session-specific profile identifier,
 /// falling back to the global active profile's color.
 pub fn resolve_profile_color(
     session_profile: Option<&String>,
     settings: &crate::settings::Settings,
 ) -> Option<String> {
-    let pname = session_profile
+    let identifier = session_profile
         .or(settings.active_composio_profile.as_ref());
-    pname
-        .and_then(|name| settings.composio_profiles.iter().find(|p| &p.name == name))
+    identifier
+        .and_then(|val| {
+            settings.composio_profiles.iter().find(|p| &p.id == val)
+        })
         .map(|p| p.color.clone())
         .or_else(|| settings.get_active_profile().map(|p| p.color.clone()))
 }

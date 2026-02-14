@@ -61,8 +61,10 @@ impl ConversationProcessor {
         // Inject active profile context to help the summarizer detect profile switches
         let active_profile_name = _settings
             .active_composio_profile
-            .clone()
-            .unwrap_or_else(|| "None".to_string());
+            .as_deref()
+            .and_then(|id| _settings.profile_name_for_id(id))
+            .unwrap_or("None")
+            .to_string();
         let system_note = format!("[System Note: Current Active Composio Profile is '{}'. If this differs from the previous summary, update the summary to reflect the new profile.]", active_profile_name);
 
         let recent_history = std::iter::once(system_note)

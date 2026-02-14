@@ -33,7 +33,7 @@ pub enum ChatCommand {
     NewChatWithMemory,
     ScrollToBottom,
     FocusChat,
-    DeleteSession,
+    DeleteSession(String),
     CancelGeneration,
     CopyToDraft(String),
     TriggerAiAnalysis,
@@ -62,7 +62,7 @@ pub fn ChatInput(
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let SessionIdContext(_current_session_id) = use_context::<SessionIdContext>();
-    let settings = use_context::<Signal<Settings>>();
+    let mut settings = use_context::<Signal<Settings>>();
     let _settings_manager = use_context::<Signal<SettingsManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
@@ -70,7 +70,6 @@ pub fn ChatInput(
     let DraftContext(mut draft) = use_context::<DraftContext>();
     let mut is_dragging = use_signal(|| false);
     let mut attachments = use_signal(Vec::<Attachment>::new);
-    let mut active_composio_profile_name = consume_context::<Signal<Option<String>>>();
     let mut is_processing_attachments = use_signal(|| false);
     let mut show_profile_selector = use_signal(|| false);
     let mut show_model_selector = use_signal(|| false);
@@ -120,7 +119,7 @@ pub fn ChatInput(
                 | ChatCommand::SwitchTab(_)
                 | ChatCommand::SwitchToSession(_)
                 | ChatCommand::NewChat 
-                | ChatCommand::DeleteSession 
+                | ChatCommand::DeleteSession(_) 
                 | ChatCommand::SwitchProfile(_)
                 | ChatCommand::SwitchModel(_)
                 | ChatCommand::CloseTab => {
@@ -201,10 +200,7 @@ pub fn ChatInput(
                 }
             }
 
-            // Reset command to avoid re-triggering
-            spawn(async move {
-                chat_command.set(None);
-            });
+            // Command clearing is handled centrally in main.rs to avoid double-clear race
         }
     });
 
@@ -254,7 +250,8 @@ pub fn ChatInput(
                         raw_output: None,
                         profile_color: {
                             let settings_read = settings.read();
-                            let profile_name = active_composio_profile_name.read().clone();
+                            let profile_name = session_state.read().get_active_session()
+                                .and_then(|s| settings_read.resolve_session_profile_display_name(s.composio_profile.as_deref()));
                             crate::components::shared::resolve_profile_color(
                                 profile_name.as_ref(),
                                 &settings_read,
@@ -554,11 +551,10 @@ pub fn ChatInput(
                         let profiles = &settings_read.composio_profiles;
 
                         if profiles.len() > 1 {
-                            // LIVE AUTHORITY: Use global signal
-                            let active_profile_name = active_composio_profile_name.read().clone();
-                            
-                            let active_profile = profiles.iter()
-                                .find(|p| Some(&p.name) == active_profile_name.as_ref())
+                            // session.composio_profile stores ID (matching settings.active_composio_profile)
+                            let active_profile = session_state.read().get_active_session()
+                                .and_then(|s| s.composio_profile.as_ref())
+                                .and_then(|id| profiles.iter().find(|p| &p.id == id))  // Match by ID
                                 .or_else(|| settings_read.get_active_profile())
                                 .cloned()
                                 .unwrap_or_else(|| profiles[0].clone());
@@ -578,41 +574,45 @@ pub fn ChatInput(
                                         div {
                                             class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
                                             for (index, profile) in profiles.iter().enumerate() {
-                                                if profile.name != active_profile.name {
-                                                    button {
-                                                        class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
-                                                        onclick: {
-                                                            let new_profile_name = profile.name.clone();
-                                                            move |_| {
-                                                                // Update GLOBAL signal first
-                                                                active_composio_profile_name.set(Some(new_profile_name.clone()));
-                                                                
-                                                                if let Some(session) = session_state.write().get_active_session_mut() {
-                                                                    session.composio_profile = Some(new_profile_name.clone());
+                                                {
+                                                    let profile_id = profile.id.clone();
+                                                    let profile_name = profile.name.clone();
+                                                    let profile_color = profile.color.clone();
+                                                    let profile_initial = profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
+                                                    
+                                                    if profile.name != active_profile.name {
+                                                        rsx! {
+                                                            button {
+                                                                class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
+                                                                onclick: move |_| {
+                                                                    if let Some(session) = session_state.write().get_active_session_mut() {
+                                                                        session.composio_profile = Some(profile_id.clone());
+                                                                    }
+                                                                    settings.write().active_composio_profile = Some(profile_id.clone());
+                                                                    
+                                                                    // Trigger summary refresh
+                                                                    scheduler.send(SchedulerSignal::ForceRefresh);
+                                                                    show_profile_selector.set(false);
+                                                                },
+                                                                div {
+                                                                    class: "flex items-center space-x-2",
+                                                                    span {
+                                                                        class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm", profile_color),
+                                                                        "{profile_initial}"
+                                                                    }
+                                                                    span { class: "truncate", "{profile_name}" }
                                                                 }
-                                                                // NOTE: We no longer write to global settings here.
-                                                                // Global settings.active_composio_profile is only the template for NEW chats.
-                                                                
-                                                                // Trigger summary refresh
-                                                                scheduler.send(SchedulerSignal::ForceRefresh);
-                                                                show_profile_selector.set(false);
-                                                            }
-                                                        },
-                                                        div {
-                                                            class: "flex items-center space-x-2",
-                                                            span {
-                                                                class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm", profile.color),
-                                                                "{profile.name.chars().next().unwrap_or('?').to_uppercase()}"
-                                                            }
-                                                            span { class: "truncate", "{profile.name}" }
-                                                        }
-                                                        // Hotkey hint (1-indexed)
-                                                        if index < 9 {
-                                                            span {
-                                                                class: "text-xs text-fg-muted font-mono",
-                                                                "⌘{index + 1}"
+                                                                // Hotkey hint (1-indexed)
+                                                                if index < 9 {
+                                                                    span {
+                                                                        class: "text-xs text-fg-muted font-mono",
+                                                                        "⌘{index + 1}"
+                                                                    }
+                                                                }
                                                             }
                                                         }
+                                                    } else {
+                                                        rsx! {{}}
                                                     }
                                                 }
                                             }

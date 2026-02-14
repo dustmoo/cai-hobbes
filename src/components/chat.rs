@@ -12,6 +12,7 @@ use super::shared::{DraftContext, MessageContent, SessionIdContext, StreamMessag
 use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRenderer};
 use crate::components::stream_manager::StreamManagerContext;
 use crate::context::permissions::PermissionManager;
+use crate::mcp::manager::{COMPOSIO_NATIVE_PREFIX, is_composio_native};
 use crate::context::prompt_builder::PromptBuilder;
 use crate::session::ActiveContext;
 use crate::settings::Settings;
@@ -105,22 +106,22 @@ pub fn ChatWindow(
     let mut last_session_id = use_signal(|| session_state.read().active_session_id.clone());
     let mut stream_update_trigger = use_signal(|| 0);
     let mut show_scroll_button = use_signal(|| false);
-    let active_composio_profile_name = consume_context::<Signal<Option<String>>>();
 
     // Shared helper: fetch fresh MCP context for a session and update its active_context.
     // Returns the fetched McpContext for downstream use (e.g. passing to send_prompt_to_llm).
     let fetch_fresh_mcp_context = move |target_id: String, settings_snapshot: Settings| async move {
-        let profile_name = session_state.read()
+        // Pass the profile ID directly (composio_profile is the stable ID)
+        let profile_id = session_state.read()
             .sessions.get(&target_id)
-            .and_then(|s| s.composio_profile.clone())
-            .or_else(|| settings_snapshot.active_composio_profile.clone());
+            .and_then(|s| s.composio_profile.clone());
 
-        if let Some(name) = &profile_name {
+        // ensure_native_client_for_profile can accept name or ID — pass the ID
+        if let Some(ref id) = profile_id {
             let _ = mcp_manager.read()
-                .ensure_native_client_for_profile(name, &settings_snapshot).await;
+                .ensure_native_client_for_profile(id, &settings_snapshot).await;
         }
 
-        let fresh = mcp_manager.read().get_mcp_context(profile_name).await;
+        let fresh = mcp_manager.read().get_mcp_context(profile_id).await;
         {
             let mut state = session_state.write();
             if let Some(session) = state.sessions.get_mut(&target_id) {
@@ -170,22 +171,20 @@ pub fn ChatWindow(
         let mut current_context = _mcp_context.read().clone();
         let mut state = session_state.write();
         if let Some(session) = state.sessions.get_mut(&*current_target_id.read()) {
-            let profile = active_composio_profile_name.read().clone();
+            let profile_id = session.composio_profile.clone();
             
             // Filter servers to only include non-native or profile-matching native tools
+            // Use the server_name convention: config.name contains the display key,
+            // but we filter by matching the profile_id against the known session profile.
             current_context.servers.retain(|s| {
-                if s.name == "composio-native" || s.name.starts_with("composio-native:") {
-                    let p_name = if s.name == "composio-native" {
-                        "".to_string()
-                    } else {
-                        s.name.strip_prefix("composio-native:").unwrap_or_default().to_string()
-                    };
-                    
-                    if let Some(target) = &profile {
-                        p_name.is_empty() || p_name == *target
+                if is_composio_native(&s.name) {
+                    if let Some(ref target_id) = profile_id {
+                        // Include singleton (legacy) or if name contains the target profile ID/name
+                        let suffix = s.name.strip_prefix("composio-native:").unwrap_or_default();
+                        suffix.is_empty() || suffix == target_id
                     } else {
                         // If no profile, only allow the legacy/default composio-native
-                        p_name.is_empty()
+                        s.name == COMPOSIO_NATIVE_PREFIX
                     }
                 } else {
                     true
@@ -292,7 +291,13 @@ pub fn ChatWindow(
                 has_pending_approvals.set(false);
 
                 // 1. Identify tools that need to be run and capture profile context
-                let composio_profile = active_composio_profile_name.peek().clone();
+                let active_session_id_inner = active_session_id.clone();
+                let composio_profile = {
+                    let state = session_state.read();
+                    state.sessions.get(&active_session_id_inner)
+                        .and_then(|s| s.composio_profile.clone())
+                };
+
                 {
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&active_session_id) {
@@ -405,11 +410,15 @@ pub fn ChatWindow(
 
                 stream_manager.start_stream(
                     hobbes_message_id,
-                    session_id,
+                    session_id.clone(),
                     prompt_data,
                     on_complete,
                     mcp_context,
-                    active_composio_profile_name.peek().clone(),
+                    {
+                        let state = session_state.read();
+                        state.sessions.get(&session_id)
+                            .and_then(|s| s.composio_profile.clone())
+                    },
                 );
 
                 rx.recv().await;
@@ -811,7 +820,7 @@ pub fn ChatWindow(
                 optimization_summary: modal_optimization_summary,
                 on_start_chat: move |new_context: ActiveContext| {
                      // Create new session with memory
-                     let new_session_id = session_state.write().create_session(settings.peek().active_composio_profile.clone());
+                     let new_session_id = session_state.write().create_session(settings.peek().get_active_profile().map(|p| p.id.clone()));
                      // Update context of the new session
                      if let Some(session) = session_state.write().sessions.get_mut(&new_session_id) {
                          session.active_context = new_context;

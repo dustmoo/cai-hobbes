@@ -2676,6 +2676,10 @@ video {
   background-color: rgb(127 29 29 / 0.5);
 }
 
+.bg-red-900\/80 {
+  background-color: rgb(127 29 29 / 0.8);
+}
+
 .bg-secondary-500 {
   --tw-bg-opacity: 1;
   background-color: rgb(199 86 129 / var(--tw-bg-opacity, 1));
@@ -3107,6 +3111,11 @@ video {
 .text-purple-600 {
   --tw-text-opacity: 1;
   color: rgb(147 51 234 / var(--tw-text-opacity, 1));
+}
+
+.text-red-100 {
+  --tw-text-opacity: 1;
+  color: rgb(254 226 226 / var(--tw-text-opacity, 1));
 }
 
 .text-red-200 {

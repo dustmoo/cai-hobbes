@@ -56,7 +56,7 @@ impl StreamManagerContext {
         prompt_data: crate::context::prompt_builder::LlmPrompt,
         on_complete: impl FnOnce() + 'static,
         mcp_context: Option<crate::mcp::manager::McpContext>,
-        profile_name: Option<String>,
+        profile_id: Option<String>,
     ) {
         self.is_sending.set(true);
         tracing::info!(message_id = %message_id, session_id = %session_id, "'start_stream' entered.");
@@ -269,13 +269,13 @@ impl StreamManagerContext {
                         let mut session_state = self.session_state;
                         let tool_results_tx_clone = tool_results_tx.clone();
                         let completed_tool_tasks_clone = completed_tool_tasks.clone();
-                        let profile_name_inner = profile_name.clone();
+                        let profile_id_inner = profile_id.clone();
                         let session_id_inner = session_id.clone();
                         let _handle = spawn(async move {
                             let args_json: serde_json::Value =
                                 serde_json::from_str(&tool_call.arguments)
                                     .unwrap_or(serde_json::Value::Null);
-                            let profile_name = profile_name_inner;
+                            let profile_id = profile_id_inner;
 
                             let result_receiver = mcp_manager
                                 .read()
@@ -284,7 +284,7 @@ impl StreamManagerContext {
                                     &tool_call.tool_name,
                                     args_json,
                                     false,
-                                    profile_name.clone(),
+                                    profile_id.clone(),
                                 )
                                 .await;
 
@@ -320,7 +320,7 @@ impl StreamManagerContext {
                                                     .initiate_composio_auth(
                                                         &tool_call.server_name,
                                                         &tool_call.tool_name,
-                                                        profile_name.clone(),
+                                                        profile_id.clone(),
                                                     )
                                                     .await
                                                 {
@@ -417,7 +417,7 @@ impl StreamManagerContext {
                                     profile_color: {
                                         let settings_read = self.settings.read();
                                         crate::components::shared::resolve_profile_color(
-                                            profile_name.as_ref(),
+                                            profile_id.as_ref(),
                                             &settings_read,
                                         )
                                     },

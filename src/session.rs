@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use dioxus_signals::Writable;
 
 use crate::mcp::manager::McpContext;
 use serde_json::Value;
@@ -495,12 +494,6 @@ impl SessionState {
         self.sessions.get_mut(&self.active_session_id)
     }
 
-    #[allow(dead_code)] // Vestigial after session-targeted streaming refactor (v0.9.46); kept for potential future non-streaming callers
-    pub fn touch_active_session(&mut self) {
-        if let Some(session) = self.sessions.get_mut(&self.active_session_id) {
-            session.last_updated = Utc::now();
-        }
-    }
 
     /// Touch (update `last_updated`) on a specific session by ID.
     /// Used by stream_manager to target the originating session after a tab switch.
@@ -535,7 +528,6 @@ impl SessionState {
 
 
     pub fn update_window_size(&mut self, width: f64, height: f64) {
-        tracing::debug!("Updating window size in state to: {}x{}", width, height);
         self.window_width = width;
         self.window_height = height;
         // Note: Save is now handled asynchronously by the caller to avoid UI hang.
@@ -554,23 +546,7 @@ impl SessionState {
     /// For extremely large states this could become a bottleneck; a future optimization could
     /// serialize into bytes on the main thread (fast memcpy) and only do file I/O async.
     pub fn save_async(state: SessionState, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
-        let handle = tokio::spawn(async move {
-            tokio::task::spawn_blocking(move || state.save()).await.unwrap_or_else(|e| Err(std::io::Error::other(e)))
-        });
-        if let Some(mut sig) = error_signal {
-            dioxus::prelude::spawn(async move {
-                if let Ok(Err(e)) = handle.await {
-                    tracing::error!("Failed to save session state async: {}", e);
-                    *sig.write() = Some(format!("Failed to save session: {}", e));
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                if let Ok(Err(e)) = handle.await {
-                    tracing::error!("Failed to save session state async: {}", e);
-                }
-            });
-        }
+        crate::async_persist::persist_async(move || state.save(), "session state", error_signal);
     }
 
     pub fn update_session_name_raw(&mut self, id: &str, new_name: String) {
@@ -591,15 +567,6 @@ impl SessionState {
             .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
     }
 
-    #[allow(dead_code)] // Vestigial after session-targeted streaming refactor (v0.9.46); kept for potential future non-streaming callers
-    pub fn remove_message(&mut self, message_id: &uuid::Uuid) {
-        if let Some(session) = self.get_active_session_mut() {
-            if let Some(index) = session.messages.iter().position(|m| m.id == *message_id) {
-                session.messages.remove(index);
-                tracing::info!(message_id = %message_id, "Removed message from active session.");
-            }
-        }
-    }
     pub fn get_message_mut_by_execution_id(
         &mut self,
         execution_id: &str,
@@ -615,6 +582,31 @@ impl SessionState {
                 _ => false,
             })
         })
+    }
+
+    /// Migrate session composio_profile from name-based to ID-based.
+    /// Any session whose composio_profile matches a profile name (but not an ID)
+    /// gets updated to the corresponding profile ID.
+    pub fn migrate_session_profiles_to_ids(&mut self, settings: &crate::settings::Settings) -> bool {
+        let mut migrated = false;
+        for session in self.sessions.values_mut() {
+            if let Some(ref value) = session.composio_profile {
+                // Already an ID — skip
+                if settings.composio_profiles.iter().any(|p| &p.id == value) {
+                    continue;
+                }
+                // Match by name → replace with ID
+                if let Some(profile) = settings.composio_profiles.iter().find(|p| &p.name == value) {
+                    tracing::info!(
+                        "Migrating session '{}' composio_profile from name '{}' to id '{}'",
+                        session.id, value, profile.id
+                    );
+                    session.composio_profile = Some(profile.id.clone());
+                    migrated = true;
+                }
+            }
+        }
+        migrated
     }
 }
 impl Default for SessionState {

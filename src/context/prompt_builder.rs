@@ -336,8 +336,10 @@ impl<'a> PromptBuilder<'a> {
             .iter()
             .any(|p| p.is_fully_configured())
         {
-            let active_profile_name = self.session.composio_profile.as_deref()
-                .or(self.settings.active_composio_profile.as_deref())
+            let profile_id = self.session.composio_profile.as_deref()
+                .or(self.settings.active_composio_profile.as_deref());
+            let active_profile_name = profile_id
+                .and_then(|id| self.settings.profile_name_for_id(id))
                 .unwrap_or("Default");
 
             system_context_map.insert(
