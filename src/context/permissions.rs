@@ -6,17 +6,14 @@ use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ToolCategory {
-    // ReadOnly, // e.g., read_file, list_files
-    // Write,    // e.g., write_to_file, apply_diff
-    // Execute,  // e.g., execute_command
-    Mcp, // General MCP tools
+    Mcp, // All MCP tool calls use this single category
 }
 
 #[derive(Debug, PartialEq)]
 pub enum PermissionStatus {
     Allowed,
     RequiresPrompt,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // API contract: matched in manager.rs but denials currently use RequiresPrompt → UI flow
     Denied(String),
 }
 
@@ -38,7 +35,7 @@ impl Default for PermissionSettings {
             granular_permissions: HashMap::new(),
             mcp_server_permissions: HashMap::new(),
             skill_permissions: HashMap::new(),
-            max_ai_turns: 10,
+            max_ai_turns: 25,
         }
     }
 }
@@ -109,7 +106,6 @@ impl PermissionManager {
     }
 
     /// Check if skill execution is allowed based on permission settings.
-    #[allow(dead_code)]
     pub fn check_skill_permission(&self, skill_name: &str) -> PermissionStatus {
         let settings = self.settings.read();
 
@@ -154,7 +150,7 @@ mod tests {
 
                 assert!(!pm.is_turn_limit_reached());
 
-                for _ in 0..10 {
+                for _ in 0..25 {
                     pm.increment_turn_count();
                 }
 

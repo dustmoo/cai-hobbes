@@ -159,6 +159,7 @@ pub fn ChatWindow(
     let mut show_forget_memory_modal = use_signal(|| false);
     let mut forget_modal_context = use_signal(ActiveContext::default);
     let mut modal_optimization_summary = use_signal(|| Option::<String>::None);
+    let mut show_forget_confirm_modal = use_signal(|| false);
 
     let on_interaction = move || {
         show_scroll_button.set(false);
@@ -833,7 +834,12 @@ pub fn ChatWindow(
                 on_optimize_memory: move |current_context: ActiveContext| {
                     optimization_target.set(OptimizationTarget::NewChatModal);
                     forget_modal_context.set(current_context);
-                    show_forget_memory_modal.set(true);
+                    let confirm = settings.read().confirm_forget_memory;
+                    if confirm {
+                        show_forget_confirm_modal.set(true);
+                    } else {
+                        show_forget_memory_modal.set(true);
+                    }
                 },
                 on_cancel: move |_| {
                     show_new_chat_memory_modal.set(false);
@@ -872,6 +878,24 @@ pub fn ChatWindow(
                 on_cancel: move |_| {
                     show_delete_confirm_modal.set(false);
                     pending_delete_message_id.set(None);
+                }
+            }
+
+            ConfirmDeleteModal {
+                is_visible: show_forget_confirm_modal,
+                title: "Optimize Memory",
+                message: "This will use AI to rewrite your conversation context based on your instructions. The original context will be replaced. Continue?".to_string(),
+                confirm_button_text: "Continue",
+                show_dont_ask_again: true,
+                on_confirm: move |dont_ask_again: bool| {
+                    if dont_ask_again {
+                        settings.write().confirm_forget_memory = false;
+                    }
+                    show_forget_confirm_modal.set(false);
+                    show_forget_memory_modal.set(true);
+                },
+                on_cancel: move |_| {
+                    show_forget_confirm_modal.set(false);
                 }
             }
         }
