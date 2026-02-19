@@ -146,6 +146,7 @@ pub struct UsageMetadata {
 /// Supported Gemini Models for Pricing
 #[derive(Debug, PartialEq, Clone)]
 pub enum GeminiModel {
+    Gemini3_1ProPreview,
     Gemini3_0ProPreview,
     Gemini3_0FlashPreview,
     Gemini2_5Pro,
@@ -169,6 +170,7 @@ impl GeminiModel {
 
         match s {
             // Gemini 3 Series - STRICT PREFIX MATCHING FIRST
+            _ if s.starts_with("gemini-3.1-pro") => GeminiModel::Gemini3_1ProPreview,
             _ if s.starts_with("gemini-3.0-pro") || s.starts_with("gemini-3-pro") => {
                 GeminiModel::Gemini3_0ProPreview
             }
@@ -240,7 +242,7 @@ impl GeminiModel {
 
     pub fn get_rates(&self, prompt_tokens: i32) -> (f64, f64) {
         match self {
-            GeminiModel::Gemini3_0ProPreview => {
+            GeminiModel::Gemini3_1ProPreview | GeminiModel::Gemini3_0ProPreview => {
                 if prompt_tokens > 200_000 {
                     (4.00, 18.00)
                 } else {
@@ -275,10 +277,9 @@ impl GeminiModel {
     }
 }
 
-/// Calculate cost in USD based on model and token usage
-/// Pricing per million tokens for Gemini models (as of Jan 2026)
-/// Calculate cost in USD based on model and token usage
-/// Handles dynamic rates for Thinking Mode and Context Caching
+/// Calculate cost in USD based on model and token usage.
+/// Pricing per million tokens for Gemini models (as of Jan 2026).
+/// Handles dynamic rates for Thinking Mode and Context Caching.
 pub fn calculate_cost(model: &str, usage: &UsageMetadata) -> f64 {
     let gemini_model = GeminiModel::from_slug(model);
     let (input_rate, mut output_rate) = gemini_model.get_rates(usage.prompt_token_count);
@@ -404,7 +405,7 @@ impl GeminiModel {
     /// Returns the thinking config style for this model
     pub fn thinking_config_style(&self) -> ThinkingConfigStyle {
         match self {
-            GeminiModel::Gemini3_0ProPreview => ThinkingConfigStyle::LevelPro,
+            GeminiModel::Gemini3_1ProPreview | GeminiModel::Gemini3_0ProPreview => ThinkingConfigStyle::LevelPro,
             GeminiModel::Gemini3_0FlashPreview | GeminiModel::Gemini2_0FlashThinking => {
                 ThinkingConfigStyle::LevelFlash
             }
@@ -419,6 +420,7 @@ impl GeminiModel {
     /// Returns the official human-readable name for this model
     pub fn display_name(&self) -> String {
         match self {
+            GeminiModel::Gemini3_1ProPreview => "Gemini 3.1 Pro".to_string(),
             GeminiModel::Gemini3_0ProPreview => "Gemini 3 Pro".to_string(),
             GeminiModel::Gemini3_0FlashPreview => "Gemini 3 Flash".to_string(),
             GeminiModel::Gemini2_5Pro => "Gemini 2.5 Pro".to_string(),
@@ -467,6 +469,7 @@ impl GeminiModel {
     /// This is the authoritative source for model identifiers sent to the API.
     pub fn canonical_slug(&self) -> &str {
         match self {
+            GeminiModel::Gemini3_1ProPreview => "gemini-3.1-pro-preview",
             GeminiModel::Gemini3_0ProPreview => "gemini-3-pro-preview",
             GeminiModel::Gemini3_0FlashPreview => "gemini-3-flash-preview",
             GeminiModel::Gemini2_5Pro => "gemini-2.5-pro",
@@ -1862,6 +1865,7 @@ mod tests {
 
     #[test]
     fn test_supports_thinking() {
+        assert!(GeminiModel::Gemini3_1ProPreview.supports_thinking());
         assert!(GeminiModel::Gemini3_0ProPreview.supports_thinking());
         assert!(GeminiModel::Gemini3_0FlashPreview.supports_thinking());
         assert!(GeminiModel::Gemini2_5Pro.supports_thinking());
@@ -1874,6 +1878,10 @@ mod tests {
     #[test]
     fn test_thinking_config_style() {
         use ThinkingConfigStyle::*;
+        assert_eq!(
+            GeminiModel::Gemini3_1ProPreview.thinking_config_style(),
+            LevelPro
+        );
         assert_eq!(
             GeminiModel::Gemini3_0ProPreview.thinking_config_style(),
             LevelPro
@@ -1895,6 +1903,10 @@ mod tests {
     #[test]
     fn test_valid_thinking_levels() {
         assert_eq!(
+            GeminiModel::Gemini3_1ProPreview.valid_thinking_levels(),
+            &["low", "high"]
+        );
+        assert_eq!(
             GeminiModel::Gemini3_0ProPreview.valid_thinking_levels(),
             &["low", "high"]
         );
@@ -1911,7 +1923,11 @@ mod tests {
     #[test]
     fn test_from_slug_versioned_models() {
         // Gemini 3 versioned slugs should map correctly
-        // Test Official API style (gemini-3-pro)
+        // Test Official API style (gemini-3.1-pro and gemini-3-pro)
+        assert_eq!(
+            GeminiModel::from_slug("gemini-3.1-pro-preview"),
+            GeminiModel::Gemini3_1ProPreview
+        );
         assert_eq!(
             GeminiModel::from_slug("gemini-3-pro-preview"),
             GeminiModel::Gemini3_0ProPreview
@@ -1954,6 +1970,7 @@ mod tests {
     fn test_canonical_slug_round_trip() {
         // Ensure canonical slugs resolve back to the correct model
         let models = [
+            GeminiModel::Gemini3_1ProPreview,
             GeminiModel::Gemini3_0ProPreview,
             GeminiModel::Gemini3_0FlashPreview,
             GeminiModel::Gemini2_5Pro,

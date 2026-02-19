@@ -1278,7 +1278,7 @@ pub fn MessageBubble(
                                              div { class: "w-1.5 h-1.5 bg-current rounded-full animate-bounce [animation-delay:-0.15s]" }
                                              div { class: "w-1.5 h-1.5 bg-current rounded-full animate-bounce" }
                                         }
-                                        span { class: "ml-2 font-medium", "Thinking..." }
+                                        span { class: "ml-2 font-medium", "Considering..." }
                                     }
                                     if *show_thinking.read() {
                                         div {

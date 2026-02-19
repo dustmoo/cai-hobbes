@@ -448,7 +448,7 @@ impl Default for Settings {
             active_llm: LlmProvider::Gemini,
             gemini_config: GeminiConfig {
                 api_key: None,
-                chat_model: GeminiModel::Gemini3_0FlashPreview.canonical_slug().to_string(),
+                chat_model: GeminiModel::Gemini3_1ProPreview.canonical_slug().to_string(),
                 summary_model: GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
                 thinking_enabled: false,
                 thinking_level: "high".to_string(),
@@ -500,6 +500,8 @@ pub fn get_default_model_icon(model_slug: &str) -> String {
     // Match specific variants first for visual distinction
     if slug.contains("experimental") {
         "🧪".to_string()
+    } else if slug.contains("gemini-3.1") {
+        "✨".to_string()
     } else if slug.contains("image") {
         "🎨".to_string()
     } else if slug.contains("lite") {
@@ -529,10 +531,10 @@ pub fn get_default_model_icon(model_slug: &str) -> String {
 /// Derives slugs from GeminiModel::canonical_slug() to prevent version drift.
 fn default_model_slots() -> Vec<String> {
     vec![
+        GeminiModel::Gemini3_1ProPreview.canonical_slug().to_string(),
         GeminiModel::Gemini3_0FlashPreview.canonical_slug().to_string(),
         GeminiModel::Gemini3_0ProPreview.canonical_slug().to_string(),
         GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
-        "".to_string(), // Slot 4
         "".to_string(), // Slot 5
         "".to_string(), // Slot 6
         "".to_string(), // Slot 7
