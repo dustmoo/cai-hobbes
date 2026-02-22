@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 /// Threshold above which we use LLM-based tool selection instead of enabling all tools.
-/// Set to 50 to stay within Gemini's optimized tool limit.
-pub const TOOL_SELECTION_THRESHOLD: usize = 50;
+/// Set to 128 to match Gemini's tool limit — only massive toolkits (200+) trigger LLM selection.
+pub const TOOL_SELECTION_THRESHOLD: usize = 128;
 
 /// Maximum tools to select for a single toolkit to stay within Gemini's optimized tool limit.
 pub const MAX_TOOLS_PER_TOOLKIT: usize = 50;

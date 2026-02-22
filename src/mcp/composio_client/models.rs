@@ -330,6 +330,76 @@ pub struct ToolExecuteResponse {
     pub session_info: Option<Value>,
 }
 
+impl ToolExecuteResponse {
+    /// Single authority for detecting auth errors in a Composio tool response.
+    ///
+    /// Checks all known patterns the Composio API uses to signal auth failures:
+    /// 1. `data.status_code` — numeric 401/403
+    /// 2. `data.statusCode` — string or numeric 401/403
+    /// 3. `data.ECODE` — `AUTH_*` / `OAUTH_*` prefixes
+    /// 4. `data.http_error` — substring "401"/"403"
+    /// 5. `data.data.status_code` / `data.data.statusCode` — nested variants
+    /// 6. `error` string — "401", "403 Forbidden", "Authentication required"
+    ///
+    /// NOTE: This does NOT cover the Double-MCP `result.content[].text` path,
+    /// which operates on the raw JSON-RPC envelope before deserialization.
+    /// That check lives in `execution.rs` as a separate lifecycle stage.
+    pub fn is_auth_error(&self) -> bool {
+        if self.successful {
+            return false;
+        }
+
+        let data = &self.data;
+
+        // 1. data.status_code (numeric)
+        let status_code_num = data.get("status_code").is_some_and(|v| {
+            v.as_u64().is_some_and(|n| n == 401 || n == 403)
+                || v.as_i64().is_some_and(|n| n == 401 || n == 403)
+        });
+
+        // 2. data.statusCode (string "401"/"403" or numeric)
+        let status_code_str = data.get("statusCode").is_some_and(|v| {
+            v.as_str().is_some_and(|s| s == "401" || s == "403")
+                || v.as_u64().is_some_and(|n| n == 401 || n == 403)
+        });
+
+        // 3. data.ECODE (AUTH_018, OAUTH_018, etc.)
+        let ecode_match = data
+            .get("ECODE")
+            .and_then(|v| v.as_str())
+            .is_some_and(|e| e.starts_with("AUTH_") || e.starts_with("OAUTH_"));
+
+        // 4. data.http_error (substring)
+        let http_error_match = data
+            .get("http_error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("401") || s.contains("403"));
+
+        // 5. Nested data.data.status_code / data.data.statusCode
+        let nested_status = data.get("data").is_some_and(|inner| {
+            inner.get("status_code").is_some_and(|v| {
+                v.as_u64().is_some_and(|n| n == 401 || n == 403)
+            }) || inner.get("statusCode").is_some_and(|v| {
+                v.as_str().is_some_and(|s| s == "401" || s == "403")
+                    || v.as_u64().is_some_and(|n| n == 401 || n == 403)
+            })
+        });
+
+        // 6. Fallback: error string substring match (last resort)
+        let error_str = self.error.as_deref().unwrap_or("");
+        let error_fallback = error_str.contains("401")
+            || error_str.contains("403 Forbidden")
+            || error_str.contains("Authentication required");
+
+        status_code_num
+            || status_code_str
+            || ecode_match
+            || http_error_match
+            || nested_status
+            || error_fallback
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct PaginatedToolResult {
     #[serde(alias = "items")]

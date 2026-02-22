@@ -600,10 +600,7 @@ pub fn ChatWindow(
                 }
             };
 
-            spawn(async move {
-                let state_snapshot = session_state.read().clone();
-                let _ = tokio::task::spawn_blocking(move || state_snapshot.save()).await;
-            });
+            crate::session::SessionState::save_async(&session_state.read(), None);
 
             let mcp_context = session_state
                 .read()
@@ -664,10 +661,7 @@ pub fn ChatWindow(
                     }
                 };
 
-                spawn(async move {
-                    let state_snapshot = session_state.read().clone();
-                    let _ = tokio::task::spawn_blocking(move || state_snapshot.save()).await;
-                });
+                crate::session::SessionState::save_async(&session_state.read(), None);
 
                 let mcp_context = if fresh_mcp_context.servers.is_empty() {
                     None
@@ -753,10 +747,7 @@ pub fn ChatWindow(
                         });
                     }
                 }
-                spawn(async move {
-                    let state_snapshot = session_state.read().clone();
-                    let _ = tokio::task::spawn_blocking(move || state_snapshot.save()).await;
-                });
+                crate::session::SessionState::save_async(&session_state.read(), None);
                 // Force refresh messagelist
                 stream_update_trigger.set(stream_update_trigger() + 1);
             }
@@ -1278,7 +1269,14 @@ pub fn MessageBubble(
                                              div { class: "w-1.5 h-1.5 bg-current rounded-full animate-bounce [animation-delay:-0.15s]" }
                                              div { class: "w-1.5 h-1.5 bg-current rounded-full animate-bounce" }
                                         }
-                                        span { class: "ml-2 font-medium", "Considering..." }
+                                        span {
+                                            class: "ml-2 font-medium",
+                                            if local_thought_summary.read().as_ref().is_none_or(|s| s.is_empty()) {
+                                                "Considering..."
+                                            } else {
+                                                "Thinking..."
+                                            }
+                                        }
                                     }
                                     if *show_thinking.read() {
                                         div {
@@ -1321,7 +1319,8 @@ pub fn MessageBubble(
                                             if let Some(msg) = state.get_message_mut(&message_id) {
                                                 msg.comments.retain(|c| c.id != comment_id);
                                             }
-                                            crate::session::SessionState::save_async(state.clone(), Some(save_error));
+                                            drop(state);
+                                            crate::session::SessionState::save_signal(&session_state, Some(save_error));
                                         }
                                     }
                                 }
@@ -1420,7 +1419,8 @@ pub fn MessageBubble(
                                     if let Some(msg) = state.get_message_mut(&message.id) {
                                         msg.comments.push(new_comment);
                                     }
-                                    crate::session::SessionState::save_async(state.clone(), Some(save_error));
+                                    drop(state);
+                                    crate::session::SessionState::save_signal(&session_state, Some(save_error));
 
                                     on_comment.call(());
 
@@ -1455,7 +1455,8 @@ pub fn MessageBubble(
                                                         comment.comment = new_comment_text;
                                                     }
                                                 }
-                                                crate::session::SessionState::save_async(state.clone(), Some(save_error));
+                                                drop(state);
+                                                crate::session::SessionState::save_signal(&session_state, Some(save_error));
                                             }
                                             editing_comment_id.set(None);
                                             selection_mode.set(SelectionMode::None);

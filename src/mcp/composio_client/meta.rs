@@ -35,13 +35,15 @@ pub fn get_meta_tools() -> Vec<ComposioTool> {
             is_deprecated: None,
             is_no_auth: Some(true),
         },
-        // Meta-tool 2: Get specific tools for a chosen app
+        // Meta-tool 2: Get specific tools for a chosen app (also injects them as native FunctionDeclarations)
         ComposioTool {
             name: "COMPOSIO_GET_APP_TOOLS".to_string(),
             description: Some(
-                "List all available tools for a specific Composio app/toolkit. \
+                "List and activate tools for a specific Composio app/toolkit. \
                 Use this AFTER discovering the app name with COMPOSIO_DISCOVER_APPS. \
-                Returns tool names, descriptions, and parameter schemas for the selected app.".to_string()
+                Returns tool names, descriptions, and parameter schemas for the selected app. \
+                IMPORTANT: After calling this, the discovered tools become available as native \
+                function calls — you can call them directly by name without COMPOSIO_EXECUTE_TOOL.".to_string()
             ),
             parameters: Some(serde_json::json!({
                 "type": "object",
@@ -65,12 +67,13 @@ pub fn get_meta_tools() -> Vec<ComposioTool> {
             is_deprecated: None,
             is_no_auth: Some(true),
         },
-        // Meta-tool 3: Execute a specific tool
+        // Meta-tool 3: Execute a specific tool (fallback for tools not yet loaded as native calls)
         ComposioTool {
             name: "COMPOSIO_EXECUTE_TOOL".to_string(),
             description: Some(
-                "Execute a Composio tool by name. Use COMPOSIO_GET_APP_TOOLS first to find the correct \
-                tool name and required parameters. Pass the exact tool name and arguments as JSON.".to_string()
+                "Execute a Composio tool by name. This is a fallback for tools that are not yet available \
+                as native function calls. Prefer calling COMPOSIO_GET_APP_TOOLS first to make tools \
+                available natively. Pass the exact tool name and arguments as JSON.".to_string()
             ),
             parameters: Some(serde_json::json!({
                 "type": "object",
@@ -89,6 +92,31 @@ pub fn get_meta_tools() -> Vec<ComposioTool> {
             toolkit: Some(ComposioToolkit { slug: "composio".to_string() }),
             app: None,
             slug: Some("COMPOSIO_EXECUTE_TOOL".to_string()),
+            input_parameters: None,
+            input_schema: None,
+            output_parameters: None,
+            tags: None,
+            version: None,
+            available_versions: None,
+            is_deprecated: None,
+            is_no_auth: Some(true),
+        },
+        // Meta-tool 4: Clear dynamically discovered tools from the session
+        ComposioTool {
+            name: "COMPOSIO_CLEAR_TOOLS".to_string(),
+            description: Some(
+                "Clear all dynamically discovered tools from the current session. \
+                Use this when switching contexts or when the discovered tools are no longer needed, \
+                to free up space within the function declaration limit.".to_string()
+            ),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            })),
+            toolkit: Some(ComposioToolkit { slug: "composio".to_string() }),
+            app: None,
+            slug: Some("COMPOSIO_CLEAR_TOOLS".to_string()),
             input_parameters: None,
             input_schema: None,
             output_parameters: None,

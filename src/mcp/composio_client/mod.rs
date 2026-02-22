@@ -134,8 +134,9 @@ impl ComposioClient {
         &self,
         toolkit_slug: &str,
         user_id: &str,
+        force: bool,
     ) -> Result<String, String> {
-        auth::initiate_connection(self, toolkit_slug, user_id).await
+        auth::initiate_connection(self, toolkit_slug, user_id, force).await
     }
 
     // --- Discovery Module Delegates ---
@@ -223,4 +224,55 @@ impl ComposioClient {
         }
     }
 
+    /// Reconnect a previously-connected toolkit via the core 5-point lifecycle.
+    /// Used by auth recovery when a tool call fails due to expired credentials.
+    pub async fn reconnect_toolkit(
+        &self,
+        toolkit_slug: &str,
+    ) -> Result<String, String> {
+        let user_id = self.user_id.clone().unwrap_or_else(|| "default".to_string());
+
+        // Step 1: Hydrate auth_config_cache so we find existing configs
+        tracing::info!("[RECONNECT 1/5] Hydrating auth_config_cache for '{}'...", toolkit_slug);
+        if let Err(e) = auth::list_auth_configs(self).await {
+            tracing::warn!("[RECONNECT] Failed to hydrate auth configs: {}", e);
+        }
+
+        // Step 2: Resolve existing auth_config_id
+        tracing::info!("[RECONNECT 2/5] Resolving auth config...");
+        let auth_config_id = auth::get_auth_config_id(self, toolkit_slug).await?;
+        tracing::info!("[RECONNECT] Found auth_config_id '{}' for '{}'", auth_config_id, toolkit_slug);
+
+        // Step 3: Delete stale ACTIVE connections
+        tracing::info!("[RECONNECT 3/5] Pruning stale connections...");
+        if let Ok(accounts) = auth::list_connected_accounts(self).await {
+            for acc in &accounts {
+                let matches = acc.toolkit.as_ref()
+                    .map(|t| t.slug.eq_ignore_ascii_case(toolkit_slug))
+                    .unwrap_or(false);
+                if matches && acc.status.eq_ignore_ascii_case("ACTIVE") {
+                    tracing::info!("[RECONNECT] Deleting stale connection '{}' for '{}'", acc.id, toolkit_slug);
+                    let _ = auth::delete_connected_account(self, &acc.id).await;
+                }
+            }
+        }
+        // Bust stale cache
+        if let Ok(mut map) = self.toolkit_account_map.write() {
+            map.remove(toolkit_slug);
+        }
+
+        // Step 4: Initiate OAuth (force=true → opens browser)
+        tracing::info!("[RECONNECT 4/5] Initiating OAuth (force=true)...");
+        let result = auth::initiate_connection(self, toolkit_slug, &user_id, true).await?;
+
+        // Step 5: Re-patch server to ensure toolkit + auth_config binding
+        tracing::info!("[RECONNECT 5/5] Re-patching MCP server...");
+        match self.add_toolkit_to_server(toolkit_slug, &auth_config_id, None).await {
+            Ok(Some(new_url)) => tracing::info!("[RECONNECT] Server re-patched: {}", new_url),
+            Ok(None) => tracing::info!("[RECONNECT] Server already configured for '{}'", toolkit_slug),
+            Err(e) => tracing::warn!("[RECONNECT] Server re-patch warning: {}", e),
+        }
+
+        Ok(result)
+    }
 }

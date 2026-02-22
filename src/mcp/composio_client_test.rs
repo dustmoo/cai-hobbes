@@ -409,4 +409,79 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
              }
         }
     }
+
+    // ---------------------------------------------------------------
+    // is_auth_error() unit tests (single-authority auth detection)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_is_auth_error_status_code() {
+        use crate::mcp::composio_client::models::ToolExecuteResponse;
+
+        let resp = ToolExecuteResponse {
+            data: json!({ "status_code": 401 }),
+            error: None,
+            successful: false,
+            log_id: None,
+            session_info: None,
+        };
+        assert!(resp.is_auth_error(), "Should detect status_code 401");
+
+        let resp_403 = ToolExecuteResponse {
+            data: json!({ "statusCode": "403" }),
+            error: None,
+            successful: false,
+            log_id: None,
+            session_info: None,
+        };
+        assert!(resp_403.is_auth_error(), "Should detect statusCode \"403\"");
+    }
+
+    #[test]
+    fn test_is_auth_error_ecode() {
+        use crate::mcp::composio_client::models::ToolExecuteResponse;
+
+        let resp = ToolExecuteResponse {
+            data: json!({ "ECODE": "OAUTH_018" }),
+            error: None,
+            successful: false,
+            log_id: None,
+            session_info: None,
+        };
+        assert!(resp.is_auth_error(), "Should detect ECODE OAUTH_018");
+
+        let resp_auth = ToolExecuteResponse {
+            data: json!({ "ECODE": "AUTH_001" }),
+            error: None,
+            successful: false,
+            log_id: None,
+            session_info: None,
+        };
+        assert!(resp_auth.is_auth_error(), "Should detect ECODE AUTH_001");
+    }
+
+    #[test]
+    fn test_is_auth_error_false_positive() {
+        use crate::mcp::composio_client::models::ToolExecuteResponse;
+
+        // Successful response should never be flagged
+        let resp_success = ToolExecuteResponse {
+            data: json!({ "status_code": 401 }),
+            error: None,
+            successful: true,
+            log_id: None,
+            session_info: None,
+        };
+        assert!(!resp_success.is_auth_error(), "Successful response should not be auth error");
+
+        // No auth signals at all
+        let resp_clean = ToolExecuteResponse {
+            data: json!({ "result": "ok", "status_code": 200 }),
+            error: None,
+            successful: false,
+            log_id: None,
+            session_info: None,
+        };
+        assert!(!resp_clean.is_auth_error(), "200 status_code should not be auth error");
+    }
 }

@@ -157,7 +157,7 @@ pub fn SettingsPanel() -> Element {
 
                             if conflicts.is_empty() {
                                 show_conflict_modal.set(false);
-                                crate::session::SessionState::save_async(session_state.peek().clone(), Some(save_error));
+                                crate::session::SessionState::save_async(&session_state.peek(), Some(save_error));
                             }
                         }
                     }
@@ -2104,7 +2104,7 @@ pub fn SettingsPanel() -> Element {
                                                         if !conflicting_sessions.read().is_empty() {
                                                             show_conflict_modal.set(true);
                                                         } else {
-                                                            crate::session::SessionState::save_async(current_state.clone(), Some(save_error));
+                                                            crate::session::SessionState::save_async(&current_state, Some(save_error));
                                                             tracing::info!("Successfully imported history with no conflicts.");
                                                         }
                                                     },
