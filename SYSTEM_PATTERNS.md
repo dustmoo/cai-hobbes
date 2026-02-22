@@ -1,7 +1,7 @@
 # SYSTEM_PATTERNS.md - Hobbes Beta Architecture & Critical Mandates
 
 > **Version**: Beta (v0.9.x)  
-> **Last Updated**: 2026-02-01
+> **Last Updated**: 2026-02-22
 
 This document consolidates critical system patterns, anti-patterns, and architectural mandates for the Hobbes codebase. It serves as the authoritative reference for implementation patterns discovered through production experience.
 
@@ -178,3 +178,70 @@ For deeper documentation on specific subsystems:
 ---
 
 *This document supersedes `memory-bank/systemPatterns.md` as of Beta release.*
+
+---
+
+## Patterns Added in v0.9.50
+
+### 6. Auth Recovery — 5-Point Reconnect Lifecycle
+
+> **Pattern ID**: P-006  
+> **Replaces**: Ad-hoc self-repair in `execution.rs` (deprecated)
+
+When a tool call fails with 401/403, the system runs a full 5-point reconnect:
+1. Hydrate `auth_config_cache`
+2. Resolve `auth_config_id` (cache → API → create)
+3. Delete stale ACTIVE connections + bust `toolkit_account_map`
+4. Initiate OAuth with `force=true` (bypasses ACTIVE safety check)
+5. Re-patch MCP server
+
+After successful re-auth, `try_auth_recovery()` **retries the original tool call** with preserved arguments.
+
+**Location**: `src/mcp/composio_client/mod.rs` → `reconnect_toolkit()`, `src/mcp/manager.rs` → `try_auth_recovery()`
+
+---
+
+### 7. Single-Authority Auth Detection
+
+> **Pattern ID**: P-007  
+> **Replaces**: Duplicated substring matching in `execution.rs` and `manager.rs` (deprecated)
+
+All auth error detection is centralized in `ToolExecuteResponse::is_auth_error()` covering 6 patterns: `status_code`, `statusCode`, `ECODE`, `http_error`, nested `data.data`, and error string fallback.
+
+**Location**: `src/mcp/composio_client/models.rs`  
+**If broken**: Auth failures silently pass through without triggering recovery.
+
+---
+
+### 8. Dynamic Tool Injection (OnDemand Mode)
+
+> **Pattern ID**: P-008  
+> **Anti-Pattern**: Loading all 200+ tools upfront into every Gemini request
+
+`COMPOSIO_GET_APP_TOOLS` discovers tools, deduplicates, applies budget-aware selection (capped at `GEMINI_TOOL_LIMIT = 128`), and injects into `dynamic_composio_tools` cache as native `rmcp::Tool` objects.
+
+`COMPOSIO_CLEAR_TOOLS` flushes the cache. `build_mcp_context()` includes dynamic cache as a virtual server.
+
+**Location**: `src/mcp/manager.rs`
+
+---
+
+### 9. Serialize-Then-Move Persistence
+
+> **Pattern ID**: P-009  
+> **Replaces**: Clone-based `save_async(state: SessionState)` (deprecated)
+
+**NEVER** clone `SessionState` for async saves. Serialize to `Vec<u8>` on the calling thread, move only the bytes to background I/O.
+
+```rust
+// ❌ DEPRECATED: Deep clone of all sessions + messages
+SessionState::save_async(state.clone(), None);
+
+// ✅ CORRECT: Borrow, serialize, move bytes
+SessionState::save_async(&state, None);
+
+// ✅ CORRECT: After releasing a write guard on a Signal
+SessionState::save_signal(&session_state, None);
+```
+
+**Location**: `src/session.rs`, `src/async_persist.rs`
