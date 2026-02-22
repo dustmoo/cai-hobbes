@@ -77,6 +77,10 @@ pub struct ActiveContext {
     pub mcp_tools: Option<McpContext>, // Fixed: Restored field as it is still used in chat.rs/prompt_builder.rs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolWrapper>>,
+    /// Dynamically discovered Composio tools (populated by COMPOSIO_GET_APP_TOOLS).
+    /// These are merged into the Gemini FunctionDeclarations on the next turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_composio_tools: Vec<rmcp::model::Tool>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -163,8 +167,17 @@ impl Session {
     }
 }
 
+/// Schema version for SessionState persistence.
+/// Bump this when adding new migrations to `load()`.
+/// Existing files without this field default to 0 via `#[serde(default)]`.
+pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionState {
+    /// Schema version for forward-compatible migrations.
+    /// Files without this field (pre-versioning) default to 0.
+    #[serde(default)]
+    pub schema_version: u32,
     pub sessions: HashMap<String, Session>,
     pub active_session_id: String,
     pub window_width: f64,
@@ -205,7 +218,7 @@ impl SessionState {
 
         // Try direct deserialization first
         if let Ok(mut state) = serde_json::from_str::<Self>(&data) {
-            tracing::info!("Successfully loaded session data.");
+            tracing::info!("Successfully loaded session data (schema_version={}).", state.schema_version);
 
             // Validate active_session_id
             if !state.sessions.contains_key(&state.active_session_id) {
@@ -224,6 +237,22 @@ impl SessionState {
                     state.active_session_id.clear();
                 }
             }
+
+            // Run forward migrations if schema is behind current version.
+            // Gate future migrations here: `if state.schema_version < 2 { ... }`
+            if state.schema_version < CURRENT_SESSION_SCHEMA_VERSION {
+                tracing::info!(
+                    "Running forward migrations from schema v{} to v{}",
+                    state.schema_version,
+                    CURRENT_SESSION_SCHEMA_VERSION
+                );
+                state.schema_version = CURRENT_SESSION_SCHEMA_VERSION;
+                // Save the upgraded schema version
+                if let Err(e) = state.save() {
+                    tracing::error!("Failed to save schema-upgraded session state: {}", e);
+                }
+            }
+
             return Ok(state);
         }
 
@@ -274,7 +303,7 @@ impl SessionState {
                                 // Assign timestamp: base_time + index milliseconds
                                 let timestamp =
                                     base_time + chrono::Duration::milliseconds(index as i64);
-                                message.as_object_mut().unwrap().insert(
+                                message.as_object_mut().expect("message migration: message value must be a JSON object").insert(
                                     "created_at".to_string(),
                                     serde_json::json!(timestamp.to_rfc3339()),
                                 );
@@ -380,6 +409,9 @@ impl SessionState {
             }
         }
 
+        // Mark as current schema version after successful migration
+        state.schema_version = CURRENT_SESSION_SCHEMA_VERSION;
+
         // Only save the migrated state if we actually recovered sessions
         if !state.sessions.is_empty() {
             if let Err(e) = state.save() {
@@ -461,7 +493,7 @@ impl SessionState {
 
     pub fn create_session(&mut self, initial_profile: Option<String>) -> String {
         let new_id = self.create_session_raw(initial_profile);
-        Self::save_async(self.clone(), None);
+        Self::save_async(self, None);
         new_id
     }
 
@@ -483,7 +515,7 @@ impl SessionState {
 
     pub fn delete_session(&mut self, id: &str) {
         self.delete_session_raw(id);
-        Self::save_async(self.clone(), None);
+        Self::save_async(self, None);
     }
 
     pub fn get_active_session(&self) -> Option<&Session> {
@@ -534,19 +566,83 @@ impl SessionState {
         // The caller should invoke save_async() after updating window size.
     }
 
+    /// Write pre-serialized bytes to the session file using the same atomic
+    /// tempfile pattern as `save()`. Used by `save_async` to avoid cloning.
+    fn save_bytes(bytes: Vec<u8>) -> Result<(), std::io::Error> {
+        use std::io::Write;
+
+        let path = get_sessions_path().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find sessions path")
+        })?;
+        let parent_dir = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Could not find parent directory",
+            )
+        })?;
+
+        let mut temp_file = tempfile::NamedTempFile::new_in(parent_dir)?;
+        temp_file.write_all(&bytes)?;
+        temp_file.as_file().sync_all()?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::Permissions::from_mode(0o600);
+            temp_file.as_file().set_permissions(permissions)?;
+        }
+
+        temp_file.persist(&path).map_err(|e| e.error)?;
+        Ok(())
+    }
+
     /// Saves the session state to disk on a background thread.
     /// This prevents blocking the main UI thread during file I/O.
     /// If `error_signal` is provided, save failures will be surfaced to the UI.
     ///
-    /// **Design Note:** The caller passes a cloned `SessionState` by value (not by reference),
-    /// which means the full state — including all sessions and messages — is cloned before
-    /// being moved into the spawned task. This is an intentional trade-off: serializing on the
-    /// main thread would block the UI for the entire JSON encoding duration, whereas the clone
-    /// cost (proportional to total message count) is typically negligible for normal usage.
-    /// For extremely large states this could become a bottleneck; a future optimization could
-    /// serialize into bytes on the main thread (fast memcpy) and only do file I/O async.
-    pub fn save_async(state: SessionState, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
-        crate::async_persist::persist_async(move || state.save(), "session state", error_signal);
+    /// **Design Note (Serialize-Then-Move):** Serialization happens on the calling
+    /// thread via a borrow of `&SessionState`, producing an owned `Vec<u8>`. Only
+    /// this byte buffer is moved to the background thread for file I/O. This avoids
+    /// the expensive deep clone of the entire state (all sessions + all messages)
+    /// that the previous implementation required.
+    pub fn save_async(state: &SessionState, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
+        // Guard: skip if saves are disabled (backup protection)
+        if state.save_disabled {
+            tracing::warn!("save_async: Save disabled due to prior load failure - protecting backup data");
+            return;
+        }
+
+        // Serialize on the current thread — borrows state, no clone needed
+        let bytes = match serde_json::to_vec_pretty(state) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("Failed to serialize session state: {}", e);
+                if let Some(mut sig) = error_signal {
+                    use dioxus::prelude::Writable;
+                    *sig.write() = Some(format!("Failed to serialize session state: {}", e));
+                }
+                return;
+            }
+        };
+
+        // Move only the byte buffer to the background thread for file I/O
+        crate::async_persist::persist_bytes_async(
+            bytes,
+            Self::save_bytes,
+            "session state",
+            error_signal,
+        );
+    }
+
+    /// Convenience: save the session state from a Dioxus Signal after releasing a write guard.
+    /// This encapsulates the common `drop(guard); save_async(&signal.read(), ...)` pattern
+    /// to avoid borrow conflicts between write guards and the read borrow needed for serialization.
+    pub fn save_signal(
+        signal: &dioxus::prelude::Signal<SessionState>,
+        error_signal: Option<dioxus::prelude::Signal<Option<String>>>,
+    ) {
+        use dioxus::prelude::Readable;
+        Self::save_async(&signal.read(), error_signal);
     }
 
     pub fn update_session_name_raw(&mut self, id: &str, new_name: String) {
@@ -557,7 +653,7 @@ impl SessionState {
 
     pub fn update_session_name(&mut self, id: &str, new_name: String) {
         self.update_session_name_raw(id, new_name);
-        Self::save_async(self.clone(), None);
+        Self::save_async(self, None);
     }
     pub fn get_message_mut(
         &mut self,
@@ -612,6 +708,7 @@ impl SessionState {
 impl Default for SessionState {
     fn default() -> Self {
         Self {
+            schema_version: CURRENT_SESSION_SCHEMA_VERSION,
             sessions: HashMap::new(),
             active_session_id: String::new(),
             window_width: 1440.0, // 16:9 ratio default

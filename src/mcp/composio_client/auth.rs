@@ -487,10 +487,70 @@ pub(crate) async fn get_auth_config_id(
 
     if has_custom_creds {
         tracing::info!(
-            "Custom credentials detected locally for toolkit '{}'. bypassing lookup to ensure BYOA primacy.",
+            "Custom credentials detected for toolkit '{}'. Checking for existing auth config before creating.",
             toolkit_slug
         );
-        // create_auth_config will detect the custom credentials and use them.
+        // BYOA Primacy: We want to ensure custom creds are used, but we MUST check
+        // if an auth config already exists first. Creating a duplicate will fail with
+        // 400 ("Missing required field Client Id") because the API rejects duplicates.
+        // Only call create_auth_config if no existing config is found.
+
+        // 1. Check cache
+        if let Ok(cache) = client.auth_config_cache.read() {
+            if let Some(cached_id) = cache.get(toolkit_slug) {
+                tracing::info!(
+                    "Found cached auth_config_id '{}' for BYOA toolkit '{}'",
+                    cached_id, toolkit_slug
+                );
+                return Ok(cached_id.clone());
+            }
+        }
+
+        // 2. Check API — do the same filtered lookup as the non-BYOA path
+        let url = format!("{}/auth_configs", client.get_api_base_url());
+        let req = client
+            .client
+            .get(&url)
+            .header("x-api-key", &client.api_key)
+            .query(&[("toolkit_slug", toolkit_slug), ("limit", "50")]);
+
+        if let Ok(response) = req.send().await {
+            if response.status().is_success() {
+                if let Ok(text) = response.text().await {
+                    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(items) = json_value.get("items").and_then(|v| v.as_array()) {
+                            for item in items {
+                                let item_slug = item
+                                    .get("toolkit")
+                                    .and_then(|t| t.get("slug"))
+                                    .and_then(|s| s.as_str());
+                                if let Some(slug) = item_slug {
+                                    if slug.eq_ignore_ascii_case(toolkit_slug) {
+                                        if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                                            tracing::info!(
+                                                "Found existing auth config '{}' for BYOA toolkit '{}' via API lookup",
+                                                id, toolkit_slug
+                                            );
+                                            // Cache it
+                                            if let Ok(mut cache) = client.auth_config_cache.write() {
+                                                cache.insert(toolkit_slug.to_string(), id.to_string());
+                                            }
+                                            return Ok(id.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. No existing config found — create with BYOA credentials
+        tracing::info!(
+            "No existing auth config for BYOA toolkit '{}'. Creating with custom credentials.",
+            toolkit_slug
+        );
         return create_auth_config(client, toolkit_slug, None, false).await;
     }
 
@@ -756,11 +816,14 @@ fn cache_auth_configs(client: &ComposioClient, configs: &[AuthConfigInfo]) {
     tracing::debug!("Cached {} auth configs", cache.len());
 }
 
-/// Initiate the OAuth connection flow
+/// Initiate the OAuth connection flow.
+/// When `force` is true, skips the ACTIVE connection safety check (used during
+/// auth recovery when we KNOW the token is dead despite ACTIVE backend status).
 pub async fn initiate_connection(
     client: &ComposioClient,
     toolkit_slug: &str,
     user_id: &str,
+    force: bool,
 ) -> Result<String, String> {
     // Use the internal Proxy Link endpoint (original working pattern from 889718d)
     // This is different from the public /api/v3/connected_accounts endpoint.
@@ -784,36 +847,42 @@ pub async fn initiate_connection(
 
     // SAFETY CHECK: After pruning, verify if we already have an ACTIVE connection.
     // If so, skip the OAuth flow entirely to prevent unnecessary re-initiation loops.
-    match list_connected_accounts(client).await {
-        Ok(accounts) => {
-            let has_active = accounts.iter().any(|acc| {
-                let matches_toolkit = acc
-                    .toolkit
-                    .as_ref()
-                    .map(|t| t.slug.eq_ignore_ascii_case(toolkit_slug))
-                    .unwrap_or(false)
-                    || acc
-                        .app_name
+    // EXCEPTION: When force=true (auth recovery from a confirmed 401), skip this check
+    // because the backend reports ACTIVE even though the downstream token is dead.
+    if !force {
+        match list_connected_accounts(client).await {
+            Ok(accounts) => {
+                let has_active = accounts.iter().any(|acc| {
+                    let matches_toolkit = acc
+                        .toolkit
                         .as_ref()
-                        .map(|n| n.eq_ignore_ascii_case(toolkit_slug))
-                        .unwrap_or(false);
-                let matches_user = acc.user_id.as_deref() == Some(&final_user_id);
-                let is_active = acc.status.eq_ignore_ascii_case("ACTIVE");
-                matches_toolkit && matches_user && is_active
-            });
+                        .map(|t| t.slug.eq_ignore_ascii_case(toolkit_slug))
+                        .unwrap_or(false)
+                        || acc
+                            .app_name
+                            .as_ref()
+                            .map(|n| n.eq_ignore_ascii_case(toolkit_slug))
+                            .unwrap_or(false);
+                    let matches_user = acc.user_id.as_deref() == Some(&final_user_id);
+                    let is_active = acc.status.eq_ignore_ascii_case("ACTIVE");
+                    matches_toolkit && matches_user && is_active
+                });
 
-            if has_active {
-                tracing::info!(
-                    "[AUTH] Active connection already exists for toolkit '{}' (user: {}). Skipping OAuth flow.",
-                    toolkit_slug,
-                    final_user_id
-                );
-                return Ok("Connection already active. No re-authentication needed.".to_string());
+                if has_active {
+                    tracing::info!(
+                        "[AUTH] Active connection already exists for toolkit '{}' (user: {}). Skipping OAuth flow.",
+                        toolkit_slug,
+                        final_user_id
+                    );
+                    return Ok("Connection already active. No re-authentication needed.".to_string());
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[AUTH] Failed to check for active connections: {}. Proceeding with OAuth.", e);
             }
         }
-        Err(e) => {
-            tracing::warn!("[AUTH] Failed to check for active connections: {}. Proceeding with OAuth.", e);
-        }
+    } else {
+        tracing::info!("[AUTH RECOVERY] Force mode: skipping ACTIVE safety check for '{}'", toolkit_slug);
     }
 
     // We need the auth_config_id to tell the API WHICH toolkit to link.

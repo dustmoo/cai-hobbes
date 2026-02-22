@@ -32,3 +32,39 @@ pub fn persist_async(
         });
     }
 }
+
+/// Persist pre-serialized bytes to disk on a background thread.
+///
+/// This is the "serialize-then-move" pattern: the caller serializes data on the
+/// main thread (which can borrow the data without cloning), then hands off the
+/// owned byte buffer to a background thread for file I/O only.
+///
+/// `write_fn` receives the pre-serialized bytes and writes them to disk.
+pub fn persist_bytes_async(
+    bytes: Vec<u8>,
+    write_fn: impl FnOnce(Vec<u8>) -> io::Result<()> + Send + 'static,
+    context_label: &'static str,
+    error_signal: Option<Signal<Option<String>>>,
+) {
+    let handle = tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || write_fn(bytes))
+            .await
+            .unwrap_or_else(|e| Err(io::Error::other(e)))
+    });
+
+    if let Some(mut sig) = error_signal {
+        spawn(async move {
+            if let Ok(Err(e)) = handle.await {
+                tracing::error!("Failed to save {} async: {}", context_label, e);
+                *sig.write() = Some(format!("Failed to save {}: {}", context_label, e));
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Ok(Err(e)) = handle.await {
+                tracing::error!("Failed to save {} async: {}", context_label, e);
+            }
+        });
+    }
+}
+

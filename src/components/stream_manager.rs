@@ -504,7 +504,7 @@ impl StreamManagerContext {
                     }
                     self.active_stream_handles.write().remove(&message_id);
                     self.content_generated.write().remove(&message_id); // Cleanup
-                    crate::session::SessionState::save_async(self.session_state.read().clone(), None);
+                    crate::session::SessionState::save_async(&self.session_state.read(), None);
                     on_complete();
                     self.is_sending.set(false);
                     self.scheduler.send(SchedulerSignal::Activity);
@@ -524,7 +524,7 @@ impl StreamManagerContext {
                 self.active_stream_handles.write().remove(&message_id);
                 self.content_generated.write().remove(&message_id); // Cleanup
 
-                crate::session::SessionState::save_async(self.session_state.read().clone(), None);
+                crate::session::SessionState::save_async(&self.session_state.read(), None);
 
                 // Clean up the current stream state before triggering the next one
                 on_complete();
@@ -542,8 +542,9 @@ impl StreamManagerContext {
             {
                 let mut state = self.session_state.write();
                 state.touch_session(&session_id);
-                crate::session::SessionState::save_async(state.clone(), Some(self.save_error_signal));
             }
+            // Save after releasing the write guard — save_async borrows via read()
+            crate::session::SessionState::save_async(&self.session_state.read(), Some(self.save_error_signal));
 
             let settings = self.settings.read().clone();
             let summarizer = self.tool_call_summarizer.read();
