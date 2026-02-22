@@ -1483,11 +1483,11 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                         let toolkit_slug = toolkit.slug.clone();
                                         let settings_snapshot = local_settings.read().clone();
 
-                                        // Get the current force_load status (default: false = on-demand)
-                                        let is_force_load = settings_snapshot.get_active_profile()
+                                        // Get the current load mode for this toolkit
+                                        let load_mode = settings_snapshot.get_active_profile()
                                             .and_then(|p| p.toolkit_configs.iter().find(|c| c.slug == toolkit_slug))
-                                            .map(|c| c.force_load)
-                                            .unwrap_or(false);
+                                            .map(|c| c.effective_load_mode())
+                                            .unwrap_or(crate::settings::ToolkitLoadMode::OnDemand);
 
                                         rsx! {
                                             div {
@@ -1510,14 +1510,22 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                 if toolkit.is_connected {
                                                     select {
                                                         class: "px-2 py-1 bg-section border border-faint rounded text-xs",
-                                                        value: if is_force_load { "force" } else { "ondemand" },
+                                                        value: match load_mode {
+                                                            crate::settings::ToolkitLoadMode::Loaded => "loaded",
+                                                            crate::settings::ToolkitLoadMode::OnDemand => "ondemand",
+                                                            crate::settings::ToolkitLoadMode::Excluded => "excluded",
+                                                        },
                                                         onchange: {
                                                             let slug = toolkit_slug.clone();
                                                             let tool_count = toolkit.tool_count;
                                                             let display_name = toolkit.display_name.clone();
                                                             // Redundant locals removed
                                                             move |event: dioxus::events::FormEvent| {
-                                                                let new_force_load = event.value() == "force";
+                                                                let new_mode = match event.value().as_str() {
+                                                                    "loaded" => crate::settings::ToolkitLoadMode::Loaded,
+                                                                    "excluded" => crate::settings::ToolkitLoadMode::Excluded,
+                                                                    _ => crate::settings::ToolkitLoadMode::OnDemand,
+                                                                };
                                                                 let slug = slug.clone();
                                                                 let display_name = display_name.clone();
                                                                 let mcp_manager = mcp_manager;
@@ -1528,13 +1536,15 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                 let mut s = local_settings.write();
                                                                 if let Some(profile) = s.get_active_profile_mut() {
                                                                     if let Some(config) = profile.toolkit_configs.iter_mut().find(|c| c.slug == slug) {
-                                                                        config.force_load = new_force_load;
+                                                                        config.load_mode = new_mode;
+                                                                        config.force_load = false; // Clear legacy field
                                                                     } else {
                                                                         profile.toolkit_configs.push(crate::settings::ComposioToolkitConfig {
                                                                             slug: slug.clone(),
                                                                             display_name: display_name.clone(),
                                                                             tool_count,
-                                                                            force_load: new_force_load,
+                                                                            force_load: false,
+                                                                            load_mode: new_mode,
                                                                         });
                                                                     }
                                                                 }
@@ -1546,7 +1556,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                 if let Err(e) = settings_manager.read().save(&updated_settings) {
                                                                     tracing::error!("Failed to save toolkit settings: {}", e);
                                                                 } else {
-                                                                    tracing::debug!("Saved toolkit config: {} = {}", slug, if new_force_load { "force-load" } else { "on-demand" });
+                                                                    tracing::debug!("Saved toolkit config: {} = {:?}", slug, new_mode);
                                                                 }
 
                                                                 // Reload Composio tools and update UI
@@ -1564,8 +1574,9 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                 });
                                                             }
                                                         },
+                                                        option { value: "loaded", "Loaded (always)" }
                                                         option { value: "ondemand", "On-demand" }
-                                                        option { value: "force", "Load always" }
+                                                        option { value: "excluded", "Excluded" }
                                                     }
                                                 } else {
                                                     span {
@@ -1579,7 +1590,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                 }
                                 p {
                                     class: "text-xs text-fg-muted mt-2",
-                                    "On-demand uses Tool Router's search→execute pattern. Force load makes all tools available upfront."
+                                    "Loaded: all tools available upfront. On-demand: discover then use dynamically. Excluded: hidden from AI."
                                 }
                             }
                         }

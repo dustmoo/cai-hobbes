@@ -1,4 +1,4 @@
-use super::auth::{initiate_connection, list_auth_configs, list_connected_accounts};
+use super::auth::{list_auth_configs, list_connected_accounts};
 use super::models::*;
 use super::utils::write_to_debug_file;
 use super::ComposioClient;
@@ -559,6 +559,24 @@ pub async fn execute_tool(
         }
     }
 
+    // BYOA CREDENTIAL INJECTION
+    // Custom Tool Credentials (Settings → Credentials) injected as missing tool arguments.
+    // ContextStore injection above takes priority — BYOA only fills remaining gaps.
+    if let Some(ref tk_slug) = toolkit_slug {
+        if let Ok(creds) = client.custom_auth_creds.read() {
+            if let Some(toolkit_creds) = creds.get(tk_slug) {
+                if let Some(obj) = arguments.as_object_mut() {
+                    for (k, v) in toolkit_creds {
+                        if !obj.contains_key(k) {
+                            tracing::debug!("[BYOA] Injecting '{}' for '{}'", k, tk_slug);
+                            obj.insert(k.clone(), serde_json::Value::String(v.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // PROACTIVE AUTH CHECK (restored from v0.9.4 pattern)
     // Check for an ACTIVE connected account for this toolkit BEFORE calling the proxy.
     // If no active connection, trigger initiate_connection immediately.
@@ -599,12 +617,11 @@ pub async fn execute_tool(
                 tk_slug
             );
 
-            match initiate_connection(client, tk_slug, &user_id).await {
+            match client.reconnect_toolkit(tk_slug).await {
                 Ok(result_msg) => {
                     if result_msg.contains("Authentication successful") {
-                        tracing::info!("[AUTH] Authentication successful, proceeding with tool execution immediately.");
+                        tracing::info!("[AUTH] 5-point reconnect successful, proceeding with tool execution.");
                         // FALLTHROUGH: Don't return, let the code proceed to step 2 (URL construction & execution)
-                        // This prevents the "Auth Loop" where a retry might hit a stale cache check.
                     } else {
                         let url = result_msg
                             .split_whitespace()
@@ -626,7 +643,7 @@ pub async fn execute_tool(
                     }
                 }
                 Err(e) => {
-                    tracing::error!("[AUTH] Failed to initiate connection: {}", e);
+                    tracing::error!("[AUTH] 5-point reconnect failed: {}", e);
                     return Ok(ToolExecuteResponse {
                         data: serde_json::Value::Null,
                         error: Some(format!(
@@ -691,7 +708,7 @@ pub async fn execute_tool(
                 status.as_u16(),
                 tk_slug
             );
-            match initiate_connection(client, tk_slug, &user_id).await {
+            match client.reconnect_toolkit(tk_slug).await {
                 Ok(result_msg) => {
                     if result_msg.contains("Authentication successful") {
                         return Ok(ToolExecuteResponse {
@@ -724,7 +741,7 @@ pub async fn execute_tool(
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Failed to initiate connection: {}", e);
+                    tracing::error!("[AUTH] 5-point reconnect failed for HTTP {}: {}", status.as_u16(), e);
                     return Err(format!(
                         "Authentication required but connection failed: {}",
                         e
@@ -823,104 +840,44 @@ pub async fn execute_tool(
     let session_info = json_value.get("session_info").cloned();
 
     // ----------------------------------------------------------------
-    // ROBUST AUTH DETECTION (Preserved from recent improvements)
+    // AUTH DETECTION — delegates to ToolExecuteResponse::is_auth_error()
     // ----------------------------------------------------------------
-    let mut needs_auth = false;
-    let mut is_hard_auth_failure = false; // Flag to override "soft" refresh signals
+    // Build a temporary response to use the shared detection method.
+    // The final ToolExecuteResponse is returned at the bottom; here we
+    // only need the bool to decide whether to bust the cache.
+    let temp_response = ToolExecuteResponse {
+        data: data.clone(),
+        error: if error_msg.is_empty() { None } else { Some(error_msg.clone()) },
+        successful,
+        log_id: None,
+        session_info: None,
+    };
+    let mut needs_auth = temp_response.is_auth_error();
 
-    // Check data.status_code
-    if let Some(status_code) = data.get("status_code") {
-        let code = status_code
-            .as_u64()
-            .or_else(|| status_code.as_i64().map(|i| i as u64));
-        if code == Some(401) || code == Some(403) {
-            tracing::info!("[AUTH] Detected status_code {} in data", code.unwrap_or(0));
-            needs_auth = true;
-            is_hard_auth_failure = true;
-        }
-    }
-
-    // Check ECODEs
-    if !needs_auth {
-        if let Some(ecode) = data.get("ECODE").and_then(|v| v.as_str()) {
-            if ecode.starts_with("AUTH_") || ecode.starts_with("OAUTH_") {
-                tracing::info!("[AUTH] Detected ECODE {}", ecode);
-                needs_auth = true;
-                is_hard_auth_failure = true;
-            }
-        }
-    }
-
-    // Check http_error
-    if !needs_auth {
-        if let Some(http_error) = data.get("http_error").and_then(|v| v.as_str()) {
-            if http_error.contains("401") || http_error.contains("403") {
-                tracing::info!("[AUTH] Detected http_error {}", http_error);
-                needs_auth = true;
-                is_hard_auth_failure = true;
-            }
-        }
-    }
-
-    // Check MCP-protocol Level Error (Double-MCP Pattern)
-    // Format: { "result": { "content": [{ "type": "text", "text": "{\"ECODE\":\"OAUTH_018\",...}" }], "isError": true } }
+    // EXTENSION: Double-MCP `result.content[].text` check.
+    // This operates on the raw JSON-RPC envelope (`json_value`), NOT on the
+    // deserialized ToolExecuteResponse — a different lifecycle stage.
+    // The MCP proxy sometimes wraps errors inside a JSON-RPC result object.
     if !needs_auth {
         if let Some(result) = json_value.get("result") {
             if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
-                // Extract error message from content array
                 if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
                     for item in content {
                         if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            // FIRST: Try to parse the nested text as JSON for deterministic signals
-                            // The text field often contains stringified JSON with ECODE and status_code
+                            // Try to parse the nested text as JSON for deterministic signals
                             if let Ok(inner) = serde_json::from_str::<Value>(text) {
-                                // Check for ECODE in inner JSON (OAUTH_018, OAUTH_023, AUTH_018, etc.)
-                                if let Some(ecode) = inner.get("ECODE").and_then(|v| v.as_str()) {
-                                    if ecode.starts_with("AUTH_") || ecode.starts_with("OAUTH_") {
-                                        tracing::info!(
-                                            "[AUTH] Detected ECODE {} in result.content[0].text",
-                                            ecode
-                                        );
-                                        needs_auth = true;
-                                        is_hard_auth_failure = true;
-                                        error_msg = text.to_string();
-                                        successful = false;
-                                        break;
-                                    }
-                                }
-                                // Check for status_code in inner JSON (direct field)
-                                if !needs_auth {
-                                    if let Some(status_code) = inner.get("status_code") {
-                                        let code = status_code
-                                            .as_u64()
-                                            .or_else(|| status_code.as_i64().map(|i| i as u64));
-                                        if code == Some(401) || code == Some(403) {
-                                            tracing::info!("[AUTH] Detected status_code {} in result.content[0].text", code.unwrap_or(0));
-                                            needs_auth = true;
-                                            is_hard_auth_failure = true;
-                                            error_msg = text.to_string();
-                                            successful = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                                // Check for data.status_code in inner JSON (nested field)
-                                if !needs_auth {
-                                    if let Some(inner_data) = inner.get("data") {
-                                        if let Some(status_code) = inner_data.get("status_code") {
-                                            let code = status_code
-                                                .as_u64()
-                                                .or_else(|| status_code.as_i64().map(|i| i as u64));
-                                            if code == Some(401) || code == Some(403) {
-                                                tracing::info!("[AUTH] Detected data.status_code {} in result.content[0].text", code.unwrap_or(0));
-                                                needs_auth = true;
-                                                is_hard_auth_failure = true;
-                                                error_msg = text.to_string();
-                                                successful = false;
-                                                break;
-                                            }
-                                        }
-                                    }
+                                let inner_response = ToolExecuteResponse {
+                                    data: inner,
+                                    error: Some(text.to_string()),
+                                    successful: false,
+                                    log_id: None,
+                                    session_info: None,
+                                };
+                                if inner_response.is_auth_error() {
+                                    needs_auth = true;
+                                    error_msg = text.to_string();
+                                    successful = false;
+                                    break;
                                 }
                             }
                             // FALLBACK: Substring matching for unstructured errors
@@ -933,7 +890,6 @@ pub async fn execute_tool(
                                     text
                                 );
                                 needs_auth = true;
-                                is_hard_auth_failure = true;
                                 error_msg = text.to_string();
                                 successful = false;
                                 break;
@@ -945,70 +901,24 @@ pub async fn execute_tool(
         }
     }
 
-    // Check auth_refresh_required (Critical for avoiding loops)
-    // REGRESSION FIX: Only respect this flag if we check explicit HARD auth failure.
-    // If we have an OAUTH_018 or 401, we MUST trigger auth regardless of what this flag says.
-    if needs_auth && !is_hard_auth_failure {
-        let auth_refresh = data
-            .get("auth_refresh_required")
-            .or_else(|| json_value.get("auth_refresh_required"));
-        if let Some(refresh) = auth_refresh.and_then(|v| v.as_bool()) {
-            if !refresh {
-                tracing::info!("[AUTH] auth_refresh_required=false, ignoring auth error");
-                needs_auth = false;
-            }
-        }
-    }
-
-    // Trigger managed flow if needed
+    // Auth recovery is handled by `try_auth_recovery` in manager.rs which has access to
+    // the full 5-point connection lifecycle (auth config lookup, OAuth, server patching,
+    // tool selection, reload). We just pass the raw error through with clear logging.
     if needs_auth {
         if let Some(tk_slug) = &toolkit_slug {
-            tracing::info!(
-                "[AUTH] Auth failure detected for toolkit '{}', initiating self-repair",
+            tracing::warn!(
+                "[AUTH] Auth error detected for toolkit '{}'. Raw error will propagate to manager.rs for 5-point recovery.",
                 tk_slug
             );
-
-            // SELF-REPAIR: Hydrate auth_config_cache before triggering OAuth.
-            // This ensures the cache is fresh for potential LLM retry scenarios.
-            // If the issue was stale cache, the next execution may succeed without OAuth.
-            if let Err(e) = list_auth_configs(client).await {
-                tracing::warn!(
-                    "[AUTH] Failed to hydrate auth configs during self-repair: {}",
-                    e
-                );
-            } else {
-                tracing::info!("[AUTH] Successfully hydrated auth_config_cache");
-            }
-
-            // Now trigger the managed connection flow (opens browser for OAuth if needed)
-            match initiate_connection(client, tk_slug, &user_id).await {
-                Ok(res) => {
-                    if res.contains("Authentication successful") {
-                        return Ok(ToolExecuteResponse {
-                            data: Value::Null,
-                            error: Some("Authentication successful! Please retry.".to_string()),
-                            successful: false,
-                            log_id: None,
-                            session_info: None,
-                        });
-                    }
-                    let url = res.split_whitespace().last().unwrap_or(&res).to_string();
-                    let redirect = if url.starts_with("http") {
-                        url
-                    } else {
-                        res.clone()
-                    };
-
-                    return Ok(ToolExecuteResponse {
-                        data: serde_json::json!({ "redirectUrl": redirect }),
-                        error: Some(format!("Authentication required. {}", res)),
-                        successful: false,
-                        log_id: None,
-                        session_info: None,
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("Auth trigger failed: {}", e);
+            // Defense-in-depth: bust the stale toolkit_account_map EAGERLY here
+            // so that even if the manager-level recovery doesn't fire (e.g. tool
+            // called via COMPOSIO_EXECUTE_TOOL path), the next execute_tool call
+            // won't short-circuit on a cached ACTIVE entry.
+            // `reconnect_toolkit` in mod.rs performs the same bust during its
+            // Step 3 — both locations are intentional. (Review: 2026-02-21)
+            if let Ok(mut map) = client.toolkit_account_map.write() {
+                if map.remove(tk_slug).is_some() {
+                    tracing::info!("[AUTH] Cleared stale '{}' from toolkit_account_map", tk_slug);
                 }
             }
         }

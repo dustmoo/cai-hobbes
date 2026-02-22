@@ -37,31 +37,66 @@ fn composio_server_key(profile_id: &str) -> String {
     format!("{}:{}", COMPOSIO_NATIVE_PREFIX, profile_id)
 }
 
+/// Gemini's practical tool limit for FunctionDeclarations.
+const GEMINI_TOOL_LIMIT: usize = 128;
+
+/// Score a tool's relevance by name keywords for budget-aware selection.
+/// Higher score = more likely to be included when over budget.
+///
+/// MAYBE: Consider exposing these priority weights in the Settings UI in the future.
+/// For now, these defaults work well and exposing them risks user misconfiguration.
+fn score_tool_relevance(name: &str) -> u32 {
+    let upper = name.to_uppercase();
+    // Root traversal / auth tools — critical for hierarchy navigation
+    if upper.contains("_TEAM") || upper.contains("_WORKSPACE") || upper.contains("_ORGANIZATION")
+        || upper.contains("_AUTH") || upper.contains("_SPACE")
+    {
+        return 100;
+    }
+    // Core read operations
+    if upper.contains("_GET_") || upper.contains("_LIST_") || upper.contains("_SEARCH_")
+        || upper.contains("_FIND_")
+    {
+        return 80;
+    }
+    // Core write operations
+    if upper.contains("_CREATE_") || upper.contains("_ADD_") || upper.contains("_POST_") {
+        return 60;
+    }
+    // Core update operations
+    if upper.contains("_UPDATE_") || upper.contains("_SET_") || upper.contains("_EDIT_")
+        || upper.contains("_MODIFY_")
+    {
+        return 40;
+    }
+    // Delete operations
+    if upper.contains("_DELETE_") || upper.contains("_REMOVE_") {
+        return 20;
+    }
+    // Everything else (specialized, admin, etc.)
+    10
+}
+
 /// Check a failed Composio `ToolExecuteResponse` for 401/403 auth errors and attempt
 /// auto-reconnection via OAuth. Returns `Some(CallToolResult)` if the auth flow
 /// handled the error (success or auth-required URL), or `None` to fall through
 /// to the normal error response path.
+///
+/// Pattern 150.8.1: On auth failure, busts the stale `toolkit_account_map` cache entry,
+/// re-authenticates, and retries the tool call with the original arguments.
 async fn try_auth_recovery(
     response: &crate::mcp::composio_client::models::ToolExecuteResponse,
     tool_name: &str,
     composio_client: &ComposioClient,
+    original_args: Option<serde_json::Value>,
 ) -> Option<CallToolResult> {
     if response.successful {
         return None;
     }
 
-    let data_str = serde_json::to_string(&response.data).unwrap_or_default();
-    let error_str = response.error.as_deref().unwrap_or("");
-    let combined = format!("{} {}", data_str, error_str);
-
-    let is_auth_error = combined.contains("\"statusCode\":\"401\"")
-        || combined.contains("\"statusCode\":\"403\"")
-        || combined.contains("\"status_code\":401")
-        || combined.contains("\"status_code\":403")
-        || combined.contains("401 Client Error")
-        || combined.contains("403 Forbidden");
-
-    if !is_auth_error {
+    // Delegate auth detection to the single-authority method on ToolExecuteResponse.
+    // This covers status_code, statusCode, ECODE, http_error, nested data, and error string.
+    if !response.is_auth_error() {
         return None;
     }
 
@@ -71,24 +106,58 @@ async fn try_auth_recovery(
         .next()
         .unwrap_or(tool_name)
         .to_lowercase();
-    let user_id = composio_client
-        .user_id
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
 
-    tracing::info!("[AUTH] 401/403 detected for toolkit '{}', triggering connection flow", toolkit_slug);
+    tracing::info!("[AUTH RECOVERY] Auth error detected for '{}' (toolkit: '{}'), triggering 5-point reconnect", tool_name, toolkit_slug);
 
-    match composio_client.initiate_connection(&toolkit_slug, &user_id).await {
+    // Use the full 5-point reconnect lifecycle:
+    // 1. Hydrate auth_config_cache (finds existing configs)
+    // 2. Resolve auth_config_id (cache → API → create)
+    // 3. Delete stale ACTIVE connections + bust cache
+    // 4. Initiate OAuth with force=true (opens browser)
+    // 5. Re-patch MCP server
+    match composio_client.reconnect_toolkit(&toolkit_slug).await {
         Ok(result_msg) => {
             if result_msg.contains("Authentication successful") {
-                Some(CallToolResult {
-                    content: vec![rmcp::model::Content::text(
-                        "Authentication successful! Please try the tool again.".to_string(),
-                    )],
-                    is_error: Some(false),
-                    structured_content: None,
-                    meta: None,
-                })
+                // Auth succeeded — retry the tool call with original args
+                if let Some(args) = original_args {
+                    tracing::info!("[AUTH RECOVERY] Re-auth succeeded, retrying '{}'", tool_name);
+                    match composio_client.execute_tool(tool_name, args).await {
+                        Ok(retry_response) => {
+                            let content_text = if retry_response.successful {
+                                serde_json::to_string_pretty(&retry_response.data)
+                                    .unwrap_or_else(|_| "{}".to_string())
+                            } else {
+                                retry_response.error.unwrap_or_else(|| "Retry failed".to_string())
+                            };
+                            Some(CallToolResult {
+                                content: vec![rmcp::model::Content::text(content_text)],
+                                is_error: Some(!retry_response.successful),
+                                structured_content: Some(retry_response.data),
+                                meta: None,
+                            })
+                        }
+                        Err(e) => {
+                            tracing::error!("[AUTH RECOVERY] Retry of '{}' failed: {}", tool_name, e);
+                            Some(CallToolResult {
+                                content: vec![rmcp::model::Content::text(
+                                    format!("Re-authenticated but retry failed: {}", e),
+                                )],
+                                is_error: Some(true),
+                                structured_content: None,
+                                meta: None,
+                            })
+                        }
+                    }
+                } else {
+                    Some(CallToolResult {
+                        content: vec![rmcp::model::Content::text(
+                            "Authentication successful! Please try the tool again.".to_string(),
+                        )],
+                        is_error: Some(false),
+                        structured_content: None,
+                        meta: None,
+                    })
+                }
             } else {
                 let url = result_msg
                     .split_whitespace()
@@ -105,7 +174,7 @@ async fn try_auth_recovery(
             }
         }
         Err(e) => {
-            tracing::error!("Failed to initiate connection: {}", e);
+            tracing::error!("[AUTH RECOVERY] 5-point reconnect failed: {}", e);
             None // Fall through to return original error
         }
     }
@@ -233,6 +302,10 @@ pub struct McpManager {
     cached_server_statuses: Arc<Mutex<Option<Vec<McpServerStatus>>>>,
     /// Shared SecretManager for non-blocking credential access
     secret_manager: Signal<crate::secret_manager::SecretManager>,
+    /// Dynamically discovered Composio tools (populated by COMPOSIO_GET_APP_TOOLS).
+    /// Included as a virtual server in get_mcp_context() so the prompt builder
+    /// sends them to Gemini as real FunctionDeclarations.
+    pub dynamic_composio_tools: Arc<Mutex<Vec<rmcp::model::Tool>>>,
 }
 
 impl McpManager {
@@ -250,6 +323,7 @@ impl McpManager {
             config_path: Some(config_path),
             cached_server_statuses: Arc::new(Mutex::new(None)),
             secret_manager,
+            dynamic_composio_tools: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -313,6 +387,10 @@ impl McpManager {
         let discovery_result = composio_client.list_tools_for_session(&force_load_slugs).await
             .map_err(|e| format!("Failed to list Composio tools: {}", e))?;
 
+        // Convert Composio tools to rmcp::model::Tool for the prompt builder.
+        // This conversion appears at multiple lifecycle stages (init, hot-reload,
+        // dynamic injection, marketplace connect, auth recovery) — each call site
+        // operates on a different tool set, so consolidation is not beneficial.
         let tools = discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
 
         Ok(ActiveMcpClient {
@@ -1198,6 +1276,24 @@ impl McpManager {
             .map_err(|e| format!("Failed to write to mcp_servers.json: {}", e))
     }
 
+    /// Execute a tool on an MCP server.
+    ///
+    /// # Error Type: `Result<..., String>` — Architectural Decision
+    ///
+    /// This function (and the MCP boundary in general) deliberately uses `String`
+    /// for error types rather than a structured `thiserror` enum. This is intentional:
+    ///
+    /// 1. **MCP is cross-language**: Tool responses come from servers written in Python,
+    ///    Node.js, Go, etc. Errors are free-form strings with no guaranteed schema.
+    /// 2. **AI consumption**: Errors are forwarded to the LLM for self-correction.
+    ///    The AI needs human-readable context, not Rust enum variants.
+    /// 3. **Display-final**: Most errors are shown directly to the user or AI — `String`
+    ///    is the terminal format regardless.
+    /// 4. **Normalization is impractical**: Each MCP server produces unique error formats.
+    ///    A catch-all `Other(String)` variant would contain 90%+ of cases, defeating the purpose.
+    ///
+    /// For internal plumbing (keychain, persistence), structured errors ARE used — see
+    /// `KeychainError` in `keychain_ffi.rs` for the established pattern.
     pub async fn use_mcp_tool(
         &self,
         server_name: &str,
@@ -1305,7 +1401,16 @@ impl McpManager {
 
         let tool = match client.tools.iter().find(|t| t.name == tool_name) {
             Some(t) => t.clone(),
-            None => return Err(format!("Tool not found: {}", tool_name)),
+            None => {
+                // Fallback: check the dynamic Composio tools cache.
+                // Dynamically discovered tools (via COMPOSIO_GET_APP_TOOLS) live here,
+                // not in any ActiveMcpClient.tools list.
+                let dynamic_cache = self.dynamic_composio_tools.lock().await;
+                match dynamic_cache.iter().find(|t| t.name == tool_name) {
+                    Some(t) => t.clone(),
+                    None => return Err(format!("Tool not found: {}", tool_name)),
+                }
+            }
         };
 
         // BYOA FIX: Re-inject custom credentials before tool execution (Pattern 25)
@@ -1330,6 +1435,13 @@ impl McpManager {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let service = client.service.clone();
+        let dynamic_tools_cache = self.dynamic_composio_tools.clone();
+        // Capture the set of tool names currently loaded on this server.
+        // Used to filter dynamic injection: only tools the proxy will accept
+        // for tools/call should be injected as FunctionDeclarations.
+        let loaded_tool_names: std::collections::HashSet<String> = client.tools.iter()
+            .map(|t| t.name.to_string())
+            .collect();
 
         // Note: composio_meta synthetic server removed - Tool Router handles on-demand tools
 
@@ -1409,23 +1521,83 @@ impl McpManager {
                                 .await
                             {
                                 Ok(discovery_result) => {
-                                    let results: Vec<serde_json::Value> = discovery_result.tools
+                                    let total_available = discovery_result.tools.len();
+
+                                    // Deduplicate: skip tools already loaded on the server
+                                    let new_tools: Vec<_> = discovery_result.tools
                                         .iter()
-                                        .map(|t| {
-                                            serde_json::json!({
-                                                "name": t.name,
-                                                "description": t.description,
-                                                "parameters": t.parameters,
-                                            })
-                                        })
+                                        .filter(|t| !loaded_tool_names.contains(&t.name))
+                                        .collect();
+
+                                    // Budget-aware selection: only inject as many as Gemini can handle
+                                    let budget = GEMINI_TOOL_LIMIT.saturating_sub(loaded_tool_names.len());
+                                    let budget_limited = new_tools.len() > budget;
+
+                                    let selected: Vec<_> = if budget_limited {
+                                        // Score and sort by relevance, take top N within budget
+                                        let mut scored: Vec<_> = new_tools.iter()
+                                            .map(|t| (score_tool_relevance(&t.name), *t))
+                                            .collect();
+                                        scored.sort_by(|a, b| b.0.cmp(&a.0));
+                                        scored.into_iter().take(budget).map(|(_, t)| t).collect()
+                                    } else {
+                                        new_tools
+                                    };
+
+                                    // Inject selected tools into the dynamic cache
+                                    let rmcp_tools: Vec<rmcp::model::Tool> = selected
+                                        .iter()
+                                        .map(|t| composio_to_rmcp_tool(t))
+                                        .collect();
+                                    let injected_count = rmcp_tools.len();
+                                    {
+                                        let mut cache = dynamic_tools_cache.lock().await;
+                                        let new_names: std::collections::HashSet<String> = rmcp_tools.iter()
+                                            .map(|t| t.name.to_string())
+                                            .collect();
+                                        cache.retain(|t| !new_names.contains(&t.name.to_string()));
+                                        cache.extend(rmcp_tools);
+                                        tracing::info!(
+                                            "Injected {} dynamic tools for '{}' (from {} available, budget: {}, cache: {})",
+                                            injected_count, app_name, total_available, budget, cache.len()
+                                        );
+                                    }
+
+                                    // Populate tool→toolkit mapping for ALL discovered tools
+                                    // (even non-injected ones, so COMPOSIO_EXECUTE_TOOL can resolve context)
+                                    if let Ok(mut map) = composio_client.tool_toolkit_map.write() {
+                                        for t in &discovery_result.tools {
+                                            map.insert(t.name.clone(), app_name.to_string());
+                                        }
+                                    }
+
+                                    // Build response
+                                    let tool_results: Vec<serde_json::Value> = selected
+                                        .iter()
+                                        .map(|t| serde_json::json!({
+                                            "name": t.name,
+                                            "description": t.description,
+                                        }))
                                         .collect();
 
                                     let content_text = serde_json::to_string_pretty(&serde_json::json!({
                                         "app": app_name,
-                                        "tools_count": results.len(),
-                                        "tools": results,
-                                        "hint": "Use COMPOSIO_EXECUTE_TOOL with the exact tool name and required arguments to execute a tool."
-                                    })).unwrap_or_default();
+                                        "injected_count": injected_count,
+                                        "total_available": total_available,
+                                        "budget_limited": budget_limited,
+                                        "tools": tool_results,
+                                        "hint": if budget_limited {
+                                            format!("{} most relevant tools injected (budget: {} max). Use COMPOSIO_EXECUTE_TOOL for any tool not listed.", injected_count, GEMINI_TOOL_LIMIT)
+                                        } else {
+                                            "All tools are now available as native function calls. Call them directly by name.".to_string()
+                                        }
+                                    })).unwrap_or_else(|e| {
+                                        tracing::error!("Failed to serialize tool discovery response: {}", e);
+                                        // Hand-crafted JSON is intentional here: the primary serde_json
+                                        // serializer just failed, and this output is consumed as Content::text
+                                        // by the AI — not parsed as JSON by any downstream consumer.
+                                        format!("{{\"error\": \"Failed to format tool list for '{}'\"}}", app_name)
+                                    });
 
                                     Ok(CallToolResult {
                                         content: vec![rmcp::model::Content::text(content_text)],
@@ -1440,6 +1612,22 @@ impl McpManager {
                                 )),
                             }
                         }
+                    } else if tool.name == "COMPOSIO_CLEAR_TOOLS" {
+                        // Clear all dynamically discovered tools from the cache
+                        let mut cache = dynamic_tools_cache.lock().await;
+                        let cleared_count = cache.len();
+                        cache.clear();
+                        tracing::info!("COMPOSIO_CLEAR_TOOLS: cleared {} dynamic tools", cleared_count);
+
+                        Ok(CallToolResult {
+                            content: vec![rmcp::model::Content::text(format!(
+                                "Cleared {} dynamically discovered tools from the session.",
+                                cleared_count
+                            ))],
+                            is_error: Some(false),
+                            structured_content: None,
+                            meta: None,
+                        })
                     } else if tool.name == "COMPOSIO_EXECUTE_TOOL" {
                         // Extract tool_name and arguments - handle missing tool_name as error
                         match args.get("tool_name").and_then(|v| v.as_str()) {
@@ -1448,6 +1636,7 @@ impl McpManager {
                                     .get("arguments")
                                     .cloned()
                                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                                let retry_args = tool_args.clone();
 
                                 tracing::info!(
                                     "COMPOSIO_EXECUTE_TOOL: executing '{}'",
@@ -1460,8 +1649,8 @@ impl McpManager {
                                     .await
                                 {
                                     Ok(response) => {
-                                        // Check for auth failure (401/403) and attempt auto-reconnection
-                                        if let Some(auth_result) = try_auth_recovery(&response, target_tool_name, &composio_client).await {
+                                        // Check for auth failure (401/403) and attempt auto-reconnection + retry
+                                        if let Some(auth_result) = try_auth_recovery(&response, target_tool_name, &composio_client, Some(retry_args)).await {
                                             let _ = tx.send(Ok(auth_result));
                                             return;
                                         }
@@ -1492,10 +1681,11 @@ impl McpManager {
                         }
                     } else {
                         // Regular Composio tool execution
+                        let retry_args = args.clone();
                         match composio_client.execute_tool(&tool.name, args).await {
                             Ok(response) => {
-                                // Check for auth failure (401/403) and attempt auto-reconnection
-                                if let Some(auth_result) = try_auth_recovery(&response, &tool.name, &composio_client).await {
+                                // Check for auth failure (401/403) and attempt auto-reconnection + retry
+                                if let Some(auth_result) = try_auth_recovery(&response, &tool.name, &composio_client, Some(retry_args)).await {
                                     let _ = tx.send(Ok(auth_result));
                                     return;
                                 }
@@ -1777,6 +1967,34 @@ impl McpManager {
             server_contexts.push(server_context);
         }
 
+        // Include dynamically discovered Composio tools as a virtual server entry.
+        // These are tools fetched by COMPOSIO_GET_APP_TOOLS and cached for injection
+        // into the prompt as real FunctionDeclarations.
+        // Use the same display name as the real Composio server so the UX shows
+        // a friendly profile name (e.g. "composio-native:Puget Systems") instead of a UUID.
+        let dynamic_tools = self.dynamic_composio_tools.lock().await;
+        if !dynamic_tools.is_empty() {
+            // Find the matching Composio server's display name
+            let server_name = servers.iter()
+                .find(|(k, c)| {
+                    is_composio_native(k) && match (&profile_id, &c.profile_id) {
+                        (Some(target), Some(cid)) => target == cid,
+                        (None, _) => true,
+                        _ => false,
+                    }
+                })
+                .map(|(_, c)| c.config.name.clone())
+                .unwrap_or_else(|| match &profile_id {
+                    Some(pid) => composio_server_key(pid),
+                    None => COMPOSIO_NATIVE_PREFIX.to_string(),
+                });
+            server_contexts.push(McpServerContext {
+                name: server_name,
+                description: "Dynamically discovered Composio tools".to_string(),
+                tools: dynamic_tools.clone(),
+            });
+        }
+
         McpContext {
             servers: server_contexts,
         }
@@ -1941,7 +2159,7 @@ impl McpManager {
         tracing::info!("[Step 2/5] Initiating OAuth...");
         connection_status.set("Authenticating...".to_string());
         
-        match client.initiate_connection(&toolkit_slug, &user_id).await {
+        match client.initiate_connection(&toolkit_slug, &user_id, false).await {
             Ok(result_msg) => {
                  tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
                  // Wait implied by await
@@ -2060,7 +2278,8 @@ impl McpManager {
                         slug: toolkit_slug.clone(),
                         display_name: toolkit_slug.clone(),
                         tool_count: 0,
-                        force_load: true,
+                        force_load: false,
+                        load_mode: crate::settings::ToolkitLoadMode::OnDemand,
                     });
                 }
             }
@@ -2140,7 +2359,7 @@ impl McpManager {
             // The client.initiate_connection implementation uses self.user_id if available.
             // We passed it in 'new', so it should be there.
 
-            client.initiate_connection(&toolkit_slug, "").await
+            client.initiate_connection(&toolkit_slug, "", false).await
         } else {
             Err(format!("Server '{}' is not a Composio client", server_name))
         }

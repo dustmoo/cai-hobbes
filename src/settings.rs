@@ -325,6 +325,18 @@ pub const APP_ATTRIBUTION: &str =
 // ============================================================================
 pub const CURRENT_TOS_VERSION: &str = "1.1";
 
+/// How a Composio toolkit's tools are made available to the AI.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+pub enum ToolkitLoadMode {
+    /// All tools loaded upfront into every Gemini request
+    Loaded,
+    /// Tools discovered via meta-tools, then injected dynamically (default)
+    #[default]
+    OnDemand,
+    /// Toolkit completely hidden from AI
+    Excluded,
+}
+
 /// Configuration for a single Composio toolkit's loading behavior
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct ComposioToolkitConfig {
@@ -335,10 +347,25 @@ pub struct ComposioToolkitConfig {
     /// Number of tools in this toolkit (cached for UI display)
     #[serde(default)]
     pub tool_count: usize,
-    /// If true, all tools are loaded upfront instead of on-demand via Tool Router
-    /// Default is false (on-demand via Tool Router)
-    #[serde(default)]
+    /// DEPRECATED: Legacy boolean, kept for backward-compatible deserialization.
+    /// New code should use `load_mode` instead.
+    #[serde(default, skip_serializing)]
     pub force_load: bool,
+    /// How this toolkit's tools are loaded (replaces `force_load`).
+    #[serde(default)]
+    pub load_mode: ToolkitLoadMode,
+}
+
+impl ComposioToolkitConfig {
+    /// Resolve the effective load mode, accounting for legacy `force_load` migration.
+    /// If `load_mode` is the default (OnDemand) AND `force_load` is true, treat as `Loaded`.
+    pub fn effective_load_mode(&self) -> ToolkitLoadMode {
+        if self.force_load && self.load_mode == ToolkitLoadMode::OnDemand {
+            ToolkitLoadMode::Loaded
+        } else {
+            self.load_mode
+        }
+    }
 }
 
 /// A Composio profile containing connection settings for one Composio account
@@ -390,48 +417,16 @@ impl Default for ComposioProfile {
 }
 
 impl ComposioProfile {
-    /// Get slugs of toolkits configured for force loading (upfront)
+    /// Get slugs of toolkits configured for "Loaded" mode (all tools upfront).
     pub fn get_force_load_toolkit_slugs(&self) -> Vec<String> {
         self.toolkit_configs
             .iter()
-            .filter(|c| c.force_load)
+            .filter(|c| c.effective_load_mode() == ToolkitLoadMode::Loaded)
             .map(|c| c.slug.clone())
             .collect()
     }
 
-    /// Get slugs of toolkits configured for on-demand loading (default)
-    #[allow(dead_code)]
-    pub fn get_on_demand_toolkit_slugs(&self) -> Vec<String> {
-        self.toolkit_configs
-            .iter()
-            .filter(|c| !c.force_load)
-            .map(|c| c.slug.clone())
-            .collect()
-    }
 
-    /// Check if a toolkit is configured for force loading
-    #[allow(dead_code)]
-    pub fn is_toolkit_force_load(&self, slug: &str) -> bool {
-        self.toolkit_configs
-            .iter()
-            .find(|c| c.slug.eq_ignore_ascii_case(slug))
-            .map(|c| c.force_load)
-            .unwrap_or(false) // Default to on-demand if not configured
-    }
-
-    /// Update or add a toolkit configuration
-    #[allow(dead_code)]
-    pub fn set_toolkit_config(&mut self, config: ComposioToolkitConfig) {
-        if let Some(existing) = self
-            .toolkit_configs
-            .iter_mut()
-            .find(|c| c.slug == config.slug)
-        {
-            *existing = config;
-        } else {
-            self.toolkit_configs.push(config);
-        }
-    }
     /// Check if the profile is fully configured (has both User ID and API Key)
     pub fn is_fully_configured(&self) -> bool {
         self.user_id.as_ref().is_some_and(|s| !s.is_empty())

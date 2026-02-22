@@ -209,8 +209,10 @@ fn app() -> Element {
     use_effect(move || {
         let settings_snapshot = settings.peek().clone();
         let mut state = session_state.write();
-        if state.migrate_session_profiles_to_ids(&settings_snapshot) {
-            SessionState::save_async(state.clone(), None);
+        let migrated = state.migrate_session_profiles_to_ids(&settings_snapshot);
+        drop(state); // Release write guard before borrowing for save
+        if migrated {
+            SessionState::save_signal(&session_state, None);
         }
     });
 
@@ -1064,7 +1066,7 @@ fn app() -> Element {
                     .write()
                     .update_window_size(content_width, logical_size.height);
                 // Save asynchronously on a background thread to avoid blocking the UI
-                SessionState::save_async(session_state.read().clone(), None);
+                SessionState::save_async(&session_state.read(), None);
             });
         }
     });
@@ -1120,7 +1122,7 @@ fn app() -> Element {
                         }
 
                         if session_changed {
-                            SessionState::save_async(session_state.read().clone(), Some(save_error));
+                            SessionState::save_async(&session_state.read(), Some(save_error));
                             mcp_manager.read().invalidate_status_cache();
                         }
                     }

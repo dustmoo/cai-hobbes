@@ -1031,9 +1031,8 @@ impl LlmConnector for GeminiConnector {
                                                         tool_not_found_count += 1;
                                                         tracing::error!("LLM requested tool '{}' which was not found in the provided context (count: {}).", function_call.name, tool_not_found_count);
                                                         // After repeated failures, emit the persistent error message that triggers QuickFix buttons
-                                                        let tool_error_msg = if tool_not_found_count >= 2 {
-                                                            format!(
-                                                                "[Hobbes encountered a persistent error ('TOOL_NOT_FOUND') after multiple retries. The model may be hallucinating a tool that does not exist.]")
+                                                            let tool_error_msg = if tool_not_found_count >= 2 {
+                                                            "[Hobbes encountered a persistent error ('TOOL_NOT_FOUND') after multiple retries. The model may be hallucinating a tool that does not exist.]".to_string()
                                                         } else {
                                                             format!(
                                                             "⚠️ **Tool Not Available: `{}`**\n\n\
