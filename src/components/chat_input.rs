@@ -301,7 +301,10 @@ pub fn ChatInput(
                         // Spawn Execution
                         let mut sc_clone = skill_call.clone();
                         let mut session_state = session_state; // move clone into closure
-                        let mcp_context = _mcp_context.read().clone();
+                        let mut mcp_context = _mcp_context.read().clone();
+                        // Enrich with toolkit slugs from Settings so on-demand toolkits
+                        // don't produce false "Missing capability" warnings
+                        mcp_context.enrich_from_settings(&settings.read());
 
                         spawn(async move {
                             match crate::skills::execute_skill(&mut sc_clone, Some(&mcp_context)).await {

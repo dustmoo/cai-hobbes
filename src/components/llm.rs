@@ -1768,7 +1768,7 @@ mod tests {
         };
 
         // Pass an empty MCP context so the tool won't be found
-        let mcp_context = Some(crate::mcp::manager::McpContext { servers: vec![] });
+        let mcp_context = Some(crate::mcp::manager::McpContext { servers: vec![], connected_toolkit_slugs: vec![] });
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         connector

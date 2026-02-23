@@ -832,6 +832,7 @@ mod tests {
 
         let mcp_context = McpContext {
             servers: vec![server],
+            connected_toolkit_slugs: vec![],
         };
 
         let active_context = ActiveContext {
@@ -1065,6 +1066,7 @@ mod tests {
 
         let mcp_context = McpContext {
             servers: vec![server],
+            connected_toolkit_slugs: vec![],
         };
 
         let active_context = ActiveContext {
@@ -1274,6 +1276,7 @@ mod tests {
 
         let mcp_context = McpContext {
             servers: vec![server],
+            connected_toolkit_slugs: vec![],
         };
 
         let active_context = ActiveContext {

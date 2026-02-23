@@ -923,6 +923,7 @@ pub enum SettingsTab {
     Permissions,
     Hotkeys,
     Credentials,
+    Skills,
     About,
 }
 

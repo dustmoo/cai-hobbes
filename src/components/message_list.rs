@@ -326,7 +326,10 @@ pub fn MessageList(
                                                                                     if let Some(ref id) = profile_id {
                                                                                         let _ = mcp_manager.read().ensure_native_client_for_profile(id, &settings.read()).await;
                                                                                     }
-                                                                                    let fresh_mcp_context = mcp_manager.read().get_mcp_context(profile_id).await;
+                                                                                    let mut fresh_mcp_context = mcp_manager.read().get_mcp_context(profile_id).await;
+                                                                                    // Enrich with toolkit slugs from Settings so on-demand toolkits
+                                                                                    // don't produce false "Missing capability" warnings
+                                                                                    fresh_mcp_context.enrich_from_settings(&settings.read());
                                                                                     let mcp_context = if fresh_mcp_context.servers.is_empty() {
                                                                                         None
                                                                                     } else {

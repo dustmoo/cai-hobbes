@@ -474,6 +474,17 @@ pub fn SettingsPanel() -> Element {
                     "Credentials"
                 }
                 button {
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Skills { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
+                    onclick: move |_| {
+                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Skills;
+                        let state = (*ui_state.read()).clone();
+                        let manager = (*ui_state_manager.read()).clone();
+                        spawn(async move { let _ = manager.save(&state); });
+                    },
+                    Icon { width: 18, height: 18, icon: fi_icons::FiBook }
+                    "Skills"
+                }
+                button {
                     class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::About { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::About;
@@ -2579,6 +2590,82 @@ pub fn SettingsPanel() -> Element {
                     },
                     crate::settings::SettingsTab::Credentials => rsx! {
                          ToolCredentials {}
+                    },
+                    crate::settings::SettingsTab::Skills => rsx! {
+                        div {
+                            class: "border border-subtle rounded-lg mb-4",
+                            div {
+                                class: "p-4 bg-section rounded-lg",
+                                h3 { class: "text-md font-semibold mb-3", "Skills" }
+                                p { class: "text-sm text-fg-muted mb-4",
+                                    "Skills are instruction sets that teach Hobbes how to perform specific tasks using available tools."
+                                }
+
+                                // Reload button
+                                div {
+                                    class: "mb-4",
+                                    button {
+                                        class: "px-3 py-1.5 bg-primary-600 hover:bg-primary-500 text-white text-sm rounded-md transition-colors",
+                                        onclick: move |_| {
+                                            let skill_registry = skill_registry;
+                                            spawn(async move {
+                                                crate::skills::SkillRegistry::reload_into_signal(skill_registry).await;
+                                            });
+                                        },
+                                        "↻ Reload Skills"
+                                    }
+                                }
+
+                                // Skills list
+                                {
+                                    let registry = skill_registry.read();
+                                    let skills_lock = registry.skills.read().unwrap_or_else(|p| p.into_inner());
+                                    let mut skill_entries: Vec<_> = skills_lock.iter().collect();
+                                    skill_entries.sort_by_key(|(name, _)| name.to_string());
+
+                                    if skill_entries.is_empty() {
+                                        rsx! {
+                                            div {
+                                                class: "text-sm text-fg-muted italic p-3 border border-subtle rounded-md",
+                                                "No skills loaded. Add .skill directories to "
+                                                code { class: "text-xs bg-black/20 px-1 py-0.5 rounded", "~/.hobbes/skills/" }
+                                                " or "
+                                                code { class: "text-xs bg-black/20 px-1 py-0.5 rounded", "~/Library/Application Support/com.clearmirror.hobbes/skills/" }
+                                            }
+                                        }
+                                    } else {
+                                        rsx! {
+                                            div {
+                                                class: "space-y-2",
+                                                for (name, skill) in skill_entries {
+                                                    div {
+                                                        class: "p-3 border border-subtle rounded-md bg-black/10",
+                                                        div {
+                                                            class: "flex items-center gap-2 mb-1",
+                                                            span { class: "text-sm font-medium text-fg", "{name}" }
+                                                        }
+                                                        if !skill.metadata.description.is_empty() {
+                                                            p { class: "text-xs text-fg-muted mb-1", "{skill.metadata.description}" }
+                                                        }
+                                                        if let Some(tools) = &skill.metadata.allowed_tools {
+                                                            div {
+                                                                class: "flex flex-wrap gap-1 mt-1",
+                                                                for tool in tools {
+                                                                    span {
+                                                                        class: "text-xs px-1.5 py-0.5 bg-primary-900/30 text-primary-300 rounded",
+                                                                        "{tool}"
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     },
                     crate::settings::SettingsTab::About => rsx! {
                 // About & Legal Section

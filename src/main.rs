@@ -219,7 +219,7 @@ fn app() -> Element {
     // Global focus context for keyboard event coordination
     use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
 
-    let mut skill_registry = use_context_provider(|| Signal::new(skills::SkillRegistry::new()));
+    let skill_registry = use_context_provider(|| Signal::new(skills::SkillRegistry::new()));
     let mut skills_loaded = use_signal(|| false);
     
     // Pattern: Grounded App Initialization
@@ -232,44 +232,11 @@ fn app() -> Element {
     // Sync theme to DOM (class on <html> element)
     theme::use_theme_sync(settings);
 
-    // Asynchronously load skills from ~/.hobbes/skills
+    // Asynchronously load skills from all canonical directories (global + platform)
     use_effect(move || {
         if !skills_loaded() {
             spawn(async move {
-                let skills_dir = dirs::home_dir()
-                    .map(|h| h.join(".hobbes/skills"))
-                    .unwrap_or_default();
-
-                if skills_dir.exists() {
-                    let loaded = tokio::task::spawn_blocking(move || {
-                        let temp_registry = skills::SkillRegistry::new();
-                        match temp_registry.load_from_directory(&skills_dir) {
-                            Ok(names) => Some((temp_registry, names)),
-                            Err(e) => {
-                                tracing::warn!("Failed to load skills: {}", e);
-                                None
-                            }
-                        }
-                    })
-                    .await;
-
-                    if let Ok(Some((loaded_registry, names))) = loaded {
-                        // Merge loaded skills into the context signal
-                        let loaded_skills = loaded_registry
-                            .skills
-                            .read()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .clone();
-                        *skill_registry
-                            .write()
-                            .skills
-                            .write()
-                            .unwrap_or_else(|p| p.into_inner()) = loaded_skills;
-                        tracing::info!("Loaded {} skills: {:?}", names.len(), names);
-                    }
-                } else {
-                    tracing::debug!("Skills directory not found: {:?}", skills_dir);
-                }
+                skills::SkillRegistry::reload_into_signal(skill_registry).await;
                 skills_loaded.set(true);
             });
         }
@@ -637,6 +604,7 @@ fn app() -> Element {
     let mcp_context = use_context_provider(|| {
         Signal::new(mcp::manager::McpContext {
             servers: Vec::new(),
+            connected_toolkit_slugs: Vec::new(),
         })
     });
 
