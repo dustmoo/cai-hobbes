@@ -50,11 +50,17 @@ pub fn check_permission(permission_manager: &PermissionManager, skill_name: &str
     permission_manager.check_skill_permission(skill_name)
 }
 
-/// Helper to extract all available tool names from the MCP context, indexed by name AND toolkit slug
+/// Helper to extract all available tool names from the MCP context, indexed by:
+/// 1. Exact tool name (standard)
+/// 2. Server name as toolkit slug (for non-Composio MCP servers)
+/// 3. Composio toolkit slug prefix (Section 6 waterfall: name prefix split)
+/// 4. Connected-but-not-loaded toolkit slugs (for on-demand Tool Router toolkits)
 fn extract_tool_map(context: &McpContext) -> HashMap<String, Vec<String>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
 
     for server in &context.servers {
+        let is_composio = crate::mcp::manager::is_composio_native(&server.name);
+
         // 1. Index by Tool Name (Standard)
         for tool in &server.tools {
             map.entry(tool.name.to_string())
@@ -62,15 +68,44 @@ fn extract_tool_map(context: &McpContext) -> HashMap<String, Vec<String>> {
                 .push(tool.name.to_string());
         }
 
-        // 2. Index by Toolkit Slug (e.g. "news_api" -> ["news_api_get_headlines", ...])
-        // We use the server name as the toolkit slug reference
-        let slug = server.name.clone();
-        let server_tools: Vec<String> = server.tools.iter().map(|t| t.name.to_string()).collect();
-        
-        map.entry(slug)
-            .or_default()
-            .extend(server_tools);
+        if is_composio {
+            // 3. For Composio tools, index by toolkit slug prefix
+            // Section 6 waterfall: GMAIL_SEND_EMAIL → slug "gmail"
+            // This groups all tools under their toolkit slug for capability resolution
+            let mut slug_tools: HashMap<String, Vec<String>> = HashMap::new();
+            for tool in &server.tools {
+                let name = tool.name.to_string();
+                // Extract slug: split by '_', take the first segment, lowercase
+                if let Some(slug) = name.split('_').next() {
+                    let slug_lower = slug.to_lowercase();
+                    slug_tools.entry(slug_lower)
+                        .or_default()
+                        .push(name);
+                }
+            }
+            for (slug, tools) in slug_tools {
+                map.entry(slug)
+                    .or_default()
+                    .extend(tools);
+            }
+        } else {
+            // 2. For non-Composio servers, index by server name as toolkit slug
+            let slug = server.name.clone();
+            let server_tools: Vec<String> = server.tools.iter().map(|t| t.name.to_string()).collect();
+            map.entry(slug)
+                .or_default()
+                .extend(server_tools);
+        }
     }
+
+    // 4. Index connected-but-not-loaded toolkit slugs (Tool Router on-demand)
+    // These are toolkits the user has connected but whose tools aren't force-loaded.
+    // The AI can discover them via COMPOSIO_GET_APP_TOOLS.
+    for slug in &context.connected_toolkit_slugs {
+        map.entry(slug.clone())
+            .or_default(); // Empty vec = connected but no loaded tools yet
+    }
+
     map
 }
 
@@ -148,9 +183,26 @@ pub async fn execute_skill(
             matches.dedup();
 
             if matches.is_empty() {
-                warnings.push(format!("Missing required capability: '{}'. The skill may not function correctly.", capability));
-                // Fallback: Resolve to generic name so the Agent at least sees what was requested
-                resolved_tools.insert(capability.clone(), capability.clone()); 
+                // Check if this capability is a known connected toolkit (on-demand, not yet loaded)
+                if tool_map.contains_key(capability) {
+                    // Connected but no tools loaded yet — the AI can use COMPOSIO_GET_APP_TOOLS
+                    // to discover tools for this toolkit. No warning needed.
+                    resolved_tools.insert(capability.clone(), format!("(on-demand) Use COMPOSIO_GET_APP_TOOLS with app='{}' to discover available tools", capability));
+                } else if let Some(matching_slug) = tool_map.keys().find(|key| {
+                    // Fuzzy slug match: "calendar" matches "googlecalendar" (substring in on-demand slug).
+                    // Require minimum 3-char capability to avoid overly broad single-letter matches.
+                    let cap_lower = capability.to_lowercase();
+                    if cap_lower.len() < 3 { return false; }
+                    let key_lower = key.to_lowercase();
+                    key_lower.contains(&cap_lower) || cap_lower.contains(&key_lower)
+                }) {
+                    // Found a connected toolkit whose slug contains the capability (or vice versa)
+                    resolved_tools.insert(capability.clone(), format!("(on-demand) Use COMPOSIO_GET_APP_TOOLS with app='{}' to discover available tools", matching_slug));
+                } else {
+                    warnings.push(format!("Missing required capability: '{}'. The skill may not function correctly.", capability));
+                    // Fallback: Resolve to generic name so the Agent at least sees what was requested
+                    resolved_tools.insert(capability.clone(), capability.clone());
+                }
             } else {
                 // Return ALL matching tools so the Agent can choose the most appropriate one
                 matches.sort(); // Sort alphabetically for consistency

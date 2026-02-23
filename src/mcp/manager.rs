@@ -222,6 +222,28 @@ struct McpServersWrapper {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct McpContext {
     pub servers: Vec<McpServerContext>,
+    /// Toolkit slugs connected to the active Composio profile (MCP-First, Section 6).
+    /// Includes both force-loaded AND on-demand toolkits. Used by the skill executor
+    /// to validate capabilities without false warnings for connected-but-not-loaded toolkits.
+    #[serde(default)]
+    pub connected_toolkit_slugs: Vec<String>,
+}
+
+impl McpContext {
+    /// Enrich connected_toolkit_slugs from the active Composio profile's toolkit_configs.
+    /// This ensures on-demand toolkit slugs are always present even when the runtime
+    /// cache (from list_connected_toolkits) hasn't been hydrated yet.
+    pub fn enrich_from_settings(&mut self, settings: &crate::settings::Settings) {
+        if let Some(profile) = settings.get_active_profile() {
+            let existing: HashSet<String> = self.connected_toolkit_slugs.iter().cloned().collect();
+            for config in &profile.toolkit_configs {
+                let slug = config.slug.to_lowercase();
+                if !existing.contains(&slug) {
+                    self.connected_toolkit_slugs.push(slug);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -1995,8 +2017,24 @@ impl McpManager {
             });
         }
 
+        // Populate connected toolkit slugs from cached Composio toolkit info (MCP-First, Section 6).
+        // This is a pure cache read — no network calls. The cache is hydrated by
+        // list_connected_toolkits() which uses the MCP `tools/list` endpoint.
+        let connected_toolkit_slugs = servers.iter()
+            .find(|(k, _)| is_composio_native(k))
+            .and_then(|(_, client)| {
+                if let McpClientType::NativeComposio(ref composio_client) = client.service {
+                    composio_client.get_cached_toolkit_info()
+                } else {
+                    None
+                }
+            })
+            .map(|infos| infos.into_iter().map(|ti| ti.slug).collect::<Vec<_>>())
+            .unwrap_or_default();
+
         McpContext {
             servers: server_contexts,
+            connected_toolkit_slugs,
         }
     }
 

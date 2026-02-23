@@ -11,11 +11,83 @@ pub struct SkillRegistry {
     pub loaded_paths: Arc<RwLock<Vec<PathBuf>>>,
 }
 
+/// Returns all canonical skill directories (global + platform-specific).
+/// - Global: `~/.hobbes/skills` (cross-platform, user-facing)
+/// - Platform: `data_local_dir/com.clearmirror.hobbes/skills` (macOS Application Support, etc.)
+pub fn get_skills_directories() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    // 1. Global: ~/.hobbes/skills
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".hobbes").join("skills"));
+    }
+
+    // 2. Platform-specific: ~/Library/Application Support/com.clearmirror.hobbes/skills (macOS)
+    //    or equivalent data_local_dir on other platforms
+    if let Some(data_dir) = dirs::data_local_dir() {
+        let platform_dir = data_dir.join("com.clearmirror.hobbes").join("skills");
+        // Avoid duplicating if they happen to resolve to the same path
+        if !dirs.contains(&platform_dir) {
+            dirs.push(platform_dir);
+        }
+    }
+
+    dirs
+}
+
 impl SkillRegistry {
     pub fn new() -> Self {
         Self {
             skills: Arc::new(RwLock::new(HashMap::new())),
             loaded_paths: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Load skills from all canonical directories (global + platform).
+    /// Returns the names of all successfully loaded skills.
+    pub fn load_all(&self) -> Vec<String> {
+        let mut all_names = Vec::new();
+        for dir in get_skills_directories() {
+            if dir.exists() {
+                match self.load_from_directory(&dir) {
+                    Ok(names) => all_names.extend(names),
+                    Err(e) => tracing::warn!("Failed to load skills from {:?}: {}", dir, e),
+                }
+            } else {
+                tracing::debug!("Skills directory not found, skipping: {:?}", dir);
+            }
+        }
+        all_names
+    }
+
+    /// Reload all skills from canonical directories and merge into a Dioxus Signal.
+    /// Encapsulates the spawn_blocking + RwLock merge pattern used at startup and
+    /// by the Settings "Reload Skills" button.
+    pub async fn reload_into_signal(mut signal: dioxus::prelude::Signal<SkillRegistry>) {
+        use dioxus_signals::Writable;
+        let loaded = tokio::task::spawn_blocking(move || {
+            let temp_registry = SkillRegistry::new();
+            let names = temp_registry.load_all();
+            if names.is_empty() {
+                None
+            } else {
+                Some((temp_registry, names))
+            }
+        })
+        .await;
+
+        if let Ok(Some((loaded_registry, names))) = loaded {
+            let loaded_skills = loaded_registry
+                .skills
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            *signal
+                .write()
+                .skills
+                .write()
+                .unwrap_or_else(|p| p.into_inner()) = loaded_skills;
+            tracing::info!("Loaded {} skills: {:?}", names.len(), names);
         }
     }
 
