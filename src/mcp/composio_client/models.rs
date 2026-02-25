@@ -339,7 +339,10 @@ impl ToolExecuteResponse {
     /// 3. `data.ECODE` — `AUTH_*` / `OAUTH_*` prefixes
     /// 4. `data.http_error` — substring "401"/"403"
     /// 5. `data.data.status_code` / `data.data.statusCode` — nested variants
-    /// 6. `error` string — "401", "403 Forbidden", "Authentication required"
+    /// 6. `error` string — deterministic status code patterns only
+    ///
+    /// CYCLE GUARD: Returns false if `data.redirectUrl` is present — this means
+    /// the response is our own generated auth redirect, not an upstream error.
     ///
     /// NOTE: This does NOT cover the Double-MCP `result.content[].text` path,
     /// which operates on the raw JSON-RPC envelope before deserialization.
@@ -351,31 +354,41 @@ impl ToolExecuteResponse {
 
         let data = &self.data;
 
-        // 1. data.status_code (numeric)
+        // CYCLE GUARD: If the response already contains a redirectUrl, this is
+        // our own generated auth redirect (from initiate_connection or
+        // reconnect_toolkit). It is NOT a new upstream auth error.
+        // NOTE: Do NOT check for `data.status` here — that field is ubiquitous
+        // in Composio API responses (e.g. ConnectedAccount.status = "ACTIVE")
+        // and would suppress real auth errors. (Review: 2026-02-25)
+        if data.get("redirectUrl").is_some() {
+            return false;
+        }
+
+        // 1. data.status_code (numeric) — HARD signal
         let status_code_num = data.get("status_code").is_some_and(|v| {
             v.as_u64().is_some_and(|n| n == 401 || n == 403)
                 || v.as_i64().is_some_and(|n| n == 401 || n == 403)
         });
 
-        // 2. data.statusCode (string "401"/"403" or numeric)
+        // 2. data.statusCode (string "401"/"403" or numeric) — HARD signal
         let status_code_str = data.get("statusCode").is_some_and(|v| {
             v.as_str().is_some_and(|s| s == "401" || s == "403")
                 || v.as_u64().is_some_and(|n| n == 401 || n == 403)
         });
 
-        // 3. data.ECODE (AUTH_018, OAUTH_018, etc.)
+        // 3. data.ECODE (AUTH_018, OAUTH_018, etc.) — HARD signal
         let ecode_match = data
             .get("ECODE")
             .and_then(|v| v.as_str())
             .is_some_and(|e| e.starts_with("AUTH_") || e.starts_with("OAUTH_"));
 
-        // 4. data.http_error (substring)
+        // 4. data.http_error (substring) — HARD signal
         let http_error_match = data
             .get("http_error")
             .and_then(|v| v.as_str())
             .is_some_and(|s| s.contains("401") || s.contains("403"));
 
-        // 5. Nested data.data.status_code / data.data.statusCode
+        // 5. Nested data.data.status_code / data.data.statusCode — HARD signal
         let nested_status = data.get("data").is_some_and(|inner| {
             inner.get("status_code").is_some_and(|v| {
                 v.as_u64().is_some_and(|n| n == 401 || n == 403)
@@ -385,11 +398,13 @@ impl ToolExecuteResponse {
             })
         });
 
-        // 6. Fallback: error string substring match (last resort)
+        // 6. Fallback: error string — SOFT signal (restricted patterns only)
+        // CAUTION: Do NOT match on "Authentication required" — our own code
+        // generates messages containing this string in auth redirect responses.
+        // Only match on deterministic HTTP status codes in the error string.
         let error_str = self.error.as_deref().unwrap_or("");
         let error_fallback = error_str.contains("401")
-            || error_str.contains("403 Forbidden")
-            || error_str.contains("Authentication required");
+            || error_str.contains("403 Forbidden");
 
         status_code_num
             || status_code_str

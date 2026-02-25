@@ -6,6 +6,10 @@ use crate::mcp::manager::{COMPOSIO_NATIVE_PREFIX, is_composio_native};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Gemini API rejects FunctionDeclaration schemas that exceed this nesting depth.
+/// Empirically ~4 levels is the limit before INVALID_ARGUMENT errors occur.
+const MAX_NESTING_DEPTH: usize = 4;
+
 /// Errors that can occur during MCP-to-Gemini conversion.
 #[derive(Debug)]
 pub enum ConversionError {
@@ -155,9 +159,33 @@ fn simplify_compound_types(obj: &serde_json::Map<String, Value>) -> serde_json::
 /// Convert a serde_json::Value representing a JSON Schema to a GeminiSchema.
 /// This recursively processes the schema, ignoring unsupported fields.
 fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
+    convert_schema_inner(value, 0)
+}
+
+/// Inner recursive converter with depth tracking.
+/// At depths exceeding MAX_NESTING_DEPTH, schemas are flattened to STRING
+/// to prevent Gemini INVALID_ARGUMENT errors on deeply nested tool definitions.
+fn convert_schema_inner(value: &Value, depth: usize) -> Result<GeminiSchema, ConversionError> {
     let obj = value
         .as_object()
         .ok_or_else(|| ConversionError::InvalidSchema("Schema must be an object".to_string()))?;
+
+    // Depth guard: flatten to STRING if we've exceeded Gemini's nesting limit
+    if depth > MAX_NESTING_DEPTH {
+        let desc = obj
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| Some("(Schema flattened due to nesting depth limit)".to_string()));
+        return Ok(GeminiSchema {
+            schema_type: SchemaType::String,
+            description: desc,
+            properties: None,
+            required: None,
+            items: None,
+            enum_values: None,
+        });
+    }
 
     // Pre-process: Handle oneOf/anyOf/allOf by using the first element
     // Gemini doesn't support these compound types
@@ -191,7 +219,7 @@ fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
                 }
 
                 // Recursively convert the property schema
-                match convert_schema(val) {
+                match convert_schema_inner(val, depth + 1) {
                     Ok(schema) => {
                         converted_props.insert(key.clone(), schema);
                     }
@@ -267,7 +295,7 @@ fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
                 None
             }
         } else {
-            match convert_schema(items_val) {
+            match convert_schema_inner(items_val, depth + 1) {
                 Ok(schema) => Some(Box::new(schema)),
                 Err(_) => {
                     // If items conversion fails, provide default for ARRAY types
@@ -320,13 +348,28 @@ fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Gemini rejects properties/required on non-OBJECT types,
+    // and enum on non-STRING types.
+    // Strip them to prevent INVALID_ARGUMENT errors from raw MCP tool schemas.
+    let (final_properties, final_required) = if schema_type != SchemaType::Object {
+        (None, None)
+    } else {
+        (properties, required)
+    };
+
+    let final_enum = if schema_type != SchemaType::String {
+        None
+    } else {
+        enum_values
+    };
+
     Ok(GeminiSchema {
         schema_type,
         description,
-        properties,
-        required,
+        properties: final_properties,
+        required: final_required,
         items,
-        enum_values,
+        enum_values: final_enum,
     })
 }
 
@@ -474,5 +517,133 @@ mod tests {
         assert!(!json_str.contains("default"));
         assert!(!json_str.contains("minLength"));
         assert!(!json_str.contains("maxLength"));
+    }
+
+    #[test]
+    fn test_max_nesting_depth_flattens() {
+        // Build a schema 6 levels deep — should flatten at depth > MAX_NESTING_DEPTH (4)
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "level1": {                           // depth 1
+                    "type": "object",
+                    "properties": {
+                        "level2": {                   // depth 2
+                            "type": "object",
+                            "properties": {
+                                "level3": {           // depth 3
+                                    "type": "object",
+                                    "properties": {
+                                        "level4": {   // depth 4
+                                            "type": "object",
+                                            "properties": {
+                                                "level5": {   // depth 5 — exceeds MAX_NESTING_DEPTH
+                                                    "type": "object",
+                                                    "description": "This is deep",
+                                                    "properties": {
+                                                        "value": { "type": "string" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let result = convert_schema(&schema).unwrap();
+
+        // Navigate to depth 5 and verify it was flattened to STRING
+        let l1 = result.properties.as_ref().unwrap().get("level1").unwrap();
+        let l2 = l1.properties.as_ref().unwrap().get("level2").unwrap();
+        let l3 = l2.properties.as_ref().unwrap().get("level3").unwrap();
+        let l4 = l3.properties.as_ref().unwrap().get("level4").unwrap();
+        let l5 = l4.properties.as_ref().unwrap().get("level5").unwrap();
+
+        // Level 5 should be flattened to STRING (depth > 4)
+        assert_eq!(l5.schema_type, SchemaType::String);
+        assert!(l5.properties.is_none(), "Flattened schema should have no properties");
+        assert!(l5.description.is_some(), "Flattened schema should preserve description");
+        assert_eq!(l5.description.as_ref().unwrap(), "This is deep");
+    }
+
+    #[test]
+    fn test_properties_stripped_from_non_object_types() {
+        // Some raw MCP tools attach properties to STRING or ARRAY types
+        // Gemini rejects this combination
+        let schema = json!({
+            "type": "string",
+            "properties": {
+                "foo": { "type": "string" }
+            },
+            "required": ["foo"]
+        });
+
+        let result = convert_schema(&schema).unwrap();
+        assert_eq!(result.schema_type, SchemaType::String);
+        assert!(result.properties.is_none(), "properties should be stripped from non-OBJECT");
+        assert!(result.required.is_none(), "required should be stripped from non-OBJECT");
+    }
+
+    #[test]
+    fn test_title_field_ignored() {
+        // Raw MCP tools may include 'title' which GeminiSchema doesn't support
+        let schema = json!({
+            "type": "object",
+            "title": "My Tool Parameters",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "title": "User Name"
+                }
+            }
+        });
+
+        let result = convert_schema(&schema).unwrap();
+        let json_str = serde_json::to_string(&result).unwrap();
+        assert!(!json_str.contains("title"), "title field should not appear in serialized output");
+        assert!(!json_str.contains("My Tool Parameters"));
+        assert!(!json_str.contains("User Name"));
+    }
+
+    #[test]
+    fn test_enum_stripped_from_non_string_types() {
+        // Exact pattern from ClickUp MCP: max_depth is INTEGER with enum values
+        // Gemini error: "properties[max_depth].enum: only allowed for STRING type"
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "max_depth": {
+                    "type": "integer",
+                    "enum": [1, 2, 3, 4, 5],
+                    "description": "Maximum depth level"
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["open", "closed"]
+                }
+            }
+        });
+
+        let result = convert_schema(&schema).unwrap();
+        let props = result.properties.as_ref().unwrap();
+
+        // INTEGER with enum — enum should be stripped
+        let max_depth = props.get("max_depth").unwrap();
+        assert_eq!(max_depth.schema_type, SchemaType::Integer);
+        assert!(max_depth.enum_values.is_none(), "enum should be stripped from INTEGER type");
+        assert_eq!(max_depth.description.as_ref().unwrap(), "Maximum depth level");
+
+        // STRING with enum — enum should be preserved
+        let status = props.get("status").unwrap();
+        assert_eq!(status.schema_type, SchemaType::String);
+        assert_eq!(
+            status.enum_values,
+            Some(vec!["open".to_string(), "closed".to_string()])
+        );
     }
 }

@@ -1,6 +1,6 @@
 # HOBBES TERMS OF SERVICE
 
-**Version 1.1 | Effective Date: February 2026**
+**Version 1.2 | Effective Date: February 2026**
 
 By using Hobbes ("the Software"), you agree to these terms.
 
@@ -59,6 +59,17 @@ We reserve the right to modify these terms. Continued use after changes constitu
 ## 11. GOVERNING LAW
 
 These terms are governed by the laws of the State of Washington, without regard to conflict of law principles.
+
+## 12. EU AI ACT & TERRITORIAL USE RESTRICTION
+
+Hobbes is an experimental, local-first software tool developed and incorporated in the State of Washington, USA. It operates on a "Bring Your Own Key" (BYOK) architecture and functions purely as a local user interface and memory manager.
+
+By downloading, installing, or using Hobbes, you acknowledge and agree that:
+
+1. You are acting as the sole Deployer of any AI models you choose to connect to this Software.
+2. Hobbes is **not intended for use within the European Union (EU)** or by EU citizens. We do not actively market, distribute, or support this Software within the EU market.
+3. If you access or use Hobbes from within the EU, you do so entirely at your own risk and assume full responsibility for compliance with all local laws, including the EU AI Act (Regulation (EU) 2024/1689), GDPR, and any downstream provider liabilities.
+4. We expressly disclaim any liability for the outputs, data processing, or regulatory compliance of third-party API models connected to this Software by the user.
 
 ---
 

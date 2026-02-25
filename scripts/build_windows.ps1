@@ -84,7 +84,7 @@ $BuildMode = if ($Release) { "--release" } else { "" }
 $BuildModeLabel = if ($Release) { "release" } else { "debug" }
 
 Write-Host "  Mode: $BuildModeLabel"
-Write-Host "  Package: windows_app"
+Write-Host "  Package: windows_app (binary: hobbes)"
 Write-Host ""
 
 # Build the Windows app crate (uses shared main.rs)
@@ -99,14 +99,19 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-$BinaryPath = Join-Path $ProjectDir "target\$BuildModeLabel\windows_app.exe"
-if (-not (Test-Path $BinaryPath)) {
-    Write-Host "  [X] Binary not found at: $BinaryPath" -ForegroundColor Red
+# Cargo produces hobbes.exe; rename to hobbes_VERSION.exe
+$RawBinaryPath = Join-Path $ProjectDir "target\$BuildModeLabel\hobbes.exe"
+if (-not (Test-Path $RawBinaryPath)) {
+    Write-Host "  [X] Binary not found at: $RawBinaryPath" -ForegroundColor Red
     exit 1
 }
 
+$VersionedName = "hobbes_$Version.exe"
+$BinaryPath = Join-Path $ProjectDir "target\$BuildModeLabel\$VersionedName"
+Move-Item -Force $RawBinaryPath $BinaryPath
+
 $BinarySize = "{0:N2} MB" -f ((Get-Item $BinaryPath).Length / 1MB)
-Write-Host "  [OK] Built: $BinaryPath ($BinarySize)" -ForegroundColor Green
+Write-Host "  [OK] Built: $VersionedName ($BinarySize)" -ForegroundColor Green
 
 # Signing (optional)
 if ($Sign) {
@@ -154,8 +159,7 @@ if ($Sign) {
 Write-Host ""
 Write-Host "=== Build Complete ===" -ForegroundColor Green
 Write-Host ""
-Write-Host "Run with:" -ForegroundColor Cyan
-Write-Host "  $BinaryPath" -ForegroundColor White
+Write-Host "Output: $BinaryPath" -ForegroundColor Cyan
 Write-Host ""
 
 # Platform-specific notes
@@ -164,3 +168,4 @@ Write-Host "  - First run may trigger SmartScreen (unsigned binary)" -Foreground
 Write-Host "  - Credentials stored via Windows Credential Manager" -ForegroundColor DarkGray
 Write-Host "  - MCP servers spawn via cmd.exe subprocess" -ForegroundColor DarkGray
 Write-Host ""
+

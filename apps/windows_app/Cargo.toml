@@ -9,7 +9,7 @@ description = "Coming Soon: Windows support for Hobbes"
 publish = false
 
 [[bin]]
-name = "windows_app"
+name = "hobbes"
 path = "../../src/main.rs"
 
 [dependencies]

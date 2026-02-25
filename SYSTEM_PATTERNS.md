@@ -183,19 +183,31 @@ For deeper documentation on specific subsystems:
 
 ## Patterns Added in v0.9.50
 
-### 6. Auth Recovery — 5-Point Reconnect Lifecycle
+### 6. Auth Recovery — 6-Point Reconnect Lifecycle
 
 > **Pattern ID**: P-006  
 > **Replaces**: Ad-hoc self-repair in `execution.rs` (deprecated)
 
-When a tool call fails with 401/403, the system runs a full 5-point reconnect:
-1. Hydrate `auth_config_cache`
-2. Resolve `auth_config_id` (cache → API → create)
-3. Delete stale ACTIVE connections + bust `toolkit_account_map`
-4. Initiate OAuth with `force=true` (bypasses ACTIVE safety check)
-5. Re-patch MCP server
+When a tool call fails with 401/403, the system runs a full 6-point reconnect:
+1.  **Hydrate `auth_config_cache`** via `list_auth_configs`
+2.  **Resolve `auth_config_id`** (cache → API → create)
+3.  **Delete stale ACTIVE connections** + bust `toolkit_account_map`
+4.  **Initiate OAuth** with `force=true` (bypasses ACTIVE safety check)
+5.  **Re-patch MCP server** to ensure toolkit + auth_config binding
+6.  **Re-hydrate `toolkit_account_map`** via `list_connected_accounts`
 
-After successful re-auth, `try_auth_recovery()` **retries the original tool call** with preserved arguments.
+> [!IMPORTANT]
+> Step 6 is critical. Step 3 busts the cache entry, and without Step 6 the next tool call's
+> proactive check sees an empty cache, concludes there's no connection, and fires another
+> reconnect — destroying the brand-new credentials.
+
+After successful re-auth, `try_auth_recovery()` returns `is_error: Some(false)` to let the LLM pace the retry. Internal retries are an **anti-pattern** (see below).
+
+> [!WARNING]
+> **Anti-Patterns** (confirmed Feb 2026):
+> - **Internal retry after reconnect**: Immediate retry hits proxy before token propagates → 401 → infinite browser loop
+> - **Fallthrough after proactive reconnect**: Same issue — executes tool before token syncs → 401 → `try_auth_recovery` fires second reconnect
+> - **Case-sensitive cache keys**: `toolkit_account_map` keys must be **lowercase**. API slug casing varies between endpoints.
 
 **Location**: `src/mcp/composio_client/mod.rs` → `reconnect_toolkit()`, `src/mcp/manager.rs` → `try_auth_recovery()`
 

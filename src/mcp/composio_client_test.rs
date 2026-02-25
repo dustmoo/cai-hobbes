@@ -484,4 +484,139 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
         };
         assert!(!resp_clean.is_auth_error(), "200 status_code should not be auth error");
     }
+
+    /// Regression test: Composio MCP proxy wraps errors inside a JSON-RPC result
+    /// object with `isError: true` and auth error signals embedded in `content[].text`.
+    /// The Double-MCP check inspects this inner content for ECODE/status_code patterns.
+    ///
+    /// NOTE: A prior version of this test used `isError: false`, testing a fix
+    /// where we inspected ALL content regardless of isError. That fix was reverted
+    /// because it caused false positives on successful tool responses — a root cause
+    /// of the auth loop regression. The isError gate is now restored: we only inspect
+    /// content when isError is true or absent.
+    #[tokio::test]
+    async fn test_execute_tool_detects_auth_in_jsonrpc_wrapper() {
+        let mock_server = MockServer::start().await;
+
+        // 1. Mock connected accounts (proactive auth check will find one)
+        let connected_accounts_response = json!({
+            "items": [{
+                "id": "acc_clickup_stale",
+                "status": "ACTIVE",
+                "userId": "default",
+                "appName": "clickup",
+                "providerId": "clickup"
+            }]
+        });
+
+        Mock::given(method("GET"))
+            .and(path_regex("/api/v3/connected_accounts.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(connected_accounts_response))
+            .mount(&mock_server)
+            .await;
+
+        // 2. Mock the MCP proxy response: JSON-RPC envelope with isError: true
+        //    and auth error embedded in content text — this is the shape where
+        //    the proxy correctly signals an error from the downstream API.
+        let inner_error_json = json!({
+            "successful": false,
+            "error": "OAuth token not found",
+            "ECODE": "OAUTH_018",
+            "status_code": 401,
+            "http_error": "401 Client Error: Unauthorized for url: https://api.clickup.com/api/v2/list/123/task",
+            "message": "OAuth token not found",
+        });
+
+        let jsonrpc_response = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "content": [{
+                    "text": serde_json::to_string(&inner_error_json).unwrap(),
+                    "type": "text"
+                }],
+                "isError": true  // Proxy signals error
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex("/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jsonrpc_response))
+            .mount(&mock_server)
+            .await;
+
+        let client = ComposioClient::new(
+            "test-key".to_string(),
+            mock_server.uri(),
+            Some("default".to_string()),
+            None,
+            "test-profile-id".to_string(),
+            None,
+        );
+
+        let result = client
+            .execute_tool("CLICKUP_GET_TASKS", json!({"list_id": "123"}))
+            .await;
+
+        assert!(result.is_ok(), "Execute should not return Err: {:?}", result.err());
+        let response = result.unwrap();
+
+        // CRITICAL ASSERTIONS: The fix should detect the embedded auth error
+        assert!(!response.successful, "Response must be marked unsuccessful when inner content has auth error");
+        assert!(
+            response.error.as_deref().unwrap_or("").contains("OAuth token not found")
+                || response.error.as_deref().unwrap_or("").contains("OAUTH_018"),
+            "Error message should contain the auth error from the inner content, got: {:?}",
+            response.error
+        );
+    }
+
+    /// Regression: responses containing `redirectUrl` are our own generated auth redirects.
+    /// `is_auth_error()` must return false to prevent re-triggering the auth flow
+    /// (the "cycle guard" pattern). Even if the response has other auth signals,
+    /// the redirectUrl takes precedence.
+    #[test]
+    fn test_is_auth_error_ignores_redirect_url() {
+        use crate::mcp::composio_client::models::ToolExecuteResponse;
+
+        let resp = ToolExecuteResponse {
+            data: serde_json::json!({
+                "redirectUrl": "https://connect.composio.dev/auth/...",
+                "status_code": 401,
+                "ECODE": "OAUTH_018"
+            }),
+            error: Some("Authentication required".to_string()),
+            successful: false,
+            log_id: None,
+            session_info: None,
+        };
+        assert!(
+            !resp.is_auth_error(),
+            "redirectUrl present → should NOT be flagged as auth error (cycle guard)"
+        );
+    }
+
+    /// Regression: after removing the overbroad `data.get("status").is_some()` guard,
+    /// verify that real auth errors containing a `status` field (e.g. from downstream
+    /// APIs that happen to include status metadata) are still correctly detected.
+    #[test]
+    fn test_is_auth_error_with_status_field_still_detects() {
+        use crate::mcp::composio_client::models::ToolExecuteResponse;
+
+        let resp = ToolExecuteResponse {
+            data: serde_json::json!({
+                "status": "FAILED",
+                "ECODE": "OAUTH_018",
+                "status_code": 401
+            }),
+            error: Some("OAuth token not found".to_string()),
+            successful: false,
+            log_id: None,
+            session_info: None,
+        };
+        assert!(
+            resp.is_auth_error(),
+            "Real auth error with status field must still be detected"
+        );
+    }
 }

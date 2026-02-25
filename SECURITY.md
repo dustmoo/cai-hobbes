@@ -17,3 +17,9 @@ If strict credentials are detected in the repository history:
 
 ## Local Primacy Strategy
 Hobbes enforces "Local Primacy" for all sensitive operations. Keys are generated locally, stored in Keychain, and accessed via the `keychain_ffi` bridge. They never touch the file system or git index.
+
+## Regulatory & Territorial Compliance
+
+Hobbes is developed in the State of Washington, USA. It operates on a **BYOK (Bring Your Own Key)** architecture: the software itself performs no inference, stores no model weights, and makes no AI decisions. The user is the sole **Deployer** of any connected AI models.
+
+**EU AI Act (Regulation (EU) 2024/1689):** Hobbes is not intended for use within the European Union. We do not market, distribute, or support this software in the EU. Users who access Hobbes from within the EU do so at their own risk and assume full responsibility for compliance with the EU AI Act, GDPR, and all applicable local regulations. See [`README.md`](README.md) for the full territorial use restriction.

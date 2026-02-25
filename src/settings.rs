@@ -323,7 +323,7 @@ pub const APP_ATTRIBUTION: &str =
 // The version should match the "Version X.X" in the markdown file header.
 // Users who accepted an older version will see the TOS screen again.
 // ============================================================================
-pub const CURRENT_TOS_VERSION: &str = "1.1";
+pub const CURRENT_TOS_VERSION: &str = "1.2";
 
 /// How a Composio toolkit's tools are made available to the AI.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]

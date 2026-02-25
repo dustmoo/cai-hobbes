@@ -131,12 +131,16 @@ pub async fn list_connected_accounts(
                 let account_id = acc.id.clone();
                 
                 // Map both Toolkit Slug and App Name if available
+                // CRITICAL: Always lowercase keys. All lookups use .to_lowercase()
+                // (see execution.rs line 590). Without this, API casing like "CLICKUP"
+                // won't match the lookup key "clickup", causing false cache misses
+                // that trigger unnecessary initiate_connection and duplicate connections.
                 if let Some(toolkit) = &acc.toolkit {
-                    map.insert(toolkit.slug.clone(), account_id.clone());
+                    map.insert(toolkit.slug.to_lowercase(), account_id.clone());
                 }
                 
                 if let Some(app_name) = &acc.app_name {
-                    map.insert(app_name.clone(), account_id.clone());
+                    map.insert(app_name.to_lowercase(), account_id.clone());
                 }
             }
         }
@@ -533,7 +537,7 @@ pub(crate) async fn get_auth_config_id(
                                             );
                                             // Cache it
                                             if let Ok(mut cache) = client.auth_config_cache.write() {
-                                                cache.insert(toolkit_slug.to_string(), id.to_string());
+                                                cache.insert(toolkit_slug.to_lowercase(), id.to_string());
                                             }
                                             return Ok(id.to_string());
                                         }
@@ -925,8 +929,15 @@ pub async fn initiate_connection(
         ));
     }
 
-    // Parse response to find redirect URL
+    // Parse response to find redirect URL and connected_account_id
     let json: Value = serde_json::from_str(&response_text).map_err(|e| e.to_string())?;
+
+    // Capture connected_account_id from link response (managed auth returns it here)
+    let link_account_id = json
+        .get("connected_account_id")
+        .or_else(|| json.get("connectedAccountId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // Check for redirectUrl at various locations in response structure
     // REST API typically returns it in 'redirectUrl' or 'connectionRequest.redirectUrl'
@@ -962,88 +973,142 @@ pub async fn initiate_connection(
             ));
         }
 
-        // Wait for the callback (with timeout)
-        match tokio::time::timeout(tokio::time::Duration::from_secs(300), rx.recv()).await {
-            Ok(Some(result)) => {
-                if result.success {
-                    tracing::info!("Authentication successful!");
+        // Try callback first (60s — works for BYOA where localhost receives redirect).
+        // If it doesn't fire, fall back to polling the connection status (managed auth
+        // where connect.composio.dev handles OAuth internally and never redirects to us).
+        let callback_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(60),
+            rx.recv(),
+        )
+        .await;
 
-                    // Log the connectedAccountId for debugging
-                    if let Some(acc_id) = result
-                        .params
-                        .get("connectedAccountId")
-                        .or_else(|| result.params.get("connected_account_id"))
-                    {
-                        tracing::info!(
-                            "Received connectedAccountId: {} for toolkit: {} (user: {})",
-                            acc_id,
-                            toolkit_slug,
-                            final_user_id
-                        );
+        match callback_result {
+            Ok(Some(result)) if result.success => {
+                tracing::info!("Authentication successful via callback!");
+
+                // Write connectedAccountId to toolkit_account_map
+                if let Some(acc_id) = result
+                    .params
+                    .get("connectedAccountId")
+                    .or_else(|| result.params.get("connected_account_id"))
+                {
+                    tracing::info!(
+                        "Received connectedAccountId: {} for toolkit: {} (user: {})",
+                        acc_id, toolkit_slug, final_user_id
+                    );
+                    if let Ok(mut map) = client.toolkit_account_map.write() {
+                        map.insert(toolkit_slug.to_lowercase(), acc_id.clone());
                     }
+                }
 
-                    // CAPTURE CONTEXT KEYS
-                    // Save any non-standard parameters to the ContextStore (e.g., team_id, workspace_id)
-                    let standard_keys = [
-                        "code",
-                        "state",
-                        "scope",
-                        "error",
-                        "error_description",
-                        "error_uri",
-                        "status",
-                    ];
-                    for (key, value) in &result.params {
-                        if !standard_keys.contains(&key.as_str()) {
-                            tracing::info!(
-                                "[CONTEXT] Capturing context param '{}' for toolkit '{}'",
-                                key,
-                                toolkit_slug
-                            );
-                            client.context_store.save_param(
-                                toolkit_slug,
-                                &final_user_id,
-                                key,
-                                value,
-                            );
+                // CAPTURE CONTEXT KEYS from callback params
+                // Save non-standard parameters to ContextStore for injection into tool
+                // arguments (Pattern 123). This includes connected_account_id which
+                // ClickUp and other routed toolkits need (Pattern 124).
+                // Staleness protection: reconnect_toolkit busts these entries via
+                // context_store.remove_param before re-auth.
+                let standard_keys = [
+                    "code", "state", "scope", "error",
+                    "error_description", "error_uri", "status",
+                ];
+                for (key, value) in &result.params {
+                    if !standard_keys.contains(&key.as_str()) {
+                        tracing::info!(
+                            "[CONTEXT] Capturing context param '{}' for toolkit '{}'",
+                            key, toolkit_slug
+                        );
+                        client.context_store.save_param(
+                            toolkit_slug, &final_user_id, key, value,
+                        );
+                        // KEY NORMALIZATION (Pattern 123 Extension)
+                        if key.contains('_') {
+                            let camel_key = super::utils::snake_to_camel(key);
+                            if camel_key != *key {
+                                tracing::info!("[CONTEXT] Normalizing '{}' -> '{}'", key, camel_key);
+                                client.context_store.save_param(
+                                    toolkit_slug, &final_user_id, &camel_key, value,
+                                );
+                            }
+                        }
+                    }
+                }
 
-                            // KEY NORMALIZATION (Pattern 123 Extension)
-                            // Some tools (like ClickUp) expect camelCase context keys, but OAuth callbacks often return snake_case.
-                            // We save BOTH to ensure dynamic injection works regardless of the tool's schema.
-                            // GENERIC: Convert any snake_case key to camelCase automatically.
-                            if key.contains('_') {
-                                let camel_key = super::utils::snake_to_camel(key);
-                                if camel_key != *key {
-                                    tracing::info!(
-                                        "[CONTEXT] Normalizing '{}' -> '{}'",
-                                        key,
-                                        camel_key
-                                    );
-                                    client.context_store.save_param(
-                                        toolkit_slug,
-                                        &final_user_id,
-                                        &camel_key,
-                                        value,
-                                    );
+                let _ = list_auth_configs(client).await;
+                Ok("Authentication successful! You can now use the tool.".to_string())
+            }
+            Ok(Some(result)) => {
+                // Callback fired but reported failure
+                let error = result.error.unwrap_or_else(|| "Unknown error".to_string());
+                Err(format!("Authentication failed: {}", error))
+            }
+            _ => {
+                // Callback didn't fire within 60s — try polling for managed auth
+                if let Some(ref acct_id) = link_account_id {
+                    tracing::debug!(
+                        "[MANAGED AUTH] Callback didn't fire, polling connection for ACTIVE status"
+                    );
+                    let poll_url = format!(
+                        "{}/connected_accounts/{}",
+                        client.get_api_base_url(),
+                        acct_id
+                    );
+                    // Exponential backoff: start at 3s, add 1s every 10 attempts, cap at 10s.
+                    // Total wait ≈ 4 minutes (comparable to prior 80 × 3s = 240s).
+                    for attempt in 1..=80 {
+                        let delay_secs = std::cmp::min(3 + (attempt / 10), 10);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+                        if let Ok(resp) = client
+                            .client
+                            .get(&poll_url)
+                            .header("x-api-key", &client.api_key)
+                            .send()
+                            .await
+                        {
+                            if let Ok(text) = resp.text().await {
+                                if let Ok(j) = serde_json::from_str::<Value>(&text) {
+                                    let status = j
+                                        .get("status")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("unknown");
+                                    match status {
+                                        "ACTIVE" => {
+                                            tracing::info!(
+                                                "[MANAGED AUTH] Connection is ACTIVE (poll {})",
+                                                attempt
+                                            );
+                                            if let Ok(mut map) = client.toolkit_account_map.write() {
+                                                map.insert(toolkit_slug.to_lowercase(), acct_id.clone());
+                                            }
+                                            let _ = list_auth_configs(client).await;
+                                            return Ok("Authentication successful! You can now use the tool.".to_string());
+                                        }
+                                        "FAILED" | "EXPIRED" | "REVOKED" => {
+                                            let reason = j
+                                                .get("status_reason")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("No reason given");
+                                            return Err(format!(
+                                                "Authentication failed ({}): {}",
+                                                status, reason
+                                            ));
+                                        }
+                                        _ => {
+                                            if attempt % 10 == 0 {
+                                                tracing::debug!(
+                                                    "[MANAGED AUTH] Still waiting (status: {}, attempt {}/80, interval: {}s)",
+                                                    status, attempt, delay_secs
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-
-                    // Refresh auth configs cache to pick up any new configs
-                    let _ = list_auth_configs(client).await;
-
-                    Ok("Authentication successful! You can now use the tool.".to_string())
+                    Err("Authentication timed out — connection did not become ACTIVE within 5 minutes".to_string())
                 } else {
-                    let error = result.error.unwrap_or_else(|| "Unknown error".to_string());
-                    Err(format!("Authentication failed: {}", error))
+                    Err("Authentication timed out (callback did not fire)".to_string())
                 }
-            }
-            Ok(None) => {
-                Err("Callback server closed unexpectedly".to_string())
-            }
-            Err(_) => {
-                Err("Authentication timed out (5 minutes)".to_string())
             }
         }
     } else {
