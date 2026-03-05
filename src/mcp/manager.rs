@@ -88,7 +88,6 @@ async fn try_auth_recovery(
     response: &crate::mcp::composio_client::models::ToolExecuteResponse,
     tool_name: &str,
     composio_client: &ComposioClient,
-    original_args: Option<serde_json::Value>,
 ) -> Option<CallToolResult> {
     if response.successful {
         return None;
@@ -100,64 +99,46 @@ async fn try_auth_recovery(
         return None;
     }
 
+    // CYCLE GUARD: If the response already contains a redirectUrl, it means execute_tool's
+    // proactive auth check already triggered reconnect_toolkit and returned an OAuth URL.
+    // We must NOT fire recovery again, or we'll enter a double-reconnect loop where
+    // is_auth_error() matches our own "Authentication required" error message.
+    if response.data.get("redirectUrl").is_some() {
+        tracing::debug!("[AUTH RECOVERY] Skipping — response is already an auth redirect from proactive check");
+        return None;
+    }
+
     // Extract toolkit slug from tool name (first segment before _)
-    let toolkit_slug = tool_name
-        .split('_')
-        .next()
-        .unwrap_or(tool_name)
-        .to_lowercase();
+    let toolkit_slug = ComposioClient::normalize_toolkit_key(
+        tool_name.split('_').next().unwrap_or(tool_name),
+    );
 
-    tracing::info!("[AUTH RECOVERY] Auth error detected for '{}' (toolkit: '{}'), triggering 5-point reconnect", tool_name, toolkit_slug);
+    tracing::info!("[AUTH RECOVERY] Auth error detected for '{}' (toolkit: '{}'), triggering 6-point reconnect", tool_name, toolkit_slug);
 
-    // Use the full 5-point reconnect lifecycle:
+    // Use the full 6-point reconnect lifecycle:
     // 1. Hydrate auth_config_cache (finds existing configs)
     // 2. Resolve auth_config_id (cache → API → create)
     // 3. Delete stale ACTIVE connections + bust cache
     // 4. Initiate OAuth with force=true (opens browser)
     // 5. Re-patch MCP server
+    // 6. Re-hydrate toolkit_account_map
     match composio_client.reconnect_toolkit(&toolkit_slug).await {
         Ok(result_msg) => {
             if result_msg.contains("Authentication successful") {
-                // Auth succeeded — retry the tool call with original args
-                if let Some(args) = original_args {
-                    tracing::info!("[AUTH RECOVERY] Re-auth succeeded, retrying '{}'", tool_name);
-                    match composio_client.execute_tool(tool_name, args).await {
-                        Ok(retry_response) => {
-                            let content_text = if retry_response.successful {
-                                serde_json::to_string_pretty(&retry_response.data)
-                                    .unwrap_or_else(|_| "{}".to_string())
-                            } else {
-                                retry_response.error.unwrap_or_else(|| "Retry failed".to_string())
-                            };
-                            Some(CallToolResult {
-                                content: vec![rmcp::model::Content::text(content_text)],
-                                is_error: Some(!retry_response.successful),
-                                structured_content: Some(retry_response.data),
-                                meta: None,
-                            })
-                        }
-                        Err(e) => {
-                            tracing::error!("[AUTH RECOVERY] Retry of '{}' failed: {}", tool_name, e);
-                            Some(CallToolResult {
-                                content: vec![rmcp::model::Content::text(
-                                    format!("Re-authenticated but retry failed: {}", e),
-                                )],
-                                is_error: Some(true),
-                                structured_content: None,
-                                meta: None,
-                            })
-                        }
-                    }
-                } else {
-                    Some(CallToolResult {
-                        content: vec![rmcp::model::Content::text(
-                            "Authentication successful! Please try the tool again.".to_string(),
-                        )],
-                        is_error: Some(false),
-                        structured_content: None,
-                        meta: None,
-                    })
-                }
+                // ANTI-PATTERN: Do NOT retry the tool call internally!
+                // Because reconnect_toolkit uses force=true (which prunes connections),
+                // an immediate internal retry that fails (e.g. due to proxy sync delay)
+                // would return a 401 -> is_error: Some(true) -> causing the LLM to autonomously
+                // retry -> triggering ANOTHER prune and ANOTHER browser popup in an infinite loop!
+                // Returning `is_error: Some(false)` breaks the LLM's panic loop and allows token propagation.
+                Some(CallToolResult {
+                    content: vec![rmcp::model::Content::text(
+                        "Authentication successful! Please try the tool again.".to_string(),
+                    )],
+                    is_error: Some(false),
+                    structured_content: None,
+                    meta: None,
+                })
             } else {
                 let url = result_msg
                     .split_whitespace()
@@ -174,7 +155,7 @@ async fn try_auth_recovery(
             }
         }
         Err(e) => {
-            tracing::error!("[AUTH RECOVERY] 5-point reconnect failed: {}", e);
+            tracing::error!("[AUTH RECOVERY] 6-point reconnect failed: {}", e);
             None // Fall through to return original error
         }
     }
@@ -1658,8 +1639,6 @@ impl McpManager {
                                     .get("arguments")
                                     .cloned()
                                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                                let retry_args = tool_args.clone();
-
                                 tracing::info!(
                                     "COMPOSIO_EXECUTE_TOOL: executing '{}'",
                                     target_tool_name
@@ -1672,7 +1651,7 @@ impl McpManager {
                                 {
                                     Ok(response) => {
                                         // Check for auth failure (401/403) and attempt auto-reconnection + retry
-                                        if let Some(auth_result) = try_auth_recovery(&response, target_tool_name, &composio_client, Some(retry_args)).await {
+                                        if let Some(auth_result) = try_auth_recovery(&response, target_tool_name, &composio_client).await {
                                             let _ = tx.send(Ok(auth_result));
                                             return;
                                         }
@@ -1703,11 +1682,10 @@ impl McpManager {
                         }
                     } else {
                         // Regular Composio tool execution
-                        let retry_args = args.clone();
                         match composio_client.execute_tool(&tool.name, args).await {
                             Ok(response) => {
                                 // Check for auth failure (401/403) and attempt auto-reconnection + retry
-                                if let Some(auth_result) = try_auth_recovery(&response, &tool.name, &composio_client, Some(retry_args)).await {
+                                if let Some(auth_result) = try_auth_recovery(&response, &tool.name, &composio_client).await {
                                     let _ = tx.send(Ok(auth_result));
                                     return;
                                 }
@@ -2139,7 +2117,7 @@ impl McpManager {
         mut trigger_search: Signal<i32>,
         mut connected_slugs: Signal<HashSet<String>>,
     ) -> Result<(), String> {
-        tracing::info!("Consolidated 5-Point Connection: toolkit_slug={} (auth_scheme: {:?}, managed: {})", 
+        tracing::info!("Consolidated 6-Point Connection: toolkit_slug={} (auth_scheme: {:?}, managed: {})", 
             toolkit_slug, auth_scheme, use_managed_auth);
 
         is_connecting.set(true);
@@ -2344,7 +2322,7 @@ impl McpManager {
         
         is_connecting.set(false);
         connection_status.set("Connected".to_string());
-        tracing::info!("5-Point Connection Flow Complete for '{}'", toolkit_slug);
+        tracing::info!("6-Point Connection Flow Complete for '{}'", toolkit_slug);
         
         Ok(())
     }

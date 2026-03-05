@@ -900,9 +900,8 @@ mod tests {
         assert!(options.get("additionalProperties").is_none()); // Nested removal
 
         let priority = options.get("properties").unwrap().get("priority").unwrap();
-        let priority_enum = priority.get("enum").unwrap().as_array().unwrap();
-        assert_eq!(priority_enum[0], "1");
-        assert_eq!(priority_enum[4], "null"); // Handles null correctly
+        // Gemini only allows enum on STRING type — enum is stripped from NUMBER
+        assert!(priority.get("enum").is_none(), "enum should be stripped from NUMBER type");
 
         let tags = properties.get("tags").unwrap();
         let tag_items = tags.get("items").unwrap();

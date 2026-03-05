@@ -74,6 +74,27 @@ impl ContextStore {
         self.save();
     }
 
+    /// Remove a specific parameter from the store (e.g. bust stale connected_account_id on reconnect).
+    pub fn remove_param(&self, toolkit_slug: &str, user_id: &str, key: &str) {
+        let mut removed = false;
+        if let Ok(mut cache) = self.cache.write() {
+            if let Some(toolkit_entry) = cache.get_mut(toolkit_slug) {
+                if let Some(user_entry) = toolkit_entry.get_mut(user_id) {
+                    if user_entry.remove(key).is_some() {
+                        removed = true;
+                        tracing::info!(
+                            "[CONTEXT] Removed stale '{}' for toolkit '{}' user '{}'",
+                            key, toolkit_slug, user_id
+                        );
+                    }
+                }
+            }
+        }
+        if removed {
+            self.save();
+        }
+    }
+
     pub fn get_context(
         &self,
         toolkit_slug: &str,

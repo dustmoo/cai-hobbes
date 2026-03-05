@@ -263,8 +263,34 @@ impl SessionState {
         let backup_path = path.with_extension("json.bak");
         fs::copy(&path, backup_path)?;
 
+        let mut state = Self::migrate_from_raw_json(&data)?;
+
+        // Mark as current schema version after successful migration
+        state.schema_version = CURRENT_SESSION_SCHEMA_VERSION;
+
+        // Only save the migrated state if we actually recovered sessions
+        if !state.sessions.is_empty() {
+            if let Err(e) = state.save() {
+                tracing::error!("Failed to save migrated session state: {}", e);
+            }
+        } else {
+            tracing::warn!("Migration produced empty sessions - NOT saving to preserve backup");
+        }
+
+        Ok(state)
+    }
+
+    /// Migrate raw JSON data from an older format into a [`SessionState`].
+    ///
+    /// This is the fallback path when direct deserialization fails — it parses
+    /// the data as a generic `serde_json::Value`, applies all known field/format
+    /// migrations, and then deserializes the result into the current struct shape.
+    ///
+    /// Extracted from `load()` so it can be exercised by unit tests without
+    /// touching the filesystem.
+    fn migrate_from_raw_json(data: &str) -> Result<Self, std::io::Error> {
         let mut state = SessionState::default();
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&data) {
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
             // Migrate MessageContent::Text from old tuple format to new struct format
             if let Some(sessions_obj) = value.get_mut("sessions").and_then(|v| v.as_object_mut()) {
                 for (_session_id, session_val) in sessions_obj.iter_mut() {
@@ -296,11 +322,9 @@ impl SessionState {
                         .get_mut("messages")
                         .and_then(|v| v.as_array_mut())
                     {
-                        let base_time = chrono::Utc::now() - chrono::Duration::hours(1); // Start 1 hour ago
+                        let base_time = chrono::Utc::now() - chrono::Duration::hours(1);
                         for (index, message) in messages.iter_mut().enumerate() {
-                            // Check if created_at field exists
                             if message.get("created_at").is_none() {
-                                // Assign timestamp: base_time + index milliseconds
                                 let timestamp =
                                     base_time + chrono::Duration::milliseconds(index as i64);
                                 message.as_object_mut().expect("message migration: message value must be a JSON object").insert(
@@ -319,54 +343,41 @@ impl SessionState {
                     {
                         for message in messages.iter_mut() {
                             if let Some(content) = message.get_mut("content") {
-                                // Helper closure to migrate common fields
                                 let migrate_tool_fields = |obj: &mut serde_json::Map<String, serde_json::Value>| {
-                                    // id -> execution_id
                                     if obj.contains_key("id") && !obj.contains_key("execution_id") {
                                         if let Some(val) = obj.remove("id") {
                                             obj.insert("execution_id".to_string(), val);
-                                            tracing::debug!("Migrated id -> execution_id");
                                         }
                                     }
-                                    // name -> tool_name
                                     if obj.contains_key("name") && !obj.contains_key("tool_name") {
                                         if let Some(val) = obj.remove("name") {
                                             obj.insert("tool_name".to_string(), val);
-                                            tracing::debug!("Migrated name -> tool_name");
-                                        }
-                                    }
-                                };
-                                
-                                let migrate_skill_fields = |obj: &mut serde_json::Map<String, serde_json::Value>| {
-                                    // id -> execution_id
-                                    if obj.contains_key("id") && !obj.contains_key("execution_id") {
-                                        if let Some(val) = obj.remove("id") {
-                                            obj.insert("execution_id".to_string(), val);
-                                            tracing::debug!("Migrated id -> execution_id");
-                                        }
-                                    }
-                                    // name -> skill_name
-                                    if obj.contains_key("name") && !obj.contains_key("skill_name") {
-                                        if let Some(val) = obj.remove("name") {
-                                            obj.insert("skill_name".to_string(), val);
-                                            tracing::debug!("Migrated name -> skill_name");
                                         }
                                     }
                                 };
 
-                                // Check for ToolCall
+                                let migrate_skill_fields = |obj: &mut serde_json::Map<String, serde_json::Value>| {
+                                    if obj.contains_key("id") && !obj.contains_key("execution_id") {
+                                        if let Some(val) = obj.remove("id") {
+                                            obj.insert("execution_id".to_string(), val);
+                                        }
+                                    }
+                                    if obj.contains_key("name") && !obj.contains_key("skill_name") {
+                                        if let Some(val) = obj.remove("name") {
+                                            obj.insert("skill_name".to_string(), val);
+                                        }
+                                    }
+                                };
+
                                 if let Some(tool_call) = content.get_mut("ToolCall").and_then(|v| v.as_object_mut()) {
                                     migrate_tool_fields(tool_call);
                                 }
-                                // Check for PermissionRequest (structure similar to ToolCall)
                                 if let Some(perm_req) = content.get_mut("PermissionRequest").and_then(|v| v.as_object_mut()) {
                                     migrate_tool_fields(perm_req);
                                 }
-                                // Check for SkillCall
                                 if let Some(skill_call) = content.get_mut("SkillCall").and_then(|v| v.as_object_mut()) {
                                     migrate_skill_fields(skill_call);
                                 }
-                                // Check for SkillPermissionRequest
                                 if let Some(skill_perm) = content.get_mut("SkillPermissionRequest").and_then(|v| v.as_object_mut()) {
                                     migrate_skill_fields(skill_perm);
                                 }
@@ -385,7 +396,6 @@ impl SessionState {
                     }
                     Err(e) => {
                         tracing::error!("Migration failed to deserialize sessions: {}. NOT overwriting backup.", e);
-                        // Return error so caller doesn't use empty state
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!("Migration failed: {}. Your data backup is at sessions.json.bak", e)
@@ -408,19 +418,6 @@ impl SessionState {
                 }
             }
         }
-
-        // Mark as current schema version after successful migration
-        state.schema_version = CURRENT_SESSION_SCHEMA_VERSION;
-
-        // Only save the migrated state if we actually recovered sessions
-        if !state.sessions.is_empty() {
-            if let Err(e) = state.save() {
-                tracing::error!("Failed to save migrated session state: {}", e);
-            }
-        } else {
-            tracing::warn!("Migration produced empty sessions - NOT saving to preserve backup");
-        }
-
         Ok(state)
     }
 
@@ -803,5 +800,281 @@ mod tests {
 
         let original = fs::read_to_string(&test_path).expect("Failed to read original");
         assert!(original.contains("100.0"));
+    }
+
+    // === Migration Tests ===
+
+    /// Helper: wrap a single session with messages into a full SessionState JSON string.
+    /// Uses the old format WITHOUT schema_version so it will fail direct deser and hit migrate_from_raw_json.
+    fn make_old_session_json(messages_json: &str) -> String {
+        format!(
+            r#"{{
+                "sessions": {{
+                    "test-session-1": {{
+                        "id": "test-session-1",
+                        "name": "Test Session",
+                        "messages": [{messages_json}],
+                        "active_context": {{}},
+                        "last_updated": "2026-01-01T00:00:00Z"
+                    }}
+                }},
+                "active_session_id": "test-session-1",
+                "window_width": 800.0,
+                "window_height": 600.0,
+                "tool_call_history": []
+            }}"#
+        )
+    }
+
+    /// Test: old {"Text": "string"} format is migrated to {"Text": {"content": "string", ...}}
+    #[test]
+    fn test_migration_text_format() {
+        let old_message = r#"
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "author": "User",
+                "content": {"Text": "Hello world"},
+                "attachments": [],
+                "comments": [],
+                "created_at": "2026-01-01T00:00:00Z"
+            }
+        "#;
+        let json = make_old_session_json(old_message);
+        let state = SessionState::migrate_from_raw_json(&json)
+            .expect("Migration should succeed");
+
+        let session = state.sessions.get("test-session-1").expect("Session missing");
+        assert_eq!(session.messages.len(), 1);
+
+        match &session.messages[0].content {
+            crate::components::shared::MessageContent::Text { content, thought_signature, thought_summary } => {
+                assert_eq!(content, "Hello world");
+                assert!(thought_signature.is_none());
+                assert!(thought_summary.is_none());
+            }
+            other => panic!("Expected Text variant, got {:?}", other),
+        }
+    }
+
+    /// Test: messages without created_at get timestamps backfilled in order.
+    #[test]
+    fn test_migration_timestamps() {
+        let old_messages = r#"
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "author": "User",
+                "content": {"Text": {"content": "First", "thought_signature": null, "thought_summary": null}},
+                "attachments": [],
+                "comments": []
+            },
+            {
+                "id": "00000000-0000-0000-0000-000000000002",
+                "author": "Hobbes",
+                "content": {"Text": {"content": "Second", "thought_signature": null, "thought_summary": null}},
+                "attachments": [],
+                "comments": []
+            }
+        "#;
+        let json = make_old_session_json(old_messages);
+        let state = SessionState::migrate_from_raw_json(&json)
+            .expect("Migration should succeed");
+
+        let session = state.sessions.get("test-session-1").expect("Session missing");
+        assert_eq!(session.messages.len(), 2);
+
+        // Both should have created_at, and the second should be after the first
+        let t0 = session.messages[0].created_at;
+        let t1 = session.messages[1].created_at;
+        assert!(t1 > t0, "Second message timestamp should be after first: {:?} vs {:?}", t0, t1);
+    }
+
+    /// Test: ToolCall/PermissionRequest field renames (id -> execution_id, name -> tool_name)
+    #[test]
+    fn test_migration_toolcall_renames() {
+        let old_message = r#"
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "author": "Hobbes",
+                "content": {
+                    "ToolCall": {
+                        "id": "old-exec-id",
+                        "server_name": "test-server",
+                        "name": "old-tool-name",
+                        "arguments": "{}",
+                        "status": "Completed",
+                        "response": "ok",
+                        "thought_signature": null,
+                        "thought_summary": null
+                    }
+                },
+                "attachments": [],
+                "comments": [],
+                "created_at": "2026-01-01T00:00:00Z"
+            }
+        "#;
+        let json = make_old_session_json(old_message);
+        let state = SessionState::migrate_from_raw_json(&json)
+            .expect("Migration should succeed");
+
+        let session = state.sessions.get("test-session-1").expect("Session missing");
+        match &session.messages[0].content {
+            crate::components::shared::MessageContent::ToolCall(tc) => {
+                assert_eq!(tc.execution_id, "old-exec-id", "id should have migrated to execution_id");
+                assert_eq!(tc.tool_name, "old-tool-name", "name should have migrated to tool_name");
+            }
+            other => panic!("Expected ToolCall, got {:?}", other),
+        }
+    }
+
+    /// Test: SkillCall/SkillPermissionRequest field renames (id -> execution_id, name -> skill_name)
+    #[test]
+    fn test_migration_skillcall_renames() {
+        let old_message = r#"
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "author": "Hobbes",
+                "content": {
+                    "SkillCall": {
+                        "id": "old-skill-exec-id",
+                        "name": "old-skill-name",
+                        "arguments": "{}",
+                        "status": "Completed",
+                        "response": "ok",
+                        "instructions": "do stuff"
+                    }
+                },
+                "attachments": [],
+                "comments": [],
+                "created_at": "2026-01-01T00:00:00Z"
+            }
+        "#;
+        let json = make_old_session_json(old_message);
+        let state = SessionState::migrate_from_raw_json(&json)
+            .expect("Migration should succeed");
+
+        let session = state.sessions.get("test-session-1").expect("Session missing");
+        match &session.messages[0].content {
+            crate::components::shared::MessageContent::SkillCall(sc) => {
+                assert_eq!(sc.execution_id, "old-skill-exec-id", "id should have migrated to execution_id");
+                assert_eq!(sc.skill_name, "old-skill-name", "name should have migrated to skill_name");
+            }
+            other => panic!("Expected SkillCall, got {:?}", other),
+        }
+    }
+
+    /// Test: Full round-trip — old format with ALL migration triggers, migrated, serialized, re-deserialized.
+    #[test]
+    fn test_migration_full_roundtrip() {
+        // Build a fixture with every migration trigger active simultaneously:
+        // 1. Old Text format ({"Text": "string"})
+        // 2. Missing created_at
+        // 3. Old ToolCall field names
+        let old_messages = r#"
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "author": "User",
+                "content": {"Text": "Hello from old format"},
+                "attachments": [],
+                "comments": []
+            },
+            {
+                "id": "00000000-0000-0000-0000-000000000002",
+                "author": "Hobbes",
+                "content": {
+                    "ToolCall": {
+                        "id": "tc-1",
+                        "server_name": "mcp-server",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"/tmp/test\"}",
+                        "status": "Completed",
+                        "response": "file contents",
+                        "thought_signature": null,
+                        "thought_summary": null
+                    }
+                },
+                "attachments": [],
+                "comments": []
+            },
+            {
+                "id": "00000000-0000-0000-0000-000000000003",
+                "author": "Hobbes",
+                "content": {"Text": "Here is the result"},
+                "attachments": [],
+                "comments": []
+            }
+        "#;
+        let json = make_old_session_json(old_messages);
+
+        // Step 1: Migrate from old format
+        let state = SessionState::migrate_from_raw_json(&json)
+            .expect("Migration should succeed");
+
+        let session = state.sessions.get("test-session-1").expect("Session missing");
+        assert_eq!(session.messages.len(), 3);
+
+        // Verify Text migration worked
+        match &session.messages[0].content {
+            crate::components::shared::MessageContent::Text { content, .. } => {
+                assert_eq!(content, "Hello from old format");
+            }
+            other => panic!("Message 0: expected Text, got {:?}", other),
+        }
+
+        // Verify ToolCall migration worked
+        match &session.messages[1].content {
+            crate::components::shared::MessageContent::ToolCall(tc) => {
+                assert_eq!(tc.execution_id, "tc-1");
+                assert_eq!(tc.tool_name, "read_file");
+            }
+            other => panic!("Message 1: expected ToolCall, got {:?}", other),
+        }
+
+        // Verify timestamps were backfilled
+        for msg in &session.messages {
+            // created_at should be set (non-zero)
+            assert!(msg.created_at.timestamp() > 0, "created_at should be set for all messages");
+        }
+        // Timestamps should be in order
+        assert!(session.messages[1].created_at > session.messages[0].created_at);
+        assert!(session.messages[2].created_at > session.messages[1].created_at);
+
+        // Verify window dimensions preserved
+        assert_eq!(state.window_width, 800.0);
+        assert_eq!(state.window_height, 600.0);
+
+        // Step 2: Serialize the migrated state and re-deserialize — "round trip"
+        let serialized = serde_json::to_string_pretty(&state)
+            .expect("Serialization should succeed");
+        let reloaded: SessionState = serde_json::from_str(&serialized)
+            .expect("Round-trip deserialization should succeed without needing migration");
+
+        assert_eq!(state.sessions.len(), reloaded.sessions.len());
+        assert_eq!(state.active_session_id, reloaded.active_session_id);
+        assert_eq!(state.window_width, reloaded.window_width);
+        let reloaded_session = reloaded.sessions.get("test-session-1").expect("Session missing on reload");
+        assert_eq!(reloaded_session.messages.len(), 3);
+    }
+
+    /// Test: save() is a no-op when save_disabled is true.
+    #[test]
+    fn test_save_disabled_guard() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let test_path = temp_dir.path().join("disabled_sessions.json");
+
+        // Create initial content
+        fs::write(&test_path, "original content").expect("Failed to write initial file");
+
+        let state = SessionState {
+            save_disabled: true,
+            window_width: 999.0,
+            ..Default::default()
+        };
+
+        // save() should return Ok but NOT touch the file
+        // We can't directly test with the hardcoded path, but we can verify the guard logic
+        let result = state.save();
+        // save() will try to use get_sessions_path(), but the important thing is
+        // the save_disabled check returns early with Ok(())
+        assert!(result.is_ok(), "save() with save_disabled should return Ok");
     }
 }

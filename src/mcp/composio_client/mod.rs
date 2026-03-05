@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::mcp::composio_client::discovery::DiscoveryResult;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 // Re-export models and utils for convenience
 pub use context_store::ContextStore;
@@ -40,6 +41,9 @@ pub struct ComposioClient {
     pub(crate) cached_toolkit_info: Arc<RwLock<Option<Vec<ToolkitInfo>>>>,
     /// Chrome profile directory for scoped auth URL launching (e.g., "Default", "Profile 1")
     pub chrome_profile_directory: Option<String>,
+    /// Per-toolkit reconnect cooldown: prevents firing reconnect_toolkit more than
+    /// once per RECONNECT_COOLDOWN_SECS for the same toolkit. Key=lowercase slug.
+    reconnect_cooldowns: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl ComposioClient {
@@ -80,6 +84,7 @@ impl ComposioClient {
             context_store,
             cached_toolkit_info: Arc::new(RwLock::new(None)),
             chrome_profile_directory,
+            reconnect_cooldowns: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -91,6 +96,13 @@ impl ComposioClient {
         } else {
             tracing::error!("Failed to acquire write lock for custom_auth_creds");
         }
+    }
+
+    /// Canonical lowercase key for toolkit maps and caches.
+    /// All toolkit-keyed maps (toolkit_account_map, reconnect_cooldowns, ContextStore)
+    /// use this normalization. Centralizing it prevents case-mismatch bugs.
+    pub(crate) fn normalize_toolkit_key(slug: &str) -> String {
+        slug.to_lowercase()
     }
 
     pub(crate) fn get_api_base_url(&self) -> String {
@@ -224,12 +236,40 @@ impl ComposioClient {
         }
     }
 
-    /// Reconnect a previously-connected toolkit via the core 5-point lifecycle.
+    /// Reconnect a previously-connected toolkit via the core 6-point lifecycle.
     /// Used by auth recovery when a tool call fails due to expired credentials.
+    ///
+    /// COOLDOWN: Refuses to re-fire within 30 seconds for the same toolkit to
+    /// prevent rapid browser popup storms from cascading auth detection layers.
+    const RECONNECT_COOLDOWN_SECS: u64 = 30;
+
     pub async fn reconnect_toolkit(
         &self,
         toolkit_slug: &str,
     ) -> Result<String, String> {
+        let slug_lower = Self::normalize_toolkit_key(toolkit_slug);
+
+        // COOLDOWN CHECK: Refuse to fire again within the cooldown window
+        if let Ok(cooldowns) = self.reconnect_cooldowns.read() {
+            if let Some(last_time) = cooldowns.get(&slug_lower) {
+                let elapsed = last_time.elapsed().as_secs();
+                if elapsed < Self::RECONNECT_COOLDOWN_SECS {
+                    tracing::warn!(
+                        "[RECONNECT COOLDOWN] Skipping reconnect for '{}' — last attempt was {}s ago (cooldown: {}s)",
+                        toolkit_slug, elapsed, Self::RECONNECT_COOLDOWN_SECS
+                    );
+                    return Err(format!(
+                        "Reconnect cooldown active for '{}'. Last attempt was {}s ago. Please wait before retrying.",
+                        toolkit_slug, elapsed
+                    ));
+                }
+            }
+        }
+
+        // Record this attempt
+        if let Ok(mut cooldowns) = self.reconnect_cooldowns.write() {
+            cooldowns.insert(slug_lower.clone(), Instant::now());
+        }
         let user_id = self.user_id.clone().unwrap_or_else(|| "default".to_string());
 
         // Step 1: Hydrate auth_config_cache so we find existing configs
@@ -243,23 +283,70 @@ impl ComposioClient {
         let auth_config_id = auth::get_auth_config_id(self, toolkit_slug).await?;
         tracing::info!("[RECONNECT] Found auth_config_id '{}' for '{}'", auth_config_id, toolkit_slug);
 
-        // Step 3: Delete stale ACTIVE connections
+        // Step 3: Delete stale connections AND protect against propagation loop
         tracing::info!("[RECONNECT 3/5] Pruning stale connections...");
+        
+        // Use the safe pruning logic instead of a blanket delete.
+        // prune_connections ensures the *newest* ACTIVE connection is preserved,
+        // while older duplicates and stale INITIATED ones are removed.
+        if let Err(e) = auth::prune_connections(self, toolkit_slug, &user_id).await {
+            tracing::warn!("[RECONNECT] Failed to prune connections: {}", e);
+        }
+
+        // PROPAGATION LOOP GUARD: Check if there's a recently created ACTIVE connection.
+        // If the proxy returns a 401 right after auth completes, it's just a sync delay.
+        // If we continue with reconnect_toolkit, we force the user to re-auth in the browser unnecessarily.
         if let Ok(accounts) = auth::list_connected_accounts(self).await {
+            let mut newest_active: Option<&models::ConnectedAccount> = None;
             for acc in &accounts {
-                let matches = acc.toolkit.as_ref()
+                let matches_toolkit = acc.toolkit.as_ref()
                     .map(|t| t.slug.eq_ignore_ascii_case(toolkit_slug))
-                    .unwrap_or(false);
-                if matches && acc.status.eq_ignore_ascii_case("ACTIVE") {
-                    tracing::info!("[RECONNECT] Deleting stale connection '{}' for '{}'", acc.id, toolkit_slug);
-                    let _ = auth::delete_connected_account(self, &acc.id).await;
+                    .unwrap_or(false)
+                    || acc.app_name.as_ref().map(|n| n.eq_ignore_ascii_case(toolkit_slug)).unwrap_or(false);
+                
+                if matches_toolkit && acc.status.eq_ignore_ascii_case("ACTIVE") {
+                    if let Some(current) = newest_active {
+                        if let (Some(t_new), Some(t_curr)) = (acc.created_at.as_deref(), current.created_at.as_deref()) {
+                            if t_new > t_curr {
+                                newest_active = Some(acc);
+                            }
+                        }
+                    } else {
+                        newest_active = Some(acc);
+                    }
+                }
+            }
+
+            if let Some(active_acc) = newest_active {
+                if let Some(created_at) = &active_acc.created_at {
+                    if let Ok(parsed_time) = chrono::DateTime::parse_from_rfc3339(created_at) {
+                        let age_seconds = chrono::Utc::now().signed_duration_since(parsed_time.with_timezone(&chrono::Utc)).num_seconds();
+                        if age_seconds < 60 {
+                            tracing::warn!(
+                                "[PROPAGATION GUARD] ACTIVE connection '{}' is only {}s old. This 401 is likely a proxy propagation delay. Aborting re-auth loop.",
+                                active_acc.id, age_seconds
+                            );
+                            
+                            // Return an explicit error that prompts the LLM to wait, rather than
+                            // continuing the cycle to open a new browser popup.
+                            return Err(
+                                "Authentication successful but not yet active on the proxy (sync delay). Please wait 15 seconds and try the tool again.".to_string()
+                            );
+                        }
+                    }
                 }
             }
         }
+
         // Bust stale cache
         if let Ok(mut map) = self.toolkit_account_map.write() {
-            map.remove(toolkit_slug);
+            // Keys are always lowercase (see auth.rs hydration)
+            map.remove(&Self::normalize_toolkit_key(toolkit_slug));
         }
+        // Bust stale ContextStore entries (prevents stale ID injection if re-auth fails)
+        let bust_user = self.user_id.clone().unwrap_or_else(|| "default".to_string());
+        self.context_store.remove_param(toolkit_slug, &bust_user, "connected_account_id");
+        self.context_store.remove_param(toolkit_slug, &bust_user, "connectedAccountId");
 
         // Step 4: Initiate OAuth (force=true → opens browser)
         tracing::info!("[RECONNECT 4/5] Initiating OAuth (force=true)...");
@@ -271,6 +358,15 @@ impl ComposioClient {
             Ok(Some(new_url)) => tracing::info!("[RECONNECT] Server re-patched: {}", new_url),
             Ok(None) => tracing::info!("[RECONNECT] Server already configured for '{}'", toolkit_slug),
             Err(e) => tracing::warn!("[RECONNECT] Server re-patch warning: {}", e),
+        }
+
+        // CACHE RE-HYDRATION: Step 3 busted the toolkit_account_map entry.
+        // We MUST repopulate it now that the new connection is ACTIVE,
+        // otherwise the next execute_tool proactive check will see an empty
+        // cache, conclude there's no connection, and fire ANOTHER reconnect.
+        tracing::info!("[RECONNECT] Re-hydrating toolkit_account_map after successful reconnect...");
+        if let Err(e) = auth::list_connected_accounts(self).await {
+            tracing::warn!("[RECONNECT] Failed to re-hydrate connected accounts cache: {}", e);
         }
 
         Ok(result)

@@ -1,4 +1,4 @@
-use super::auth::{list_auth_configs, list_connected_accounts};
+use super::auth::list_auth_configs;
 use super::models::*;
 use super::utils::write_to_debug_file;
 use super::ComposioClient;
@@ -539,9 +539,13 @@ pub async fn execute_tool(
         Some(guessed)
     });
 
-    // CONTEXT INJECTION (Pattern 123)
-    // Check if we have stored context keys (e.g. team_id) and inject them if missing.
+    // CONTEXT INJECTION (Pattern 123 / Pattern 124)
+    // Check if we have stored context keys (e.g. team_id, connectedAccountId) and inject them if missing.
     // NOTE: This must run AFTER heuristic resolution to ensure we don't miss injection for guessed toolkits.
+    // Pattern 124 (Targeted Identity Grounding): connected_account_id is saved to ContextStore
+    // during OAuth callback and injected here for routed toolkits like ClickUp.
+    // Staleness protection: reconnect_toolkit busts ContextStore entries via remove_param
+    // before re-auth, preventing stale IDs from leaking back into tool calls.
     if let Some(ref tk_slug) = toolkit_slug {
         if let Some(context) = client.context_store.get_context(tk_slug, &user_id) {
             if let Some(obj) = arguments.as_object_mut() {
@@ -577,87 +581,9 @@ pub async fn execute_tool(
         }
     }
 
-    // PROACTIVE AUTH CHECK (restored from v0.9.4 pattern)
-    // Check for an ACTIVE connected account for this toolkit BEFORE calling the proxy.
-    // If no active connection, trigger initiate_connection immediately.
-    if let Some(ref tk_slug) = toolkit_slug {
-        tracing::debug!(
-            "[AUTH] Checking for active connection for toolkit '{}'",
-            tk_slug
-        );
-
-        // OPTIMIZED PATTERN 122: Check cache first, then fetch
-        let has_active_connection = {
-            // 1. Check Cache
-            let cached = client.toolkit_account_map.read().ok().and_then(|map| map.get(tk_slug).cloned());
-            
-            if let Some(acc_id) = cached {
-                tracing::debug!("[AUTH] Found cached ACTIVE connection '{}' for toolkit '{}'", acc_id, tk_slug);
-                true
-            } else {
-                // 2. Cache Miss - Fetch & Refresh
-                tracing::debug!("[AUTH] Cache miss for toolkit '{}'. Fetching connected accounts...", tk_slug);
-                match list_connected_accounts(client).await {
-                    Ok(_) => {
-                        // 3. Check Cache Again (populated by list_connected_accounts)
-                         client.toolkit_account_map.read().ok().map(|map| map.contains_key(tk_slug)).unwrap_or(false)
-                    },
-                    Err(e) => {
-                        tracing::warn!("[AUTH] Failed to fetch connected accounts: {}", e);
-                        false
-                    }
-                }
-            }
-        };
-
-        // If no active connection, trigger OAuth flow proactively
-        if !has_active_connection {
-            tracing::warn!(
-                "[OAUTH TRIGGER] No active connection for toolkit '{}'. Initiating auth flow.",
-                tk_slug
-            );
-
-            match client.reconnect_toolkit(tk_slug).await {
-                Ok(result_msg) => {
-                    if result_msg.contains("Authentication successful") {
-                        tracing::info!("[AUTH] 5-point reconnect successful, proceeding with tool execution.");
-                        // FALLTHROUGH: Don't return, let the code proceed to step 2 (URL construction & execution)
-                    } else {
-                        let url = result_msg
-                            .split_whitespace()
-                            .last()
-                            .unwrap_or(&result_msg)
-                            .to_string();
-                        let redirect_url = if url.starts_with("http") {
-                            url
-                        } else {
-                            result_msg.clone()
-                        };
-                        return Ok(ToolExecuteResponse {
-                            data: serde_json::json!({ "redirectUrl": redirect_url }),
-                            error: Some(format!("Authentication required. {}", result_msg)),
-                            successful: false,
-                            log_id: None,
-                            session_info: None,
-                        });
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("[AUTH] 5-point reconnect failed: {}", e);
-                    return Ok(ToolExecuteResponse {
-                        data: serde_json::Value::Null,
-                        error: Some(format!(
-                            "No active connection for toolkit '{}' and failed to start auth: {}",
-                            tk_slug, e
-                        )),
-                        successful: false,
-                        log_id: None,
-                        session_info: None,
-                    });
-                }
-            }
-        }
-    }
+    // AUTH NOTE: No proactive auth check here. The MCP Proxy resolves authority
+    // 100% from the `user_id` Routing Key (see native_mcp_bridge.md KI).
+    // If the proxy returns OAUTH_018, `try_auth_recovery` in manager.rs handles it.
 
     // 2. Build URL AFTER resolving the correct user_id
     // Uses the standardized build_mcp_url which handles Double-MCP and user_id mapping
@@ -699,59 +625,29 @@ pub async fn execute_tool(
 
     let status = response.status();
 
-    // Handle 401/403 at the HTTP level immediately
+    // Handle 401/403 at the HTTP level.
+    // Do NOT call initiate_connection here — the proactive check (line 580) already
+    // handles first-use auth. A 401 after successful auth is typically a token
+    // propagation delay in the Composio proxy. Calling initiate_connection here
+    // caused double-browser-popup storms and cache thrashing (busting the entry
+    // we JUST wrote from the callback). Instead, let the response flow through to
+    // try_auth_recovery in manager.rs which has the 30s cooldown.
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        // HTTP 401/403 = deterministic auth failure - trigger managed flow
-        if let Some(tk_slug) = &toolkit_slug {
-            tracing::info!(
-                "[AUTH] HTTP {} for toolkit '{}', triggering connection flow",
+        if let Some(ref tk_slug) = toolkit_slug {
+            tracing::warn!(
+                "[AUTH] HTTP {} for toolkit '{}'. Deferring to manager try_auth_recovery.",
                 status.as_u16(),
                 tk_slug
             );
-            match client.reconnect_toolkit(tk_slug).await {
-                Ok(result_msg) => {
-                    if result_msg.contains("Authentication successful") {
-                        return Ok(ToolExecuteResponse {
-                            data: serde_json::Value::Null,
-                            error: Some(
-                                "Authentication successful! Please try the tool again.".to_string(),
-                            ),
-                            successful: false,
-                            log_id: None,
-                            session_info: None,
-                        });
-                    } else {
-                        let url_candidate = result_msg
-                            .split_whitespace()
-                            .last()
-                            .unwrap_or(&result_msg)
-                            .to_string();
-                        let redirect_url = if url_candidate.starts_with("http") {
-                            url_candidate
-                        } else {
-                            result_msg.clone()
-                        };
-                        return Ok(ToolExecuteResponse {
-                            data: serde_json::json!({ "redirectUrl": redirect_url }),
-                            error: Some(format!("Authentication required. {}", result_msg)),
-                            successful: false,
-                            log_id: None,
-                            session_info: None,
-                        });
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("[AUTH] 5-point reconnect failed for HTTP {}: {}", status.as_u16(), e);
-                    return Err(format!(
-                        "Authentication required but connection failed: {}",
-                        e
-                    ));
-                }
-            }
         }
+        // Fall through — the response body will be parsed below and the auth error
+        // will be detected by is_auth_error() and handled by manager.rs
     }
 
-    if !status.is_success() {
+    if !status.is_success()
+        && status != reqwest::StatusCode::UNAUTHORIZED
+        && status != reqwest::StatusCode::FORBIDDEN
+    {
         match response.error_for_status() {
             Ok(_) => unreachable!(),
             Err(e) => return Err(e.to_string()),
@@ -858,9 +754,15 @@ pub async fn execute_tool(
     // This operates on the raw JSON-RPC envelope (`json_value`), NOT on the
     // deserialized ToolExecuteResponse — a different lifecycle stage.
     // The MCP proxy sometimes wraps errors inside a JSON-RPC result object.
+    //
+    // RESTORED GUARD: Only inspect content text when isError is true OR absent.
+    // When isError is explicitly false, the proxy considers the relay successful
+    // and the content is normal tool output — not an error to parse for auth signals.
     if !needs_auth {
         if let Some(result) = json_value.get("result") {
-            if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+            let is_error = result.get("isError").and_then(|v| v.as_bool());
+            // Gate: isError must be true or absent (None = proxy didn't set it)
+            if is_error != Some(false) {
                 if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
                     for item in content {
                         if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
@@ -901,24 +803,43 @@ pub async fn execute_tool(
         }
     }
 
+    // SAFETY GUARD: Respect auth_refresh_required when present.
+    // The API sometimes signals "yes this looks like an auth error, but don't
+    // actually refresh" (auth_refresh_required=false). This prevents unnecessary
+    // reconnect cycles from soft/ambiguous signals.
+    // Hard signals (ECODE, status_code) are unaffected — they always trigger recovery.
+    if needs_auth {
+        let auth_refresh = data
+            .get("auth_refresh_required")
+            .or_else(|| json_value.get("auth_refresh_required"));
+        if let Some(refresh) = auth_refresh.and_then(|v| v.as_bool()) {
+            if !refresh {
+                tracing::info!("[AUTH] auth_refresh_required=false, suppressing auth recovery");
+                needs_auth = false;
+            }
+        }
+    }
+
     // Auth recovery is handled by `try_auth_recovery` in manager.rs which has access to
-    // the full 5-point connection lifecycle (auth config lookup, OAuth, server patching,
+    // the full 6-point connection lifecycle (auth config lookup, OAuth, server patching,
     // tool selection, reload). We just pass the raw error through with clear logging.
     if needs_auth {
         if let Some(tk_slug) = &toolkit_slug {
             tracing::warn!(
-                "[AUTH] Auth error detected for toolkit '{}'. Raw error will propagate to manager.rs for 5-point recovery.",
+                "[AUTH] Auth error detected for toolkit '{}'. Raw error will propagate to manager.rs for 6-point recovery.",
                 tk_slug
             );
-            // Defense-in-depth: bust the stale toolkit_account_map EAGERLY here
+            // INTENTIONAL DUPLICATION: bust the stale toolkit_account_map EAGERLY here
             // so that even if the manager-level recovery doesn't fire (e.g. tool
             // called via COMPOSIO_EXECUTE_TOOL path), the next execute_tool call
             // won't short-circuit on a cached ACTIVE entry.
             // `reconnect_toolkit` in mod.rs performs the same bust during its
-            // Step 3 — both locations are intentional. (Review: 2026-02-21)
+            // Step 3 — both locations are intentional defense-in-depth. (Review: 2026-02-21, 2026-02-25)
             if let Ok(mut map) = client.toolkit_account_map.write() {
-                if map.remove(tk_slug).is_some() {
-                    tracing::info!("[AUTH] Cleared stale '{}' from toolkit_account_map", tk_slug);
+                // Keys are always lowercase (see normalize_toolkit_key)
+                let key = super::ComposioClient::normalize_toolkit_key(tk_slug);
+                if map.remove(&key).is_some() {
+                    tracing::info!("[AUTH] Cleared stale '{}' from toolkit_account_map", key);
                 }
             }
         }

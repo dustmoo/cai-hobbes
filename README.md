@@ -126,6 +126,17 @@ Hobbes is released under the **Functional Source License (FSL 1.1)**.
 
 We believe in open source sustainability. This model protects the project's ability to fund itself in the short term while guaranteeing a fully open future.
 
+## ⚖️ EU AI Act & Territorial Use Restriction
+
+Hobbes is an experimental, local-first software tool developed and incorporated in the State of Washington, USA. It operates on a "Bring Your Own Key" (BYOK) architecture and functions purely as a local user interface and memory manager.
+
+By downloading, installing, or using Hobbes, you acknowledge and agree that:
+
+1. **You are acting as the sole Deployer** of any AI models you choose to connect to this software.
+2. **Hobbes is not intended for use within the European Union (EU)** or by EU citizens. We do not actively market, distribute, or support this software within the EU market.
+3. If you access or use Hobbes from within the EU, you do so **entirely at your own risk** and assume full responsibility for compliance with all local laws, including the EU AI Act (Regulation (EU) 2024/1689), GDPR, and any downstream provider liabilities.
+4. We **expressly disclaim any liability** for the outputs, data processing, or regulatory compliance of third-party API models connected to this software by the user.
+
 ## Contributing
 
 Please see [`CONTRIBUTING.md`](CONTRIBUTING.md) for details on how to contribute.
