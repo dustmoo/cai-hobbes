@@ -22,7 +22,8 @@ pub fn MessageList(
     let ui_state = consume_context::<Signal<crate::settings::UiState>>();
     let settings = use_context::<Signal<crate::settings::Settings>>();
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
-    let mut chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    let mut chat_command =
+        use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
     let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     let _ = stream_update_trigger.read();
 
@@ -33,12 +34,13 @@ pub fn MessageList(
     let profile_color = {
         let state = session_state.read();
         let settings_read = settings.read();
-        let session_profile = state.sessions.get(&*session_id.read())
+        let session_profile = state
+            .sessions
+            .get(&*session_id.read())
             .and_then(|s| s.composio_profile.as_ref());
         crate::components::shared::resolve_profile_color(session_profile, &settings_read)
             .unwrap_or_default()
     };
-
 
     use_effect(move || {
         if let Some(cmd) = chat_command.read().clone() {
@@ -160,10 +162,13 @@ pub fn MessageList(
                                         let session_id = session_id.read().clone();
                                         rsx! {
                                             match &message.content {
-                                                MessageContent::Text { content: text, thought_signature, thought_summary } => {
+                                                MessageContent::Text { content: text, thought_signature: _, thought_summary: _ } => {
                                                     let stream_manager = consume_context::<crate::components::stream_manager::StreamManagerContext>();
                                                     let is_generating = stream_manager.is_generating(&message.id);
-                                                    let should_render = !text.is_empty() || is_generating || !message.attachments.is_empty() || thought_summary.is_some() || thought_signature.is_some();
+                                                    // Don't render empty bubbles — thinking data (thought_signature/thought_summary)
+                                                    // is absorbed into the adjacent ToolCall card, so an empty text message
+                                                    // with only thinking metadata should be hidden.
+                                                    let should_render = !text.is_empty() || is_generating || !message.attachments.is_empty();
 
                                                     if should_render {
                                                         rsx! {
@@ -320,7 +325,7 @@ pub fn MessageList(
                                                                                             (sc, profile)
                                                                                         } else { (None, None) }
                                                                                     };
-                                                                                    
+
                                                                                     // Get FRESH, profile-scoped MCP context using mcp_manager
                                                                                     // This follows the same lifecycle as chat.rs:539-557
                                                                                     if let Some(ref id) = profile_id {
@@ -335,7 +340,7 @@ pub fn MessageList(
                                                                                     } else {
                                                                                         Some(fresh_mcp_context)
                                                                                     };
-                                                                                    
+
                                                                                     if let Some(mut sc) = skill_call_clone {
                                                                                         tracing::info!("Executing skill: {}", sc.skill_name);
                                                                                         match crate::skills::execute_skill(&mut sc, mcp_context.as_ref()).await {

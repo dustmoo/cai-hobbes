@@ -63,8 +63,10 @@ pub fn NewChatMemoryModal(
         tracing::debug!("NewChatMemoryModal::submit_session called");
         match serde_json::from_str::<ActiveContext>(&content) {
             Ok(mut valid_context) => {
-                tracing::info!("NewChatMemoryModal::submit_session - valid context parsed, restoring tools");
-                
+                tracing::info!(
+                    "NewChatMemoryModal::submit_session - valid context parsed, restoring tools"
+                );
+
                 // Restore logic: usage state (mcp_tools/tools) must optionally persist from source
                 // if not present in the editor (which we explicitly stripped above).
                 // If the user *manually* added tools in the JSON (unlikely but possible), we accept them.
@@ -93,7 +95,7 @@ pub fn NewChatMemoryModal(
             }
         }
     };
-    
+
     // Clone for the onclick handler
     let mut submit_session_click = submit_session.clone();
 

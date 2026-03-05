@@ -1,17 +1,17 @@
 use crate::components::shared::ToolCallStatus;
 use crate::components::smithery_registry::SmitheryServerDetail;
 use crate::context::permissions::{PermissionManager, PermissionStatus};
+use crate::llm::GeminiConnector;
 use crate::mcp::authenticated_sse::AuthenticatedClientError;
 use crate::mcp::composio_client::{composio_to_rmcp_tool, ComposioClient};
+use crate::mcp::tool_selection::{ToolCandidate, ToolSelectionRequest, TOOL_SELECTION_THRESHOLD};
+use crate::settings::{Settings, SettingsManager};
+use crate::SecretManagerTrait;
 use dioxus::prelude::spawn;
 use dioxus::prelude::Signal;
 use dioxus_signals::{Readable, Writable};
-use crate::SecretManagerTrait;
 use rmcp::model::{CallToolRequestParam, CallToolResult, PaginatedRequestParam, Tool};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
-use crate::mcp::tool_selection::{TOOL_SELECTION_THRESHOLD, ToolSelectionRequest, ToolCandidate};
-use crate::components::llm::GeminiConnector;
-use crate::settings::{Settings, SettingsManager};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::sse_client::SseTransportError;
 use serde::{Deserialize, Serialize};
@@ -48,13 +48,18 @@ const GEMINI_TOOL_LIMIT: usize = 128;
 fn score_tool_relevance(name: &str) -> u32 {
     let upper = name.to_uppercase();
     // Root traversal / auth tools — critical for hierarchy navigation
-    if upper.contains("_TEAM") || upper.contains("_WORKSPACE") || upper.contains("_ORGANIZATION")
-        || upper.contains("_AUTH") || upper.contains("_SPACE")
+    if upper.contains("_TEAM")
+        || upper.contains("_WORKSPACE")
+        || upper.contains("_ORGANIZATION")
+        || upper.contains("_AUTH")
+        || upper.contains("_SPACE")
     {
         return 100;
     }
     // Core read operations
-    if upper.contains("_GET_") || upper.contains("_LIST_") || upper.contains("_SEARCH_")
+    if upper.contains("_GET_")
+        || upper.contains("_LIST_")
+        || upper.contains("_SEARCH_")
         || upper.contains("_FIND_")
     {
         return 80;
@@ -64,7 +69,9 @@ fn score_tool_relevance(name: &str) -> u32 {
         return 60;
     }
     // Core update operations
-    if upper.contains("_UPDATE_") || upper.contains("_SET_") || upper.contains("_EDIT_")
+    if upper.contains("_UPDATE_")
+        || upper.contains("_SET_")
+        || upper.contains("_EDIT_")
         || upper.contains("_MODIFY_")
     {
         return 40;
@@ -104,14 +111,15 @@ async fn try_auth_recovery(
     // We must NOT fire recovery again, or we'll enter a double-reconnect loop where
     // is_auth_error() matches our own "Authentication required" error message.
     if response.data.get("redirectUrl").is_some() {
-        tracing::debug!("[AUTH RECOVERY] Skipping — response is already an auth redirect from proactive check");
+        tracing::debug!(
+            "[AUTH RECOVERY] Skipping — response is already an auth redirect from proactive check"
+        );
         return None;
     }
 
     // Extract toolkit slug from tool name (first segment before _)
-    let toolkit_slug = ComposioClient::normalize_toolkit_key(
-        tool_name.split('_').next().unwrap_or(tool_name),
-    );
+    let toolkit_slug =
+        ComposioClient::normalize_toolkit_key(tool_name.split('_').next().unwrap_or(tool_name));
 
     tracing::info!("[AUTH RECOVERY] Auth error detected for '{}' (toolkit: '{}'), triggering 6-point reconnect", tool_name, toolkit_slug);
 
@@ -145,7 +153,10 @@ async fn try_auth_recovery(
                     .last()
                     .unwrap_or(&result_msg)
                     .to_string();
-                let auth_msg = format!("Authentication required. Please connect your account: {}", url);
+                let auth_msg = format!(
+                    "Authentication required. Please connect your account: {}",
+                    url
+                );
                 Some(CallToolResult {
                     content: vec![rmcp::model::Content::text(auth_msg)],
                     is_error: Some(true),
@@ -339,7 +350,9 @@ impl McpManager {
         // Inject Custom Tool Credentials (BYOA) - Read from memory cache (INSTANT)
         // This avoids blocking keychain I/O on the main thread
         // Pattern 153: Scope injected credentials to the target profile
-        let custom_creds = secret_manager.peek().get_custom_tool_credentials(Some(profile_id));
+        let custom_creds = secret_manager
+            .peek()
+            .get_custom_tool_credentials(Some(profile_id));
 
         if !custom_creds.is_empty() {
             tracing::info!(
@@ -352,12 +365,17 @@ impl McpManager {
     }
 
     /// Helper: Initialize a native Composio client for a specific profile.
-    pub async fn initialize_native_composio_for_profile(&self, profile: &crate::settings::ComposioProfile) -> Result<ActiveMcpClient, String> {
+    pub async fn initialize_native_composio_for_profile(
+        &self,
+        profile: &crate::settings::ComposioProfile,
+    ) -> Result<ActiveMcpClient, String> {
         let Some(api_key) = profile.api_key.clone() else {
             return Err("No Composio API key configured".to_string());
         };
 
-        let base_url = profile.base_url.clone()
+        let base_url = profile
+            .base_url
+            .clone()
             .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
         let entity_id = profile.entity_id.clone();
         let user_id = profile.user_id.clone();
@@ -374,7 +392,12 @@ impl McpManager {
         );
 
         let composio_client = Arc::new(ComposioClient::new(
-            api_key, base_url, entity_id, user_id, profile_id, profile.chrome_profile_directory.clone(),
+            api_key,
+            base_url,
+            entity_id,
+            user_id,
+            profile_id,
+            profile.chrome_profile_directory.clone(),
         ));
 
         // Inject credentials
@@ -387,14 +410,20 @@ impl McpManager {
         let mut composio_config = McpServerConfig::composio_stub(server_name);
         composio_config.description = description;
 
-        let discovery_result = composio_client.list_tools_for_session(&force_load_slugs).await
+        let discovery_result = composio_client
+            .list_tools_for_session(&force_load_slugs)
+            .await
             .map_err(|e| format!("Failed to list Composio tools: {}", e))?;
 
         // Convert Composio tools to rmcp::model::Tool for the prompt builder.
         // This conversion appears at multiple lifecycle stages (init, hot-reload,
         // dynamic injection, marketplace connect, auth recovery) — each call site
         // operates on a different tool set, so consolidation is not beneficial.
-        let tools = discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
+        let tools = discovery_result
+            .tools
+            .iter()
+            .map(composio_to_rmcp_tool)
+            .collect();
 
         Ok(ActiveMcpClient {
             config: composio_config,
@@ -405,20 +434,29 @@ impl McpManager {
         })
     }
 
-
-
     /// Ensure a native Composio client is loaded for a specific profile name or ID.
     /// If not loaded, it fetches the profile from settings and initializes it.
     /// This now supports both Name-based (legacy) and ID-based lookups, prioritizing ID.
-    pub async fn ensure_native_client_for_profile(&self, name_or_id: &str, settings: &Settings) -> Result<(), String> {
+    pub async fn ensure_native_client_for_profile(
+        &self,
+        name_or_id: &str,
+        settings: &Settings,
+    ) -> Result<(), String> {
         // Resolve to a stable ID first
-        let profile = settings.composio_profiles.iter()
+        let profile = settings
+            .composio_profiles
+            .iter()
             .find(|p| p.id == name_or_id)
-            .or_else(|| settings.composio_profiles.iter().find(|p| p.name == name_or_id))
+            .or_else(|| {
+                settings
+                    .composio_profiles
+                    .iter()
+                    .find(|p| p.name == name_or_id)
+            })
             .ok_or_else(|| format!("Composio profile '{}' not found in settings", name_or_id))?;
 
         let server_key = composio_server_key(&profile.id);
-        
+
         {
             let servers = self.servers.lock().await;
             if servers.contains_key(&server_key) {
@@ -427,7 +465,7 @@ impl McpManager {
         }
 
         let client = self.initialize_native_composio_for_profile(profile).await?;
-        
+
         {
             let mut servers = self.servers.lock().await;
             servers.insert(server_key, client);
@@ -489,7 +527,9 @@ impl McpManager {
     ) {
         // Pattern 123: Identity Trinity - force specific profile lookup
         let profile = if let Some(ref val) = profile_id {
-            settings.composio_profiles.iter()
+            settings
+                .composio_profiles
+                .iter()
                 .find(|p| &p.id == val || &p.name == val)
                 .cloned()
         } else {
@@ -497,7 +537,10 @@ impl McpManager {
         };
 
         let Some(profile) = profile else {
-            tracing::warn!("Failed to find profile for reinitialization: {:?}", profile_id);
+            tracing::warn!(
+                "Failed to find profile for reinitialization: {:?}",
+                profile_id
+            );
             return;
         };
 
@@ -511,12 +554,13 @@ impl McpManager {
             let mut servers = self.servers.lock().await;
             // Clear specific target key if exists
             servers.remove(&server_key);
-            
+
             // Also clear by name for legacy cleanup if needed
             let name_key = format!("{}:{}", COMPOSIO_NATIVE_PREFIX, profile.name);
             servers.remove(&name_key);
 
-            let native_keys: Vec<String> = servers.keys()
+            let native_keys: Vec<String> = servers
+                .keys()
                 .filter(|k| is_composio_native(k))
                 .cloned()
                 .collect();
@@ -541,24 +585,31 @@ impl McpManager {
 
                 self.invalidate_status_cache_async().await;
                 mcp_context_signal.set(self.get_mcp_context(Some(profile.id.clone())).await);
-                tracing::info!("Successfully reinitialized Composio client for profile: {}", profile.name);
+                tracing::info!(
+                    "Successfully reinitialized Composio client for profile: {}",
+                    profile.name
+                );
             }
             Err(e) => {
                 let error_msg = format!("Failed to reinitialize Composio: {}", e);
                 {
                     let mut servers = self.servers.lock().await;
-                    // Remove ALL composio-native clients 
-                    let native_keys: Vec<String> = servers.keys()
+                    // Remove ALL composio-native clients
+                    let native_keys: Vec<String> = servers
+                        .keys()
                         .filter(|k| is_composio_native(k))
                         .cloned()
                         .collect();
                     for key in native_keys {
                         servers.remove(&key);
                     }
-                    
+
                     let mut dummy_config = McpServerConfig::composio_stub(server_key.clone());
                     dummy_config.description = "Composio Integration Hub".to_string();
-                    self.failed_servers.lock().await.insert(server_key.clone(), (dummy_config, error_msg.clone()));
+                    self.failed_servers
+                        .lock()
+                        .await
+                        .insert(server_key.clone(), (dummy_config, error_msg.clone()));
                 }
 
                 if Self::is_needs_setup_error(&error_msg) {
@@ -566,7 +617,7 @@ impl McpManager {
                 } else {
                     tracing::error!("{}", error_msg);
                 }
-                
+
                 mcp_context_signal.set(self.get_mcp_context(Some(profile.id)).await);
             }
         }
@@ -679,7 +730,11 @@ impl McpManager {
                 };
 
                 let display_name = active_client.config.name.clone();
-                tracing::info!("Received initialized client for: {} (Storage Key: {})", display_name, storage_key);
+                tracing::info!(
+                    "Received initialized client for: {} (Storage Key: {})",
+                    display_name,
+                    storage_key
+                );
 
                 // Lock and insert the new client
                 servers_map_clone
@@ -688,7 +743,9 @@ impl McpManager {
                     .insert(storage_key, active_client);
 
                 // Invalidate status cache BEFORE updating context signal (Pattern 150.8)
-                self_clone_for_receiver.invalidate_status_cache_async().await;
+                self_clone_for_receiver
+                    .invalidate_status_cache_async()
+                    .await;
 
                 // Get the full, updated context and set the signal
                 let new_context = self_clone_for_receiver.get_mcp_context(None).await;
@@ -709,8 +766,14 @@ impl McpManager {
             let self_clone = self.clone();
 
             spawn(async move {
-                tracing::info!("Initializing virtual Composio client for profile '{}'", profile_clone.name);
-                match self_clone.initialize_native_composio_for_profile(&profile_clone).await {
+                tracing::info!(
+                    "Initializing virtual Composio client for profile '{}'",
+                    profile_clone.name
+                );
+                match self_clone
+                    .initialize_native_composio_for_profile(&profile_clone)
+                    .await
+                {
                     Ok(active_client) => {
                         if tx_clone.send(active_client).is_err() {
                             tracing::error!("Failed to send initialized virtual Composio client");
@@ -730,7 +793,10 @@ impl McpManager {
 
         // Skip composio-native in the config loop — it is initialized via the
         // dedicated `initialize_native_composio_for_profile` path above (lines 537-559).
-        for server_config in configs.iter().filter(|sc| !sc.disabled && sc.name != COMPOSIO_NATIVE_PREFIX) {
+        for server_config in configs
+            .iter()
+            .filter(|sc| !sc.disabled && sc.name != COMPOSIO_NATIVE_PREFIX)
+        {
             let mut server_config_clone = server_config.clone();
             if let Some(key) = &settings.smithery_api_key {
                 server_config_clone
@@ -772,7 +838,11 @@ impl McpManager {
                                 profile.chrome_profile_directory.clone(),
                             ));
 
-                            McpManager::inject_custom_credentials(&composio_client, &profile.name, &secret_manager);
+                            McpManager::inject_custom_credentials(
+                                &composio_client,
+                                &profile.name,
+                                &secret_manager,
+                            );
 
                             let client_for_tools = composio_client.clone();
 
@@ -784,8 +854,11 @@ impl McpManager {
                                 .await
                             {
                                 Ok(discovery_result) => {
-                                    let tools =
-                                        discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
+                                    let tools = discovery_result
+                                        .tools
+                                        .iter()
+                                        .map(composio_to_rmcp_tool)
+                                        .collect();
                                     let active_client = ActiveMcpClient {
                                         config: server_config_clone.clone(),
                                         service: McpClientType::NativeComposio(
@@ -1087,7 +1160,7 @@ impl McpManager {
                                         if !cursor.is_empty() {
                                             next_cursor = Some(cursor);
                                             continue;
-                                    }
+                                        }
                                     }
                                     break;
                                 }
@@ -1328,7 +1401,8 @@ impl McpManager {
                     scoped_key
                 } else {
                     // Fallback: search by profile_id field (handles ID/name mismatch)
-                    servers_guard.iter()
+                    servers_guard
+                        .iter()
                         .find(|(k, c)| is_composio_native(k) && c.profile_id.as_deref() == Some(p))
                         .map(|(k, _)| k.clone())
                         .unwrap_or_else(|| {
@@ -1342,13 +1416,17 @@ impl McpManager {
             }
             // 3. If suffix is a profile NAME (from config.name), search by config.name match
             else if !suffix.is_empty() {
-                servers_guard.iter()
+                servers_guard
+                    .iter()
                     .find(|(_, c)| c.config.name == server_name)
                     .map(|(k, _)| k.clone())
                     .unwrap_or_else(|| {
                         // Also try matching suffix against profile_id
-                        servers_guard.iter()
-                            .find(|(k, c)| is_composio_native(k) && c.profile_id.as_deref() == Some(suffix))
+                        servers_guard
+                            .iter()
+                            .find(|(k, c)| {
+                                is_composio_native(k) && c.profile_id.as_deref() == Some(suffix)
+                            })
                             .map(|(k, _)| k.clone())
                             .unwrap_or_else(|| {
                                 if servers_guard.contains_key(COMPOSIO_NATIVE_PREFIX) {
@@ -1422,17 +1500,19 @@ impl McpManager {
             // Get profile name for scoped injection
             // Pattern 123: Use resolved profile name strictly
             let resolved_profile = if actual_server_name.starts_with("composio-native:") {
-                actual_server_name.strip_prefix("composio-native:").map(|s| s.to_string())
+                actual_server_name
+                    .strip_prefix("composio-native:")
+                    .map(|s| s.to_string())
             } else {
                 profile_id.clone()
             };
-            
+
             if let Some(p_name) = resolved_profile {
                 Self::inject_custom_credentials(composio_client, &p_name, &self.secret_manager);
             } else {
-                 // Fallback to all if no profile known
-                 let all_creds = self.secret_manager.peek().get_all_custom_tool_credentials();
-                 composio_client.set_custom_creds(all_creds);
+                // Fallback to all if no profile known
+                let all_creds = self.secret_manager.peek().get_all_custom_tool_credentials();
+                composio_client.set_custom_creds(all_creds);
             }
         }
 
@@ -1442,9 +1522,8 @@ impl McpManager {
         // Capture the set of tool names currently loaded on this server.
         // Used to filter dynamic injection: only tools the proxy will accept
         // for tools/call should be injected as FunctionDeclarations.
-        let loaded_tool_names: std::collections::HashSet<String> = client.tools.iter()
-            .map(|t| t.name.to_string())
-            .collect();
+        let loaded_tool_names: std::collections::HashSet<String> =
+            client.tools.iter().map(|t| t.name.to_string()).collect();
 
         // Note: composio_meta synthetic server removed - Tool Router handles on-demand tools
 
@@ -1477,21 +1556,34 @@ impl McpManager {
                         let query = args.get("query").and_then(|v| v.as_str());
                         tracing::info!("COMPOSIO_DISCOVER_APPS: query='{:?}'", query);
 
-                        // Use list_all_toolkits (which searches the marketplace)
-                        // This allows discovery of both connected and unconnected toolkits
-                        match composio_client
-                            .list_all_toolkits(query, None, Some(20), None, None)
-                            .await
-                        {
-                            Ok((toolkits, _, _)) => {
-                                let results: Vec<serde_json::Value> = toolkits
+                        // Operational Authority: Use list_connected_toolkits (MCP-first,
+                        // cross-referenced with user-scoped toolkit_account_map) rather than
+                        // the unfiltered REST marketplace catalog. Only shows apps the user
+                        // has connected accounts for.
+                        match composio_client.list_connected_toolkits().await {
+                            Ok(toolkit_infos) => {
+                                // Apply optional query filter client-side
+                                let filtered: Vec<_> = if let Some(q) = query {
+                                    let q_lower = q.to_lowercase();
+                                    toolkit_infos
+                                        .into_iter()
+                                        .filter(|tk| {
+                                            tk.slug.to_lowercase().contains(&q_lower)
+                                                || tk.display_name.to_lowercase().contains(&q_lower)
+                                        })
+                                        .collect()
+                                } else {
+                                    toolkit_infos
+                                };
+
+                                let results: Vec<serde_json::Value> = filtered
                                     .iter()
                                     .map(|tk| {
                                         serde_json::json!({
-                                            "name": tk.name, // Use name, e.g., "Gmail"
-                                            "slug": tk.slug, // Use slug for get_app_tools
-                                            "description": tk.description(),
-                                            "tool_count": tk.tools_count()
+                                            "name": tk.display_name,
+                                            "slug": tk.slug,
+                                            "tool_count": tk.tool_count,
+                                            "is_connected": tk.is_connected
                                         })
                                     })
                                     .collect();
@@ -1527,18 +1619,21 @@ impl McpManager {
                                     let total_available = discovery_result.tools.len();
 
                                     // Deduplicate: skip tools already loaded on the server
-                                    let new_tools: Vec<_> = discovery_result.tools
+                                    let new_tools: Vec<_> = discovery_result
+                                        .tools
                                         .iter()
                                         .filter(|t| !loaded_tool_names.contains(&t.name))
                                         .collect();
 
                                     // Budget-aware selection: only inject as many as Gemini can handle
-                                    let budget = GEMINI_TOOL_LIMIT.saturating_sub(loaded_tool_names.len());
+                                    let budget =
+                                        GEMINI_TOOL_LIMIT.saturating_sub(loaded_tool_names.len());
                                     let budget_limited = new_tools.len() > budget;
 
                                     let selected: Vec<_> = if budget_limited {
                                         // Score and sort by relevance, take top N within budget
-                                        let mut scored: Vec<_> = new_tools.iter()
+                                        let mut scored: Vec<_> = new_tools
+                                            .iter()
                                             .map(|t| (score_tool_relevance(&t.name), *t))
                                             .collect();
                                         scored.sort_by(|a, b| b.0.cmp(&a.0));
@@ -1548,16 +1643,13 @@ impl McpManager {
                                     };
 
                                     // Inject selected tools into the dynamic cache
-                                    let rmcp_tools: Vec<rmcp::model::Tool> = selected
-                                        .iter()
-                                        .map(|t| composio_to_rmcp_tool(t))
-                                        .collect();
+                                    let rmcp_tools: Vec<rmcp::model::Tool> =
+                                        selected.iter().map(|t| composio_to_rmcp_tool(t)).collect();
                                     let injected_count = rmcp_tools.len();
                                     {
                                         let mut cache = dynamic_tools_cache.lock().await;
-                                        let new_names: std::collections::HashSet<String> = rmcp_tools.iter()
-                                            .map(|t| t.name.to_string())
-                                            .collect();
+                                        let new_names: std::collections::HashSet<String> =
+                                            rmcp_tools.iter().map(|t| t.name.to_string()).collect();
                                         cache.retain(|t| !new_names.contains(&t.name.to_string()));
                                         cache.extend(rmcp_tools);
                                         tracing::info!(
@@ -1577,10 +1669,12 @@ impl McpManager {
                                     // Build response
                                     let tool_results: Vec<serde_json::Value> = selected
                                         .iter()
-                                        .map(|t| serde_json::json!({
-                                            "name": t.name,
-                                            "description": t.description,
-                                        }))
+                                        .map(|t| {
+                                            serde_json::json!({
+                                                "name": t.name,
+                                                "description": t.description,
+                                            })
+                                        })
                                         .collect();
 
                                     let content_text = serde_json::to_string_pretty(&serde_json::json!({
@@ -1620,7 +1714,10 @@ impl McpManager {
                         let mut cache = dynamic_tools_cache.lock().await;
                         let cleared_count = cache.len();
                         cache.clear();
-                        tracing::info!("COMPOSIO_CLEAR_TOOLS: cleared {} dynamic tools", cleared_count);
+                        tracing::info!(
+                            "COMPOSIO_CLEAR_TOOLS: cleared {} dynamic tools",
+                            cleared_count
+                        );
 
                         Ok(CallToolResult {
                             content: vec![rmcp::model::Content::text(format!(
@@ -1651,7 +1748,13 @@ impl McpManager {
                                 {
                                     Ok(response) => {
                                         // Check for auth failure (401/403) and attempt auto-reconnection + retry
-                                        if let Some(auth_result) = try_auth_recovery(&response, target_tool_name, &composio_client).await {
+                                        if let Some(auth_result) = try_auth_recovery(
+                                            &response,
+                                            target_tool_name,
+                                            &composio_client,
+                                        )
+                                        .await
+                                        {
                                             let _ = tx.send(Ok(auth_result));
                                             return;
                                         }
@@ -1685,7 +1788,9 @@ impl McpManager {
                         match composio_client.execute_tool(&tool.name, args).await {
                             Ok(response) => {
                                 // Check for auth failure (401/403) and attempt auto-reconnection + retry
-                                if let Some(auth_result) = try_auth_recovery(&response, &tool.name, &composio_client).await {
+                                if let Some(auth_result) =
+                                    try_auth_recovery(&response, &tool.name, &composio_client).await
+                                {
                                     let _ = tx.send(Ok(auth_result));
                                     return;
                                 }
@@ -1920,10 +2025,11 @@ impl McpManager {
     ) -> Result<Vec<crate::mcp::composio_client::ToolkitInfo>, String> {
         let servers = self.servers.lock().await;
         // Find any composio-native client (may have profile suffix)
-        let composio_client = servers.iter()
+        let composio_client = servers
+            .iter()
             .find(|(k, _)| is_composio_native(k))
             .map(|(_, v)| v);
-        
+
         if let Some(client) = composio_client {
             if let McpClientType::NativeComposio(composio_client) = &client.service {
                 // Use list_connected_toolkits which:
@@ -1972,33 +2078,61 @@ impl McpManager {
         // into the prompt as real FunctionDeclarations.
         // Use the same display name as the real Composio server so the UX shows
         // a friendly profile name (e.g. "composio-native:Puget Systems") instead of a UUID.
+        //
+        // DEDUPLICATION (March 2026): Build a set of all tool names already present
+        // across all server contexts. Dynamic tools that collide with force-loaded
+        // tools are excluded to prevent Gemini "Duplicate function declaration" 400 errors.
         let dynamic_tools = self.dynamic_composio_tools.lock().await;
         if !dynamic_tools.is_empty() {
-            // Find the matching Composio server's display name
-            let server_name = servers.iter()
-                .find(|(k, c)| {
-                    is_composio_native(k) && match (&profile_id, &c.profile_id) {
-                        (Some(target), Some(cid)) => target == cid,
-                        (None, _) => true,
-                        _ => false,
-                    }
-                })
-                .map(|(_, c)| c.config.name.clone())
-                .unwrap_or_else(|| match &profile_id {
-                    Some(pid) => composio_server_key(pid),
-                    None => COMPOSIO_NATIVE_PREFIX.to_string(),
+            let existing_tool_names: HashSet<String> = server_contexts
+                .iter()
+                .flat_map(|sc| sc.tools.iter().map(|t| t.name.to_string()))
+                .collect();
+
+            let deduped_tools: Vec<Tool> = dynamic_tools
+                .iter()
+                .filter(|t| !existing_tool_names.contains(t.name.as_ref()))
+                .cloned()
+                .collect();
+
+            let skipped = dynamic_tools.len() - deduped_tools.len();
+            if skipped > 0 {
+                tracing::info!(
+                    "Dynamic tools: {} total, {} skipped (already in force-loaded set), {} injected",
+                    dynamic_tools.len(), skipped, deduped_tools.len()
+                );
+            }
+
+            if !deduped_tools.is_empty() {
+                // Find the matching Composio server's display name
+                let server_name = servers
+                    .iter()
+                    .find(|(k, c)| {
+                        is_composio_native(k)
+                            && match (&profile_id, &c.profile_id) {
+                                (Some(target), Some(cid)) => target == cid,
+                                (None, _) => true,
+                                _ => false,
+                            }
+                    })
+                    .map(|(_, c)| c.config.name.clone())
+                    .unwrap_or_else(|| match &profile_id {
+                        Some(pid) => composio_server_key(pid),
+                        None => COMPOSIO_NATIVE_PREFIX.to_string(),
+                    });
+                server_contexts.push(McpServerContext {
+                    name: server_name,
+                    description: "Dynamically discovered Composio tools".to_string(),
+                    tools: deduped_tools,
                 });
-            server_contexts.push(McpServerContext {
-                name: server_name,
-                description: "Dynamically discovered Composio tools".to_string(),
-                tools: dynamic_tools.clone(),
-            });
+            }
         }
 
         // Populate connected toolkit slugs from cached Composio toolkit info (MCP-First, Section 6).
         // This is a pure cache read — no network calls. The cache is hydrated by
         // list_connected_toolkits() which uses the MCP `tools/list` endpoint.
-        let connected_toolkit_slugs = servers.iter()
+        let connected_toolkit_slugs = servers
+            .iter()
             .find(|(k, _)| is_composio_native(k))
             .and_then(|(_, client)| {
                 if let McpClientType::NativeComposio(ref composio_client) = client.service {
@@ -2021,9 +2155,12 @@ impl McpManager {
         let mut unloaded = self.unloaded_servers.lock().await;
         unloaded.insert(server_name.to_string());
         drop(unloaded); // Release lock before sync try_lock in invalidate
-        // Pattern 150.8.1: Authoritative invalidation prevents UI state gaps
+                        // Pattern 150.8.1: Authoritative invalidation prevents UI state gaps
         self.invalidate_status_cache();
-        tracing::info!("Unloaded server '{}' - tools hidden from AI, cache invalidated", server_name);
+        tracing::info!(
+            "Unloaded server '{}' - tools hidden from AI, cache invalidated",
+            server_name
+        );
     }
 
     /// Load a server's tools back into the AI context
@@ -2031,9 +2168,12 @@ impl McpManager {
         let mut unloaded = self.unloaded_servers.lock().await;
         unloaded.remove(server_name);
         drop(unloaded); // Release lock before sync try_lock in invalidate
-        // Pattern 150.8.1: Authoritative invalidation prevents UI state gaps
+                        // Pattern 150.8.1: Authoritative invalidation prevents UI state gaps
         self.invalidate_status_cache();
-        tracing::info!("Loaded server '{}' - tools visible to AI, cache invalidated", server_name);
+        tracing::info!(
+            "Loaded server '{}' - tools visible to AI, cache invalidated",
+            server_name
+        );
     }
 
     /// Check if a server's tools are currently visible to the AI
@@ -2052,9 +2192,7 @@ impl McpManager {
         let mut servers = self.servers.lock().await;
 
         // Find the active composio-native client (may have profile suffix like "composio-native:ProfileName")
-        let composio_key = servers.keys()
-            .find(|k| is_composio_native(k))
-            .cloned();
+        let composio_key = servers.keys().find(|k| is_composio_native(k)).cloned();
 
         if let Some(key) = composio_key {
             if let Some(active_client) = servers.get_mut(&key) {
@@ -2071,7 +2209,11 @@ impl McpManager {
                         .await
                     {
                         Ok(discovery_result) => {
-                            let tools = discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
+                            let tools = discovery_result
+                                .tools
+                                .iter()
+                                .map(composio_to_rmcp_tool)
+                                .collect();
                             active_client.tools = tools;
                             active_client.warning_message = discovery_result.warning;
                             tracing::info!(
@@ -2117,8 +2259,12 @@ impl McpManager {
         mut trigger_search: Signal<i32>,
         mut connected_slugs: Signal<HashSet<String>>,
     ) -> Result<(), String> {
-        tracing::info!("Consolidated 6-Point Connection: toolkit_slug={} (auth_scheme: {:?}, managed: {})", 
-            toolkit_slug, auth_scheme, use_managed_auth);
+        tracing::info!(
+            "Consolidated 6-Point Connection: toolkit_slug={} (auth_scheme: {:?}, managed: {})",
+            toolkit_slug,
+            auth_scheme,
+            use_managed_auth
+        );
 
         is_connecting.set(true);
         connection_status.set("Connecting...".to_string());
@@ -2139,9 +2285,13 @@ impl McpManager {
             return Err(err);
         };
 
-        let base_url = profile.base_url.clone()
+        let base_url = profile
+            .base_url
+            .clone()
             .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
-        let user_id = profile.user_id.clone()
+        let user_id = profile
+            .user_id
+            .clone()
             .or(profile.entity_id.clone())
             .unwrap_or_else(|| "default".to_string());
         let profile_id = profile.id.clone();
@@ -2159,9 +2309,13 @@ impl McpManager {
         tracing::info!("[Step 1/5] Resolving Auth Config...");
         let auth_config_id = match client.get_auth_config_id(&toolkit_slug).await {
             Ok(id) => {
-                tracing::info!("Resolved auth config '{}' for toolkit '{}'", id, toolkit_slug);
+                tracing::info!(
+                    "Resolved auth config '{}' for toolkit '{}'",
+                    id,
+                    toolkit_slug
+                );
                 id
-            },
+            }
             Err(e) => {
                 let msg = format!("Failed to resolve auth config: {}", e);
                 tracing::error!("{}", msg);
@@ -2174,69 +2328,99 @@ impl McpManager {
         // Step 2: Initiate OAuth (Proxy Link) - AUTH FIRST
         tracing::info!("[Step 2/5] Initiating OAuth...");
         connection_status.set("Authenticating...".to_string());
-        
-        match client.initiate_connection(&toolkit_slug, &user_id, false).await {
+
+        match client
+            .initiate_connection(&toolkit_slug, &user_id, false)
+            .await
+        {
             Ok(result_msg) => {
-                 tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
-                 // Wait implied by await
-            },
+                tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
+                // Wait implied by await
+            }
             Err(e) => {
-                 let msg = format!("Authentication failed: {}", e);
-                 tracing::error!("{}", msg);
-                 connection_error.set(Some(msg.clone()));
-                 is_connecting.set(false);
-                 return Err(msg);
+                let msg = format!("Authentication failed: {}", e);
+                tracing::error!("{}", msg);
+                connection_error.set(Some(msg.clone()));
+                is_connecting.set(false);
+                return Err(msg);
             }
         }
 
         // Step 3: Add Toolkit to Server (PATCH Registry)
         tracing::info!("[Step 3/5] Patching MCP Server...");
         connection_status.set("Configuring Server...".to_string());
-        
+
         // Pass None so the vacuum fix handles non-standard slugs (e.g. spaces).
-        // Step 4 will trigger LLM selection if tools exceed TOOL_SELECTION_THRESHOLD.
-        let patch_result = client.add_toolkit_to_server(&toolkit_slug, &auth_config_id, None).await;
-        
+        // Step 4 will trigger LLM selection if tools exceed TOOL_SELECTION_THRESHOLD,
+        // UNLESS admin has pre-configured allowed_tools (security override).
+        let patch_result = client
+            .add_toolkit_to_server(&toolkit_slug, &auth_config_id, None)
+            .await;
+
+        // Track admin-curated tools detected during PATCH for Step 4 skip logic
+        let admin_tools_detected;
+
         match patch_result {
-            Ok(Some(new_server_url)) => {
-                tracing::info!("New MCP server created/updated: {}. Syncing client base URL.", new_server_url);
-                
-                // SYNC FIX: Update client internal URL
-                client.base_url = new_server_url.clone();
-
-                // GLOBAL SYNC: Update the global servers map so Status and other calls
-                // use the correct, newly-provisioned server URL immediately.
-                // Key format MUST be ID-based for stability: "composio-native:{profile_id}"
-                {
-                    let server_key = composio_server_key(&profile.id);
-                    let mut s = self.servers.lock().await;
-                    if let Some(existing) = s.get_mut(&server_key) {
-                        existing.service = McpClientType::NativeComposio(std::sync::Arc::new(client.clone()));
-                    } else {
-                        let active_client = ActiveMcpClient {
-                            config: McpServerConfig::composio_stub(composio_server_key(&profile.id)),
-                            service: McpClientType::NativeComposio(std::sync::Arc::new(client.clone())),
-                            tools: Vec::new(),
-                            warning_message: None,
-                            profile_id: Some(profile.id.clone()),
-                        };
-                        s.insert(server_key.clone(), active_client);
-                    }
+            Ok(result) => {
+                admin_tools_detected = !result.existing_toolkit_tools.is_empty();
+                if admin_tools_detected {
+                    tracing::info!(
+                        "[Step 3/5] Admin has pre-configured {} tools for '{}'. Will skip re-selection.",
+                        result.existing_toolkit_tools.len(),
+                        toolkit_slug
+                    );
                 }
 
-                {
-                    let mut s = settings_signal.write();
-                    if let Some(p) = s.composio_profiles.iter_mut().find(|p| p.id == profile_id) {
-                        p.base_url = Some(new_server_url.clone());
+                if let Some(new_server_url) = result.new_server_url {
+                    tracing::info!(
+                        "New MCP server created/updated: {}. Syncing client base URL.",
+                        new_server_url
+                    );
+
+                    // SYNC FIX: Update client internal URL
+                    client.base_url = new_server_url.clone();
+
+                    // GLOBAL SYNC: Update the global servers map so Status and other calls
+                    // use the correct, newly-provisioned server URL immediately.
+                    // Key format MUST be ID-based for stability: "composio-native:{profile_id}"
+                    {
+                        let server_key = composio_server_key(&profile.id);
+                        let mut s = self.servers.lock().await;
+                        if let Some(existing) = s.get_mut(&server_key) {
+                            existing.service =
+                                McpClientType::NativeComposio(std::sync::Arc::new(client.clone()));
+                        } else {
+                            let active_client = ActiveMcpClient {
+                                config: McpServerConfig::composio_stub(composio_server_key(
+                                    &profile.id,
+                                )),
+                                service: McpClientType::NativeComposio(std::sync::Arc::new(
+                                    client.clone(),
+                                )),
+                                tools: Vec::new(),
+                                warning_message: None,
+                                profile_id: Some(profile.id.clone()),
+                            };
+                            s.insert(server_key.clone(), active_client);
+                        }
                     }
+
+                    {
+                        let mut s = settings_signal.write();
+                        if let Some(p) = s.composio_profiles.iter_mut().find(|p| p.id == profile_id)
+                        {
+                            p.base_url = Some(new_server_url.clone());
+                        }
+                    }
+                    let updated = settings_signal.peek().clone();
+                    let sm = settings_manager.clone();
+                    spawn(async move {
+                        let _ = tokio::task::spawn_blocking(move || sm.save(&updated)).await;
+                    });
+                } else {
+                    tracing::debug!("Used existing MCP server for toolkit '{}'", toolkit_slug);
                 }
-                let updated = settings_signal.peek().clone();
-                let sm = settings_manager.clone();
-                spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || sm.save(&updated)).await;
-                });
             }
-            Ok(None) => tracing::debug!("Used existing MCP server for toolkit '{}'", toolkit_slug),
             Err(e) => {
                 let msg = format!("Failed to configure server: {}", e);
                 tracing::error!("{}", msg);
@@ -2247,56 +2431,86 @@ impl McpManager {
         }
 
         // Step 4: Smart Selection & Binding
-        tracing::info!("[Step 4/5] optimizing Tool Selection...");
-        connection_status.set("Optimizing Tools...".to_string());
-        
-        let selected_tools: Option<Vec<String>> = match client.get_toolkit_tools_detailed(&toolkit_slug).await {
-            Ok(tools) if tools.len() > TOOL_SELECTION_THRESHOLD => {
-                connection_status.set(format!("Selecting from {} tools...", tools.len()));
-                let candidates: Vec<ToolCandidate> = tools.into_iter()
-                    .map(|(name, desc)| ToolCandidate { name, description: desc })
-                    .collect();
+        // SECURITY: Skip re-selection if admin has pre-configured allowed_tools for this toolkit.
+        // This prevents Hobbes from overwriting admin curation (e.g., disabled SEND actions).
+        if admin_tools_detected {
+            tracing::info!(
+                "[Step 4/5] Skipping tool selection — admin-configured tools are authoritative for '{}'",
+                toolkit_slug
+            );
+            connection_status.set("Admin tools preserved".to_string());
+        } else {
+            tracing::info!("[Step 4/5] optimizing Tool Selection...");
+            connection_status.set("Optimizing Tools...".to_string());
 
-                let request = ToolSelectionRequest::new(toolkit_slug.clone(), None, candidates);
-                let llm_connector = GeminiConnector::new(settings_snapshot.gemini_config.clone());
+            let selected_tools: Option<Vec<String>> =
+                match client.get_toolkit_tools_detailed(&toolkit_slug).await {
+                    Ok(tools) if tools.len() > TOOL_SELECTION_THRESHOLD => {
+                        connection_status.set(format!("Selecting from {} tools...", tools.len()));
+                        let candidates: Vec<ToolCandidate> = tools
+                            .into_iter()
+                            .map(|(name, desc)| ToolCandidate {
+                                name,
+                                description: desc,
+                            })
+                            .collect();
 
-                match llm_connector.select_tools_for_toolkit(&request).await {
-                    Ok(selection) => Some(selection.selected_tools),
-                    Err(e) => {
-                        tracing::warn!("LLM tool selection failed: {}. Using default.", e);
-                        None
+                        let request =
+                            ToolSelectionRequest::new(toolkit_slug.clone(), None, candidates);
+                        let llm_connector =
+                            GeminiConnector::new(settings_snapshot.gemini_config.clone());
+
+                        match llm_connector.select_tools_for_toolkit(&request).await {
+                            Ok(selection) => Some(selection.selected_tools),
+                            Err(e) => {
+                                tracing::warn!("LLM tool selection failed: {}. Using default.", e);
+                                None
+                            }
+                        }
                     }
+                    Ok(tools) if !tools.is_empty() => {
+                        // Small toolkit: use all tools explicitly
+                        tracing::info!(
+                            "Toolkit '{}' has {} tools (under threshold), using all.",
+                            toolkit_slug,
+                            tools.len()
+                        );
+                        Some(tools.into_iter().map(|(name, _)| name).collect())
+                    }
+                    _ => None,
+                };
+
+            // If selected_tools is present, re-patch to apply filter
+            if let Some(tools) = selected_tools.clone() {
+                tracing::info!("Applying smart selection of {} tools", tools.len());
+                if let Err(e) = client
+                    .add_toolkit_to_server(&toolkit_slug, &auth_config_id, Some(tools))
+                    .await
+                {
+                    tracing::warn!("Failed to apply smart tool selection: {}", e);
                 }
             }
-            Ok(tools) if !tools.is_empty() => {
-                // Small toolkit: use all tools explicitly
-                tracing::info!("Toolkit '{}' has {} tools (under threshold), using all.", toolkit_slug, tools.len());
-                Some(tools.into_iter().map(|(name, _)| name).collect())
-            }
-            _ => None,
-        };
-        
-        // If selected_tools is present, re-patch to apply filter
-        if let Some(tools) = selected_tools.clone() {
-             tracing::info!("Applying smart selection of {} tools", tools.len());
-             if let Err(e) = client.add_toolkit_to_server(&toolkit_slug, &auth_config_id, Some(tools)).await {
-                 tracing::warn!("Failed to apply smart tool selection: {}", e);
-             }
-        }
+        } // end of !admin_tools_detected branch
 
         // Step 5: Final Reload
         tracing::info!("[Step 5/5] Finalizing Configuration...");
         {
             let mut s = settings_signal.write();
             if let Some(profile) = s.get_active_profile_mut() {
-                if !profile.toolkit_configs.iter().any(|c| c.slug == toolkit_slug) {
-                    profile.toolkit_configs.push(crate::settings::ComposioToolkitConfig {
-                        slug: toolkit_slug.clone(),
-                        display_name: toolkit_slug.clone(),
-                        tool_count: 0,
-                        force_load: false,
-                        load_mode: crate::settings::ToolkitLoadMode::OnDemand,
-                    });
+                if !profile
+                    .toolkit_configs
+                    .iter()
+                    .any(|c| c.slug == toolkit_slug)
+                {
+                    profile
+                        .toolkit_configs
+                        .push(crate::settings::ComposioToolkitConfig {
+                            slug: toolkit_slug.clone(),
+                            display_name: toolkit_slug.clone(),
+                            tool_count: 0,
+                            force_load: false,
+                            load_mode: crate::settings::ToolkitLoadMode::OnDemand,
+                        });
                 }
             }
             let updated = s.clone();
@@ -2315,20 +2529,20 @@ impl McpManager {
         // Update Context
         mcp_context_signal.set(self.get_mcp_context(None).await);
         self.invalidate_status_cache();
-        
+
         let current_trigger = *trigger_search.peek();
         trigger_search.set(current_trigger + 1);
         connected_slugs.write().insert(toolkit_slug.to_lowercase());
-        
+
         is_connecting.set(false);
         connection_status.set("Connected".to_string());
         tracing::info!("6-Point Connection Flow Complete for '{}'", toolkit_slug);
-        
+
         Ok(())
     }
     pub async fn get_client(&self, server_name: &str) -> Result<ActiveMcpClient, String> {
         let servers = self.servers.lock().await; // Lock held only for this lookup
-        
+
         // 1. Direct lookup
         if let Some(client) = servers.get(server_name) {
             return Ok(client.clone());
@@ -2512,15 +2726,15 @@ impl McpManager {
         // but could still be active or failed. Now uses "composio-native:{profile}" format.
         {
             // Find any active composio-native client (may have profile suffix)
-            let active_composio: Option<(&String, &ActiveMcpClient)> = servers.iter()
-                .find(|(k, _)| is_composio_native(k));
-            
+            let active_composio: Option<(&String, &ActiveMcpClient)> =
+                servers.iter().find(|(k, _)| is_composio_native(k));
+
             // Find any failed composio-native client
-            let failed_composio: Option<(&String, &(McpServerConfig, String))> = failed.iter()
-                .find(|(k, _)| is_composio_native(k));
-            
+            let failed_composio: Option<(&String, &(McpServerConfig, String))> =
+                failed.iter().find(|(k, _)| is_composio_native(k));
+
             let display_name = COMPOSIO_NATIVE_PREFIX.to_string();
-            
+
             if let Some((name, client)) = active_composio {
                 let composio_is_loaded = !unloaded.contains(name);
                 statuses.push(McpServerStatus {
@@ -2591,7 +2805,9 @@ impl McpManager {
             *cache = None;
             tracing::debug!("Invalidated server status cache");
         } else {
-            tracing::warn!("invalidate_status_cache: try_lock failed — mutex contended, cache NOT cleared");
+            tracing::warn!(
+                "invalidate_status_cache: try_lock failed — mutex contended, cache NOT cleared"
+            );
         }
     }
 
@@ -2628,23 +2844,32 @@ impl McpManager {
                     return;
                 };
 
-                match self_clone.initialize_native_composio_for_profile(profile).await {
+                match self_clone
+                    .initialize_native_composio_for_profile(profile)
+                    .await
+                {
                     Ok(active_client) => {
-                        servers_clone.lock().await.insert(server_name_owned.clone(), active_client);
+                        servers_clone
+                            .lock()
+                            .await
+                            .insert(server_name_owned.clone(), active_client);
                         self_clone.invalidate_status_cache_async().await;
                         let new_context = self_clone.get_mcp_context(None).await;
                         mcp_context_signal_clone.set(new_context);
-                        tracing::info!("Successfully retried virtual Composio client: {}", server_name_owned);
+                        tracing::info!(
+                            "Successfully retried virtual Composio client: {}",
+                            server_name_owned
+                        );
                     }
                     Err(e) => {
                         let error_msg = format!("Failed to retry Composio: {}", e);
                         if !McpManager::is_needs_setup_error(&error_msg) {
                             tracing::error!("{}", error_msg);
                             let stub = McpServerConfig::composio_stub(server_name_owned.clone());
-                            failed_servers_clone.lock().await.insert(
-                                server_name_owned,
-                                (stub, error_msg),
-                            );
+                            failed_servers_clone
+                                .lock()
+                                .await
+                                .insert(server_name_owned, (stub, error_msg));
                             self_clone.invalidate_status_cache_async().await;
                             let new_context = self_clone.get_mcp_context(None).await;
                             mcp_context_signal_clone.set(new_context);
@@ -2742,8 +2967,11 @@ impl McpManager {
 
                         match client_for_tools.list_tools().await {
                             Ok(discovery_result) => {
-                                let tools =
-                                    discovery_result.tools.iter().map(composio_to_rmcp_tool).collect();
+                                let tools = discovery_result
+                                    .tools
+                                    .iter()
+                                    .map(composio_to_rmcp_tool)
+                                    .collect();
                                 let active_client = ActiveMcpClient {
                                     config: server_config_clone,
                                     service: McpClientType::NativeComposio(composio_client),
@@ -3098,7 +3326,8 @@ impl McpManager {
                     }
                 }
 
-                let mut config = McpServerConfig::composio_stub(server_config.qualified_name.clone());
+                let mut config =
+                    McpServerConfig::composio_stub(server_config.qualified_name.clone());
                 config.command = Some(c.command.clone());
                 config.args = Some(args);
                 config.env = env;

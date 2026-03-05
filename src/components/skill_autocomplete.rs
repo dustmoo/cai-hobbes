@@ -1,5 +1,5 @@
-use dioxus::prelude::*;
 use crate::skills::Skill;
+use dioxus::prelude::*;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct SkillAutocompleteProps {
@@ -17,7 +17,8 @@ pub fn SkillAutocomplete(props: SkillAutocompleteProps) -> Element {
     // Measure input position to prevent overflow clipping (Smart Positioning)
     use_effect(move || {
         spawn(async move {
-            let eval = document::eval(r#"
+            let eval = document::eval(
+                r#"
                 const input = document.getElementById('chat-textarea');
                 if (!input) return null;
                 const rect = input.getBoundingClientRect();
@@ -26,8 +27,9 @@ pub fn SkillAutocomplete(props: SkillAutocompleteProps) -> Element {
                     bottom: window.innerHeight - rect.top + 8,
                     left: rect.left
                 };
-            "#);
-            
+            "#,
+            );
+
             if let Ok(json) = eval.await {
                 if !json.is_null() {
                     let bottom = json["bottom"].as_f64().unwrap_or(0.0);
@@ -42,15 +44,19 @@ pub fn SkillAutocomplete(props: SkillAutocompleteProps) -> Element {
     if props.skills.is_empty() {
         return rsx! {};
     }
-    
+
     let (bottom, left) = *position.read();
-    let opacity = if *visible.read() { "opacity-100" } else { "opacity-0" };
+    let opacity = if *visible.read() {
+        "opacity-100"
+    } else {
+        "opacity-0"
+    };
 
     rsx! {
         div {
             class: "fixed w-72 bg-card border border-subtle rounded-lg shadow-xl z-[100] overflow-hidden py-1 max-h-64 overflow-y-auto transition-opacity duration-150 {opacity}",
             style: "bottom: {bottom}px; left: {left}px;",
-            
+
             // Keyboard navigation hint
             div {
                 class: "px-3 py-1 text-[10px] text-fg-muted border-b border-primary-800 flex items-center gap-2",
@@ -60,7 +66,7 @@ pub fn SkillAutocomplete(props: SkillAutocompleteProps) -> Element {
                 span { "•" }
                 span { "Esc Cancel" }
             }
-            
+
             for (i, skill) in props.skills.iter().enumerate() {
                 button {
                     key: "{skill.metadata.name}",
@@ -73,19 +79,19 @@ pub fn SkillAutocomplete(props: SkillAutocompleteProps) -> Element {
                         let s = skill.clone();
                         move |_| props.on_select.call(s.clone())
                     },
-                    // Note: Hover state doesn't update selected_index in parent, 
+                    // Note: Hover state doesn't update selected_index in parent,
                     // keeping keyboard nav as primary source of truth for 'selected' state to avoid conflicts.
                     // If we wanted hover to update selection, we'd need an on_hover event handler prop.
-                    
+
                     div {
                         class: "flex items-center justify-between w-full",
-                        span { 
-                            class: if i == props.selected_index { 
-                                "font-mono font-medium text-primary-200" 
-                            } else { 
-                                "font-mono font-medium text-primary-400 group-hover:text-primary-300" 
-                            }, 
-                            "/{skill.metadata.name}" 
+                        span {
+                            class: if i == props.selected_index {
+                                "font-mono font-medium text-primary-200"
+                            } else {
+                                "font-mono font-medium text-primary-400 group-hover:text-primary-300"
+                            },
+                            "/{skill.metadata.name}"
                         }
                     }
                     if !skill.metadata.description.is_empty() {

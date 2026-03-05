@@ -8,10 +8,13 @@ use std::collections::HashMap;
 // CONSTANTS
 // ============================================================================
 
-/// Known secret keys used by the application (Gemini, Smithery)
+/// Known secret keys used by the application
 pub const KNOWN_KEYS: &[&str] = &[
-    "api_key",          // Gemini API key
-    "smithery_api_key", // Smithery API key
+    "api_key",               // Legacy Gemini API key (migrated to gemini_api_key)
+    "gemini_api_key",        // Gemini API key (provider-scoped)
+    "claude_api_key",        // Claude API key (provider-scoped)
+    "openai_compat_api_key", // OpenAI-compatible API key (provider-scoped)
+    "smithery_api_key",      // Smithery API key
 ];
 
 /// Prefix for Composio profile API keys (e.g., "composio_api_key_default")
@@ -44,8 +47,14 @@ pub const CUSTOM_KEYS_INDEX_KEY: &str = "composio_custom_keys_index";
 /// ```
 pub fn format_custom_tool_key(profile: Option<&str>, slug: &str, field: &str) -> String {
     match profile {
-        Some(p) => format!("{}p:{}:{}{}{}", CUSTOM_TOOL_PREFIX, p, slug, CUSTOM_TOOL_SEPARATOR, field),
-        None => format!("{}{}{}{}", CUSTOM_TOOL_PREFIX, slug, CUSTOM_TOOL_SEPARATOR, field),
+        Some(p) => format!(
+            "{}p:{}:{}{}{}",
+            CUSTOM_TOOL_PREFIX, p, slug, CUSTOM_TOOL_SEPARATOR, field
+        ),
+        None => format!(
+            "{}{}{}{}",
+            CUSTOM_TOOL_PREFIX, slug, CUSTOM_TOOL_SEPARATOR, field
+        ),
     }
 }
 
@@ -54,7 +63,7 @@ pub fn format_custom_tool_key(profile: Option<&str>, slug: &str, field: &str) ->
 /// Returns `None` if the key doesn't match the expected format.
 pub fn parse_custom_tool_key(key: &str) -> Option<(Option<String>, String, String)> {
     let rest = key.strip_prefix(CUSTOM_TOOL_PREFIX)?;
-    
+
     // Check for profile scoping: p:{profile}:{slug}__field
     if let Some(p_rest) = rest.strip_prefix("p:") {
         if let Some((profile_part, slug_field_part)) = p_rest.split_once(':') {
@@ -62,7 +71,11 @@ pub fn parse_custom_tool_key(key: &str) -> Option<(Option<String>, String, Strin
             if slug.is_empty() || field.is_empty() || profile_part.is_empty() {
                 return None;
             }
-            return Some((Some(profile_part.to_string()), slug.to_string(), field.to_string()));
+            return Some((
+                Some(profile_part.to_string()),
+                slug.to_string(),
+                field.to_string(),
+            ));
         }
     }
 
@@ -73,8 +86,6 @@ pub fn parse_custom_tool_key(key: &str) -> Option<(Option<String>, String, Strin
     }
     Some((None, slug.to_string(), field.to_string()))
 }
-
-
 
 /// Check if a given key belongs to a specific toolkit slug (ignoring profile).
 pub fn key_belongs_to_toolkit(key: &str, slug: &str) -> bool {
@@ -182,26 +193,37 @@ pub trait SecretManagerTrait {
     /// Retrieve all loaded custom tool credentials for a specific profile.
     ///
     /// Returns a nested map: `Map<ToolkitSlug, Map<FieldName, Value>>`.
-    fn get_custom_tool_credentials(&self, profile_name: Option<&str>) -> HashMap<String, HashMap<String, String>> {
+    fn get_custom_tool_credentials(
+        &self,
+        profile_name: Option<&str>,
+    ) -> HashMap<String, HashMap<String, String>> {
         extract_custom_tool_credentials(profile_name, self.secrets_ref())
     }
 
     /// Check if there are any custom credentials for a specific toolkit slug in any profile.
     fn has_custom_tool_credentials(&self, slug: &str) -> bool {
-        self.secrets_ref().keys().any(|k| key_belongs_to_toolkit(k, slug))
+        self.secrets_ref()
+            .keys()
+            .any(|k| key_belongs_to_toolkit(k, slug))
     }
 
     /// Set a custom tool credential and update the index.
-    fn set_custom_tool_credential(&mut self, profile_name: Option<&str>, slug: &str, field: &str, value: String) -> Result<(), String> {
+    fn set_custom_tool_credential(
+        &mut self,
+        profile_name: Option<&str>,
+        slug: &str,
+        field: &str,
+        value: String,
+    ) -> Result<(), String> {
         let key = format_custom_tool_key(profile_name, slug, field);
-        
+
         // 1. Save the actual secret
         self.set(&key, value)?;
 
         // 2. Update Index
         let current_index = self.get_index_from_keychain().unwrap_or_default();
         let new_index = add_to_index_csv(&current_index, &key);
-        
+
         if new_index != current_index {
             self.set(CUSTOM_KEYS_INDEX_KEY, new_index)?;
             tracing::info!("Updated custom tool index with new key: {}", key);
@@ -211,9 +233,14 @@ pub trait SecretManagerTrait {
     }
 
     /// Delete a custom tool credential and update the index.
-    fn delete_custom_tool_credential(&mut self, profile_name: Option<&str>, slug: &str, field: &str) -> Result<(), String> {
+    fn delete_custom_tool_credential(
+        &mut self,
+        profile_name: Option<&str>,
+        slug: &str,
+        field: &str,
+    ) -> Result<(), String> {
         let key = format_custom_tool_key(profile_name, slug, field);
-        
+
         // 1. Delete the actual secret
         let _ = self.delete(&key);
 
@@ -267,16 +294,13 @@ pub fn extract_custom_tool_credentials(
             // Fallback: Global/Global Match if no profile specified
             let matches = match (profile_name, k_profile) {
                 (Some(p), Some(kp)) if p == kp => true,
-                (None, _) => true, // Extract ALL if no filter
+                (None, _) => true,       // Extract ALL if no filter
                 (Some(_), None) => true, // Fallback: Allow global creds in a profile
                 _ => false,
             };
 
             if matches {
-                result
-                    .entry(slug)
-                    .or_default()
-                    .insert(field, value.clone());
+                result.entry(slug).or_default().insert(field, value.clone());
             }
         }
     }
@@ -313,10 +337,20 @@ mod tests {
     fn test_parse_custom_tool_key_valid() {
         // Global key
         let result = parse_custom_tool_key("composio_tool_slack__api_key");
-        assert_eq!(result, Some((None, "slack".to_string(), "api_key".to_string())));
+        assert_eq!(
+            result,
+            Some((None, "slack".to_string(), "api_key".to_string()))
+        );
         // Profile-scoped key
         let scoped = parse_custom_tool_key("composio_tool_p:Puget:slack__api_key");
-        assert_eq!(scoped, Some((Some("Puget".to_string()), "slack".to_string(), "api_key".to_string())));
+        assert_eq!(
+            scoped,
+            Some((
+                Some("Puget".to_string()),
+                "slack".to_string(),
+                "api_key".to_string()
+            ))
+        );
     }
 
     #[test]
@@ -327,12 +361,16 @@ mod tests {
         assert_eq!(parse_custom_tool_key("composio_tool_slug__"), None); // Empty field
     }
 
-
-
     #[test]
     fn test_key_belongs_to_toolkit() {
-        assert!(key_belongs_to_toolkit("composio_tool_slack__api_key", "slack"));
-        assert!(!key_belongs_to_toolkit("composio_tool_gmail__api_key", "slack"));
+        assert!(key_belongs_to_toolkit(
+            "composio_tool_slack__api_key",
+            "slack"
+        ));
+        assert!(!key_belongs_to_toolkit(
+            "composio_tool_gmail__api_key",
+            "slack"
+        ));
         assert!(!key_belongs_to_toolkit("api_key", "slack"));
     }
 
@@ -362,16 +400,34 @@ mod tests {
     #[test]
     fn test_extract_custom_tool_credentials() {
         let mut secrets = HashMap::new();
-        secrets.insert("composio_tool_slack__api_key".to_string(), "sk-123".to_string());
-        secrets.insert("composio_tool_slack__secret".to_string(), "sec-456".to_string());
-        secrets.insert("composio_tool_gmail__token".to_string(), "tok-789".to_string());
+        secrets.insert(
+            "composio_tool_slack__api_key".to_string(),
+            "sk-123".to_string(),
+        );
+        secrets.insert(
+            "composio_tool_slack__secret".to_string(),
+            "sec-456".to_string(),
+        );
+        secrets.insert(
+            "composio_tool_gmail__token".to_string(),
+            "tok-789".to_string(),
+        );
         secrets.insert("api_key".to_string(), "gemini-key".to_string()); // Not a tool cred
 
         let result = extract_custom_tool_credentials(None, &secrets);
 
         assert_eq!(result.len(), 2); // slack and gmail
-        assert_eq!(result.get("slack").unwrap().get("api_key").unwrap(), "sk-123");
-        assert_eq!(result.get("slack").unwrap().get("secret").unwrap(), "sec-456");
-        assert_eq!(result.get("gmail").unwrap().get("token").unwrap(), "tok-789");
+        assert_eq!(
+            result.get("slack").unwrap().get("api_key").unwrap(),
+            "sk-123"
+        );
+        assert_eq!(
+            result.get("slack").unwrap().get("secret").unwrap(),
+            "sec-456"
+        );
+        assert_eq!(
+            result.get("gmail").unwrap().get("token").unwrap(),
+            "tok-789"
+        );
     }
 }

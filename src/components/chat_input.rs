@@ -11,8 +11,8 @@ use std::time::SystemTime;
 
 #[cfg(debug_assertions)]
 use crate::context::prompt_builder::PromptBuilder;
-use crate::components::llm::GeminiModel;
-use crate::settings::{get_default_model_icon, get_slot_icon, Settings, SettingsManager, UiState};
+use crate::llm::GeminiModel;
+use crate::settings::{get_default_model_icon, get_slot_icon, LlmProvider, Settings, SettingsManager, UiState};
 use hobbes_core::models::Attachment;
 
 use crate::components::focus_context::FocusContext;
@@ -48,6 +48,16 @@ pub enum ChatCommand {
     #[allow(dead_code)] // Constructed and consumed locally via signal pattern
     ToggleModelSelector,
     CloseTab,
+}
+
+/// Provider-aware model display name. For Gemini, uses the curated display name
+/// from GeminiModel. For other providers, the raw slug is already human-readable
+/// (e.g. `gpt-4o-mini`, `Qwen/Qwen3-235B`).
+fn display_name_for_provider(provider: &LlmProvider, model_slug: &str) -> String {
+    match provider {
+        LlmProvider::Gemini => GeminiModel::from_slug(model_slug).display_name(),
+        _ => model_slug.to_string(),
+    }
 }
 
 #[component]
@@ -112,14 +122,14 @@ pub fn ChatInput(
                 ChatCommand::ToggleModelSelector => {
                     show_model_selector.set(!show_model_selector());
                 }
-                ChatCommand::ToggleSettings 
-                | ChatCommand::ToggleHistory 
-                | ChatCommand::ToggleMcp 
+                ChatCommand::ToggleSettings
+                | ChatCommand::ToggleHistory
+                | ChatCommand::ToggleMcp
                 | ChatCommand::SwitchToSettingsTab(_, _)
                 | ChatCommand::SwitchTab(_)
                 | ChatCommand::SwitchToSession(_)
-                | ChatCommand::NewChat 
-                | ChatCommand::DeleteSession(_) 
+                | ChatCommand::NewChat
+                | ChatCommand::DeleteSession(_)
                 | ChatCommand::SwitchProfile(_)
                 | ChatCommand::SwitchModel(_)
                 | ChatCommand::CloseTab => {
@@ -223,22 +233,28 @@ pub fn ChatInput(
             let parts: Vec<&str> = user_message.split_whitespace().collect();
             if !parts.is_empty() {
                 let skill_name = parts[0].trim_start_matches('/');
-                let skill_registry = use_context::<Signal<crate::skills::registry::SkillRegistry>>();
+                let skill_registry =
+                    use_context::<Signal<crate::skills::registry::SkillRegistry>>();
                 let skill_opt = {
                     let registry = skill_registry.read();
                     registry.get_skill(skill_name)
                 };
-                
+
                 if let Some(skill) = skill_opt {
                     let arguments = parts[1..].join(" ");
-                    let permission_manager = use_context::<Signal<crate::context::permissions::PermissionManager>>();
-                    let permission_status = permission_manager.read().check_skill_permission(&skill.metadata.name);
+                    let permission_manager =
+                        use_context::<Signal<crate::context::permissions::PermissionManager>>();
+                    let permission_status = permission_manager
+                        .read()
+                        .check_skill_permission(&skill.metadata.name);
 
                     let skill_call = crate::components::shared::SkillCall {
                         execution_id: uuid::Uuid::new_v4().to_string(),
                         skill_name: skill.metadata.name.clone(),
                         arguments,
-                        status: if permission_status == crate::context::permissions::PermissionStatus::Allowed {
+                        status: if permission_status
+                            == crate::context::permissions::PermissionStatus::Allowed
+                        {
                             crate::components::shared::SkillCallStatus::Running
                         } else {
                             crate::components::shared::SkillCallStatus::Pending
@@ -250,15 +266,19 @@ pub fn ChatInput(
                         raw_output: None,
                         profile_color: {
                             let settings_read = settings.read();
-                            let profile_name = session_state.read().get_active_session()
-                                .and_then(|s| settings_read.resolve_session_profile_display_name(s.composio_profile.as_deref()));
+                            let profile_name =
+                                session_state.read().get_active_session().and_then(|s| {
+                                    settings_read.resolve_session_profile_display_name(
+                                        s.composio_profile.as_deref(),
+                                    )
+                                });
                             crate::components::shared::resolve_profile_color(
                                 profile_name.as_ref(),
                                 &settings_read,
                             )
                         },
                     };
-                    
+
                     // First, push a normal user text bubble showing the command (history parity)
                     let user_bubble = crate::components::chat::Message {
                         id: uuid::Uuid::new_v4(),
@@ -283,7 +303,9 @@ pub fn ChatInput(
                         let skill_message = crate::components::chat::Message {
                             id: uuid::Uuid::new_v4(),
                             author: "User".to_string(),
-                            content: crate::components::shared::MessageContent::SkillCall(skill_call.clone()),
+                            content: crate::components::shared::MessageContent::SkillCall(
+                                skill_call.clone(),
+                            ),
                             attachments: Vec::new(),
                             comments: Vec::new(),
                             created_at: chrono::Utc::now(),
@@ -307,27 +329,34 @@ pub fn ChatInput(
                         mcp_context.enrich_from_settings(&settings.read());
 
                         spawn(async move {
-                            match crate::skills::execute_skill(&mut sc_clone, Some(&mcp_context)).await {
+                            match crate::skills::execute_skill(&mut sc_clone, Some(&mcp_context))
+                                .await
+                            {
                                 Ok(result) => {
                                     // Update message with completed SkillCall
                                     let mut state = session_state.write();
                                     if let Some(session) = state.get_active_session_mut() {
-                                        if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
+                                        if let Some(msg) =
+                                            session.messages.iter_mut().find(|m| m.id == msg_id)
+                                        {
                                             sc_clone.status = result.status;
                                             sc_clone.response = result.output;
                                             msg.content = crate::components::shared::MessageContent::SkillCall(sc_clone);
                                         }
                                     }
                                     drop(state); // Release lock before triggering
-                                    // Auto-trigger LLM to respond with the injected skill context
+                                                 // Auto-trigger LLM to respond with the injected skill context
                                     chat_command.set(Some(ChatCommand::TriggerAiAnalysis));
                                 }
                                 Err(e) => {
                                     tracing::error!("Skill execution failed: {}", e);
                                     let mut state = session_state.write();
                                     if let Some(session) = state.get_active_session_mut() {
-                                        if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
-                                            sc_clone.status = crate::components::shared::SkillCallStatus::Error;
+                                        if let Some(msg) =
+                                            session.messages.iter_mut().find(|m| m.id == msg_id)
+                                        {
+                                            sc_clone.status =
+                                                crate::components::shared::SkillCallStatus::Error;
                                             sc_clone.response = format!("Error: {}", e);
                                             msg.content = crate::components::shared::MessageContent::SkillCall(sc_clone);
                                         }
@@ -335,27 +364,28 @@ pub fn ChatInput(
                                 }
                             }
                         });
-
-
                     } else {
                         // PROMPT PATH (Existing Logic)
                         let skill_message = crate::components::chat::Message {
                             id: uuid::Uuid::new_v4(),
                             author: "User".to_string(),
-                            content: crate::components::shared::MessageContent::SkillPermissionRequest(skill_call),
+                            content:
+                                crate::components::shared::MessageContent::SkillPermissionRequest(
+                                    skill_call,
+                                ),
                             attachments: Vec::new(),
                             comments: Vec::new(),
                             created_at: chrono::Utc::now(),
                             usage: None,
                         };
-                        
+
                         let mut state = session_state.write();
                         if let Some(session) = state.get_active_session_mut() {
                             session.messages.push(user_bubble);
                             session.messages.push(skill_message);
                         }
                     }
-                    
+
                     draft.set(String::new());
                     attachments.set(Vec::new());
                     return;
@@ -469,8 +499,8 @@ pub fn ChatInput(
 
                 // Model Selector Dropdown
                 { if ui_state.read().show_model_selector {
-                    let current_model = settings.read().gemini_config.chat_model.clone();
-                    let slots = settings.read().model_slots.clone();
+                    let current_model = settings.read().active_chat_model();
+                    let slots = settings.read().active_model_slots();
                     let user_icons = settings.read().model_icons.clone();
                     // Icon priority: user-set icon > slot position icon > default
                     let current_slot_idx = slots.iter().position(|s| s == &current_model);
@@ -483,7 +513,7 @@ pub fn ChatInput(
                             class: "relative",
                             button {
                                 class: "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm hover:border-primary-500 transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-primary-600",
-                                title: "{GeminiModel::from_slug(&current_model).display_name()}",
+                                title: "{display_name_for_provider(&settings.read().active_llm, &current_model)}",
                                 onclick: move |_| show_model_selector.set(!show_model_selector()),
                                 "{model_icon}"
                             }
@@ -499,7 +529,7 @@ pub fn ChatInput(
                                             let icon = user_icons.get(model_slug).cloned()
                                                 .unwrap_or_else(|| get_slot_icon(index));
                                             // Display name: strip common prefixes for readability
-                                            let display_name = GeminiModel::from_slug(model_slug).display_name();
+                                            let display_name = display_name_for_provider(&settings.read().active_llm, model_slug);
 
                                             rsx! {
                                                 button {
@@ -582,7 +612,7 @@ pub fn ChatInput(
                                                     let profile_name = profile.name.clone();
                                                     let profile_color = profile.color.clone();
                                                     let profile_initial = profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                                                    
+
                                                     if profile.name != active_profile.name {
                                                         rsx! {
                                                             button {
@@ -592,7 +622,7 @@ pub fn ChatInput(
                                                                         session.composio_profile = Some(profile_id.clone());
                                                                     }
                                                                     settings.write().active_composio_profile = Some(profile_id.clone());
-                                                                    
+
                                                                     // Trigger summary refresh
                                                                     scheduler.send(SchedulerSignal::ForceRefresh);
                                                                     show_profile_selector.set(false);
@@ -746,7 +776,7 @@ pub fn ChatInput(
                         }
 
                         let is_force_submit = matches_hotkey(&event, &hotkeys.submit_chat);
-                        
+
                         // 2. Filter Global Modifiers
                         // Allow if it matches our force submit (e.g. Cmd+Enter), otherwise let browser/OS handle Cmd+X, Cmd+R, etc.
                         let has_cmd_opt_ctrl = modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::ALT);
@@ -835,7 +865,7 @@ pub fn ChatInput(
                                             } else {
                                                 String::new()
                                             };
-                                            
+
                                             let skill_command = if args.is_empty() {
                                                 format!("/{} ", skill.metadata.name)
                                             } else {
@@ -1188,7 +1218,8 @@ fn SessionCostIcon() -> Element {
     // animation_target prevents strobe: only trigger once per distinct cost value
     let old_cost = *prev_cost.peek();
     let last_target = *animation_target.peek();
-    if total_cost > old_cost && (total_cost - old_cost).abs() > 0.0001
+    if total_cost > old_cost
+        && (total_cost - old_cost).abs() > 0.0001
         && (total_cost - last_target).abs() > 0.0001
     {
         prev_cost.set(total_cost);

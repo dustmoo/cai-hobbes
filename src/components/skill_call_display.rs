@@ -4,18 +4,17 @@
 //! Follows the patterns from tool_call_display.rs for consistency.
 
 use dioxus::prelude::*;
-use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fi_icons;
+use dioxus_free_icons::Icon;
 
-
-use crate::components::shared::{SkillCall, SkillCallStatus, CapabilityContextPayload};
+use crate::components::shared::{CapabilityContextPayload, SkillCall, SkillCallStatus};
 
 /// Props for the SkillPermissionPrompt component
 #[derive(Props, Clone, PartialEq)]
 pub struct SkillPermissionPromptProps {
     pub skill_call: SkillCall,
-    pub on_approve: EventHandler<String>,  // execution_id
-    pub on_deny: EventHandler<String>,     // execution_id
+    pub on_approve: EventHandler<String>, // execution_id
+    pub on_deny: EventHandler<String>,    // execution_id
 }
 
 /// Permission prompt for skill execution - shows Approve/Deny buttons
@@ -24,7 +23,7 @@ pub fn SkillPermissionPrompt(props: SkillPermissionPromptProps) -> Element {
     let mut settings = consume_context::<Signal<crate::settings::Settings>>();
     let settings_manager = consume_context::<Signal<crate::settings::SettingsManager>>();
     let skill_call = props.skill_call.clone();
-    
+
     // Signal for "Always allow this skill" checkbox
     let mut remember_choice = use_signal(|| false);
 
@@ -138,22 +137,23 @@ pub struct SkillCallDisplayProps {
 #[component]
 pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
     let skill_call = &props.skill_call;
-    
+
     // Consume global UI state for default preferences
     let ui_state = consume_context::<Signal<crate::settings::UiState>>();
-    
+
     // Local signals initialized from global defaults - sticky per bubble
     let mut show_arguments = use_signal(|| false);
     let mut show_response = use_signal(|| true); // Expand response by default for visibility
     let mut show_tools_detail = use_signal(|| false); // Collapsed by default to reduce noise
     let mut show_instructions = use_signal(|| ui_state.read().default_skill_instructions_open);
-    
+
     // Try to parse response as CapabilityContextPayload
-    let context_payload: Option<CapabilityContextPayload> = if skill_call.status == SkillCallStatus::Completed {
-        serde_json::from_str(&skill_call.response).ok()
-    } else {
-        None
-    };
+    let context_payload: Option<CapabilityContextPayload> =
+        if skill_call.status == SkillCallStatus::Completed {
+            serde_json::from_str(&skill_call.response).ok()
+        } else {
+            None
+        };
 
     // If we need to show permission prompt, render that instead
     if props.show_permission_prompt && skill_call.status == SkillCallStatus::Pending {
@@ -167,7 +167,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
             };
         }
     }
-    
+
     // Choose status text
     let status_text = match skill_call.status {
         SkillCallStatus::Pending => "Pending",
@@ -190,7 +190,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                 span { class: "font-mono font-bold text-sm", "{skill_call.skill_name}" }
                 span { class: "text-[10px] opacity-70 uppercase tracking-wider font-bold ml-auto", "{status_text}" }
             }
-            
+
             // Warnings (if Capability Context)
             if let Some(payload) = &context_payload {
                 if !payload.warnings.is_empty() {
@@ -229,7 +229,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                     }
                 }
             }
-            
+
             // Response collapsible section
             if !skill_call.response.is_empty() {
                 div {
@@ -242,7 +242,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                         } else {
                             Icon { width: 14, height: 14, icon: fi_icons::FiChevronRight }
                         }
-                        
+
                         // Change label if it's a Context Payload
                         if context_payload.is_some() {
                              "Context Payload"
@@ -265,14 +265,14 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                                         class: "grid grid-cols-[max-content_1fr] gap-x-2 gap-y-1 text-xs font-mono",
                                         span { class: "opacity-50", "Tools:" }
                                         span { "{payload.resolved_tools.len()} Resolved" }
-                                        
+
                                         span { class: "opacity-50", "Scripts:" }
                                         span { "{payload.environment.scripts.len()} Found" }
-                                        
+
                                         span { class: "opacity-50", "Resources:" }
                                         span { "{payload.environment.resources.len()} Found" }
                                     }
-                                    
+
                                     // Helper for Resolved Tools
                                     if !payload.resolved_tools.is_empty() {
                                         div {
@@ -291,7 +291,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                                                 }
                                                 span { class: "text-[10px] bg-white/10 px-1.5 rounded opacity-50 font-mono", "{payload.resolved_tools.len()}" }
                                             }
-                                            
+
                                             // Collapsible Content
                                             if *show_tools_detail.read() {
                                                 div {
@@ -325,7 +325,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                     }
                 }
             }
-            
+
             // Instructions collapsible section - rendered from instruction_manual in payload
             if let Some(payload) = &context_payload {
                 if !payload.instruction_manual.is_empty() {
@@ -353,7 +353,7 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
                     }
                 }
             }
-            
+
 
         }
     }

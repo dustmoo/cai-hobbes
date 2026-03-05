@@ -1,5 +1,5 @@
-use crate::components::llm::LlmConnector;
 use crate::components::shared::MessageContent;
+use crate::llm::LlmConnector;
 use crate::session::{ConversationSummary, Session};
 use crate::settings::Settings;
 use std::sync::Arc;

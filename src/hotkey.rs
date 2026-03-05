@@ -328,7 +328,10 @@ pub fn matches_hotkey_internal(modifiers: Modifiers, key: &Key, hotkey_str: &str
             "arrowleft" => *key == Key::ArrowLeft,
             "arrowright" => *key == Key::ArrowRight,
             "tab" => *key == Key::Tab,
-            "space" => matches!(key, Key::Character(c) if c == " ") || *key == Key::Character("Space".to_string()),
+            "space" => {
+                matches!(key, Key::Character(c) if c == " ")
+                    || *key == Key::Character("Space".to_string())
+            }
             k => {
                 // Character match (case-insensitive)
                 match key {
@@ -368,7 +371,7 @@ mod tests {
             &Key::Enter,
             "CmdOrCtrl+Enter"
         ));
-    
+
         // Cmd+Shift+Enter
         assert!(matches_hotkey_internal(
             Modifiers::SUPER | Modifiers::SHIFT,
@@ -382,7 +385,7 @@ mod tests {
             &Key::Character("s".to_string()),
             "CmdOrCtrl+S"
         ));
-        
+
         // Case insensitive S
         assert!(matches_hotkey_internal(
             Modifiers::SUPER,

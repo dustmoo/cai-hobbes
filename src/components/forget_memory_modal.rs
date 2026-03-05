@@ -1,5 +1,5 @@
 use crate::components::focus_context::FocusContext;
-use crate::components::llm::{Content, GeminiRequest, Part};
+use crate::llm::{Content, GeminiRequest, Part};
 use crate::session::ActiveContext;
 use crate::settings::Settings;
 use dioxus::prelude::*;
@@ -46,9 +46,8 @@ pub fn ForgetMemoryModal(
         let current_context_val = current_context.clone();
         // Only serialize the conversation_summary - NOT the full ActiveContext
         // The full ActiveContext includes mcp_tools which can be massive (all tool definitions)
-        let summary_json =
-            serde_json::to_string_pretty(&current_context_val.conversation_summary)
-                .unwrap_or_default();
+        let summary_json = serde_json::to_string_pretty(&current_context_val.conversation_summary)
+            .unwrap_or_default();
         let settings_read = settings.read();
 
         // Clone the full config from state to preserve all fields (API key, etc.)
@@ -65,7 +64,7 @@ pub fn ForgetMemoryModal(
             // We use the configured summary model via the transient config
             // The connector will now use the properly loaded settings state
 
-            let connector = crate::components::llm::GeminiConnector::new(transient_config);
+            let connector = crate::llm::GeminiConnector::new(transient_config);
 
             let prompt = format!(
                 r#"You are an intelligent memory optimization assistant.
@@ -96,8 +95,10 @@ Ensure the "optimized_summary" maintains the correct schema."#,
                 tools: None,
                 system_instruction: None,
                 tool_config: None,
-                generation_config: Some(crate::components::llm::GenerationConfig {
+                generation_config: Some(crate::llm::GenerationConfig {
                     thinking_config: None, // No thinking needed for this utility task
+                    response_mime_type: None,
+                    response_schema: None,
                 }),
             };
 

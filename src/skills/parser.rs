@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -64,7 +64,7 @@ impl Skill {
             // Fallback for non-existent paths (e.g. tests)
             path.to_path_buf()
         };
-        
+
         Self::parse(&content, canonical_path)
     }
 
@@ -74,7 +74,7 @@ impl Skill {
         }
 
         let parts: Vec<&str> = content.splitn(3, "---").collect();
-        
+
         if parts.len() < 3 {
             return Err(SkillParserError::InvalidFrontmatter);
         }
@@ -153,18 +153,24 @@ allowed-tools: [Read, Grep]
 These are instructions.
 "#;
         let skill = Skill::parse(content, PathBuf::from("test.md")).unwrap();
-        
+
         assert_eq!(skill.metadata.name, "test-skill");
         assert_eq!(skill.metadata.description, "A test skill");
         assert!(skill.metadata.disable_model_invocation);
         assert!(skill.metadata.user_invocable); // Default
-        assert_eq!(skill.metadata.allowed_tools, Some(vec!["Read".to_string(), "Grep".to_string()]));
+        assert_eq!(
+            skill.metadata.allowed_tools,
+            Some(vec!["Read".to_string(), "Grep".to_string()])
+        );
         assert_eq!(skill.instructions, "These are instructions.");
     }
 
     #[test]
     fn test_missing_frontmatter() {
         let content = "Just text";
-        assert!(matches!(Skill::parse(content, PathBuf::from("test.md")), Err(SkillParserError::MissingFrontmatter)));
+        assert!(matches!(
+            Skill::parse(content, PathBuf::from("test.md")),
+            Err(SkillParserError::MissingFrontmatter)
+        ));
     }
 }

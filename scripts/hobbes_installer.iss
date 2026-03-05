@@ -1,5 +1,5 @@
 ; Hobbes Windows Installer - Inno Setup Script
-; Compile with: ISCC.exe /DVersion="0.9.50" hobbes_installer.iss
+; Compile with: ISCC.exe /DVersion="0.9.51" hobbes_installer.iss
 ; Download Inno Setup from: https://jrsoftware.org/isdl.php
 
 #ifndef Version

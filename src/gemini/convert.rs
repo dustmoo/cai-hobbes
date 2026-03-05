@@ -2,7 +2,7 @@
 // This module provides explicit, type-safe conversion from MCP tools to Gemini function declarations.
 
 use crate::gemini::types::{GeminiFunctionDeclaration, GeminiSchema, SchemaType};
-use crate::mcp::manager::{COMPOSIO_NATIVE_PREFIX, is_composio_native};
+use crate::mcp::manager::{is_composio_native, COMPOSIO_NATIVE_PREFIX};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -48,6 +48,7 @@ impl std::error::Error for ConversionError {}
 /// - Must start with a letter or underscore
 /// - Only alphanumeric, underscores, dots, colons, or dashes allowed
 /// - Maximum 64 characters
+#[allow(dead_code)] // Used in tests and via get_prefixed_tool_name
 pub fn sanitize_function_name(name: &str) -> String {
     let mut sanitized: String = name
         .chars()
@@ -80,6 +81,7 @@ pub fn sanitize_function_name(name: &str) -> String {
     sanitized
 }
 
+#[allow(dead_code)] // Used in tests and via get_prefixed_tool_name
 pub fn normalize_server_name(server_name: &str) -> &str {
     if is_composio_native(server_name) {
         COMPOSIO_NATIVE_PREFIX
@@ -93,6 +95,7 @@ pub fn get_prefixed_tool_name(server_name: &str, tool_name: &str) -> String {
     sanitize_function_name(&format!("{}_{}", norm_server, tool_name))
 }
 
+#[allow(dead_code)] // Used in tests; production uses convert_schema directly
 pub fn mcp_tool_to_gemini(
     tool: &rmcp::model::Tool,
     server_name: &str,
@@ -158,7 +161,7 @@ fn simplify_compound_types(obj: &serde_json::Map<String, Value>) -> serde_json::
 
 /// Convert a serde_json::Value representing a JSON Schema to a GeminiSchema.
 /// This recursively processes the schema, ignoring unsupported fields.
-fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
+pub fn convert_schema(value: &Value) -> Result<GeminiSchema, ConversionError> {
     convert_schema_inner(value, 0)
 }
 
@@ -566,8 +569,14 @@ mod tests {
 
         // Level 5 should be flattened to STRING (depth > 4)
         assert_eq!(l5.schema_type, SchemaType::String);
-        assert!(l5.properties.is_none(), "Flattened schema should have no properties");
-        assert!(l5.description.is_some(), "Flattened schema should preserve description");
+        assert!(
+            l5.properties.is_none(),
+            "Flattened schema should have no properties"
+        );
+        assert!(
+            l5.description.is_some(),
+            "Flattened schema should preserve description"
+        );
         assert_eq!(l5.description.as_ref().unwrap(), "This is deep");
     }
 
@@ -585,8 +594,14 @@ mod tests {
 
         let result = convert_schema(&schema).unwrap();
         assert_eq!(result.schema_type, SchemaType::String);
-        assert!(result.properties.is_none(), "properties should be stripped from non-OBJECT");
-        assert!(result.required.is_none(), "required should be stripped from non-OBJECT");
+        assert!(
+            result.properties.is_none(),
+            "properties should be stripped from non-OBJECT"
+        );
+        assert!(
+            result.required.is_none(),
+            "required should be stripped from non-OBJECT"
+        );
     }
 
     #[test]
@@ -605,7 +620,10 @@ mod tests {
 
         let result = convert_schema(&schema).unwrap();
         let json_str = serde_json::to_string(&result).unwrap();
-        assert!(!json_str.contains("title"), "title field should not appear in serialized output");
+        assert!(
+            !json_str.contains("title"),
+            "title field should not appear in serialized output"
+        );
         assert!(!json_str.contains("My Tool Parameters"));
         assert!(!json_str.contains("User Name"));
     }
@@ -635,8 +653,14 @@ mod tests {
         // INTEGER with enum — enum should be stripped
         let max_depth = props.get("max_depth").unwrap();
         assert_eq!(max_depth.schema_type, SchemaType::Integer);
-        assert!(max_depth.enum_values.is_none(), "enum should be stripped from INTEGER type");
-        assert_eq!(max_depth.description.as_ref().unwrap(), "Maximum depth level");
+        assert!(
+            max_depth.enum_values.is_none(),
+            "enum should be stripped from INTEGER type"
+        );
+        assert_eq!(
+            max_depth.description.as_ref().unwrap(),
+            "Maximum depth level"
+        );
 
         // STRING with enum — enum should be preserved
         let status = props.get("status").unwrap();

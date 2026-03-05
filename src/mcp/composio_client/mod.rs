@@ -7,8 +7,8 @@ pub mod meta;
 pub mod models;
 pub mod utils;
 
-use serde_json::Value;
 use crate::mcp::composio_client::discovery::DiscoveryResult;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -92,7 +92,10 @@ impl ComposioClient {
     pub fn set_custom_creds(&self, creds: HashMap<String, HashMap<String, String>>) {
         if let Ok(mut lock) = self.custom_auth_creds.write() {
             *lock = creds;
-            tracing::info!("Updated custom auth credentials for {} toolkits", lock.len());
+            tracing::info!(
+                "Updated custom auth credentials for {} toolkits",
+                lock.len()
+            );
         } else {
             tracing::error!("Failed to acquire write lock for custom_auth_creds");
         }
@@ -135,10 +138,7 @@ impl ComposioClient {
 
     /// Get existing auth config ID for a toolkit, or create one if not found.
     /// Prefers cached/existing configs to avoid duplicates.
-    pub(crate) async fn get_auth_config_id(
-        &self,
-        toolkit_slug: &str,
-    ) -> Result<String, String> {
+    pub(crate) async fn get_auth_config_id(&self, toolkit_slug: &str) -> Result<String, String> {
         auth::get_auth_config_id(self, toolkit_slug).await
     }
 
@@ -218,7 +218,7 @@ impl ComposioClient {
         toolkit_slug: &str,
         auth_config_id: &str,
         selected_tools: Option<Vec<String>>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<execution::AddToolkitResult, String> {
         execution::add_toolkit_to_server(self, toolkit_slug, auth_config_id, selected_tools).await
     }
 
@@ -243,10 +243,7 @@ impl ComposioClient {
     /// prevent rapid browser popup storms from cascading auth detection layers.
     const RECONNECT_COOLDOWN_SECS: u64 = 30;
 
-    pub async fn reconnect_toolkit(
-        &self,
-        toolkit_slug: &str,
-    ) -> Result<String, String> {
+    pub async fn reconnect_toolkit(&self, toolkit_slug: &str) -> Result<String, String> {
         let slug_lower = Self::normalize_toolkit_key(toolkit_slug);
 
         // COOLDOWN CHECK: Refuse to fire again within the cooldown window
@@ -270,10 +267,16 @@ impl ComposioClient {
         if let Ok(mut cooldowns) = self.reconnect_cooldowns.write() {
             cooldowns.insert(slug_lower.clone(), Instant::now());
         }
-        let user_id = self.user_id.clone().unwrap_or_else(|| "default".to_string());
+        let user_id = self
+            .user_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
 
         // Step 1: Hydrate auth_config_cache so we find existing configs
-        tracing::info!("[RECONNECT 1/5] Hydrating auth_config_cache for '{}'...", toolkit_slug);
+        tracing::info!(
+            "[RECONNECT 1/5] Hydrating auth_config_cache for '{}'...",
+            toolkit_slug
+        );
         if let Err(e) = auth::list_auth_configs(self).await {
             tracing::warn!("[RECONNECT] Failed to hydrate auth configs: {}", e);
         }
@@ -281,11 +284,15 @@ impl ComposioClient {
         // Step 2: Resolve existing auth_config_id
         tracing::info!("[RECONNECT 2/5] Resolving auth config...");
         let auth_config_id = auth::get_auth_config_id(self, toolkit_slug).await?;
-        tracing::info!("[RECONNECT] Found auth_config_id '{}' for '{}'", auth_config_id, toolkit_slug);
+        tracing::info!(
+            "[RECONNECT] Found auth_config_id '{}' for '{}'",
+            auth_config_id,
+            toolkit_slug
+        );
 
         // Step 3: Delete stale connections AND protect against propagation loop
         tracing::info!("[RECONNECT 3/5] Pruning stale connections...");
-        
+
         // Use the safe pruning logic instead of a blanket delete.
         // prune_connections ensures the *newest* ACTIVE connection is preserved,
         // while older duplicates and stale INITIATED ones are removed.
@@ -299,14 +306,22 @@ impl ComposioClient {
         if let Ok(accounts) = auth::list_connected_accounts(self).await {
             let mut newest_active: Option<&models::ConnectedAccount> = None;
             for acc in &accounts {
-                let matches_toolkit = acc.toolkit.as_ref()
+                let matches_toolkit = acc
+                    .toolkit
+                    .as_ref()
                     .map(|t| t.slug.eq_ignore_ascii_case(toolkit_slug))
                     .unwrap_or(false)
-                    || acc.app_name.as_ref().map(|n| n.eq_ignore_ascii_case(toolkit_slug)).unwrap_or(false);
-                
+                    || acc
+                        .app_name
+                        .as_ref()
+                        .map(|n| n.eq_ignore_ascii_case(toolkit_slug))
+                        .unwrap_or(false);
+
                 if matches_toolkit && acc.status.eq_ignore_ascii_case("ACTIVE") {
                     if let Some(current) = newest_active {
-                        if let (Some(t_new), Some(t_curr)) = (acc.created_at.as_deref(), current.created_at.as_deref()) {
+                        if let (Some(t_new), Some(t_curr)) =
+                            (acc.created_at.as_deref(), current.created_at.as_deref())
+                        {
                             if t_new > t_curr {
                                 newest_active = Some(acc);
                             }
@@ -320,13 +335,15 @@ impl ComposioClient {
             if let Some(active_acc) = newest_active {
                 if let Some(created_at) = &active_acc.created_at {
                     if let Ok(parsed_time) = chrono::DateTime::parse_from_rfc3339(created_at) {
-                        let age_seconds = chrono::Utc::now().signed_duration_since(parsed_time.with_timezone(&chrono::Utc)).num_seconds();
+                        let age_seconds = chrono::Utc::now()
+                            .signed_duration_since(parsed_time.with_timezone(&chrono::Utc))
+                            .num_seconds();
                         if age_seconds < 60 {
                             tracing::warn!(
                                 "[PROPAGATION GUARD] ACTIVE connection '{}' is only {}s old. This 401 is likely a proxy propagation delay. Aborting re-auth loop.",
                                 active_acc.id, age_seconds
                             );
-                            
+
                             // Return an explicit error that prompts the LLM to wait, rather than
                             // continuing the cycle to open a new browser popup.
                             return Err(
@@ -344,19 +361,43 @@ impl ComposioClient {
             map.remove(&Self::normalize_toolkit_key(toolkit_slug));
         }
         // Bust stale ContextStore entries (prevents stale ID injection if re-auth fails)
-        let bust_user = self.user_id.clone().unwrap_or_else(|| "default".to_string());
-        self.context_store.remove_param(toolkit_slug, &bust_user, "connected_account_id");
-        self.context_store.remove_param(toolkit_slug, &bust_user, "connectedAccountId");
+        let bust_user = self
+            .user_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        self.context_store
+            .remove_param(toolkit_slug, &bust_user, "connected_account_id");
+        self.context_store
+            .remove_param(toolkit_slug, &bust_user, "connectedAccountId");
 
         // Step 4: Initiate OAuth (force=true → opens browser)
         tracing::info!("[RECONNECT 4/5] Initiating OAuth (force=true)...");
         let result = auth::initiate_connection(self, toolkit_slug, &user_id, true).await?;
 
         // Step 5: Re-patch server to ensure toolkit + auth_config binding
+        // SECURITY: Passing None preserves admin-configured allowed_tools (no re-selection)
         tracing::info!("[RECONNECT 5/5] Re-patching MCP server...");
-        match self.add_toolkit_to_server(toolkit_slug, &auth_config_id, None).await {
-            Ok(Some(new_url)) => tracing::info!("[RECONNECT] Server re-patched: {}", new_url),
-            Ok(None) => tracing::info!("[RECONNECT] Server already configured for '{}'", toolkit_slug),
+        match self
+            .add_toolkit_to_server(toolkit_slug, &auth_config_id, None)
+            .await
+        {
+            Ok(result) => {
+                if let Some(new_url) = result.new_server_url {
+                    tracing::info!("[RECONNECT] Server re-patched: {}", new_url);
+                } else {
+                    tracing::info!(
+                        "[RECONNECT] Server already configured for '{}'",
+                        toolkit_slug
+                    );
+                }
+                if !result.existing_toolkit_tools.is_empty() {
+                    tracing::info!(
+                        "[RECONNECT] Preserved {} admin-configured tools for '{}'",
+                        result.existing_toolkit_tools.len(),
+                        toolkit_slug
+                    );
+                }
+            }
             Err(e) => tracing::warn!("[RECONNECT] Server re-patch warning: {}", e),
         }
 
@@ -364,9 +405,14 @@ impl ComposioClient {
         // We MUST repopulate it now that the new connection is ACTIVE,
         // otherwise the next execute_tool proactive check will see an empty
         // cache, conclude there's no connection, and fire ANOTHER reconnect.
-        tracing::info!("[RECONNECT] Re-hydrating toolkit_account_map after successful reconnect...");
+        tracing::info!(
+            "[RECONNECT] Re-hydrating toolkit_account_map after successful reconnect..."
+        );
         if let Err(e) = auth::list_connected_accounts(self).await {
-            tracing::warn!("[RECONNECT] Failed to re-hydrate connected accounts cache: {}", e);
+            tracing::warn!(
+                "[RECONNECT] Failed to re-hydrate connected accounts cache: {}",
+                e
+            );
         }
 
         Ok(result)

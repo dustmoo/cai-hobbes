@@ -392,7 +392,11 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
 
         let tools = client.list_tools().await.expect("Failed to list tools");
 
-        assert_eq!(tools.tools.len(), 3, "Should have fetched 3 tools total across 2 pages");
+        assert_eq!(
+            tools.tools.len(),
+            3,
+            "Should have fetched 3 tools total across 2 pages"
+        );
         assert_eq!(tools.tools[0].name, "TOOL_1");
         assert_eq!(tools.tools[1].name, "TOOL_2");
         assert_eq!(tools.tools[2].name, "TOOL_3");
@@ -400,13 +404,19 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
         // Verify request payload purity (Pattern: Pure MCP Payload)
         let requests = mock_server.received_requests().await.unwrap();
         for req in requests {
-             let body_str = std::str::from_utf8(&req.body).unwrap();
-             if body_str.contains("tools/list") {
-                 let body: serde_json::Value = serde_json::from_str(body_str).unwrap();
-                 let params = body["params"].as_object().unwrap();
-                 assert!(params.contains_key("limit"), "Optimization: Should request limit");
-                 assert!(!params.contains_key("user_id"), "Mandate: Body must NOT contain user_id");
-             }
+            let body_str = std::str::from_utf8(&req.body).unwrap();
+            if body_str.contains("tools/list") {
+                let body: serde_json::Value = serde_json::from_str(body_str).unwrap();
+                let params = body["params"].as_object().unwrap();
+                assert!(
+                    params.contains_key("limit"),
+                    "Optimization: Should request limit"
+                );
+                assert!(
+                    !params.contains_key("user_id"),
+                    "Mandate: Body must NOT contain user_id"
+                );
+            }
         }
     }
 
@@ -472,7 +482,10 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
             log_id: None,
             session_info: None,
         };
-        assert!(!resp_success.is_auth_error(), "Successful response should not be auth error");
+        assert!(
+            !resp_success.is_auth_error(),
+            "Successful response should not be auth error"
+        );
 
         // No auth signals at all
         let resp_clean = ToolExecuteResponse {
@@ -482,7 +495,10 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
             log_id: None,
             session_info: None,
         };
-        assert!(!resp_clean.is_auth_error(), "200 status_code should not be auth error");
+        assert!(
+            !resp_clean.is_auth_error(),
+            "200 status_code should not be auth error"
+        );
     }
 
     /// Regression test: Composio MCP proxy wraps errors inside a JSON-RPC result
@@ -558,14 +574,29 @@ data: {"result":{"tools":[{"name":"GMAIL_ADD_LABEL_TO_EMAIL","description":"test
             .execute_tool("CLICKUP_GET_TASKS", json!({"list_id": "123"}))
             .await;
 
-        assert!(result.is_ok(), "Execute should not return Err: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Execute should not return Err: {:?}",
+            result.err()
+        );
         let response = result.unwrap();
 
         // CRITICAL ASSERTIONS: The fix should detect the embedded auth error
-        assert!(!response.successful, "Response must be marked unsuccessful when inner content has auth error");
         assert!(
-            response.error.as_deref().unwrap_or("").contains("OAuth token not found")
-                || response.error.as_deref().unwrap_or("").contains("OAUTH_018"),
+            !response.successful,
+            "Response must be marked unsuccessful when inner content has auth error"
+        );
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("OAuth token not found")
+                || response
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("OAUTH_018"),
             "Error message should contain the auth error from the inner content, got: {:?}",
             response.error
         );

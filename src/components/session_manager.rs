@@ -1,8 +1,5 @@
 #![allow(non_snake_case)]
-use crate::{
-    components::chat_input::ChatCommand,
-    session::SessionState,
-};
+use crate::{components::chat_input::ChatCommand, session::SessionState};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 

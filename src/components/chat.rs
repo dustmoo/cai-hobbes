@@ -12,8 +12,8 @@ use super::shared::{DraftContext, MessageContent, SessionIdContext, StreamMessag
 use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRenderer};
 use crate::components::stream_manager::StreamManagerContext;
 use crate::context::permissions::PermissionManager;
-use crate::mcp::manager::{COMPOSIO_NATIVE_PREFIX, is_composio_native};
 use crate::context::prompt_builder::PromptBuilder;
+use crate::mcp::manager::{is_composio_native, COMPOSIO_NATIVE_PREFIX};
 use crate::session::ActiveContext;
 use crate::settings::Settings;
 use dioxus::html::geometry::euclid::Rect;
@@ -88,15 +88,15 @@ pub fn ChatWindow(
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let permission_manager = use_context::<Signal<PermissionManager>>();
     let mut chat_command = use_context::<Signal<Option<super::chat_input::ChatCommand>>>();
-    
+
     // Consume current_session_id from global context
     let SessionIdContext(current_session_id_signal) = use_context::<SessionIdContext>();
     let current_target_id = current_session_id_signal;
-    
+
     // Now provide draft via a unique context type to avoid collisions
     let draft = use_signal(|| "".to_string());
     use_context_provider(|| DraftContext(draft));
-    
+
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
     let stream_manager = consume_context::<StreamManagerContext>();
     let active_message_id = use_signal(|| None::<Uuid>);
@@ -111,14 +111,18 @@ pub fn ChatWindow(
     // Returns the fetched McpContext for downstream use (e.g. passing to send_prompt_to_llm).
     let fetch_fresh_mcp_context = move |target_id: String, settings_snapshot: Settings| async move {
         // Pass the profile ID directly (composio_profile is the stable ID)
-        let profile_id = session_state.read()
-            .sessions.get(&target_id)
+        let profile_id = session_state
+            .read()
+            .sessions
+            .get(&target_id)
             .and_then(|s| s.composio_profile.clone());
 
         // ensure_native_client_for_profile can accept name or ID — pass the ID
         if let Some(ref id) = profile_id {
-            let _ = mcp_manager.read()
-                .ensure_native_client_for_profile(id, &settings_snapshot).await;
+            let _ = mcp_manager
+                .read()
+                .ensure_native_client_for_profile(id, &settings_snapshot)
+                .await;
         }
 
         let fresh = mcp_manager.read().get_mcp_context(profile_id).await;
@@ -141,7 +145,6 @@ pub fn ChatWindow(
         let state = session_state.read();
         state.sessions.get(&*target_id).cloned()
     });
-
 
     // Delete modal state
     let mut show_delete_confirm_modal = use_signal(|| false);
@@ -173,7 +176,7 @@ pub fn ChatWindow(
         let mut state = session_state.write();
         if let Some(session) = state.sessions.get_mut(&*current_target_id.read()) {
             let profile_id = session.composio_profile.clone();
-            
+
             // Filter servers to only include non-native or profile-matching native tools
             // Use the server_name convention: config.name contains the display key,
             // but we filter by matching the profile_id against the known session profile.
@@ -192,8 +195,7 @@ pub fn ChatWindow(
                 }
             });
 
-
-                if !current_context.servers.is_empty() {
+            if !current_context.servers.is_empty() {
                 session.active_context.mcp_tools = Some(current_context);
             } else {
                 session.active_context.mcp_tools = None;
@@ -295,7 +297,9 @@ pub fn ChatWindow(
                 let active_session_id_inner = active_session_id.clone();
                 let composio_profile = {
                     let state = session_state.read();
-                    state.sessions.get(&active_session_id_inner)
+                    state
+                        .sessions
+                        .get(&active_session_id_inner)
                         .and_then(|s| s.composio_profile.clone())
                 };
 
@@ -385,7 +389,7 @@ pub fn ChatWindow(
 
     // Reusable closure for sending a message
     let send_prompt_to_llm = {
-        move |prompt_data: crate::context::prompt_builder::LlmPrompt,
+        move |prompt_data: crate::llm::LlmPrompt,
               mcp_context: Option<crate::mcp::manager::McpContext>,
               hobbes_message_id: Uuid,
               session_id: String| {
@@ -417,7 +421,9 @@ pub fn ChatWindow(
                     mcp_context,
                     {
                         let state = session_state.read();
-                        state.sessions.get(&session_id)
+                        state
+                            .sessions
+                            .get(&session_id)
                             .and_then(|s| s.composio_profile.clone())
                     },
                 );
@@ -430,27 +436,27 @@ pub fn ChatWindow(
         }
     };
 
-    let send_message = std::rc::Rc::new(move |(user_message, attachments): (String, Vec<Attachment>)| {
-        spawn({
-            let mut session_state = session_state;
-            let settings = settings;
-            let send_prompt_to_llm = send_prompt_to_llm;
-            let mut permission_manager = permission_manager;
-            let mut has_new_comments = has_new_comments;
-            let _target_session_id = current_target_id;
+    let send_message = std::rc::Rc::new(
+        move |(user_message, attachments): (String, Vec<Attachment>)| {
+            spawn({
+                let mut session_state = session_state;
+                let settings = settings;
+                let send_prompt_to_llm = send_prompt_to_llm;
+                let mut permission_manager = permission_manager;
+                let mut has_new_comments = has_new_comments;
 
-            async move {
-            let settings_read = settings.read().clone();
-            let target_id = current_target_id.read().clone();
+                async move {
+                    let settings_read = settings.read().clone();
+                    let target_id = current_target_id.read().clone();
 
-            // Reset the AI turn count every time the user sends a message.
-            permission_manager.write().reset_turn_count();
+                    // Reset the AI turn count every time the user sends a message.
+                    permission_manager.write().reset_turn_count();
 
-            // Clear the tool call history to ensure a fresh start for the new turn.
-            session_state.write().tool_call_history.clear();
+                    // Clear the tool call history to ensure a fresh start for the new turn.
+                    session_state.write().tool_call_history.clear();
 
-            // Check if the last message was the turn limit warning.
-            let last_message_was_warning = session_state.read().sessions.get(&target_id)
+                    // Check if the last message was the turn limit warning.
+                    let last_message_was_warning = session_state.read().sessions.get(&target_id)
                 .and_then(|s| s.messages.last())
                 .is_some_and(|m| {
                     if let MessageContent::Text { content: text, .. } = &m.content {
@@ -460,17 +466,111 @@ pub fn ChatWindow(
                     }
                 });
 
-            if last_message_was_warning {
-                permission_manager.write().reset_turn_count();
-            }
+                    if last_message_was_warning {
+                        permission_manager.write().reset_turn_count();
+                    }
 
-            if user_message.trim().is_empty() && attachments.is_empty() {
-                if *has_new_comments.read() {
+                    if user_message.trim().is_empty() && attachments.is_empty() {
+                        if *has_new_comments.read() {
+                            has_new_comments.set(false);
+                            let hobbes_message_id = Uuid::new_v4();
+                            {
+                                let mut state = session_state.write();
+                                if let Some(session) = state.sessions.get_mut(&target_id) {
+                                    session.messages.push(Message {
+                                        id: hobbes_message_id,
+                                        author: "Hobbes".to_string(),
+                                        content: MessageContent::Text {
+                                            content: "".to_string(),
+                                            thought_signature: None,
+                                            thought_summary: None,
+                                        },
+                                        attachments: Vec::new(),
+                                        comments: Vec::new(),
+                                        created_at: chrono::Utc::now(),
+                                        usage: None,
+                                    });
+                                }
+                            }
+
+                            let fresh_mcp_context =
+                                fetch_fresh_mcp_context(target_id.clone(), settings_read.clone())
+                                    .await;
+
+                            let prompt_data = {
+                                let state = session_state.read();
+                                if let Some(session) = state.sessions.get(&target_id) {
+                                    let builder =
+                                        PromptBuilder::new(session, &settings_read, &state);
+                                    builder.build_prompt("".to_string(), None)
+                                } else {
+                                    return;
+                                }
+                            };
+
+                            let mcp_context = if fresh_mcp_context.servers.is_empty() {
+                                None
+                            } else {
+                                Some(fresh_mcp_context)
+                            };
+                            send_prompt_to_llm(
+                                prompt_data,
+                                mcp_context,
+                                hobbes_message_id,
+                                target_id.clone(),
+                            );
+                        }
+                        return;
+                    }
+
                     has_new_comments.set(false);
+
+                    if permission_manager.read().is_turn_limit_reached() {
+                        let mut state = session_state.write();
+                        if let Some(session) = state.sessions.get_mut(&target_id) {
+                            session.messages.push(Message {
+                                id: Uuid::new_v4(),
+                                author: "User".to_string(),
+                                content: MessageContent::Text {
+                                    content: user_message.clone(),
+                                    thought_signature: None,
+                                    thought_summary: None,
+                                },
+                                attachments,
+                                comments: Vec::new(),
+                                created_at: chrono::Utc::now(),
+                                usage: None,
+                            });
+                            session.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        author: "Hobbes".to_string(),
+                        content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings_read.permission_settings.max_ai_turns), thought_signature: None, thought_summary: None },
+                        attachments: Vec::new(),
+                        comments: Vec::new(),
+                        created_at: chrono::Utc::now(),
+                        usage: None,
+                    });
+                        }
+                        return;
+                    }
+
                     let hobbes_message_id = Uuid::new_v4();
                     {
                         let mut state = session_state.write();
                         if let Some(session) = state.sessions.get_mut(&target_id) {
+                            session.messages.push(Message {
+                                id: Uuid::new_v4(),
+                                author: "User".to_string(),
+                                content: MessageContent::Text {
+                                    content: user_message.clone(),
+                                    thought_signature: None,
+                                    thought_summary: None,
+                                },
+                                attachments,
+                                comments: Vec::new(),
+                                created_at: chrono::Utc::now(),
+                                usage: None,
+                            });
                             session.messages.push(Message {
                                 id: hobbes_message_id,
                                 author: "Hobbes".to_string(),
@@ -487,134 +587,59 @@ pub fn ChatWindow(
                         }
                     }
 
-                    let fresh_mcp_context = fetch_fresh_mcp_context(target_id.clone(), settings_read.clone()).await;
+                    let fresh_mcp_context =
+                        fetch_fresh_mcp_context(target_id.clone(), settings_read.clone()).await;
+
+                    // Preserve conversation summary across the send
+                    {
+                        let conversation_summary = session_state
+                            .read()
+                            .sessions
+                            .get(&target_id)
+                            .map(|s| s.active_context.conversation_summary.clone())
+                            .unwrap_or_default();
+                        let mut state = session_state.write();
+                        if let Some(session) = state.sessions.get_mut(&target_id) {
+                            session.active_context.conversation_summary = conversation_summary;
+                        }
+                    }
 
                     let prompt_data = {
+                        let user_prompt = user_message.clone();
                         let state = session_state.read();
                         if let Some(session) = state.sessions.get(&target_id) {
                             let builder = PromptBuilder::new(session, &settings_read, &state);
-                            builder.build_prompt("".to_string(), None)
+                            builder.build_prompt(user_prompt, None)
                         } else {
+                            tracing::error!("No active session found when building prompt");
                             return;
                         }
                     };
+
+                    crate::session::SessionState::save_async(&session_state.read(), None);
 
                     let mcp_context = if fresh_mcp_context.servers.is_empty() {
                         None
                     } else {
                         Some(fresh_mcp_context)
                     };
-                    send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id, target_id.clone());
+                    send_prompt_to_llm(
+                        prompt_data,
+                        mcp_context,
+                        hobbes_message_id,
+                        target_id.clone(),
+                    );
                 }
-                return;
-            }
-
-            has_new_comments.set(false);
-
-            if permission_manager.read().is_turn_limit_reached() {
-                let mut state = session_state.write();
-                if let Some(session) = state.sessions.get_mut(&target_id) {
-                    session.messages.push(Message {
-                        id: Uuid::new_v4(),
-                        author: "User".to_string(),
-                        content: MessageContent::Text {
-                            content: user_message.clone(),
-                            thought_signature: None,
-                            thought_summary: None,
-                        },
-                        attachments,
-                        comments: Vec::new(),
-                        created_at: chrono::Utc::now(),
-                        usage: None,
-                    });
-                    session.messages.push(Message {
-                        id: Uuid::new_v4(),
-                        author: "Hobbes".to_string(),
-                        content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings_read.permission_settings.max_ai_turns), thought_signature: None, thought_summary: None },
-                        attachments: Vec::new(),
-                        comments: Vec::new(),
-                        created_at: chrono::Utc::now(),
-                        usage: None,
-                    });
-                }
-                return;
-            }
-
-            let hobbes_message_id = Uuid::new_v4();
-            {
-                let mut state = session_state.write();
-                if let Some(session) = state.sessions.get_mut(&target_id) {
-                    session.messages.push(Message {
-                        id: Uuid::new_v4(),
-                        author: "User".to_string(),
-                        content: MessageContent::Text {
-                            content: user_message.clone(),
-                            thought_signature: None,
-                            thought_summary: None,
-                        },
-                        attachments,
-                        comments: Vec::new(),
-                        created_at: chrono::Utc::now(),
-                        usage: None,
-                    });
-                    session.messages.push(Message {
-                        id: hobbes_message_id,
-                        author: "Hobbes".to_string(),
-                        content: MessageContent::Text {
-                            content: "".to_string(),
-                            thought_signature: None,
-                            thought_summary: None,
-                        },
-                        attachments: Vec::new(),
-                        comments: Vec::new(),
-                        created_at: chrono::Utc::now(),
-                        usage: None,
-                    });
-                }
-            }
-
-            let _fresh_mcp = fetch_fresh_mcp_context(target_id.clone(), settings_read.clone()).await;
-
-            // Preserve conversation summary across the send
-            {
-                let conversation_summary = session_state
-                    .read()
-                    .sessions.get(&target_id)
-                    .map(|s| s.active_context.conversation_summary.clone())
-                    .unwrap_or_default();
-                let mut state = session_state.write();
-                if let Some(session) = state.sessions.get_mut(&target_id) {
-                    session.active_context.conversation_summary = conversation_summary;
-                }
-            }
-
-            let prompt_data = {
-                let user_prompt = user_message.clone();
-                let state = session_state.read();
-                if let Some(session) = state.sessions.get(&target_id) {
-                    let builder = PromptBuilder::new(session, &settings_read, &state);
-                    builder.build_prompt(user_prompt, None)
-                } else {
-                    tracing::error!("No active session found when building prompt");
-                    return;
-                }
-            };
-
-            crate::session::SessionState::save_async(&session_state.read(), None);
-
-            let mcp_context = session_state
-                .read()
-                .sessions.get(&target_id)
-                .and_then(|s| s.active_context.mcp_tools.clone());
-            send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id, target_id.clone());
-        }});
-    });
+            });
+        },
+    );
 
     let cancel_message = move || {
         if let Some(id) = *active_message_id.read() {
-            let session_id = active_session_for_stream.read().clone().unwrap_or_else(|| {
-                current_target_id.read().clone()
-            });
+            let session_id = active_session_for_stream
+                .read()
+                .clone()
+                .unwrap_or_else(|| current_target_id.read().clone());
             stream_manager.cancel_stream(&id, &session_id);
         }
     };
@@ -648,15 +673,18 @@ pub fn ChatWindow(
                     }
                 }
 
-                let fresh_mcp_context = fetch_fresh_mcp_context(target_id.clone(), settings.clone()).await;
+                let fresh_mcp_context =
+                    fetch_fresh_mcp_context(target_id.clone(), settings.clone()).await;
 
-            let prompt_data = {
-                let state = session_state.read();
-                if let Some(session) = state.sessions.get(&target_id) {
-                    let builder = PromptBuilder::new(session, &settings, &state);
-                    builder.build_prompt("".to_string(), None)
+                let prompt_data = {
+                    let state = session_state.read();
+                    if let Some(session) = state.sessions.get(&target_id) {
+                        let builder = PromptBuilder::new(session, &settings, &state);
+                        builder.build_prompt("".to_string(), None)
                     } else {
-                        tracing::error!("Active session lost during continuation flow - aborting prompt build");
+                        tracing::error!(
+                            "Active session lost during continuation flow - aborting prompt build"
+                        );
                         return;
                     }
                 };
@@ -669,7 +697,12 @@ pub fn ChatWindow(
                     Some(fresh_mcp_context)
                 };
                 tracing::debug!("Sending continuation prompt to LLM.");
-                send_prompt_to_llm(prompt_data, mcp_context, hobbes_message_id, target_id.clone());
+                send_prompt_to_llm(
+                    prompt_data,
+                    mcp_context,
+                    hobbes_message_id,
+                    target_id.clone(),
+                );
             });
         })
     };
@@ -680,19 +713,22 @@ pub fn ChatWindow(
             .register_callback(continue_prompt_flow.clone());
     });
 
-    let root_classes = "relative flex flex-col bg-app text-fg rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
+    let root_classes =
+        "relative flex flex-col bg-app text-fg rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
 
     let delete_message = move |message_id: Uuid| {
         let confirm = settings.read().confirm_on_message_delete;
         if confirm {
             if let Some(index) = session_state
                 .read()
-                .sessions.get(&*current_target_id.read())
+                .sessions
+                .get(&*current_target_id.read())
                 .and_then(|s| s.messages.iter().position(|m| m.id == message_id))
             {
                 let session_len = session_state
                     .read()
-                    .sessions.get(&*current_target_id.read())
+                    .sessions
+                    .get(&*current_target_id.read())
                     .map(|s| s.messages.len())
                     .unwrap_or(0);
                 let count = session_len - index;
@@ -754,12 +790,12 @@ pub fn ChatWindow(
             OptimizationTarget::NewChatModal => {
                 // Update the New Chat Modal's initial context signal
                 // This triggers the use_effect in NewChatMemoryModal to update the JSON editor
-                
+
                 // CRITICAL: The new_context coming back might be stripped of tools (because we stripped them before sending to optimization).
                 // We must preserve the tools from the *existing* modal_initial_context.
                 let mut preserved_context = new_context;
                 let current_modal_context = modal_initial_context.read();
-                
+
                 if preserved_context.mcp_tools.is_none() {
                     preserved_context.mcp_tools = current_modal_context.mcp_tools.clone();
                 }
@@ -779,118 +815,118 @@ pub fn ChatWindow(
     if session_guard.is_some() {
         rsx! {
 
-        div {
-            class: "{root_classes}",
-            onmounted: move |cx| container_element.set(Some(cx.data())),
-            MessageList {
-                stream_update_trigger: stream_update_trigger,
-                show_scroll_button: show_scroll_button,
-                on_delete: delete_message,
-                on_comment: move |_| has_new_comments.set(true),
-            },
-            ChatInput {
-                is_sending: Signal::new(*stream_manager.is_sending.read() || stream_manager.is_any_generating()),
-                has_new_comments: has_new_comments,
-                has_pending_approvals: has_pending_approvals,
-                on_send: {
-                    let send_message = send_message.clone();
-                    move |(msg, attachments)| send_message((msg, attachments))
+            div {
+                class: "{root_classes}",
+                onmounted: move |cx| container_element.set(Some(cx.data())),
+                MessageList {
+                    stream_update_trigger: stream_update_trigger,
+                    show_scroll_button: show_scroll_button,
+                    on_delete: delete_message,
+                    on_comment: move |_| has_new_comments.set(true),
                 },
-                on_cancel: move |_| cancel_message(),
-                on_interaction: on_interaction,
-                on_new_chat_with_memory: move |_| {
-                    if let Some(session) = session_state.read().sessions.get(&*current_target_id.read()) {
-                        modal_initial_context.set(session.active_context.clone());
-                        show_new_chat_memory_modal.set(true);
-                    }
-                },
-            }
-
-            NewChatMemoryModal {
-                is_visible: show_new_chat_memory_modal,
-                initial_context: modal_initial_context.read().clone(),
-                optimization_summary: modal_optimization_summary,
-                on_start_chat: move |new_context: ActiveContext| {
-                     // Create new session with memory
-                     let new_session_id = session_state.write().create_session(settings.peek().get_active_profile().map(|p| p.id.clone()));
-                     // Update context of the new session
-                     if let Some(session) = session_state.write().sessions.get_mut(&new_session_id) {
-                         session.active_context = new_context;
-                     }
-                     // Open the new session in a tab via the command bus
-                     chat_command.set(Some(super::chat_input::ChatCommand::SwitchToSession(new_session_id)));
-                     show_new_chat_memory_modal.set(false);
-                     modal_optimization_summary.set(None); // Clear summary on close
-                },
-                on_optimize_memory: move |current_context: ActiveContext| {
-                    optimization_target.set(OptimizationTarget::NewChatModal);
-                    forget_modal_context.set(current_context);
-                    let confirm = settings.read().confirm_forget_memory;
-                    if confirm {
-                        show_forget_confirm_modal.set(true);
-                    } else {
-                        show_forget_memory_modal.set(true);
-                    }
-                },
-                on_cancel: move |_| {
-                    show_new_chat_memory_modal.set(false);
-                    modal_optimization_summary.set(None); // Clear summary on close
-                },
-            }
-
-            ForgetMemoryModal {
-                is_visible: show_forget_memory_modal,
-                current_context: forget_modal_context.read().clone(),
-                on_apply: on_forget_apply,
-                on_cancel: move |_| show_forget_memory_modal.set(false),
-            }
-
-            ConfirmDeleteModal {
-                is_visible: show_delete_confirm_modal,
-                title: "Delete Messages",
-                message: format!("Are you sure you want to delete this message and the {} messages that follow? This cannot be undone.", delete_message_count().saturating_sub(1)),
-                confirm_button_text: "Delete",
-                show_dont_ask_again: true,
-                on_confirm: move |dont_ask_again: bool| {
-                    if dont_ask_again {
-                        settings.write().confirm_on_message_delete = false;
-                    }
-                    if let Some(id) = pending_delete_message_id.read().as_ref() {
-                        let active_session_id = current_target_id.read().clone();
-                        if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
-                            session.delete_message_and_after(id);
-                            // Trigger update
-                            stream_update_trigger.set(stream_update_trigger() + 1);
+                ChatInput {
+                    is_sending: Signal::new(*stream_manager.is_sending.read() || stream_manager.is_any_generating()),
+                    has_new_comments: has_new_comments,
+                    has_pending_approvals: has_pending_approvals,
+                    on_send: {
+                        let send_message = send_message.clone();
+                        move |(msg, attachments)| send_message((msg, attachments))
+                    },
+                    on_cancel: move |_| cancel_message(),
+                    on_interaction: on_interaction,
+                    on_new_chat_with_memory: move |_| {
+                        if let Some(session) = session_state.read().sessions.get(&*current_target_id.read()) {
+                            modal_initial_context.set(session.active_context.clone());
+                            show_new_chat_memory_modal.set(true);
                         }
-                    }
-                    show_delete_confirm_modal.set(false);
-                    pending_delete_message_id.set(None);
-                },
-                on_cancel: move |_| {
-                    show_delete_confirm_modal.set(false);
-                    pending_delete_message_id.set(None);
+                    },
                 }
-            }
 
-            ConfirmDeleteModal {
-                is_visible: show_forget_confirm_modal,
-                title: "Optimize Memory",
-                message: "This will use AI to rewrite your conversation context based on your instructions. The original context will be replaced. Continue?".to_string(),
-                confirm_button_text: "Continue",
-                show_dont_ask_again: true,
-                on_confirm: move |dont_ask_again: bool| {
-                    if dont_ask_again {
-                        settings.write().confirm_forget_memory = false;
+                NewChatMemoryModal {
+                    is_visible: show_new_chat_memory_modal,
+                    initial_context: modal_initial_context.read().clone(),
+                    optimization_summary: modal_optimization_summary,
+                    on_start_chat: move |new_context: ActiveContext| {
+                         // Create new session with memory
+                         let new_session_id = session_state.write().create_session(settings.peek().get_active_profile().map(|p| p.id.clone()));
+                         // Update context of the new session
+                         if let Some(session) = session_state.write().sessions.get_mut(&new_session_id) {
+                             session.active_context = new_context;
+                         }
+                         // Open the new session in a tab via the command bus
+                         chat_command.set(Some(super::chat_input::ChatCommand::SwitchToSession(new_session_id)));
+                         show_new_chat_memory_modal.set(false);
+                         modal_optimization_summary.set(None); // Clear summary on close
+                    },
+                    on_optimize_memory: move |current_context: ActiveContext| {
+                        optimization_target.set(OptimizationTarget::NewChatModal);
+                        forget_modal_context.set(current_context);
+                        let confirm = settings.read().confirm_forget_memory;
+                        if confirm {
+                            show_forget_confirm_modal.set(true);
+                        } else {
+                            show_forget_memory_modal.set(true);
+                        }
+                    },
+                    on_cancel: move |_| {
+                        show_new_chat_memory_modal.set(false);
+                        modal_optimization_summary.set(None); // Clear summary on close
+                    },
+                }
+
+                ForgetMemoryModal {
+                    is_visible: show_forget_memory_modal,
+                    current_context: forget_modal_context.read().clone(),
+                    on_apply: on_forget_apply,
+                    on_cancel: move |_| show_forget_memory_modal.set(false),
+                }
+
+                ConfirmDeleteModal {
+                    is_visible: show_delete_confirm_modal,
+                    title: "Delete Messages",
+                    message: format!("Are you sure you want to delete this message and the {} messages that follow? This cannot be undone.", delete_message_count().saturating_sub(1)),
+                    confirm_button_text: "Delete",
+                    show_dont_ask_again: true,
+                    on_confirm: move |dont_ask_again: bool| {
+                        if dont_ask_again {
+                            settings.write().confirm_on_message_delete = false;
+                        }
+                        if let Some(id) = pending_delete_message_id.read().as_ref() {
+                            let active_session_id = current_target_id.read().clone();
+                            if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
+                                session.delete_message_and_after(id);
+                                // Trigger update
+                                stream_update_trigger.set(stream_update_trigger() + 1);
+                            }
+                        }
+                        show_delete_confirm_modal.set(false);
+                        pending_delete_message_id.set(None);
+                    },
+                    on_cancel: move |_| {
+                        show_delete_confirm_modal.set(false);
+                        pending_delete_message_id.set(None);
                     }
-                    show_forget_confirm_modal.set(false);
-                    show_forget_memory_modal.set(true);
-                },
-                on_cancel: move |_| {
-                    show_forget_confirm_modal.set(false);
+                }
+
+                ConfirmDeleteModal {
+                    is_visible: show_forget_confirm_modal,
+                    title: "Optimize Memory",
+                    message: "This will use AI to rewrite your conversation context based on your instructions. The original context will be replaced. Continue?".to_string(),
+                    confirm_button_text: "Continue",
+                    show_dont_ask_again: true,
+                    on_confirm: move |dont_ask_again: bool| {
+                        if dont_ask_again {
+                            settings.write().confirm_forget_memory = false;
+                        }
+                        show_forget_confirm_modal.set(false);
+                        show_forget_memory_modal.set(true);
+                    },
+                    on_cancel: move |_| {
+                        show_forget_confirm_modal.set(false);
+                    }
                 }
             }
         }
-    }
     } else {
         rsx! {
             div { class: "flex-1 flex items-center justify-center text-fg-muted", "Synchronizing..." }
@@ -1058,7 +1094,6 @@ pub fn MessageBubble(
             let is_streaming = stream_manager.is_generating(&message.id);
             let has_content = stream_manager.has_generated_content(&message.id);
 
-
             // Setup eval for text selection
             let message_id_str = message.id.to_string();
 
@@ -1170,7 +1205,12 @@ pub fn MessageBubble(
                                     selection_mode.set(SelectionMode::None);
                                 }
                             } else if !data.text.trim().is_empty() {
-                                selection_data.set(SelectionState { text: data.text.clone(), markdown: data.markdown.clone(), top: data.top, left: data.left });
+                                selection_data.set(SelectionState {
+                                    text: data.text.clone(),
+                                    markdown: data.markdown.clone(),
+                                    top: data.top,
+                                    left: data.left,
+                                });
                                 selection_mode.set(SelectionMode::Toolbar);
                             }
                         }
@@ -1215,7 +1255,7 @@ pub fn MessageBubble(
             let is_thinking = is_streaming && !has_content;
 
             let bubble_classes = if is_thinking {
-                 "bg-transparent border border-dashed border-faint animate-pulse self-start mr-auto"
+                "bg-transparent border border-dashed border-faint animate-pulse self-start mr-auto"
             } else if is_user {
                 "bg-bubble-user text-white self-end ml-auto"
             } else {
