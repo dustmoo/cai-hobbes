@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "Hobbes"
-version = "0.9.50"
+version = "0.9.51"
 dependencies = [
  "ammonia",
  "arboard",
@@ -7468,7 +7468,7 @@ checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
 
 [[package]]
 name = "windows_app"
-version = "0.9.50"
+version = "0.9.51"
 dependencies = [
  "ammonia",
  "arboard",

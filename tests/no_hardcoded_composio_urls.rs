@@ -16,7 +16,11 @@ fn no_hardcoded_composio_urls() {
         let path = entry.unwrap().path();
         if path.extension().map(|e| e == "rs").unwrap_or(false) {
             // Skip constants.rs - it's the legitimate single source of truth
-            if path.file_name().map(|n| n == "constants.rs").unwrap_or(false) {
+            if path
+                .file_name()
+                .map(|n| n == "constants.rs")
+                .unwrap_or(false)
+            {
                 continue;
             }
             let content = fs::read_to_string(&path).unwrap();
@@ -24,7 +28,10 @@ fn no_hardcoded_composio_urls() {
             for (i, line) in content.lines().enumerate() {
                 let trimmed = line.trim();
                 // Skip comments and doc strings
-                if trimmed.starts_with("//") || trimmed.starts_with("///") || trimmed.starts_with("/*") {
+                if trimmed.starts_with("//")
+                    || trimmed.starts_with("///")
+                    || trimmed.starts_with("/*")
+                {
                     continue;
                 }
                 if line.contains("backend.composio.dev") {

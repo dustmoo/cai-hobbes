@@ -13,7 +13,8 @@ pub enum ToolCategory {
 pub enum PermissionStatus {
     Allowed,
     RequiresPrompt,
-    #[allow(dead_code)] // API contract: matched in manager.rs but denials currently use RequiresPrompt → UI flow
+    #[allow(dead_code)]
+    // API contract: matched in manager.rs but denials currently use RequiresPrompt → UI flow
     Denied(String),
 }
 

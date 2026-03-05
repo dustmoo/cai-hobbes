@@ -132,10 +132,10 @@ impl std::fmt::Display for ToolCallStatus {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Copy, Debug, Default)]
 pub enum SkillCallStatus {
     #[default]
-    Pending,    // Awaiting user permission
-    Running,    // Currently executing
-    Completed,  // Successfully finished
-    Error,      // Execution failed
+    Pending, // Awaiting user permission
+    Running,   // Currently executing
+    Completed, // Successfully finished
+    Error,     // Execution failed
 }
 
 impl std::fmt::Display for SkillCallStatus {
@@ -156,13 +156,13 @@ pub struct SkillCall {
     pub arguments: String,
     pub status: SkillCallStatus,
     pub response: String,
-    pub instructions: String,  // Processed skill instructions
+    pub instructions: String, // Processed skill instructions
     #[serde(default)]
-    pub path: std::path::PathBuf,     // Path to skill file
+    pub path: std::path::PathBuf, // Path to skill file
     #[serde(default)]
-    pub has_scripts: bool,             // Whether skill has executable scripts
+    pub has_scripts: bool, // Whether skill has executable scripts
     #[serde(default)]
-    pub raw_output: Option<String>,    // Clean output for use_result
+    pub raw_output: Option<String>, // Clean output for use_result
     #[serde(default)]
     pub profile_color: Option<String>, // Historical profile color for rendering
 }
@@ -222,12 +222,9 @@ pub fn resolve_profile_color(
     session_profile: Option<&String>,
     settings: &crate::settings::Settings,
 ) -> Option<String> {
-    let identifier = session_profile
-        .or(settings.active_composio_profile.as_ref());
+    let identifier = session_profile.or(settings.active_composio_profile.as_ref());
     identifier
-        .and_then(|val| {
-            settings.composio_profiles.iter().find(|p| &p.id == val)
-        })
+        .and_then(|val| settings.composio_profiles.iter().find(|p| &p.id == val))
         .map(|p| p.color.clone())
         .or_else(|| settings.get_active_profile().map(|p| p.color.clone()))
 }

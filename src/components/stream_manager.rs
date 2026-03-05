@@ -18,7 +18,7 @@ use crate::processing::summarization_scheduler::SchedulerSignal;
 pub struct StreamManagerContext {
     stream_receivers: Signal<HashMap<Uuid, UnboundedReceiver<StreamMessage>>>,
     active_stream_handles: Signal<HashMap<Uuid, Task>>,
-    llm_connector: Signal<std::sync::Arc<dyn crate::components::llm::LlmConnector>>,
+    llm_connector: Signal<std::sync::Arc<dyn crate::llm::LlmConnector>>,
     session_state: Signal<SessionState>,
     mcp_manager: Signal<crate::mcp::manager::McpManager>,
     tool_call_summarizer: Signal<ToolCallSummarizer>,
@@ -53,7 +53,7 @@ impl StreamManagerContext {
         mut self,
         message_id: Uuid,
         session_id: String,
-        prompt_data: crate::context::prompt_builder::LlmPrompt,
+        prompt_data: crate::llm::LlmPrompt,
         on_complete: impl FnOnce() + 'static,
         mcp_context: Option<crate::mcp::manager::McpContext>,
         profile_id: Option<String>,
@@ -83,6 +83,10 @@ impl StreamManagerContext {
             let (tool_results_tx, mut tool_results_rx) =
                 mpsc::unbounded_channel::<crate::components::shared::ToolCallRecord>();
             let mut tool_call_count = 0;
+            // Defense-in-depth: track dispatched tool calls to prevent duplicate execution
+            // even if the LLM connector fails to dedup (e.g., different providers).
+            let mut dispatched_tool_calls: std::collections::HashSet<(String, String, u64)> =
+                std::collections::HashSet::new();
             let completed_tool_tasks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut final_text_for_this_turn = String::new();
             let mut thought_signature_for_this_turn: Option<String> = None;
@@ -99,7 +103,7 @@ impl StreamManagerContext {
                         if !content.is_empty() {
                             self.content_generated.write().insert(message_id);
                         }
-                        
+
                         // Append the content to the buffer
                         let was_empty = final_text_for_this_turn.is_empty();
                         final_text_for_this_turn.push_str(&content);
@@ -113,27 +117,40 @@ impl StreamManagerContext {
                                 thought_summary_for_this_turn = Some(summary.clone());
                             }
                         }
-                        if stream_tx
-                            .send(StreamMessage::Text {
-                                content: content.clone(),
-                                thought_signature: thought_signature.clone(),
-                                thought_summary: thought_summary.clone(),
-                            })
-                            .is_err()
-                        {
-                            break;
+                        // Only forward to the UI stream when there's actual content to render.
+                        // Pure thinking-only messages (content="" + thought_summary only) are
+                        // accumulated silently and attached to whatever follows (tool call or text).
+                        // This prevents separate "Thinking Process" bubbles from appearing before
+                        // tool call cards — matching Gemini's behavior where thinking is absorbed
+                        // into the tool call card.
+                        let has_renderable_content =
+                            !content.is_empty() || thought_signature.is_some();
+                        if has_renderable_content {
+                            if stream_tx
+                                .send(StreamMessage::Text {
+                                    content: content.clone(),
+                                    thought_signature: thought_signature.clone(),
+                                    thought_summary: thought_summary.clone(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         self.scheduler.send(SchedulerSignal::Activity);
 
-                        // Critical Fix: Update session state immediately on the first chunk.
+                        // Critical Fix: Update session state immediately on the first CONTENT chunk.
                         // This ensures that the parent `MessageList` sees that the message has content
                         // and continues to render the `MessageBubble` even if `is_generating` momentarily flips to false
                         // or if the stream ends abruptly. Solving the "disappearing bubble" regression.
-                        // IMPORTANT: We must also flush thought_signature/thought_summary, otherwise when the stream
-                        // ends (e.g., UNEXPECTED_TOOL_CALL), the message has no content AND no thoughts => pruned.
-                        if was_empty {
+                        // IMPORTANT: Only trigger this for actual text content, NOT for thinking-only messages.
+                        // Thinking-only messages (content="") should NOT persist as separate bubbles —
+                        // they get absorbed into the ToolCall card via thought_summary_for_this_turn.
+                        if was_empty && !final_text_for_this_turn.is_empty() {
                             let mut state = self.session_state.write();
-                            if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
+                            if let Some(msg) =
+                                state.get_message_mut_in_session(&session_id, &message_id)
+                            {
                                 if let crate::components::shared::MessageContent::Text {
                                     content: msg_content,
                                     thought_signature: msg_thought_sig,
@@ -147,7 +164,11 @@ impl StreamManagerContext {
                             }
                         }
 
-                        is_first_message = false;
+                        // Only mark as non-first when we have actual content, so that
+                        // thinking-only messages don't prevent ToolCall from upgrading in-place.
+                        if !content.is_empty() {
+                            is_first_message = false;
+                        }
                     }
                     StreamMessage::Error { message: error_msg } => {
                         tracing::error!("LLM stream error: {}", error_msg);
@@ -157,7 +178,9 @@ impl StreamManagerContext {
                             let mut state = self.session_state.write();
                             if is_first_message {
                                 // Update the placeholder message with the error
-                                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
+                                if let Some(msg) =
+                                    state.get_message_mut_in_session(&session_id, &message_id)
+                                {
                                     msg.content =
                                         crate::components::shared::MessageContent::Error {
                                             message: error_msg.clone(),
@@ -196,6 +219,27 @@ impl StreamManagerContext {
                     StreamMessage::ToolCall(mut tool_call) => {
                         // Mark as generated since we got a tool call
                         self.content_generated.write().insert(message_id);
+
+                        // Defense-in-depth dedup: check if this exact tool call was already dispatched
+                        {
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            tool_call.arguments.hash(&mut hasher);
+                            let args_hash = hasher.finish();
+                            let dedup_key = (
+                                tool_call.server_name.clone(),
+                                tool_call.tool_name.clone(),
+                                args_hash,
+                            );
+                            if dispatched_tool_calls.contains(&dedup_key) {
+                                tracing::warn!(
+                                    "stream_manager: Duplicate tool call suppressed: '{}::{}' (args_hash: {})",
+                                    tool_call.server_name, tool_call.tool_name, args_hash
+                                );
+                                continue;
+                            }
+                            dispatched_tool_calls.insert(dedup_key);
+                        }
 
                         // Attach any accumulated thinking summary to this tool call
                         if tool_call.thought_summary.is_none()
@@ -238,7 +282,9 @@ impl StreamManagerContext {
                             // received thinking data so far (final_text is empty), we upgrade the existing
                             // placeholder message to a ToolCall instead of splitting into two bubbles.
                             if is_first_message || final_text_for_this_turn.is_empty() {
-                                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
+                                if let Some(msg) =
+                                    state.get_message_mut_in_session(&session_id, &message_id)
+                                {
                                     msg.content =
                                         crate::components::shared::MessageContent::ToolCall(
                                             tool_call.clone(),
@@ -389,7 +435,10 @@ impl StreamManagerContext {
 
                             let mut state = session_state.write();
 
-                            if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
+                            if let Some(msg) = state.get_message_mut_in_session(
+                                &session_id_inner,
+                                &tool_call_message_id,
+                            ) {
                                 if is_permission_request {
                                     if let Ok(tc) =
                                         serde_json::from_str::<crate::components::shared::ToolCall>(
@@ -433,7 +482,9 @@ impl StreamManagerContext {
                     StreamMessage::Usage(usage_data) => {
                         // Update message with usage data
                         let mut state = self.session_state.write();
-                        if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
+                        if let Some(msg) =
+                            state.get_message_mut_in_session(&session_id, &message_id)
+                        {
                             msg.usage = Some(usage_data.clone());
                         }
 
@@ -445,9 +496,12 @@ impl StreamManagerContext {
                         if let Some(session) = state.sessions.get_mut(&session_id) {
                             session.accumulated_cost = session.total_cost();
                             session.accumulated_tokens = session.total_tokens();
-                            session.accumulated_turns = session.messages.iter()
+                            session.accumulated_turns = session
+                                .messages
+                                .iter()
                                 .filter(|m| m.usage.is_some())
-                                .count() as i32;
+                                .count()
+                                as i32;
                         }
 
                         // Forward usage to UI
@@ -472,6 +526,50 @@ impl StreamManagerContext {
                         *thought_summary = thought_summary_for_this_turn.clone();
                     }
                 }
+            } else if tool_call_count == 0 && thought_summary_for_this_turn.is_some() {
+                // No text content, no tool calls, but thinking WAS produced.
+                // This is the model's entire response (e.g., Qwen thinking-only response).
+                // Use a visible marker as content so should_render passes (it no longer
+                // triggers on thought_summary alone — that change prevents empty bubbles
+                // when thinking is absorbed into ToolCall cards for OpenAI providers).
+                let thinking_marker = "💭".to_string();
+                let mut state = self.session_state.write();
+                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
+                    if let crate::components::shared::MessageContent::Text {
+                        content,
+                        thought_signature,
+                        thought_summary,
+                    } = &mut msg.content
+                    {
+                        *content = thinking_marker.clone();
+                        *thought_signature = thought_signature_for_this_turn.clone();
+                        *thought_summary = thought_summary_for_this_turn.clone();
+                    }
+                }
+                // Also forward to UI so the bubble renders
+                let _ = stream_tx.send(StreamMessage::Text {
+                    content: thinking_marker,
+                    thought_signature: thought_signature_for_this_turn.clone(),
+                    thought_summary: thought_summary_for_this_turn.clone(),
+                });
+            } else if tool_call_count == 0 {
+                // Truly empty response: no text, no thinking, no tool calls.
+                // Surface this to the user instead of going blank (loud failure).
+                tracing::warn!("Model returned empty response — no text, thinking, or tool calls.");
+                let empty_msg = "⚠️ The model returned an empty response. This can happen when the context is too large or the model doesn't understand the instructions. Try sending your message again or switching to a different model.";
+                let mut state = self.session_state.write();
+                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
+                    if let crate::components::shared::MessageContent::Text { content, .. } =
+                        &mut msg.content
+                    {
+                        *content = empty_msg.to_string();
+                    }
+                }
+                let _ = stream_tx.send(StreamMessage::Text {
+                    content: empty_msg.to_string(),
+                    thought_signature: None,
+                    thought_summary: None,
+                });
             }
 
             // Wait for all tool execution tasks to complete before proceeding to collect results.
@@ -544,7 +642,10 @@ impl StreamManagerContext {
                 state.touch_session(&session_id);
             }
             // Save after releasing the write guard — save_async borrows via read()
-            crate::session::SessionState::save_async(&self.session_state.read(), Some(self.save_error_signal));
+            crate::session::SessionState::save_async(
+                &self.session_state.read(),
+                Some(self.save_error_signal),
+            );
 
             let settings = self.settings.read().clone();
             let summarizer = self.tool_call_summarizer.read();
@@ -576,12 +677,14 @@ impl StreamManagerContext {
             handle.cancel();
             tracing::info!(message_id = %message_id, "Aborted stream task handle.");
         }
-        
+
         // Cleanup generated state
         self.content_generated.write().remove(message_id);
 
         // 2. Remove the message from the originating session
-        self.session_state.write().remove_message_in_session(session_id, message_id);
+        self.session_state
+            .write()
+            .remove_message_in_session(session_id, message_id);
 
         // 3. Remove the stream receiver
         if self.stream_receivers.write().remove(message_id).is_some() {
@@ -621,7 +724,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
     let context = use_hook(|| StreamManagerContext {
         stream_receivers: Signal::new(HashMap::new()),
         active_stream_handles: Signal::new(HashMap::new()),
-        llm_connector: consume_context::<Signal<Arc<dyn crate::components::llm::LlmConnector>>>(),
+        llm_connector: consume_context::<Signal<Arc<dyn crate::llm::LlmConnector>>>(),
         session_state,
         mcp_manager,
         tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
@@ -668,10 +771,9 @@ mod tests {
             let continuation_controller =
                 use_context_provider(|| Signal::new(ContinuationController::new()));
             let llm_connector = use_context_provider(|| {
-                Signal::new(Arc::new(crate::components::llm::GeminiConnector::new(
+                Signal::new(Arc::new(crate::llm::GeminiConnector::new(
                     settings.read().gemini_config.clone(),
-                ))
-                    as Arc<dyn crate::components::llm::LlmConnector>)
+                )) as Arc<dyn crate::llm::LlmConnector>)
             });
             let scheduler = use_coroutine(|_| async {});
             let mut stream_manager = use_context_provider(|| StreamManagerContext {
@@ -738,10 +840,9 @@ mod tests {
             let continuation_controller =
                 use_context_provider(|| Signal::new(ContinuationController::new()));
             let llm_connector = use_context_provider(|| {
-                Signal::new(Arc::new(crate::components::llm::GeminiConnector::new(
+                Signal::new(Arc::new(crate::llm::GeminiConnector::new(
                     settings.read().gemini_config.clone(),
-                ))
-                    as Arc<dyn crate::components::llm::LlmConnector>)
+                )) as Arc<dyn crate::llm::LlmConnector>)
             });
             let scheduler = use_coroutine(|_| async {});
             let stream_manager = use_context_provider(|| StreamManagerContext {

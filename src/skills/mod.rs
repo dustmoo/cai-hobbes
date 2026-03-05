@@ -1,6 +1,6 @@
+mod executor;
 pub mod parser;
 pub mod registry;
-mod executor;
 
 // Re-export common types
 pub use parser::Skill;

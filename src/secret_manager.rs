@@ -1,15 +1,15 @@
+use crate::biometric_auth::AuthContext;
+use crate::keychain_ffi;
 #[allow(unused_imports)]
 pub use crate::keychain_ffi::{
     delete_generic_password, find_generic_password, find_generic_password_with_context,
     set_generic_password, set_generic_password_with_biometric_protection, KeychainError,
 };
-use crate::biometric_auth::AuthContext;
-use crate::keychain_ffi;
 use crate::secret_types;
 use std::collections::HashMap;
 
 // Re-export shared constants for API compatibility
-pub use crate::secret_types::{KNOWN_KEYS, composio_key_name};
+pub use crate::secret_types::{composio_key_name, KNOWN_KEYS};
 
 /// Centralized secret manager that caches secrets in memory
 /// and provides efficient batch loading from the macOS Keychain.
@@ -31,6 +31,17 @@ impl SecretManager {
     pub fn new() -> Self {
         Self {
             secrets: HashMap::new(),
+        }
+    }
+
+    /// Post-load migration: remap legacy key names to provider-scoped names.
+    fn migrate_legacy_keys(&mut self) {
+        if !self.secrets.contains_key("gemini_api_key") {
+            if let Some(legacy_key) = self.secrets.get("api_key").cloned() {
+                tracing::info!("Migrating legacy 'api_key' to 'gemini_api_key'");
+                self.secrets
+                    .insert("gemini_api_key".to_string(), legacy_key);
+            }
         }
     }
 
@@ -84,9 +95,14 @@ impl SecretManager {
         }
 
         // Load custom tool credentials from the index (BYOA)
-        match keychain_ffi::find_generic_password_with_context("composio_custom_keys_index", context) {
+        match keychain_ffi::find_generic_password_with_context(
+            "composio_custom_keys_index",
+            context,
+        ) {
             Ok(index_csv) => {
-                tracing::info!("Found custom tools index, loading credentials with biometric context...");
+                tracing::info!(
+                    "Found custom tools index, loading credentials with biometric context..."
+                );
                 for key in index_csv.split(',') {
                     let key = key.trim();
                     if !key.is_empty() {
@@ -96,7 +112,11 @@ impl SecretManager {
                                 tracing::debug!("Loaded custom tool secret with context: {}", key);
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to load indexed secret '{}' with context: {}", key, e);
+                                tracing::warn!(
+                                    "Failed to load indexed secret '{}' with context: {}",
+                                    key,
+                                    e
+                                );
                             }
                         }
                     }
@@ -106,6 +126,8 @@ impl SecretManager {
                 tracing::debug!("No custom tools index found (composio_custom_keys_index).");
             }
         }
+
+        self.migrate_legacy_keys();
 
         tracing::debug!(
             "SecretManager loaded {} secrets with biometric context",
@@ -201,7 +223,7 @@ impl SecretManagerTrait for SecretManager {
                 for key in index_csv.split(',') {
                     let key = key.trim();
                     if !key.is_empty() {
-                         match keychain_ffi::find_generic_password(key) {
+                        match keychain_ffi::find_generic_password(key) {
                             Ok(value) => {
                                 self.secrets.insert(key.to_string(), value);
                                 tracing::debug!("Loaded custom tool secret: {}", key);
@@ -217,6 +239,8 @@ impl SecretManagerTrait for SecretManager {
                 tracing::debug!("No custom tools index found (composio_custom_keys_index).");
             }
         }
+
+        self.migrate_legacy_keys();
 
         tracing::info!(
             "SecretManager loaded {} secrets from keychain",
@@ -286,7 +310,11 @@ impl SecretManagerTrait for SecretManager {
             }
             Err(keychain_ffi::KeychainError::NotFound) => {}
             Err(e) => {
-                tracing::warn!("Failed to load Composio key for profile id '{}': {}", profile_id, e);
+                tracing::warn!(
+                    "Failed to load Composio key for profile id '{}': {}",
+                    profile_id,
+                    e
+                );
             }
         }
     }

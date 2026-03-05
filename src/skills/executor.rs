@@ -9,10 +9,12 @@
 //! 3. Constructs a "Context Payload" (Instructions + Resources + Resolved Tools).
 //! 4. Returns this payload to the Agent, who then drives execution using standard MCP tools.
 
-use crate::components::shared::{SkillCall, SkillCallStatus, CapabilityContextPayload, SkillEnvironment};
+use crate::components::shared::{
+    CapabilityContextPayload, SkillCall, SkillCallStatus, SkillEnvironment,
+};
 use crate::context::permissions::{PermissionManager, PermissionStatus};
-use crate::skills::parser::Skill;
 use crate::mcp::manager::McpContext;
+use crate::skills::parser::Skill;
 use std::collections::HashMap;
 
 /// Result of a skill execution (now just a context payload delivery)
@@ -36,17 +38,26 @@ pub enum SkillExecutionError {
 impl std::fmt::Display for SkillExecutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SkillExecutionError::PermissionDenied(reason) => write!(f, "Permission denied: {}", reason),
-            SkillExecutionError::ExecutionFailed(reason) => write!(f, "Execution failed: {}", reason),
+            SkillExecutionError::PermissionDenied(reason) => {
+                write!(f, "Permission denied: {}", reason)
+            }
+            SkillExecutionError::ExecutionFailed(reason) => {
+                write!(f, "Execution failed: {}", reason)
+            }
             SkillExecutionError::SkillNotFound(reason) => write!(f, "Skill not found: {}", reason),
-            SkillExecutionError::ContextBuilderError(reason) => write!(f, "Context builder error: {}", reason),
+            SkillExecutionError::ContextBuilderError(reason) => {
+                write!(f, "Context builder error: {}", reason)
+            }
         }
     }
 }
 
 /// Check if skill execution is allowed based on permission settings.
 #[allow(dead_code)]
-pub fn check_permission(permission_manager: &PermissionManager, skill_name: &str) -> PermissionStatus {
+pub fn check_permission(
+    permission_manager: &PermissionManager,
+    skill_name: &str,
+) -> PermissionStatus {
     permission_manager.check_skill_permission(skill_name)
 }
 
@@ -78,23 +89,18 @@ fn extract_tool_map(context: &McpContext) -> HashMap<String, Vec<String>> {
                 // Extract slug: split by '_', take the first segment, lowercase
                 if let Some(slug) = name.split('_').next() {
                     let slug_lower = slug.to_lowercase();
-                    slug_tools.entry(slug_lower)
-                        .or_default()
-                        .push(name);
+                    slug_tools.entry(slug_lower).or_default().push(name);
                 }
             }
             for (slug, tools) in slug_tools {
-                map.entry(slug)
-                    .or_default()
-                    .extend(tools);
+                map.entry(slug).or_default().extend(tools);
             }
         } else {
             // 2. For non-Composio servers, index by server name as toolkit slug
             let slug = server.name.clone();
-            let server_tools: Vec<String> = server.tools.iter().map(|t| t.name.to_string()).collect();
-            map.entry(slug)
-                .or_default()
-                .extend(server_tools);
+            let server_tools: Vec<String> =
+                server.tools.iter().map(|t| t.name.to_string()).collect();
+            map.entry(slug).or_default().extend(server_tools);
         }
     }
 
@@ -102,8 +108,7 @@ fn extract_tool_map(context: &McpContext) -> HashMap<String, Vec<String>> {
     // These are toolkits the user has connected but whose tools aren't force-loaded.
     // The AI can discover them via COMPOSIO_GET_APP_TOOLS.
     for slug in &context.connected_toolkit_slugs {
-        map.entry(slug.clone())
-            .or_default(); // Empty vec = connected but no loaded tools yet
+        map.entry(slug.clone()).or_default(); // Empty vec = connected but no loaded tools yet
     }
 
     map
@@ -118,22 +123,30 @@ fn extract_tool_map(context: &McpContext) -> HashMap<String, Vec<String>> {
 /// 4. Bundles instructions, file paths, and scripts into a JSON payload.
 pub async fn execute_skill(
     skill_call: &mut SkillCall,
-    mcp_context: Option<&McpContext>
+    mcp_context: Option<&McpContext>,
 ) -> Result<SkillExecutionResult, SkillExecutionError> {
-    
     // 1. Load the Skill definition
     let skill = if !skill_call.path.as_os_str().is_empty() && skill_call.path.exists() {
-         Skill::from_file(&skill_call.path)
-            .map_err(|e| SkillExecutionError::SkillNotFound(format!("Failed to reload skill at {:?}: {}", skill_call.path, e)))?
+        Skill::from_file(&skill_call.path).map_err(|e| {
+            SkillExecutionError::SkillNotFound(format!(
+                "Failed to reload skill at {:?}: {}",
+                skill_call.path, e
+            ))
+        })?
     } else {
-        return Err(SkillExecutionError::SkillNotFound("Skill path is missing or invalid".to_string()));
+        return Err(SkillExecutionError::SkillNotFound(
+            "Skill path is missing or invalid".to_string(),
+        ));
     };
 
     // 2. Validate Tools & Resolve Dependencies
     let tool_map = mcp_context.map(extract_tool_map).unwrap_or_default();
     let available_keys: Vec<String> = tool_map.keys().cloned().collect();
 
-    tracing::info!("Available Capability Keys for Resolution: {:?}", available_keys);
+    tracing::info!(
+        "Available Capability Keys for Resolution: {:?}",
+        available_keys
+    );
     let mut resolved_tools = HashMap::new();
     let mut warnings = Vec::new();
 
@@ -143,7 +156,7 @@ pub async fn execute_skill(
             // 1. Direct Lookup (Toolkit Slug or Exact Tool Name)
             // 2. Namespaced Match: tool identifier ends with "_" + capability
             // 3. Keyword Heuristic: "shell" matches "bash", "zsh", "sh", "run_command"
-            
+
             let mut matches: Vec<String> = Vec::new();
 
             // 1. Direct Lookup (Checks both full tool name AND toolkit name)
@@ -154,30 +167,40 @@ pub async fn execute_skill(
                 // We perform this search against the *values* (actual tool names) to ensure we find specific tools
                 // even if the exact toolkit key wasn't hit.
                 let all_tools: Vec<String> = tool_map.values().flatten().cloned().collect();
-                
-                let heuristic_matches: Vec<String> = all_tools.iter()
+
+                let heuristic_matches: Vec<String> = all_tools
+                    .iter()
                     .filter(|actual| {
-                         let actual = *actual;
-                         // 2. Namespaced Match
-                         if actual.ends_with(&format!("_{}", capability)) { return true; }
-                        
-                         // 3. Keyword Heuristic for Common Abstract Capabilities
-                         match capability.as_str() {
-                             "shell" | "run_command" => {
-                                 actual.contains("run_command") || actual.contains("execute_shell") || actual.contains("write_to_terminal") || actual == "bash" || actual == "zsh"
-                             },
-                             "filesystem" => {
-                                 actual.contains("read_file") || actual.contains("write_file") || actual.contains("list_directory") || actual.starts_with("fs_")
-                             },
-                             // Default: case-insensitive substring match
-                             _ => actual.to_lowercase().contains(&capability.to_lowercase())
-                         }
+                        let actual = *actual;
+                        // 2. Namespaced Match
+                        if actual.ends_with(&format!("_{}", capability)) {
+                            return true;
+                        }
+
+                        // 3. Keyword Heuristic for Common Abstract Capabilities
+                        match capability.as_str() {
+                            "shell" | "run_command" => {
+                                actual.contains("run_command")
+                                    || actual.contains("execute_shell")
+                                    || actual.contains("write_to_terminal")
+                                    || actual == "bash"
+                                    || actual == "zsh"
+                            }
+                            "filesystem" => {
+                                actual.contains("read_file")
+                                    || actual.contains("write_file")
+                                    || actual.contains("list_directory")
+                                    || actual.starts_with("fs_")
+                            }
+                            // Default: case-insensitive substring match
+                            _ => actual.to_lowercase().contains(&capability.to_lowercase()),
+                        }
                     })
                     .cloned()
                     .collect();
                 matches.extend(heuristic_matches);
             }
-            
+
             // Deduplicate matches
             matches.sort();
             matches.dedup();
@@ -192,14 +215,19 @@ pub async fn execute_skill(
                     // Fuzzy slug match: "calendar" matches "googlecalendar" (substring in on-demand slug).
                     // Require minimum 3-char capability to avoid overly broad single-letter matches.
                     let cap_lower = capability.to_lowercase();
-                    if cap_lower.len() < 3 { return false; }
+                    if cap_lower.len() < 3 {
+                        return false;
+                    }
                     let key_lower = key.to_lowercase();
                     key_lower.contains(&cap_lower) || cap_lower.contains(&key_lower)
                 }) {
                     // Found a connected toolkit whose slug contains the capability (or vice versa)
                     resolved_tools.insert(capability.clone(), format!("(on-demand) Use COMPOSIO_GET_APP_TOOLS with app='{}' to discover available tools", matching_slug));
                 } else {
-                    warnings.push(format!("Missing required capability: '{}'. The skill may not function correctly.", capability));
+                    warnings.push(format!(
+                        "Missing required capability: '{}'. The skill may not function correctly.",
+                        capability
+                    ));
                     // Fallback: Resolve to generic name so the Agent at least sees what was requested
                     resolved_tools.insert(capability.clone(), capability.clone());
                 }
@@ -263,7 +291,7 @@ pub async fn execute_skill(
 mod tests {
     // We would need to mock McpContext here to test validation logic rigorously.
     // For now, these placeholders confirm the structural changes.
-    
+
     #[tokio::test]
     async fn test_execute_skill_returns_payload() {
         // Setup requires valid file path logic which is hard in unit tests without temp files.

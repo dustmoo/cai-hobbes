@@ -1,14 +1,44 @@
-use crate::components::llm::GeminiModel;
 use crate::context::permissions::{PermissionSettings, ToolCategory};
+pub use crate::llm::{ClaudeConfig, GeminiConfig, OpenAiCompatConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum LlmProvider {
+    #[default]
     Gemini,
+    OpenAiCompat,
+    Claude,
+}
+
+impl LlmProvider {
+    /// Human-readable name for UI display
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Gemini => "Gemini",
+            Self::OpenAiCompat => "OpenAI Compatible",
+            Self::Claude => "Claude",
+        }
+    }
+
+    /// Keychain key name for this provider's API key
+    pub fn keychain_key(&self) -> &'static str {
+        match self {
+            Self::Gemini => "gemini_api_key",
+            Self::OpenAiCompat => "openai_compat_api_key",
+            Self::Claude => "claude_api_key",
+        }
+    }
+
+    /// All provider variants for UI iteration
+    /// NOTE: Claude is excluded from this version's UI — the stub connector isn't ready.
+    /// The LlmProvider::Claude enum variant remains for structural completeness.
+    pub fn all_variants() -> &'static [LlmProvider] {
+        &[Self::Gemini, Self::OpenAiCompat]
+    }
 }
 
 /// Application color theme
@@ -18,20 +48,6 @@ pub enum Theme {
     Dark,
     Light,
     System,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct GeminiConfig {
-    #[serde(skip)]
-    pub api_key: Option<String>,
-    pub chat_model: String,
-    pub summary_model: String,
-    #[serde(default)]
-    pub thinking_enabled: bool,
-    #[serde(default = "default_thinking_level")]
-    pub thinking_level: String,
-    #[serde(default)]
-    pub thinking_budget: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -171,6 +187,10 @@ default_switch_tab! {
 pub struct Settings {
     pub active_llm: LlmProvider,
     pub gemini_config: GeminiConfig,
+    #[serde(default)]
+    pub openai_compat_config: OpenAiCompatConfig,
+    #[serde(default)]
+    pub claude_config: ClaudeConfig,
     pub persona: String,
     pub user_name: Option<String>,
     pub force_tool_use_instruction: Option<String>,
@@ -226,9 +246,6 @@ pub struct Settings {
     /// Custom icons/emojis for each model (key = model slug, value = emoji)
     #[serde(default)]
     pub model_icons: HashMap<String, String>,
-    /// Ordered list of model slugs for the quick-switch slots (Control+1-9)
-    #[serde(default = "default_model_slots")]
-    pub model_slots: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -426,7 +443,6 @@ impl ComposioProfile {
             .collect()
     }
 
-
     /// Check if the profile is fully configured (has both User ID and API Key)
     pub fn is_fully_configured(&self) -> bool {
         self.user_id.as_ref().is_some_and(|s| !s.is_empty())
@@ -441,14 +457,9 @@ impl Default for Settings {
 
         Self {
             active_llm: LlmProvider::Gemini,
-            gemini_config: GeminiConfig {
-                api_key: None,
-                chat_model: GeminiModel::Gemini3_1ProPreview.canonical_slug().to_string(),
-                summary_model: GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
-                thinking_enabled: false,
-                thinking_level: "high".to_string(),
-                thinking_budget: None,
-            },
+            gemini_config: GeminiConfig::default(),
+            openai_compat_config: OpenAiCompatConfig::default(),
+            claude_config: ClaudeConfig::default(),
             persona: "You are Hobbes. Be a direct, clear, and radically candid partner. Function as an exocortex, matching the user's communication style. Your default tone is that of a professional friend.".to_string(),
             user_name: None,
             force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available. When using the fetch tool, you MUST provide markdown links as sources.".to_string()),
@@ -484,7 +495,6 @@ impl Default for Settings {
             theme: Theme::default(),
             tos_accepted_version: None,
             model_icons: HashMap::new(),
-            model_slots: default_model_slots(),
         }
     }
 }
@@ -493,6 +503,8 @@ impl Default for Settings {
 pub fn get_default_model_icon(model_slug: &str) -> String {
     let slug = model_slug.to_lowercase();
     // Match specific variants first for visual distinction
+
+    // --- Gemini family ---
     if slug.contains("experimental") {
         "🧪".to_string()
     } else if slug.contains("gemini-3.1") {
@@ -509,34 +521,44 @@ pub fn get_default_model_icon(model_slug: &str) -> String {
         "⚡".to_string()
     } else if slug.contains("2.5-pro") || slug.contains("2.5_pro") {
         "🧠".to_string()
-    } else if slug.contains("pro") {
-        "💎".to_string()
     } else if slug.contains("nano") {
         "🔬".to_string()
     } else if slug.contains("gemma") {
         "💠".to_string()
+    // --- OpenAI family ---
+    } else if slug.contains("o3") || slug.contains("o1") {
+        "🔮".to_string() // reasoning models
+    } else if slug.contains("gpt-4.1") {
+        "🏆".to_string()
+    } else if slug.contains("gpt-4o") {
+        "💎".to_string()
+    } else if slug.contains("gpt-4") {
+        "🌟".to_string()
+    } else if slug.contains("gpt-3.5") || slug.contains("gpt-35") {
+        "💬".to_string()
+    // --- Open-source families ---
+    } else if slug.contains("qwen") {
+        "🐼".to_string()
+    } else if slug.contains("deepseek") {
+        "🔭".to_string()
+    } else if slug.contains("llama") {
+        "🦙".to_string()
+    } else if slug.contains("mistral") || slug.contains("mixtral") {
+        "🌬️".to_string()
+    } else if slug.contains("codestral") {
+        "💻".to_string()
+    } else if slug.contains("phi") {
+        "🔬".to_string()
+    } else if slug.contains("command") {
+        "⌘".to_string() // Cohere Command
+    // --- Generic fallbacks ---
+    } else if slug.contains("pro") {
+        "💎".to_string()
     } else if slug.contains("flash") {
         "⚡".to_string()
     } else {
         "🤖".to_string()
     }
-}
-
-/// Default model slots — curated list for quick switching.
-/// Derives slugs from GeminiModel::canonical_slug() to prevent version drift.
-fn default_model_slots() -> Vec<String> {
-    vec![
-        GeminiModel::Gemini3_1ProPreview.canonical_slug().to_string(),
-        GeminiModel::Gemini3_0FlashPreview.canonical_slug().to_string(),
-        GeminiModel::Gemini3_0ProPreview.canonical_slug().to_string(),
-        GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
-        "".to_string(), // Slot 5
-        "".to_string(), // Slot 6
-        "".to_string(), // Slot 7
-        "".to_string(), // Slot 8
-        "".to_string(), // Slot 9
-        "".to_string(), // Slot 10
-    ]
 }
 
 /// Get the fixed icon for a model slot position (0-indexed)
@@ -553,16 +575,62 @@ pub fn get_slot_icon(slot_index: usize) -> String {
         7 => "💫",
         8 => "🔬",
         _ => "🤖",
-    }.to_string()
+    }
+    .to_string()
 }
 
 impl Settings {
+    pub fn active_model_slots(&self) -> Vec<String> {
+        match self.active_llm {
+            LlmProvider::Gemini => self.gemini_config.model_slots.clone(),
+            LlmProvider::OpenAiCompat => self.openai_compat_config.model_slots.clone(),
+            LlmProvider::Claude => self.claude_config.model_slots.clone(),
+        }
+    }
+
+    pub fn active_chat_model(&self) -> String {
+        match self.active_llm {
+            LlmProvider::Gemini => self.gemini_config.chat_model.clone(),
+            LlmProvider::OpenAiCompat => self.openai_compat_config.model.clone(),
+            LlmProvider::Claude => self.claude_config.model.clone(),
+        }
+    }
+
+    pub fn set_active_chat_model(&mut self, model: String) {
+        match self.active_llm {
+            LlmProvider::Gemini => self.gemini_config.chat_model = model,
+            LlmProvider::OpenAiCompat => self.openai_compat_config.model = model,
+            LlmProvider::Claude => self.claude_config.model = model,
+        }
+    }
+
+    pub fn update_active_model_slot(&mut self, index: usize, model: String) {
+        match self.active_llm {
+            LlmProvider::Gemini => {
+                while self.gemini_config.model_slots.len() <= index {
+                    self.gemini_config.model_slots.push("".to_string());
+                }
+                self.gemini_config.model_slots[index] = model;
+            }
+            LlmProvider::OpenAiCompat => {
+                while self.openai_compat_config.model_slots.len() <= index {
+                    self.openai_compat_config.model_slots.push("".to_string());
+                }
+                self.openai_compat_config.model_slots[index] = model;
+            }
+            LlmProvider::Claude => {
+                while self.claude_config.model_slots.len() <= index {
+                    self.claude_config.model_slots.push("".to_string());
+                }
+                self.claude_config.model_slots[index] = model;
+            }
+        }
+    }
+
     /// Get the currently active Composio profile (matched by stable ID)
     pub fn get_active_profile(&self) -> Option<&ComposioProfile> {
         if let Some(active_id) = &self.active_composio_profile {
-            self.composio_profiles
-                .iter()
-                .find(|p| &p.id == active_id)
+            self.composio_profiles.iter().find(|p| &p.id == active_id)
         } else {
             None
         }
@@ -681,13 +749,25 @@ impl Settings {
     pub fn migrate_active_profile_name_to_id(&mut self) {
         if let Some(ref current_value) = self.active_composio_profile {
             // Already matches an ID — nothing to do
-            if self.composio_profiles.iter().any(|p| &p.id == current_value) {
+            if self
+                .composio_profiles
+                .iter()
+                .any(|p| &p.id == current_value)
+            {
                 return;
             }
             // Try matching by name instead
-            if let Some(profile) = self.composio_profiles.iter().find(|p| &p.name == current_value) {
+            if let Some(profile) = self
+                .composio_profiles
+                .iter()
+                .find(|p| &p.name == current_value)
+            {
                 let id = profile.id.clone();
-                tracing::info!("Migrating active_composio_profile from name '{}' to id '{}'", current_value, id);
+                tracing::info!(
+                    "Migrating active_composio_profile from name '{}' to id '{}'",
+                    current_value,
+                    id
+                );
                 self.active_composio_profile = Some(id);
             }
         }
@@ -696,18 +776,37 @@ impl Settings {
     /// Ensure chat_model is synced to a configured slot.
     /// If the current chat_model doesn't match any non-empty slot, set it to slot 1's model.
     pub fn sync_chat_model_to_slots(&mut self) {
-        let non_empty_slots: Vec<&String> = self.model_slots.iter().filter(|s| !s.is_empty()).collect();
+        let slots = self.active_model_slots();
+        let non_empty_slots: Vec<&String> = slots.iter().filter(|s| !s.is_empty()).collect();
         if non_empty_slots.is_empty() {
-            return; // No slots configured, leave chat_model as-is
+            return;
         }
-        let in_a_slot = non_empty_slots.iter().any(|s| **s == self.gemini_config.chat_model);
-        if !in_a_slot {
-            let first_slot = non_empty_slots[0].clone();
-            tracing::info!(
-                "Syncing chat_model from '{}' to slot 1 model '{}'",
-                self.gemini_config.chat_model, first_slot
-            );
-            self.gemini_config.chat_model = first_slot;
+
+        match self.active_llm {
+            LlmProvider::Gemini => {
+                let in_a_slot = non_empty_slots
+                    .iter()
+                    .any(|s| **s == self.gemini_config.chat_model);
+                if !in_a_slot {
+                    self.gemini_config.chat_model = non_empty_slots[0].clone();
+                }
+            }
+            LlmProvider::OpenAiCompat => {
+                let in_a_slot = non_empty_slots
+                    .iter()
+                    .any(|s| **s == self.openai_compat_config.model);
+                if !in_a_slot {
+                    self.openai_compat_config.model = non_empty_slots[0].clone();
+                }
+            }
+            LlmProvider::Claude => {
+                let in_a_slot = non_empty_slots
+                    .iter()
+                    .any(|s| **s == self.claude_config.model);
+                if !in_a_slot {
+                    self.claude_config.model = non_empty_slots[0].clone();
+                }
+            }
         }
     }
 
@@ -747,10 +846,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_thinking_level() -> String {
-    "high".to_string()
-}
-
 #[derive(Clone)]
 pub struct SettingsManager {
     settings_path: PathBuf,
@@ -780,20 +875,12 @@ impl SettingsManager {
         if let Ok(mut settings) = serde_json::from_str::<Settings>(&content) {
             settings.migrate_legacy_composio_settings();
             settings.ensure_profile_ids();
-            let had_name_migration = settings.active_composio_profile.as_ref()
-                .is_some_and(|v| !settings.composio_profiles.iter().any(|p| p.id == *v));
             // Happy-path migration: JSON deserialized cleanly but active_composio_profile
             // may still hold a legacy profile *name*. Convert it to a stable *id*.
             // This also runs in the fallback path below (L894) for the same reason — both
             // paths must independently guarantee the value is ID-based before the app boots.
             settings.migrate_active_profile_name_to_id();
             settings.sync_chat_model_to_slots();
-            // Persist migration results so the next launch reads corrected IDs
-            if had_name_migration {
-                if self.save(&settings).is_err() {
-                    tracing::error!("Failed to save migrated settings.");
-                }
-            }
             return settings;
         }
 
@@ -813,6 +900,15 @@ impl SettingsManager {
                 }
                 if let Some(summary_model) = value.get("summary_model").and_then(|v| v.as_str()) {
                     settings.gemini_config.summary_model = summary_model.to_string();
+                }
+                if let Some(slots) = value.get("model_slots").and_then(|v| v.as_array()) {
+                    let slots_vec: Vec<String> = slots
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    if !slots_vec.is_empty() {
+                        settings.gemini_config.model_slots = slots_vec;
+                    }
                 }
             }
             if let Some(persona) = value.get("persona").and_then(|v| v.as_str()) {
@@ -905,12 +1001,27 @@ impl SettingsManager {
         if let Some(parent) = self.settings_path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // Safety net: backup before overwrite to prevent data loss from deserialization regressions
+        if self.settings_path.exists() {
+            let backup_path = self.settings_path.with_extension("json.bak");
+            if let Err(e) = fs::copy(&self.settings_path, &backup_path) {
+                tracing::warn!("Failed to create settings backup: {}", e);
+            }
+        }
         fs::write(&self.settings_path, content)
     }
 
-    pub fn save_async(&self, settings: Settings, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
+    pub fn save_async(
+        &self,
+        settings: Settings,
+        error_signal: Option<dioxus::prelude::Signal<Option<String>>>,
+    ) {
         let manager = self.clone();
-        crate::async_persist::persist_async(move || manager.save(&settings), "settings", error_signal);
+        crate::async_persist::persist_async(
+            move || manager.save(&settings),
+            "settings",
+            error_signal,
+        );
     }
 }
 
@@ -1073,7 +1184,11 @@ impl UiStateManager {
         fs::write(&self.state_path, content)
     }
 
-    pub fn save_async(&self, state: UiState, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
+    pub fn save_async(
+        &self,
+        state: UiState,
+        error_signal: Option<dioxus::prelude::Signal<Option<String>>>,
+    ) {
         let manager = self.clone();
         crate::async_persist::persist_async(move || manager.save(&state), "UI state", error_signal);
     }
@@ -1106,9 +1221,8 @@ pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
     let local_state_path = {
         #[cfg(target_os = "macos")]
         {
-            dirs::home_dir().map(|h| {
-                h.join("Library/Application Support/Google/Chrome/Local State")
-            })
+            dirs::home_dir()
+                .map(|h| h.join("Library/Application Support/Google/Chrome/Local State"))
         }
         #[cfg(target_os = "windows")]
         {

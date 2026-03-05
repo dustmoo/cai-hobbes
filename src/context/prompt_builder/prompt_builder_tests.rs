@@ -52,21 +52,7 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
     let prompt = builder.build_prompt("Hello".to_string(), None);
 
     // Extract the system instruction text
-    let system_instruction = prompt
-        .system_instruction
-        .expect("Should have system instruction");
-    let full_text: String = system_instruction
-        .parts
-        .iter()
-        .filter_map(|p| {
-            if let Part::Text { text, .. } = p {
-                Some(text.as_str())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let full_text = prompt.system.expect("Should have system instruction");
 
     // Assert: Composio context should be present
     assert!(
@@ -103,21 +89,7 @@ fn test_composio_context_not_injected_when_profile_missing_api_key() {
     let builder = PromptBuilder::new(&session, &settings, &session_state);
     let prompt = builder.build_prompt("Hello".to_string(), None);
 
-    let system_instruction = prompt
-        .system_instruction
-        .expect("Should have system instruction");
-    let full_text: String = system_instruction
-        .parts
-        .iter()
-        .filter_map(|p| {
-            if let Part::Text { text, .. } = p {
-                Some(text.as_str())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let full_text = prompt.system.expect("Should have system instruction");
 
     // Assert: Composio context should NOT be present
     assert!(
@@ -146,25 +118,61 @@ fn test_composio_context_not_injected_when_profile_missing_user_id() {
     let builder = PromptBuilder::new(&session, &settings, &session_state);
     let prompt = builder.build_prompt("Hello".to_string(), None);
 
-    let system_instruction = prompt
-        .system_instruction
-        .expect("Should have system instruction");
-    let full_text: String = system_instruction
-        .parts
-        .iter()
-        .filter_map(|p| {
-            if let Part::Text { text, .. } = p {
-                Some(text.as_str())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let full_text = prompt.system.expect("Should have system instruction");
 
     // Assert: Composio context should NOT be present
     assert!(
         !full_text.contains("composio_context"),
         "System prompt should NOT contain composio_context when User ID is missing"
+    );
+}
+
+#[test]
+fn test_oversized_entities_stripped_from_system_context() {
+    use crate::session::ConversationSummary;
+    use crate::session::ConversationSummaryEntities;
+
+    let mut session = create_test_session();
+    let session_state = create_test_session_state();
+    let settings = Settings::default();
+
+    // Inject a conversation summary with both normal and oversized entities
+    let mut other_entities = std::collections::HashMap::new();
+    // Normal entity — should survive
+    other_entities.insert("project_name".to_string(), serde_json::json!("Hobbes"));
+    // Oversized entity — simulates a `message_history` data dump (>500 chars)
+    other_entities.insert(
+        "message_history".to_string(),
+        serde_json::json!("x".repeat(600)),
+    );
+
+    session.active_context.conversation_summary = ConversationSummary {
+        summary: "Test conversation".to_string(),
+        sentiment: "neutral".to_string(),
+        entities: ConversationSummaryEntities {
+            user_name: "Dustin".to_string(),
+            other_entities,
+        },
+    };
+
+    let builder = PromptBuilder::new(&session, &settings, &session_state);
+    let prompt = builder.build_prompt("Hello".to_string(), None);
+
+    let full_text = prompt.system.expect("Should have system instruction");
+
+    // user_name should be preserved (explicitly exempted from size check)
+    assert!(
+        full_text.contains("Dustin"),
+        "user_name should be preserved in system context"
+    );
+    // Normal-sized entity should be preserved
+    assert!(
+        full_text.contains("project_name"),
+        "Normal-sized entities should be preserved"
+    );
+    // Oversized entity should be stripped
+    assert!(
+        !full_text.contains("message_history"),
+        "Oversized entities (>500 chars) should be stripped from system context"
     );
 }

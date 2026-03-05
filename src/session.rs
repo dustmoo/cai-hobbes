@@ -7,9 +7,19 @@ use std::path::PathBuf;
 use crate::mcp::manager::McpContext;
 use serde_json::Value;
 
+/// Deserialize a String that may be `null` in JSON (from LLM responses).
+/// `#[serde(default)]` only handles missing keys; this also handles explicit `null`.
+fn null_to_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct ConversationSummaryEntities {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
     pub user_name: String,
     #[serde(flatten)]
     pub other_entities: HashMap<String, Value>,
@@ -17,9 +27,9 @@ pub struct ConversationSummaryEntities {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct ConversationSummary {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
     pub summary: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
     pub sentiment: String,
     #[serde(default)]
     pub entities: ConversationSummaryEntities,
@@ -62,8 +72,7 @@ pub struct ToolWrapper {
     pub tool: Tool,
 }
 
-#[derive(Default)]
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ActiveContext {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,8 +93,6 @@ pub struct ActiveContext {
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
-
-
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Session {
@@ -190,13 +197,12 @@ pub struct SessionState {
 }
 
 fn get_sessions_path() -> Option<PathBuf> {
-    dirs::config_dir()
-        .and_then(|mut path| {
-            path.push("com.hobbes.app");
-            fs::create_dir_all(&path).ok()?;
-            path.push("sessions.json");
-            Some(path)
-        })
+    dirs::config_dir().and_then(|mut path| {
+        path.push("com.hobbes.app");
+        fs::create_dir_all(&path).ok()?;
+        path.push("sessions.json");
+        Some(path)
+    })
 }
 
 impl SessionState {
@@ -218,7 +224,10 @@ impl SessionState {
 
         // Try direct deserialization first
         if let Ok(mut state) = serde_json::from_str::<Self>(&data) {
-            tracing::info!("Successfully loaded session data (schema_version={}).", state.schema_version);
+            tracing::info!(
+                "Successfully loaded session data (schema_version={}).",
+                state.schema_version
+            );
 
             // Validate active_session_id
             if !state.sessions.contains_key(&state.active_session_id) {
@@ -327,10 +336,15 @@ impl SessionState {
                             if message.get("created_at").is_none() {
                                 let timestamp =
                                     base_time + chrono::Duration::milliseconds(index as i64);
-                                message.as_object_mut().expect("message migration: message value must be a JSON object").insert(
-                                    "created_at".to_string(),
-                                    serde_json::json!(timestamp.to_rfc3339()),
-                                );
+                                message
+                                    .as_object_mut()
+                                    .expect(
+                                        "message migration: message value must be a JSON object",
+                                    )
+                                    .insert(
+                                        "created_at".to_string(),
+                                        serde_json::json!(timestamp.to_rfc3339()),
+                                    );
                                 tracing::debug!("Migrated message {} with timestamp", index);
                             }
                         }
@@ -343,7 +357,10 @@ impl SessionState {
                     {
                         for message in messages.iter_mut() {
                             if let Some(content) = message.get_mut("content") {
-                                let migrate_tool_fields = |obj: &mut serde_json::Map<String, serde_json::Value>| {
+                                let migrate_tool_fields = |obj: &mut serde_json::Map<
+                                    String,
+                                    serde_json::Value,
+                                >| {
                                     if obj.contains_key("id") && !obj.contains_key("execution_id") {
                                         if let Some(val) = obj.remove("id") {
                                             obj.insert("execution_id".to_string(), val);
@@ -356,7 +373,10 @@ impl SessionState {
                                     }
                                 };
 
-                                let migrate_skill_fields = |obj: &mut serde_json::Map<String, serde_json::Value>| {
+                                let migrate_skill_fields = |obj: &mut serde_json::Map<
+                                    String,
+                                    serde_json::Value,
+                                >| {
                                     if obj.contains_key("id") && !obj.contains_key("execution_id") {
                                         if let Some(val) = obj.remove("id") {
                                             obj.insert("execution_id".to_string(), val);
@@ -369,16 +389,26 @@ impl SessionState {
                                     }
                                 };
 
-                                if let Some(tool_call) = content.get_mut("ToolCall").and_then(|v| v.as_object_mut()) {
+                                if let Some(tool_call) =
+                                    content.get_mut("ToolCall").and_then(|v| v.as_object_mut())
+                                {
                                     migrate_tool_fields(tool_call);
                                 }
-                                if let Some(perm_req) = content.get_mut("PermissionRequest").and_then(|v| v.as_object_mut()) {
+                                if let Some(perm_req) = content
+                                    .get_mut("PermissionRequest")
+                                    .and_then(|v| v.as_object_mut())
+                                {
                                     migrate_tool_fields(perm_req);
                                 }
-                                if let Some(skill_call) = content.get_mut("SkillCall").and_then(|v| v.as_object_mut()) {
+                                if let Some(skill_call) =
+                                    content.get_mut("SkillCall").and_then(|v| v.as_object_mut())
+                                {
                                     migrate_skill_fields(skill_call);
                                 }
-                                if let Some(skill_perm) = content.get_mut("SkillPermissionRequest").and_then(|v| v.as_object_mut()) {
+                                if let Some(skill_perm) = content
+                                    .get_mut("SkillPermissionRequest")
+                                    .and_then(|v| v.as_object_mut())
+                                {
                                     migrate_skill_fields(skill_perm);
                                 }
                             }
@@ -395,10 +425,16 @@ impl SessionState {
                         tracing::info!("Migration recovered {} sessions", state.sessions.len());
                     }
                     Err(e) => {
-                        tracing::error!("Migration failed to deserialize sessions: {}. NOT overwriting backup.", e);
+                        tracing::error!(
+                            "Migration failed to deserialize sessions: {}. NOT overwriting backup.",
+                            e
+                        );
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Migration failed: {}. Your data backup is at sessions.json.bak", e)
+                            format!(
+                                "Migration failed: {}. Your data backup is at sessions.json.bak",
+                                e
+                            ),
                         ));
                     }
                 }
@@ -523,7 +559,6 @@ impl SessionState {
         self.sessions.get_mut(&self.active_session_id)
     }
 
-
     /// Touch (update `last_updated`) on a specific session by ID.
     /// Used by stream_manager to target the originating session after a tab switch.
     pub fn touch_session(&mut self, session_id: &str) {
@@ -554,7 +589,6 @@ impl SessionState {
             }
         }
     }
-
 
     pub fn update_window_size(&mut self, width: f64, height: f64) {
         self.window_width = width;
@@ -602,10 +636,15 @@ impl SessionState {
     /// this byte buffer is moved to the background thread for file I/O. This avoids
     /// the expensive deep clone of the entire state (all sessions + all messages)
     /// that the previous implementation required.
-    pub fn save_async(state: &SessionState, error_signal: Option<dioxus::prelude::Signal<Option<String>>>) {
+    pub fn save_async(
+        state: &SessionState,
+        error_signal: Option<dioxus::prelude::Signal<Option<String>>>,
+    ) {
         // Guard: skip if saves are disabled (backup protection)
         if state.save_disabled {
-            tracing::warn!("save_async: Save disabled due to prior load failure - protecting backup data");
+            tracing::warn!(
+                "save_async: Save disabled due to prior load failure - protecting backup data"
+            );
             return;
         }
 
@@ -680,7 +719,10 @@ impl SessionState {
     /// Migrate session composio_profile from name-based to ID-based.
     /// Any session whose composio_profile matches a profile name (but not an ID)
     /// gets updated to the corresponding profile ID.
-    pub fn migrate_session_profiles_to_ids(&mut self, settings: &crate::settings::Settings) -> bool {
+    pub fn migrate_session_profiles_to_ids(
+        &mut self,
+        settings: &crate::settings::Settings,
+    ) -> bool {
         let mut migrated = false;
         for session in self.sessions.values_mut() {
             if let Some(ref value) = session.composio_profile {
@@ -689,10 +731,13 @@ impl SessionState {
                     continue;
                 }
                 // Match by name → replace with ID
-                if let Some(profile) = settings.composio_profiles.iter().find(|p| &p.name == value) {
+                if let Some(profile) = settings.composio_profiles.iter().find(|p| &p.name == value)
+                {
                     tracing::info!(
                         "Migrating session '{}' composio_profile from name '{}' to id '{}'",
-                        session.id, value, profile.id
+                        session.id,
+                        value,
+                        profile.id
                     );
                     session.composio_profile = Some(profile.id.clone());
                     migrated = true;
@@ -840,14 +885,20 @@ mod tests {
             }
         "#;
         let json = make_old_session_json(old_message);
-        let state = SessionState::migrate_from_raw_json(&json)
-            .expect("Migration should succeed");
+        let state = SessionState::migrate_from_raw_json(&json).expect("Migration should succeed");
 
-        let session = state.sessions.get("test-session-1").expect("Session missing");
+        let session = state
+            .sessions
+            .get("test-session-1")
+            .expect("Session missing");
         assert_eq!(session.messages.len(), 1);
 
         match &session.messages[0].content {
-            crate::components::shared::MessageContent::Text { content, thought_signature, thought_summary } => {
+            crate::components::shared::MessageContent::Text {
+                content,
+                thought_signature,
+                thought_summary,
+            } => {
                 assert_eq!(content, "Hello world");
                 assert!(thought_signature.is_none());
                 assert!(thought_summary.is_none());
@@ -876,16 +927,23 @@ mod tests {
             }
         "#;
         let json = make_old_session_json(old_messages);
-        let state = SessionState::migrate_from_raw_json(&json)
-            .expect("Migration should succeed");
+        let state = SessionState::migrate_from_raw_json(&json).expect("Migration should succeed");
 
-        let session = state.sessions.get("test-session-1").expect("Session missing");
+        let session = state
+            .sessions
+            .get("test-session-1")
+            .expect("Session missing");
         assert_eq!(session.messages.len(), 2);
 
         // Both should have created_at, and the second should be after the first
         let t0 = session.messages[0].created_at;
         let t1 = session.messages[1].created_at;
-        assert!(t1 > t0, "Second message timestamp should be after first: {:?} vs {:?}", t0, t1);
+        assert!(
+            t1 > t0,
+            "Second message timestamp should be after first: {:?} vs {:?}",
+            t0,
+            t1
+        );
     }
 
     /// Test: ToolCall/PermissionRequest field renames (id -> execution_id, name -> tool_name)
@@ -913,14 +971,22 @@ mod tests {
             }
         "#;
         let json = make_old_session_json(old_message);
-        let state = SessionState::migrate_from_raw_json(&json)
-            .expect("Migration should succeed");
+        let state = SessionState::migrate_from_raw_json(&json).expect("Migration should succeed");
 
-        let session = state.sessions.get("test-session-1").expect("Session missing");
+        let session = state
+            .sessions
+            .get("test-session-1")
+            .expect("Session missing");
         match &session.messages[0].content {
             crate::components::shared::MessageContent::ToolCall(tc) => {
-                assert_eq!(tc.execution_id, "old-exec-id", "id should have migrated to execution_id");
-                assert_eq!(tc.tool_name, "old-tool-name", "name should have migrated to tool_name");
+                assert_eq!(
+                    tc.execution_id, "old-exec-id",
+                    "id should have migrated to execution_id"
+                );
+                assert_eq!(
+                    tc.tool_name, "old-tool-name",
+                    "name should have migrated to tool_name"
+                );
             }
             other => panic!("Expected ToolCall, got {:?}", other),
         }
@@ -949,14 +1015,22 @@ mod tests {
             }
         "#;
         let json = make_old_session_json(old_message);
-        let state = SessionState::migrate_from_raw_json(&json)
-            .expect("Migration should succeed");
+        let state = SessionState::migrate_from_raw_json(&json).expect("Migration should succeed");
 
-        let session = state.sessions.get("test-session-1").expect("Session missing");
+        let session = state
+            .sessions
+            .get("test-session-1")
+            .expect("Session missing");
         match &session.messages[0].content {
             crate::components::shared::MessageContent::SkillCall(sc) => {
-                assert_eq!(sc.execution_id, "old-skill-exec-id", "id should have migrated to execution_id");
-                assert_eq!(sc.skill_name, "old-skill-name", "name should have migrated to skill_name");
+                assert_eq!(
+                    sc.execution_id, "old-skill-exec-id",
+                    "id should have migrated to execution_id"
+                );
+                assert_eq!(
+                    sc.skill_name, "old-skill-name",
+                    "name should have migrated to skill_name"
+                );
             }
             other => panic!("Expected SkillCall, got {:?}", other),
         }
@@ -1006,10 +1080,12 @@ mod tests {
         let json = make_old_session_json(old_messages);
 
         // Step 1: Migrate from old format
-        let state = SessionState::migrate_from_raw_json(&json)
-            .expect("Migration should succeed");
+        let state = SessionState::migrate_from_raw_json(&json).expect("Migration should succeed");
 
-        let session = state.sessions.get("test-session-1").expect("Session missing");
+        let session = state
+            .sessions
+            .get("test-session-1")
+            .expect("Session missing");
         assert_eq!(session.messages.len(), 3);
 
         // Verify Text migration worked
@@ -1032,7 +1108,10 @@ mod tests {
         // Verify timestamps were backfilled
         for msg in &session.messages {
             // created_at should be set (non-zero)
-            assert!(msg.created_at.timestamp() > 0, "created_at should be set for all messages");
+            assert!(
+                msg.created_at.timestamp() > 0,
+                "created_at should be set for all messages"
+            );
         }
         // Timestamps should be in order
         assert!(session.messages[1].created_at > session.messages[0].created_at);
@@ -1043,15 +1122,18 @@ mod tests {
         assert_eq!(state.window_height, 600.0);
 
         // Step 2: Serialize the migrated state and re-deserialize — "round trip"
-        let serialized = serde_json::to_string_pretty(&state)
-            .expect("Serialization should succeed");
+        let serialized =
+            serde_json::to_string_pretty(&state).expect("Serialization should succeed");
         let reloaded: SessionState = serde_json::from_str(&serialized)
             .expect("Round-trip deserialization should succeed without needing migration");
 
         assert_eq!(state.sessions.len(), reloaded.sessions.len());
         assert_eq!(state.active_session_id, reloaded.active_session_id);
         assert_eq!(state.window_width, reloaded.window_width);
-        let reloaded_session = reloaded.sessions.get("test-session-1").expect("Session missing on reload");
+        let reloaded_session = reloaded
+            .sessions
+            .get("test-session-1")
+            .expect("Session missing on reload");
         assert_eq!(reloaded_session.messages.len(), 3);
     }
 

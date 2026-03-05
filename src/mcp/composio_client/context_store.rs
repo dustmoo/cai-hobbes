@@ -84,7 +84,9 @@ impl ContextStore {
                         removed = true;
                         tracing::info!(
                             "[CONTEXT] Removed stale '{}' for toolkit '{}' user '{}'",
-                            key, toolkit_slug, user_id
+                            key,
+                            toolkit_slug,
+                            user_id
                         );
                     }
                 }

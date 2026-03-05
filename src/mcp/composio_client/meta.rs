@@ -8,9 +8,9 @@ pub fn get_meta_tools() -> Vec<ComposioTool> {
         ComposioTool {
             name: "COMPOSIO_DISCOVER_APPS".to_string(),
             description: Some(
-                "Discover available Composio applications and toolkits. \
-                Use this to find which apps match your needs (e.g., query 'email' to find 'Gmail'). \
-                Returns app names, descriptions, and tool counts. \
+                "Discover Composio apps and toolkits accessible in your active profile. \
+                Returns only apps you have connected accounts for (not the full marketplace). \
+                Use this to find which of your apps match your needs (e.g., query 'email' to find 'Gmail'). \
                 After finding the right app, use COMPOSIO_GET_APP_TOOLS to list its specific tools.".to_string()
             ),
             parameters: Some(serde_json::json!({

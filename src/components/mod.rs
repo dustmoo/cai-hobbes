@@ -3,20 +3,18 @@ pub mod chat_input;
 pub mod comment_modal;
 pub mod conflict_modal;
 pub mod inline_comment_popover;
-pub mod llm;
 pub mod markdown_renderer;
 pub mod message_list;
 pub mod new_chat_memory_modal;
 pub mod selection_toolbar;
 pub mod session_manager;
 pub mod settings_panel;
-pub mod stream_manager;
-pub mod syntax_highlighter;
-pub mod tool_call_display;
 pub mod skill_autocomplete;
 pub mod skill_call_display;
+pub mod stream_manager;
+pub mod syntax_highlighter;
 pub mod tab_bar;
-
+pub mod tool_call_display;
 
 pub mod confirm_delete_modal;
 pub mod confirm_save_modal;

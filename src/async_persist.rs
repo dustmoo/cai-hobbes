@@ -67,4 +67,3 @@ pub fn persist_bytes_async(
         });
     }
 }
-

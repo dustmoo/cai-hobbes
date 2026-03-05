@@ -13,7 +13,11 @@ fn main() {
     }
 
     // Run tailwindcss to build the CSS file
-    let npx = if cfg!(target_os = "windows") { "npx.cmd" } else { "npx" };
+    let npx = if cfg!(target_os = "windows") {
+        "npx.cmd"
+    } else {
+        "npx"
+    };
     let status = Command::new(npx)
         .args([
             "tailwindcss",

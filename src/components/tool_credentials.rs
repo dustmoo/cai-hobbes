@@ -1,7 +1,7 @@
 use crate::mcp::composio_client::ComposioClient;
 use crate::secret_manager::SecretManager;
-use crate::SecretManagerTrait;
 use crate::settings::Settings;
+use crate::SecretManagerTrait;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use std::collections::{HashMap, HashSet};
@@ -65,7 +65,8 @@ pub fn ToolCredentials() -> Element {
     let mut highlighted_index = use_signal(|| 0usize);
 
     // State for schema discovery
-    let mut selected_toolkit_listing = use_signal(|| Option::<crate::mcp::composio_client::models::ComposioToolkitListing>::None);
+    let mut selected_toolkit_listing =
+        use_signal(|| Option::<crate::mcp::composio_client::models::ComposioToolkitListing>::None);
     let mut listing_loading = use_signal(|| false);
 
     // Fetch toolkit listing when slug is selected
@@ -81,12 +82,30 @@ pub fn ToolCredentials() -> Element {
             listing_loading.set(true);
             if let Some(profile) = settings_snapshot.get_active_profile() {
                 if let Some(api_key) = &profile.api_key {
-                    let base_url = profile.base_url.clone().unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
-                    let client = ComposioClient::new(api_key.clone(), base_url, profile.entity_id.clone(), profile.user_id.clone(), profile.id.clone(), None);
-                    
-                    match crate::mcp::composio_client::discovery::get_toolkit_metadata(&client, &slug).await {
+                    let base_url = profile
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
+                    let client = ComposioClient::new(
+                        api_key.clone(),
+                        base_url,
+                        profile.entity_id.clone(),
+                        profile.user_id.clone(),
+                        profile.id.clone(),
+                        None,
+                    );
+
+                    match crate::mcp::composio_client::discovery::get_toolkit_metadata(
+                        &client, &slug,
+                    )
+                    .await
+                    {
                         Ok(listing) => {
-                            tracing::info!("Discovered schema for toolkit {}: {:?}", slug, listing.auth_config);
+                            tracing::info!(
+                                "Discovered schema for toolkit {}: {:?}",
+                                slug,
+                                listing.auth_config
+                            );
                             selected_toolkit_listing.set(Some(listing));
                         }
                         Err(e) => {
@@ -140,29 +159,34 @@ pub fn ToolCredentials() -> Element {
                         .unwrap_or_default();
 
                     // Fetch all toolkits
-                    match client.list_all_toolkits(None, None, Some(100), None, Some("name")).await {
+                    match client
+                        .list_all_toolkits(None, None, Some(100), None, Some("name"))
+                        .await
+                    {
                         Ok((toolkits, _, _)) => {
                             let mut toolkit_list: Vec<(String, String, bool)> = toolkits
                                 .into_iter()
                                 .map(|t| {
-                                    let is_connected = connected_slugs.contains(&t.slug.to_lowercase());
+                                    let is_connected =
+                                        connected_slugs.contains(&t.slug.to_lowercase());
                                     (t.slug.clone(), t.name.clone(), is_connected)
                                 })
                                 .collect();
 
                             // Sort: connected first, then alphabetically by name
-                            toolkit_list.sort_by(|a, b| {
-                                match (a.2, b.2) {
-                                    (true, false) => std::cmp::Ordering::Less,
-                                    (false, true) => std::cmp::Ordering::Greater,
-                                    _ => a.1.to_lowercase().cmp(&b.1.to_lowercase()),
-                                }
+                            toolkit_list.sort_by(|a, b| match (a.2, b.2) {
+                                (true, false) => std::cmp::Ordering::Less,
+                                (false, true) => std::cmp::Ordering::Greater,
+                                _ => a.1.to_lowercase().cmp(&b.1.to_lowercase()),
                             });
 
                             available_toolkits.set(toolkit_list);
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to fetch toolkits for credentials dropdown: {}", e);
+                            tracing::warn!(
+                                "Failed to fetch toolkits for credentials dropdown: {}",
+                                e
+                            );
                             toolkits_error.set(Some(format!("Failed to load toolkits: {}", e)));
                         }
                     }
@@ -252,15 +276,15 @@ pub fn ToolCredentials() -> Element {
                 p { class: "text-sm text-fg-muted",
                     "Add your own Client IDs and Secrets for tools that require custom authentication (e.g., LinkedIn, Google)."
                 }
-                
+
                 // LinkedIn-specific guidance (Pattern 25: Security Master)
                 if selected_slug.read().to_lowercase().contains("linkedin") {
                     div { class: "mt-3 p-3 bg-blue-900/30 border border-blue-700/50 rounded-md",
                         h5 { class: "text-xs font-semibold text-blue-300 mb-1", "LinkedIn App Limits Detected?" }
                         p { class: "text-xs text-blue-100/70 leading-relaxed",
                             "If you hit 'App Level Rate Limits', you should create your own LinkedIn App at "
-                            a { 
-                                class: "text-blue-400 hover:underline", 
+                            a {
+                                class: "text-blue-400 hover:underline",
                                 href: "https://www.linkedin.com/developers/apps",
                                 "LinkedIn Developers"
                             }
@@ -404,7 +428,7 @@ pub fn ToolCredentials() -> Element {
                     }
                     div {
                         label { class: "block text-xs font-medium text-fg-muted mb-1", "Field Name (e.g. client_id)" }
-                        
+
                         // Dynamic field suggestions based on schema
                         if let Some(listing) = selected_toolkit_listing.read().as_ref() {
                             if let Some(auth_config) = &listing.auth_config {

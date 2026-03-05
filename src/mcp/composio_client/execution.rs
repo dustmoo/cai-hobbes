@@ -4,14 +4,25 @@ use super::utils::write_to_debug_file;
 use super::ComposioClient;
 use serde_json::Value;
 
+/// Result of add_toolkit_to_server including pre-existing tool config state.
+/// Used by callers to determine whether an admin has pre-curated the tool list.
+pub struct AddToolkitResult {
+    /// New server URL if a server was created, so caller can save it.
+    pub new_server_url: Option<String>,
+    /// Pre-existing allowed_tools for this specific toolkit (if admin configured them).
+    /// Non-empty means an admin has curated the tool list — callers MUST NOT overwrite.
+    pub existing_toolkit_tools: Vec<String>,
+}
+
 /// Add a toolkit to the MCP server configuration via PATCH API.
-/// Returns the new server URL if a server was created, so caller can save it.
+/// Returns an `AddToolkitResult` with the new server URL (if created) and any
+/// pre-existing allowed_tools for this toolkit (for admin curation detection).
 pub async fn add_toolkit_to_server(
     client: &ComposioClient,
     toolkit_slug: &str,
     auth_config_id: &str,
     selected_tools: Option<Vec<String>>,
-) -> Result<Option<String>, String> {
+) -> Result<AddToolkitResult, String> {
     // Extract target server ID from base_url/settings for verification
     let target_server_id = client
         .base_url
@@ -59,29 +70,31 @@ pub async fn add_toolkit_to_server(
         .ok_or("Invalid server list response")?;
 
     // Find matching server or use the first one, OR CREATE if none exist
-    let (server_id, server_obj_owned, newly_created_url): (String, Value, Option<String>) = if items.is_empty() {
+    let (server_id, server_obj_owned, newly_created_url): (String, Value, Option<String>) = if items
+        .is_empty()
+    {
         // No servers exist - create one and an instance for this user
         tracing::info!("No MCP servers found. Creating new server for first toolkit connection.");
-        
+
         let new_server = create_mcp_server(client, toolkit_slug, auth_config_id).await?;
         let new_server_id = new_server
             .get("id")
             .and_then(|s| s.as_str())
             .ok_or("Created server missing ID")?
             .to_string();
-        
+
         // Construct the new MCP URL for the caller to save
         let base_domain = api_base.replace("/api/v3", "");
         let new_url = format!("{}/v3/mcp/{}/mcp", base_domain, new_server_id);
         tracing::info!("Created new server with URL: {}", new_url);
-        
+
         // Create instance to bind user to this server
         if let Some(ref user_id) = client.user_id {
             if let Err(e) = create_mcp_instance(client, &new_server_id, user_id).await {
                 tracing::warn!("Failed to create instance (user may already exist): {}", e);
             }
         }
-        
+
         (new_server_id, new_server, Some(new_url))
     } else {
         // MATCHING LOGIC: Prioritize the exact target_server_id if provided
@@ -92,7 +105,7 @@ pub async fn add_toolkit_to_server(
                 .find(|s| s.get("id").and_then(|id| id.as_str()) == Some(target_server_id));
         }
 
-        // Fallback to first if not found, or matching by toolkit if possible? 
+        // Fallback to first if not found, or matching by toolkit if possible?
         // For now, let's just be more logging-heavy about the choice.
         let found = target_server
             .or_else(|| {
@@ -105,20 +118,20 @@ pub async fn add_toolkit_to_server(
                 tracing::error!("Registry returned empty items list after successful list call");
                 "No MCP servers found for this account".to_string()
             })?;
-        
+
         let id = found
             .get("id")
             .and_then(|s| s.as_str())
             .ok_or("Server object missing ID")?
             .to_string();
-            
+
         // Return URL for settings update
         let base_domain = api_base.replace("/api/v3", "");
         let existing_url = format!("{}/v3/mcp/{}/mcp", base_domain, id);
-        
+
         (id, found.clone(), Some(existing_url))
     };
-    
+
     // Ensure user is bound to the server (required for tool visibility)
     // Call this regardless of whether the server is new or existing.
     if let Some(ref user_id) = client.user_id {
@@ -182,10 +195,12 @@ pub async fn add_toolkit_to_server(
             let valid_id_map: std::collections::HashMap<String, String> = active_configs
                 .iter()
                 .filter_map(|ac| {
-                    ac.toolkit.as_ref().map(|t| (ac.id.clone(), t.slug.clone().to_lowercase()))
+                    ac.toolkit
+                        .as_ref()
+                        .map(|t| (ac.id.clone(), t.slug.clone().to_lowercase()))
                 })
                 .collect();
-            
+
             let target_slug_lower = toolkit_slug.to_lowercase();
 
             // 2. Filter existing IDs
@@ -200,7 +215,11 @@ pub async fn add_toolkit_to_server(
                         // This is an config for OUR target toolkit.
                         // We will be adding the NEW authoritative one below.
                         // So we drop this one (pruning old configs for this tool).
-                        tracing::debug!("Pruning stale/old auth config '{}' for current toolkit '{}'", existing_id, target_slug_lower);
+                        tracing::debug!(
+                            "Pruning stale/old auth config '{}' for current toolkit '{}'",
+                            existing_id,
+                            target_slug_lower
+                        );
                         auth_updated = true; // We changed the list
                     } else {
                         // It belongs to another toolkit, keep it.
@@ -222,10 +241,17 @@ pub async fn add_toolkit_to_server(
     // 3. Add the NEW authoritative auth config for this toolkit
     if !auth_config_ids.contains(&auth_config_id.to_string()) {
         auth_config_ids.push(auth_config_id.to_string());
-        tracing::info!("Binding new auth_config '{}' for toolkit '{}'", auth_config_id, toolkit_slug);
+        tracing::info!(
+            "Binding new auth_config '{}' for toolkit '{}'",
+            auth_config_id,
+            toolkit_slug
+        );
         auth_updated = true;
     } else {
-         tracing::debug!("Auth config '{}' already present in reconciled list", auth_config_id);
+        tracing::debug!(
+            "Auth config '{}' already present in reconciled list",
+            auth_config_id
+        );
     }
 
     // Check if toolkit already exists
@@ -252,15 +278,31 @@ pub async fn add_toolkit_to_server(
         })
         .unwrap_or_default();
 
-    // Determine which tools to add: use pre-selected or fetch all
+    // SECURITY: Detect pre-existing admin-configured tools for THIS specific toolkit.
+    // If an admin has curated allowed_tools, we MUST NOT overwrite them.
+    let toolkit_prefix = format!("{}_", toolkit_slug.to_uppercase().replace("-", "_"));
+    let existing_toolkit_tools: Vec<String> = custom_tools
+        .iter()
+        .filter(|t| t.to_uppercase().starts_with(&toolkit_prefix))
+        .cloned()
+        .collect();
+
+    if !existing_toolkit_tools.is_empty() {
+        tracing::info!(
+            "[ADMIN TOOLS] Detected {} pre-configured tools for toolkit '{}' (admin curation)",
+            existing_toolkit_tools.len(),
+            toolkit_slug
+        );
+    }
+
+    // Determine which tools to add: use pre-selected or preserve existing
     let mut use_all_tools = false;
     let tools_added = if let Some(pre_selected) = selected_tools {
         // Use pre-selected tools (from LLM smart selection)
-        
+
         // PRUNING FIX: Remove existing tools for THIS toolkit before adding selection.
         // This ensures the AI's selection actually replaces the "all tools" default.
-        let prefix = format!("{}_", toolkit_slug.to_uppercase().replace("-", "_"));
-        custom_tools.retain(|t| !t.to_uppercase().starts_with(&prefix));
+        custom_tools.retain(|t| !t.to_uppercase().starts_with(&toolkit_prefix));
 
         let mut added = 0;
         for tool in pre_selected {
@@ -277,12 +319,23 @@ pub async fn add_toolkit_to_server(
         );
         added
     } else {
-        // Step 3 path: No tools specified - do NOT fetch/add all tools here.
-        // We set use_all_tools=true to OMIT the allowed_tools field from the PATCH payload,
-        // which lets the Composio backend default to allowing all tools for this toolkit
-        // until Step 4 (Smart Selection) runs and applies a specific filter.
-        tracing::info!("No tools specified for '{}'. Toolkit/auth binding only.", toolkit_slug);
-        use_all_tools = true;
+        // No tools specified. SECURITY: If existing tools are configured for this
+        // toolkit (admin curation), PRESERVE them instead of stripping via use_all_tools.
+        if !existing_toolkit_tools.is_empty() {
+            tracing::info!(
+                "[ADMIN TOOLS] Preserving {} existing allowed_tools for '{}' (no re-selection)",
+                existing_toolkit_tools.len(),
+                toolkit_slug
+            );
+            // use_all_tools stays false → existing tools will be included in PATCH
+        } else {
+            // Truly no tools configured: let backend default to all tools
+            tracing::info!(
+                "No tools specified for '{}'. Toolkit/auth binding only.",
+                toolkit_slug
+            );
+            use_all_tools = true;
+        }
         0
     };
 
@@ -320,18 +373,21 @@ pub async fn add_toolkit_to_server(
         if !patch_response.status().is_success() {
             let status = patch_response.status();
             let text = patch_response.text().await.unwrap_or_default();
-            
+
             // FAIL FAST: This configuration is critical. If it fails, tools won't work correctly.
             // This prevents "hollow" user generation and the "0 tools" vacuum.
-            return Err(format!("Failed to configure toolkit on server ({}): {}", status, text));
+            return Err(format!(
+                "Failed to configure toolkit on server ({}): {}",
+                status, text
+            ));
         }
     } else {
-         tracing::info!(
+        tracing::info!(
             "Toolkit '{}' already configured, skipping PATCH",
             toolkit_slug
         );
     }
-    
+
     // Step 4: Generate/register user with the MCP server
     // This is required for the user to see the tools
     // API: POST /api/v3/mcp/servers/generate
@@ -382,7 +438,10 @@ pub async fn add_toolkit_to_server(
         toolkit_slug,
         custom_tools.len()
     );
-    Ok(newly_created_url)
+    Ok(AddToolkitResult {
+        new_server_url: newly_created_url,
+        existing_toolkit_tools,
+    })
 }
 
 /// Create a new MCP server for the user's first toolkit.
@@ -431,7 +490,10 @@ async fn create_mcp_server(
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(format!("Failed to create MCP server ({}): {}", status, text));
+        return Err(format!(
+            "Failed to create MCP server ({}): {}",
+            status, text
+        ));
     }
 
     let server: Value = response
@@ -743,7 +805,11 @@ pub async fn execute_tool(
     // only need the bool to decide whether to bust the cache.
     let temp_response = ToolExecuteResponse {
         data: data.clone(),
-        error: if error_msg.is_empty() { None } else { Some(error_msg.clone()) },
+        error: if error_msg.is_empty() {
+            None
+        } else {
+            Some(error_msg.clone())
+        },
         successful,
         log_id: None,
         session_info: None,
@@ -857,4 +923,3 @@ pub async fn execute_tool(
         session_info,
     })
 }
-

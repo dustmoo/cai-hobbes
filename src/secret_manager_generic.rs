@@ -1,12 +1,12 @@
 #![cfg(not(target_os = "macos"))]
 
-use std::collections::HashMap;
-use keyring::Entry;
 use crate::constants::SERVICE_NAME;
 use crate::secret_types;
+use keyring::Entry;
+use std::collections::HashMap;
 
 // Re-export shared constants for API compatibility
-pub use crate::secret_types::{KNOWN_KEYS, composio_key_name};
+pub use crate::secret_types::{composio_key_name, KNOWN_KEYS};
 
 /// Dummy AuthContext for non-macOS generic implementation.
 /// This matches the type in the macOS implementation for API parity.
@@ -50,7 +50,9 @@ pub fn set_generic_password_with_biometric_protection(
 /// Stub for set_generic_password (API parity)
 pub fn set_generic_password(account: &str, password: &str) -> Result<(), KeychainError> {
     if let Ok(entry) = Entry::new(SERVICE_NAME, account) {
-        entry.set_password(password).map_err(|_| KeychainError::SecurityError(-1))?;
+        entry
+            .set_password(password)
+            .map_err(|_| KeychainError::SecurityError(-1))?;
         Ok(())
     } else {
         Err(KeychainError::SecurityError(-1))
@@ -151,14 +153,18 @@ impl SecretManagerTrait for SecretManager {
                 for key in index_csv.split(',') {
                     let key = key.trim();
                     if !key.is_empty() {
-                         if let Ok(entry) = Entry::new(SERVICE_NAME, key) {
+                        if let Ok(entry) = Entry::new(SERVICE_NAME, key) {
                             match entry.get_password() {
                                 Ok(value) => {
                                     self.secrets.insert(key.to_string(), value);
                                     tracing::debug!("Loaded custom tool secret: {}", key);
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Failed to load indexed secret '{}': {}", key, e);
+                                    tracing::warn!(
+                                        "Failed to load indexed secret '{}': {}",
+                                        key,
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -182,10 +188,11 @@ impl SecretManagerTrait for SecretManager {
     fn set(&mut self, key: &str, value: String) -> Result<(), String> {
         let entry = Entry::new(SERVICE_NAME, key)
             .map_err(|e| format!("Failed to create keyring entry: {}", e))?;
-            
-        entry.set_password(&value)
+
+        entry
+            .set_password(&value)
             .map_err(|e| format!("Failed to save secret to Keyring: {}", e))?;
-            
+
         self.secrets.insert(key.to_string(), value);
         tracing::debug!("Saved secret: {}", key);
         Ok(())
@@ -204,8 +211,8 @@ impl SecretManagerTrait for SecretManager {
     fn load_composio_key(&mut self, profile_id: &str) {
         let key = composio_key_name(profile_id);
         if let Some(value) = self.get_from_keychain_directly(&key) {
-             self.secrets.insert(key, value);
-             tracing::debug!("Loaded Composio key for profile id: {}", profile_id);
+            self.secrets.insert(key, value);
+            tracing::debug!("Loaded Composio key for profile id: {}", profile_id);
         }
     }
 

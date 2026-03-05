@@ -4,10 +4,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::components::shared::{StreamMessage, ToolCall};
-use crate::context::prompt_builder::LlmPrompt;
+use super::types::LlmPrompt;
+use super::GeminiConfig;
+use super::LlmConnector;
+use crate::components::shared::{StreamMessage, ToolCall, UsageData};
 use crate::mcp::manager::McpContext;
-use crate::settings::GeminiConfig;
 
 use crate::session::Tool;
 
@@ -27,6 +28,10 @@ pub struct ThinkingConfig {
 pub struct GenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -147,6 +152,8 @@ pub struct UsageMetadata {
 #[derive(Debug, PartialEq, Clone)]
 pub enum GeminiModel {
     Gemini3_1ProPreview,
+    Gemini3_1FlashPreview,
+    Gemini3_1FlashLitePreview,
     Gemini3_0ProPreview,
     Gemini3_0FlashPreview,
     Gemini2_5Pro,
@@ -171,6 +178,8 @@ impl GeminiModel {
         match s {
             // Gemini 3 Series - STRICT PREFIX MATCHING FIRST
             _ if s.starts_with("gemini-3.1-pro") => GeminiModel::Gemini3_1ProPreview,
+            _ if s.starts_with("gemini-3.1-flash-lite") => GeminiModel::Gemini3_1FlashLitePreview,
+            _ if s.starts_with("gemini-3.1-flash") => GeminiModel::Gemini3_1FlashPreview,
             _ if s.starts_with("gemini-3.0-pro") || s.starts_with("gemini-3-pro") => {
                 GeminiModel::Gemini3_0ProPreview
             }
@@ -228,7 +237,7 @@ impl GeminiModel {
             _ if s.contains("thinking") => GeminiModel::Gemini2_0FlashThinking,
             _ if s.contains("nano") => GeminiModel::NanoBanana,
             _ if s.contains("gemma") => GeminiModel::Gemma3,
-            _ if s.contains("flash-lite") => GeminiModel::Gemini2_0FlashLite, // assume cheap
+            _ if s.contains("flash-lite") => GeminiModel::Gemini3_1FlashLitePreview, // 3.1 is current gen
             _ if s.contains("flash") => GeminiModel::Gemini2_0Flash,          // assume mid-tier
             // Jan 2026: 1.5 deprecated, use 2.5 Pro (has thinking budget support)
             _ if s.contains("pro") => GeminiModel::Gemini2_5Pro,
@@ -249,7 +258,8 @@ impl GeminiModel {
                     (2.00, 12.00)
                 }
             }
-            GeminiModel::Gemini3_0FlashPreview => (0.50, 3.00),
+            GeminiModel::Gemini3_0FlashPreview | GeminiModel::Gemini3_1FlashPreview => (0.50, 3.00),
+            GeminiModel::Gemini3_1FlashLitePreview => (0.25, 1.50),
 
             GeminiModel::Gemini2_5Pro => (1.25, 10.00),
             GeminiModel::Gemini2_5Flash => (0.15, 0.60), // Updated to correct rates: $0.15 Input, $0.60 Output
@@ -312,6 +322,7 @@ pub fn calculate_cost(model: &str, usage: &UsageMetadata) -> f64 {
 #[serde(rename_all = "camelCase")]
 pub struct Candidate {
     pub content: ContentResponse,
+    #[allow(dead_code)]
     pub finish_reason: Option<String>,
 }
 
@@ -341,40 +352,391 @@ pub struct PartResponse {
     pub thought: Option<bool>,
 }
 
-impl From<PartResponse> for Part {
-    fn from(resp: PartResponse) -> Self {
-        if let Some(fc) = resp.function_call {
-            Part::FunctionCall {
-                function_call: FunctionCallPart {
-                    name: fc.name,
-                    args: fc.args,
+use crate::llm::convert::LlmFormatConverter;
+use crate::llm::convert::StreamEvent;
+
+impl LlmFormatConverter for GeminiConnector {
+    fn to_native_request(&self, prompt: &LlmPrompt, _streaming: bool) -> serde_json::Value {
+        let mut contents = Vec::new();
+
+        for msg in &prompt.messages {
+            let mut parts = Vec::new();
+            for block in &msg.content {
+                match block {
+                    crate::llm::ContentBlock::Text { text } => {
+                        parts.push(Part::Text {
+                            text: text.clone(),
+                            thought: None,
+                        });
+                    }
+                    crate::llm::ContentBlock::Thinking { text, signature: _ } => {
+                        parts.push(Part::Text {
+                            text: text.clone(),
+                            thought: Some(true),
+                        });
+                        // Gemini doesn't take the signature back in a simple text part usually,
+                        // but if we were continuing a thought it might be needed elsewhere.
+                    }
+                    crate::llm::ContentBlock::ToolCall {
+                        id: _,
+                        name,
+                        arguments,
+                        signature,
+                    } => {
+                        // Name is already sanitized by prompt_builder's get_prefixed_tool_name.
+                        // Do NOT re-sanitize — sanitize_tool_name would convert hyphens to
+                        // underscores, breaking consistency with tool declarations.
+                        parts.push(Part::FunctionCall {
+                            function_call: FunctionCallPart {
+                                name: name.clone(),
+                                args: arguments.clone(),
+                            },
+                            thought_signature: signature.clone(),
+                        });
+                    }
+                    crate::llm::ContentBlock::ToolResult {
+                        call_id: _,
+                        name,
+                        content,
+                    } => {
+                        // Gemini requires `response` to be a Protobuf Struct (JSON object).
+                        // Wrap non-object values (arrays, strings, etc.) in {"result": ...}.
+                        let response_value = if content.is_object() {
+                            content.clone()
+                        } else {
+                            serde_json::json!({ "result": content })
+                        };
+                        // Name is already sanitized by prompt_builder's get_prefixed_tool_name.
+                        parts.push(Part::FunctionResponse {
+                            function_response: FunctionResponsePart {
+                                name: name.clone(),
+                                response: response_value,
+                            },
+                        });
+                    }
+                    crate::llm::ContentBlock::Image { mime_type, data } => {
+                        parts.push(Part::InlineData {
+                            inline_data: InlineDataPart {
+                                mime_type: mime_type.clone(),
+                                data: data.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+
+            contents.push(Content {
+                role: match msg.role {
+                    crate::llm::ChatRole::User => "user".to_string(),
+                    crate::llm::ChatRole::Assistant => "model".to_string(),
+                    crate::llm::ChatRole::Tool => "user".to_string(), // Gemini uses 'user' role for tool results
+                    crate::llm::ChatRole::System => "user".to_string(), // Should be handled by system_instruction
                 },
-                thought_signature: fc.thought_signature.or(resp.thought_signature),
-            }
+                parts,
+            });
+        }
+
+        let system_instruction = prompt.system.as_ref().map(|s| SystemInstruction {
+            parts: vec![Part::Text {
+                text: s.clone(),
+                thought: None,
+            }],
+        });
+
+        let tools = if prompt.tools.is_empty() {
+            None
         } else {
-            Part::Text {
-                text: resp.text,
-                thought: resp.thought,
+            // Route through Gemini schema sanitizer for type coercion, array-items fix, enum stripping
+            let mut function_declarations = Vec::new();
+            for t in &prompt.tools {
+                let sanitized_name =
+                    crate::gemini::convert::get_prefixed_tool_name(&t.server_name, &t.name);
+
+                // Use the existing Gemini schema sanitizer for robust conversion
+                match crate::gemini::convert::convert_schema(&t.parameters) {
+                    Ok(gemini_schema) => {
+                        match serde_json::to_value(
+                            &crate::gemini::types::GeminiFunctionDeclaration {
+                                name: sanitized_name,
+                                description: if t.description.is_empty() {
+                                    None
+                                } else {
+                                    Some(t.description.clone())
+                                },
+                                parameters: Some(gemini_schema),
+                            },
+                        ) {
+                            Ok(tool_value) => function_declarations.push(tool_value),
+                            Err(e) => tracing::warn!(
+                                "Tool '{}' serialization failed: {}. Skipping.",
+                                t.name,
+                                e
+                            ),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Tool '{}:{}' incompatible with Gemini: {}. Skipping.",
+                            t.server_name,
+                            t.name,
+                            e
+                        );
+                    }
+                }
             }
+
+            // Enforce Gemini's 128-tool limit to prevent 400 errors
+            const GEMINI_TOOL_LIMIT: usize = 128;
+            if function_declarations.len() > GEMINI_TOOL_LIMIT {
+                let original_count = function_declarations.len();
+                function_declarations.truncate(GEMINI_TOOL_LIMIT);
+                tracing::warn!(
+                    "Tool count ({}) exceeds Gemini limit ({}). Truncated {} tools.",
+                    original_count,
+                    GEMINI_TOOL_LIMIT,
+                    original_count - GEMINI_TOOL_LIMIT
+                );
+            }
+
+            if function_declarations.is_empty() {
+                None
+            } else {
+                Some(vec![Tool {
+                    function_declarations,
+                }])
+            }
+        };
+
+        // Determine tool config
+        let tool_config = if tools.is_some() {
+            Some(ToolConfig {
+                function_calling_config: FunctionCallingConfig {
+                    mode: "AUTO".to_string(),
+                    allowed_function_names: None,
+                },
+            })
+        } else {
+            None
+        };
+
+        // Build thinking config based on model and settings
+        let mut model_slug = self.config.chat_model.clone();
+        if model_slug.starts_with("models/") {
+            model_slug = model_slug.strip_prefix("models/").unwrap().to_string();
+        }
+        let gemini_model = GeminiModel::from_slug(&model_slug);
+
+        let generation_config = if self.config.thinking_enabled {
+            match gemini_model.thinking_config_style() {
+                ThinkingConfigStyle::LevelPro | ThinkingConfigStyle::LevelFlash => {
+                    let level = if gemini_model
+                        .valid_thinking_levels()
+                        .contains(&self.config.thinking_level.as_str())
+                    {
+                        self.config.thinking_level.clone()
+                    } else {
+                        "high".to_string()
+                    };
+                    Some(ThinkingConfig {
+                        thinking_level: Some(level),
+                        thinking_budget: None,
+                        include_thoughts: Some(true),
+                    })
+                }
+                ThinkingConfigStyle::Budget => Some(ThinkingConfig {
+                    thinking_level: None,
+                    thinking_budget: self.config.thinking_budget,
+                    include_thoughts: Some(true),
+                }),
+                ThinkingConfigStyle::None => None,
+            }
+            .map(|tc| GenerationConfig {
+                thinking_config: Some(tc),
+                response_mime_type: None,
+                response_schema: None,
+            })
+        } else {
+            None
+        };
+
+        let request = GeminiRequest {
+            contents,
+            tools,
+            system_instruction,
+            tool_config,
+            generation_config,
+        };
+
+        serde_json::to_value(request).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn parse_stream_chunk(&self, chunk: &str) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+
+        // Gemini SSE format is typically data: {...}
+        let json_str = if let Some(stripped) = chunk.strip_prefix("data: ") {
+            stripped
+        } else {
+            chunk
+        };
+
+        if json_str.trim() == "[DONE]" {
+            events.push(StreamEvent::Done);
+            return events;
+        }
+
+        match serde_json::from_str::<GeminiResponse>(json_str) {
+            Ok(parsed) => {
+                if let Some(candidate) = parsed.candidates.first() {
+                    for part in &candidate.content.parts {
+                        if let Some(fc) = &part.function_call {
+                            // Pass the raw sanitized name through — resolution happens
+                            // in generate_content_stream via lookup, not by splitting.
+                            // GAP 4: Match old merge order — prefer part-level over fc-level
+                            events.push(StreamEvent::ToolCall {
+                                id: "gemini".to_string(),
+                                name: fc.name.clone(),
+                                server_name: None,
+                                arguments: fc.args.clone(),
+                                signature: part
+                                    .thought_signature
+                                    .clone()
+                                    .or(fc.thought_signature.clone()),
+                            });
+                        } else if part.thought.unwrap_or(false) && !part.text.is_empty() {
+                            events.push(StreamEvent::Thinking {
+                                text: part.text.clone(),
+                                signature: part.thought_signature.clone(),
+                            });
+                        } else if !part.text.is_empty() {
+                            // GAP 2: Apply unparse_json_response for wrapped JSON text
+                            let (content, thought_summary) = if part.text.trim().starts_with('{')
+                                && part.text.trim().ends_with('}')
+                            {
+                                unparse_json_response(&part.text)
+                            } else {
+                                (part.text.clone(), None)
+                            };
+                            if !content.is_empty() {
+                                events.push(StreamEvent::Text { content });
+                            }
+                            if let Some(summary) = thought_summary {
+                                events.push(StreamEvent::Thinking {
+                                    text: summary,
+                                    signature: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                if let Some(usage) = parsed.usage_metadata {
+                    let model = self.config.chat_model.clone();
+                    let cost = calculate_cost(&model, &usage);
+                    events.push(StreamEvent::Usage(UsageData {
+                        prompt_tokens: usage.prompt_token_count,
+                        completion_tokens: usage.candidates_token_count.unwrap_or(0),
+                        total_tokens: usage.total_token_count,
+                        cached_content_tokens: usage.cached_content_token_count,
+                        thoughts_tokens: usage.thoughts_token_count,
+                        cost: Some(cost),
+                    }));
+                }
+            }
+            Err(e) => {
+                // If it's not a full GeminiResponse, it might be an error or a malformed chunk
+                if json_str.contains("error") {
+                    if let Ok(err) = serde_json::from_str::<GeminiErrorResponse>(json_str) {
+                        events.push(StreamEvent::Error {
+                            message: err.error.message,
+                        });
+                    }
+                } else {
+                    // Possible partial JSON or other SSE noise
+                    tracing::trace!("Failed to parse Gemini chunk: {}. Chunk: {}", e, json_str);
+                }
+            }
+        }
+
+        events
+    }
+
+    fn convert_mcp_tool(
+        &self,
+        tool: &rmcp::model::Tool,
+        server_name: &str,
+    ) -> Result<crate::llm::ToolDefinition, String> {
+        Ok(crate::llm::ToolDefinition::from_mcp(tool, server_name))
+    }
+
+    fn sanitize_tool_name(&self, name: &str) -> String {
+        // Gemini restricted characters: a-z, A-Z, 0-9, _, and max 63 chars
+        let mut sanitized: String = name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+
+        if sanitized.len() > 63 {
+            sanitized.truncate(63);
+        }
+        sanitized
+    }
+
+    fn original_tool_name(&self, sanitized: &str) -> Option<String> {
+        // The resolved_tool_call logic handles this more robustly
+        Some(sanitized.to_string())
+    }
+
+    fn max_tools(&self) -> usize {
+        128
+    }
+}
+
+impl GeminiConnector {
+    /// Resolve a sanitized tool name back into (server_name, tool_name).
+    ///
+    /// When `mcp_context` is available, uses prefix-matching against known servers
+    /// for lossless resolution (handles server names containing underscores like
+    /// `composio-native`). Falls back to first-underscore split when no context.
+    fn resolve_tool_call(
+        &self,
+        sanitized_name: &str,
+        mcp_context: &Option<crate::mcp::manager::McpContext>,
+    ) -> (String, String) {
+        // Prefer lossless prefix-matching against known servers
+        if let Some(ctx) = mcp_context {
+            for server in &ctx.servers {
+                let server_prefix = format!(
+                    "{}_",
+                    crate::gemini::convert::sanitize_function_name(
+                        crate::gemini::convert::normalize_server_name(&server.name)
+                    )
+                );
+                if sanitized_name.starts_with(&server_prefix) {
+                    return (
+                        server.name.clone(),
+                        sanitized_name[server_prefix.len()..].to_string(),
+                    );
+                }
+            }
+        }
+        // Fallback: first underscore split (fragile for multi-underscore server names)
+        if let Some(pos) = sanitized_name.find('_') {
+            let server = sanitized_name[..pos].to_string();
+            let tool = sanitized_name[pos + 1..].to_string();
+            (server, tool)
+        } else {
+            ("unknown".to_string(), sanitized_name.to_string())
         }
     }
 }
 
-#[async_trait]
-pub trait LlmConnector: Send + Sync {
-    async fn generate_content_stream(
-        &self,
-        prompt_data: LlmPrompt,
-        tx: mpsc::UnboundedSender<StreamMessage>,
-        mcp_context: Option<McpContext>,
-    );
-
-    async fn summarize_conversation(
-        &self,
-        previous_summary: String,
-        recent_messages: String,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>;
-}
+// Trait moved to src/llm/mod.rs
 
 pub struct GeminiConnector {
     config: GeminiConfig,
@@ -405,10 +767,13 @@ impl GeminiModel {
     /// Returns the thinking config style for this model
     pub fn thinking_config_style(&self) -> ThinkingConfigStyle {
         match self {
-            GeminiModel::Gemini3_1ProPreview | GeminiModel::Gemini3_0ProPreview => ThinkingConfigStyle::LevelPro,
-            GeminiModel::Gemini3_0FlashPreview | GeminiModel::Gemini2_0FlashThinking => {
-                ThinkingConfigStyle::LevelFlash
+            GeminiModel::Gemini3_1ProPreview | GeminiModel::Gemini3_0ProPreview => {
+                ThinkingConfigStyle::LevelPro
             }
+            GeminiModel::Gemini3_1FlashPreview
+            | GeminiModel::Gemini3_1FlashLitePreview
+            | GeminiModel::Gemini3_0FlashPreview
+            | GeminiModel::Gemini2_0FlashThinking => ThinkingConfigStyle::LevelFlash,
             GeminiModel::Gemini2_5Pro
             | GeminiModel::Gemini2_5Flash
             | GeminiModel::Gemini2_5FlashLite
@@ -421,6 +786,8 @@ impl GeminiModel {
     pub fn display_name(&self) -> String {
         match self {
             GeminiModel::Gemini3_1ProPreview => "Gemini 3.1 Pro".to_string(),
+            GeminiModel::Gemini3_1FlashPreview => "Gemini 3.1 Flash".to_string(),
+            GeminiModel::Gemini3_1FlashLitePreview => "Gemini 3.1 Flash Lite".to_string(),
             GeminiModel::Gemini3_0ProPreview => "Gemini 3 Pro".to_string(),
             GeminiModel::Gemini3_0FlashPreview => "Gemini 3 Flash".to_string(),
             GeminiModel::Gemini2_5Pro => "Gemini 2.5 Pro".to_string(),
@@ -434,7 +801,7 @@ impl GeminiModel {
             GeminiModel::NanoBananaPro => "Nano Banana Pro (Image · Planned)".to_string(),
             GeminiModel::Gemma3 => "Gemma 3".to_string(),
             GeminiModel::Unknown(slug) => {
-                // Fallback for unknown slugs: 
+                // Fallback for unknown slugs:
                 // 1. Strip models/ prefix
                 // 2. Replace - and _ with space
                 // 3. Title case words
@@ -459,7 +826,7 @@ impl GeminiModel {
     /// Valid thinking levels for Flash 3 (Pro only supports low/high)
     pub fn valid_thinking_levels(&self) -> &'static [&'static str] {
         match self.thinking_config_style() {
-            ThinkingConfigStyle::LevelPro => &["low", "high"],
+            ThinkingConfigStyle::LevelPro => &["low", "medium", "high"],
             ThinkingConfigStyle::LevelFlash => &["minimal", "low", "medium", "high"],
             _ => &[],
         }
@@ -470,6 +837,8 @@ impl GeminiModel {
     pub fn canonical_slug(&self) -> &str {
         match self {
             GeminiModel::Gemini3_1ProPreview => "gemini-3.1-pro-preview",
+            GeminiModel::Gemini3_1FlashPreview => "gemini-3.1-flash-preview",
+            GeminiModel::Gemini3_1FlashLitePreview => "gemini-3.1-flash-lite-preview",
             GeminiModel::Gemini3_0ProPreview => "gemini-3-pro-preview",
             GeminiModel::Gemini3_0FlashPreview => "gemini-3-flash-preview",
             GeminiModel::Gemini2_5Pro => "gemini-2.5-pro",
@@ -728,12 +1097,13 @@ impl LlmConnector for GeminiConnector {
                 }
             },
         };
+
         let mut model = self.config.chat_model.clone();
         if model.starts_with("models/") {
             model = model.strip_prefix("models/").unwrap().to_string();
         }
 
-        tracing::info!(model = %model, "LLM: Generating content stream");
+        tracing::info!(model = %model, "LLM: Generating content stream (Refactored)");
 
         const MAX_RETRIES: u32 = 2;
         let client = Client::builder()
@@ -741,129 +1111,40 @@ impl LlmConnector for GeminiConnector {
             .build()
             .expect("Failed to build reqwest client");
 
-        // Build thinking config based on model and settings
-        let generation_config = if self.config.thinking_enabled {
-            let gemini_model = GeminiModel::from_slug(&model);
-            match gemini_model.thinking_config_style() {
-                ThinkingConfigStyle::LevelPro | ThinkingConfigStyle::LevelFlash => {
-                    // Validate level is supported for this model
-                    let level = if gemini_model
-                        .valid_thinking_levels()
-                        .contains(&self.config.thinking_level.as_str())
-                    {
-                        self.config.thinking_level.clone()
-                    } else {
-                        "high".to_string() // Default fallback
-                    };
-                    Some(ThinkingConfig {
-                        thinking_level: Some(level),
-                        thinking_budget: None,
-                        include_thoughts: Some(true),
-                    })
-                }
-                ThinkingConfigStyle::Budget => Some(ThinkingConfig {
-                    thinking_level: None,
-                    thinking_budget: self.config.thinking_budget,
-                    include_thoughts: Some(true),
-                }),
-                ThinkingConfigStyle::None => None,
+        // Convert neutral prompt to native request once as a base
+        let native_request_val = self.to_native_request(&prompt_data, true);
+        let mut request_body: GeminiRequest = match serde_json::from_value(native_request_val) {
+            Ok(req) => req,
+            Err(e) => {
+                let _ = tx.send(StreamMessage::Error {
+                    message: format!("Failed to build Gemini request: {}", e),
+                });
+                return;
             }
-            .map(|tc| GenerationConfig {
-                thinking_config: Some(tc),
-            })
-        } else {
-            None
         };
 
-        let mut request_body = GeminiRequest {
-            contents: prompt_data.contents,
-            tools: prompt_data.tools.clone(),
-            system_instruction: prompt_data.system_instruction,
-            tool_config: if prompt_data.tools.is_some() {
-                Some(ToolConfig {
-                    function_calling_config: FunctionCallingConfig {
-                        mode: "AUTO".to_string(),
-                        allowed_function_names: None,
-                    },
-                })
-            } else {
-                None
-            },
-            generation_config,
-        };
-
-        // --- Synchronous Logging Block ---
+        // --- Logging Block ---
         {
-            // Create a sanitized version of the request for logging
-            let mut sanitized_request = request_body.clone();
-            for content in &mut sanitized_request.contents {
-                for part in &mut content.parts {
-                    if let Part::InlineData { inline_data } = part {
-                        let original_len = inline_data.data.len();
-                        if original_len > 100 {
-                            let truncated_data =
-                                inline_data.data.chars().take(50).collect::<String>();
-                            inline_data.data =
-                                format!("[{} bytes, truncated]...{}", original_len, truncated_data);
-                        }
-                    }
-                }
-            }
-            tracing::debug!("Sending Gemini request: {:?}", sanitized_request);
-
-            // Write the full request (with tools) to debug file for diagnosis
             if tracing::enabled!(tracing::Level::DEBUG) {
                 if let Ok(request_json) = serde_json::to_string_pretty(&request_body) {
                     let debug_dir = std::env::temp_dir().join("hobbes_debug_logs");
                     if std::fs::create_dir_all(&debug_dir).is_ok() {
-                        let file_path = debug_dir.join("gemini_request.json");
-                        if let Err(e) = std::fs::write(&file_path, &request_json) {
-                            tracing::warn!("Failed to write Gemini debug file: {}", e);
-                        } else {
-                            tracing::debug!("Wrote Gemini request to {:?}", file_path);
-                        }
+                        let _ =
+                            std::fs::write(debug_dir.join("gemini_request.json"), &request_json);
                     }
                 }
             }
-            tracing::info!("Using chat model: {}", model);
         }
-        // --- End Synchronous Logging Block ---
 
-        // --- End Synchronous Logging Block ---
-
-        let url =
-            self.build_model_endpoint(&model, "streamGenerateContent", &api_key) + "&alt=sse";
+        let url = self.build_model_endpoint(&model, "streamGenerateContent", &api_key) + "&alt=sse";
 
         for attempt in 0..MAX_RETRIES {
             let response = match client.post(&url).json(&request_body).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let error_msg = if e.is_timeout() {
-                        tracing::error!(
-                            "Gemini API Request TIMED OUT on attempt {}. Duration: 600s",
-                            attempt + 1
-                        );
-                        format!(
-                            "Request timed out after 600 seconds (attempt {}/{})",
-                            attempt + 1,
-                            MAX_RETRIES
-                        )
-                    } else {
-                        tracing::error!("Error sending request on attempt {}: {}", attempt + 1, e);
-                        format!(
-                            "Network error: {} (attempt {}/{})",
-                            e,
-                            attempt + 1,
-                            MAX_RETRIES
-                        )
-                    };
-
                     if attempt + 1 == MAX_RETRIES {
                         let _ = tx.send(StreamMessage::Error {
-                            message: format!(
-                                "Failed to connect to Gemini API after {} attempts. {}",
-                                MAX_RETRIES, error_msg
-                            ),
+                            message: format!("Network error after {} attempts: {}", MAX_RETRIES, e),
                         });
                         return;
                     }
@@ -874,41 +1155,31 @@ impl LlmConnector for GeminiConnector {
 
             if !response.status().is_success() {
                 let status = response.status();
-                let body_text = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Failed to read error body".to_string());
-                let error_message = if let Ok(error_response) =
-                    serde_json::from_str::<GeminiErrorResponse>(&body_text)
-                {
-                    tracing::error!(
-                        "Gemini API Error [{}]: {}",
-                        status,
-                        error_response.error.message
-                    );
-                    format!(
-                        "Gemini API Error [{}]: {}",
-                        status, error_response.error.message
-                    )
+                let body_text = response.text().await.unwrap_or_default();
+                let msg = if let Ok(err) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
+                    err.error.message
                 } else {
-                    tracing::error!("Gemini API Error [{}]: {}", status, body_text);
-                    format!("Gemini API Error [{}]: {}", status, body_text)
+                    body_text
                 };
-
                 let _ = tx.send(StreamMessage::Error {
-                    message: error_message,
+                    message: format!("Gemini API Error [{}]: {}", status, msg),
                 });
                 return;
             }
 
             let mut stream = response.bytes_stream();
+            let mut buffer = Vec::<u8>::new();
+            let mut current_attempt_parts = Vec::<Part>::new();
+            let mut malformed_call_detected = false;
+            let mut unexpected_tool_call_detected = false;
             let mut has_sent_data = false;
             let mut tool_not_found_count: u32 = 0;
             let mut finish_reason: Option<String> = None;
-            let mut buffer = Vec::<u8>::new();
-            let mut malformed_call_detected = false;
-            let mut unexpected_tool_call_detected = false;
-            let mut current_attempt_parts = Vec::<Part>::new();
+            // Dedup guard: Gemini SSE sends cumulative candidate snapshots, so the same
+            // functionCall can appear in multiple chunks. Track (name, args_hash) to
+            // prevent duplicate execution.
+            let mut emitted_tool_calls: std::collections::HashSet<(String, u64)> =
+                std::collections::HashSet::new();
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -916,229 +1187,214 @@ impl LlmConnector for GeminiConnector {
                         buffer.extend_from_slice(&bytes);
                         while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
                             let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
-                            let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                            let line = String::from_utf8_lossy(&line_bytes);
 
-                            if let Some(json_str) = line.strip_prefix("data: ") {
-                                if json_str.is_empty() {
-                                    continue;
-                                }
-                                match serde_json::from_str::<GeminiResponse>(json_str) {
-                                    Ok(parsed) => {
-                                        if let Some(candidate) = parsed.candidates.first() {
-                                            if let Some(reason) = &candidate.finish_reason {
-                                                finish_reason = Some(reason.clone());
-                                                if reason == "MALFORMED_FUNCTION_CALL" {
-                                                    tracing::warn!("Malformed function call detected on attempt {}. Retrying...", attempt + 1);
-                                                    malformed_call_detected = true;
-                                                    break; // Break from inner while to retry
-                                                }
-                                                if reason == "UNEXPECTED_TOOL_CALL" {
-                                                    tracing::warn!("Unexpected tool call detected on attempt {}. Retrying with correction...", attempt + 1);
-                                                    unexpected_tool_call_detected = true;
-                                                    break; // Break from inner while to retry
-                                                }
-                                                if reason != "STOP" {
-                                                    tracing::warn!(
-                                                        "Gemini stream finished with reason: {}",
-                                                        reason
-                                                    );
-                                                }
-                                            }
-                                            // Process ALL parts - Gemini with thinking returns multiple parts
-                                            // (thought parts AND content parts) in a single response
-                                            for part in &candidate.content.parts {
-                                                current_attempt_parts
-                                                    .push(Part::from(part.clone()));
-                                                // Check if this is a thought summary part first
-                                                if part.thought.unwrap_or(false)
-                                                    && !part.text.is_empty()
-                                                {
-                                                    // This is a thought summary - send it as thought_summary
-                                                    if tx
-                                                        .send(StreamMessage::Text {
-                                                            content: String::new(),
-                                                            thought_signature: None,
-                                                            thought_summary: Some(
-                                                                part.text.clone(),
-                                                            ),
-                                                        })
-                                                        .is_err()
-                                                    {
-                                                        return;
-                                                    }
-                                                    has_sent_data = true;
-                                                } else if let Some(function_call) =
-                                                    &part.function_call
-                                                {
-                                                    // Log raw JSON if it contains a function call
-                                                    tracing::debug!(
-                                                        "Raw JSON with function call: {}",
-                                                        json_str
-                                                    );
+                            // Check for Gemini-specific finish reasons that require retry
+                            if line.contains("MALFORMED_FUNCTION_CALL") {
+                                malformed_call_detected = true;
+                                finish_reason = Some("MALFORMED_FUNCTION_CALL".to_string());
+                                break;
+                            }
+                            if line.contains("UNEXPECTED_TOOL_CALL") {
+                                unexpected_tool_call_detected = true;
+                                finish_reason = Some("UNEXPECTED_TOOL_CALL".to_string());
+                                break;
+                            }
+                            // Track SAFETY finish reason
+                            if line.contains("\"SAFETY\"") && line.contains("finishReason") {
+                                finish_reason = Some("SAFETY".to_string());
+                            }
 
-                                                    // Log the thought_signature field for debugging
-                                                    if let Some(ref thought_sig) =
-                                                        part.thought_signature
-                                                    {
-                                                        tracing::info!("Received function call '{}' with thought_signature: '{}'",
-                                                        function_call.name,
-                                                        if thought_sig.len() > 50 { &thought_sig[..50] } else { thought_sig }
-                                                    );
-                                                    } else {
-                                                        tracing::warn!("Received function call '{}' WITHOUT thought_signature field", function_call.name);
-                                                    }
-
-                                                    let mut found_tool = false;
-
-                                                    // Note: composio_meta routing removed - Tool Router handles on-demand tools
-                                                    if let Some(context) = &mcp_context {
-                                                        'server_loop: for server in &context.servers
-                                                        {
-                                                            for tool in &server.tools {
-                                                                let sanitized_tool_name = crate::gemini::convert::get_prefixed_tool_name(&server.name, &tool.name);
-                                                                if sanitized_tool_name
-                                                                    == function_call.name
-                                                                {
-                                                                    let tool_call = ToolCall::new(
-                                                                        server.name.clone(),
-                                                                        tool.name.to_string(), // Use original tool name for execution
-                                                                        function_call.args.clone(),
-                                                                        part.thought_signature
-                                                                            .clone()
-                                                                            .or(function_call
-                                                                                .thought_signature
-                                                                                .clone()),
-                                                                        None, // thought_summary will be populated by stream_manager
-                                                                    );
-                                                                    if tx
-                                                                        .send(
-                                                                            StreamMessage::ToolCall(
-                                                                                tool_call,
-                                                                            ),
-                                                                        )
-                                                                        .is_err()
-                                                                    {
-                                                                        return;
-                                                                    }
-                                                                    has_sent_data = true;
-                                                                    found_tool = true;
-                                                                    break 'server_loop;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    if !found_tool {
-                                                        tool_not_found_count += 1;
-                                                        tracing::error!("LLM requested tool '{}' which was not found in the provided context (count: {}).", function_call.name, tool_not_found_count);
-                                                        // After repeated failures, emit the persistent error message that triggers QuickFix buttons
-                                                            let tool_error_msg = if tool_not_found_count >= 2 {
-                                                            "[Hobbes encountered a persistent error ('TOOL_NOT_FOUND') after multiple retries. The model may be hallucinating a tool that does not exist.]".to_string()
-                                                        } else {
-                                                            format!(
-                                                            "⚠️ **Tool Not Available: `{}`**\n\n\
-                                                            Hobbes tried to use a tool that isn't currently loaded. This can happen if:\n\n\
-                                                            • The MCP server providing this tool is not running\n\
-                                                            • The tool requires authentication that hasn't been set up\n\
-                                                            • The tool list needs to be refreshed\n\n\
-                                                            Please check your MCP Integration settings.",
-                                                            function_call.name)
-                                                        };
-                                                        if tx
-                                                            .send(StreamMessage::Text {
-                                                                content: tool_error_msg,
-                                                                thought_signature: None,
-                                                                thought_summary: None,
-                                                            })
-                                                            .is_err()
-                                                        {
-                                                            return;
-                                                        }
-                                                        has_sent_data = true;
-                                                        // Circuit breaker: stop the stream after persistent tool-not-found
-                                                        if tool_not_found_count >= 2 {
-                                                            return;
-                                                        }
-                                                    }
-                                                } else if !part.text.is_empty() {
-                                                    // Check if the text is structured JSON that needs unwrapping
-                                                    let (content, thought_summary) =
-                                                        if part.text.trim().starts_with('{')
-                                                            && part.text.trim().ends_with('}')
-                                                        {
-                                                            unparse_json_response(&part.text)
-                                                        } else {
-                                                            (part.text.clone(), None)
-                                                        };
-
-                                                    if !content.is_empty()
-                                                        || thought_summary.is_some()
-                                                    {
-                                                        if tx
-                                                            .send(StreamMessage::Text {
-                                                                content,
-                                                                thought_signature: None,
-                                                                thought_summary,
-                                                            })
-                                                            .is_err()
-                                                        {
-                                                            return;
-                                                        }
-                                                        has_sent_data = true;
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        // Send usage data if present
-                                        if let Some(usage) = &parsed.usage_metadata {
-                                            let cost = calculate_cost(&model, usage);
-                                            let usage_data = crate::components::shared::UsageData {
-                                                prompt_tokens: usage.prompt_token_count,
-                                                completion_tokens: usage
-                                                    .candidates_token_count
-                                                    .unwrap_or(0),
-                                                total_tokens: usage.total_token_count,
-                                                thoughts_tokens: usage.thoughts_token_count,
-                                                cached_content_tokens: usage
-                                                    .cached_content_token_count,
-                                                cost: Some(cost),
+                            let events = self.parse_stream_chunk(&line);
+                            for event in events {
+                                match event {
+                                    StreamEvent::Text { content } => {
+                                        // Check for structured JSON unwrapping
+                                        let (final_content, thought_summary) =
+                                            if content.trim().starts_with('{') {
+                                                unparse_json_response(&content)
+                                            } else {
+                                                (content.clone(), None)
                                             };
-                                            if tx.send(StreamMessage::Usage(usage_data)).is_err() {
-                                                tracing::warn!(
-                                                    "Failed to send usage data to stream"
-                                                );
-                                            }
+
+                                        if !final_content.is_empty() || thought_summary.is_some() {
+                                            current_attempt_parts.push(Part::Text {
+                                                text: content, // Keep raw for context history
+                                                thought: None,
+                                            });
+                                            let _ = tx.send(StreamMessage::Text {
+                                                content: final_content,
+                                                thought_signature: None,
+                                                thought_summary,
+                                            });
+                                            has_sent_data = true;
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::error!("Failed to parse JSON chunk from stream: {}. Chunk: '{}'", e, json_str);
-                                        // Check if this is a malformed call finish reason
-                                        if json_str.contains("MALFORMED_FUNCTION_CALL") {
-                                            tracing::warn!("Malformed function call detected via string search on attempt {}. Retrying...", attempt + 1);
-                                            malformed_call_detected = true;
-                                            break; // Break from inner while to retry
+                                    StreamEvent::Thinking { text, signature } => {
+                                        current_attempt_parts.push(Part::Text {
+                                            text: text.clone(),
+                                            thought: Some(true),
+                                        });
+                                        let _ = tx.send(StreamMessage::Text {
+                                            content: String::new(),
+                                            thought_signature: signature,
+                                            thought_summary: Some(text),
+                                        });
+                                        has_sent_data = true;
+                                    }
+                                    StreamEvent::ToolCall {
+                                        id: _,
+                                        name: fc_name,
+                                        server_name: _,
+                                        arguments,
+                                        signature,
+                                    } => {
+                                        // GAP 1: Diagnostic logging for thought_signature
+                                        if let Some(ref sig) = signature {
+                                            tracing::info!("Received function call '{}' with thought_signature: '{}'",
+                                                fc_name,
+                                                if sig.len() > 50 { &sig[..50] } else { sig }
+                                            );
+                                        } else {
+                                            tracing::warn!("Received function call '{}' WITHOUT thought_signature field", fc_name);
                                         }
-                                        // Check if this is an unexpected tool call finish reason
-                                        if json_str.contains("UNEXPECTED_TOOL_CALL") {
-                                            tracing::warn!("Unexpected tool call detected via string search on attempt {}. Retrying with correction...", attempt + 1);
-                                            unexpected_tool_call_detected = true;
-                                            break; // Break from inner while to retry
+
+                                        // GAP 3: ALWAYS accumulate the function call into current_attempt_parts,
+                                        // even if tool is not found. This is critical for grounding retries —
+                                        // the model must see its own failed attempt for self-correction.
+                                        current_attempt_parts.push(Part::FunctionCall {
+                                            function_call: FunctionCallPart {
+                                                name: fc_name.clone(),
+                                                args: arguments.clone(),
+                                            },
+                                            thought_signature: signature.clone(),
+                                        });
+
+                                        // Original pattern: iterate all servers/tools, compare
+                                        // get_prefixed_tool_name against the raw function call name.
+                                        // On match, use the ORIGINAL server.name and tool.name.
+                                        let mut found_tool = false;
+                                        let mut matched_server = String::new();
+                                        let mut matched_tool = String::new();
+
+                                        if let Some(ref ctx) = mcp_context {
+                                            'server_loop: for server in &ctx.servers {
+                                                for tool in &server.tools {
+                                                    let sanitized_tool_name = crate::gemini::convert::get_prefixed_tool_name(&server.name, &tool.name);
+                                                    if sanitized_tool_name == fc_name {
+                                                        matched_server = server.name.clone();
+                                                        matched_tool = tool.name.to_string();
+                                                        found_tool = true;
+                                                        break 'server_loop;
+                                                    }
+                                                }
+                                            }
+
+                                            // Fallback for on-demand tools (e.g. from COMPOSIO_GET_APP_TOOLS).
+                                            // These live in the MCP manager's dynamic cache, not the static snapshot.
+                                            // Reverse-map: try each server's normalized prefix against fc_name.
+                                            if !found_tool {
+                                                for server in &ctx.servers {
+                                                    // Build the prefix the same way get_prefixed_tool_name does:
+                                                    // normalize_server_name → sanitize_function_name → append "_"
+                                                    let server_prefix = format!("{}_",
+                                                        crate::gemini::convert::sanitize_function_name(
+                                                            crate::gemini::convert::normalize_server_name(&server.name)
+                                                        )
+                                                    );
+                                                    if fc_name.starts_with(&server_prefix) {
+                                                        matched_server = server.name.clone();
+                                                        matched_tool = fc_name
+                                                            [server_prefix.len()..]
+                                                            .to_string();
+                                                        found_tool = true;
+                                                        tracing::info!(
+                                                            "On-demand tool '{}' resolved via prefix match: server='{}', tool='{}'",
+                                                            fc_name, matched_server, matched_tool
+                                                        );
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // No context — use resolve_tool_call with None
+                                            found_tool = true;
+                                            let (s, t) = self.resolve_tool_call(&fc_name, &None);
+                                            matched_server = s;
+                                            matched_tool = t;
                                         }
-                                        let error_message = "[Hobbes encountered a stream error. Please check the logs for details.]";
-                                        if tx
-                                            .send(StreamMessage::Text {
-                                                content: error_message.to_string(),
+
+                                        if found_tool {
+                                            // Dedup: hash the arguments to create a fingerprint
+                                            use std::hash::{Hash, Hasher};
+                                            let mut hasher =
+                                                std::collections::hash_map::DefaultHasher::new();
+                                            arguments.to_string().hash(&mut hasher);
+                                            let args_hash = hasher.finish();
+                                            let dedup_key = (fc_name.clone(), args_hash);
+
+                                            if emitted_tool_calls.contains(&dedup_key) {
+                                                tracing::warn!(
+                                                    "Duplicate tool call suppressed: '{}' (args_hash: {})",
+                                                    fc_name, args_hash
+                                                );
+                                            } else {
+                                                emitted_tool_calls.insert(dedup_key);
+                                                let tool_call = ToolCall::new(
+                                                    matched_server,
+                                                    matched_tool,
+                                                    arguments.clone(),
+                                                    signature.clone(),
+                                                    None,
+                                                );
+                                                let _ = tx.send(StreamMessage::ToolCall(tool_call));
+                                                has_sent_data = true;
+                                            }
+                                        } else {
+                                            // Tool not found in mcp_context - send user-friendly error
+                                            tool_not_found_count += 1;
+                                            tracing::error!("LLM requested tool '{}' which was not found in the provided context (count: {}).", fc_name, tool_not_found_count);
+
+                                            let tool_error_msg = if tool_not_found_count >= 2 {
+                                                "[Hobbes encountered a persistent error ('TOOL_NOT_FOUND') after multiple retries. The model may be hallucinating a tool that does not exist.]".to_string()
+                                            } else {
+                                                format!(
+                                                    "⚠️ **Tool Not Available: `{}`**\n\n\
+                                                    Hobbes tried to use a tool that isn't currently loaded. This can happen if:\n\n\
+                                                    • The MCP server providing this tool is not running\n\
+                                                    • The tool requires authentication that hasn't been set up\n\
+                                                    • The tool list needs to be refreshed\n\n\
+                                                    Please check your MCP Integration settings.",
+                                                    fc_name)
+                                            };
+                                            let _ = tx.send(StreamMessage::Text {
+                                                content: tool_error_msg,
                                                 thought_signature: None,
                                                 thought_summary: None,
-                                            })
-                                            .is_err()
-                                        {
-                                            tracing::error!(
-                                                "Failed to send stream error message to UI."
-                                            );
+                                            });
+                                            has_sent_data = true;
+                                            // Circuit breaker: stop the stream after persistent tool-not-found
+                                            if tool_not_found_count >= 2 {
+                                                return;
+                                            }
                                         }
+                                    }
+                                    StreamEvent::Usage(usage) => {
+                                        let _ = tx.send(StreamMessage::Usage(
+                                            crate::components::shared::UsageData {
+                                                prompt_tokens: usage.prompt_tokens,
+                                                completion_tokens: usage.completion_tokens,
+                                                total_tokens: usage.total_tokens,
+                                                cost: usage.cost,
+                                                ..Default::default()
+                                            },
+                                        ));
+                                    }
+                                    StreamEvent::Error { message } => {
+                                        let _ = tx.send(StreamMessage::Error { message });
                                         return;
                                     }
+                                    StreamEvent::Done => return,
                                 }
                             }
                         }
@@ -1147,131 +1403,110 @@ impl LlmConnector for GeminiConnector {
                         }
                     }
                     Err(e) => {
-                        tracing::error!("Error in stream: {}", e);
-                        break;
+                        let _ = tx.send(StreamMessage::Error {
+                            message: format!("Stream error: {}", e),
+                        });
+                        return;
                     }
                 }
             }
 
-            if malformed_call_detected || unexpected_tool_call_detected {
-                if attempt + 1 < MAX_RETRIES {
-                    tracing::warn!(
-                        "Retry triggered for stream error (attempt {}/{}). Sleeping 1s...",
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
+            // Specific Gemini retry/grounding logic
+            if (malformed_call_detected || unexpected_tool_call_detected)
+                && attempt + 1 < MAX_RETRIES
+            {
+                tracing::warn!("Retry triggered for Gemini (attempt {}).", attempt + 1);
+                if !current_attempt_parts.is_empty() {
+                    request_body.contents.push(Content {
+                        role: "model".to_string(),
+                        parts: current_attempt_parts,
+                    });
 
-                    // Ground the model by adding its failed attempt and a correction to the context history
-                    // This prevents "model myopia" where the model repeats the same hallucination.
-                    if !current_attempt_parts.is_empty() {
-                        request_body.contents.push(Content {
-                            role: "model".to_string(),
-                            parts: current_attempt_parts,
-                        });
-
-                        let correction_text = if unexpected_tool_call_detected {
-                            // Generate a list of available tools to help the model correct itself
-                            let available_tools_str = if let Some(context) = &mcp_context {
-                                let mut tools = Vec::new();
-                                for server in &context.servers {
-                                    for tool in &server.tools {
-                                        let sanitized_name =
-                                            crate::gemini::convert::get_prefixed_tool_name(
-                                                &server.name, &tool.name,
-                                            );
-                                        tools.push(format!("- {}", sanitized_name));
+                    let correction = if unexpected_tool_call_detected {
+                        // Enumerate available tools from the request to ground the model's retry
+                        let available_tools_str = if let Some(tools) = &request_body.tools {
+                            let mut names = Vec::new();
+                            for tool in tools {
+                                for decl in &tool.function_declarations {
+                                    if let Some(name) = decl.get("name").and_then(|n| n.as_str()) {
+                                        names.push(format!("- {}", name));
                                     }
                                 }
-                                if tools.is_empty() {
-                                    "No tools are currently available.".to_string()
-                                } else {
-                                    format!("Available tools:\n{}", tools.join("\n"))
-                                }
+                            }
+                            if names.is_empty() {
+                                "No tools are currently available.".to_string()
                             } else {
-                                "No tools context available.".to_string()
-                            };
-
-                            format!("[System Note]: The previous generation failed because you attempted to call a tool that is not in the `tools` list. \n\n{}\n\nPlease verify the `tools` list and try again. Do not hallucinate function names. If you cannot perform the action with available tools, explain why.", available_tools_str)
+                                format!("Available tools:\n{}", names.join("\n"))
+                            }
                         } else {
-                            "[System Note]: The previous generation failed because the function call was malformed. Please ensure your tool call matches the defined schema exactly.".to_string()
+                            "No tools context available.".to_string()
                         };
 
-                        request_body.contents.push(Content {
-                            role: "user".to_string(),
-                            parts: vec![Part::Text {
-                                text: correction_text,
-                                thought: None,
-                            }],
-                        });
-                    }
+                        format!("[System Note]: The previous generation failed because you attempted to call a tool that is not in the `tools` list. \n\n{}\n\nPlease verify the `tools` list and try again. Do not hallucinate function names. If you cannot perform the action with available tools, explain why.", available_tools_str)
+                    } else {
+                        "[System Note]: The previous generation failed because the function call was malformed. Please ensure your tool call matches the defined schema exactly.".to_string()
+                    };
 
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue; // Go to the next iteration of the for loop
-                } else {
-                    tracing::error!(
-                        "Stream error persisted after {} retries. Aborting.",
-                        MAX_RETRIES
-                    );
-                    // Send an explicit failure message to the UI
-                    if tx.send(StreamMessage::Text {
-                    content: format!("[Hobbes encountered a persistent error ('{}') after multiple retries. The model may be hallucinating a tool that does not exist.]",
-                        if unexpected_tool_call_detected { "UNEXPECTED_TOOL_CALL" } else { "MALFORMED_FUNCTION_CALL" }),
+                    request_body.contents.push(Content {
+                        role: "user".to_string(),
+                        parts: vec![Part::Text {
+                            text: correction,
+                            thought: None,
+                        }],
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+
+            // Retries exhausted for malformed/unexpected tool calls — send persistent error to user
+            if malformed_call_detected || unexpected_tool_call_detected {
+                tracing::error!(
+                    "Stream error persisted after {} retries. Aborting.",
+                    MAX_RETRIES
+                );
+                let _ = tx.send(StreamMessage::Text {
+                    content: format!(
+                        "[Hobbes encountered a persistent error ('{}') after multiple retries. The model may be hallucinating a tool that does not exist.]",
+                        if unexpected_tool_call_detected { "UNEXPECTED_TOOL_CALL" } else { "MALFORMED_FUNCTION_CALL" }
+                    ),
                     thought_signature: None,
                     thought_summary: None,
-                }).is_err() {
-                    tracing::error!("Failed to send final error message to UI.");
-                }
-                    // We return here to stop the stream.
-                    // The outer 'if !has_sent_data' check might fire too if we didn't send anything earlier,
-                    // but we just sent a message, so we should be good?
-                    // Wait, 'has_sent_data' is local to the attempt loop? No, it's defined inside 'attempt' loop.
-                    // So if we 'return', the task ends.
-                    return;
-                }
+                });
+                return;
             }
 
             if !has_sent_data {
-                tracing::error!(
-                    "Gemini finished without sending data. Finish Reason: {:?}. Request was: {}",
-                    finish_reason,
-                    serde_json::to_string_pretty(&request_body).unwrap_or_default()
-                );
                 let default_message = match finish_reason.as_deref() {
-                Some("SAFETY") => "[Hobbes did not provide a response due to the safety filter.]".to_string(),
-                Some("UNEXPECTED_TOOL_CALL") => {
-                    "⚠️ **Tool Connection Issue**\n\n\
-                    Hobbes tried to use a tool that isn't currently available. Please check:\n\n\
-                    1. **Is the MCP server running?** Open Settings → MCP Integration and verify the server status.\n\
-                    2. **Is the tool connected?** For Composio tools, ensure the profile is active and connected.\n\
-                    3. **Try refreshing** the tool list by toggling the MCP server off and on.\n\n\
-                    If the issue persists, the tool may need to be re-authorized or the server restarted.".to_string()
-                },
-                Some("MALFORMED_FUNCTION_CALL") => {
-                    "⚠️ **Tool Call Error**\n\n\
-                    Hobbes encountered an issue formatting a tool request. This is usually temporary.\n\
-                    Please try your request again.".to_string()
-                },
-                Some(reason) => format!(
-                    "⚠️ **Response Issue**\n\n\
-                    Hobbes could not complete the response.\n\
-                    **Reason:** {}\n\n\
-                    If this persists, try simplifying your request or checking your tool connections.",
-                    reason
-                ),
-                None => "[Hobbes did not provide a response due to an internal error.]".to_string(),
-            };
-                if tx
-                    .send(StreamMessage::Text {
-                        content: default_message,
-                        thought_signature: None,
-                        thought_summary: None,
-                    })
-                    .is_err()
-                {
-                    tracing::error!("Failed to send default message to UI.");
-                }
+                    Some("SAFETY") => "[Hobbes did not provide a response due to the safety filter.]".to_string(),
+                    Some("UNEXPECTED_TOOL_CALL") => {
+                        "⚠️ **Tool Connection Issue**\n\n\
+                        Hobbes tried to use a tool that isn't currently available. Please check:\n\n\
+                        1. **Is the MCP server running?** Open Settings → MCP Integration and verify the server status.\n\
+                        2. **Is the tool connected?** For Composio tools, ensure the profile is active and connected.\n\
+                        3. **Try refreshing** the tool list by toggling the MCP server off and on.\n\n\
+                        If the issue persists, the tool may need to be re-authorized or the server restarted.".to_string()
+                    },
+                    Some("MALFORMED_FUNCTION_CALL") => {
+                        "⚠️ **Tool Call Error**\n\n\
+                        Hobbes encountered an issue formatting a tool request. This is usually temporary.\n\
+                        Please try your request again.".to_string()
+                    },
+                    Some(reason) => format!(
+                        "⚠️ **Response Issue**\n\n\
+                        Hobbes could not complete the response.\n\
+                        **Reason:** {}\n\n\
+                        If this persists, try simplifying your request or checking your tool connections.",
+                        reason
+                    ),
+                    None => "Gemini finished without sending any data.".to_string(),
+                };
+                let _ = tx.send(StreamMessage::Text {
+                    content: default_message,
+                    thought_signature: None,
+                    thought_summary: None,
+                });
             }
-            // If we've successfully processed the stream without a malformed call, break the retry loop.
             break;
         }
     }
@@ -1285,19 +1520,17 @@ impl LlmConnector for GeminiConnector {
 
         let api_key = match self.config.api_key.clone() {
             Some(key) => key,
-            None => {
-                match std::env::var("GEMINI_API_KEY") {
-                    Ok(key) => key,
-                    Err(_) => {
-                        tracing::warn!("Skipping summarization: GEMINI_API_KEY not set in settings or environment");
-                        return Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "GEMINI_API_KEY not configured",
-                        ))
-                            as Box<dyn std::error::Error + Send + Sync>);
-                    }
+            None => match std::env::var("GEMINI_API_KEY") {
+                Ok(key) => key,
+                Err(_) => {
+                    tracing::warn!("Skipping summarization: GEMINI_API_KEY not set");
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "GEMINI_API_KEY not configured",
+                    ))
+                        as Box<dyn std::error::Error + Send + Sync>);
                 }
-            }
+            },
         };
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(120))
@@ -1311,12 +1544,18 @@ You will be given a previous summary (which may be empty) and the most recent me
 Your primary task is to integrate the new information from the recent messages into the previous summary, updating and extending it.
 Preserve existing information while incorporating new facts, entities, or user preferences.
 
-A crucial part of your task is to analyze the **sentiment and mood** of the user in the "Recent Messages".
+Analyze the sentiment and mood of the user in the "Recent Messages".
 
-Format your response as a single, clean JSON object with three keys: "summary", "entities", and "sentiment".
+Populate the JSON response with:
 - "summary": A concise, updated summary of the entire conversation so far.
-- "entities": An object containing all key-value pairs of extracted information. If the user mentions their name, be sure to extract it and include it as `{{\"user_name\": \"...\"}}` in this object.
-- "sentiment": A brief string describing the user's current sentiment or mood (e.g., "curious and collaborative", "frustrated but focused", "pleased with the progress", "neutral"). This should reflect the feeling of the recent messages.
+- "sentiment": A brief string describing the user's current mood (e.g., "curious and collaborative", "frustrated but focused").
+- "entities": An object with:
+  - "user_name": The user's name if mentioned.
+  - "project_name": The active project or codebase name.
+  - "key_topics": Main topics discussed (array of short strings).
+  - "key_decisions": Important decisions made (array of short strings).
+  - "active_profile": The active Composio profile name if mentioned.
+  - "blockers": Current blockers or open issues (array of short strings).
 
 Previous Summary:
 ---
@@ -1330,6 +1569,28 @@ Recent Messages:
             previous_summary, recent_messages
         );
 
+        // Structured output schema — enforced at the API level.
+        // The model can ONLY return fields defined here.
+        let summary_schema = serde_json::json!({
+            "type": "OBJECT",
+            "properties": {
+                "summary": { "type": "STRING", "description": "Concise updated summary of the conversation" },
+                "sentiment": { "type": "STRING", "description": "User's current mood" },
+                "entities": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "user_name": { "type": "STRING", "description": "User's name if mentioned" },
+                        "project_name": { "type": "STRING", "description": "Active project or codebase name" },
+                        "key_topics": { "type": "ARRAY", "items": { "type": "STRING" }, "description": "Main topics discussed" },
+                        "key_decisions": { "type": "ARRAY", "items": { "type": "STRING" }, "description": "Important decisions made" },
+                        "active_profile": { "type": "STRING", "description": "Active Composio profile name" },
+                        "blockers": { "type": "ARRAY", "items": { "type": "STRING" }, "description": "Current blockers or open issues" }
+                    }
+                }
+            },
+            "required": ["summary", "sentiment", "entities"]
+        });
+
         let request_body = GeminiRequest {
             contents: vec![Content {
                 role: "user".to_string(),
@@ -1341,7 +1602,11 @@ Recent Messages:
             tools: None,
             system_instruction: None,
             tool_config: None,
-            generation_config: None,
+            generation_config: Some(GenerationConfig {
+                thinking_config: None,
+                response_mime_type: Some("application/json".to_string()),
+                response_schema: Some(summary_schema),
+            }),
         };
 
         tracing::info!("Using summary model: {}", self.config.summary_model);
@@ -1509,11 +1774,7 @@ mod tests {
             }]
         });
 
-        let response_body = format!(
-            "data: {}\n\ndata: {}\n\n",
-            thought_json,
-            content_json
-        );
+        let response_body = format!("data: {}\n\ndata: {}\n\n", thought_json, content_json);
 
         // Configure the mock server
         Mock::given(method("POST"))
@@ -1530,21 +1791,21 @@ mod tests {
             thinking_enabled: true,
             thinking_level: "high".to_string(),
             thinking_budget: Some(1024),
+            model_slots: vec![],
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
 
         // Create prompt data
         let prompt_data = LlmPrompt {
-            contents: vec![Content {
-                role: "user".to_string(),
-                parts: vec![Part::Text {
+            system: None,
+            messages: vec![crate::llm::ChatMessage {
+                role: crate::llm::ChatRole::User,
+                content: vec![crate::llm::ContentBlock::Text {
                     text: "Hello".to_string(),
-                    thought: None,
                 }],
             }],
-            tools: None,
-            system_instruction: None,
+            tools: vec![],
         };
 
         // Create channel
@@ -1615,20 +1876,20 @@ mod tests {
             thinking_enabled: false,
             thinking_level: "high".to_string(),
             thinking_budget: None,
+            model_slots: vec![],
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
 
         let prompt_data = LlmPrompt {
-            contents: vec![Content {
-                role: "user".to_string(),
-                parts: vec![Part::Text {
+            system: None,
+            messages: vec![crate::llm::ChatMessage {
+                role: crate::llm::ChatRole::User,
+                content: vec![crate::llm::ContentBlock::Text {
                     text: "Use a tool".to_string(),
-                    thought: None,
                 }],
             }],
-            tools: None,
-            system_instruction: None,
+            tools: vec![],
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1681,20 +1942,20 @@ mod tests {
             thinking_enabled: false,
             thinking_level: "high".to_string(),
             thinking_budget: None,
+            model_slots: vec![],
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
 
         let prompt_data = LlmPrompt {
-            contents: vec![Content {
-                role: "user".to_string(),
-                parts: vec![Part::Text {
+            system: None,
+            messages: vec![crate::llm::ChatMessage {
+                role: crate::llm::ChatRole::User,
+                content: vec![crate::llm::ContentBlock::Text {
                     text: "Test".to_string(),
-                    thought: None,
                 }],
             }],
-            tools: None,
-            system_instruction: None,
+            tools: vec![],
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1751,24 +2012,27 @@ mod tests {
             thinking_enabled: false,
             thinking_level: "high".to_string(),
             thinking_budget: None,
+            model_slots: vec![],
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
 
         let prompt_data = LlmPrompt {
-            contents: vec![Content {
-                role: "user".to_string(),
-                parts: vec![Part::Text {
+            system: None,
+            messages: vec![crate::llm::ChatMessage {
+                role: crate::llm::ChatRole::User,
+                content: vec![crate::llm::ContentBlock::Text {
                     text: "Use a tool".to_string(),
-                    thought: None,
                 }],
             }],
-            tools: None,
-            system_instruction: None,
+            tools: vec![],
         };
 
         // Pass an empty MCP context so the tool won't be found
-        let mcp_context = Some(crate::mcp::manager::McpContext { servers: vec![], connected_toolkit_slugs: vec![] });
+        let mcp_context = Some(crate::mcp::manager::McpContext {
+            servers: vec![],
+            connected_toolkit_slugs: vec![],
+        });
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         connector
@@ -1865,6 +2129,8 @@ mod tests {
     #[test]
     fn test_supports_thinking() {
         assert!(GeminiModel::Gemini3_1ProPreview.supports_thinking());
+        assert!(GeminiModel::Gemini3_1FlashPreview.supports_thinking());
+        assert!(GeminiModel::Gemini3_1FlashLitePreview.supports_thinking());
         assert!(GeminiModel::Gemini3_0ProPreview.supports_thinking());
         assert!(GeminiModel::Gemini3_0FlashPreview.supports_thinking());
         assert!(GeminiModel::Gemini2_5Pro.supports_thinking());
@@ -1886,6 +2152,10 @@ mod tests {
             LevelPro
         );
         assert_eq!(
+            GeminiModel::Gemini3_1FlashLitePreview.thinking_config_style(),
+            LevelFlash
+        );
+        assert_eq!(
             GeminiModel::Gemini3_0FlashPreview.thinking_config_style(),
             LevelFlash
         );
@@ -1903,14 +2173,18 @@ mod tests {
     fn test_valid_thinking_levels() {
         assert_eq!(
             GeminiModel::Gemini3_1ProPreview.valid_thinking_levels(),
-            &["low", "high"]
+            &["low", "medium", "high"]
         );
         assert_eq!(
             GeminiModel::Gemini3_0ProPreview.valid_thinking_levels(),
-            &["low", "high"]
+            &["low", "medium", "high"]
         );
         assert_eq!(
             GeminiModel::Gemini3_0FlashPreview.valid_thinking_levels(),
+            &["minimal", "low", "medium", "high"]
+        );
+        assert_eq!(
+            GeminiModel::Gemini3_1FlashLitePreview.valid_thinking_levels(),
             &["minimal", "low", "medium", "high"]
         );
         assert!(GeminiModel::Gemini2_0Flash
@@ -1926,6 +2200,10 @@ mod tests {
         assert_eq!(
             GeminiModel::from_slug("gemini-3.1-pro-preview"),
             GeminiModel::Gemini3_1ProPreview
+        );
+        assert_eq!(
+            GeminiModel::from_slug("gemini-3.1-flash-lite-preview"),
+            GeminiModel::Gemini3_1FlashLitePreview
         );
         assert_eq!(
             GeminiModel::from_slug("gemini-3-pro-preview"),
@@ -1970,6 +2248,8 @@ mod tests {
         // Ensure canonical slugs resolve back to the correct model
         let models = [
             GeminiModel::Gemini3_1ProPreview,
+            GeminiModel::Gemini3_1FlashPreview,
+            GeminiModel::Gemini3_1FlashLitePreview,
             GeminiModel::Gemini3_0ProPreview,
             GeminiModel::Gemini3_0FlashPreview,
             GeminiModel::Gemini2_5Pro,
@@ -2000,6 +2280,7 @@ mod tests {
             thinking_enabled: false,
             thinking_level: "high".to_string(),
             thinking_budget: None,
+            model_slots: vec![],
         };
         let connector = GeminiConnector::new(config);
         let url =

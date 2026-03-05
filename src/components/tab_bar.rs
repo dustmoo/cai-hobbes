@@ -22,7 +22,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
     rsx! {
         div {
             class: "flex items-center bg-section border-b border-primary-700/50 h-10 shrink-0 overflow-x-auto no-scrollbar",
-            
+
             // Tab items
             for (idx, session_id) in props.open_tabs.iter().enumerate() {
                 {
@@ -38,7 +38,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     let on_select = props.on_select_tab;
                     let on_close = props.on_close_tab;
                     let is_editing = editing_tab_id.read().as_ref() == Some(session_id);
-                    
+
                     rsx! {
                         div {
                             key: "{session_id_key}",
@@ -52,7 +52,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                     on_select.call(idx);
                                 }
                             },
-                            
+
                             if is_editing {
                                 div {
                                     class: "flex items-center w-full",
@@ -130,7 +130,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                     "{session_name}"
                                 }
                             }
-                            
+
                             // Close button (visible on hover)
                             if !is_editing {
                                 button {
@@ -150,7 +150,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     }
                 }
             }
-            
+
             // New tab button
             button {
                 class: "flex items-center justify-center h-full px-3 text-fg-muted hover:bg-card hover:text-fg transition-colors",
@@ -165,5 +165,3 @@ pub fn TabBar(props: TabBarProps) -> Element {
         }
     }
 }
-
-

@@ -1,15 +1,15 @@
 use crate::components::confirm_save_modal::ConfirmSaveModal;
 use crate::components::conflict_modal::ConflictModal;
 use crate::components::hotkey_recorder::HotkeyRecorder;
-use crate::components::llm::GeminiModel;
 use crate::components::markdown_renderer::MarkdownRenderer;
 use crate::components::onboarding::TOS_CONTENT;
 use crate::components::tool_credentials::ToolCredentials;
+use crate::llm::GeminiModel;
 use crate::mcp::composio_client::validate_composio_api_key;
 use crate::settings::{get_slot_icon, is_sandboxed, HotkeySettings, Settings, SettingsManager};
+use crate::SecretManagerTrait;
 use crate::{context::permissions::ToolCategory, session::SessionState};
 use dioxus::prelude::*;
-use crate::SecretManagerTrait;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use rfd;
 use std::io::Write;
@@ -38,14 +38,19 @@ pub fn SettingsPanel() -> Element {
     let mut has_unsaved_changes = use_signal(|| false);
 
     // Signals for model fetching
-    let mut available_models =
-        use_signal(Vec::<crate::services::gemini_models::GeminiModel>::new);
+    let mut available_models = use_signal(Vec::<crate::services::gemini_models::GeminiModel>::new);
     let mut models_loading = use_signal(|| false);
     let mut models_error = use_signal(|| Option::<String>::None);
     let skill_registry = use_context::<Signal<crate::skills::registry::SkillRegistry>>();
     let mut models_fetch_trigger = use_signal(|| 0u32);
     // show_model_slots is now persisted in UiState (defaults to open)
     let mut picker_open_for_slot: Signal<Option<usize>> = use_signal(|| None);
+
+    // Signals for OpenAI-compat model fetching
+    let mut oai_available_models = use_signal(Vec::<String>::new);
+    let mut oai_models_loading = use_signal(|| false);
+    let mut oai_models_error = use_signal(|| Option::<String>::None);
+    let mut oai_models_fetch_trigger = use_signal(|| 0u32);
 
     // Effect to fetch models when API key is available or refresh is triggered
     use_effect(move || {
@@ -67,6 +72,38 @@ pub fn SettingsPanel() -> Element {
                         tracing::error!("Failed to fetch models: {}", e);
                         models_error.set(Some(format!("Failed to load models: {}", e)));
                         models_loading.set(false);
+                    }
+                }
+            });
+        }
+    });
+
+    // Effect to fetch OpenAI-compat models — trigger-only (not endpoint-reactive)
+    // Uses peek() for config reads to avoid firing on every keystroke
+    use_effect(move || {
+        let _trigger = oai_models_fetch_trigger.read(); // Only subscribe to trigger
+        let endpoint = local_settings.peek().openai_compat_config.endpoint.clone();
+        let api_key = local_settings.peek().openai_compat_config.api_key.clone();
+
+        if !endpoint.is_empty() {
+            oai_models_loading.set(true);
+            oai_models_error.set(None);
+
+            spawn(async move {
+                match crate::services::openai_compat_validation::fetch_openai_compat_models(
+                    &endpoint,
+                    api_key.as_deref(),
+                )
+                .await
+                {
+                    Ok(models) => {
+                        oai_available_models.set(models);
+                        oai_models_loading.set(false);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to fetch OAI models: {}", e);
+                        oai_models_error.set(Some(e));
+                        oai_models_loading.set(false);
                     }
                 }
             });
@@ -240,7 +277,7 @@ pub fn SettingsPanel() -> Element {
                 ConfirmSaveModal {
                     is_visible: show_confirm_save_modal,
                     title: "Save Settings".to_string(),
-                    message: "You have unsaved changes. Are you sure you want to save?".to_string(),
+                    message: "Your changes will be applied immediately and affect all sessions. Continue?".to_string(),
                     on_confirm: move |remember| {
                         if remember {
                             local_settings.write().confirm_on_save = false;
@@ -253,49 +290,26 @@ pub fn SettingsPanel() -> Element {
                         let mut settings_to_save = global_settings.clone();
                         let smithery_key_opt = settings_to_save.smithery_api_key.clone();
                         let gemini_key_opt = settings_to_save.gemini_config.api_key.clone();
+                        let claude_key_opt = settings_to_save.claude_config.api_key.clone();
+                        let oai_key_opt = settings_to_save.openai_compat_config.api_key.clone();
                         // Extract Composio keys to save (using profile ID as keychain key)
                         let composio_keys: Vec<(String, String)> = settings_to_save.composio_profiles.iter()
                             .filter_map(|p| p.api_key.as_ref().map(|k| (p.id.clone(), k.clone())))
                             .collect();
 
-                        // We also need to update the settings to store "trimmed" keys if we modify them logic-wise,
-                        // but for now let's just save what we have.
-                        // Actually, the original logic trimmed the smithery key. Let's replicate that.
                         let smithery_key_to_save = smithery_key_opt.map(|k| k.trim().to_string());
                         if let Some(ref trimmed) = smithery_key_to_save {
                              settings_to_save.smithery_api_key = Some(trimmed.clone());
                         }
-
-                        // Clone managers for async use
-                        // We can use the signal directly inside spawn as they are Copy handles
-
-                        // Wait, SettingsManager matches: pub struct SettingsManager { settings_path: PathBuf } -> derives?
-                        // settings.rs:299: pub struct SettingsManager ... doesn't verify Clone. It was used as signal.
-                        // Let's check settings.rs. It doesn't derive Clone!
-                        // We can reconstruct it or just pass the path?
-                        // Or we can just use the signal reader inside the spawn_blocking? No, signal is not Send.
-
-                        // Workaround: We only need `save` which writes to a path.
-                        // Let's just capture the path if possible, or assume we can't easily clone SettingsManager.
-                        // Actually, looking at code, `SettingsManager` is `Clone`? No, looking at `settings.rs` line 299: `pub struct SettingsManager { settings_path: PathBuf, }`.
-                        // It does NOT derive Clone.
-                        // However, we can construct a new one if we know the path.
-                        // Or better: `settings_manager` signal held by the component.
-                        // We can't pass the signal.
-                        // We just need to write the file. `Settings` is serializable.
-                        // We can use `std::fs::write` in the blocking task manually or implement a helper.
-                        // The `save` method just does: `fs::write(&self.settings_path, content)`.
-
-                        // Strategy: We can't easily call `settings_manager.save` in background without cloning it.
-                        // Let's assume for now we keep `settings_manager.save` on main thread (file IO is fast-ish)
-                        // BUT definitely move Keychain IO (Composio/Smithery keys) to background.
 
                         // Critical: Update the global settings signal so the app (menus, hotkeys) reacts immediately
                         *global_settings = settings_to_save.clone();
                         has_unsaved_changes.set(false);
 
                         let mut secret_updates = Vec::new();
-                        if let Some(k) = gemini_key_opt { secret_updates.push(("api_key".to_string(), k)); }
+                        if let Some(k) = gemini_key_opt { secret_updates.push(("gemini_api_key".to_string(), k)); }
+                        if let Some(k) = claude_key_opt { secret_updates.push(("claude_api_key".to_string(), k)); }
+                        if let Some(k) = oai_key_opt { secret_updates.push(("openai_compat_api_key".to_string(), k)); }
                         if let Some(k) = smithery_key_to_save { secret_updates.push(("smithery_api_key".to_string(), k)); }
                         tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(id, _)| id).collect::<Vec<_>>());
 
@@ -522,7 +536,17 @@ pub fn SettingsPanel() -> Element {
                                 label { class: "block text-sm font-medium text-fg-muted", "LLM Provider" }
                                 select {
                                     class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                    option { value: "Gemini", "Gemini" }
+                                    onchange: move |evt: Event<FormData>| {
+                                        let provider = match evt.value().as_str() {
+                                            "OpenAiCompat" => crate::settings::LlmProvider::OpenAiCompat,
+                                            "Claude" => crate::settings::LlmProvider::Claude,
+                                            _ => crate::settings::LlmProvider::Gemini,
+                                        };
+                                        local_settings.write().active_llm = provider;
+                                    },
+                                    option { value: "Gemini", selected: local_settings.read().active_llm == crate::settings::LlmProvider::Gemini, "Gemini" }
+                                    option { value: "OpenAiCompat", selected: local_settings.read().active_llm == crate::settings::LlmProvider::OpenAiCompat, "OpenAI Compatible" }
+                                    // Claude hidden from UI — stub connector not ready for this version
                                 }
                             }
                             if local_settings.read().active_llm == crate::settings::LlmProvider::Gemini {
@@ -747,11 +771,11 @@ pub fn SettingsPanel() -> Element {
                                         if local_settings.read().gemini_config.thinking_enabled {
                                             {
                                                 let current_model = local_settings.read().gemini_config.chat_model.clone();
-                                                let gemini_model = crate::components::llm::GeminiModel::from_slug(&current_model);
+                                                let gemini_model = crate::llm::GeminiModel::from_slug(&current_model);
 
                                                 match gemini_model.thinking_config_style() {
-                                                    crate::components::llm::ThinkingConfigStyle::LevelPro |
-                                                    crate::components::llm::ThinkingConfigStyle::LevelFlash => {
+                                                    crate::llm::ThinkingConfigStyle::LevelPro |
+                                                    crate::llm::ThinkingConfigStyle::LevelFlash => {
                                                         rsx! {
                                                             div {
                                                                 class: "mb-3",
@@ -773,7 +797,7 @@ pub fn SettingsPanel() -> Element {
                                                             }
                                                         }
                                                     },
-                                                    crate::components::llm::ThinkingConfigStyle::Budget => {
+                                                    crate::llm::ThinkingConfigStyle::Budget => {
                                                         rsx! {
                                                             div {
                                                                 class: "mb-3",
@@ -799,7 +823,7 @@ pub fn SettingsPanel() -> Element {
                                                             }
                                                         }
                                                     },
-                                                    crate::components::llm::ThinkingConfigStyle::None => {
+                                                    crate::llm::ThinkingConfigStyle::None => {
                                                         rsx! {
                                                             div {
                                                                 class: "p-3 bg-yellow-900/30 border border-yellow-700/50 rounded-lg",
@@ -811,7 +835,7 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
-                                    
+
                                     // Model Quick-Switch Slots Section
                                     div {
                                         class: "mb-4 pt-4 border-t border-subtle",
@@ -835,7 +859,7 @@ pub fn SettingsPanel() -> Element {
                                                         key: "model-slot-{i}",
                                                         class: "flex items-center gap-3",
                                                         {
-                                                            let slot_model = local_settings.read().model_slots.get(i).cloned().unwrap_or_default();
+                                                            let slot_model = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
                                                             let effective_icon = if !slot_model.is_empty() {
                                                                 local_settings.read().model_icons.get(&slot_model).cloned()
                                                                     .unwrap_or_else(|| get_slot_icon(i))
@@ -870,18 +894,10 @@ pub fn SettingsPanel() -> Element {
                                                             select {
                                                                 class: "block w-full px-2 py-1 bg-input border border-subtle rounded text-xs",
                                                                 onchange: move |evt| {
-                                                                    let mut settings = local_settings.write();
-                                                                    if i < settings.model_slots.len() {
-                                                                        settings.model_slots[i] = evt.value();
-                                                                    } else {
-                                                                        while settings.model_slots.len() <= i {
-                                                                            settings.model_slots.push("".to_string());
-                                                                        }
-                                                                        settings.model_slots[i] = evt.value();
-                                                                    }
+                                                                    local_settings.write().update_active_model_slot(i, evt.value());
                                                                 },
                                                                 {
-                                                                    let current_slot_value = local_settings.read().model_slots.get(i).cloned().unwrap_or_default();
+                                                                    let current_slot_value = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
                                                                     let models = available_models.read();
                                                                     let current_in_list = models.iter().any(|m| m.name == current_slot_value);
 
@@ -907,7 +923,7 @@ pub fn SettingsPanel() -> Element {
                                                             // Emoji picker popover — only shown when this slot's icon is clicked
                                                             if picker_open_for_slot() == Some(i) {
                                                                 {
-                                                                    let slot_model_for_picker = local_settings.read().model_slots.get(i).cloned().unwrap_or_default();
+                                                                    let slot_model_for_picker = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
                                                                     if !slot_model_for_picker.is_empty() {
                                                                         let current_custom = local_settings.read().model_icons.get(&slot_model_for_picker).cloned().unwrap_or_default();
                                                                         rsx! {
@@ -957,6 +973,391 @@ pub fn SettingsPanel() -> Element {
                                     }
                                 }
                             }
+                            // === OpenAI-Compatible Config ===
+                            if local_settings.read().active_llm == crate::settings::LlmProvider::OpenAiCompat {
+                                div {
+                                    class: "pl-4 border-l-2 border-subtle",
+                                    div {
+                                        class: "mb-4",
+                                        label { class: "block text-sm font-medium text-fg-muted", "Endpoint URL" }
+                                        input {
+                                            class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                            r#type: "text",
+                                            placeholder: "http://localhost:11434",
+                                            value: "{local_settings.read().openai_compat_config.endpoint}",
+                                            oninput: move |event| local_settings.write().openai_compat_config.endpoint = event.value()
+                                        }
+                                        p {
+                                            class: "text-xs text-fg-muted mt-1",
+                                            "Ollama, vLLM, LM Studio, or any OpenAI-format API endpoint"
+                                        }
+                                    }
+                                    div {
+                                        class: "mb-4",
+                                        div {
+                                            class: "flex justify-between items-center mb-1",
+                                            label { class: "block text-sm font-medium text-fg-muted", "Model" }
+                                            if !local_settings.read().openai_compat_config.endpoint.is_empty() {
+                                                button {
+                                                    class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-fg-muted disabled:cursor-not-allowed",
+                                                    disabled: *oai_models_loading.read(),
+                                                    onclick: move |_| {
+                                                        oai_models_fetch_trigger.set(oai_models_fetch_trigger() + 1);
+                                                    },
+                                                    if *oai_models_loading.read() { "Loading..." } else { "↻ Refresh" }
+                                                }
+                                            }
+                                        }
+                                        if local_settings.read().openai_compat_config.endpoint.is_empty() {
+                                            p {
+                                                class: "mt-1 text-sm text-fg-muted italic",
+                                                "Please configure your endpoint above to discover models"
+                                            }
+                                        } else if *oai_models_loading.read() {
+                                            p {
+                                                class: "mt-1 text-sm text-fg-muted italic",
+                                                "Discovering available models..."
+                                            }
+                                        } else if let Some(error) = oai_models_error.read().as_ref() {
+                                            div {
+                                                p {
+                                                    class: "mt-1 text-sm text-red-400 mb-2",
+                                                    "{error}"
+                                                }
+                                                // Fallback text input when discovery fails
+                                                input {
+                                                    class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                    r#type: "text",
+                                                    placeholder: "Enter model name manually",
+                                                    value: "{local_settings.read().openai_compat_config.model}",
+                                                    oninput: move |event| local_settings.write().openai_compat_config.model = event.value()
+                                                }
+                                            }
+                                        } else if oai_available_models.read().is_empty() {
+                                            // No models discovered — fallback to text input
+                                            input {
+                                                class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                r#type: "text",
+                                                placeholder: "Enter model name",
+                                                value: "{local_settings.read().openai_compat_config.model}",
+                                                oninput: move |event| local_settings.write().openai_compat_config.model = event.value()
+                                            }
+                                        } else {
+                                            select {
+                                                class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                value: "{local_settings.read().openai_compat_config.model}",
+                                                onchange: move |event: Event<FormData>| {
+                                                    local_settings.write().openai_compat_config.model = event.value();
+                                                },
+                                                {
+                                                    let current = local_settings.read().openai_compat_config.model.clone();
+                                                    let models = oai_available_models.read();
+                                                    let in_list = models.contains(&current);
+                                                    rsx! {
+                                                        if current.is_empty() {
+                                                            option { value: "", selected: true, "Select a model..." }
+                                                        }
+                                                        if !current.is_empty() && !in_list {
+                                                            option { value: "{current}", selected: true, "{current}" }
+                                                        }
+                                                        for model in models.iter() {
+                                                            option {
+                                                                value: "{model}",
+                                                                selected: *model == current,
+                                                                "{model}"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "mb-4",
+                                        label { class: "block text-sm font-medium text-fg-muted", "API Key (optional)" }
+                                        input {
+                                            class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                            r#type: "password",
+                                            placeholder: "Leave blank for local servers",
+                                            value: "{local_settings.read().openai_compat_config.api_key.as_deref().unwrap_or(\"\")}",
+                                            oninput: move |event| {
+                                                let val = event.value();
+                                                local_settings.write().openai_compat_config.api_key = if val.is_empty() { None } else { Some(val) };
+                                            }
+                                        }
+                                    }
+                                    // Enable Tool Use toggle
+                                    div {
+                                        class: "mb-4 pt-2",
+                                        div {
+                                            class: "flex items-center justify-between",
+                                            label { class: "block text-sm font-medium text-fg-muted", "Enable Tool Use" }
+                                            label {
+                                                class: "relative inline-flex items-center cursor-pointer",
+                                                input {
+                                                    r#type: "checkbox",
+                                                    class: "sr-only peer",
+                                                    checked: local_settings.read().openai_compat_config.tools_enabled,
+                                                    onchange: move |event| {
+                                                        local_settings.write().openai_compat_config.tools_enabled = event.checked();
+                                                    }
+                                                }
+                                                div { class: "w-11 h-6 bg-input peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
+                                            }
+                                        }
+                                        p {
+                                            class: "text-xs text-fg-muted mt-1",
+                                            "Send MCP tool definitions to the model. Requires server support (e.g. vLLM needs --enable-auto-tool-choice --tool-call-parser)."
+                                        }
+                                    }
+
+                                    // Max Context Tokens
+                                    div {
+                                        class: "mb-4",
+                                        label { class: "block text-sm font-medium text-fg-muted", "Max Context Tokens" }
+                                        input {
+                                            class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                            r#type: "number",
+                                            placeholder: "None (unlimited)",
+                                            value: match local_settings.read().openai_compat_config.max_context_tokens {
+                                                Some(v) => v.to_string(),
+                                                None => String::new(),
+                                            },
+                                            onchange: move |event: FormEvent| {
+                                                let val = event.value();
+                                                if val.trim().is_empty() {
+                                                    local_settings.write().openai_compat_config.max_context_tokens = None;
+                                                } else if let Ok(n) = val.trim().parse::<usize>() {
+                                                    local_settings.write().openai_compat_config.max_context_tokens = Some(n);
+                                                }
+                                            }
+                                        }
+                                        p {
+                                            class: "text-xs text-fg-muted mt-1",
+                                            "Model's context window size in tokens. Older messages are automatically trimmed to fit. Leave empty for unlimited (Gemini)."
+                                        }
+                                    }
+
+                                    // Summary Model Selector
+                                    div {
+                                        class: "mb-4",
+                                        div {
+                                            class: "flex justify-between items-center mb-1",
+                                            label { class: "block text-sm font-medium text-fg-muted", "Summary Model" }
+                                            if !local_settings.read().openai_compat_config.endpoint.is_empty() {
+                                                button {
+                                                    class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-fg-muted disabled:cursor-not-allowed",
+                                                    disabled: *oai_models_loading.read(),
+                                                    onclick: move |_| {
+                                                        oai_models_fetch_trigger.set(oai_models_fetch_trigger() + 1);
+                                                    },
+                                                    if *oai_models_loading.read() { "Loading..." } else { "↻ Refresh" }
+                                                }
+                                            }
+                                        }
+                                        if local_settings.read().openai_compat_config.endpoint.is_empty() {
+                                            p {
+                                                class: "mt-1 text-sm text-fg-muted italic",
+                                                "Configure endpoint above to discover models"
+                                            }
+                                        } else if oai_available_models.read().is_empty() && !*oai_models_loading.read() {
+                                            // No models discovered — fallback to text input
+                                            input {
+                                                class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                r#type: "text",
+                                                placeholder: "Enter summary model name (defaults to chat model)",
+                                                value: "{local_settings.read().openai_compat_config.summary_model.as_deref().unwrap_or(\"\")}",
+                                                oninput: move |event| {
+                                                    let val = event.value();
+                                                    local_settings.write().openai_compat_config.summary_model = if val.is_empty() { None } else { Some(val) };
+                                                }
+                                            }
+                                        } else {
+                                            select {
+                                                class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                value: "{local_settings.read().openai_compat_config.summary_model.as_deref().unwrap_or(\"\")}",
+                                                onchange: move |event: Event<FormData>| {
+                                                    let val = event.value();
+                                                    local_settings.write().openai_compat_config.summary_model = if val.is_empty() { None } else { Some(val) };
+                                                },
+                                                {
+                                                    let current = local_settings.read().openai_compat_config.summary_model.clone().unwrap_or_default();
+                                                    let models = oai_available_models.read();
+                                                    let in_list = models.contains(&current);
+                                                    rsx! {
+                                                        option { value: "", selected: current.is_empty(), "Use chat model" }
+                                                        if !current.is_empty() && !in_list {
+                                                            option { value: "{current}", selected: true, "{current}" }
+                                                        }
+                                                        for model in models.iter() {
+                                                            option {
+                                                                value: "{model}",
+                                                                selected: *model == current,
+                                                                "{model}"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        p {
+                                            class: "text-xs text-fg-muted mt-1",
+                                            "Model used for conversation summarization. Defaults to your chat model if not set."
+                                        }
+                                    }
+
+                                    // Model Quick-Switch Slots Section
+                                    div {
+                                        class: "mb-4 pt-4 border-t border-subtle",
+                                        div {
+                                            class: "flex justify-between items-center cursor-pointer mb-2 group",
+                                            onclick: move |_| {
+                                                let mut state = ui_state.write();
+                                                state.show_model_slots = !state.show_model_slots;
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            },
+                                            label { class: "block text-sm font-medium text-fg-muted group-hover:text-fg transition-colors", "Model Quick-Switch Slots" }
+                                            span { class: "text-xs text-fg-muted", if ui_state.read().show_model_slots { "▼" } else { "▶" } }
+                                        }
+                                        if ui_state.read().show_model_slots {
+                                            div {
+                                                class: "space-y-3 pl-2 mb-4",
+                                                for i in 0..10 {
+                                                    div {
+                                                        key: "oai-model-slot-{i}",
+                                                        class: "flex items-center gap-3",
+                                                        {
+                                                            let slot_model = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                            let effective_icon = if !slot_model.is_empty() {
+                                                                local_settings.read().model_icons.get(&slot_model).cloned()
+                                                                    .unwrap_or_else(|| get_slot_icon(i))
+                                                            } else {
+                                                                get_slot_icon(i)
+                                                            };
+                                                            let has_model = !slot_model.is_empty();
+                                                            rsx! {
+                                                                div {
+                                                                    class: if has_model {
+                                                                        "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm shrink-0 cursor-pointer hover:border-primary-500 transition-all"
+                                                                    } else {
+                                                                        "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm shrink-0"
+                                                                    },
+                                                                    title: if has_model { "Click to change icon" } else { "" },
+                                                                    onclick: move |_| {
+                                                                        if has_model {
+                                                                            let current = picker_open_for_slot();
+                                                                            if current == Some(i) {
+                                                                                picker_open_for_slot.set(None);
+                                                                            } else {
+                                                                                picker_open_for_slot.set(Some(i));
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    "{effective_icon}"
+                                                                }
+                                                            }
+                                                        }
+                                                        div {
+                                                            class: "flex-1",
+                                                            if oai_available_models.read().is_empty() {
+                                                                // No models discovered — fallback to text input
+                                                                input {
+                                                                    class: "block w-full px-2 py-1 bg-input border border-subtle rounded text-xs",
+                                                                    r#type: "text",
+                                                                    placeholder: "Enter model name",
+                                                                    value: "{local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default()}",
+                                                                    onchange: move |evt: FormEvent| {
+                                                                        local_settings.write().update_active_model_slot(i, evt.value());
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                select {
+                                                                    class: "block w-full px-2 py-1 bg-input border border-subtle rounded text-xs",
+                                                                    value: "{local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default()}",
+                                                                    onchange: move |evt| {
+                                                                        local_settings.write().update_active_model_slot(i, evt.value());
+                                                                    },
+                                                                    {
+                                                                        let current_slot_value = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                        let models = oai_available_models.read();
+                                                                        let current_in_list = models.contains(&current_slot_value);
+
+                                                                        rsx! {
+                                                                            option { value: "", selected: current_slot_value.is_empty(), "None" }
+                                                                            if !current_slot_value.is_empty() && !current_in_list {
+                                                                                option {
+                                                                                    value: "{current_slot_value}",
+                                                                                    selected: true,
+                                                                                    "{current_slot_value}"
+                                                                                }
+                                                                            }
+                                                                            for model in models.iter() {
+                                                                                option {
+                                                                                    value: "{model}",
+                                                                                    selected: *model == current_slot_value,
+                                                                                    "{model}"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            // Emoji picker popover
+                                                            if picker_open_for_slot() == Some(i) {
+                                                                {
+                                                                    let slot_model_for_picker = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                    if !slot_model_for_picker.is_empty() {
+                                                                        let current_custom = local_settings.read().model_icons.get(&slot_model_for_picker).cloned().unwrap_or_default();
+                                                                        rsx! {
+                                                                            div {
+                                                                                class: "flex gap-1 flex-wrap mt-1 p-1.5 bg-card border border-subtle rounded-lg shadow-lg",
+                                                                                for emoji in ["\u{26a1}", "\u{1f9e0}", "\u{1f34c}", "\u{1f916}", "\u{1f48e}", "\u{1f525}", "\u{2728}", "\u{1f680}", "\u{1f319}", "\u{2b50}"] {
+                                                                                    button {
+                                                                                        class: format!("w-7 h-7 rounded-full bg-section border flex items-center justify-center text-sm transition-all {}",
+                                                                                            if current_custom == emoji { "border-primary-500 ring-1 ring-primary-500/30 scale-110" } else { "border-subtle hover:border-primary-500 hover:scale-110" }
+                                                                                        ),
+                                                                                        onclick: {
+                                                                                            let model = slot_model_for_picker.clone();
+                                                                                            let icon = emoji.to_string();
+                                                                                            move |_| {
+                                                                                                local_settings.write().model_icons.insert(model.clone(), icon.clone());
+                                                                                                picker_open_for_slot.set(None);
+                                                                                            }
+                                                                                        },
+                                                                                        "{emoji}"
+                                                                                    }
+                                                                                }
+                                                                                button {
+                                                                                    class: "w-7 h-7 rounded-full bg-section border border-subtle flex items-center justify-center text-[10px] text-fg-muted hover:border-red-500 hover:text-red-400 transition-all",
+                                                                                    title: "Reset to default",
+                                                                                    onclick: {
+                                                                                        let model = slot_model_for_picker.clone();
+                                                                                        move |_| {
+                                                                                            local_settings.write().model_icons.remove(&model);
+                                                                                            picker_open_for_slot.set(None);
+                                                                                        }
+                                                                                    },
+                                                                                    "✕"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    } else {
+                                                                        rsx! {}
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        span { class: "text-[10px] text-fg-muted font-mono w-6 text-right", "^{i+1}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Claude config section hidden — stub connector not ready for this version
                         }
                     }
                 }
@@ -2271,21 +2672,21 @@ pub fn SettingsPanel() -> Element {
                     p { class: "text-xs text-fg-muted mb-4",
                         "Manage auto-approval for specific skills. When enabled, these skills will execute without prompting."
                     }
-                    
+
                     {
                         // Get all skills from registry AND saved permissions
                         let registry = skill_registry.read();
                         let saved_permissions = local_settings.read().permission_settings.skill_permissions.clone();
-                        
+
                         // Build merged map: registry skills + any saved permissions
                         let mut all_skills: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-                        
+
                         // Add all registered skills (default to false if no saved permission)
                         for skill in registry.list_skills() {
                             let is_allowed = saved_permissions.get(&skill.metadata.name).copied().unwrap_or(false);
                             all_skills.insert(skill.metadata.name.clone(), is_allowed);
                         }
-                        
+
                         // Also include any saved permissions for skills not currently in registry
                         // (in case a skill was removed but permission was saved)
                         for (name, allowed) in &saved_permissions {
@@ -2293,7 +2694,7 @@ pub fn SettingsPanel() -> Element {
                                 all_skills.insert(name.clone(), *allowed);
                             }
                         }
-                        
+
                         if all_skills.is_empty() {
                             rsx! {
                                 div {
@@ -2316,7 +2717,7 @@ pub fn SettingsPanel() -> Element {
                                         let description = skill_opt.as_ref()
                                             .map(|s| s.metadata.description.clone())
                                             .unwrap_or_else(|| "No description available.".to_string());
-                                        
+
                                             rsx! {
                                                 div {
                                             class: "flex items-center justify-between p-4 bg-input rounded-lg border border-primary-800 hover:border-primary-600 transition-colors",
@@ -2779,6 +3180,8 @@ pub fn SettingsPanel() -> Element {
                             let mut settings_to_save = global_settings.clone();
                             let smithery_key_opt = settings_to_save.smithery_api_key.clone();
                             let gemini_key_opt = settings_to_save.gemini_config.api_key.clone();
+                            let claude_key_opt = settings_to_save.claude_config.api_key.clone();
+                            let oai_key_opt = settings_to_save.openai_compat_config.api_key.clone();
                             let composio_keys: Vec<(String, String)> = settings_to_save.composio_profiles.iter()
                                 .filter_map(|p| p.api_key.as_ref().map(|k| (p.id.clone(), k.clone())))
                                 .collect();
@@ -2789,7 +3192,9 @@ pub fn SettingsPanel() -> Element {
                             }
 
                             let mut secret_updates = Vec::new();
-                            if let Some(k) = gemini_key_opt { secret_updates.push(("api_key".to_string(), k)); }
+                            if let Some(k) = gemini_key_opt { secret_updates.push(("gemini_api_key".to_string(), k)); }
+                            if let Some(k) = claude_key_opt { secret_updates.push(("claude_api_key".to_string(), k)); }
+                            if let Some(k) = oai_key_opt { secret_updates.push(("openai_compat_api_key".to_string(), k)); }
                             if let Some(k) = smithery_key_to_save { secret_updates.push(("smithery_api_key".to_string(), k)); }
                             tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(n, _)| n).collect::<Vec<_>>());
 

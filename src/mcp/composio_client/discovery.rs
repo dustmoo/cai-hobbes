@@ -29,7 +29,10 @@ pub async fn list_tools(client: &ComposioClient) -> Result<DiscoveryResult, Stri
     loop {
         page_count += 1;
         if page_count > MAX_PAGES {
-            tracing::warn!("Hit max page limit ({}) while fetching tools, stopping.", MAX_PAGES);
+            tracing::warn!(
+                "Hit max page limit ({}) while fetching tools, stopping.",
+                MAX_PAGES
+            );
             warning_message = Some(format!("Tool limit reached ({} pages). Some tools may be missing - please narrow your scope.", MAX_PAGES));
             break;
         }
@@ -77,7 +80,10 @@ pub async fn list_tools(client: &ComposioClient) -> Result<DiscoveryResult, Stri
                     status,
                     text
                 );
-                warning_message = Some("Server initialized but has no tools configured. Use /discover to add tools.".to_string());
+                warning_message = Some(
+                    "Server initialized but has no tools configured. Use /discover to add tools."
+                        .to_string(),
+                );
                 break; // Exit loop, returning whatever we have (likely empty) + warning
             }
 
@@ -151,9 +157,12 @@ pub async fn list_tools(client: &ComposioClient) -> Result<DiscoveryResult, Stri
 
 /// Get information about connected toolkits for UI display
 ///
-/// IMPORTANT: This function derives toolkit info purely from the MCP `tools/list` response,
-/// which is scoped to the active MCP server. It does NOT use the REST `list_connected_accounts`
-/// endpoint, which returns global accounts across all profiles.
+/// Derives toolkit availability from the MCP `tools/list` response (server-scoped),
+/// then cross-references with `toolkit_account_map` (populated by `list_connected_accounts`,
+/// filtered by the current user's `user_id`) to determine actual connectivity.
+///
+/// Toolkits present on the server but lacking a valid user connection will have
+/// `is_connected: false`, preventing the Status UI from showing them as green.
 ///
 /// See COMPOSIO_ENDPOINTS.md mandate: "MCP-First for Status"
 ///
@@ -192,6 +201,12 @@ pub async fn list_connected_toolkits(client: &ComposioClient) -> Result<Vec<Tool
         }
     }
 
+    // Refresh user-scoped account map from REST connected_accounts.
+    // auth.rs now filters by the current profile's user_id, so only accounts
+    // belonging to this user populate the map.
+    let _ = super::auth::list_connected_accounts(client).await;
+    let account_map = client.toolkit_account_map.read();
+
     // Build ToolkitInfo from aggregated data
     let mut toolkit_infos: Vec<ToolkitInfo> = toolkit_map
         .into_iter()
@@ -204,11 +219,17 @@ pub async fn list_connected_toolkits(client: &ComposioClient) -> Result<Vec<Tool
                 .unwrap_or_default()
                 + &slug[1..];
 
+            // Check toolkit_account_map (user_id-filtered) for active connection
+            let is_connected = account_map
+                .as_ref()
+                .map(|m| m.contains_key(&slug))
+                .unwrap_or(false);
+
             ToolkitInfo {
                 slug,
                 display_name,
                 tool_count,
-                is_connected: true, // All tools from MCP are connected by definition
+                is_connected,
             }
         })
         .collect();
@@ -218,7 +239,11 @@ pub async fn list_connected_toolkits(client: &ComposioClient) -> Result<Vec<Tool
 
     // Cache the result
     client.set_cached_toolkit_info(toolkit_infos.clone());
-    tracing::debug!("Cached {} toolkit infos", toolkit_infos.len());
+    tracing::debug!(
+        "Cached {} toolkit infos ({} connected)",
+        toolkit_infos.len(),
+        toolkit_infos.iter().filter(|t| t.is_connected).count()
+    );
 
     Ok(toolkit_infos)
 }
@@ -411,7 +436,6 @@ pub async fn get_connected_toolkit_slugs(
     Ok(slugs)
 }
 
-
 /// Helper to fetch the raw tools enum from the REST API (global catalog).
 /// Used for smart tool selection (Step 4) where we need the full list of available
 /// tools for a toolkit, NOT the session-scoped MCP tools/list which may return 0
@@ -441,8 +465,6 @@ async fn fetch_tool_enum(client: &ComposioClient) -> Result<Vec<String>, String>
         .await
         .map_err(|e| format!("Failed to parse tools enum response: {}", e))
 }
-
-
 
 /// Fetch all tool slugs for a specific toolkit from the REST API (global catalog).
 /// Uses /tools/enum which returns ALL available tools regardless of session state.
@@ -698,7 +720,9 @@ fn parse_tools_response(
                         }) {
                             return Ok(tools);
                         }
-                        if let Ok(paginated) = serde_json::from_value::<PaginatedToolResult>(result.clone()) {
+                        if let Ok(paginated) =
+                            serde_json::from_value::<PaginatedToolResult>(result.clone())
+                        {
                             if let Some(tools) = paginated.tools {
                                 return Ok(tools);
                             }
@@ -773,12 +797,13 @@ fn parse_pagination_cursor(
 ) -> Result<Option<String>, String> {
     // Check if the response is in SSE format
     let trimmed_response = response_text.trim();
-    let json_text = if trimmed_response.starts_with("event:") || trimmed_response.starts_with("data:") {
-        let data_start = response_text.find("data:").unwrap_or(0) + "data:".len();
-        response_text[data_start..].trim()
-    } else {
-        response_text
-    };
+    let json_text =
+        if trimmed_response.starts_with("event:") || trimmed_response.starts_with("data:") {
+            let data_start = response_text.find("data:").unwrap_or(0) + "data:".len();
+            response_text[data_start..].trim()
+        } else {
+            response_text
+        };
 
     match serde_json::from_str::<serde_json::Value>(json_text) {
         Ok(json_value) => {
@@ -797,7 +822,9 @@ fn parse_pagination_cursor(
                 }
                 // Check direct result object (fallback)
                 if let Some(result) = json_obj.get("result") {
-                    if let Ok(paginated) = serde_json::from_value::<PaginatedToolResult>(result.clone()) {
+                    if let Ok(paginated) =
+                        serde_json::from_value::<PaginatedToolResult>(result.clone())
+                    {
                         return Ok(paginated.next_cursor);
                     }
                 }

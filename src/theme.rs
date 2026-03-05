@@ -5,8 +5,8 @@
 // `<html>` element. It also handles `System` mode by checking
 // `prefers-color-scheme`.
 
-use dioxus::prelude::*;
 use crate::settings::{Settings, Theme};
+use dioxus::prelude::*;
 
 /// Syncs the application theme to the DOM's `<html>` element class.
 ///
@@ -17,15 +17,20 @@ pub fn use_theme_sync(settings: Signal<Settings>) {
         let theme = settings.read().theme;
         spawn(async move {
             let script = match theme {
-                Theme::Dark => r#"
+                Theme::Dark => {
+                    r#"
                     document.documentElement.classList.remove('light');
                     document.documentElement.classList.add('dark');
-                "#,
-                Theme::Light => r#"
+                "#
+                }
+                Theme::Light => {
+                    r#"
                     document.documentElement.classList.remove('dark');
                     document.documentElement.classList.add('light');
-                "#,
-                Theme::System => r#"
+                "#
+                }
+                Theme::System => {
+                    r#"
                     if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
                         document.documentElement.classList.remove('light');
                         document.documentElement.classList.add('dark');
@@ -33,7 +38,8 @@ pub fn use_theme_sync(settings: Signal<Settings>) {
                         document.documentElement.classList.remove('dark');
                         document.documentElement.classList.add('light');
                     }
-                "#,
+                "#
+                }
             };
             let _ = document::eval(script);
         });

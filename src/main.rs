@@ -8,12 +8,9 @@
 
 use dioxus::desktop::tao::dpi::PhysicalSize;
 use dioxus::desktop::tao::event::{Event, WindowEvent};
-use dioxus::desktop::{
-    muda::MenuEvent, use_window,
-    use_wry_event_handler, Config, WindowBuilder,
-};
 #[cfg(target_os = "macos")]
 use dioxus::desktop::tao::platform::macos::WindowBuilderExtMacOS;
+use dioxus::desktop::{muda::MenuEvent, use_window, use_wry_event_handler, Config, WindowBuilder};
 use dioxus::prelude::*;
 use dotenvy::dotenv;
 use futures_util::StreamExt;
@@ -30,15 +27,16 @@ mod hotkey;
 mod keychain_ffi;
 #[cfg(all(test, target_os = "macos"))]
 mod keychain_tests;
+mod llm;
 mod mcp;
 mod menu;
 mod permissions;
 mod processing;
-mod secret_types;
 #[cfg(target_os = "macos")]
 mod secret_manager;
 #[cfg(not(target_os = "macos"))]
 mod secret_manager_generic;
+mod secret_types;
 #[cfg(not(target_os = "macos"))]
 use secret_manager_generic as secret_manager;
 
@@ -114,10 +112,10 @@ use crate::settings::SettingsManager;
 use crate::{
     components::{
         confirm_delete_modal::ConfirmDeleteModal,
-        llm::{GeminiConnector, LlmConnector},
-        stream_manager::StreamManager,
         shared::{SessionIdContext, SessionToDeleteContext},
+        stream_manager::StreamManager,
     },
+    llm::{ClaudeConnector, GeminiConnector, LlmConnector, OpenAiCompatConnector},
     mcp::manager::McpManager,
 };
 use std::path::PathBuf;
@@ -221,7 +219,7 @@ fn app() -> Element {
 
     let skill_registry = use_context_provider(|| Signal::new(skills::SkillRegistry::new()));
     let mut skills_loaded = use_signal(|| false);
-    
+
     // Pattern: Grounded App Initialization
     // Masks transient desyncs during the first render tick
     let mut is_app_initialized = use_signal(|| false);
@@ -332,7 +330,7 @@ fn app() -> Element {
 
                     {
                         let sm_read = secret_manager.read();
-                        gemini_key = sm_read.get("api_key").cloned();
+                        gemini_key = sm_read.get("gemini_api_key").cloned();
                         smithery_key = sm_read.get("smithery_api_key").cloned();
                         composio_legacy_key = sm_read.get("composio_api_key").cloned();
 
@@ -342,11 +340,16 @@ fn app() -> Element {
                                 profile_keys.push((i, api_key.clone(), false, profile.id.clone()));
                                 tracing::debug!(
                                     "Loaded API key for Composio profile: {} ({})",
-                                    profile.name, profile.id
+                                    profile.name,
+                                    profile.id
                                 );
                             } else if let Some(api_key) = sm_read.get_composio_key(&profile.name) {
                                 profile_keys.push((i, api_key.clone(), true, profile.id.clone()));
-                                tracing::info!("Migrating Composio key for profile '{}' from name to ID '{}'", profile.name, profile.id);
+                                tracing::info!(
+                                    "Migrating Composio key for profile '{}' from name to ID '{}'",
+                                    profile.name,
+                                    profile.id
+                                );
                             }
                         }
                     } // sm_read dropped here
@@ -355,6 +358,20 @@ fn app() -> Element {
                     let mut current_settings = settings.write();
                     if let Some(api_key) = gemini_key {
                         current_settings.gemini_config.api_key = Some(api_key);
+                    }
+                    // Hydrate Claude key from keychain
+                    if current_settings.claude_config.api_key.is_none() {
+                        let sm_read = secret_manager.read();
+                        if let Some(claude_key) = sm_read.get("claude_api_key").cloned() {
+                            current_settings.claude_config.api_key = Some(claude_key);
+                        }
+                    }
+                    // Hydrate OpenAI-compat key from keychain
+                    if current_settings.openai_compat_config.api_key.is_none() {
+                        let sm_read = secret_manager.read();
+                        if let Some(oai_key) = sm_read.get("openai_compat_api_key").cloned() {
+                            current_settings.openai_compat_config.api_key = Some(oai_key);
+                        }
                     }
                     if let Some(smithery_api_key) = smithery_key {
                         current_settings.smithery_api_key = Some(smithery_api_key);
@@ -370,7 +387,10 @@ fn app() -> Element {
                         if *needs_migration {
                             let mut sm_write = secret_manager.write();
                             if let Err(e) = sm_write.set_composio_key(profile_id, api_key.clone()) {
-                                tracing::error!("Failed to migrate legacy Composio key to ID: {}", e);
+                                tracing::error!(
+                                    "Failed to migrate legacy Composio key to ID: {}",
+                                    e
+                                );
                             }
                         }
                     }
@@ -383,12 +403,31 @@ fn app() -> Element {
                         let mut sm_write = secret_manager.write();
                         let all_secrets = sm_write.secrets_ref().clone();
                         for (key, val) in all_secrets {
-                            if let Some((Some(p_name), slug, field)) = crate::secret_types::parse_custom_tool_key(&key) {
-                                if let Some(profile) = current_settings.composio_profiles.iter().find(|p| p.name == p_name) {
-                                    let id_key = crate::secret_types::format_custom_tool_key(Some(&profile.id), &slug, &field);
+                            if let Some((Some(p_name), slug, field)) =
+                                crate::secret_types::parse_custom_tool_key(&key)
+                            {
+                                if let Some(profile) = current_settings
+                                    .composio_profiles
+                                    .iter()
+                                    .find(|p| p.name == p_name)
+                                {
+                                    let id_key = crate::secret_types::format_custom_tool_key(
+                                        Some(&profile.id),
+                                        &slug,
+                                        &field,
+                                    );
                                     if !sm_write.has_key(&id_key) {
-                                        tracing::info!("Migrating custom tool credential for '{}' to ID '{}'", p_name, profile.id);
-                                        let _ = sm_write.set_custom_tool_credential(Some(&profile.id), &slug, &field, val);
+                                        tracing::info!(
+                                            "Migrating custom tool credential for '{}' to ID '{}'",
+                                            p_name,
+                                            profile.id
+                                        );
+                                        let _ = sm_write.set_custom_tool_credential(
+                                            Some(&profile.id),
+                                            &slug,
+                                            &field,
+                                            val,
+                                        );
                                     }
                                 }
                             }
@@ -424,7 +463,8 @@ fn app() -> Element {
                         sm.load_composio_key(name);
                     }
                     sm
-                }).await;
+                })
+                .await;
 
                 if let Ok(sm) = loaded_secrets {
                     secret_manager.set(sm);
@@ -438,7 +478,7 @@ fn app() -> Element {
 
                     {
                         let sm_read = secret_manager.read();
-                        gemini_key = sm_read.get("api_key").cloned();
+                        gemini_key = sm_read.get("gemini_api_key").cloned();
                         smithery_key = sm_read.get("smithery_api_key").cloned();
                         composio_legacy_key = sm_read.get("composio_api_key").cloned();
 
@@ -448,11 +488,16 @@ fn app() -> Element {
                                 profile_keys.push((i, api_key.clone(), false, profile.id.clone()));
                                 tracing::debug!(
                                     "Loaded API key for Composio profile: {} ({})",
-                                    profile.name, profile.id
+                                    profile.name,
+                                    profile.id
                                 );
                             } else if let Some(api_key) = sm_read.get_composio_key(&profile.name) {
                                 profile_keys.push((i, api_key.clone(), true, profile.id.clone()));
-                                tracing::info!("Migrating Composio key for profile '{}' from name to ID '{}'", profile.name, profile.id);
+                                tracing::info!(
+                                    "Migrating Composio key for profile '{}' from name to ID '{}'",
+                                    profile.name,
+                                    profile.id
+                                );
                             }
                         }
                     } // sm_read dropped here
@@ -461,6 +506,25 @@ fn app() -> Element {
                     let mut current_settings = settings.write();
                     if let Some(api_key) = gemini_key {
                         current_settings.gemini_config.api_key = Some(api_key);
+                    }
+                    // Hydrate Claude key from keychain
+                    if current_settings.claude_config.api_key.is_none() {
+                        let sm_read = secret_manager.read();
+                        if let Some(claude_key) = sm_read.get("claude_api_key").cloned() {
+                            current_settings.claude_config.api_key = Some(claude_key);
+                        }
+                    }
+                    // Hydrate OpenAI-compat key from keychain
+                    if current_settings.openai_compat_config.api_key.is_none() {
+                        let sm_read = secret_manager.read();
+                        if let Some(oai_key) = sm_read.get("openai_compat_api_key").cloned() {
+                            tracing::info!("Hydrated OpenAI-compat API key from keychain ({}... chars)", oai_key.len());
+                            current_settings.openai_compat_config.api_key = Some(oai_key);
+                        } else {
+                            tracing::warn!("OpenAI-compat API key not found in keychain — SecretManager has {} keys", sm_read.secrets_ref().len());
+                        }
+                    } else {
+                        tracing::debug!("OpenAI-compat API key already present in settings, skipping keychain hydration");
                     }
                     if let Some(smithery_api_key) = smithery_key {
                         current_settings.smithery_api_key = Some(smithery_api_key);
@@ -476,7 +540,10 @@ fn app() -> Element {
                         if *needs_migration {
                             let mut sm_write = secret_manager.write();
                             if let Err(e) = sm_write.set_composio_key(profile_id, api_key.clone()) {
-                                tracing::error!("Failed to migrate legacy Composio key to ID: {}", e);
+                                tracing::error!(
+                                    "Failed to migrate legacy Composio key to ID: {}",
+                                    e
+                                );
                             }
                         }
                     }
@@ -487,12 +554,31 @@ fn app() -> Element {
                         let mut sm_write = secret_manager.write();
                         let all_secrets = sm_write.secrets_ref().clone();
                         for (key, val) in all_secrets {
-                            if let Some((Some(p_name), slug, field)) = crate::secret_types::parse_custom_tool_key(&key) {
-                                if let Some(profile) = current_settings.composio_profiles.iter().find(|p| p.name == p_name) {
-                                    let id_key = crate::secret_types::format_custom_tool_key(Some(&profile.id), &slug, &field);
+                            if let Some((Some(p_name), slug, field)) =
+                                crate::secret_types::parse_custom_tool_key(&key)
+                            {
+                                if let Some(profile) = current_settings
+                                    .composio_profiles
+                                    .iter()
+                                    .find(|p| p.name == p_name)
+                                {
+                                    let id_key = crate::secret_types::format_custom_tool_key(
+                                        Some(&profile.id),
+                                        &slug,
+                                        &field,
+                                    );
                                     if !sm_write.has_key(&id_key) {
-                                        tracing::info!("Migrating custom tool credential for '{}' to ID '{}'", p_name, profile.id);
-                                        let _ = sm_write.set_custom_tool_credential(Some(&profile.id), &slug, &field, val);
+                                        tracing::info!(
+                                            "Migrating custom tool credential for '{}' to ID '{}'",
+                                            p_name,
+                                            profile.id
+                                        );
+                                        let _ = sm_write.set_custom_tool_credential(
+                                            Some(&profile.id),
+                                            &slug,
+                                            &field,
+                                            val,
+                                        );
                                     }
                                 }
                             }
@@ -525,6 +611,12 @@ fn app() -> Element {
             crate::settings::LlmProvider::Gemini => {
                 Arc::new(GeminiConnector::new(settings.gemini_config.clone()))
             }
+            crate::settings::LlmProvider::OpenAiCompat => Arc::new(OpenAiCompatConnector::new(
+                settings.openai_compat_config.clone(),
+            )),
+            crate::settings::LlmProvider::Claude => {
+                Arc::new(ClaudeConnector::new(settings.claude_config.clone()))
+            }
         };
         Signal::new(connector)
     });
@@ -533,16 +625,28 @@ fn app() -> Element {
     use_effect(move || {
         // Use read() to subscribe to settings changes so this effect re-runs
         // when the API key is loaded from biometrics
-        let (active_llm, gemini_config) = {
+        let (active_llm, gemini_config, openai_compat_config, claude_config) = {
             let current_settings = settings.read();
             (
-                current_settings.active_llm.clone(),
+                current_settings.active_llm,
                 current_settings.gemini_config.clone(),
+                current_settings.openai_compat_config.clone(),
+                current_settings.claude_config.clone(),
             )
         };
         // Now the read borrow is dropped, safe to set the connector
         let new_connector: Arc<dyn LlmConnector> = match active_llm {
             crate::settings::LlmProvider::Gemini => Arc::new(GeminiConnector::new(gemini_config)),
+            crate::settings::LlmProvider::OpenAiCompat => {
+                tracing::info!(
+                    "Recreating OpenAI-compat connector: model='{}', endpoint='{}', api_key={}",
+                    openai_compat_config.model,
+                    openai_compat_config.endpoint,
+                    if openai_compat_config.api_key.is_some() { "present" } else { "MISSING" },
+                );
+                Arc::new(OpenAiCompatConnector::new(openai_compat_config))
+            }
+            crate::settings::LlmProvider::Claude => Arc::new(ClaudeConnector::new(claude_config)),
         };
         llm_connector.set(new_connector);
     });
@@ -577,20 +681,30 @@ fn app() -> Element {
 
     let needs_onboarding = use_memo(move || {
         let settings = settings.read();
-        
+
         // Check TOS acceptance (compare against current version)
         let tos_accepted = settings
             .tos_accepted_version
             .as_ref()
             .map(|v| v == crate::settings::CURRENT_TOS_VERSION)
             .unwrap_or(false);
-        
-        // Check API key presence
-        let key_present =
-            settings.gemini_config.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok();
-        
-        // Need onboarding if either TOS not accepted or API key missing
-        !tos_accepted || !key_present
+
+        // Check if the current provider is configured
+        let provider_configured = match settings.active_llm {
+            crate::settings::LlmProvider::Gemini => {
+                settings.gemini_config.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok()
+            }
+            crate::settings::LlmProvider::OpenAiCompat => {
+                !settings.openai_compat_config.endpoint.is_empty()
+            }
+            crate::settings::LlmProvider::Claude => {
+                settings.claude_config.api_key.is_some()
+                    || std::env::var("ANTHROPIC_API_KEY").is_ok()
+            }
+        };
+
+        // Need onboarding if either TOS not accepted or active provider missing config
+        !tos_accepted || !provider_configured
     });
 
     let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
@@ -607,8 +721,6 @@ fn app() -> Element {
             connected_toolkit_slugs: Vec::new(),
         })
     });
-
-
 
     // NOTE: The sync-back effect (Pattern 155) was removed.
     // Profile ID is now written directly to settings.active_composio_profile
@@ -668,7 +780,10 @@ fn app() -> Element {
 
             // Only reinitialize if the profile signature actually changed
             if current_signature != previous {
-                tracing::info!("Active Composio profile properties changed, reinitializing client: {:?}", current_signature);
+                tracing::info!(
+                    "Active Composio profile properties changed, reinitializing client: {:?}",
+                    current_signature
+                );
 
                 // Invalidate caches - profile changed
                 mcp_manager.read().invalidate_status_cache();
@@ -689,7 +804,6 @@ fn app() -> Element {
         });
     }
 
-
     let mut show_session_manager = use_signal(|| false);
     let mut show_settings_panel = use_signal(|| false);
     let mut show_mcp_manager = use_signal(|| false);
@@ -700,9 +814,10 @@ fn app() -> Element {
     let mut last_known_size = use_signal(|| PhysicalSize::new(0, 0));
     let mut tray_icon = use_signal::<Option<TrayIcon>>(|| None);
     let mut show_confirm_modal = use_context_provider(|| Signal::new(false));
-    let mut session_to_delete = use_context_provider(|| SessionToDeleteContext(Signal::new(String::new())));
-    let mut save_error = use_context_provider(|| crate::components::shared::SaveErrorContext(Signal::new(None))).0;
-
+    let mut session_to_delete =
+        use_context_provider(|| SessionToDeleteContext(Signal::new(String::new())));
+    let mut save_error =
+        use_context_provider(|| crate::components::shared::SaveErrorContext(Signal::new(None))).0;
 
     let mut chat_command = use_context_provider(|| Signal::new(None::<ChatCommand>));
 
@@ -710,9 +825,11 @@ fn app() -> Element {
     let mut open_tabs = use_signal(|| {
         let ui = ui_state.read();
         let state = session_state.read();
-        
+
         // Filter tabs to ensure they only contain existing session IDs
-        let tabs: Vec<String> = ui.open_tabs.iter()
+        let tabs: Vec<String> = ui
+            .open_tabs
+            .iter()
             .filter(|id| state.sessions.contains_key(*id))
             .cloned()
             .collect();
@@ -735,7 +852,7 @@ fn app() -> Element {
     let mut current_session_id = use_signal(|| {
         let tabs = open_tabs.read();
         let idx = *active_tab_index.peek();
-        
+
         // Safely get the tab at idx, falling back to first tab, then to active_session_id
         if let Some(id) = tabs.get(idx) {
             id.clone()
@@ -747,24 +864,26 @@ fn app() -> Element {
     });
     use_context_provider(|| SessionIdContext(current_session_id));
 
-
     // Persist tab state to UiState (Pattern 12 & 13)
     use_effect(move || {
         let mut ui = ui_state.write();
         ui.open_tabs = open_tabs.read().clone();
         ui.active_tab_index = *active_tab_index.read();
-        
+
         // Snapshot targets for Pattern 12 persistence
         let ui_snapshot = ui.clone();
         let manager = ui_state_manager.peek().clone();
-        
+
         manager.save_async(ui_snapshot, Some(save_error));
     });
 
     let active_profile_id = move || settings.peek().get_active_profile().map(|p| p.id.clone());
 
     let mut sync_profile_from_session = move |session_id: &str| {
-        let profile_id = session_state.read().sessions.get(session_id)
+        let profile_id = session_state
+            .read()
+            .sessions
+            .get(session_id)
             .and_then(|s| s.composio_profile.clone());
         if let Some(pid) = profile_id {
             if settings.peek().active_composio_profile.as_deref() != Some(&pid) {
@@ -793,7 +912,6 @@ fn app() -> Element {
         }
     };
 
-
     let mut delete_session_fn = move |id_to_delete: String| {
         let mut state = session_state.write();
         state.delete_session(&id_to_delete);
@@ -811,7 +929,7 @@ fn app() -> Element {
                 new_idx = tabs.len().saturating_sub(1);
             }
             let new_session_id = tabs[new_idx].clone();
-            
+
             open_tabs.set(tabs);
             active_tab_index.set(new_idx);
             current_session_id.set(new_session_id.clone());
@@ -833,7 +951,7 @@ fn app() -> Element {
                 new_idx = tabs.len().saturating_sub(1);
             }
             let new_session_id = tabs[new_idx].clone();
-            
+
             open_tabs.set(tabs);
             active_tab_index.set(new_idx);
             current_session_id.set(new_session_id.clone());
@@ -851,7 +969,6 @@ fn app() -> Element {
         session_state.write().active_session_id = new_id.clone();
         current_session_id.set(new_id);
     };
-
 
     // Call the summarization scheduler hook BEFORE the hotkey manager
     processing::summarization_scheduler::use_summarization_scheduler();
@@ -1045,10 +1162,14 @@ fn app() -> Element {
         let cmd_opt = chat_command.read().clone();
         if let Some(cmd) = cmd_opt {
             tracing::debug!("App handling global ChatCommand: {:?}", cmd);
-            
+
             match cmd {
                 ChatCommand::SwitchToSettingsTab(tab, slug) => {
-                    tracing::info!("App: Switching to Settings Tab: {:?}, slug: {:?}", tab, slug);
+                    tracing::info!(
+                        "App: Switching to Settings Tab: {:?}, slug: {:?}",
+                        tab,
+                        slug
+                    );
                     show_settings_panel.set(true);
                     show_session_manager.set(false);
                     show_mcp_manager.set(false);
@@ -1065,13 +1186,16 @@ fn app() -> Element {
                         let new_profile_id = profiles[idx].id.clone();
                         let new_profile_name = profiles[idx].name.clone();
                         // Determine if Settings are stale
-                        let settings_stale = settings.peek().active_composio_profile.as_deref() != Some(&new_profile_id);
+                        let settings_stale = settings.peek().active_composio_profile.as_deref()
+                            != Some(&new_profile_id);
 
                         let mut session_changed = false;
                         // Scope the write lock so it's dropped before setting signals
                         {
                             let mut state = session_state.write();
-                            if let Some(session) = state.sessions.get_mut(&*current_session_id.read()) {
+                            if let Some(session) =
+                                state.sessions.get_mut(&*current_session_id.read())
+                            {
                                 if session.composio_profile.as_deref() != Some(&new_profile_id) {
                                     session.composio_profile = Some(new_profile_id.clone());
                                     session.active_context.mcp_tools = None;
@@ -1082,7 +1206,12 @@ fn app() -> Element {
 
                         // Set settings AFTER write lock is released to avoid stale reactive reads
                         if settings_stale || session_changed {
-                            tracing::info!("SwitchProfile: forcing update (stale={} session={}) to {:?}", settings_stale, session_changed, new_profile_name);
+                            tracing::info!(
+                                "SwitchProfile: forcing update (stale={} session={}) to {:?}",
+                                settings_stale,
+                                session_changed,
+                                new_profile_name
+                            );
                             // Write ID to settings IMMEDIATELY so get_active_profile() works
                             // without waiting for an async sync-back effect
                             settings.write().active_composio_profile = Some(new_profile_id);
@@ -1096,13 +1225,19 @@ fn app() -> Element {
                     }
                 }
                 ChatCommand::SwitchModel(idx) => {
-                    let slots = settings.peek().model_slots.clone();
+                    let slots = settings.peek().active_model_slots();
                     if idx < slots.len() {
                         let new_model = slots[idx].clone();
                         if !new_model.is_empty() {
-                            tracing::info!("SwitchModel: switching to slot {} model '{}'", idx, new_model);
-                            settings.write().gemini_config.chat_model = new_model;
-                            settings_manager.read().save_async(settings.peek().clone(), Some(save_error));
+                            tracing::info!(
+                                "SwitchModel: switching to slot {} model '{}'",
+                                idx,
+                                new_model
+                            );
+                            settings.write().set_active_chat_model(new_model);
+                            settings_manager
+                                .read()
+                                .save_async(settings.peek().clone(), Some(save_error));
                         } else {
                             tracing::info!("SwitchModel: slot {} is empty, ignoring", idx);
                         }
@@ -1111,16 +1246,28 @@ fn app() -> Element {
                     }
                 }
                 ChatCommand::ToggleSettings => {
-                    show_settings_panel.set(!show_settings_panel());
-                    if show_settings_panel() { show_session_manager.set(false); show_mcp_manager.set(false); }
+                    let new_state = !*show_settings_panel.peek();
+                    show_settings_panel.set(new_state);
+                    if new_state {
+                        show_session_manager.set(false);
+                        show_mcp_manager.set(false);
+                    }
                 }
                 ChatCommand::ToggleHistory => {
-                    show_session_manager.set(!show_session_manager());
-                    if show_session_manager() { show_settings_panel.set(false); show_mcp_manager.set(false); }
+                    let new_state = !*show_session_manager.peek();
+                    show_session_manager.set(new_state);
+                    if new_state {
+                        show_settings_panel.set(false);
+                        show_mcp_manager.set(false);
+                    }
                 }
                 ChatCommand::ToggleMcp => {
-                    show_mcp_manager.set(!show_mcp_manager());
-                    if show_mcp_manager() { show_settings_panel.set(false); show_session_manager.set(false); }
+                    let new_state = !*show_mcp_manager.peek();
+                    show_mcp_manager.set(new_state);
+                    if new_state {
+                        show_settings_panel.set(false);
+                        show_session_manager.set(false);
+                    }
                 }
                 ChatCommand::DeleteSession(target_id) => {
                     if !target_id.is_empty() {
@@ -1177,197 +1324,197 @@ fn app() -> Element {
     });
 
     rsx! {
-        if matches!(*permission_status_signal.read(), permissions::PermissionStatus::JustGranted) {
-            RestartRequired {}
-        } else if *needs_onboarding.read() {
-            div {
-                class: "flex items-center justify-center h-screen bg-app text-fg",
-                components::onboarding::Onboarding {
-                    needs_onboarding,
+            if matches!(*permission_status_signal.read(), permissions::PermissionStatus::JustGranted) {
+                RestartRequired {}
+            } else if *needs_onboarding.read() {
+                div {
+                    class: "flex items-center justify-center h-screen bg-app text-fg",
+                    components::onboarding::Onboarding {
+                        needs_onboarding,
+                    }
                 }
-            }
-        } else {
-            // SummarizationScheduler component removed; hook called above.
-            if *is_app_initialized.read() {
-                StreamManager {
-                ConfirmDeleteModal {
-                    is_visible: show_confirm_modal,
-                    title: "Delete Session".to_string(),
-                    message: "Are you sure you want to delete this session? This action cannot be undone.".to_string(),
-                    on_cancel: move |_| show_confirm_modal.set(false),
-                    on_confirm: move |remember| {
-                        let id_to_delete_str = session_to_delete.0.read().clone();
-                        if !id_to_delete_str.is_empty() {
-                            delete_session_fn(id_to_delete_str);
-                        }
-                        if remember {
-                            let mut current_settings = settings.write();
-                            current_settings.confirm_on_delete = false;
-                            let sm = settings_manager.read();
-                            sm.save_async(current_settings.clone(), Some(save_error));
-                        }
-                        show_confirm_modal.set(false);
-                    },
-                }
-                    div {
-                        class: "flex flex-col h-screen bg-app text-fg",
-                        // Save error toast notification
-                        if let Some(err_msg) = save_error.read().as_ref() {
-                            div {
-                                class: "flex items-center justify-between px-4 py-2 bg-red-900/80 border-b border-red-700 text-red-100 text-sm",
-                                span { "{err_msg}" }
-                                button {
-                                    class: "ml-4 px-2 py-0.5 text-xs bg-red-800 hover:bg-red-700 rounded transition-colors",
-                                    onclick: move |_| { save_error.set(None); },
-                                    "Dismiss"
-                                }
+            } else {
+                // SummarizationScheduler component removed; hook called above.
+                if *is_app_initialized.read() {
+                    StreamManager {
+                    ConfirmDeleteModal {
+                        is_visible: show_confirm_modal,
+                        title: "Delete Session".to_string(),
+                        message: "Are you sure you want to delete this session? This action cannot be undone.".to_string(),
+                        on_cancel: move |_| show_confirm_modal.set(false),
+                        on_confirm: move |remember| {
+                            let id_to_delete_str = session_to_delete.0.read().clone();
+                            if !id_to_delete_str.is_empty() {
+                                delete_session_fn(id_to_delete_str);
                             }
-                        }
-                        // Main content area
+                            if remember {
+                                let mut current_settings = settings.write();
+                                current_settings.confirm_on_delete = false;
+                                let sm = settings_manager.read();
+                                sm.save_async(current_settings.clone(), Some(save_error));
+                            }
+                            show_confirm_modal.set(false);
+                        },
+                    }
                         div {
-                            class: "flex flex-row flex-1 min-h-0", // This will contain the sidebars and chat
-                            // The onkeydown handler has been removed to allow native hotkeys (copy, paste, etc.) to function correctly.
-                            // The global hotkey for toggling visibility is no longer required.
-                            // When the user releases the mouse, save the last known size.
-
-
-                        // Session Manager Sidebar
-                        if *show_session_manager.read() {
-                            div {
-                                class: "flex flex-row h-full",
-                                // Session Manager Panel
+                            class: "flex flex-col h-screen bg-app text-fg",
+                            // Save error toast notification
+                            if let Some(err_msg) = save_error.read().as_ref() {
                                 div {
-                                    id: "session-manager-panel",
-                                    style: "width: {settings_panel_width}px;",
-                                    class: "bg-section text-fg h-full",
-                                    components::session_manager::SessionManager {}
-                                }
-                                // Draggable Divider
-                                div {
-                                    class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                    onmousedown: move |event| {
-                                        drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                        is_dragging.set(true);
-                                    },
+                                    class: "flex items-center justify-between px-4 py-2 bg-red-900/80 border-b border-red-700 text-red-100 text-sm",
+                                    span { "{err_msg}" }
+                                    button {
+                                        class: "ml-4 px-2 py-0.5 text-xs bg-red-800 hover:bg-red-700 rounded transition-colors",
+                                        onclick: move |_| { save_error.set(None); },
+                                        "Dismiss"
+                                    }
                                 }
                             }
-                        }
-
-                        // Settings Panel Sidebar
-                        if *show_settings_panel.read() {
+                            // Main content area
                             div {
-                                class: "flex flex-row h-full",
-                                // Settings Panel
+                                class: "flex flex-row flex-1 min-h-0", // This will contain the sidebars and chat
+                                // The onkeydown handler has been removed to allow native hotkeys (copy, paste, etc.) to function correctly.
+                                // The global hotkey for toggling visibility is no longer required.
+                                // When the user releases the mouse, save the last known size.
+
+
+                            // Session Manager Sidebar
+                            if *show_session_manager.read() {
                                 div {
-                                    id: "settings-panel",
-                                    style: "width: {settings_panel_width}px;",
-                                    class: "bg-section text-fg h-full",
-                                    // This is the correct location for the settings panel component
-                                    components::settings_panel::SettingsPanel {}
-                                }
-                                // Draggable Divider
-                                div {
-                                    class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                    onmousedown: move |event| {
-                                        drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                        is_dragging.set(true);
-                                    },
+                                    class: "flex flex-row h-full",
+                                    // Session Manager Panel
+                                    div {
+                                        id: "session-manager-panel",
+                                        style: "width: {settings_panel_width}px;",
+                                        class: "bg-section text-fg h-full",
+                                        components::session_manager::SessionManager {}
+                                    }
+                                    // Draggable Divider
+                                    div {
+                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
+                                        onmousedown: move |event| {
+                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
+                                            is_dragging.set(true);
+                                        },
+                                    }
                                 }
                             }
-                        }
 
-                        // MCP Manager Sidebar
-                        if *show_mcp_manager.read() {
-                            div {
-                                class: "flex flex-row h-full",
-                                // MCP Manager Panel
+                            // Settings Panel Sidebar
+                            if *show_settings_panel.read() {
                                 div {
-                                    id: "mcp-manager-panel",
-                                    style: "width: {settings_panel_width}px;",
-                                    class: "bg-section text-fg h-full",
-                                    components::mcp_marketplace::McpMarketplace {}
-                                }
-                                // Draggable Divider
-                                div {
-                                    class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                    onmousedown: move |event| {
-                                        drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                        is_dragging.set(true);
-                                    },
+                                    class: "flex flex-row h-full",
+                                    // Settings Panel
+                                    div {
+                                        id: "settings-panel",
+                                        style: "width: {settings_panel_width}px;",
+                                        class: "bg-section text-fg h-full",
+                                        // This is the correct location for the settings panel component
+                                        components::settings_panel::SettingsPanel {}
+                                    }
+                                    // Draggable Divider
+                                    div {
+                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
+                                        onmousedown: move |event| {
+                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
+                                            is_dragging.set(true);
+                                        },
+                                    }
                                 }
                             }
-                        }
 
-                        // Mouse move handler for resizing
-                        if *is_dragging.read() {
-                            div {
-                                class: "fixed inset-0 z-50", // Covers the whole screen to capture mouse events
-                                onmousemove: move |event| {
-                                    if *is_dragging.read() {
-                                        let (start_x, start_width) = drag_start_info();
-                                        let delta_x = event.data.screen_coordinates().x - start_x;
-                                        let new_width = start_width + delta_x;
-                                        if new_width > 200.0 && new_width < 800.0 {
-                                            let panel_id = if *show_settings_panel.read() {
-                                                "settings-panel"
-                                            } else if *show_mcp_manager.read() {
-                                                "mcp-manager-panel"
-                                            } else {
-                                                "session-manager-panel"
-                                            };
-                                            let js = format!("document.getElementById('{}').style.width = '{}px';", panel_id, new_width);
-                                            let _ = document::eval(&js);
-                                            final_width_on_drag_end.set(new_width);
+                            // MCP Manager Sidebar
+                            if *show_mcp_manager.read() {
+                                div {
+                                    class: "flex flex-row h-full",
+                                    // MCP Manager Panel
+                                    div {
+                                        id: "mcp-manager-panel",
+                                        style: "width: {settings_panel_width}px;",
+                                        class: "bg-section text-fg h-full",
+                                        components::mcp_marketplace::McpMarketplace {}
+                                    }
+                                    // Draggable Divider
+                                    div {
+                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
+                                        onmousedown: move |event| {
+                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
+                                            is_dragging.set(true);
+                                        },
+                                    }
+                                }
+                            }
+
+                            // Mouse move handler for resizing
+                            if *is_dragging.read() {
+                                div {
+                                    class: "fixed inset-0 z-50", // Covers the whole screen to capture mouse events
+                                    onmousemove: move |event| {
+                                        if *is_dragging.read() {
+                                            let (start_x, start_width) = drag_start_info();
+                                            let delta_x = event.data.screen_coordinates().x - start_x;
+                                            let new_width = start_width + delta_x;
+                                            if new_width > 200.0 && new_width < 800.0 {
+                                                let panel_id = if *show_settings_panel.read() {
+                                                    "settings-panel"
+                                                } else if *show_mcp_manager.read() {
+                                                    "mcp-manager-panel"
+                                                } else {
+                                                    "session-manager-panel"
+                                                };
+                                                let js = format!("document.getElementById('{}').style.width = '{}px';", panel_id, new_width);
+                                                let _ = document::eval(&js);
+                                                final_width_on_drag_end.set(new_width);
+                                            }
+                                        }
+                                    },
+                                    onmouseup: move |_| {
+                                        is_dragging.set(false);
+                                    },
+                                    onmouseleave: move |_| {
+                                        // If mouse leaves the overlay, stop dragging
+                                        if *is_dragging.read() {
+                                            is_dragging.set(false);
                                         }
                                     }
-                                },
-                                onmouseup: move |_| {
-                                    is_dragging.set(false);
-                                },
-                                onmouseleave: move |_| {
-                                    // If mouse leaves the overlay, stop dragging
-                                    if *is_dragging.read() {
-                                        is_dragging.set(false);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Main Chat Window
-                        div {
-                            class: "flex-1 flex flex-col min-h-0 border-t border-primary-700/50",
-                            {
-                                let tabs = open_tabs.read();
-                                let state = session_state.read();
-                                rsx! {
-                                    components::tab_bar::TabBar {
-                                        open_tabs: tabs.clone(),
-                                        tab_names: tabs.iter().map(|id| {
-                                            state.sessions.get(id)
-                                                .map(|s| s.name.clone())
-                                                .unwrap_or_else(|| "New Session".to_string())
-                                        }).collect(),
-                                        active_tab_index: *active_tab_index.read(),
-                                        on_select_tab: switch_tab_fn,
-                                        on_close_tab: close_tab_fn,
-                                        on_new_tab: move |_| new_tab_fn(),
-                                    }
                                 }
                             }
 
-                            components::chat::ChatWindow {
-                                on_content_resize: move |_| {},
-                                on_interaction: move |_| {},
+                            // Main Chat Window
+                            div {
+                                class: "flex-1 flex flex-col min-h-0 border-t border-primary-700/50",
+                                {
+                                    let tabs = open_tabs.read();
+                                    let state = session_state.read();
+                                    rsx! {
+                                        components::tab_bar::TabBar {
+                                            open_tabs: tabs.clone(),
+                                            tab_names: tabs.iter().map(|id| {
+                                                state.sessions.get(id)
+                                                    .map(|s| s.name.clone())
+                                                    .unwrap_or_else(|| "New Session".to_string())
+                                            }).collect(),
+                                            active_tab_index: *active_tab_index.read(),
+                                            on_select_tab: switch_tab_fn,
+                                            on_close_tab: close_tab_fn,
+                                            on_new_tab: move |_| new_tab_fn(),
+                                        }
+                                    }
+                                }
+
+                                components::chat::ChatWindow {
+                                    on_content_resize: move |_| {},
+                                    on_interaction: move |_| {},
+                                }
                             }
                         }
                     }
                 }
+            } else {
+                LoadingScreen {}
             }
-        } else {
-            LoadingScreen {}
         }
     }
-}
 }
 
 #[component]

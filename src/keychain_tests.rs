@@ -2,7 +2,7 @@
 #[cfg(test)]
 mod tests {
     use crate::keychain_ffi;
-    use crate::secret_manager::{SecretManager, composio_key_name};
+    use crate::secret_manager::{composio_key_name, SecretManager};
     use crate::SecretManagerTrait;
 
     // Mock constants

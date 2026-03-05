@@ -2,18 +2,20 @@
 #![allow(clippy::await_holding_invalid_type)]
 
 use crate::components::mcp_search_form::McpSearchForm;
-use crate::components::smithery_registry::{SmitheryClient, SmitheryServer};
 use crate::components::shared::SessionIdContext;
+use crate::components::smithery_registry::{SmitheryClient, SmitheryServer};
 use crate::components::syntax_highlighter::highlight_json;
-use crate::mcp::composio_client::{ComposioCategory, ComposioClient, ComposioToolkitListing, ResolvedAuth};
+use crate::mcp::composio_client::{
+    ComposioCategory, ComposioClient, ComposioToolkitListing, ResolvedAuth,
+};
 use crate::mcp::manager::{McpManager, McpServerStatus, ServerStatus, COMPOSIO_NATIVE_PREFIX};
 use crate::settings::{McpSource, Settings, SettingsManager};
-use dioxus::prelude::*;
 use crate::SecretManagerTrait;
+use dioxus::prelude::*;
+use dioxus_free_icons::{icons::fi_icons, Icon};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use dioxus_free_icons::{icons::fi_icons, Icon};
 
 #[derive(Clone, PartialEq)]
 enum ActiveTab {
@@ -202,7 +204,6 @@ pub fn McpMarketplace() -> Element {
     let filter_deployed = use_signal(|| false);
     let sort_by = use_signal(|| "usage".to_string());
 
-
     // State for server list
     let mut current_page = use_signal(|| 1i32);
     let mut total_pages = use_signal(|| 1i32);
@@ -304,14 +305,14 @@ pub fn McpMarketplace() -> Element {
         move || {
             let mut connected_slugs = connected_slugs;
             // Subscribe to settings changes (profile switch)
-                let settings_snapshot = settings.read().clone();
-                // Subscribe to search trigger (bumped after connect_toolkit completes)
-                let _trigger = *trigger_search.read();
+            let settings_snapshot = settings.read().clone();
+            // Subscribe to search trigger (bumped after connect_toolkit completes)
+            let _trigger = *trigger_search.read();
 
-                async move {
-                    // Check if we have a profile with an API key
-                    if let Some(profile) = settings_snapshot.get_active_profile() {
-                        if let Some(api_key) = &profile.api_key {
+            async move {
+                // Check if we have a profile with an API key
+                if let Some(profile) = settings_snapshot.get_active_profile() {
+                    if let Some(api_key) = &profile.api_key {
                         let base_url = profile
                             .base_url
                             .clone()
@@ -637,7 +638,7 @@ pub fn McpMarketplace() -> Element {
                             // If this branch is hit, it means we are in a mixed state (e.g. Smithery
                             // source selected but clicking a Composio tool).
                             // ------------------------------------------------------------------
-                            
+
                             tracing::warn!("Delegating Composio install to McpServerCard logic.");
                             error_msg.set(Some(
                                 "Please switch to 'Composio' source in settings to install this tool."
@@ -1078,10 +1079,17 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     // Toolkit management state (only relevant for Composio)
     let is_composio = status.name == COMPOSIO_NATIVE_PREFIX;
     // NOTE: show_toolkits is read from ui_state.composio_toolkit_expanded instead of local signal
-    let mut toolkits: Signal<Vec<crate::mcp::composio_client::ToolkitInfo>> =
-        use_signal(Vec::new);
+    let mut toolkits: Signal<Vec<crate::mcp::composio_client::ToolkitInfo>> = use_signal(Vec::new);
     let mut toolkits_loading = use_signal(|| false);
     let mut toolkits_error: Signal<Option<String>> = use_signal(|| None);
+
+    // Connection state for inline "Connect" button on disconnected toolkits
+    let mut tk_is_connecting = use_signal(|| false);
+    let mut tk_connection_status = use_signal(|| String::new());
+    let mut tk_connection_error: Signal<Option<String>> = use_signal(|| None);
+    let mut tk_connecting_slug: Signal<Option<String>> = use_signal(|| None);
+    let connected_slugs: Signal<std::collections::HashSet<String>> =
+        use_signal(std::collections::HashSet::new);
 
     // Log errors to console for debugging
     let status_for_logging = status.clone();
@@ -1096,13 +1104,15 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let mut last_profile_id: Signal<Option<String>> = use_signal(|| None);
     use_effect(move || {
         let _context = mcp_context.read(); // Subscribe to context changes
-        
+
         // Derive the active profile ID for this session (session stores IDs post-migration)
         let state = session_state.read();
-        let active_profile_id = state.sessions.get(&*current_session_id.read())
+        let active_profile_id = state
+            .sessions
+            .get(&*current_session_id.read())
             .and_then(|s| s.composio_profile.clone())
             .or_else(|| settings.read().active_composio_profile.clone());
-            
+
         let previous_profile = last_profile_id.peek().clone();
 
         // Only reset if profile actually changed (not on initial mount with None -> Some)
@@ -1352,7 +1362,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                 let server_name = status.name.clone();
                                 // Redundant locals removed
                                 // mcp_manager, mcp_context, settings captured by move
-                                let settings = settings; // settings not listed as redundant in error? 
+                                let settings = settings; // settings not listed as redundant in error?
                                 // wait, error 1254, 1255. 1259 was settings.
                                 // If settings was redundant, it should have been flagged.
                                 // Let's try removing it too to be safe, as it is likely redundant if others are.
@@ -1579,9 +1589,78 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                         option { value: "excluded", "Excluded" }
                                                     }
                                                 } else {
-                                                    span {
-                                                        class: "text-xs text-fg-muted",
-                                                        "Not connected"
+                                                    // Show Connect button for disconnected toolkits
+                                                    {
+                                                        let slug_for_btn = toolkit_slug.clone();
+                                                        let is_this_connecting = tk_connecting_slug.read().as_deref() == Some(slug_for_btn.as_str()) && *tk_is_connecting.read();
+                                                        rsx! {
+                                                            if is_this_connecting {
+                                                                span {
+                                                                    class: "text-xs text-yellow-400 animate-pulse",
+                                                                    "Connecting..."
+                                                                }
+                                                            } else if tk_connecting_slug.read().as_deref() == Some(slug_for_btn.as_str()) {
+                                                                if let Some(error) = tk_connection_error.read().as_ref() {
+                                                                    span {
+                                                                        class: "text-xs text-red-400 max-w-32 truncate",
+                                                                        title: "{error}",
+                                                                        "{error}"
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                button {
+                                                                    class: "px-2 py-0.5 bg-btn-primary hover:bg-btn-primary-hover rounded text-xs font-medium transition-colors",
+                                                                    onclick: {
+                                                                        let slug = slug_for_btn.clone();
+                                                                        move |_| {
+                                                                            let slug = slug.clone();
+                                                                            let mcp_manager = mcp_manager;
+                                                                            let mcp_context = mcp_context;
+                                                                            let settings = settings;
+                                                                            let settings_manager = settings_manager;
+                                                                            let mut refresh_trigger = refresh_trigger;
+                                                                            let mut toolkits = toolkits;
+
+                                                                            tk_connecting_slug.set(Some(slug.clone()));
+                                                                            tk_is_connecting.set(true);
+                                                                            tk_connection_status.set("Connecting...".to_string());
+                                                                            tk_connection_error.set(None);
+
+                                                                            spawn(async move {
+                                                                                let mcp_manager_val = mcp_manager.read().clone();
+                                                                                let settings_manager_val = settings_manager.peek().clone();
+
+                                                                                if let Err(e) = mcp_manager_val.connect_toolkit(
+                                                                                    slug.clone(),
+                                                                                    None, // auth_scheme — use default
+                                                                                    true, // use_managed_auth
+                                                                                    mcp_context,
+                                                                                    settings,
+                                                                                    settings_manager_val,
+                                                                                    tk_is_connecting,
+                                                                                    tk_connection_status,
+                                                                                    tk_connection_error,
+                                                                                    refresh_trigger,
+                                                                                    connected_slugs,
+                                                                                ).await {
+                                                                                    tracing::error!("Connect toolkit '{}' failed: {}", slug, e);
+                                                                                }
+
+                                                                                // Invalidate caches and re-fetch toolkit list
+                                                                                mcp_manager.read().invalidate_status_cache();
+                                                                                match mcp_manager.read().get_composio_toolkits().await {
+                                                                                    Ok(kits) => toolkits.set(kits),
+                                                                                    Err(e) => tracing::error!("Failed to refresh toolkits: {}", e),
+                                                                                }
+                                                                                let current = *refresh_trigger.peek();
+                                                                                refresh_trigger.set(current + 1);
+                                                                            });
+                                                                        }
+                                                                    },
+                                                                    "Connect"
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1613,7 +1692,8 @@ fn McpServerCard(
     let settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
-    let mut chat_command = use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    let mut chat_command =
+        use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
     let secret_manager = use_context::<Signal<crate::secret_manager::SecretManager>>();
 
     // Connection state for Composio Connect button
@@ -1621,7 +1701,6 @@ fn McpServerCard(
     let mut connection_status: Signal<String> = use_signal(|| "Connect".to_string());
     let mut connection_error: Signal<Option<String>> = use_signal(|| None);
     let connection_task = use_signal(|| Option::<Task>::None);
-
 
     // Source-aware install detection:
     // - Composio: check if toolkit slug is in connected_slugs
@@ -1678,7 +1757,11 @@ fn McpServerCard(
     let (status_class, _status_text) = match install_status.read().as_ref() {
         Some((true, false)) => (
             "h-2 w-2 rounded-full bg-green-500",
-            if is_composio_tool { "Connected" } else { "Loaded" },
+            if is_composio_tool {
+                "Connected"
+            } else {
+                "Loaded"
+            },
         ),
         Some((true, true)) => ("h-2 w-2 rounded-full bg-red-500", "Error"),
         _ => (
@@ -1703,7 +1786,7 @@ fn McpServerCard(
     } else {
         ResolvedAuth::NoAuth // Default for non-Composio
     };
-    
+
     let show_setup_credentials = resolved_auth == ResolvedAuth::RequiresSetup;
 
     rsx! {
@@ -1770,7 +1853,7 @@ fn McpServerCard(
                                                 connection_error.set(None);
 
                                                 let task = spawn(async move {
-                                                    tracing::info!("Initiating Composio connection for toolkit: {} (auth_scheme: {:?}, managed: {})", 
+                                                    tracing::info!("Initiating Composio connection for toolkit: {} (auth_scheme: {:?}, managed: {})",
                                                         toolkit_slug, auth_scheme, use_managed_auth);
 
                                                     let settings_snapshot = settings.peek().clone();
@@ -1778,7 +1861,7 @@ fn McpServerCard(
                                                         if let Some(_api_key) = &profile.api_key {
                                                             let mcp_manager_val = mcp_manager.read().clone();
                                                             let settings_manager_val = settings_manager.peek().clone();
-                                                            
+
                                                             spawn(async move {
                                                                 if let Err(e) = mcp_manager_val.connect_toolkit(
                                                                     toolkit_slug,

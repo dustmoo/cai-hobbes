@@ -117,9 +117,10 @@ pub async fn list_connected_accounts(
 
     // PATTERN 122: Proactive Cache Hydration
     // Populate the toolkit_account_map used by execution.rs for "Proactive Verification"
+    let current_user_id = client.user_id.clone().or(client.entity_id.clone());
     if let Ok(mut map) = client.toolkit_account_map.write() {
-        // Clear old entries to ensure freshness
-        // map.clear(); // Optional: Clearing might delete valid entries if we fetched a partial list (though we fetch all here)
+        // Clear old entries to ensure freshness on each hydration
+        map.clear();
 
         for acc in &all_accounts {
             // Only cache ACTIVE connections
@@ -127,24 +128,46 @@ pub async fn list_connected_accounts(
                 continue;
             }
 
-            if let Some(_uid) = &acc.user_id {
-                let account_id = acc.id.clone();
-                
-                // Map both Toolkit Slug and App Name if available
-                // CRITICAL: Always lowercase keys. All lookups use .to_lowercase()
-                // (see execution.rs line 590). Without this, API casing like "CLICKUP"
-                // won't match the lookup key "clickup", causing false cache misses
-                // that trigger unnecessary initiate_connection and duplicate connections.
-                if let Some(toolkit) = &acc.toolkit {
-                    map.insert(toolkit.slug.to_lowercase(), account_id.clone());
-                }
-                
-                if let Some(app_name) = &acc.app_name {
-                    map.insert(app_name.to_lowercase(), account_id.clone());
-                }
+            // CRITICAL: Only accept accounts whose user_id matches the current profile's
+            // user_id. Without this filter, stale ACTIVE entries from old UUIDs (e.g. after
+            // API key rotation) pollute the map and cause toolkits to appear "connected"
+            // when they are not authenticated for the current user.
+            let uid_matches = match (&acc.user_id, &current_user_id) {
+                (Some(acc_uid), Some(client_uid)) => acc_uid == client_uid,
+                (None, None) => true, // Both unset — legacy/default entity
+                _ => false,           // Mismatch — skip
+            };
+
+            if !uid_matches {
+                tracing::trace!(
+                    "[AUTH] Skipping account '{}' — user_id {:?} does not match current {:?}",
+                    acc.id,
+                    acc.user_id,
+                    current_user_id
+                );
+                continue;
+            }
+
+            let account_id = acc.id.clone();
+
+            // Map both Toolkit Slug and App Name if available
+            // CRITICAL: Always lowercase keys. All lookups use .to_lowercase()
+            // (see execution.rs line 590). Without this, API casing like "CLICKUP"
+            // won't match the lookup key "clickup", causing false cache misses
+            // that trigger unnecessary initiate_connection and duplicate connections.
+            if let Some(toolkit) = &acc.toolkit {
+                map.insert(toolkit.slug.to_lowercase(), account_id.clone());
+            }
+
+            if let Some(app_name) = &acc.app_name {
+                map.insert(app_name.to_lowercase(), account_id.clone());
             }
         }
-        tracing::debug!("Hydrated toolkit_account_map with {} entries", map.len());
+        tracing::debug!(
+            "Hydrated toolkit_account_map with {} entries (filtered by user_id: {:?})",
+            map.len(),
+            current_user_id
+        );
     } else {
         tracing::warn!("Failed to acquire write lock for toolkit_account_map");
     }
@@ -331,7 +354,10 @@ pub(crate) async fn create_auth_config(
     // IMPORTANT: The field is "auth_config" not "options" - matches Composio Python SDK
     // Check for custom credentials first (BYOA - Local Primacy)
     let custom_creds = {
-        let lock = client.custom_auth_creds.read().unwrap_or_else(|e| e.into_inner());
+        let lock = client
+            .custom_auth_creds
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         lock.get(toolkit_slug).cloned()
     };
 
@@ -347,7 +373,7 @@ pub(crate) async fn create_auth_config(
             toolkit_slug,
             creds.keys()
         );
-        
+
         // Convert HashMap<String, String> to Map<String, Value>
         let mut credentials_json = serde_json::Map::new();
         for (k, v) in creds {
@@ -504,7 +530,8 @@ pub(crate) async fn get_auth_config_id(
             if let Some(cached_id) = cache.get(toolkit_slug) {
                 tracing::info!(
                     "Found cached auth_config_id '{}' for BYOA toolkit '{}'",
-                    cached_id, toolkit_slug
+                    cached_id,
+                    toolkit_slug
                 );
                 return Ok(cached_id.clone());
             }
@@ -536,8 +563,12 @@ pub(crate) async fn get_auth_config_id(
                                                 id, toolkit_slug
                                             );
                                             // Cache it
-                                            if let Ok(mut cache) = client.auth_config_cache.write() {
-                                                cache.insert(toolkit_slug.to_lowercase(), id.to_string());
+                                            if let Ok(mut cache) = client.auth_config_cache.write()
+                                            {
+                                                cache.insert(
+                                                    toolkit_slug.to_lowercase(),
+                                                    id.to_string(),
+                                                );
                                             }
                                             return Ok(id.to_string());
                                         }
@@ -878,15 +909,23 @@ pub async fn initiate_connection(
                         toolkit_slug,
                         final_user_id
                     );
-                    return Ok("Connection already active. No re-authentication needed.".to_string());
+                    return Ok(
+                        "Connection already active. No re-authentication needed.".to_string()
+                    );
                 }
             }
             Err(e) => {
-                tracing::warn!("[AUTH] Failed to check for active connections: {}. Proceeding with OAuth.", e);
+                tracing::warn!(
+                    "[AUTH] Failed to check for active connections: {}. Proceeding with OAuth.",
+                    e
+                );
             }
         }
     } else {
-        tracing::info!("[AUTH RECOVERY] Force mode: skipping ACTIVE safety check for '{}'", toolkit_slug);
+        tracing::info!(
+            "[AUTH RECOVERY] Force mode: skipping ACTIVE safety check for '{}'",
+            toolkit_slug
+        );
     }
 
     // We need the auth_config_id to tell the API WHICH toolkit to link.
@@ -976,11 +1015,8 @@ pub async fn initiate_connection(
         // Try callback first (60s — works for BYOA where localhost receives redirect).
         // If it doesn't fire, fall back to polling the connection status (managed auth
         // where connect.composio.dev handles OAuth internally and never redirects to us).
-        let callback_result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(60),
-            rx.recv(),
-        )
-        .await;
+        let callback_result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(60), rx.recv()).await;
 
         match callback_result {
             Ok(Some(result)) if result.success => {
@@ -994,7 +1030,9 @@ pub async fn initiate_connection(
                 {
                     tracing::info!(
                         "Received connectedAccountId: {} for toolkit: {} (user: {})",
-                        acc_id, toolkit_slug, final_user_id
+                        acc_id,
+                        toolkit_slug,
+                        final_user_id
                     );
                     if let Ok(mut map) = client.toolkit_account_map.write() {
                         map.insert(toolkit_slug.to_lowercase(), acc_id.clone());
@@ -1008,25 +1046,38 @@ pub async fn initiate_connection(
                 // Staleness protection: reconnect_toolkit busts these entries via
                 // context_store.remove_param before re-auth.
                 let standard_keys = [
-                    "code", "state", "scope", "error",
-                    "error_description", "error_uri", "status",
+                    "code",
+                    "state",
+                    "scope",
+                    "error",
+                    "error_description",
+                    "error_uri",
+                    "status",
                 ];
                 for (key, value) in &result.params {
                     if !standard_keys.contains(&key.as_str()) {
                         tracing::info!(
                             "[CONTEXT] Capturing context param '{}' for toolkit '{}'",
-                            key, toolkit_slug
+                            key,
+                            toolkit_slug
                         );
-                        client.context_store.save_param(
-                            toolkit_slug, &final_user_id, key, value,
-                        );
+                        client
+                            .context_store
+                            .save_param(toolkit_slug, &final_user_id, key, value);
                         // KEY NORMALIZATION (Pattern 123 Extension)
                         if key.contains('_') {
                             let camel_key = super::utils::snake_to_camel(key);
                             if camel_key != *key {
-                                tracing::info!("[CONTEXT] Normalizing '{}' -> '{}'", key, camel_key);
+                                tracing::info!(
+                                    "[CONTEXT] Normalizing '{}' -> '{}'",
+                                    key,
+                                    camel_key
+                                );
                                 client.context_store.save_param(
-                                    toolkit_slug, &final_user_id, &camel_key, value,
+                                    toolkit_slug,
+                                    &final_user_id,
+                                    &camel_key,
+                                    value,
                                 );
                             }
                         }
@@ -1076,8 +1127,12 @@ pub async fn initiate_connection(
                                                 "[MANAGED AUTH] Connection is ACTIVE (poll {})",
                                                 attempt
                                             );
-                                            if let Ok(mut map) = client.toolkit_account_map.write() {
-                                                map.insert(toolkit_slug.to_lowercase(), acct_id.clone());
+                                            if let Ok(mut map) = client.toolkit_account_map.write()
+                                            {
+                                                map.insert(
+                                                    toolkit_slug.to_lowercase(),
+                                                    acct_id.clone(),
+                                                );
                                             }
                                             let _ = list_auth_configs(client).await;
                                             return Ok("Authentication successful! You can now use the tool.".to_string());

@@ -206,6 +206,7 @@ impl ComposioToolkitListing {
     }
 
     /// Get the tools count from meta
+    #[allow(dead_code)]
     pub fn tools_count(&self) -> Option<usize> {
         self.meta.as_ref().and_then(|m| m.tools_count)
     }
@@ -390,12 +391,13 @@ impl ToolExecuteResponse {
 
         // 5. Nested data.data.status_code / data.data.statusCode — HARD signal
         let nested_status = data.get("data").is_some_and(|inner| {
-            inner.get("status_code").is_some_and(|v| {
-                v.as_u64().is_some_and(|n| n == 401 || n == 403)
-            }) || inner.get("statusCode").is_some_and(|v| {
-                v.as_str().is_some_and(|s| s == "401" || s == "403")
-                    || v.as_u64().is_some_and(|n| n == 401 || n == 403)
-            })
+            inner
+                .get("status_code")
+                .is_some_and(|v| v.as_u64().is_some_and(|n| n == 401 || n == 403))
+                || inner.get("statusCode").is_some_and(|v| {
+                    v.as_str().is_some_and(|s| s == "401" || s == "403")
+                        || v.as_u64().is_some_and(|n| n == 401 || n == 403)
+                })
         });
 
         // 6. Fallback: error string — SOFT signal (restricted patterns only)
@@ -403,8 +405,7 @@ impl ToolExecuteResponse {
         // generates messages containing this string in auth redirect responses.
         // Only match on deterministic HTTP status codes in the error string.
         let error_str = self.error.as_deref().unwrap_or("");
-        let error_fallback = error_str.contains("401")
-            || error_str.contains("403 Forbidden");
+        let error_fallback = error_str.contains("401") || error_str.contains("403 Forbidden");
 
         status_code_num
             || status_code_str
