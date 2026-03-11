@@ -120,6 +120,16 @@ impl Session {
         if let Ok(uuid) = uuid::Uuid::parse_str(message_id) {
             if let Some(index) = self.messages.iter().position(|m| m.id == uuid) {
                 let count = self.messages.len() - index;
+                // Harvest cost/token data from the messages being deleted
+                // so the session totals never drop when messages are pruned.
+                for msg in &self.messages[index..] {
+                    if let Some(usage) = &msg.usage {
+                        if let Some(cost) = usage.cost {
+                            self.accumulated_cost += cost;
+                        }
+                        self.accumulated_tokens += usage.total_tokens;
+                    }
+                }
                 self.messages.truncate(index);
                 self.last_updated = Utc::now();
                 count
@@ -131,24 +141,28 @@ impl Session {
         }
     }
 
-    /// Calculate total cost for all messages in this session
-    /// Always sums from message-level usage data, which is the source of truth.
+    /// Calculate total cost for all messages in this session.
+    /// Includes `accumulated_cost` from deleted messages so the counter
+    /// never drops when the user prunes conversation history.
     pub fn total_cost(&self) -> f64 {
-        self.messages
+        let message_cost: f64 = self.messages
             .iter()
             .filter_map(|m| m.usage.as_ref())
             .filter_map(|u| u.cost)
-            .sum()
+            .sum();
+        self.accumulated_cost + message_cost
     }
 
-    /// Calculate total tokens for all messages in this session
-    /// Always sums from message-level usage data, which is the source of truth.
+    /// Calculate total tokens for all messages in this session.
+    /// Includes `accumulated_tokens` from deleted messages so the counter
+    /// never drops when the user prunes conversation history.
     pub fn total_tokens(&self) -> i32 {
-        self.messages
+        let message_tokens: i32 = self.messages
             .iter()
             .filter_map(|m| m.usage.as_ref())
             .map(|u| u.total_tokens)
-            .sum()
+            .sum();
+        self.accumulated_tokens + message_tokens
     }
 
     /// Calculate average tokens per turn
@@ -177,7 +191,7 @@ impl Session {
 /// Schema version for SessionState persistence.
 /// Bump this when adding new migrations to `load()`.
 /// Existing files without this field default to 0 via `#[serde(default)]`.
-pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionState {
@@ -191,6 +205,12 @@ pub struct SessionState {
     pub window_height: f64,
     #[serde(default)]
     pub tool_call_history: Vec<crate::components::shared::ToolCallRecord>,
+    /// All-time cumulative cost in USD across all sessions (including deleted ones).
+    #[serde(default)]
+    pub lifetime_cost: f64,
+    /// All-time cumulative token count across all sessions (including deleted ones).
+    #[serde(default)]
+    pub lifetime_tokens: i64,
     /// When true, save() will no-op to protect backup data after load failure
     #[serde(skip)]
     pub save_disabled: bool,
@@ -531,6 +551,11 @@ impl SessionState {
     }
 
     pub fn delete_session_raw(&mut self, id: &str) {
+        // Harvest cost/token data before destruction so lifetime counters survive deletion
+        if let Some(session) = self.sessions.get(id) {
+            self.lifetime_cost += session.total_cost();
+            self.lifetime_tokens += session.total_tokens() as i64;
+        }
         self.sessions.remove(id);
 
         if self.active_session_id == id {
@@ -756,6 +781,8 @@ impl Default for SessionState {
             window_width: 1440.0, // 16:9 ratio default
             window_height: 810.0,
             tool_call_history: Vec::new(),
+            lifetime_cost: 0.0,
+            lifetime_tokens: 0,
             save_disabled: false,
         }
     }
@@ -1158,5 +1185,118 @@ mod tests {
         // save() will try to use get_sessions_path(), but the important thing is
         // the save_disabled check returns early with Ok(())
         assert!(result.is_ok(), "save() with save_disabled should return Ok");
+    }
+
+    /// Test: deleting a session harvests its cost and tokens into lifetime counters.
+    #[test]
+    fn test_delete_session_harvests_cost() {
+        let mut state = SessionState::default();
+        let session_id = state.create_session_raw(None);
+
+        // Add a message with usage data
+        if let Some(session) = state.sessions.get_mut(&session_id) {
+            session.messages.push(crate::components::chat::Message {
+                id: uuid::Uuid::new_v4(),
+                author: "Hobbes".to_string(),
+                content: crate::components::shared::MessageContent::Text {
+                    content: "Hello".to_string(),
+                    thought_signature: None,
+                    thought_summary: None,
+                },
+                attachments: Vec::new(),
+                comments: Vec::new(),
+                created_at: chrono::Utc::now(),
+                usage: Some(crate::components::shared::UsageData {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    total_tokens: 150,
+                    thoughts_tokens: None,
+                    cached_content_tokens: None,
+                    cost: Some(0.0042),
+                }),
+            });
+        }
+
+        // Verify session cost before deletion
+        assert!(
+            (state.sessions.get(&session_id).unwrap().total_cost() - 0.0042).abs() < 0.00001
+        );
+        assert_eq!(state.lifetime_cost, 0.0);
+        assert_eq!(state.lifetime_tokens, 0);
+
+        // Delete the session
+        state.delete_session_raw(&session_id);
+
+        // Session should be gone, but lifetime counters should be updated
+        assert!(state.sessions.get(&session_id).is_none());
+        assert!((state.lifetime_cost - 0.0042).abs() < 0.00001);
+        assert_eq!(state.lifetime_tokens, 150);
+    }
+
+    /// Test: lifetime counters accumulate across multiple session deletions.
+    #[test]
+    fn test_lifetime_counters_accumulate() {
+        let mut state = SessionState::default();
+
+        for cost in [0.01, 0.02, 0.03] {
+            let sid = state.create_session_raw(None);
+            if let Some(session) = state.sessions.get_mut(&sid) {
+                session.messages.push(crate::components::chat::Message {
+                    id: uuid::Uuid::new_v4(),
+                    author: "Hobbes".to_string(),
+                    content: crate::components::shared::MessageContent::Text {
+                        content: "test".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                    },
+                    attachments: Vec::new(),
+                    comments: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                    usage: Some(crate::components::shared::UsageData {
+                        prompt_tokens: 100,
+                        completion_tokens: 50,
+                        total_tokens: 150,
+                        thoughts_tokens: None,
+                        cached_content_tokens: None,
+                        cost: Some(cost),
+                    }),
+                });
+            }
+            state.delete_session_raw(&sid);
+        }
+
+        assert!((state.lifetime_cost - 0.06).abs() < 0.00001);
+        assert_eq!(state.lifetime_tokens, 450);
+    }
+
+    /// Test: lifetime counters survive JSON serialization roundtrip.
+    #[test]
+    fn test_lifetime_counters_serialization() {
+        let mut state = SessionState::default();
+        state.lifetime_cost = 1.2345;
+        state.lifetime_tokens = 999_999;
+
+        let json = serde_json::to_string_pretty(&state).expect("serialize");
+        let loaded: SessionState = serde_json::from_str(&json).expect("deserialize");
+
+        assert!((loaded.lifetime_cost - 1.2345).abs() < 0.00001);
+        assert_eq!(loaded.lifetime_tokens, 999_999);
+    }
+
+    /// Test: old session files without lifetime fields deserialize with defaults.
+    #[test]
+    fn test_backward_compat_no_lifetime_fields() {
+        let old_json = r#"{
+            "schema_version": 1,
+            "sessions": {},
+            "active_session_id": "",
+            "window_width": 800.0,
+            "window_height": 600.0,
+            "tool_call_history": []
+        }"#;
+
+        let state: SessionState = serde_json::from_str(old_json).expect("deserialize old format");
+        assert_eq!(state.lifetime_cost, 0.0);
+        assert_eq!(state.lifetime_tokens, 0);
     }
 }

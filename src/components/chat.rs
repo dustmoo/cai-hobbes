@@ -320,7 +320,7 @@ pub fn ChatWindow(
 
                 if tools_to_run.is_empty() {
                     // This could be a Skill continuation (no tools to run)
-                    continuation_controller.read().trigger_continuation();
+                    continuation_controller.write().trigger_continuation();
                     return;
                 }
 
@@ -382,7 +382,7 @@ pub fn ChatWindow(
                 }
 
                 // 3. Trigger continuation to send results back to LLM
-                continuation_controller.read().trigger_continuation();
+                continuation_controller.write().trigger_continuation();
             });
         }
     });
@@ -406,9 +406,13 @@ pub fn ChatWindow(
                 let on_complete = {
                     let mut active_message_id = active_message_id;
                     let mut active_session_for_stream = active_session_for_stream;
+                    let mut continuation_controller = continuation_controller;
                     move || {
                         active_message_id.set(None);
                         active_session_for_stream.set(None);
+                        // Reset the continuation in-flight guard so the next
+                        // trigger_continuation() from stream_manager can proceed.
+                        continuation_controller.write().clear_in_flight();
                         let _ = tx.send(());
                     }
                 };
@@ -443,6 +447,7 @@ pub fn ChatWindow(
                 let settings = settings;
                 let send_prompt_to_llm = send_prompt_to_llm;
                 let mut permission_manager = permission_manager;
+                let mut stream_update_trigger = stream_update_trigger;
                 let mut has_new_comments = has_new_comments;
 
                 async move {
@@ -460,7 +465,7 @@ pub fn ChatWindow(
                 .and_then(|s| s.messages.last())
                 .is_some_and(|m| {
                     if let MessageContent::Text { content: text, .. } = &m.content {
-                        text.starts_with("Pardon, I have reached the 'Max Turn Limit' currently set to X in settings")
+                        text.starts_with("Pardon, I have reached the 'Max Turn Limit'")
                     } else {
                         false
                     }
@@ -492,6 +497,8 @@ pub fn ChatWindow(
                                     });
                                 }
                             }
+                            // Scroll to bottom immediately for comment-only sends
+                            stream_update_trigger += 1;
 
                             let fresh_mcp_context =
                                 fetch_fresh_mcp_context(target_id.clone(), settings_read.clone())
@@ -586,6 +593,9 @@ pub fn ChatWindow(
                             });
                         }
                     }
+                    // Scroll to bottom immediately so the new messages are visible
+                    // without waiting for the first streaming chunk.
+                    stream_update_trigger += 1;
 
                     let fresh_mcp_context =
                         fetch_fresh_mcp_context(target_id.clone(), settings_read.clone()).await;
@@ -672,6 +682,8 @@ pub fn ChatWindow(
                         });
                     }
                 }
+                // Scroll to bottom immediately for continuation messages
+                stream_update_trigger += 1;
 
                 let fresh_mcp_context =
                     fetch_fresh_mcp_context(target_id.clone(), settings.clone()).await;

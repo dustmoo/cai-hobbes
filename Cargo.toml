@@ -1,6 +1,6 @@
 [package]
 name = "Hobbes"
-version = "0.9.51"
+version = "0.9.52"
 authors = ["Dustin Moore <dustin@clearmirror.ai>", "Gemini 2.5/3 Pro and Flash (and a touch of Claude 3.7/4.5 Sonnet)"]
 edition = "2024"
 license-file = "LICENSE"
@@ -81,6 +81,7 @@ open = "5.3.3"
 tempfile = "3.14"
 regex = "1.10"
 serde_yml = "0.0.12"
+sublime_fuzzy = "0.7.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = { workspace = true }
 security-framework = "2.11.0"

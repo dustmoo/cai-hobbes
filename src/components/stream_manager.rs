@@ -30,6 +30,7 @@ pub struct StreamManagerContext {
     pub is_sending: Signal<bool>,
     pub content_generated: Signal<std::collections::HashSet<Uuid>>,
     save_error_signal: Signal<Option<String>>,
+    usage_log: Signal<crate::usage_log::UsageLog>,
 }
 
 impl StreamManagerContext {
@@ -83,6 +84,10 @@ impl StreamManagerContext {
             let (tool_results_tx, mut tool_results_rx) =
                 mpsc::unbounded_channel::<crate::components::shared::ToolCallRecord>();
             let mut tool_call_count = 0;
+            // Track whether the placeholder message has been upgraded to a ToolCall.
+            // Only the FIRST tool call in a turn should upgrade it; subsequent
+            // parallel tool calls must create separate messages for transparency.
+            let mut first_tool_call_placed = false;
             // Defense-in-depth: track dispatched tool calls to prevent duplicate execution
             // even if the LLM connector fails to dedup (e.g., different providers).
             let mut dispatched_tool_calls: std::collections::HashSet<(String, String, u64)> =
@@ -278,10 +283,11 @@ impl StreamManagerContext {
                         tool_call_count += 1;
                         let tool_call_message_id = {
                             let mut state = self.session_state.write();
-                            // Message Upgrading: If this is the "first" content of the turn, OR if we have only
-                            // received thinking data so far (final_text is empty), we upgrade the existing
-                            // placeholder message to a ToolCall instead of splitting into two bubbles.
-                            if is_first_message || final_text_for_this_turn.is_empty() {
+                            // Message Upgrading: Only the FIRST tool call upgrades the
+                            // placeholder.  Subsequent parallel tool calls always get their
+                            // own message so every invocation is visible to the user.
+                            if !first_tool_call_placed && (is_first_message || final_text_for_this_turn.is_empty()) {
+                                first_tool_call_placed = true;
                                 if let Some(msg) =
                                     state.get_message_mut_in_session(&session_id, &message_id)
                                 {
@@ -488,14 +494,12 @@ impl StreamManagerContext {
                             msg.usage = Some(usage_data.clone());
                         }
 
-                        // Recalculate session accumulated usage from authoritative message data.
-                        // Gemini sends usage_metadata on multiple SSE chunks, so we must NOT
-                        // blindly increment — that causes double-counting. Instead, derive
-                        // accumulated values from the message-level totals (which are replaced,
-                        // not accumulated, on each Usage event).
+                        // NOTE: accumulated_cost/accumulated_tokens are managed solely by
+                        // Session::delete_message_and_after() now — they represent costs
+                        // from *deleted* messages.  total_cost()/total_tokens() already
+                        // includes them, so we must NOT re-derive them here (that would
+                        // create a feedback loop where accumulators grow each SSE chunk).
                         if let Some(session) = state.sessions.get_mut(&session_id) {
-                            session.accumulated_cost = session.total_cost();
-                            session.accumulated_tokens = session.total_tokens();
                             session.accumulated_turns = session
                                 .messages
                                 .iter()
@@ -629,7 +633,35 @@ impl StreamManagerContext {
                 self.is_sending.set(false);
                 self.scheduler.send(SchedulerSignal::Activity);
 
-                self.continuation_controller.read().trigger_continuation();
+                // Check turn limit BEFORE triggering continuation.
+                // Without this gate the AI continuation loop runs indefinitely.
+                if self.permission_manager.read().is_turn_limit_reached() {
+                    let max_turns = self.settings.read().permission_settings.max_ai_turns;
+                    tracing::info!("Turn limit reached ({} turns). Halting continuation.", max_turns);
+                    let warning_msg = format!(
+                        "Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.",
+                        max_turns
+                    );
+                    let mut state = self.session_state.write();
+                    if let Some(session) = state.sessions.get_mut(&session_id) {
+                        session.messages.push(crate::components::chat::Message {
+                            id: Uuid::new_v4(),
+                            author: "Hobbes".to_string(),
+                            content: crate::components::shared::MessageContent::Text {
+                                content: warning_msg,
+                                thought_signature: None,
+                                thought_summary: None,
+                            },
+                            attachments: Vec::new(),
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        });
+                    }
+                    return; // Stop — user must send a message to reset and continue.
+                }
+
+                self.continuation_controller.write().trigger_continuation();
                 return; // End this stream task. The continuation will start a new one.
             }
 
@@ -637,6 +669,32 @@ impl StreamManagerContext {
 
             // This block now runs only when the conversation turn is truly complete.
             tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
+
+            // Record usage to the standalone usage log (audit ledger).
+            // This captures the final usage data for the turn, avoiding the
+            // double-counting that would occur if we recorded on every SSE chunk.
+            {
+                let state = self.session_state.read();
+                if let Some(msg) = state.sessions.get(&session_id)
+                    .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
+                {
+                    if let Some(usage) = &msg.usage {
+                        let model = self.settings.read().active_chat_model().to_string();
+                        self.usage_log.write().record(crate::usage_log::UsageLogEntry {
+                            timestamp: chrono::Utc::now(),
+                            session_id: session_id.clone(),
+                            model,
+                            prompt_tokens: usage.prompt_tokens,
+                            completion_tokens: usage.completion_tokens,
+                            total_tokens: usage.total_tokens,
+                            thoughts_tokens: usage.thoughts_tokens,
+                            cached_content_tokens: usage.cached_content_tokens,
+                            cost: usage.cost,
+                        });
+                    }
+                }
+            }
+
             {
                 let mut state = self.session_state.write();
                 state.touch_session(&session_id);
@@ -721,6 +779,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
     let permission_manager =
         consume_context::<Signal<crate::context::permissions::PermissionManager>>();
+    let usage_log = consume_context::<Signal<crate::usage_log::UsageLog>>();
     let context = use_hook(|| StreamManagerContext {
         stream_receivers: Signal::new(HashMap::new()),
         active_stream_handles: Signal::new(HashMap::new()),
@@ -736,6 +795,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         is_sending: Signal::new(false),
         content_generated: Signal::new(std::collections::HashSet::new()),
         save_error_signal: consume_context::<crate::components::shared::SaveErrorContext>().0,
+        usage_log,
     });
 
     // Provide the context to children.
@@ -791,6 +851,7 @@ mod tests {
                 is_sending: Signal::new(false),
                 content_generated: Signal::new(std::collections::HashSet::new()),
                 save_error_signal: Signal::new(None),
+                usage_log: Signal::new(crate::usage_log::UsageLog::default()),
             });
 
             let message_id = Uuid::new_v4();
@@ -860,6 +921,7 @@ mod tests {
                 is_sending: Signal::new(false),
                 content_generated: Signal::new(std::collections::HashSet::new()),
                 save_error_signal: Signal::new(None),
+                usage_log: Signal::new(crate::usage_log::UsageLog::default()),
             });
 
             let message_id = Uuid::new_v4();

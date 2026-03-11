@@ -2278,9 +2278,10 @@ pub fn SettingsPanel() -> Element {
                                                 }
                                             },
                                             option { value: "1", selected: local_settings.read().permission_settings.max_ai_turns == 1, "1 (Strict turn-taking)" }
-                                            option { value: "3", selected: local_settings.read().permission_settings.max_ai_turns == 3, "3 (Default)" }
-                                            option { value: "5", selected: local_settings.read().permission_settings.max_ai_turns == 5, "5 (More autonomy)" }
-                                            option { value: "10", selected: local_settings.read().permission_settings.max_ai_turns == 10, "10 (For complex tasks)" }
+                                            option { value: "5", selected: local_settings.read().permission_settings.max_ai_turns == 5, "5 (Conservative)" }
+                                            option { value: "10", selected: local_settings.read().permission_settings.max_ai_turns == 10, "10 (Moderate)" }
+                                            option { value: "25", selected: local_settings.read().permission_settings.max_ai_turns == 25, "25 (Default)" }
+                                            option { value: "50", selected: local_settings.read().permission_settings.max_ai_turns == 50, "50 (Max autonomy)" }
                                         }
                                     }
 

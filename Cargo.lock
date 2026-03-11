@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "Hobbes"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "ammonia",
  "arboard",
@@ -50,6 +50,7 @@ dependencies = [
  "serde_yml",
  "sha2",
  "sse-stream",
+ "sublime_fuzzy",
  "syntect",
  "tempfile",
  "thiserror 1.0.69",
@@ -4820,9 +4821,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.13"
+version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1906b49b0c3bc04b5fe5d86a77925ae6524a19b816ae38ce1e426255f1d8a31"
+checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",
@@ -5900,6 +5901,12 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "sublime_fuzzy"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa7986063f7c0ab374407e586d7048a3d5aac94f103f751088bf398e07cd5400"
 
 [[package]]
 name = "subtle"
@@ -7468,7 +7475,7 @@ checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
 
 [[package]]
 name = "windows_app"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "ammonia",
  "arboard",

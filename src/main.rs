@@ -43,6 +43,7 @@ use secret_manager_generic as secret_manager;
 pub use secret_types::SecretManagerTrait;
 mod services;
 mod session;
+mod usage_log;
 mod settings;
 mod skills;
 mod theme;
@@ -216,6 +217,9 @@ fn app() -> Element {
 
     // Global focus context for keyboard event coordination
     use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
+
+    // Usage log for cost tracking that survives session deletion
+    use_context_provider(|| Signal::new(usage_log::UsageLog::load()));
 
     let skill_registry = use_context_provider(|| Signal::new(skills::SkillRegistry::new()));
     let mut skills_loaded = use_signal(|| false);
@@ -1150,8 +1154,9 @@ fn app() -> Element {
                 session_state
                     .write()
                     .update_window_size(content_width, logical_size.height);
-                // Save asynchronously on a background thread to avoid blocking the UI
-                SessionState::save_async(&session_state.read(), None);
+                // Window dimensions are persisted at the next natural save point
+                // (message send, session switch, app close). Serializing the entire
+                // session state here was blocking the UI thread for large states.
             });
         }
     });

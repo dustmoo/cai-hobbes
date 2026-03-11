@@ -381,6 +381,13 @@ pub fn McpMarketplace() -> Element {
                 // Ensure trigger is captured for reactive tracking
                 let _ = trigger;
 
+                // Guard: don't fire API calls for very short queries (1-2 chars).
+                // Wait until the user has typed at least 3 characters to reduce
+                // unnecessary network requests and protect rate limits.
+                if !query.is_empty() && query.len() < 3 {
+                    return Ok((vec![], "Type 3+ characters to search".to_string()));
+                }
+
                 match source {
                     McpSource::Composio => {
                         // Fetch from Composio

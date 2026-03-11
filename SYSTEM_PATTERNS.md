@@ -181,7 +181,7 @@ For deeper documentation on specific subsystems:
 
 ---
 
-## Patterns Added in v0.9.51
+## Patterns Added in v0.9.52
 
 ### 6. Auth Recovery — 6-Point Reconnect Lifecycle
 
