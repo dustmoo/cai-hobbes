@@ -59,6 +59,16 @@ pub fn set_generic_password(account: &str, password: &str) -> Result<(), Keychai
     }
 }
 
+/// Standalone keychain save helper — cross-platform parity with macOS implementation.
+/// On non-macOS platforms biometric protection is a no-op; always uses standard keyring.
+pub fn save_secret_to_keychain(
+    key: &str,
+    value: &str,
+    _use_biometric: bool,
+) -> Result<(), KeychainError> {
+    set_generic_password(key, value)
+}
+
 /// Centralized secret manager that caches secrets in memory
 /// and provides efficient batch loading from platform-native keychains.
 #[derive(Clone, Debug)]
