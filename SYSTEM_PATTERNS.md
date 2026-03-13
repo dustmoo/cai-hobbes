@@ -160,6 +160,8 @@ mod secret_manager_generic; // keyring crate
 | AP-003 | Uppercase Toolkit Slugs | Gmail/Slack auth fails | Preserve API casing |
 | AP-004 | Unfiltered Account Cache | Wrong credentials used | Filter by user_id |
 | AP-005 | Direct keychain_ffi Import | Cross-platform build fails | Use secret_manager module |
+| AP-006 | Direct Keychain Save Bypass | Duplicated fallback logic, inconsistent behavior | Use `save_secret_to_keychain()` or `SecretManager::set()` |
+| AP-007 | Reversed MCP Lock Order | App deadlock (hangs forever) | Always lock `servers` before `dynamic_local_tools` |
 
 ---
 
@@ -181,7 +183,7 @@ For deeper documentation on specific subsystems:
 
 ---
 
-## Patterns Added in v0.9.52
+## Patterns Added in v0.9.53
 
 ### 6. Auth Recovery — 6-Point Reconnect Lifecycle
 
@@ -257,3 +259,40 @@ SessionState::save_signal(&session_state, None);
 ```
 
 **Location**: `src/session.rs`, `src/async_persist.rs`
+
+---
+
+### 10. MCP Lock Ordering Invariant
+
+> **Pattern ID**: P-010  
+> **Anti-Pattern**: Reversed lock acquisition (ABBA deadlock)
+
+When acquiring multiple MCP manager locks, always follow this order:
+
+```
+servers → dynamic_local_tools → dynamic_composio_tools
+```
+
+`call_tool` acquires `servers` first (line ~1655), then falls back to `dynamic_local_tools` (line ~1762). Any function that needs both locks must acquire them in the same order.
+
+**If broken**: ABBA deadlock — app hangs permanently when a user switches a server mode while a tool call is in-flight.
+
+---
+
+### 11. Centralized Keychain Save Helper
+
+> **Pattern ID**: P-011  
+> **Anti-Pattern**: Direct `keychain_ffi` calls from UI components (AP-006)
+
+All keychain save operations must use `SecretManager::set()` or the standalone `save_secret_to_keychain()` helper. Never call `set_generic_password_with_biometric_protection` / `set_generic_password_local` / `set_generic_password` directly from components.
+
+```rust
+// ❌ ANTI-PATTERN: Duplicated fallback logic in each component
+keychain_ffi::set_generic_password_with_biometric_protection(key, value)
+    .or_else(|e| { /* fallback logic */ });
+
+// ✅ CORRECT: Single source of truth
+crate::secret_manager::save_secret_to_keychain(key, value, use_biometric)
+```
+
+**Location**: `src/secret_manager.rs` → `save_secret_to_keychain()`

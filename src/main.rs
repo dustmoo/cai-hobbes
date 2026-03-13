@@ -275,15 +275,15 @@ fn app() -> Element {
                                 Some(ctx)
                             }
                             biometric_auth::AuthResult::Cancelled => {
-                                tracing::info!("User cancelled biometric auth, falling back to regular keychain access");
+                                tracing::warn!("User cancelled biometric auth — keys saved with biometric protection will NOT be available this session. Falling back to regular keychain access.");
                                 None
                             }
                             biometric_auth::AuthResult::NotAvailable(reason) => {
-                                tracing::info!("Biometric auth not available ({}), using regular keychain access", reason);
+                                tracing::warn!("Biometric auth not available ({}) — keys saved with biometric protection will NOT be available this session. Using regular keychain access.", reason);
                                 None
                             }
                             biometric_auth::AuthResult::Failed(error) => {
-                                tracing::warn!("Biometric auth failed: {}, using regular keychain access", error);
+                                tracing::warn!("Biometric auth failed: {} — keys saved with biometric protection will NOT be available this session. Using regular keychain access.", error);
                                 None
                             }
                         }
@@ -748,6 +748,12 @@ fn app() -> Element {
         let persisted_unloaded = ui_state.peek().unloaded_mcp_servers.clone();
         manager
             .set_initial_unloaded_servers(persisted_unloaded)
+            .await;
+
+        // Restore persisted on-demand servers state before launching
+        let persisted_on_demand = ui_state.peek().on_demand_mcp_servers.clone();
+        manager
+            .set_initial_on_demand_servers(persisted_on_demand)
             .await;
 
         manager

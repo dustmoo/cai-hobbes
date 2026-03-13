@@ -12,7 +12,7 @@ const SAFETY_MARGIN: f64 = 0.15;
 /// Estimate token count for a text string.
 pub fn estimate_tokens(text: &str) -> usize {
     // Use char count (not byte count) for better accuracy with Unicode
-    (text.chars().count() + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN
+    text.chars().count().div_ceil(CHARS_PER_TOKEN)
 }
 
 /// Estimate token count for a single ChatMessage.

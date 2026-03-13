@@ -326,6 +326,65 @@ pub fn set_generic_password(account: &str, password: &str) -> Result<(), Keychai
     }
 }
 
+/// Save a generic password to the keychain WITHOUT iCloud sync.
+///
+/// This is used as a fallback when biometric protection fails (e.g., missing entitlement)
+/// but the user chose device-only storage. Unlike `set_generic_password`, this never
+/// enables `kSecAttrSynchronizable`, preserving the user's privacy preference.
+///
+/// # Arguments
+/// * `account` - The account name (key)
+/// * `password` - The password value to store
+///
+/// # Returns
+/// * `Ok(())` - Successfully saved (device-only)
+/// * `Err(KeychainError)` - If the save failed
+pub fn set_generic_password_local(account: &str, password: &str) -> Result<(), KeychainError> {
+    // First, try to delete any existing item
+    let _ = delete_generic_password(account);
+
+    let query = CFMutableDictionary::new();
+
+    let service_name = CFString::new(SERVICE_NAME);
+    let account_name = CFString::new(account);
+    let password_data = CFData::from_buffer(password.as_bytes());
+
+    unsafe {
+        dict_set(&query, kSecClass, kSecClassGenericPassword);
+        dict_set(
+            &query,
+            kSecAttrService,
+            service_name.as_concrete_TypeRef() as CFTypeRef,
+        );
+        dict_set(
+            &query,
+            kSecAttrAccount,
+            account_name.as_concrete_TypeRef() as CFTypeRef,
+        );
+        set_access_group_if_sandboxed(&query);
+        dict_set(
+            &query,
+            kSecValueData,
+            password_data.as_concrete_TypeRef() as CFTypeRef,
+        );
+
+        // Explicitly NO kSecAttrSynchronizable — device-only storage
+        // Use ThisDeviceOnly for stronger isolation (matches biometric intent)
+        dict_set(
+            &query,
+            kSecAttrAccessible,
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        );
+    }
+
+    let status = unsafe { SecItemAdd(query.as_concrete_TypeRef() as CFTypeRef, ptr::null_mut()) };
+
+    match status {
+        ERR_SEC_SUCCESS => Ok(()),
+        code => Err(KeychainError::SecurityError(code)),
+    }
+}
+
 /// Delete a generic password from the keychain.
 ///
 /// # Arguments

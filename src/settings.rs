@@ -1068,6 +1068,9 @@ pub struct UiState {
     /// MCP servers that are unloaded (tools hidden from AI)
     #[serde(default)]
     pub unloaded_mcp_servers: Vec<String>,
+    /// MCP servers in on-demand mode (tools discoverable via MCP_LOAD_SERVER_TOOLS meta-tool)
+    #[serde(default)]
+    pub on_demand_mcp_servers: Vec<String>,
     /// Last active tab in Settings Panel
     #[serde(default)]
     pub active_settings_tab: SettingsTab,
@@ -1127,6 +1130,7 @@ impl Default for UiState {
             default_skill_response_open: true,
             default_skill_instructions_open: true,
             unloaded_mcp_servers: Vec::new(),
+            on_demand_mcp_servers: Vec::new(),
             active_settings_tab: SettingsTab::default(),
             llm_config_collapsed: false,
             open_tabs: Vec::new(),

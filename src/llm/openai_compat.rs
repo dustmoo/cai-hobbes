@@ -48,7 +48,7 @@ impl LlmConnector for OpenAiCompatConnector {
             let message_tokens: usize = prompt_data
                 .messages
                 .iter()
-                .map(|m| crate::context::token_estimator::estimate_message_tokens(m))
+                .map(crate::context::token_estimator::estimate_message_tokens)
                 .sum();
             let tool_tokens: usize = prompt_data
                 .tools

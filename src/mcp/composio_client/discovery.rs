@@ -12,8 +12,9 @@ pub struct DiscoveryResult {
 /// List all available tools from Composio (via MCP Protocol endpoint)
 pub async fn list_tools(client: &ComposioClient) -> Result<DiscoveryResult, String> {
     // Use the MCP Protocol endpoint - returns only tools configured for this specific server
-    // CRITICAL: Do NOT include x-api-key header - the URL itself (containing server UUID) is the auth
-    // See KI troubleshooting item #58 for details on why x-api-key causes 401 errors here
+    // Include x-api-key header — some Composio accounts require it for MCP proxy auth.
+    // Previously omitted per KI #58 (dev account didn't need it), but customer accounts
+    // return 10401 "API key required in headers" without it. Including is safe for all accounts.
 
     let mcp_url = client.build_mcp_url("");
 
@@ -59,7 +60,7 @@ pub async fn list_tools(client: &ComposioClient) -> Result<DiscoveryResult, Stri
             .post(&mcp_url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
-            // No x-api-key header - MCP URL is the authentication (see troubleshooting #58)
+            .header("x-api-key", &client.api_key)
             .json(&request)
             .send()
             .await

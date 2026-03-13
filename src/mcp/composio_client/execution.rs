@@ -679,6 +679,7 @@ pub async fn execute_tool(
         .post(&url)
         .header("Accept", "application/json, text/event-stream")
         .header("Content-Type", "application/json")
+        .header("x-api-key", &client.api_key)
         .query(&[("user_id", &user_id)]) // Keep query param for Proxy routing
         .json(&body)
         .send()

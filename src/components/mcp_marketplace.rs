@@ -1092,7 +1092,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
 
     // Connection state for inline "Connect" button on disconnected toolkits
     let mut tk_is_connecting = use_signal(|| false);
-    let mut tk_connection_status = use_signal(|| String::new());
+    let mut tk_connection_status = use_signal(String::new);
     let mut tk_connection_error: Signal<Option<String>> = use_signal(|| None);
     let mut tk_connecting_slug: Signal<Option<String>> = use_signal(|| None);
     let connected_slugs: Signal<std::collections::HashSet<String>> =
@@ -1256,59 +1256,76 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     "{status.tools} tools"
                                 }
                             }
-                            // Load/Unload toggle for local MCPs (not Composio, not error (unless retriable? no, error handles retry separately))
-                            // We now allow Disabled status because user-unloaded servers are reported as Disabled.
+                            // Load mode selector for local MCPs (not Composio)
+                            // Shows a dropdown: Loaded (always) / On-demand / Disabled
                             if !is_composio && (status.status == ServerStatus::Loaded || status.status == ServerStatus::Disabled) {
                                 {
                                     let server_name = status.name.clone();
-                                    let current_is_loaded = status.is_loaded;
-                                    // Redundant locals removed
-                                    // Captured by move closure below
+                                    let current_mode = if !status.is_loaded {
+                                        "disabled"
+                                    } else if status.is_on_demand {
+                                        "ondemand"
+                                    } else {
+                                        "loaded"
+                                    };
                                     rsx! {
-                                        button {
-                                            class: if current_is_loaded {
-                                                "text-xs px-2 py-0.5 rounded bg-action-warn text-action-warn-text border border-action-warn-border hover:opacity-80 transition-colors"
-                                            } else {
-                                                "text-xs px-2 py-0.5 rounded bg-action-success text-action-success-text border border-action-success-border hover:opacity-80 transition-colors"
-                                            },
-                                            onclick: move |_| {
+                                        select {
+                                            class: "text-xs px-2 py-0.5 bg-section border border-faint rounded cursor-pointer",
+                                            value: current_mode,
+                                            // Dioxus <select> onchange: event.value() returns the `value`
+                                            // attribute of the selected <option>, not selectedIndex. This
+                                            // differs from raw DOM where you'd need e.target.value.
+                                            onchange: move |event: dioxus::events::FormEvent| {
+                                                let new_mode = event.value();
                                                 let server_name = server_name.clone();
                                                 let mcp_manager = mcp_manager;
                                                 let mut mcp_context = mcp_context;
                                                 let mut refresh_trigger = refresh_trigger;
                                                 let mut ui_state = ui_state;
                                                 let ui_state_manager = ui_state_manager;
-                                                let should_load = !current_is_loaded;
                                                 spawn(async move {
-                                                    if should_load {
-                                                        mcp_manager.read().load_server(&server_name).await;
-                                                    } else {
-                                                        mcp_manager.read().unload_server(&server_name).await;
+                                                    match new_mode.as_str() {
+                                                        "loaded" => {
+                                                            mcp_manager.read().set_server_loaded(&server_name).await;
+                                                        }
+                                                        "ondemand" => {
+                                                            mcp_manager.read().set_server_on_demand(&server_name).await;
+                                                        }
+                                                        _ => {
+                                                            // "disabled" -> unload
+                                                            mcp_manager.read().unload_server(&server_name).await;
+                                                        }
                                                     }
 
-                                                    // Persist unloaded state to UiState
+                                                    // Persist state to UiState
                                                     {
                                                         let mut state = ui_state.write();
-                                                        if should_load {
-                                                            state.unloaded_mcp_servers.retain(|s| s != &server_name);
-                                                        } else {
-                                                            if !state.unloaded_mcp_servers.contains(&server_name) {
+                                                        // Clear from both lists first
+                                                        state.unloaded_mcp_servers.retain(|s| s != &server_name);
+                                                        state.on_demand_mcp_servers.retain(|s| s != &server_name);
+
+                                                        match new_mode.as_str() {
+                                                            "ondemand" => {
+                                                                state.on_demand_mcp_servers.push(server_name.clone());
+                                                            }
+                                                            "disabled" => {
                                                                 state.unloaded_mcp_servers.push(server_name.clone());
                                                             }
+                                                            _ => {} // "loaded" — not in either list
                                                         }
-                                                        // Save to disk (non-blocking)
                                                         ui_state_manager.read().save_async(state.clone(), Some(save_error));
                                                     }
 
-                                                    // Pattern 150.8.3: Cache already invalidated by load_server/unload_server (Pattern 150.8.1)
-                                                    // Update context signal and trigger UI refresh
+                                                    // Refresh context and UI
                                                     let new_context = mcp_manager.read().get_mcp_context(None).await;
                                                     mcp_context.set(new_context);
                                                     let current = *refresh_trigger.peek();
                                                     refresh_trigger.set(current + 1);
                                                 });
                                             },
-                                            if current_is_loaded { "Unload" } else { "Load" }
+                                            option { value: "loaded", "Loaded (always)" }
+                                            option { value: "ondemand", "On-demand" }
+                                            option { value: "disabled", "Disabled" }
                                         }
                                     }
                                 }

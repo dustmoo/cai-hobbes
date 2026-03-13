@@ -23,9 +23,10 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 
     // Debounce effect: whenever filter_query changes, wait 150ms then push
     // the value into debounced_query.  A new keystroke cancels the previous timer.
-    let raw_query = filter_query.read().clone();
+    // CRITICAL: The signal read MUST happen inside the use_effect closure so Dioxus
+    // tracks it as a reactive dependency and re-runs the effect on changes.
     use_effect(move || {
-        let q = raw_query.clone();
+        let q = filter_query.read().clone();
         spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             debounced_query.set(q);
