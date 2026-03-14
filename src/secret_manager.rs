@@ -3,7 +3,8 @@ use crate::keychain_ffi;
 #[allow(unused_imports)]
 pub use crate::keychain_ffi::{
     delete_generic_password, find_generic_password, find_generic_password_with_context,
-    set_generic_password, set_generic_password_with_biometric_protection, KeychainError,
+    set_generic_password, set_generic_password_local,
+    set_generic_password_with_biometric_protection, KeychainError,
 };
 use crate::secret_types;
 use std::collections::HashMap;
@@ -265,15 +266,16 @@ impl SecretManagerTrait for SecretManager {
             }
             Err(keychain_ffi::KeychainError::SecurityError(-34018)) => {
                 // -34018 = errSecMissingEntitlement - app not properly signed
-                // Fallback to regular keychain save without biometric protection
+                // Fallback to local-only keychain save (no iCloud sync) to respect
+                // the user's device-only storage intent
                 tracing::warn!(
-                    "Biometric protection unavailable (missing entitlement), falling back to regular keychain save for: {}",
+                    "Biometric protection unavailable (missing entitlement), falling back to local-only keychain save for: {}",
                     key
                 );
-                keychain_ffi::set_generic_password(key, &value)
+                keychain_ffi::set_generic_password_local(key, &value)
                     .map_err(|e| format!("Failed to save secret to Keychain: {}", e))?;
                 self.secrets.insert(key.to_string(), value);
-                tracing::debug!("Saved secret (without biometric protection): {}", key);
+                tracing::debug!("Saved secret (local-only, without biometric protection): {}", key);
                 Ok(())
             }
             Err(e) => Err(format!("Failed to save secret to Keychain: {}", e)),
@@ -360,5 +362,40 @@ impl SecretManagerTrait for SecretManager {
     /// Get a reference to the secrets cache for credential extraction.
     fn secrets_ref(&self) -> &HashMap<String, String> {
         &self.secrets
+    }
+}
+
+/// Standalone keychain save helper — encapsulates the biometric → local-only fallback chain.
+///
+/// Safe to call from `spawn_blocking` since it does not require `&mut self`.
+/// After calling this, update the `SecretManager` cache on the main thread via `update_cache()`.
+///
+/// # Arguments
+/// * `key` — Keychain item name (e.g. `"gemini_api_key"`)
+/// * `value` — Secret value to store
+/// * `use_biometric` — `true` for device-only biometric-protected storage,
+///   `false` for iCloud-synced storage
+pub fn save_secret_to_keychain(
+    key: &str,
+    value: &str,
+    use_biometric: bool,
+) -> Result<(), keychain_ffi::KeychainError> {
+    if use_biometric {
+        keychain_ffi::set_generic_password_with_biometric_protection(key, value).or_else(|e| {
+            if let keychain_ffi::KeychainError::SecurityError(-34018) = e {
+                // -34018 = errSecMissingEntitlement — biometric not available.
+                // Fall back to local-only save (no iCloud sync) to respect
+                // the user's device-only storage intent.
+                tracing::warn!(
+                    "Biometric protection unavailable (-34018), falling back to local-only keychain save for: {}",
+                    key
+                );
+                keychain_ffi::set_generic_password_local(key, value)
+            } else {
+                Err(e)
+            }
+        })
+    } else {
+        keychain_ffi::set_generic_password(key, value)
     }
 }

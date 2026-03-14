@@ -724,7 +724,10 @@ pub fn ChatInput(
                     oninput: move |event| {
                         scheduler.send(SchedulerSignal::Activity);
 
-                        // Auto-resize logic
+                        // Auto-resize the textarea to fit its content.
+                        // This eval is necessary because we need to measure the
+                        // DOM element's scrollHeight, which is not accessible
+                        // through Dioxus's virtual DOM.
                         let _ = document::eval(r#"
                             const el = document.getElementById('chat-textarea');
                             if (el) {
@@ -1281,6 +1284,35 @@ fn SessionCostIcon() -> Element {
                         div { class: "flex justify-between text-fg-muted",
                             span { "Avg Tokens/Turn:" }
                             span { class: "text-fg font-mono", {format!("{:.0}", avg_tokens)} }
+                        }
+                    }
+
+                    // All-time totals (lifetime counters from deleted sessions + all live sessions)
+                    {
+                        let all_time_cost = state.lifetime_cost
+                            + state.sessions.values().map(|s| s.total_cost()).sum::<f64>();
+                        let all_time_tokens = state.lifetime_tokens
+                            + state.sessions.values().map(|s| s.total_tokens() as i64).sum::<i64>();
+                        rsx! {
+                            div { class: "mt-2 pt-2 border-t border-faint space-y-2 text-xs",
+                                div { class: "text-sm font-semibold text-gray-200 mb-1", "All-Time" }
+                                div { class: "flex justify-between text-fg-muted",
+                                    span { "Lifetime Cost:" }
+                                    span { class: "text-green-400 font-mono", {format!("${:.4}", all_time_cost)} }
+                                }
+                                div { class: "flex justify-between text-fg-muted",
+                                    span { "Lifetime Tokens:" }
+                                    span { class: "text-fg font-mono",
+                                        {if all_time_tokens > 1_000_000 {
+                                            format!("{:.1}M", all_time_tokens as f64 / 1_000_000.0)
+                                        } else if all_time_tokens > 1_000 {
+                                            format!("{:.1}K", all_time_tokens as f64 / 1_000.0)
+                                        } else {
+                                            format!("{}", all_time_tokens)
+                                        }}
+                                    }
+                                }
+                            }
                         }
                     }
                     div { class: "mt-2 pt-2 border-t border-faint text-[10px] text-fg-muted text-center",

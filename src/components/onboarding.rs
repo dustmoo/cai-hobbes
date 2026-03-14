@@ -5,6 +5,7 @@ use crate::services::openai_compat_validation::validate_openai_compat_endpoint;
 use crate::settings::{
     is_sandboxed, KeychainStorageMode, LlmProvider, Settings, SettingsManager, CURRENT_TOS_VERSION,
 };
+use crate::SecretManagerTrait;
 use dioxus::prelude::*;
 use dioxus_desktop::use_window;
 
@@ -28,6 +29,8 @@ pub const TOS_CONTENT: &str = include_str!("../../assets/legal/terms_of_service.
 pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
     let mut settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
+    let mut secret_manager =
+        use_context::<Signal<crate::secret_manager::SecretManager>>();
 
     // Determine initial step based on TOS acceptance status
     let initial_step = {
@@ -184,22 +187,7 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                     let api_key = api_key_for_keychain.clone();
                     let kc_key = keychain_key.clone();
                     move || {
-                        if use_biometric {
-                            crate::secret_manager::set_generic_password_with_biometric_protection(
-                                &kc_key, &api_key,
-                            )
-                            .or_else(|e| {
-                                if let crate::secret_manager::KeychainError::SecurityError(-34018) =
-                                    e
-                                {
-                                    crate::secret_manager::set_generic_password(&kc_key, &api_key)
-                                } else {
-                                    Err(e)
-                                }
-                            })
-                        } else {
-                            crate::secret_manager::set_generic_password(&kc_key, &api_key)
-                        }
+                        crate::secret_manager::save_secret_to_keychain(&kc_key, &api_key, use_biometric)
                     }
                 })
                 .await;
@@ -211,6 +199,14 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                     is_validating.set(false);
                     return;
                 }
+
+                // Update the SecretManager cache so downstream consumers
+                // (e.g. Composio profile hydration) see the key immediately
+                // without requiring an app restart.
+                secret_manager.write().update_cache(
+                    keychain_key.clone(),
+                    api_key_for_keychain.clone(),
+                );
             }
 
             let mut current_settings = settings.read().clone();

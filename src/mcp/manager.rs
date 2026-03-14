@@ -40,6 +40,64 @@ fn composio_server_key(profile_id: &str) -> String {
 /// Gemini's practical tool limit for FunctionDeclarations.
 const GEMINI_TOOL_LIMIT: usize = 128;
 
+/// Virtual server name for the built-in local on-demand meta-tools.
+const LOCAL_META_SERVER_NAME: &str = "hobbes-local-meta";
+
+/// Get meta-tools for local MCP server on-demand loading.
+/// These allow the AI to load/unload tools from servers set to "On-demand" mode.
+fn get_local_meta_tools() -> Vec<Tool> {
+    vec![
+        Tool {
+            name: "MCP_LOAD_SERVER_TOOLS".into(),
+            description: Some(
+                "Load all tools from a local MCP server that is in on-demand mode. \
+                After calling this, the server's tools become available as native function calls \
+                on the next turn. Use this when you need to use tools from a server marked [ON-DEMAND]."
+                    .into(),
+            ),
+            input_schema: serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "The exact name of the on-demand server to load tools from (e.g., 'playwright', 'graphiti')"
+                    }
+                },
+                "required": ["server_name"]
+            }))
+            .unwrap_or_default(),
+            title: None,
+            output_schema: None,
+            annotations: None,
+            icons: None,
+            meta: None,
+        },
+        Tool {
+            name: "MCP_UNLOAD_SERVER_TOOLS".into(),
+            description: Some(
+                "Unload dynamically loaded tools from a local MCP server to free up context space. \
+                Use this when you no longer need tools from a server you previously loaded."
+                    .into(),
+            ),
+            input_schema: serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "The exact name of the server whose tools should be unloaded"
+                    }
+                },
+                "required": ["server_name"]
+            }))
+            .unwrap_or_default(),
+            title: None,
+            output_schema: None,
+            annotations: None,
+            icons: None,
+            meta: None,
+        },
+    ]
+}
 /// Score a tool's relevance by name keywords for budget-aware selection.
 /// Higher score = more likely to be included when over budget.
 ///
@@ -267,6 +325,8 @@ pub struct McpServerStatus {
     pub prompts: usize,
     /// Whether tools from this server are visible to the AI (false = unloaded at runtime)
     pub is_loaded: bool,
+    /// Whether this server is in on-demand mode (tools available via MCP_LOAD_SERVER_TOOLS)
+    pub is_on_demand: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,6 +380,13 @@ pub struct McpManager {
     /// Included as a virtual server in get_mcp_context() so the prompt builder
     /// sends them to Gemini as real FunctionDeclarations.
     pub dynamic_composio_tools: Arc<Mutex<Vec<rmcp::model::Tool>>>,
+    /// Servers whose tools are available on-demand via MCP_LOAD_SERVER_TOOLS meta-tool.
+    /// Servers in this set have their process running but tools are NOT included in get_mcp_context()
+    /// unless explicitly loaded via the meta-tool into dynamic_local_tools.
+    pub on_demand_servers: Arc<Mutex<HashSet<String>>>,
+    /// Dynamically loaded local MCP tools (populated by MCP_LOAD_SERVER_TOOLS).
+    /// Mirrors dynamic_composio_tools but for local MCP servers in on-demand mode.
+    pub dynamic_local_tools: Arc<Mutex<Vec<rmcp::model::Tool>>>,
 }
 
 impl McpManager {
@@ -338,6 +405,8 @@ impl McpManager {
             cached_server_statuses: Arc::new(Mutex::new(None)),
             secret_manager,
             dynamic_composio_tools: Arc::new(Mutex::new(Vec::new())),
+            on_demand_servers: Arc::new(Mutex::new(HashSet::new())),
+            dynamic_local_tools: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -377,18 +446,22 @@ impl McpManager {
             .base_url
             .clone()
             .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
+        // Guard: bare /v3/mcp URL has no server UUID — MCP endpoint will 10401
+        let has_server_uuid = profile.base_url.as_ref()
+            .is_some_and(|u| u.contains("/v3/mcp/"));
         let entity_id = profile.entity_id.clone();
         let user_id = profile.user_id.clone();
         let force_load_slugs = profile.get_force_load_toolkit_slugs();
         let profile_id = profile.id.clone();
 
         tracing::info!(
-            "Initializing native Composio client for profile '{}' (ID: {}). API Key: {}... Entity: {:?}, User: {:?}",
+            "Initializing native Composio client for profile '{}' (ID: {}). API Key: {}... Entity: {:?}, User: {:?}, has_server_uuid: {}",
             profile.name,
             profile_id,
             api_key.get(..8).unwrap_or(""),
             entity_id,
-            user_id
+            user_id,
+            has_server_uuid
         );
 
         let composio_client = Arc::new(ComposioClient::new(
@@ -410,10 +483,26 @@ impl McpManager {
         let mut composio_config = McpServerConfig::composio_stub(server_name);
         composio_config.description = description;
 
-        let discovery_result = composio_client
-            .list_tools_for_session(&force_load_slugs)
-            .await
-            .map_err(|e| format!("Failed to list Composio tools: {}", e))?;
+        // Only call list_tools (MCP endpoint) when we have a valid server UUID in the URL.
+        // Without a UUID, the bare /v3/mcp URL causes 10401 "MCP server not found".
+        // Meta-tools are always loaded so the user can still connect toolkits.
+        let discovery_result = if has_server_uuid {
+            composio_client
+                .list_tools_for_session(&force_load_slugs)
+                .await
+                .map_err(|e| format!("Failed to list Composio tools: {}", e))?
+        } else {
+            tracing::warn!(
+                "No MCP server UUID in base_url for profile '{}' — loading meta-tools only. \
+                 Connect a toolkit via Marketplace to resolve.",
+                profile.name
+            );
+            use crate::mcp::composio_client::discovery::DiscoveryResult;
+            DiscoveryResult {
+                tools: crate::mcp::composio_client::meta::get_meta_tools(),
+                warning: Some("No MCP server configured. Connect a toolkit to get started.".into()),
+            }
+        };
 
         // Convert Composio tools to rmcp::model::Tool for the prompt builder.
         // This conversion appears at multiple lifecycle stages (init, hot-reload,
@@ -483,6 +572,80 @@ impl McpManager {
         tracing::debug!(
             "Restored {} unloaded servers from persisted state",
             unloaded.len()
+        );
+    }
+
+    /// Initialize on-demand servers from persisted state
+    pub async fn set_initial_on_demand_servers(&self, servers: Vec<String>) {
+        let mut on_demand = self.on_demand_servers.lock().await;
+        for server in servers {
+            on_demand.insert(server);
+        }
+        tracing::debug!(
+            "Restored {} on-demand servers from persisted state",
+            on_demand.len()
+        );
+    }
+
+    /// Set a server to on-demand mode (tools hidden, discoverable via meta-tool)
+    pub async fn set_server_on_demand(&self, server_name: &str) {
+        // Remove from unloaded if present
+        {
+            let mut unloaded = self.unloaded_servers.lock().await;
+            unloaded.remove(server_name);
+        }
+        // Add to on-demand
+        {
+            let mut on_demand = self.on_demand_servers.lock().await;
+            on_demand.insert(server_name.to_string());
+        }
+        // Clear any dynamically loaded tools for this server
+        // LOCK ORDERING INVARIANT (P-010): Always acquire `servers` before
+        // `dynamic_local_tools` to match `call_tool`'s acquisition order
+        // and prevent ABBA deadlocks.
+        {
+            let servers = self.servers.lock().await;
+            let mut dynamic = self.dynamic_local_tools.lock().await;
+            if let Some(client) = servers.get(server_name) {
+                let server_tool_names: HashSet<String> =
+                    client.tools.iter().map(|t| t.name.to_string()).collect();
+                dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
+            }
+        }
+        self.invalidate_status_cache();
+        tracing::info!(
+            "Set server '{}' to on-demand mode - tools discoverable via MCP_LOAD_SERVER_TOOLS",
+            server_name
+        );
+    }
+
+    /// Set a server back to loaded mode (all tools in every prompt)
+    pub async fn set_server_loaded(&self, server_name: &str) {
+        // Remove from on-demand
+        {
+            let mut on_demand = self.on_demand_servers.lock().await;
+            on_demand.remove(server_name);
+        }
+        // Remove from unloaded
+        {
+            let mut unloaded = self.unloaded_servers.lock().await;
+            unloaded.remove(server_name);
+        }
+        // Clear dynamically loaded tools for this server (they'll now be in the main set)
+        // LOCK ORDERING INVARIANT (P-010): servers → dynamic_local_tools
+        {
+            let servers = self.servers.lock().await;
+            let mut dynamic = self.dynamic_local_tools.lock().await;
+            if let Some(client) = servers.get(server_name) {
+                let server_tool_names: HashSet<String> =
+                    client.tools.iter().map(|t| t.name.to_string()).collect();
+                dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
+            }
+        }
+        self.invalidate_status_cache();
+        tracing::info!(
+            "Set server '{}' to loaded mode - all tools visible in every prompt",
+            server_name
         );
     }
 
@@ -825,6 +988,8 @@ impl McpManager {
                             let base_url = profile.base_url.clone().unwrap_or_else(|| {
                                 "https://backend.composio.dev/v3/mcp".to_string()
                             });
+                            let has_server_uuid = profile.base_url.as_ref()
+                                .is_some_and(|u| u.contains("/v3/mcp/"));
 
                             let entity_id = profile.entity_id.clone();
                             let user_id = profile.user_id.clone();
@@ -849,9 +1014,20 @@ impl McpManager {
                             // Tool Router pattern: only load force-loaded toolkit tools + meta-tools
                             let force_load_slugs = profile.get_force_load_toolkit_slugs();
 
-                            match client_for_tools
-                                .list_tools_for_session(&force_load_slugs)
-                                .await
+                            // Guard: skip MCP list_tools when no server UUID exists (prevents 10401)
+                            let tool_result = if has_server_uuid {
+                                client_for_tools
+                                    .list_tools_for_session(&force_load_slugs)
+                                    .await
+                            } else {
+                                tracing::warn!("No MCP server UUID in base_url (launch_servers) — meta-tools only");
+                                use crate::mcp::composio_client::discovery::DiscoveryResult;
+                                Ok(DiscoveryResult {
+                                    tools: crate::mcp::composio_client::meta::get_meta_tools(),
+                                    warning: Some("No MCP server configured. Connect a toolkit to get started.".into()),
+                                })
+                            };
+                            match tool_result
                             {
                                 Ok(discovery_result) => {
                                     let tools = discovery_result
@@ -1378,6 +1554,108 @@ impl McpManager {
         bypass_permission_check: bool,
         profile_id: Option<String>,
     ) -> Result<UnboundedReceiver<Result<CallToolResult, String>>, String> {
+        // Intercept local on-demand meta-tools before normal dispatch
+        if server_name == LOCAL_META_SERVER_NAME || tool_name == "MCP_LOAD_SERVER_TOOLS" || tool_name == "MCP_UNLOAD_SERVER_TOOLS" {
+            let (tx, rx) = mpsc::unbounded_channel();
+
+            if tool_name == "MCP_LOAD_SERVER_TOOLS" {
+                let target_server = args.get("server_name").and_then(|v| v.as_str()).unwrap_or("");
+                if target_server.is_empty() {
+                    let _ = tx.send(Err("Missing 'server_name' argument".to_string()));
+                    return Ok(rx);
+                }
+
+                // Check if the server is in on-demand mode
+                let is_on_demand = {
+                    let on_demand = self.on_demand_servers.lock().await;
+                    on_demand.contains(target_server)
+                };
+
+                if !is_on_demand {
+                    let _ = tx.send(Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(format!(
+                            "Server '{}' is not in on-demand mode. Its tools are already available.",
+                            target_server
+                        ))],
+                        is_error: Some(false),
+                        structured_content: None,
+                        meta: None,
+                    }));
+                    return Ok(rx);
+                }
+
+                // Copy tools from the server into dynamic_local_tools cache
+                let servers = self.servers.lock().await;
+                if let Some(client) = servers.get(target_server) {
+                    let tool_count = client.tools.len();
+                    let tool_names: Vec<String> = client.tools.iter().map(|t| t.name.to_string()).collect();
+
+                    // Add to dynamic cache (deduplicating)
+                    let mut dynamic = self.dynamic_local_tools.lock().await;
+                    let existing_names: HashSet<String> = dynamic.iter().map(|t| t.name.to_string()).collect();
+                    let new_tools: Vec<Tool> = client.tools.iter()
+                        .filter(|t| !existing_names.contains(t.name.as_ref()))
+                        .cloned()
+                        .collect();
+                    let injected = new_tools.len();
+                    dynamic.extend(new_tools);
+
+                    tracing::info!(
+                        "MCP_LOAD_SERVER_TOOLS: Loaded {} tools from '{}' (total dynamic: {})",
+                        injected, target_server, dynamic.len()
+                    );
+
+                    let _ = tx.send(Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(format!(
+                            "Loaded {} tools from '{}'. They are now available as native function calls on the next turn.\n\nTools: {}",
+                            tool_count, target_server, tool_names.join(", ")
+                        ))],
+                        is_error: Some(false),
+                        structured_content: None,
+                        meta: None,
+                    }));
+                } else {
+                    let _ = tx.send(Err(format!("Server '{}' not found", target_server)));
+                }
+                return Ok(rx);
+            } else if tool_name == "MCP_UNLOAD_SERVER_TOOLS" {
+                let target_server = args.get("server_name").and_then(|v| v.as_str()).unwrap_or("");
+                if target_server.is_empty() {
+                    let _ = tx.send(Err("Missing 'server_name' argument".to_string()));
+                    return Ok(rx);
+                }
+
+                // Remove this server's tools from dynamic cache
+                let servers = self.servers.lock().await;
+                if let Some(client) = servers.get(target_server) {
+                    let server_tool_names: HashSet<String> =
+                        client.tools.iter().map(|t| t.name.to_string()).collect();
+                    let mut dynamic = self.dynamic_local_tools.lock().await;
+                    let before = dynamic.len();
+                    dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
+                    let removed = before - dynamic.len();
+
+                    tracing::info!(
+                        "MCP_UNLOAD_SERVER_TOOLS: Removed {} tools from '{}' (remaining dynamic: {})",
+                        removed, target_server, dynamic.len()
+                    );
+
+                    let _ = tx.send(Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(format!(
+                            "Unloaded {} tools from '{}'. Context space freed.",
+                            removed, target_server
+                        ))],
+                        is_error: Some(false),
+                        structured_content: None,
+                        meta: None,
+                    }));
+                } else {
+                    let _ = tx.send(Err(format!("Server '{}' not found", target_server)));
+                }
+                return Ok(rx);
+            }
+        }
+
         let servers_guard = self.servers.lock().await;
 
         // Resolve composio-native to the actual profile-suffixed key.
@@ -1483,13 +1761,20 @@ impl McpManager {
         let tool = match client.tools.iter().find(|t| t.name == tool_name) {
             Some(t) => t.clone(),
             None => {
-                // Fallback: check the dynamic Composio tools cache.
-                // Dynamically discovered tools (via COMPOSIO_GET_APP_TOOLS) live here,
-                // not in any ActiveMcpClient.tools list.
-                let dynamic_cache = self.dynamic_composio_tools.lock().await;
-                match dynamic_cache.iter().find(|t| t.name == tool_name) {
-                    Some(t) => t.clone(),
-                    None => return Err(format!("Tool not found: {}", tool_name)),
+                // Fallback 1: check the dynamic local tools cache.
+                // Dynamically loaded on-demand server tools live here.
+                let dynamic_local_cache = self.dynamic_local_tools.lock().await;
+                if let Some(t) = dynamic_local_cache.iter().find(|t| t.name == tool_name) {
+                    t.clone()
+                } else {
+                    // Fallback 2: check the dynamic Composio tools cache.
+                    // Dynamically discovered tools (via COMPOSIO_GET_APP_TOOLS) live here,
+                    // not in any ActiveMcpClient.tools list.
+                    let dynamic_cache = self.dynamic_composio_tools.lock().await;
+                    match dynamic_cache.iter().find(|t| t.name == tool_name) {
+                        Some(t) => t.clone(),
+                        None => return Err(format!("Tool not found: {}", tool_name)),
+                    }
                 }
             }
         };
@@ -1618,6 +1903,13 @@ impl McpManager {
                                 Ok(discovery_result) => {
                                     let total_available = discovery_result.tools.len();
 
+                                    // Identify tools already loaded on the server (force-loaded)
+                                    let already_loaded: Vec<_> = discovery_result
+                                        .tools
+                                        .iter()
+                                        .filter(|t| loaded_tool_names.contains(&t.name))
+                                        .collect();
+
                                     // Deduplicate: skip tools already loaded on the server
                                     let new_tools: Vec<_> = discovery_result
                                         .tools
@@ -1666,7 +1958,8 @@ impl McpManager {
                                         }
                                     }
 
-                                    // Build response
+                                    // Build response: include BOTH newly injected AND already-loaded tools
+                                    // so the AI knows what it can call directly.
                                     let tool_results: Vec<serde_json::Value> = selected
                                         .iter()
                                         .map(|t| {
@@ -1677,18 +1970,47 @@ impl McpManager {
                                         })
                                         .collect();
 
-                                    let content_text = serde_json::to_string_pretty(&serde_json::json!({
+                                    let already_loaded_results: Vec<serde_json::Value> = already_loaded
+                                        .iter()
+                                        .map(|t| {
+                                            serde_json::json!({
+                                                "name": t.name,
+                                                "description": t.description,
+                                            })
+                                        })
+                                        .collect();
+                                    let already_loaded_count = already_loaded_results.len();
+
+                                    let hint = if !already_loaded.is_empty() && selected.is_empty() {
+                                        // All tools already force-loaded — tell the AI exactly what it has
+                                        format!(
+                                            "All {} tools are already loaded as native function calls. Call them directly by name — they are listed in 'already_loaded' below.",
+                                            already_loaded_count
+                                        )
+                                    } else if budget_limited {
+                                        format!("{} most relevant tools injected (budget: {} max). Use COMPOSIO_EXECUTE_TOOL for any tool not listed.", injected_count, GEMINI_TOOL_LIMIT)
+                                    } else {
+                                        "All tools are now available as native function calls. Call them directly by name.".to_string()
+                                    };
+
+                                    let mut response_json = serde_json::json!({
                                         "app": app_name,
                                         "injected_count": injected_count,
                                         "total_available": total_available,
                                         "budget_limited": budget_limited,
                                         "tools": tool_results,
-                                        "hint": if budget_limited {
-                                            format!("{} most relevant tools injected (budget: {} max). Use COMPOSIO_EXECUTE_TOOL for any tool not listed.", injected_count, GEMINI_TOOL_LIMIT)
-                                        } else {
-                                            "All tools are now available as native function calls. Call them directly by name.".to_string()
+                                        "hint": hint,
+                                    });
+
+                                    // Include already-loaded tool names so the AI knows what it can call
+                                    if !already_loaded_results.is_empty() {
+                                        if let Some(obj) = response_json.as_object_mut() {
+                                            obj.insert("already_loaded_count".to_string(), serde_json::json!(already_loaded_count));
+                                            obj.insert("already_loaded".to_string(), serde_json::json!(already_loaded_results));
                                         }
-                                    })).unwrap_or_else(|e| {
+                                    }
+
+                                    let content_text = serde_json::to_string_pretty(&response_json).unwrap_or_else(|e| {
                                         tracing::error!("Failed to serialize tool discovery response: {}", e);
                                         // Hand-crafted JSON is intentional here: the primary serde_json
                                         // serializer just failed, and this output is consumed as Content::text
@@ -2045,7 +2367,9 @@ impl McpManager {
     pub async fn get_mcp_context(&self, profile_id: Option<String>) -> McpContext {
         let servers = self.servers.lock().await;
         let unloaded = self.unloaded_servers.lock().await;
+        let on_demand = self.on_demand_servers.lock().await;
         let mut server_contexts = Vec::new();
+        let mut on_demand_server_info: Vec<(String, String, usize)> = Vec::new(); // (name, description, tool_count)
 
         for (name, client) in servers.iter() {
             // Skip servers that are unloaded (tools hidden from AI)
@@ -2065,12 +2389,67 @@ impl McpManager {
                 }
             }
 
+            // On-demand servers: include name/description but NOT tools
+            if on_demand.contains(&client.config.name) && !is_composio_native(name) {
+                on_demand_server_info.push((
+                    client.config.name.clone(),
+                    client.config.description.clone(),
+                    client.tools.len(),
+                ));
+                // Include an empty-tools entry so the system prompt lists the server
+                server_contexts.push(McpServerContext {
+                    name: client.config.name.clone(),
+                    description: format!(
+                        "{} [ON-DEMAND: {} tools available — call MCP_LOAD_SERVER_TOOLS with server_name='{}' to load]",
+                        client.config.description, client.tools.len(), client.config.name
+                    ),
+                    tools: Vec::new(), // No tools in prompt
+                });
+                continue;
+            }
+
             let server_context = McpServerContext {
                 name: client.config.name.clone(),
                 description: client.config.description.clone(),
                 tools: client.tools.clone(),
             };
             server_contexts.push(server_context);
+        }
+
+        // Inject MCP_LOAD_SERVER_TOOLS / MCP_UNLOAD_SERVER_TOOLS meta-tools
+        // when any on-demand local servers exist
+        if !on_demand_server_info.is_empty() {
+            let meta_tools = get_local_meta_tools();
+            server_contexts.push(McpServerContext {
+                name: LOCAL_META_SERVER_NAME.to_string(),
+                description: "Built-in tools for loading/unloading on-demand MCP server tools"
+                    .to_string(),
+                tools: meta_tools,
+            });
+        }
+
+        // Include dynamically loaded local MCP tools (from MCP_LOAD_SERVER_TOOLS)
+        let dynamic_local = self.dynamic_local_tools.lock().await;
+        if !dynamic_local.is_empty() {
+            let existing_tool_names: HashSet<String> = server_contexts
+                .iter()
+                .flat_map(|sc| sc.tools.iter().map(|t| t.name.to_string()))
+                .collect();
+
+            let deduped_tools: Vec<Tool> = dynamic_local
+                .iter()
+                .filter(|t| !existing_tool_names.contains(t.name.as_ref()))
+                .cloned()
+                .collect();
+
+            if !deduped_tools.is_empty() {
+                server_contexts.push(McpServerContext {
+                    name: "local-on-demand".to_string(),
+                    description: "Dynamically loaded local MCP tools (via MCP_LOAD_SERVER_TOOLS)"
+                        .to_string(),
+                    tools: deduped_tools,
+                });
+            }
         }
 
         // Include dynamically discovered Composio tools as a virtual server entry.
@@ -2164,6 +2543,9 @@ impl McpManager {
     }
 
     /// Load a server's tools back into the AI context
+    /// NOTE: Superseded by `set_server_loaded()` for the 3-way mode system,
+    /// but retained as a simpler API for basic unload/reload use cases.
+    #[allow(dead_code)]
     pub async fn load_server(&self, server_name: &str) {
         let mut unloaded = self.unloaded_servers.lock().await;
         unloaded.remove(server_name);
@@ -2615,9 +2997,11 @@ impl McpManager {
         let failed = self.failed_servers.lock().await;
         let auth_required = self.auth_required_servers.lock().await;
         let unloaded = self.unloaded_servers.lock().await;
+        let on_demand = self.on_demand_servers.lock().await;
 
         // First, process all configs from the JSON file
         for config in configs {
+            let is_on_demand = on_demand.contains(&config.name);
             let is_loaded = !unloaded.contains(&config.name);
             let status = if !is_loaded {
                 // User has manually unloaded/disabled this server
@@ -2631,6 +3015,7 @@ impl McpManager {
                     resources: 0,
                     prompts: 0,
                     is_loaded: false,
+                    is_on_demand: false,
                     auth_url: None,
                     uri: config.uri.clone(),
                     profile: None,
@@ -2647,6 +3032,7 @@ impl McpManager {
                     resources: 0,
                     prompts: 0,
                     is_loaded: false, // Disabled servers are always "unloaded"
+                    is_on_demand: false,
                     auth_url: None,
                     uri: config.uri.clone(),
                     profile: None,
@@ -2663,6 +3049,7 @@ impl McpManager {
                     resources: 0, // TODO: Implement resources tracking
                     prompts: 0,   // TODO: Implement prompts tracking
                     is_loaded: true,
+                    is_on_demand,
                     auth_url: None,
                     uri: config.uri.clone(),
                     profile: None,
@@ -2680,6 +3067,7 @@ impl McpManager {
                     resources: 0,
                     prompts: 0,
                     is_loaded: false, // NeedsAuth servers are not loaded
+                    is_on_demand: false,
                     auth_url: auth_info.auth_url.clone(),
                     uri: config.uri.clone(),
                     profile: None,
@@ -2696,6 +3084,7 @@ impl McpManager {
                     resources: 0,
                     prompts: 0,
                     is_loaded: false, // Error servers are not loaded
+                    is_on_demand: false,
                     auth_url: None,
                     uri: config.uri.clone(),
                     profile: None,
@@ -2713,6 +3102,7 @@ impl McpManager {
                     resources: 0,
                     prompts: 0,
                     is_loaded: false, // Initializing servers are not loaded
+                    is_on_demand: false,
                     auth_url: None,
                     uri: config.uri.clone(),
                     profile: None,
@@ -2747,6 +3137,7 @@ impl McpManager {
                     resources: 0,
                     prompts: 0,
                     is_loaded: composio_is_loaded,
+                    is_on_demand: false,
                     auth_url: None,
                     uri: None,
                     profile: None,
@@ -2765,6 +3156,7 @@ impl McpManager {
                     resources: 0,
                     prompts: 0,
                     is_loaded: false,
+                    is_on_demand: false,
                     auth_url: None,
                     uri: None,
                     profile: None,
@@ -2783,6 +3175,7 @@ impl McpManager {
                     resources: 0,
                     prompts: 0,
                     is_loaded: false,
+                    is_on_demand: false,
                     auth_url: None,
                     uri: None,
                     profile: None,
@@ -2945,14 +3338,17 @@ impl McpManager {
                             .base_url
                             .clone()
                             .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
+                        let has_server_uuid = profile.base_url.as_ref()
+                            .is_some_and(|u| u.contains("/v3/mcp/"));
 
                         let entity_id = profile.entity_id.clone();
                         let user_id = profile.user_id.clone();
 
                         tracing::info!(
-                            "Initializing Composio Client (Retry). UserID: {:?}, EntityID: {:?}",
+                            "Initializing Composio Client (Retry). UserID: {:?}, EntityID: {:?}, has_server_uuid: {}",
                             user_id,
-                            entity_id
+                            entity_id,
+                            has_server_uuid
                         );
 
                         let composio_client = Arc::new(ComposioClient::new(
@@ -2965,6 +3361,11 @@ impl McpManager {
                         ));
                         let client_for_tools = composio_client.clone();
 
+                        // Guard: skip MCP list_tools when no server UUID (prevents 10401)
+                        if !has_server_uuid {
+                            tracing::warn!("No MCP server UUID in base_url (retry) — skipping retry");
+                            return;
+                        }
                         match client_for_tools.list_tools().await {
                             Ok(discovery_result) => {
                                 let tools = discovery_result

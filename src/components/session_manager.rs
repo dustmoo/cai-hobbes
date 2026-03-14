@@ -2,6 +2,7 @@
 use crate::{components::chat_input::ChatCommand, session::SessionState};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
+use sublime_fuzzy::best_match;
 
 #[derive(Props, PartialEq, Clone)]
 pub struct SessionManagerProps {}
@@ -14,8 +15,23 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 
     // Pagination and Filtering State
     let mut filter_query = use_signal(String::new);
+    // Debounced version of filter_query — only updates 150ms after the last keystroke.
+    // This prevents the expensive fuzzy search from running on every character.
+    let mut debounced_query = use_signal(String::new);
     let mut current_page = use_signal(|| 0);
     let mut items_per_page = use_signal(|| 10);
+
+    // Debounce effect: whenever filter_query changes, wait 150ms then push
+    // the value into debounced_query.  A new keystroke cancels the previous timer.
+    // CRITICAL: The signal read MUST happen inside the use_effect closure so Dioxus
+    // tracks it as a reactive dependency and re-runs the effect on changes.
+    use_effect(move || {
+        let q = filter_query.read().clone();
+        spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            debounced_query.set(q);
+        });
+    });
 
     // Listen for Global Commands (e.g., Delete Session Hotkey) removed - now handled in main.rs
 
@@ -25,12 +41,56 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
     let mut sorted_sessions: Vec<_> = sessions.sessions.values().collect();
     sorted_sessions.sort_by(|a, b| b.last_updated.cmp(&a.last_updated));
 
-    // Filter sessions
-    let query = filter_query.read().to_lowercase();
-    let filtered_sessions: Vec<_> = sorted_sessions
-        .into_iter()
-        .filter(|s| s.name.to_lowercase().contains(&query))
-        .collect();
+    // Filter sessions: exact substring on name + summary, then fuzzy fallback
+    let query = debounced_query.read().to_lowercase();
+    let filtered_sessions: Vec<_> = if query.is_empty() {
+        sorted_sessions
+    } else {
+        // Phase 1: Exact substring match on name + conversation summary
+        let exact: Vec<_> = sorted_sessions
+            .iter()
+            .filter(|s| {
+                s.name.to_lowercase().contains(&query)
+                    || s.active_context
+                        .conversation_summary
+                        .summary
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .copied()
+            .collect();
+
+        if !exact.is_empty() {
+            exact
+        } else {
+            // Phase 2: Fuzzy match fallback on name + summary, ranked by score
+            let mut scored: Vec<_> = sorted_sessions
+                .iter()
+                .filter_map(|s| {
+                    let name_score = best_match(&query, &s.name.to_lowercase())
+                        .map(|m| m.score());
+                    let summary_score = best_match(
+                        &query,
+                        &s.active_context.conversation_summary.summary.to_lowercase(),
+                    )
+                    .map(|m| m.score());
+
+                    let best = match (name_score, summary_score) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
+                    };
+
+                    best.map(|score| (*s, score))
+                })
+                .collect();
+
+            // Sort by fuzzy score descending (best match first)
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            scored.into_iter().map(|(s, _)| s).collect()
+        }
+    };
 
     let total_items = filtered_sessions.len();
     let limit = *items_per_page.read();

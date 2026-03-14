@@ -353,23 +353,7 @@ pub fn SettingsPanel() -> Element {
                             let results = tokio::task::spawn_blocking(move || {
                                 let mut saved = Vec::new();
                                 for (key_name, key_value) in final_secret_updates {
-                                    let save_result = if use_biometric {
-                                        // Biometric mode: device-only, Touch ID protected
-                                        crate::secret_manager::set_generic_password_with_biometric_protection(&key_name, &key_value)
-                                            .or_else(|e| {
-                                                if let crate::secret_manager::KeychainError::SecurityError(-34018) = e {
-                                                    // Fall back to regular save if entitlements missing
-                                                    crate::secret_manager::set_generic_password(&key_name, &key_value)
-                                                } else {
-                                                    Err(e)
-                                                }
-                                            })
-                                    } else {
-                                        // iCloud sync mode: syncs across devices, no biometric
-                                        crate::secret_manager::set_generic_password(&key_name, &key_value)
-                                    };
-
-                                    if let Err(e) = save_result {
+                                    if let Err(e) = crate::secret_manager::save_secret_to_keychain(&key_name, &key_value, use_biometric) {
                                         tracing::error!("Failed to save secret {}: {}", key_name, e);
                                     } else {
                                         saved.push((key_name, key_value));
@@ -2278,9 +2262,10 @@ pub fn SettingsPanel() -> Element {
                                                 }
                                             },
                                             option { value: "1", selected: local_settings.read().permission_settings.max_ai_turns == 1, "1 (Strict turn-taking)" }
-                                            option { value: "3", selected: local_settings.read().permission_settings.max_ai_turns == 3, "3 (Default)" }
-                                            option { value: "5", selected: local_settings.read().permission_settings.max_ai_turns == 5, "5 (More autonomy)" }
-                                            option { value: "10", selected: local_settings.read().permission_settings.max_ai_turns == 10, "10 (For complex tasks)" }
+                                            option { value: "5", selected: local_settings.read().permission_settings.max_ai_turns == 5, "5 (Conservative)" }
+                                            option { value: "10", selected: local_settings.read().permission_settings.max_ai_turns == 10, "10 (Moderate)" }
+                                            option { value: "25", selected: local_settings.read().permission_settings.max_ai_turns == 25, "25 (Default)" }
+                                            option { value: "50", selected: local_settings.read().permission_settings.max_ai_turns == 50, "50 (Max autonomy)" }
                                         }
                                     }
 
@@ -3198,6 +3183,14 @@ pub fn SettingsPanel() -> Element {
                             if let Some(k) = smithery_key_to_save { secret_updates.push(("smithery_api_key".to_string(), k)); }
                             tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(n, _)| n).collect::<Vec<_>>());
 
+                            // Capture the storage mode preference, overriding for Pro builds
+                            let effective_mode = if crate::settings::is_sandboxed() {
+                                settings_to_save.keychain_storage_mode.clone()
+                            } else {
+                                crate::settings::KeychainStorageMode::LocalKeychain
+                            };
+                            let use_biometric = effective_mode == crate::settings::KeychainStorageMode::Biometric;
+
                             spawn(async move {
                                 // Validate Composio API keys before saving
                                 let mut validated_composio_keys = Vec::new();
@@ -3227,15 +3220,7 @@ pub fn SettingsPanel() -> Element {
                                 let results = tokio::task::spawn_blocking(move || {
                                     let mut saved = Vec::new();
                                     for (key_name, key_value) in final_secret_updates {
-                                        let save_result = crate::secret_manager::set_generic_password_with_biometric_protection(&key_name, &key_value)
-                                            .or_else(|e| {
-                                                if let crate::secret_manager::KeychainError::SecurityError(-34018) = e {
-                                                    crate::secret_manager::set_generic_password(&key_name, &key_value)
-                                                } else {
-                                                    Err(e)
-                                                }
-                                            });
-                                        if let Err(e) = save_result {
+                                        if let Err(e) = crate::secret_manager::save_secret_to_keychain(&key_name, &key_value, use_biometric) {
                                             tracing::error!("Failed to save secret {}: {}", key_name, e);
                                         } else {
                                             saved.push((key_name, key_value));
