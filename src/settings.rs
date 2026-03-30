@@ -187,6 +187,7 @@ default_switch_tab! {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
 pub struct Settings {
     pub active_llm: LlmProvider,
     pub gemini_config: GeminiConfig,
@@ -986,6 +987,21 @@ impl SettingsManager {
         tracing::warn!("Failed to deserialize settings directly, attempting migration...");
         let mut settings = Settings::default();
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(active_llm_val) = value.get("active_llm") {
+                if let Ok(active_llm) = serde_json::from_value(active_llm_val.clone()) {
+                    settings.active_llm = active_llm;
+                }
+            }
+            if let Some(openai_val) = value.get("openai_compat_config") {
+                if let Ok(config) = serde_json::from_value(openai_val.clone()) {
+                    settings.openai_compat_config = config;
+                }
+            }
+            if let Some(claude_val) = value.get("claude_config") {
+                if let Ok(config) = serde_json::from_value(claude_val.clone()) {
+                    settings.claude_config = config;
+                }
+            }
             if let Some(gemini_config_val) = value.get("gemini_config") {
                 if let Ok(gemini_config) = serde_json::from_value(gemini_config_val.clone()) {
                     settings.gemini_config = gemini_config;

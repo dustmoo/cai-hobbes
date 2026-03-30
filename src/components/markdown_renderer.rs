@@ -1,9 +1,7 @@
 use crate::components::chat::{CodeBlock, Comment, LinkWithControls};
-use ammonia::clean;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
-use pulldown_cmark::{html, Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-
+use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 // ---------------------------------------------------------------------------
 
 /// Helper macro for routing inline markdown nodes.
@@ -606,9 +604,27 @@ pub fn MarkdownRenderer(
     #[props(default)] on_comment_edit: Option<EventHandler<String>>,
     #[props(default)] on_comment_delete: Option<EventHandler<String>>,
 ) -> Element {
-    // 1. Optimize Markdown parsing with use_memo.
-    // Re-parses only when 'content' changes.
-    let blocks = use_memo(move || {
+    // ⚠️  DO NOT WRAP THIS BLOCK IN `use_memo` ⚠️
+    //
+    // Regression history (v0.9.58, March 2026):
+    //   Wrapping the parser in `use_memo(move || { … })` silently broke live
+    //   streaming.  In Dioxus 0.6 `use_memo` only re-evaluates when *captured
+    //   Signals* change.  `content` is a plain `String` prop — not a Signal —
+    //   so the memo captured it by value on first render and never re-ran,
+    //   even though `MessageBubble` re-rendered with a longer string on every
+    //   streaming chunk.
+    //
+    // Signal chain that depends on this being inline:
+    //   1. StreamMessage::Text arrives
+    //   2. MessageBubble's local `content` Signal is appended to (.write())
+    //   3. Signal write triggers MessageBubble re-render
+    //   4. MessageBubble passes `content: content()` (resolved String) here
+    //   5. This block re-parses the updated string → live UI update
+    //
+    // If you need to optimize, convert the prop to a `ReadOnlySignal<String>`
+    // so Dioxus can track it, or throttle at the *caller* side — but do NOT
+    // memoize this parse with a String prop.
+    let blocks = {
         let content_reader = &content;
         let mut options = Options::empty();
         options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -867,10 +883,7 @@ pub fn MarkdownRenderer(
                         link_text_buffer.push_str(&text);
                     } else {
                         let target = active_target!(inline_stack, current_inlines);
-                        let mut raw_html = String::new();
-                        html::push_html(&mut raw_html, std::iter::once(Event::Text(text.clone())));
-                        let sanitized = clean(&raw_html);
-                        target.push(Inline::Text(sanitized));
+                        target.push(Inline::Text(text.to_string()));
                     }
                 }
                 Event::Code(text) => {
@@ -965,13 +978,13 @@ pub fn MarkdownRenderer(
         }
 
         blocks
-    });
+    };
 
     let elements = {
         let comments_ref = comments.as_ref();
         let pending_highlight_ref = pending_highlight.as_ref();
 
-        blocks.read()
+        blocks
             .iter()
             .cloned()
             .map(|b| render_block(b, comments_ref, pending_highlight_ref))
@@ -1156,13 +1169,7 @@ pub fn ThinkingMarkdownRenderer(
                         code_buffer.push_str(&text);
                     } else {
                         let target = active_target!(inline_stack, current_inlines);
-                        let mut raw_html = String::new();
-                        pulldown_cmark::html::push_html(
-                            &mut raw_html,
-                            std::iter::once(pulldown_cmark::Event::Text(text.clone())),
-                        );
-                        let sanitized = clean(&raw_html);
-                        target.push(Inline::Text(sanitized));
+                        target.push(Inline::Text(text.to_string()));
                     }
                 }
                 pulldown_cmark::Event::Code(text) => {
@@ -1185,7 +1192,7 @@ pub fn ThinkingMarkdownRenderer(
         // Render functions
         fn render_inline(inline: Inline) -> Element {
             match inline {
-                Inline::Text(text) => rsx! { span { dangerous_inner_html: "{text}" } },
+                Inline::Text(text) => rsx! { span { "{text}" } },
                 Inline::Code(text) => rsx! {
                     code {
                         class: "bg-section text-gray-200 font-mono rounded px-1",
