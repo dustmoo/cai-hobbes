@@ -139,6 +139,9 @@ fn default_toggle_profile() -> String {
 fn default_toggle_attachments() -> String {
     "CmdOrCtrl+Shift+A".to_string()
 }
+fn default_active_result_budget_ratio() -> f64 { 0.60 }
+fn default_context_safety_margin() -> f64 { 0.10 }
+fn default_system_prompt_budget_ratio() -> f64 { 0.20 }
 fn default_toggle_tray() -> String {
     "CmdOrCtrl+Shift+Space".to_string()
 }
@@ -223,6 +226,19 @@ pub struct Settings {
     pub max_summary_chars: usize,
     #[serde(default = "default_max_entity_count")]
     pub max_entity_count: usize,
+    /// Fraction of the context window to allocate for active tool results (0.0–1.0).
+    /// Default: 0.30 (30%). Used by `effective_tool_result_limit` for providers with
+    /// finite context windows (OpenAI-compat, Claude).
+    #[serde(default = "default_tool_result_budget_ratio")]
+    pub tool_result_budget_ratio: f64,
+    #[serde(default = "default_active_result_budget_ratio")]
+    pub active_result_budget_ratio: f64,
+    #[serde(default = "default_context_safety_margin")]
+    pub context_safety_margin: f64,
+    #[serde(default = "default_system_prompt_budget_ratio")]
+    pub system_prompt_budget_ratio: f64,
+    #[serde(default)]
+    pub image_generation_config: ImageGenerationConfig,
     // Composio profiles
     #[serde(default)]
     pub composio_profiles: Vec<ComposioProfile>,
@@ -246,6 +262,16 @@ pub struct Settings {
     /// Custom icons/emojis for each model (key = model slug, value = emoji)
     #[serde(default)]
     pub model_icons: HashMap<String, String>,
+    /// Whether background/proactive summarization is enabled.
+    /// When false, both the idle-timer and proactive (tool-loop) summarizers are skipped.
+    #[serde(default = "default_true")]
+    pub enable_summarization: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ImageGenerationConfig {
+    /// The Gemini model slug used for image generation (e.g. "gemini-2.0-flash-exp-image-generation")
+    pub model: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -456,13 +482,16 @@ impl Default for Settings {
         granular_permissions.insert(ToolCategory::Mcp, true);
 
         Self {
+            active_result_budget_ratio: 0.60,
+            context_safety_margin: 0.10,
+            system_prompt_budget_ratio: 0.20,
             active_llm: LlmProvider::Gemini,
             gemini_config: GeminiConfig::default(),
             openai_compat_config: OpenAiCompatConfig::default(),
             claude_config: ClaudeConfig::default(),
             persona: "You are Hobbes. Be a direct, clear, and radically candid partner. Function as an exocortex, matching the user's communication style. Your default tone is that of a professional friend.".to_string(),
             user_name: None,
-            force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available. When using the fetch tool, you MUST provide markdown links as sources.".to_string()),
+            force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available. When using the fetch tool, you MUST provide markdown links as sources. When you use tools you MUST use the information from the tool, if you don't have it, look up fresh information instead of guessing.".to_string()),
             project_folder: None,
             chat_history_length: 8,
             show_tray_icon: true,
@@ -484,6 +513,8 @@ impl Default for Settings {
             max_active_tool_output_length: default_max_active_tool_output_length(),
             max_summary_chars: default_max_summary_chars(),
             max_entity_count: default_max_entity_count(),
+            tool_result_budget_ratio: default_tool_result_budget_ratio(),
+            image_generation_config: ImageGenerationConfig::default(),
             composio_profiles: Vec::new(),
             hotkeys: HotkeySettings::default(),
             active_composio_profile: None,
@@ -495,6 +526,7 @@ impl Default for Settings {
             theme: Theme::default(),
             tos_accepted_version: None,
             model_icons: HashMap::new(),
+            enable_summarization: true,
         }
     }
 }
@@ -585,6 +617,43 @@ impl Settings {
             LlmProvider::Gemini => self.gemini_config.model_slots.clone(),
             LlmProvider::OpenAiCompat => self.openai_compat_config.model_slots.clone(),
             LlmProvider::Claude => self.claude_config.model_slots.clone(),
+        }
+    }
+
+    /// Resolve the effective context tuning for the current active provider.
+    /// Provider preset overrides → Global settings → Compiled defaults.
+    pub fn effective_context_tuning(&self) -> ResolvedContextTuning {
+        use crate::llm::config::ContextTuningPreset;
+        let preset: &ContextTuningPreset = match self.active_llm {
+            LlmProvider::Gemini => &self.gemini_config.context_tuning,
+            LlmProvider::OpenAiCompat => &self.openai_compat_config.context_tuning,
+            LlmProvider::Claude => &self.claude_config.context_tuning,
+        };
+
+        ResolvedContextTuning {
+            chat_history_length: preset.chat_history_length
+                .unwrap_or(self.chat_history_length),
+            max_tool_output_length: preset.max_tool_output_length
+                .unwrap_or(self.max_tool_output_length),
+            max_active_tool_output_length: preset.max_active_tool_output_length
+                .unwrap_or(self.max_active_tool_output_length),
+            max_summary_chars: preset.max_summary_chars
+                .unwrap_or(self.max_summary_chars),
+            max_entity_count: preset.max_entity_count
+                .unwrap_or(self.max_entity_count),
+            compact_tool_results: preset.compact_tool_results.unwrap_or(
+                matches!(self.active_llm, LlmProvider::OpenAiCompat)
+            ),
+            tool_result_budget_ratio: preset.tool_result_budget_ratio
+                .unwrap_or(self.tool_result_budget_ratio),
+            active_result_budget_ratio: preset.active_result_budget_ratio
+                .unwrap_or(self.active_result_budget_ratio),
+            context_safety_margin: preset.context_safety_margin
+                .unwrap_or(self.context_safety_margin),
+            system_prompt_budget_ratio: preset.system_prompt_budget_ratio
+                .unwrap_or(self.system_prompt_budget_ratio),
+            chars_per_token: preset.chars_per_token
+                .unwrap_or(DEFAULT_CHARS_PER_TOKEN),
         }
     }
 
@@ -842,6 +911,35 @@ fn default_max_entity_count() -> usize {
     50
 }
 
+fn default_tool_result_budget_ratio() -> f64 {
+    0.30
+}
+
+/// Default chars/token ratio. English prose averages ~4 chars per token;
+/// CJK/code-heavy content is closer to ~2. Exposed in settings for tuning.
+pub const DEFAULT_CHARS_PER_TOKEN: f64 = 4.0;
+
+/// Fully-resolved context tuning values (no Options — all guaranteed).
+/// Created by `Settings::effective_context_tuning()` which cascades:
+/// Provider preset → Global settings → Compiled defaults.
+pub struct ResolvedContextTuning {
+    pub chat_history_length: usize,
+    pub max_tool_output_length: usize,
+    pub max_active_tool_output_length: usize,
+    pub max_summary_chars: usize,
+    pub max_entity_count: usize,
+    /// When true, convert tool results from JSON to compact markdown.
+    /// Reduces token usage for models with small context windows.
+    pub compact_tool_results: bool,
+    pub tool_result_budget_ratio: f64,
+    pub active_result_budget_ratio: f64,
+    pub context_safety_margin: f64,
+    pub system_prompt_budget_ratio: f64,
+    /// Characters per token ratio for context budget calculations.
+    /// English prose ≈ 4.0, CJK/code-heavy ≈ 2.0.
+    pub chars_per_token: f64,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1036,6 +1134,7 @@ pub enum SettingsTab {
     Credentials,
     Skills,
     About,
+    ImageGen,
 }
 
 impl Default for SettingsTab {

@@ -86,7 +86,7 @@ pub fn use_summarization_scheduler() {
 
                         let current_message_count = active_session.messages.len();
 
-                        if current_message_count > last_summarized_message_count {
+                        if current_message_count > last_summarized_message_count && settings_guard.enable_summarization {
                             tracing::info!("Inactivity detected. Summarizing conversation.");
                             let processor_guard = processor.read();
                             if let Some(summary) = processor_guard

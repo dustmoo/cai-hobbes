@@ -1,6 +1,6 @@
 [package]
 name = "windows_app"
-version = "0.9.56"
+version = "0.9.58"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -25,6 +25,8 @@ dioxus-logger = { workspace = true }
 futures-util = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
 
 # Internal packages
 serde = { version = "1.0", features = ["derive"] }
@@ -59,9 +61,10 @@ open = "5.3.3"
 tempfile = "3.14"
 dirs = "5.0"
 keyring = "2"
-serde_yml = "0.0.12"
+serde_norway = "0.9.42"
 regex = "1.10"
 sublime_fuzzy = "0.7.0"
+json2markdown = "0.2.1"
 
 # macOS-specific dependencies (needed when checking on macOS dev machines)
 [target.'cfg(target_os = "macos")'.dependencies]

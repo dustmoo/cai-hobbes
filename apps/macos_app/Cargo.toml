@@ -22,6 +22,8 @@ dioxus-logger = { workspace = true }
 futures-util = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
 macos-accessibility-client = { workspace = true }
 dioxus-free-icons = { workspace = true, features = ["feather"] }
 pulldown-cmark = { workspace = true }
@@ -64,6 +66,10 @@ block2 = "0.6"
 core-foundation = "0.10"
 security-framework-sys = "2.11.0"
 objc2-security = { version = "0.3", features = ["SecAccessControl", "SecItem"] }
+serde_norway = "0.9.42"
+regex = "1.10"
+sublime_fuzzy = "0.7.0"
+json2markdown = "0.2.1"
 
 [dev-dependencies]
 wiremock = "0.6.5"

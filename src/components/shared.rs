@@ -40,6 +40,23 @@ impl MessageContent {
             _ => None,
         }
     }
+
+    /// One-line summary of this message content, suitable for context summaries
+    /// and background summarization. Avoids duplicating match arms across call sites.
+    pub fn display_summary(&self) -> String {
+        match self {
+            MessageContent::Text { content, .. } => content.clone(),
+            MessageContent::ToolCall(tc) => format!("[Tool Call: {}]", tc.tool_name),
+            MessageContent::PermissionRequest(tc) => {
+                format!("[Permission Request for Tool: {}]", tc.tool_name)
+            }
+            MessageContent::SkillCall(sc) => format!("[Skill Call: {}]", sc.skill_name),
+            MessageContent::SkillPermissionRequest(sc) => {
+                format!("[Permission Request for Skill: {}]", sc.skill_name)
+            }
+            MessageContent::Error { message } => format!("[Error: {}]", message),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]

@@ -12,7 +12,9 @@ use dioxus::prelude::*;
 use std::rc::Rc;
 
 /// A function that can be called to re-trigger the LLM prompt flow.
-pub type ContinuationCallback = Rc<dyn Fn()>;
+/// Accepts the `session_id` of the originating stream so the continuation
+/// always targets the correct tab, regardless of which tab is currently visible.
+pub type ContinuationCallback = Rc<dyn Fn(String)>;
 
 #[derive(Clone)]
 pub struct ContinuationController {
@@ -41,7 +43,9 @@ impl ContinuationController {
 
     /// Called by the StreamManager when a continuation hint is detected.
     /// Suppressed if a continuation is already in-flight.
-    pub fn trigger_continuation(&mut self) {
+    /// `session_id` is the originating session so the callback targets
+    /// the correct tab even if the user has switched away.
+    pub fn trigger_continuation(&mut self, session_id: String) {
         if *self.in_flight.read() {
             tracing::warn!(
                 "Continuation suppressed: another continuation is already in-flight."
@@ -49,9 +53,9 @@ impl ContinuationController {
             return;
         }
         if let Some(cb) = self.callback.read().as_ref() {
-            tracing::info!("Continuation triggered. Invoking callback.");
+            tracing::info!("Continuation triggered for session '{}'. Invoking callback.", session_id);
             self.in_flight.set(true);
-            (cb)();
+            (cb)(session_id);
         } else {
             tracing::warn!("Continuation triggered, but no callback was registered.");
         }
@@ -62,5 +66,14 @@ impl ContinuationController {
     pub fn clear_in_flight(&mut self) {
         self.in_flight.set(false);
         tracing::debug!("Continuation in_flight guard cleared.");
+    }
+
+    /// Unconditionally reset the in_flight guard.
+    /// Called on session/tab switch to prevent stale guards from blocking new work.
+    pub fn force_reset(&mut self) {
+        if *self.in_flight.read() {
+            tracing::warn!("ContinuationController: force-resetting stale in_flight guard.");
+            self.in_flight.set(false);
+        }
     }
 }

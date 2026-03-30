@@ -7,3 +7,4 @@ pub mod manager;
 pub mod oauth_flow;
 pub mod smithery_client;
 pub mod tool_selection;
+pub mod image_client;

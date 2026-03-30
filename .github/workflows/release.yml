@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos-pro:
+    name: Build & Release macOS (Direct Download)
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install NPM dependencies
+      run: npm ci
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install Dioxus CLI
+      run: cargo install dioxus-cli
+
+    - name: Prepare Keychain & Identities
+      env:
+        MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+        MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      run: |
+        # Create a temporary keychain for the build
+        security create-keychain -p actions build.keychain
+        security default-keychain -s build.keychain
+        security unlock-keychain -p actions build.keychain
+        security set-keychain-settings -t 3600 -u build.keychain
+        
+        # Import the Developer ID certificate
+        echo $MACOS_CERTIFICATE_P12 | base64 --decode > certificate.p12
+        security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+        
+        # Extract the identity name/fingerprint
+        export HOBBES_PRO_SIGNING_ID=$(security find-identity -v build.keychain | grep "Developer ID Application" | head -1 | awk -F '"' '{print $2}')
+        echo "HOBBES_PRO_SIGNING_ID=$HOBBES_PRO_SIGNING_ID" >> $GITHUB_ENV
+
+    - name: Build Pro Version
+      run: ./scripts/build_pro.sh
+
+    - name: Package to DMG
+      run: |
+        app_path="target/dx/Hobbes/release/macos/pro/Hobbes.app"
+        dmg_path="Hobbes.dmg"
+        # Create DMG
+        hdiutil create -volname "Hobbes" -srcfolder "$app_path" -ov -format UDZO "$dmg_path"
+        
+        # Sign the DMG
+        codesign --sign "$HOBBES_PRO_SIGNING_ID" "$dmg_path"
+        echo "DMG_PATH=$dmg_path" >> $GITHUB_ENV
+
+    - name: Notarize DMG
+      env:
+        APPLE_ID: ${{ secrets.APPLE_ID }}
+        APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      run: |
+        # Submit the DMG and wait for notarization to complete
+        xcrun notarytool submit "$DMG_PATH" \
+          --apple-id "$APPLE_ID" \
+          --team-id "$APPLE_TEAM_ID" \
+          --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+          --wait
+        
+        # Staple the ticket directly to the DMG
+        xcrun stapler staple "$DMG_PATH"
+
+    - name: Extract Version
+      id: version
+      run: |
+        VERSION=$(grep '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+        echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+        mv "$DMG_PATH" "Hobbes-macOS-v${VERSION}.dmg"
+
+    - name: Upload macOS Release Asset
+      uses: softprops/action-gh-release@v2
+      with:
+        files: Hobbes-macOS-v${{ steps.version.outputs.VERSION }}.dmg
+
+  build-windows:
+    name: Build & Release Windows
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install NPM dependencies
+      run: npm ci
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+
+    - name: Import Code Signing Certificate
+      env:
+        HOBBES_WIN_CERT_PFX: ${{ secrets.HOBBES_WIN_CERT_PFX }}
+        HOBBES_WIN_CERT_PASSWORD: ${{ secrets.HOBBES_WIN_CERT_PASSWORD }}
+      shell: pwsh
+      run: |
+        if ($env:HOBBES_WIN_CERT_PFX) {
+          $pfxBytes = [Convert]::FromBase64String($env:HOBBES_WIN_CERT_PFX)
+          $pfxPath = Join-Path $env:RUNNER_TEMP "cert.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+          $securePassword = ConvertTo-SecureString $env:HOBBES_WIN_CERT_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.HasPrivateKey } | Select-Object -First 1
+          echo "HOBBES_WIN_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Remove-Item $pfxPath
+        }
+
+    - name: Build Release
+      shell: pwsh
+      run: |
+        $signFlag = if ($env:HOBBES_WIN_CERT_THUMBPRINT) { "-Sign" } else { "" }
+        & .\scripts\build_windows.ps1 -Release $signFlag
+
+    - name: Extract Version
+      id: version
+      shell: pwsh
+      run: |
+        $content = Get-Content Cargo.toml -Raw
+        if ($content -match 'version\s*=\s*"([^"]+)"') {
+          echo "VERSION=$($matches[1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Rename-Item -Path "target\release\hobbes_$($matches[1]).exe" -NewName "Hobbes-Windows-v$($matches[1]).exe"
+        }
+
+    - name: Upload Windows Release Asset
+      uses: softprops/action-gh-release@v2
+      with:
+        files: target/release/Hobbes-Windows-v${{ steps.version.outputs.VERSION }}.exe

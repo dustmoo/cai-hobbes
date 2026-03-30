@@ -94,11 +94,11 @@ pub struct LlmPrompt {
 }
 
 impl LlmPrompt {
-    /// Enforce a context window budget by trimming tools and dropping oldest messages.
+    /// Enforce a context window budget by compressing content and trimming as needed.
     ///
-    /// Phase 1: If system + tools alone exceed the budget, drop the largest unused
-    ///          tool definitions first (tools already called in conversation are preserved).
-    /// Phase 2: Drop oldest messages to fit remaining content within budget.
+    /// Phase 1:   If system + tools alone exceed the budget, drop the largest unused
+    ///            tool definitions first (tools already called in conversation are preserved).
+    /// Phase 2:   Drop oldest messages to fit remaining content within budget (last resort).
     ///
     /// Returns the number of messages dropped. If 0, the prompt fit within budget.
     /// The last `protected_window` messages are never dropped.
@@ -232,7 +232,9 @@ impl LlmPrompt {
             }
         }
 
-        // Phase 2: Existing message trimming
+        // Phase 2: Message trimming (last resort)
+        // (Tool result sizing is now handled dynamically by PromptBuilder::compute_tool_result_budget()
+        // which paginates results based on the remaining token budget).
         let (drop_count, estimated_tokens) = messages_to_drop(self, budget, protected_window);
 
         if drop_count > 0 {

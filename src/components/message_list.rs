@@ -168,7 +168,7 @@ pub fn MessageList(
                                                     // Don't render empty bubbles — thinking data (thought_signature/thought_summary)
                                                     // is absorbed into the adjacent ToolCall card, so an empty text message
                                                     // with only thinking metadata should be hidden.
-                                                    let should_render = !text.is_empty() || is_generating || !message.attachments.is_empty();
+                                                    let should_render = !text.trim().is_empty() || is_generating || !message.attachments.is_empty();
 
                                                     if should_render {
                                                         rsx! {
@@ -350,7 +350,15 @@ pub fn MessageList(
                                                                                                 let mut state = session_state.write();
                                                                                                 if let Some(session) = state.sessions.get_mut(&session_id) {
                                                                                                     if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
-                                                                                                        msg.content = MessageContent::SkillCall(sc);
+                                                                                                        msg.content = MessageContent::SkillCall(sc.clone());
+                                                                                                    }
+                                                                                                    // Persist skill into session.loaded_skills
+                                                                                                    if sc.status == crate::components::shared::SkillCallStatus::Completed {
+                                                                                                        session.loaded_skills.insert(
+                                                                                                            sc.skill_name.clone(),
+                                                                                                            sc.response.clone(),
+                                                                                                        );
+                                                                                                        tracing::info!("Persisted skill '{}' into session.loaded_skills (permission path)", sc.skill_name);
                                                                                                     }
                                                                                                 }
                                                                                                 drop(state);

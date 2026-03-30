@@ -261,6 +261,20 @@ impl McpServerConfig {
             always_allow: Vec::new(),
         }
     }
+
+    /// Minimal stub config for native virtual servers (image gen, etc.).
+    pub fn native_stub(name: String, description: String) -> Self {
+        Self {
+            name,
+            command: None,
+            uri: None,
+            args: None,
+            description,
+            env: HashMap::new(),
+            disabled: false,
+            always_allow: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -320,7 +334,12 @@ pub struct McpServerStatus {
     pub status: ServerStatus,
     pub error_message: Option<String>,
     pub warning_message: Option<String>,
+    /// Total tools available on this server (including on-demand tools not yet loaded)
     pub tools: usize,
+    /// Tools actually injected into the LLM prompt this turn.
+    /// For on-demand servers: only counts tools explicitly loaded via MCP_LOAD_SERVER_TOOLS.
+    /// For normal servers: equals `tools`.
+    pub loaded_tools: usize,
     pub resources: usize,
     pub prompts: usize,
     /// Whether tools from this server are visible to the AI (false = unloaded at runtime)
@@ -335,10 +354,38 @@ pub struct McpServerStatus {
     pub profile: Option<String>,
 }
 
+impl McpServerStatus {
+    /// Create a new status with the given identity and status. All other fields
+    /// default to zero/None/false. Use struct update syntax to override specifics:
+    /// ```ignore
+    /// McpServerStatus { tools: 5, is_loaded: true, ..McpServerStatus::new(name, desc, status) }
+    /// ```
+    pub fn new(name: String, description: String, status: ServerStatus) -> Self {
+        Self {
+            display_name: name.clone(),
+            name,
+            description,
+            status,
+            error_message: None,
+            warning_message: None,
+            tools: 0,
+            loaded_tools: 0,
+            resources: 0,
+            prompts: 0,
+            is_loaded: false,
+            is_on_demand: false,
+            auth_url: None,
+            uri: None,
+            profile: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum McpClientType {
     Service(Arc<RunningService<RoleClient, ()>>),
-    NativeComposio(Arc<ComposioClient>),
+    NativeComposio(Arc<crate::mcp::composio_client::ComposioClient>),
+    NativeImage(Arc<crate::mcp::image_client::ImageClient>),
 }
 
 #[derive(Clone)]
@@ -376,6 +423,8 @@ pub struct McpManager {
     cached_server_statuses: Arc<Mutex<Option<Vec<McpServerStatus>>>>,
     /// Shared SecretManager for non-blocking credential access
     secret_manager: Signal<crate::secret_manager::SecretManager>,
+    /// Shared settings signal for Pattern 30: read image model etc. at call time
+    settings: Signal<crate::settings::Settings>,
     /// Dynamically discovered Composio tools (populated by COMPOSIO_GET_APP_TOOLS).
     /// Included as a virtual server in get_mcp_context() so the prompt builder
     /// sends them to Gemini as real FunctionDeclarations.
@@ -387,6 +436,10 @@ pub struct McpManager {
     /// Dynamically loaded local MCP tools (populated by MCP_LOAD_SERVER_TOOLS).
     /// Mirrors dynamic_composio_tools but for local MCP servers in on-demand mode.
     pub dynamic_local_tools: Arc<Mutex<Vec<rmcp::model::Tool>>>,
+    /// Reverse-lookup map: tool_name → origin server name.
+    /// Populated by MCP_LOAD_SERVER_TOOLS so that use_mcp_tool can resolve the
+    /// virtual "local-on-demand" server back to the real server for execution.
+    pub dynamic_local_tool_sources: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl McpManager {
@@ -394,6 +447,7 @@ impl McpManager {
         config_path: PathBuf,
         permission_manager: Signal<PermissionManager>,
         secret_manager: Signal<crate::secret_manager::SecretManager>,
+        settings: Signal<crate::settings::Settings>,
     ) -> Self {
         Self {
             servers: Arc::new(Mutex::new(HashMap::new())),
@@ -404,9 +458,11 @@ impl McpManager {
             config_path: Some(config_path),
             cached_server_statuses: Arc::new(Mutex::new(None)),
             secret_manager,
+            settings,
             dynamic_composio_tools: Arc::new(Mutex::new(Vec::new())),
             on_demand_servers: Arc::new(Mutex::new(HashSet::new())),
             dynamic_local_tools: Arc::new(Mutex::new(Vec::new())),
+            dynamic_local_tool_sources: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -606,10 +662,14 @@ impl McpManager {
         {
             let servers = self.servers.lock().await;
             let mut dynamic = self.dynamic_local_tools.lock().await;
+            let mut sources = self.dynamic_local_tool_sources.lock().await;
             if let Some(client) = servers.get(server_name) {
                 let server_tool_names: HashSet<String> =
                     client.tools.iter().map(|t| t.name.to_string()).collect();
                 dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
+                for name in &server_tool_names {
+                    sources.remove(name);
+                }
             }
         }
         self.invalidate_status_cache();
@@ -636,10 +696,14 @@ impl McpManager {
         {
             let servers = self.servers.lock().await;
             let mut dynamic = self.dynamic_local_tools.lock().await;
+            let mut sources = self.dynamic_local_tool_sources.lock().await;
             if let Some(client) = servers.get(server_name) {
                 let server_tool_names: HashSet<String> =
                     client.tools.iter().map(|t| t.name.to_string()).collect();
                 dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
+                for name in &server_tool_names {
+                    sources.remove(name);
+                }
             }
         }
         self.invalidate_status_cache();
@@ -950,6 +1014,36 @@ impl McpManager {
                             tracing::error!("{}", error_msg);
                         }
                     }
+                }
+            });
+        }
+
+        // Initialize Native Image Client
+        {
+            let tx_clone = tx.clone();
+
+            spawn(async move {
+                tracing::info!("Initializing virtual Image Generation client");
+
+                let image_client = Arc::new(crate::mcp::image_client::ImageClient::new());
+
+                let tools = image_client.list_tools();
+
+                let config = McpServerConfig::native_stub(
+                    "hobbes-native-image".to_string(),
+                    "Native integration for Image Generation models.".to_string(),
+                );
+
+                let active_client = ActiveMcpClient {
+                    config,
+                    service: McpClientType::NativeImage(image_client),
+                    tools,
+                    warning_message: None,
+                    profile_id: None,
+                };
+
+                if tx_clone.send(active_client).is_err() {
+                    tracing::error!("Failed to send initialized virtual Image client");
                 }
             });
         }
@@ -1592,6 +1686,7 @@ impl McpManager {
 
                     // Add to dynamic cache (deduplicating)
                     let mut dynamic = self.dynamic_local_tools.lock().await;
+                    let mut sources = self.dynamic_local_tool_sources.lock().await;
                     let existing_names: HashSet<String> = dynamic.iter().map(|t| t.name.to_string()).collect();
                     let new_tools: Vec<Tool> = client.tools.iter()
                         .filter(|t| !existing_names.contains(t.name.as_ref()))
@@ -1600,9 +1695,15 @@ impl McpManager {
                     let injected = new_tools.len();
                     dynamic.extend(new_tools);
 
+                    // Record origin server for each tool so use_mcp_tool can
+                    // resolve "local-on-demand" back to the real server.
+                    for name in &tool_names {
+                        sources.insert(name.clone(), target_server.to_string());
+                    }
+
                     tracing::info!(
-                        "MCP_LOAD_SERVER_TOOLS: Loaded {} tools from '{}' (total dynamic: {})",
-                        injected, target_server, dynamic.len()
+                        "MCP_LOAD_SERVER_TOOLS: Loaded {} tools from '{}' (total dynamic: {}, sources: {})",
+                        injected, target_server, dynamic.len(), sources.len()
                     );
 
                     let _ = tx.send(Ok(CallToolResult {
@@ -1631,9 +1732,14 @@ impl McpManager {
                     let server_tool_names: HashSet<String> =
                         client.tools.iter().map(|t| t.name.to_string()).collect();
                     let mut dynamic = self.dynamic_local_tools.lock().await;
+                    let mut sources = self.dynamic_local_tool_sources.lock().await;
                     let before = dynamic.len();
                     dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
                     let removed = before - dynamic.len();
+                    // Clean up source map
+                    for name in &server_tool_names {
+                        sources.remove(name);
+                    }
 
                     tracing::info!(
                         "MCP_UNLOAD_SERVER_TOOLS: Removed {} tools from '{}' (remaining dynamic: {})",
@@ -1656,6 +1762,17 @@ impl McpManager {
             }
         }
 
+        // Resolve "local-on-demand" virtual server → real origin server via source map.
+        // The AI sends server_name="local-on-demand" for dynamically loaded tools because
+        // get_mcp_context() presents them under that virtual name.
+        let resolved_server_name: Option<String> = if server_name == "local-on-demand" {
+            let sources = self.dynamic_local_tool_sources.lock().await;
+            sources.get(tool_name).cloned()
+        } else {
+            None
+        };
+        let effective_server_name = resolved_server_name.as_deref().unwrap_or(server_name);
+
         let servers_guard = self.servers.lock().await;
 
         // Resolve composio-native to the actual profile-suffixed key.
@@ -1664,7 +1781,7 @@ impl McpManager {
         //   "composio-native:SomeName" — config.name (profile NAME suffix, NOT the storage key)
         //   "composio-native:SomeUUID" — storage key (profile ID suffix)
         //   "other-server"             — non-composio server (pass through)
-        let actual_server_name = if is_composio_native(server_name) {
+        let actual_server_name = if is_composio_native(effective_server_name) {
             // Extract the suffix (profile name or ID) if present
             let suffix = server_name.strip_prefix("composio-native:").unwrap_or("");
 
@@ -1722,12 +1839,22 @@ impl McpManager {
                 return Err("Composio client not found and no profile specified".to_string());
             }
         } else {
-            server_name.to_string()
+            effective_server_name.to_string()
         };
 
         let client = match servers_guard.get(&actual_server_name) {
             Some(c) => c,
-            None => return Err(format!("Server not found: {}", server_name)),
+            None => {
+                // If this was a local-on-demand tool that couldn't be resolved,
+                // give a more specific error message.
+                if server_name == "local-on-demand" {
+                    return Err(format!(
+                        "Tool '{}' not found in on-demand cache. The server may need to be loaded first via MCP_LOAD_SERVER_TOOLS.",
+                        tool_name
+                    ));
+                }
+                return Err(format!("Server not found: {}", server_name));
+            }
         };
 
         let permission_check_name = if is_composio_native(server_name) {
@@ -1812,6 +1939,13 @@ impl McpManager {
 
         // Note: composio_meta synthetic server removed - Tool Router handles on-demand tools
 
+        // Pattern 30: Pre-read API key for native clients before the spawn boundary.
+        // This avoids borrowing `self` inside the async move block while still
+        // reading the latest key value at call time (not at launch time).
+        let native_image_api_key = self.secret_manager.peek().get("gemini_api_key").cloned();
+        // Pattern 30: Also read image model fresh from settings at call time
+        let native_image_model = self.settings.peek().image_generation_config.model.clone();
+
         spawn(async move {
             let result = match service {
                 McpClientType::Service(service_arc) => {
@@ -1832,6 +1966,13 @@ impl McpManager {
                     match service_arc.call_tool(request).await {
                         Ok(result) => Ok(result),
                         Err(e) => Err(format!("Failed to use tool: {}", e)),
+                    }
+                }
+                McpClientType::NativeImage(image_client) => {
+                    // Pattern 30: Both model and key are read fresh at call time
+                    match image_client.execute_tool(&tool.name, args.clone(), &native_image_model, native_image_api_key.as_deref()).await {
+                        Ok(result) => Ok(result),
+                        Err(e) => Err(e),
                     }
                 }
                 McpClientType::NativeComposio(composio_client) => {
@@ -2998,6 +3139,7 @@ impl McpManager {
         let auth_required = self.auth_required_servers.lock().await;
         let unloaded = self.unloaded_servers.lock().await;
         let on_demand = self.on_demand_servers.lock().await;
+        let dynamic_tool_sources = self.dynamic_local_tool_sources.lock().await;
 
         // First, process all configs from the JSON file
         for config in configs {
@@ -3006,107 +3148,56 @@ impl McpManager {
             let status = if !is_loaded {
                 // User has manually unloaded/disabled this server
                 McpServerStatus {
-                    name: config.name.clone(),
-                    display_name: config.name.clone(),
-                    description: config.description.clone(),
-                    status: ServerStatus::Disabled,
-                    error_message: None,
-                    tools: 0,
-                    resources: 0,
-                    prompts: 0,
-                    is_loaded: false,
-                    is_on_demand: false,
-                    auth_url: None,
                     uri: config.uri.clone(),
-                    profile: None,
-                    warning_message: None,
+                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Disabled)
                 }
             } else if config.disabled {
                 McpServerStatus {
-                    name: config.name.clone(),
-                    display_name: config.name.clone(),
-                    description: config.description.clone(),
-                    status: ServerStatus::Disabled,
-                    error_message: None,
-                    tools: 0,
-                    resources: 0,
-                    prompts: 0,
-                    is_loaded: false, // Disabled servers are always "unloaded"
-                    is_on_demand: false,
-                    auth_url: None,
                     uri: config.uri.clone(),
-                    profile: None,
-                    warning_message: None,
+                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Disabled)
                 }
             } else if let Some(client) = servers.get(&config.name) {
+                // For on-demand servers, count only tools that have been explicitly
+                // loaded via MCP_LOAD_SERVER_TOOLS into dynamic_local_tools.
+                // For normal (always-on) servers, all tools are always loaded.
+                let total_tools = client.tools.len();
+                let loaded_tools = if is_on_demand {
+                    dynamic_tool_sources
+                        .values()
+                        .filter(|src| src.as_str() == config.name.as_str())
+                        .count()
+                } else {
+                    total_tools
+                };
                 McpServerStatus {
-                    name: config.name.clone(),
-                    display_name: config.name.clone(),
-                    description: config.description.clone(),
-                    status: ServerStatus::Loaded,
-                    error_message: None,
-                    tools: client.tools.len(),
-                    resources: 0, // TODO: Implement resources tracking
-                    prompts: 0,   // TODO: Implement prompts tracking
+                    tools: total_tools,
+                    loaded_tools,
                     is_loaded: true,
                     is_on_demand,
-                    auth_url: None,
                     uri: config.uri.clone(),
-                    profile: None,
                     warning_message: client.warning_message.clone(),
+                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Loaded)
                 }
             } else if let Some(auth_info) = auth_required.get(&config.name) {
                 // Server requires OAuth authentication
                 McpServerStatus {
-                    name: config.name.clone(),
-                    display_name: config.name.clone(),
-                    description: config.description.clone(),
-                    status: ServerStatus::NeedsAuth,
                     error_message: Some(auth_info.error_message.clone()),
-                    tools: 0,
-                    resources: 0,
-                    prompts: 0,
-                    is_loaded: false, // NeedsAuth servers are not loaded
-                    is_on_demand: false,
                     auth_url: auth_info.auth_url.clone(),
                     uri: config.uri.clone(),
-                    profile: None,
-                    warning_message: None,
+                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::NeedsAuth)
                 }
             } else if let Some((_, error)) = failed.get(&config.name) {
                 McpServerStatus {
-                    name: config.name.clone(),
-                    display_name: config.name.clone(),
-                    description: config.description.clone(),
-                    status: ServerStatus::Error,
                     error_message: Some(error.clone()),
-                    tools: 0,
-                    resources: 0,
-                    prompts: 0,
-                    is_loaded: false, // Error servers are not loaded
-                    is_on_demand: false,
-                    auth_url: None,
                     uri: config.uri.clone(),
-                    profile: None,
-                    warning_message: None,
+                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Error)
                 }
             } else {
                 // Server is still initializing or hasn't been attempted yet
                 McpServerStatus {
-                    name: config.name.clone(),
-                    display_name: config.name.clone(),
-                    description: config.description.clone(),
-                    status: ServerStatus::Error,
                     error_message: Some("Initializing...".to_string()),
-                    tools: 0,
-                    resources: 0,
-                    prompts: 0,
-                    is_loaded: false, // Initializing servers are not loaded
-                    is_on_demand: false,
-                    auth_url: None,
                     uri: config.uri.clone(),
-                    profile: None,
-                    warning_message: None,
+                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Error)
                 }
             };
             statuses.push(status);
@@ -3129,57 +3220,43 @@ impl McpManager {
                 let composio_is_loaded = !unloaded.contains(name);
                 statuses.push(McpServerStatus {
                     name: display_name.clone(),
-                    display_name: "Composio (Native)".to_string(),
-                    description: "Native Composio API client".to_string(),
-                    status: ServerStatus::Loaded,
-                    error_message: None,
                     tools: client.tools.len(),
-                    resources: 0,
-                    prompts: 0,
+                    loaded_tools: client.tools.len(),
                     is_loaded: composio_is_loaded,
-                    is_on_demand: false,
-                    auth_url: None,
-                    uri: None,
-                    profile: None,
                     warning_message: client.warning_message.clone(),
+                    ..McpServerStatus::new(display_name.clone(), "Native Composio API client".to_string(), ServerStatus::Loaded)
                 });
             }
             // Check if native Composio failed to initialize
             else if let Some((_, (_, error))) = failed_composio {
                 statuses.push(McpServerStatus {
                     name: display_name.clone(),
-                    display_name: "Composio (Native)".to_string(),
-                    description: "Native Composio API client".to_string(),
-                    status: ServerStatus::Error,
                     error_message: Some(error.clone()),
-                    tools: 0,
-                    resources: 0,
-                    prompts: 0,
-                    is_loaded: false,
-                    is_on_demand: false,
-                    auth_url: None,
-                    uri: None,
-                    profile: None,
-                    warning_message: None,
+                    ..McpServerStatus::new(display_name.clone(), "Native Composio API client".to_string(), ServerStatus::Error)
                 });
             }
             // Not loaded, not failed = API key not configured (NotConfigured state)
             else {
                 statuses.push(McpServerStatus {
                     name: display_name.clone(),
-                    display_name: "Composio (Native)".to_string(),
-                    description: "Connect external tools like Gmail, GitHub, Slack".to_string(),
-                    status: ServerStatus::NotConfigured,
                     error_message: Some("Use the Marketplace to connect your first tool, or add your API key in Settings".to_string()),
-                    tools: 0,
-                    resources: 0,
-                    prompts: 0,
-                    is_loaded: false,
-                    is_on_demand: false,
-                    auth_url: None,
-                    uri: None,
-                    profile: None,
-                    warning_message: None,
+                    ..McpServerStatus::new(display_name.clone(), "Connect external tools like Gmail, GitHub, Slack".to_string(), ServerStatus::NotConfigured)
+                });
+            }
+        }
+
+        // Status reporting for the native Image Generation client
+        {
+            let active_image: Option<(&String, &ActiveMcpClient)> =
+                servers.iter().find(|(k, _)| k.as_str() == "hobbes-native-image");
+
+            if let Some((_name, client)) = active_image {
+                statuses.push(McpServerStatus {
+                    display_name: "Image Generation".to_string(),
+                    tools: client.tools.len(),
+                    loaded_tools: client.tools.len(),
+                    is_loaded: true,
+                    ..McpServerStatus::new("hobbes-native-image".to_string(), client.config.description.clone(), ServerStatus::Loaded)
                 });
             }
         }

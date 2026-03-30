@@ -37,6 +37,7 @@ mod secret_manager;
 #[cfg(not(target_os = "macos"))]
 mod secret_manager_generic;
 mod secret_types;
+mod security;
 #[cfg(not(target_os = "macos"))]
 use secret_manager_generic as secret_manager;
 
@@ -52,14 +53,67 @@ mod tray;
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 use tray_icon::TrayIcon;
 
+/// Debug builds (cargo run): DEBUG+ to log file, INFO+ to stderr.
+/// File goes to ~/Library/Application Support/com.hobbes.app/hobbes.log (daily rotation).
+#[cfg(debug_assertions)]
+fn init_logger() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    let log_dir = dirs::config_dir()
+        .unwrap_or_default()
+        .join("com.hobbes.app");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "hobbes.log");
+    let (non_blocking_file, file_guard) = tracing_appender::non_blocking(file_appender);
+    // SAFETY: Leak the guard to keep the non-blocking writer alive for the process lifetime.
+    // Box::leak is preferred over mem::forget — it communicates "intentional static lifetime"
+    // rather than "we forgot to drop this" and avoids the clippy mem_forget lint.
+    Box::leak(Box::new(file_guard));
+
+    let (non_blocking_stderr, stderr_guard) = tracing_appender::non_blocking(std::io::stderr());
+    Box::leak(Box::new(stderr_guard));
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,hobbes=debug"));
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking_file)
+        .with_ansi(false)
+        .with_filter(env_filter);
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking_stderr)
+        .with_ansi(true)
+        .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
+
+    tracing_subscriber::registry()
+        .with(file_layer)
+        .with(stderr_layer)
+        .init();
+}
+
+/// Release builds: INFO+ to stderr only, no log file created.
+#[cfg(not(debug_assertions))]
+fn init_logger() {
+    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
+    // SAFETY: Leak the guard to keep the non-blocking writer alive for the process lifetime.
+    Box::leak(Box::new(guard));
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(non_blocking)
+        .with_ansi(true)
+        .init();
+}
+
 fn main() {
     // Try to load .env file for developer convenience.
     dotenv().ok();
     tracing::debug!("Attempted to load .env file from the environment.");
-    #[cfg(debug_assertions)]
-    dioxus_logger::init(tracing::Level::DEBUG).expect("failed to init logger");
-    #[cfg(not(debug_assertions))]
-    dioxus_logger::init(tracing::Level::INFO).expect("failed to init logger");
+    // Logger setup — cargo run (debug) vs built app (release):
+    // Debug: DEBUG+ to log file, INFO+ to stderr (avoids iTerm beach-ball)
+    // Release: INFO+ to stderr only, no file created
+    init_logger();
 
     // Load session state to get window size
     let initial_state = session::SessionState::load().unwrap_or_default();
@@ -717,6 +771,7 @@ fn app() -> Element {
             get_mcp_config_path(),
             permission_manager,
             secret_manager,
+            settings,
         ))
     });
     let mcp_context = use_context_provider(|| {
@@ -1383,7 +1438,7 @@ fn app() -> Element {
                             }
                             // Main content area
                             div {
-                                class: "flex flex-row flex-1 min-h-0", // This will contain the sidebars and chat
+                                class: "flex flex-row flex-1 min-h-0 overflow-hidden", // This will contain the sidebars and chat
                                 // The onkeydown handler has been removed to allow native hotkeys (copy, paste, etc.) to function correctly.
                                 // The global hotkey for toggling visibility is no longer required.
                                 // When the user releases the mouse, save the last known size.
@@ -1392,7 +1447,7 @@ fn app() -> Element {
                             // Session Manager Sidebar
                             if *show_session_manager.read() {
                                 div {
-                                    class: "flex flex-row h-full",
+                                    class: "flex flex-row h-full shrink-0",
                                     // Session Manager Panel
                                     div {
                                         id: "session-manager-panel",
@@ -1414,7 +1469,7 @@ fn app() -> Element {
                             // Settings Panel Sidebar
                             if *show_settings_panel.read() {
                                 div {
-                                    class: "flex flex-row h-full",
+                                    class: "flex flex-row h-full shrink-0",
                                     // Settings Panel
                                     div {
                                         id: "settings-panel",
@@ -1437,7 +1492,7 @@ fn app() -> Element {
                             // MCP Manager Sidebar
                             if *show_mcp_manager.read() {
                                 div {
-                                    class: "flex flex-row h-full",
+                                    class: "flex flex-row h-full shrink-0",
                                     // MCP Manager Panel
                                     div {
                                         id: "mcp-manager-panel",
@@ -1493,7 +1548,7 @@ fn app() -> Element {
 
                             // Main Chat Window
                             div {
-                                class: "flex-1 flex flex-col min-h-0 border-t border-primary-700/50",
+                                class: "flex-1 flex flex-col min-h-0 min-w-0 border-t border-primary-700/50",
                                 {
                                     let tabs = open_tabs.read();
                                     let state = session_state.read();

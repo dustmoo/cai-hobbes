@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 
@@ -113,6 +113,11 @@ pub struct Session {
     /// Acts as the live authority for tool-calling/MCP context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composio_profile: Option<String>,
+    /// Skills actively loaded into this session's context.
+    /// Maps skill_name → CapabilityContextPayload JSON (the response from execute_skill).
+    /// Skills persist here until explicitly unloaded via /unload.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub loaded_skills: HashMap<String, String>,
 }
 
 impl Session {
@@ -188,6 +193,19 @@ impl Session {
     }
 }
 
+/// A large tool result that has been split into pages for small context windows.
+/// Stored ephemerally in SessionState — not persisted to disk.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PagedResult {
+    /// Remaining pages (front-pop for O(1) delivery).
+    pub pages: VecDeque<String>,
+    pub tool_name: String,
+}
+
+/// Session-scoped store for paginated tool results.
+/// Keys are tool_call_id (execution_id). Cleared on session switch.
+pub type PageQueue = HashMap<String, PagedResult>;
+
 /// Schema version for SessionState persistence.
 /// Bump this when adding new migrations to `load()`.
 /// Existing files without this field default to 0 via `#[serde(default)]`.
@@ -214,6 +232,13 @@ pub struct SessionState {
     /// When true, save() will no-op to protect backup data after load failure
     #[serde(skip)]
     pub save_disabled: bool,
+    /// Ephemeral store for paginated tool results — intentionally NOT persisted.
+    /// Pages are keyed by `tool_call_id` and become stale on app restart because
+    /// the model has no memory of which call IDs it was iterating.  Worst-case
+    /// memory is ~2 MB (50 entries × 10 pages × 4 KB each) and is bounded by
+    /// `MAX_PAGE_QUEUE_SIZE` in `handle_page_result`.
+    #[serde(skip)]
+    pub page_queue: PageQueue,
 }
 
 fn get_sessions_path() -> Option<PathBuf> {
@@ -226,10 +251,125 @@ fn get_sessions_path() -> Option<PathBuf> {
 }
 
 impl SessionState {
-    #[allow(dead_code)]
+    /// Fetch the next page of a paginated tool result.
+    /// Returns `(page_content, tool_name, remaining)` or `None` if the
+    /// tool_call_id is not found. Automatically cleans up the entry when
+    /// all pages have been consumed.
+    pub fn fetch_next_page(&mut self, tool_call_id: &str) -> Option<(String, String, usize)> {
+        let entry = self.page_queue.get_mut(tool_call_id)?;
+        if entry.pages.is_empty() {
+            self.page_queue.remove(tool_call_id);
+            return None;
+        }
+        let page_content = entry.pages.pop_front()?; // O(1) with VecDeque
+        let remaining = entry.pages.len();
+        let tool_name = entry.tool_name.clone();
+        if remaining == 0 {
+            self.page_queue.remove(tool_call_id);
+        }
+        Some((page_content, tool_name, remaining))
+    }
+
+    /// Handle a HOBBES_PAGE_RESULT tool call. Extracts `tool_call_id` from
+    /// `args_json`, fetches the next page, and returns `(status, response_string)`.
+    /// Single authority for all HOBBES_PAGE_RESULT dispatch sites.
+    pub fn handle_page_result(
+        &mut self,
+        args_json: &serde_json::Value,
+        tool_call_id_arg: &str,
+    ) -> (crate::components::shared::ToolCallStatus, String) {
+        let tool_call_id = if tool_call_id_arg.is_empty() {
+            args_json
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            tool_call_id_arg.to_string()
+        };
+
+        if tool_call_id.is_empty() {
+            return (
+                crate::components::shared::ToolCallStatus::Error,
+                "Missing 'tool_call_id' argument".to_string(),
+            );
+        }
+
+        match self.fetch_next_page(&tool_call_id) {
+            Some((content, tool_name, remaining)) => {
+                let footer = if remaining > 0 {
+                    format!(
+                        "\n\n[{} more page(s) remaining. Call HOBBES_PAGE_RESULT with tool_call_id=\"{}\" to see the next page.]",
+                        remaining, tool_call_id
+                    )
+                } else {
+                    "\n\n[All pages delivered.]".to_string()
+                };
+                tracing::info!(
+                    "HOBBES_PAGE_RESULT: Delivered page for '{}' (tool_call_id={}, remaining={})",
+                    tool_name, tool_call_id, remaining
+                );
+                (
+                    crate::components::shared::ToolCallStatus::Completed,
+                    format!("{}{}", content, footer),
+                )
+            }
+            None => (
+                crate::components::shared::ToolCallStatus::Error,
+                format!(
+                    "No paginated results found for tool_call_id '{}'. The pages may have expired.",
+                    tool_call_id
+                ),
+            ),
+        }
+    }
+
+    /// Store newly-generated paginated pages into the queue.
+    /// Call this after `PromptBuilder::build_prompt` in a separate write scope.
+    ///
+    /// **Critical**: Skips entries that already exist in the queue.
+    /// Each continuation turn re-runs `build_prompt()`, which re-generates
+    /// pages from the same tool results. Without this guard, `HashMap::insert`
+    /// would overwrite partially-consumed page state, causing the model to
+    /// always see page 1 again instead of the next page.
+    pub fn store_pages(&mut self, pages: Vec<(String, PagedResult)>) {
+        let mut inserted_ids = std::collections::HashSet::new();
+        
+        for (id, paged) in pages {
+            if self.page_queue.contains_key(&id) {
+                tracing::debug!(
+                    "Skipping page queue entry (already exists): id={} (remaining={})",
+                    id,
+                    self.page_queue.get(&id).map_or(0, |p| p.pages.len())
+                );
+            } else {
+                tracing::debug!("Storing page queue entry: id={}", id);
+                self.page_queue.insert(id.clone(), paged);
+                inserted_ids.insert(id);
+            }
+        }
+
+        // Keep memory bounded: cap `page_queue` size to 50 active paginated tools per session.
+        const MAX_PAGE_QUEUE_SIZE: usize = 50;
+        if self.page_queue.len() > MAX_PAGE_QUEUE_SIZE {
+            let excess = self.page_queue.len() - MAX_PAGE_QUEUE_SIZE;
+            
+            // Collect oldest/random keys EXCEPT those we just inserted
+            let keys_to_remove: Vec<String> = self.page_queue.keys()
+                .filter(|k| !inserted_ids.contains(*k))
+                .take(excess)
+                .cloned()
+                .collect();
+                
+            for key in keys_to_remove {
+                self.page_queue.remove(&key);
+                tracing::debug!("Pruned expired page queue entry to save memory: {}", key);
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub fn new() -> Self {
-        // This should be lightweight and not perform I/O.
-        // Loading will be handled asynchronously in the UI.
         Self::default()
     }
 
@@ -538,6 +678,7 @@ impl SessionState {
             accumulated_turns: 0,
             memory_optimization_summary: None,
             composio_profile: initial_profile,
+            loaded_skills: HashMap::new(),
         };
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id.clone();
@@ -673,7 +814,9 @@ impl SessionState {
             return;
         }
 
-        // Serialize on the current thread — borrows state, no clone needed
+        // Serialize on the calling thread — borrows state, no clone needed.
+        // This is the critical optimization: serde serialization is fast (CPU-bound),
+        // but cloning all sessions + messages is expensive and was causing beach-balls.
         let bytes = match serde_json::to_vec_pretty(state) {
             Ok(b) => b,
             Err(e) => {
@@ -687,12 +830,27 @@ impl SessionState {
         };
 
         // Move only the byte buffer to the background thread for file I/O
-        crate::async_persist::persist_bytes_async(
-            bytes,
-            Self::save_bytes,
-            "session state",
-            error_signal,
-        );
+        dioxus::prelude::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                Self::save_bytes(bytes)
+            })
+            .await;
+
+            // Back on the Dioxus runtime — safe to touch Signals
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!("Failed to save session state: {}", e);
+                    if let Some(mut sig) = error_signal {
+                        use dioxus::prelude::Writable;
+                        *sig.write() = Some(format!("Failed to save session state: {}", e));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("spawn_blocking panicked during save: {}", e);
+                }
+            }
+        });
     }
 
     /// Convenience: save the session state from a Dioxus Signal after releasing a write guard.
@@ -784,6 +942,7 @@ impl Default for SessionState {
             lifetime_cost: 0.0,
             lifetime_tokens: 0,
             save_disabled: false,
+            page_queue: PageQueue::new(),
         }
     }
 }
@@ -1298,5 +1457,60 @@ mod tests {
         let state: SessionState = serde_json::from_str(old_json).expect("deserialize old format");
         assert_eq!(state.lifetime_cost, 0.0);
         assert_eq!(state.lifetime_tokens, 0);
+    }
+
+    /// Test: store_pages does NOT overwrite partially-consumed entries.
+    /// This is a critical correctness invariant — each continuation turn re-runs
+    /// `build_prompt()`, which re-generates pages from the same tool results.
+    /// Without the idempotency guard, `HashMap::insert` would reset already-consumed
+    /// page state, causing the model to always see page 1 again.
+    #[test]
+    fn test_store_pages_idempotency() {
+        let mut state = SessionState::default();
+
+        // Store initial pages: ID "page-A" with 3 pages
+        let initial_pages = vec![
+            ("page-A".to_string(), PagedResult {
+                pages: VecDeque::from(vec![
+                    "Page 1 content".to_string(),
+                    "Page 2 content".to_string(),
+                    "Page 3 content".to_string(),
+                ]),
+                tool_name: "test_tool".to_string(),
+            }),
+        ];
+        state.store_pages(initial_pages);
+        assert_eq!(state.page_queue.get("page-A").unwrap().pages.len(), 3);
+
+        // Consume one page via fetch_next_page
+        let (content, name, remaining) = state.fetch_next_page("page-A").unwrap();
+        assert_eq!(content, "Page 1 content");
+        assert_eq!(name, "test_tool");
+        assert_eq!(remaining, 2);
+
+        // Simulate continuation turn: store_pages called again with same ID but fresh 3 pages
+        let re_generated = vec![
+            ("page-A".to_string(), PagedResult {
+                pages: VecDeque::from(vec![
+                    "Page 1 content".to_string(),
+                    "Page 2 content".to_string(),
+                    "Page 3 content".to_string(),
+                ]),
+                tool_name: "test_tool".to_string(),
+            }),
+        ];
+        state.store_pages(re_generated);
+
+        // CRITICAL: the queue should still have 2 pages (not reset to 3)
+        assert_eq!(
+            state.page_queue.get("page-A").unwrap().pages.len(),
+            2,
+            "store_pages must NOT overwrite partially-consumed entries"
+        );
+
+        // Verify we get page 2 next (not page 1 again)
+        let (content2, _, remaining2) = state.fetch_next_page("page-A").unwrap();
+        assert_eq!(content2, "Page 2 content");
+        assert_eq!(remaining2, 1);
     }
 }

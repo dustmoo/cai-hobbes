@@ -18,7 +18,6 @@ struct OaiModelEntry {
 
 /// Discovered model with optional context length
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Architectural — used by vLLM context-length-aware model discovery
 pub struct DiscoveredModel {
     pub id: String,
     pub context_length: Option<usize>,
@@ -120,7 +119,6 @@ pub async fn fetch_openai_compat_models(
 
 /// Fetch models with context length information.
 /// Returns DiscoveredModel structs that include max_model_len when available.
-#[allow(dead_code)] // Architectural — context-length-aware model discovery for vLLM
 pub async fn fetch_openai_compat_models_with_context(
     endpoint: &str,
     api_key: Option<&str>,

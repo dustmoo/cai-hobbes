@@ -357,7 +357,7 @@ use crate::llm::convert::StreamEvent;
 
 impl LlmFormatConverter for GeminiConnector {
     fn to_native_request(&self, prompt: &LlmPrompt, _streaming: bool) -> serde_json::Value {
-        let mut contents = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
 
         for msg in &prompt.messages {
             let mut parts = Vec::new();
@@ -425,13 +425,25 @@ impl LlmFormatConverter for GeminiConnector {
                 }
             }
 
+            let role_str = match msg.role {
+                crate::llm::ChatRole::User => "user".to_string(),
+                crate::llm::ChatRole::Assistant => "model".to_string(),
+                crate::llm::ChatRole::Tool => "user".to_string(), // Gemini uses 'user' role for tool results
+                crate::llm::ChatRole::System => "user".to_string(), // Should be handled by system_instruction
+            };
+
+            // Merge consecutive same-role Content objects (Gemini API requirement).
+            // The API strictly requires alternating user/model roles; consecutive
+            // same-role entries cause 400 errors. This restores the v0.9.48
+            // `add_to_prompt` closure behavior that was lost in the abstraction refactor.
+            if let Some(last) = contents.last_mut() {
+                if last.role == role_str {
+                    last.parts.extend(parts);
+                    continue;
+                }
+            }
             contents.push(Content {
-                role: match msg.role {
-                    crate::llm::ChatRole::User => "user".to_string(),
-                    crate::llm::ChatRole::Assistant => "model".to_string(),
-                    crate::llm::ChatRole::Tool => "user".to_string(), // Gemini uses 'user' role for tool results
-                    crate::llm::ChatRole::System => "user".to_string(), // Should be handled by system_instruction
-                },
+                role: role_str,
                 parts,
             });
         }
@@ -980,7 +992,7 @@ impl GeminiConnector {
 
         if let Some(candidate) = response_json.candidates.first() {
             if let Some(part) = candidate.content.parts.first() {
-                tracing::debug!("Raw LLM tool selection response: {}", part.text);
+                tracing::trace!("Raw LLM tool selection response: {}", part.text);
 
                 match parse_selection_response(&part.text) {
                     Ok(selection) => {
@@ -1650,7 +1662,7 @@ Recent Messages:
         if let Some(candidate) = response_json.candidates.first() {
             if let Some(part) = candidate.content.parts.first() {
                 // The model's response is expected to be a JSON string.
-                tracing::debug!("Raw LLM summary response: {}", part.text);
+                tracing::trace!("Raw LLM summary response: {}", part.text);
 
                 // Attempt to parse the text directly as JSON.
                 if let Ok(json_value) = serde_json::from_str(&part.text) {
@@ -1792,6 +1804,7 @@ mod tests {
             thinking_level: "high".to_string(),
             thinking_budget: Some(1024),
             model_slots: vec![],
+            context_tuning: Default::default(),
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -1877,6 +1890,7 @@ mod tests {
             thinking_level: "high".to_string(),
             thinking_budget: None,
             model_slots: vec![],
+            context_tuning: Default::default(),
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -1943,6 +1957,7 @@ mod tests {
             thinking_level: "high".to_string(),
             thinking_budget: None,
             model_slots: vec![],
+            context_tuning: Default::default(),
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -2013,6 +2028,7 @@ mod tests {
             thinking_level: "high".to_string(),
             thinking_budget: None,
             model_slots: vec![],
+            context_tuning: Default::default(),
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -2281,6 +2297,7 @@ mod tests {
             thinking_level: "high".to_string(),
             thinking_budget: None,
             model_slots: vec![],
+            context_tuning: Default::default(),
         };
         let connector = GeminiConnector::new(config);
         let url =
