@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -105,67 +105,68 @@ jobs:
     - name: Build Release (CI Mode)
       run: ./scripts/build_release.sh
 
-  # Windows release build (produces distributable binary)
-  build-windows-release:
-    name: Build Release (Windows)
-    runs-on: windows-latest
-    needs: build-check
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feat/')
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        toolchain: stable
-
-    - name: Cache dependencies
-      uses: Swatinem/rust-cache@v2
-
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
-
-    - name: Install NPM dependencies
-      run: npm ci
-
-    - name: Import Code Signing Certificate
-      if: env.HOBBES_WIN_CERT_PFX != ''
-      env:
-        HOBBES_WIN_CERT_PFX: ${{ secrets.HOBBES_WIN_CERT_PFX }}
-        HOBBES_WIN_CERT_PASSWORD: ${{ secrets.HOBBES_WIN_CERT_PASSWORD }}
-      shell: pwsh
-      run: |
-        $pfxBytes = [Convert]::FromBase64String($env:HOBBES_WIN_CERT_PFX)
-        $pfxPath = Join-Path $env:RUNNER_TEMP "cert.pfx"
-        [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
-        $securePassword = ConvertTo-SecureString $env:HOBBES_WIN_CERT_PASSWORD -AsPlainText -Force
-        Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
-        # Export thumbprint for signing step
-        $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.HasPrivateKey } | Select-Object -First 1
-        echo "HOBBES_WIN_CERT_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
-        Remove-Item $pfxPath
-
-    - name: Build Release
-      shell: pwsh
-      run: |
-        $signFlag = if ($env:HOBBES_WIN_CERT_THUMBPRINT) { "-Sign" } else { "" }
-        & .\scripts\build_windows.ps1 -Release $signFlag
-
-    - name: Extract Version
-      id: version
-      shell: pwsh
-      run: |
-        $content = Get-Content Cargo.toml -Raw
-        if ($content -match 'version\s*=\s*"([^"]+)"') {
-          echo "VERSION=$($matches[1])" >> $env:GITHUB_OUTPUT
-        }
-
-    - name: Upload Binary Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: hobbes-windows-${{ steps.version.outputs.VERSION }}
-        path: target/release/hobbes_${{ steps.version.outputs.VERSION }}.exe
-        retention-days: 30
+  # ── DISABLED: Azure certificate validation stalled (2026-04-04) ──
+  # Re-enable once Azure Trusted Signing identity verification completes.
+  # build-windows-release:
+  #   name: Build Release (Windows)
+  #   runs-on: windows-latest
+  #   needs: build-check
+  #   if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feat/')
+  #
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #
+  #   - name: Install Rust
+  #     uses: dtolnay/rust-toolchain@stable
+  #     with:
+  #       toolchain: stable
+  #
+  #   - name: Cache dependencies
+  #     uses: Swatinem/rust-cache@v2
+  #
+  #   - name: Setup Node.js
+  #     uses: actions/setup-node@v4
+  #     with:
+  #       node-version: '20'
+  #
+  #   - name: Install NPM dependencies
+  #     run: npm ci
+  #
+  #   - name: Import Code Signing Certificate
+  #     if: env.HOBBES_WIN_CERT_PFX != ''
+  #     env:
+  #       HOBBES_WIN_CERT_PFX: ${{ secrets.HOBBES_WIN_CERT_PFX }}
+  #       HOBBES_WIN_CERT_PASSWORD: ${{ secrets.HOBBES_WIN_CERT_PASSWORD }}
+  #     shell: pwsh
+  #     run: |
+  #       $pfxBytes = [Convert]::FromBase64String($env:HOBBES_WIN_CERT_PFX)
+  #       $pfxPath = Join-Path $env:RUNNER_TEMP "cert.pfx"
+  #       [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+  #       $securePassword = ConvertTo-SecureString $env:HOBBES_WIN_CERT_PASSWORD -AsPlainText -Force
+  #       Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+  #       # Export thumbprint for signing step
+  #       $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.HasPrivateKey } | Select-Object -First 1
+  #       echo "HOBBES_WIN_CERT_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+  #       Remove-Item $pfxPath
+  #
+  #   - name: Build Release
+  #     shell: pwsh
+  #     run: |
+  #       $signFlag = if ($env:HOBBES_WIN_CERT_THUMBPRINT) { "-Sign" } else { "" }
+  #       & .\scripts\build_windows.ps1 -Release $signFlag
+  #
+  #   - name: Extract Version
+  #     id: version
+  #     shell: pwsh
+  #     run: |
+  #       $content = Get-Content Cargo.toml -Raw
+  #       if ($content -match 'version\s*=\s*"([^"]+)"') {
+  #         echo "VERSION=$($matches[1])" >> $env:GITHUB_OUTPUT
+  #       }
+  #
+  #   - name: Upload Binary Artifact
+  #     uses: actions/upload-artifact@v4
+  #     with:
+  #       name: hobbes-windows-${{ steps.version.outputs.VERSION }}
+  #       path: target/release/hobbes_${{ steps.version.outputs.VERSION }}.exe
+  #       retention-days: 30

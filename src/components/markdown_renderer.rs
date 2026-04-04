@@ -104,6 +104,9 @@ enum RenderNode {
         children: Vec<RenderNode>,
         comment: Comment,
     },
+    HighlightWrapped {
+        children: Vec<RenderNode>,
+    },
 }
 
 fn get_node_text(node: &RenderNode) -> String {
@@ -117,7 +120,8 @@ fn get_node_text(node: &RenderNode) -> String {
         RenderNode::Emphasis(children)
         | RenderNode::Strong(children)
         | RenderNode::Strikethrough(children)
-        | RenderNode::CommentWrapped { children, .. } => {
+        | RenderNode::CommentWrapped { children, .. }
+        | RenderNode::HighlightWrapped { children } => {
             children.iter().map(get_node_text).collect()
         }
     }
@@ -230,6 +234,21 @@ fn split_node(node: RenderNode, at: usize) -> (Option<RenderNode>, Option<Render
                 },
             )
         }
+        RenderNode::HighlightWrapped { children } => {
+            let (left, right) = split_children(children, at);
+            (
+                if left.is_empty() {
+                    None
+                } else {
+                    Some(RenderNode::HighlightWrapped { children: left })
+                },
+                if right.is_empty() {
+                    None
+                } else {
+                    Some(RenderNode::HighlightWrapped { children: right })
+                },
+            )
+        }
     }
 }
 
@@ -260,7 +279,11 @@ fn split_children(children: Vec<RenderNode>, at: usize) -> (Vec<RenderNode>, Vec
     (left, right)
 }
 
-fn process_inlines(inlines: Vec<MdInline>, comments: Option<&Vec<Comment>>) -> Vec<RenderNode> {
+fn process_inlines(
+    inlines: Vec<MdInline>,
+    comments: Option<&Vec<Comment>>,
+    pending_highlight: Option<&String>,
+) -> Vec<RenderNode> {
     fn convert(inline: MdInline) -> RenderNode {
         match inline {
             MdInline::Text(s) => RenderNode::Text(s),
@@ -277,6 +300,24 @@ fn process_inlines(inlines: Vec<MdInline>, comments: Option<&Vec<Comment>>) -> V
     }
 
     let mut nodes: Vec<RenderNode> = inlines.into_iter().map(convert).collect();
+
+    if let Some(h) = pending_highlight {
+        if !h.is_empty() {
+            let full_text: String = nodes.iter().map(get_node_text).collect();
+            if let Some(start_idx) = full_text.find(h) {
+                let end_idx = start_idx + h.len();
+                let (before, mid_after) = split_children(nodes, start_idx);
+                let (mid, after) = split_children(mid_after, end_idx - start_idx);
+
+                let mut next_nodes = before;
+                if !mid.is_empty() {
+                    next_nodes.push(RenderNode::HighlightWrapped { children: mid });
+                }
+                next_nodes.extend(after);
+                nodes = next_nodes;
+            }
+        }
+    }
 
     if let Some(comments) = comments {
         for comment in comments {
@@ -317,10 +358,7 @@ fn render_node(
     comments: Option<&Vec<Comment>>,
     pending_highlight: Option<&String>,
 ) -> Element {
-    let text = get_node_text(&node);
-    let is_highlighted = pending_highlight.is_some_and(|h| !h.is_empty() && text.contains(h));
-
-    let base_content = match node {
+    match node {
         RenderNode::Text(s) => rsx! { "{s}" },
         RenderNode::Code(s) => rsx! { code { "{s}" } },
         RenderNode::SoftBreak => rsx! { " " },
@@ -407,14 +445,20 @@ fn render_node(
                 }
             }
         }
-    };
-
-    if is_highlighted {
-        rsx! {
-            span { class: "bg-yellow-200 dark:bg-yellow-900/40 text-fg", {base_content} }
+        RenderNode::HighlightWrapped { children } => {
+            let rendered_children: Vec<Element> = children
+                .into_iter()
+                .map(|child| render_node(child, comments, pending_highlight))
+                .collect();
+            rsx! {
+                span {
+                    class: "bg-yellow-200 dark:bg-yellow-900/40 text-fg",
+                    for child_el in rendered_children {
+                        {child_el}
+                    }
+                }
+            }
         }
-    } else {
-        base_content
     }
 }
 
@@ -425,7 +469,7 @@ fn render_block(
 ) -> Element {
     match block {
         MdBlock::Header { level, content } => {
-            let nodes = process_inlines(content, comments);
+            let nodes = process_inlines(content, comments, pending_highlight);
             let inlines = nodes
                 .into_iter()
                 .map(|i| render_node(i, comments, pending_highlight));
@@ -440,7 +484,7 @@ fn render_block(
         }
         MdBlock::Paragraph(inlines) => rsx! {
             p {
-                for node in process_inlines(inlines, comments) {
+                for node in process_inlines(inlines, comments, pending_highlight) {
                     {render_node(node, comments, pending_highlight)}
                 }
             }
@@ -492,7 +536,7 @@ fn render_block(
                                 for (idx, header_cell) in headers.into_iter().enumerate() {
                                     th {
                                         class: "{align_class(idx, &alignments)} font-semibold",
-                                        for node in process_inlines(header_cell, comments) {
+                                        for node in process_inlines(header_cell, comments, pending_highlight) {
                                             {render_node(node, comments, pending_highlight)}
                                         }
                                     }
@@ -506,7 +550,7 @@ fn render_block(
                                     for (idx, cell) in row.into_iter().enumerate() {
                                         td {
                                             class: "{align_class(idx, &alignments)}",
-                                            for node in process_inlines(cell, comments) {
+                                            for node in process_inlines(cell, comments, pending_highlight) {
                                                 {render_node(node, comments, pending_highlight)}
                                             }
                                         }

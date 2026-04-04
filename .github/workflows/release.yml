@@ -94,64 +94,88 @@ jobs:
     - name: Upload macOS Release Asset
       uses: softprops/action-gh-release@v2
       with:
+        body_path: RELEASE_NOTES.md
         files: Hobbes-macOS-v${{ steps.version.outputs.VERSION }}.dmg
 
-  build-windows:
-    name: Build & Release Windows
-    runs-on: windows-latest
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
-
-    - name: Install NPM dependencies
-      run: npm ci
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        toolchain: stable
-
-    - name: Cache cargo
-      uses: Swatinem/rust-cache@v2
-
-    - name: Import Code Signing Certificate
-      env:
-        HOBBES_WIN_CERT_PFX: ${{ secrets.HOBBES_WIN_CERT_PFX }}
-        HOBBES_WIN_CERT_PASSWORD: ${{ secrets.HOBBES_WIN_CERT_PASSWORD }}
-      shell: pwsh
-      run: |
-        if ($env:HOBBES_WIN_CERT_PFX) {
-          $pfxBytes = [Convert]::FromBase64String($env:HOBBES_WIN_CERT_PFX)
-          $pfxPath = Join-Path $env:RUNNER_TEMP "cert.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
-          $securePassword = ConvertTo-SecureString $env:HOBBES_WIN_CERT_PASSWORD -AsPlainText -Force
-          Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
-          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.HasPrivateKey } | Select-Object -First 1
-          echo "HOBBES_WIN_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Remove-Item $pfxPath
-        }
-
-    - name: Build Release
-      shell: pwsh
-      run: |
-        $signFlag = if ($env:HOBBES_WIN_CERT_THUMBPRINT) { "-Sign" } else { "" }
-        & .\scripts\build_windows.ps1 -Release $signFlag
-
-    - name: Extract Version
-      id: version
-      shell: pwsh
-      run: |
-        $content = Get-Content Cargo.toml -Raw
-        if ($content -match 'version\s*=\s*"([^"]+)"') {
-          echo "VERSION=$($matches[1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Rename-Item -Path "target\release\hobbes_$($matches[1]).exe" -NewName "Hobbes-Windows-v$($matches[1]).exe"
-        }
-
-    - name: Upload Windows Release Asset
-      uses: softprops/action-gh-release@v2
-      with:
-        files: target/release/Hobbes-Windows-v${{ steps.version.outputs.VERSION }}.exe
+  # ── DISABLED: Azure certificate validation stalled (2026-04-04) ──
+  # Re-enable once Azure Trusted Signing identity verification completes.
+  # build-windows:
+  #   name: Build & Release Windows
+  #   runs-on: windows-latest
+  #   permissions:
+  #     contents: write
+  #     id-token: write # Required for Azure OIDC authentication
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #
+  #   - name: Setup Node.js
+  #     uses: actions/setup-node@v4
+  #     with:
+  #       node-version: '20'
+  #
+  #   - name: Install NPM dependencies
+  #     run: npm ci
+  #
+  #   - name: Install Rust
+  #     uses: dtolnay/rust-toolchain@stable
+  #     with:
+  #       toolchain: stable
+  #
+  #   - name: Cache cargo
+  #     uses: Swatinem/rust-cache@v2
+  #
+  #   - name: Build Release Binary
+  #     shell: pwsh
+  #     run: |
+  #       & .\scripts\build_windows.ps1 -Release
+  #
+  #   - name: Extract Version
+  #     id: version
+  #     shell: pwsh
+  #     run: |
+  #       $content = Get-Content Cargo.toml -Raw
+  #       if ($content -match 'version\s*=\s*"([^"]+)"') {
+  #         echo "VERSION=$($matches[1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+  #         Rename-Item -Path "target\release\hobbes_$($matches[1]).exe" -NewName "Hobbes-Windows-v$($matches[1]).exe"
+  #       }
+  #
+  #   - name: Azure OIDC Login
+  #     uses: azure/login@v2
+  #     with:
+  #       client-id: ${{ secrets.AZURE_CLIENT_ID }}
+  #       tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+  #       subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  #
+  #   - name: Sign Main Binary
+  #     uses: azure/trusted-sign-action@v0.5.0
+  #     with:
+  #       endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+  #       signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT_NAME }}
+  #       certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+  #       files-folder: target\release
+  #       files-folder-filter: exe
+  #       timestamp-rfc3161: http://timestamp.acs.microsoft.com
+  #
+  #   - name: Build Installer
+  #     shell: pwsh
+  #     run: |
+  #       # Use Inno Setup to build the installer with the signed binary
+  #       iscc scripts\hobbes_installer.iss /DVersion=${{ steps.version.outputs.VERSION }}
+  #       # It drops the file in scripts\Output\hobbes_VERSION_setup.exe
+  #
+  #   - name: Sign Installer
+  #     uses: azure/trusted-sign-action@v0.5.0
+  #     with:
+  #       endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+  #       signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT_NAME }}
+  #       certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+  #       files-folder: scripts\Output
+  #       files-folder-filter: exe
+  #       timestamp-rfc3161: http://timestamp.acs.microsoft.com
+  #
+  #   - name: Upload Windows Release Assets
+  #     uses: softprops/action-gh-release@v2
+  #     with:
+  #       files: |
+  #         target/release/Hobbes-Windows-v${{ steps.version.outputs.VERSION }}.exe
+  #         scripts/Output/hobbes_${{ steps.version.outputs.VERSION }}_setup.exe

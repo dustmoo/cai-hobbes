@@ -1252,7 +1252,7 @@ pub fn MessageBubble(
                     while let Ok(msg) = eval.recv().await {
                         if let Ok(data) = serde_json::from_value::<SelectionData>(msg) {
                             if data.hide {
-                                if !*is_mouse_over_toolbar.read() {
+                                if !*is_mouse_over_toolbar.read() && *selection_mode.read() == SelectionMode::Toolbar {
                                     selection_mode.set(SelectionMode::None);
                                 }
                             } else if !data.text.trim().is_empty() {
@@ -1383,7 +1383,7 @@ pub fn MessageBubble(
                                     id: Some(message.id),
                                     content: content(),
                                     comments: message.comments.clone(),
-                                    pending_highlight: if *selection_mode.read() != SelectionMode::None && *selection_mode.read() != SelectionMode::CommentEdit {
+                                    pending_highlight: if *selection_mode.read() == SelectionMode::CommentInput {
                                         Some(selection_data.read().text.clone())
                                     } else {
                                         None
