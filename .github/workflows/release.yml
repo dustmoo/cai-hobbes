@@ -12,6 +12,8 @@ jobs:
   build-macos-pro:
     name: Build & Release macOS (Direct Download)
     runs-on: macos-latest
+    permissions:
+      contents: write
     steps:
     - uses: actions/checkout@v4
 
