@@ -8,7 +8,7 @@ pub enum SkillParserError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("YAML parsing error: {0}")]
-    Yaml(#[from] serde_yml::Error),
+    Yaml(#[from] serde_norway::Error),
     #[error("Missing frontmatter delimiter")]
     MissingFrontmatter,
     #[error("Invalid frontmatter format")]
@@ -82,7 +82,7 @@ impl Skill {
         let frontmatter_str = parts[1];
         let instructions = parts[2].trim().to_string();
 
-        let metadata: SkillMetadata = serde_yml::from_str(frontmatter_str)?;
+        let metadata: SkillMetadata = serde_norway::from_str(frontmatter_str)?;
 
         // Determine root path
         let root_path = path.parent().unwrap_or(&path).to_path_buf();

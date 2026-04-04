@@ -1,0 +1,41 @@
+[advisories]
+ignore = [
+    # ---- Dioxus 0.6.x / Wry 0.45 Backend Warnings ----
+    # 
+    # Hobbes uses Dioxus 0.6.3 natively. Upgrading to Dioxus 0.7.x is a major 
+    # breaking framework migration. Wry 0.45 currently relies on the GTK3 ecosystem
+    # and older `glib` bindings which are now internally deprecated.
+
+    # glib (unsound `VariantStrIter`) - Minimal Risk, NULL pointer deref only.
+    "RUSTSEC-2024-0429",
+
+    # proc-macro-error (unmaintained) - Zero Risk, build-time only macro helper.
+    "RUSTSEC-2024-0370",
+
+    # All GTK3/GDK library deprecation warnings. Unmaintained but battle-tested locally.
+    "RUSTSEC-2024-0411", # gdkwayland-sys
+    "RUSTSEC-2024-0412", # cairo-sys-rs 
+    "RUSTSEC-2024-0413", # pango-sys
+    "RUSTSEC-2024-0414", # gdkx11-sys
+    "RUSTSEC-2024-0415", # gtk
+    "RUSTSEC-2024-0416", # pango
+    "RUSTSEC-2024-0417", # gdkx11
+    "RUSTSEC-2024-0418", # gdk-sys
+    "RUSTSEC-2024-0419", # gtk3-macros
+    "RUSTSEC-2024-0420", # gtk-sys
+    "RUSTSEC-2024-0388", # gio-sys
+
+    # instant (unmaintained) - Pulled via 'tao' for Dioxus windows.
+    "RUSTSEC-2024-0384",
+    
+    # ---- Miscellaneous Dependencies ----
+
+    # yaml-rust (unmaintained) 
+    # Used purely for UI syntax highlighting themes inside 'syntect 5.3.0'.
+    # Near zero risk as we control the loaded definitions.
+    "RUSTSEC-2024-0320",
+
+    # Additional deep transitive Dioxus/Wry deps:
+    "RUSTSEC-2025-0057",
+    "RUSTSEC-2025-0141"
+]

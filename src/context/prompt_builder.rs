@@ -8,6 +8,60 @@ use crate::settings::Settings;
 use chrono::Local;
 use serde_json::{self, json};
 
+/// Snap a byte index DOWN to the nearest valid UTF-8 char boundary.
+/// Prevents panics when slicing multi-byte characters (emojis, CJK, etc.).
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Recursively unwrap JSON values that are stringified JSON.
+/// Composio (and similar wrappers) often return tool results where the actual
+/// data is embedded inside a string field, e.g.:
+///   `{"result": {"type": "text", "text": "{\"successfull\":true,...}"}}`
+/// The `json2markdown` crate treats `Value::String` as plain text, so these
+/// nested JSON payloads render as raw escaped strings. This function detects
+/// string values that parse as JSON objects/arrays and replaces them in-place,
+/// allowing the markdown renderer to recurse into the full structure.
+fn unwrap_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            // Only unwrap if the string looks like a JSON object or array
+            let trimmed = s.trim();
+            if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            {
+                if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                    // Recursively unwrap in case of multiple layers of encoding
+                    unwrap_json_strings(&mut parsed);
+                    *value = parsed;
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                unwrap_json_strings(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                unwrap_json_strings(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Result of building a prompt, including the prompt itself and any
+/// paginated tool results that need to be stored in the session state.
+pub struct PromptBuildResult {
+    pub prompt: NeutralLlmPrompt,
+    pub pages_to_store: Vec<(String, crate::session::PagedResult)>,
+}
+
 #[cfg(test)]
 mod prompt_builder_tests;
 
@@ -104,7 +158,7 @@ impl<'a> PromptBuilder<'a> {
         &self,
         user_message: String,
         _last_agent_message: Option<String>,
-    ) -> NeutralLlmPrompt {
+    ) -> PromptBuildResult {
         // 1. Extract and format tools from the session context.
         let mut tools = Vec::new();
         if let Some(mcp_context) = &self.session.active_context.mcp_tools {
@@ -118,14 +172,17 @@ impl<'a> PromptBuilder<'a> {
         // 2. Build the system instruction from the remaining context.
         let mut active_context = self.session.active_context.clone();
 
-        // Apply memory size limits from settings
+        // Resolve per-provider context tuning once for this prompt build
+        let tuning = self.settings.effective_context_tuning();
+
+        // Apply memory size limits from resolved tuning (respects per-provider overrides)
         active_context
             .conversation_summary
-            .truncate_summary(self.settings.max_summary_chars);
+            .truncate_summary(tuning.max_summary_chars);
         active_context
             .conversation_summary
             .entities
-            .prune_entities(self.settings.max_entity_count);
+            .prune_entities(tuning.max_entity_count);
 
         let mut persona = self.settings.persona.clone();
 
@@ -390,6 +447,18 @@ impl<'a> PromptBuilder<'a> {
             }
         }
 
+        // Apply system context composition for finite context windows.
+        // This compresses/omits low-priority sections to fit the system prompt
+        // within ~20% of the provider's context budget.
+        let provider_context: Option<usize> = match self.settings.active_llm {
+            crate::settings::LlmProvider::OpenAiCompat =>
+                self.settings.openai_compat_config.max_context_tokens,
+            crate::settings::LlmProvider::Claude =>
+                self.settings.claude_config.max_tokens.map(|t| t as usize),
+            _ => None,
+        };
+        Self::compose_system_for_budget(&mut system_context_map, &persona, provider_context, &tuning);
+
         let context_json = serde_json::to_string_pretty(&system_context_map).unwrap_or_default();
 
         let mut system = persona;
@@ -403,6 +472,10 @@ impl<'a> PromptBuilder<'a> {
         // 3. Construct the conversational contents.
         let mut messages: Vec<ChatMessage> = Vec::new();
         let mut last_thought_signature: Option<String> = None;
+        // Track positions of ToolResult messages for Pass 2 budget allocation
+        let mut tool_result_positions: Vec<(usize, String, String, bool)> = Vec::new();
+        // Pages to store in PageQueue (for both historical stashes and active pagination)
+        let mut pages_to_store: Vec<(String, crate::session::PagedResult)> = Vec::new();
 
         let history_len = self.settings.chat_history_length;
         let session_messages = &self.session.messages;
@@ -519,42 +592,117 @@ impl<'a> PromptBuilder<'a> {
                         };
 
                         let is_active_tool_call = Some(message.id) == last_meaningful_id;
-                        let mut result_string = tc.response.clone();
-                        let max_len = if is_active_tool_call {
-                            self.settings.max_active_tool_output_length
-                        } else {
-                            self.settings.max_tool_output_length
-                        };
+                        
+                        // Why clone here?
+                        // We clone `tc.response` explicitly so we can safely perform non-destructive 
+                        // truncation, compression (json2markdown), or pagination on the *prompt copy* 
+                        // exclusively for the LLM's consumption during this specific turn.
+                        // By leaving the historical `SessionState::tc.response` entirely untouched, 
+                        // we guarantee the original (potentially massive) tool payload is perpetually 
+                        // preserved in memory. This ensures subsequent turns can dynamically re-paginate 
+                        // or re-compress the full data as the conversation window shifts.
+                        let result_string = tc.response.clone();
 
-                        if result_string.len() > max_len {
-                            let original_len = result_string.len();
-                            let mut truncated_len = max_len;
-                            while truncated_len > 0
-                                && !result_string.is_char_boundary(truncated_len)
-                            {
-                                truncated_len -= 1;
+                        // Resolve whether to apply compact markdown conversion
+                        // (uses `tuning` already resolved at line 176 for the entire build)
+                        let use_compact = tuning.compact_tool_results;
+
+                        let result_value: serde_json::Value = if use_compact {
+                            // Parse to JSON for markdown conversion
+                            let mut json_val: serde_json::Value =
+                                serde_json::from_str(&result_string).unwrap_or(json!(result_string));
+                            // Recursively unwrap stringified JSON (e.g. Composio's result.text)
+                            // so json2markdown can render the full structure as markdown.
+                            unwrap_json_strings(&mut json_val);
+                            let md = json2markdown::MarkdownRenderer::new(1, 2).render(&json_val);
+
+                            if !is_active_tool_call {
+                                // Historical result: condense for context, stash full data
+                                let budget = tuning.max_tool_output_length;
+                                if md.len() > budget {
+                                    // Stash full markdown in PageQueue for retrieval
+                                    let stash_id = format!(
+                                        "hist-{}-{}",
+                                        sanitized_tool_name,
+                                        &tc.execution_id[..8.min(tc.execution_id.len())]
+                                    );
+                                    pages_to_store.push((
+                                        stash_id.clone(),
+                                        crate::session::PagedResult {
+                                            pages: std::collections::VecDeque::from(vec![md.clone()]),
+                                            tool_name: sanitized_tool_name.clone(),
+                                        },
+                                    ));
+
+                                    // Truncate for in-context display
+                                    let mut condensed = md;
+                                    let trunc_len = floor_char_boundary(&condensed, budget);
+                                    condensed.truncate(trunc_len);
+                                    condensed.push_str(&format!(
+                                        "\n... [Result condensed. Full data available: call HOBBES_PAGE_RESULT with tool_call_id \"{}\"]",
+                                        stash_id
+                                    ));
+                                    tracing::debug!(
+                                        "Condensed historical result for {} ({} chars → {} chars, stash_id={})",
+                                        sanitized_tool_name, result_string.len(), condensed.len(), stash_id
+                                    );
+                                    json!(condensed)
+                                } else {
+                                    // Fits within budget — use full markdown
+                                    tracing::debug!(
+                                        "Historical result {} converted to markdown ({} chars → {} chars)",
+                                        sanitized_tool_name, result_string.len(), md.len()
+                                    );
+                                    json!(md)
+                                }
+                            } else {
+                                // Active result: full markdown, Pass 2 handles budget
+                                tracing::debug!(
+                                    "Active result {} converted to markdown ({} chars → {} chars)",
+                                    sanitized_tool_name, result_string.len(), md.len()
+                                );
+                                json!(md)
                             }
-                            result_string.truncate(truncated_len);
-                            result_string.push_str(&format!(
-                                "... [Output truncated from {} bytes]",
-                                original_len
-                            ));
-                        }
-
-                        let result_value: serde_json::Value =
-                            match serde_json::from_str::<serde_json::Value>(&result_string) {
-                                Ok(val) => val,
-                                Err(_) => json!(result_string),
+                        } else {
+                            // compact_tool_results OFF: original JSON behavior
+                            let mut rs = result_string;
+                            let max_len = if is_active_tool_call {
+                                self.effective_tool_result_limit(&tuning)
+                            } else {
+                                tuning.max_tool_output_length
                             };
+
+                            if rs.len() > max_len {
+                                let original_len = rs.len();
+                                let truncated_len = floor_char_boundary(&rs, max_len);
+                                rs.truncate(truncated_len);
+                                rs.push_str(&format!(
+                                    "... [Output truncated from {} bytes]",
+                                    original_len
+                                ));
+                            }
+
+                            match serde_json::from_str::<serde_json::Value>(&rs) {
+                                Ok(val) => val,
+                                Err(_) => json!(rs),
+                            }
+                        };
 
                         messages.push(ChatMessage {
                             role: ChatRole::Tool,
                             content: vec![ContentBlock::ToolResult {
                                 call_id: tc.execution_id.to_string(),
-                                name: sanitized_tool_name,
+                                name: sanitized_tool_name.clone(),
                                 content: result_value,
                             }],
                         });
+                        // Track position for Pass 2 budget allocation
+                        tool_result_positions.push((
+                            messages.len() - 1,
+                            sanitized_tool_name,
+                            tc.execution_id.to_string(),
+                            is_active_tool_call,
+                        ));
                     }
                     MessageContent::SkillCall(sc) => {
                         if let crate::components::shared::SkillCallStatus::Completed = sc.status {
@@ -587,10 +735,439 @@ impl<'a> PromptBuilder<'a> {
             });
         }
 
-        NeutralLlmPrompt {
-            system: Some(system),
-            messages,
-            tools,
+        // ── Pass 2: Dynamic tool result budget & pagination ──
+        // For providers with finite context windows, compute per-result budgets
+        // and paginate any results that exceed them.
+
+
+        if !tool_result_positions.is_empty() {
+            let system_chars = system.len();
+            let tool_def_chars: usize = tools.iter()
+                .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
+                .sum();
+
+            let non_result_chars: usize = messages.iter()
+                .enumerate()
+                .filter(|(idx, _)| !tool_result_positions.iter().any(|(mi, _, _, _)| mi == idx))
+                .map(|(_, m)| m.content.iter().map(|b| match b {
+                    ContentBlock::Text { text } => text.len(),
+                    ContentBlock::Thinking { text, .. } => text.len(),
+                    ContentBlock::ToolCall { name, arguments, .. } => name.len() + arguments.to_string().len(),
+                    ContentBlock::ToolResult { content, .. } => content.to_string().len(),
+                    _ => 0, // Image, etc.
+                }).sum::<usize>())
+                .sum();
+
+            let active_idx = tool_result_positions.iter().position(|(_, _, _, is_active)| *is_active);
+
+            if let Some(budgets) = Self::compute_tool_result_budget(
+                system_chars,
+                tool_def_chars,
+                non_result_chars,
+                tool_result_positions.len(),
+                active_idx,
+                provider_context,
+                &tuning,
+            ) {
+                // Apply budgets: paginate results that exceed their allocation
+                for (pos_idx, (msg_idx, tool_name, execution_id, _is_active)) in tool_result_positions.iter().enumerate() {
+                    let budget_chars = budgets[pos_idx];
+
+                    if let Some(msg) = messages.get_mut(*msg_idx) {
+                        if let Some(ContentBlock::ToolResult { content, .. }) = msg.content.first() {
+                            // Extract raw content for pagination. If the value is a string
+                            // (e.g., markdown from compact_tool_results), use it directly to
+                            // avoid JSON-escaping (\n → \\n). For objects/arrays, fall back
+                            // to JSON serialization which preserves structure.
+                            let serialized = content.as_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| serde_json::to_string_pretty(content).unwrap_or_else(|_| content.to_string()));
+                            if serialized.len() > budget_chars {
+                                // Paginate: segment into pages that fit the budget.
+                                let pages = Self::segment_into_pages(&serialized, budget_chars);
+                                if pages.len() > 1 {
+                                    let short_suffix: String = execution_id.chars()
+                                        .filter(|c| c.is_alphanumeric())
+                                        .take(6)
+                                        .collect();
+                                    let tool_call_id = format!("page-{}-{}", tool_name, short_suffix);
+                                    pages_to_store.push((tool_call_id.clone(), crate::session::PagedResult {
+                                        pages: pages.iter().skip(1).cloned().collect::<std::collections::VecDeque<_>>(),
+                                        tool_name: tool_name.clone(),
+                                    }));
+                                    let total_pages = pages.len();
+                                    let remaining = total_pages - 1;
+                                    let page1_with_footer = format!(
+                                        "{}\n\n[Page 1 of {}. {} more page(s) available. To view the next page, use the HOBBES_PAGE_RESULT tool with tool_call_id \"{}\"]",
+                                        pages[0], total_pages, remaining, tool_call_id
+                                    );
+                                    tracing::info!(
+                                        "Dynamic budget: paginated '{}' ({} bytes → {} chars budget) into {} pages (id={})",
+                                        tool_name, serialized.len(), budget_chars, total_pages, tool_call_id
+                                    );
+                                    if let Some(ContentBlock::ToolResult { content, .. }) = msg.content.first_mut() {
+                                        *content = json!(page1_with_footer);
+                                    }
+                                } else {
+                                    // Single page after segmentation — truncate
+                                    let trunc_len = floor_char_boundary(&serialized, budget_chars);
+                                    let truncated = format!(
+                                        "{} ... [Output truncated from {} bytes to fit context]",
+                                        &serialized[..trunc_len], serialized.len()
+                                    );
+                                    if let Some(ContentBlock::ToolResult { content, .. }) = msg.content.first_mut() {
+                                        *content = json!(truncated);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // else: compute_tool_result_budget returned None → no context limit, skip
         }
+
+        // Inject HOBBES_PAGE_RESULT tool only when paginated results exist.
+        // This prevents the model from speculatively calling it with fabricated IDs.
+        if !pages_to_store.is_empty() {
+            tools.push(ToolDefinition {
+                name: "HOBBES_PAGE_RESULT".to_string(),
+                description: "Fetch the next page of a paginated tool result. Use the exact tool_call_id from the pagination footer.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tool_call_id": {
+                            "type": "string",
+                            "description": "The exact tool_call_id from the [Page X/Y] footer"
+                        }
+                    },
+                    "required": ["tool_call_id"]
+                }),
+                server_name: "hobbes-local-meta".to_string(),
+            });
+            tracing::info!(
+                "Injected HOBBES_PAGE_RESULT tool — {} paginated result(s) available",
+                pages_to_store.len()
+            );
+        }
+
+        // Strip historical thinking blocks for finite context windows.
+        // For small models (Qwen 3.5, etc.), re-injected <thinking> tags from
+        // previous turns can consume 30-50% of the context budget. We keep
+        // thinking only on the most recent assistant message and strip it
+        // from all earlier turns.
+        if provider_context.is_some() {
+            Self::strip_historical_thinking(&mut messages);
+        }
+
+        PromptBuildResult {
+            prompt: NeutralLlmPrompt {
+                system: Some(system),
+                messages,
+                tools,
+            },
+            pages_to_store,
+        }
+    }
+
+    /// Strip `ContentBlock::Thinking` blocks from all assistant messages except
+    /// the most recent one. This dramatically reduces context usage for models
+    /// with finite context windows — thinking content from historical turns is
+    /// the single largest contributor to context exhaustion on small models.
+    ///
+    /// Walks messages in reverse: the first `ChatRole::Assistant` message encountered
+    /// keeps its thinking blocks; all earlier assistant messages have them removed.
+    fn strip_historical_thinking(messages: &mut [ChatMessage]) {
+        let mut found_latest = false;
+        for msg in messages.iter_mut().rev() {
+            if msg.role == ChatRole::Assistant {
+                if found_latest {
+                    // Strip thinking from older assistant messages
+                    let before = msg.content.len();
+                    msg.content.retain(|block| !matches!(block, ContentBlock::Thinking { .. }));
+                    if msg.content.len() < before {
+                        tracing::debug!(
+                            "Stripped {} thinking block(s) from historical assistant message",
+                            before - msg.content.len()
+                        );
+                    }
+                } else {
+                    found_latest = true;
+                    // Keep thinking on the most recent assistant message
+                }
+            }
+        }
+    }
+
+    /// Compute per-tool-result budgets for fitting results within the context window.
+    /// Returns `None` if the provider has unlimited context.
+    ///
+    /// Budget split: the active tool result receives 60% of the remaining budget,
+    /// historical results share the remaining 40% equally.
+    fn compute_tool_result_budget(
+        system_chars: usize,
+        tool_def_chars: usize,
+        non_result_message_chars: usize,
+        num_tool_results: usize,
+        active_index: Option<usize>,
+        max_context_tokens: Option<usize>,
+        tuning: &crate::settings::ResolvedContextTuning,
+    ) -> Option<Vec<usize>> {
+        let max_tokens = max_context_tokens?;
+
+        // Convert tokens to chars using the configurable ratio
+        let total_chars = (max_tokens as f64 * tuning.chars_per_token * (1.0 - tuning.context_safety_margin)) as usize;
+        let overhead = system_chars + tool_def_chars + non_result_message_chars;
+
+        if overhead >= total_chars {
+            // No room for tool results at all
+            return Some(vec![1024; num_tool_results]); // minimal fallback
+        }
+
+        let remaining = total_chars - overhead;
+
+        if num_tool_results == 0 {
+            return Some(vec![]);
+        }
+
+        let mut budgets = Vec::with_capacity(num_tool_results);
+
+        if let Some(active_idx) = active_index {
+            let active_budget = (remaining as f64 * tuning.active_result_budget_ratio) as usize;
+            let historical_count = num_tool_results - 1;
+            let historical_per = if historical_count > 0 {
+                ((remaining as f64 * (1.0 - tuning.active_result_budget_ratio)) / historical_count as f64) as usize
+            } else {
+                0
+            };
+
+            for i in 0..num_tool_results {
+                if i == active_idx {
+                    budgets.push(active_budget);
+                } else {
+                    budgets.push(historical_per);
+                }
+            }
+        } else {
+            // No active result identified → split equally
+            let per_result = remaining / num_tool_results;
+            budgets.resize(num_tool_results, per_result);
+        }
+
+        tracing::debug!(
+            "Tool result budgets: {} chars remaining, {} results, active_idx={:?}, budgets={:?}",
+            remaining, num_tool_results, active_index, budgets
+        );
+
+        Some(budgets)
+    }
+
+    /// Split a large string into pages that each fit within `page_size` characters.
+    /// Tries to split at clean boundaries in this priority order:
+    /// 1. JSON array/object boundaries (`},`, `],`)
+    /// 2. Paragraph breaks (`\n\n`)
+    /// 3. Line breaks (`\n`)
+    /// 4. Raw char-boundary splitting (fallback)
+    fn segment_into_pages(content: &str, page_size: usize) -> Vec<String> {
+        if content.len() <= page_size {
+            return vec![content.to_string()];
+        }
+
+        let mut pages = Vec::new();
+        let mut remaining = content;
+
+        while !remaining.is_empty() {
+            if remaining.len() <= page_size {
+                pages.push(remaining.to_string());
+                break;
+            }
+
+            // Snap page_size to a valid char boundary in `remaining`
+            let safe_end = floor_char_boundary(remaining, page_size);
+            let mut split_at = safe_end;
+
+            // Look for clean split points within last 20% of page
+            let search_start = floor_char_boundary(remaining, (page_size as f64 * 0.8) as usize);
+            if search_start < safe_end {
+                let search_slice = &remaining[search_start..safe_end];
+                if let Some(pos) = search_slice.rfind("},") {
+                    // JSON object boundary
+                    split_at = search_start + pos + 2;
+                } else if let Some(pos) = search_slice.rfind("],") {
+                    // JSON array boundary
+                    split_at = search_start + pos + 2;
+                } else if let Some(pos) = search_slice.rfind("\n\n") {
+                    // Paragraph break (markdown-friendly)
+                    split_at = search_start + pos + 2;
+                } else if let Some(pos) = search_slice.rfind('\n') {
+                    // Line break
+                    split_at = search_start + pos + 1;
+                }
+            }
+
+            if split_at == 0 {
+                // Absolute fallback: take at least one character
+                split_at = remaining.char_indices()
+                    .nth(1)
+                    .map(|(i, _)| i)
+                    .unwrap_or(remaining.len());
+            }
+
+            pages.push(remaining[..split_at].to_string());
+            remaining = &remaining[split_at..];
+        }
+
+        pages
+    }
+
+    /// Calculate a context-aware cap for tool result length.
+    /// For providers with finite context windows (OpenAI-compat, Claude),
+    /// caps to ~30% of the context budget (in chars, assuming ~4 chars/token).
+    /// For Gemini or unconfigured providers, falls back to the resolved setting.
+    fn effective_tool_result_limit(&self, tuning: &crate::settings::ResolvedContextTuning) -> usize {
+        let user_max = tuning.max_active_tool_output_length;
+
+        let provider_context_tokens: Option<usize> = match self.settings.active_llm {
+            crate::settings::LlmProvider::OpenAiCompat => {
+                self.settings.openai_compat_config.max_context_tokens
+            }
+            crate::settings::LlmProvider::Claude => {
+                self.settings.claude_config.max_tokens.map(|t| t as usize)
+            }
+            crate::settings::LlmProvider::Gemini => None, // Gemini has huge context, no cap needed
+        };
+
+        if let Some(max_tokens) = provider_context_tokens {
+            let ratio = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(tuning.tool_result_budget_ratio);
+            let context_cap = (max_tokens as f64 * ratio * tuning.chars_per_token) as usize;
+            let effective = context_cap.min(user_max);
+            tracing::debug!(
+                "Tool result limit: {} chars (ratio: {:.0}%, provider context: {} tokens, user max: {})",
+                effective, ratio * 100.0, max_tokens, user_max
+            );
+            effective
+        } else {
+            user_max
+        }
+    }
+
+    /// Compress system context map to fit within a budget when the provider has
+    /// a finite context window. Uses a 4-tier priority system:
+    /// 1. Core (never omit): system_persona, user_name, current_time
+    /// 2. Skill (compress before omit): loaded_skills instruction_manuals
+    /// 3. Context (trim): conversation_summary, entities
+    /// 4. Enrichment (omit first): composio_context, mcp_servers, user_instruction
+    fn compose_system_for_budget(
+        system_context_map: &mut serde_json::Map<String, serde_json::Value>,
+        persona: &str,
+        max_context_tokens: Option<usize>,
+        tuning: &crate::settings::ResolvedContextTuning,
+    ) {
+        let Some(max_tokens) = max_context_tokens else { return };
+
+        // System prompt budget is based on tuning configuration
+        let system_budget_chars = (max_tokens as f64 * tuning.system_prompt_budget_ratio * tuning.chars_per_token) as usize;
+
+        // Serialize once; track size delta incrementally (avoids cloning the map per check)
+        let map_size = serde_json::to_string(&serde_json::Value::Object(system_context_map.clone()))
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let mut running_size = persona.len() + map_size;
+
+        if running_size <= system_budget_chars { return; }
+
+        tracing::info!(
+            "System context composition: {} chars vs {} budget ({}K model). Compressing.",
+            running_size, system_budget_chars, max_tokens / 1000
+        );
+
+        // Helper: measure serialized size of a single value (for delta tracking)
+        let value_size = |v: &serde_json::Value| -> usize {
+            serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)
+        };
+
+        // Tier 4: Drop enrichment sections
+        for key in ["composio_context", "mcp_servers", "user_instruction"] {
+            if running_size <= system_budget_chars { return; }
+            if let Some(removed) = system_context_map.remove(key) {
+                // Account for key + value + quotes/colon/comma overhead
+                let delta = key.len() + value_size(&removed) + 6;
+                running_size = running_size.saturating_sub(delta);
+                tracing::debug!("Context composition: dropped '{}' (-{} chars)", key, delta);
+            }
+        }
+
+        // Tier 3: Truncate conversation summary
+        if running_size > system_budget_chars {
+            if let Some(summary) = system_context_map.get_mut("conversation_summary")
+                .and_then(|v| v.as_object_mut())
+            {
+                let target = system_budget_chars / 6;
+                if let Some(s) = summary.get("summary")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                {
+                    if s.len() > target {
+                        let trunc = floor_char_boundary(&s, target);
+                        let truncated = format!("{}... [truncated for context budget]", &s[..trunc]);
+                        let delta = s.len().saturating_sub(truncated.len());
+                        summary.insert("summary".to_string(), json!(truncated));
+                        running_size = running_size.saturating_sub(delta);
+                        tracing::debug!("Context composition: truncated summary (-{} chars)", delta);
+                    }
+                }
+                // Aggressively prune entities for small models
+                if let Some(entities) = summary.get_mut("entities")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    let keep_keys: Vec<String> = entities.keys().take(5).cloned().collect();
+                    let before = entities.len();
+                    let size_before = value_size(&serde_json::Value::Object(entities.clone()));
+                    entities.retain(|k, _| keep_keys.contains(k) || k == "user_name");
+                    if entities.len() < before {
+                        let size_after = value_size(&serde_json::Value::Object(entities.clone()));
+                        running_size = running_size.saturating_sub(size_before.saturating_sub(size_after));
+                        tracing::debug!("Context composition: pruned entities from {} to {}", before, entities.len());
+                    }
+                }
+            }
+        }
+
+        // Tier 2: Compress skill instruction_manual (keep resolved_tools intact)
+        if running_size > system_budget_chars {
+            if let Some(skills) = system_context_map.get_mut("loaded_skills")
+                .and_then(|v| v.as_array_mut())
+            {
+                let per_skill_budget = system_budget_chars / (4 * skills.len().max(1));
+                for skill in skills.iter_mut() {
+                    if let Some(manual) = skill.get("instruction_manual")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                    {
+                        if manual.len() > per_skill_budget {
+                            let trunc = floor_char_boundary(&manual, per_skill_budget);
+                            let truncated = format!(
+                                "{}... [instruction truncated from {} chars to fit context]",
+                                &manual[..trunc], manual.len()
+                            );
+                            let delta = manual.len().saturating_sub(truncated.len());
+                            if let Some(obj) = skill.as_object_mut() {
+                                obj.insert("instruction_manual".to_string(), json!(truncated));
+                            }
+                            running_size = running_size.saturating_sub(delta);
+                            tracing::debug!(
+                                "Context composition: truncated skill instruction from {} to {} chars",
+                                manual.len(), trunc
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "System context composition complete: ~{} chars (budget: {})",
+            running_size, system_budget_chars
+        );
     }
 }

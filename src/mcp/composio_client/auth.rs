@@ -342,8 +342,8 @@ pub(crate) async fn create_auth_config(
     auth_scheme: Option<&str>,
     use_managed: bool,
 ) -> Result<String, String> {
-    tracing::error!(
-        "DEBUG: create_auth_config called for '{}'. Auth Scheme: {:?}, Use Managed: {}",
+    tracing::trace!(
+        "create_auth_config called for '{}'. Auth Scheme: {:?}, Use Managed: {}",
         toolkit_slug,
         auth_scheme,
         use_managed
@@ -429,10 +429,10 @@ pub(crate) async fn create_auth_config(
         })
     };
 
-    tracing::debug!("Auth config payload: {:?}", payload);
-    tracing::error!("DEBUG: Sending to URL: {}", url);
-    tracing::error!(
-        "DEBUG: Payload: {}",
+    tracing::trace!("Auth config payload: {:?}", payload);
+    tracing::trace!("Auth config request URL: {}", url);
+    tracing::trace!(
+        "Auth config payload: {}",
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     );
 

@@ -357,7 +357,7 @@ use crate::llm::convert::StreamEvent;
 
 impl LlmFormatConverter for GeminiConnector {
     fn to_native_request(&self, prompt: &LlmPrompt, _streaming: bool) -> serde_json::Value {
-        let mut contents = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
 
         for msg in &prompt.messages {
             let mut parts = Vec::new();
@@ -425,13 +425,25 @@ impl LlmFormatConverter for GeminiConnector {
                 }
             }
 
+            let role_str = match msg.role {
+                crate::llm::ChatRole::User => "user".to_string(),
+                crate::llm::ChatRole::Assistant => "model".to_string(),
+                crate::llm::ChatRole::Tool => "user".to_string(), // Gemini uses 'user' role for tool results
+                crate::llm::ChatRole::System => "user".to_string(), // Should be handled by system_instruction
+            };
+
+            // Merge consecutive same-role Content objects (Gemini API requirement).
+            // The API strictly requires alternating user/model roles; consecutive
+            // same-role entries cause 400 errors. This restores the v0.9.48
+            // `add_to_prompt` closure behavior that was lost in the abstraction refactor.
+            if let Some(last) = contents.last_mut() {
+                if last.role == role_str {
+                    last.parts.extend(parts);
+                    continue;
+                }
+            }
             contents.push(Content {
-                role: match msg.role {
-                    crate::llm::ChatRole::User => "user".to_string(),
-                    crate::llm::ChatRole::Assistant => "model".to_string(),
-                    crate::llm::ChatRole::Tool => "user".to_string(), // Gemini uses 'user' role for tool results
-                    crate::llm::ChatRole::System => "user".to_string(), // Should be handled by system_instruction
-                },
+                role: role_str,
                 parts,
             });
         }
@@ -878,6 +890,21 @@ impl GeminiConnector {
         self
     }
 
+    /// Resolve the API key from config or the `GEMINI_API_KEY` environment variable.
+    /// Returns `Err` if neither source provides a key.
+    fn resolve_api_key(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(key) = self.config.api_key.clone() {
+            return Ok(key);
+        }
+        match std::env::var("GEMINI_API_KEY") {
+            Ok(key) => Ok(key),
+            Err(_) => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "GEMINI_API_KEY not configured",
+            )) as Box<dyn std::error::Error + Send + Sync>),
+        }
+    }
+
     /// Helper to build the correct API endpoint for a given model.
     /// Derives the API version dynamically from the model via struct-based authority.
     /// If model name already includes "models/" prefix (from API), use it directly.
@@ -914,20 +941,10 @@ impl GeminiConnector {
             "LLM: Selecting tools for toolkit"
         );
 
-        let api_key = match self.config.api_key.clone() {
-            Some(key) => key,
-            None => match std::env::var("GEMINI_API_KEY") {
-                Ok(key) => key,
-                Err(_) => {
-                    tracing::warn!("Skipping tool selection: GEMINI_API_KEY not set");
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "GEMINI_API_KEY not configured",
-                    ))
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-            },
-        };
+        let api_key = self.resolve_api_key().map_err(|e| {
+            tracing::warn!("Skipping tool selection: {}", e);
+            e
+        })?;
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -980,7 +997,7 @@ impl GeminiConnector {
 
         if let Some(candidate) = response_json.candidates.first() {
             if let Some(part) = candidate.content.parts.first() {
-                tracing::debug!("Raw LLM tool selection response: {}", part.text);
+                tracing::trace!("Raw LLM tool selection response: {}", part.text);
 
                 match parse_selection_response(&part.text) {
                     Ok(selection) => {
@@ -1013,19 +1030,7 @@ impl GeminiConnector {
         &self,
         request: GeminiRequest,
     ) -> Result<GeminiResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let api_key = match self.config.api_key.clone() {
-            Some(key) => key,
-            None => match std::env::var("GEMINI_API_KEY") {
-                Ok(key) => key,
-                Err(_) => {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "GEMINI_API_KEY not configured",
-                    ))
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-            },
-        };
+        let api_key = self.resolve_api_key()?;
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -1084,18 +1089,15 @@ impl LlmConnector for GeminiConnector {
         tx: mpsc::UnboundedSender<StreamMessage>,
         mcp_context: Option<McpContext>,
     ) {
-        let api_key = match self.config.api_key.clone() {
-            Some(key) => key,
-            None => match std::env::var("GEMINI_API_KEY") {
-                Ok(key) => key,
-                Err(_) => {
-                    tracing::error!("GEMINI_API_KEY not set in settings or environment");
-                    let _ = tx.send(StreamMessage::Error {
-                        message: "⚠️ **API Key Not Configured**\n\nPlease set your Gemini API key in Settings → AI Model to use Hobbes.".to_string(),
-                    });
-                    return;
-                }
-            },
+        let api_key = match self.resolve_api_key() {
+            Ok(key) => key,
+            Err(_) => {
+                tracing::error!("GEMINI_API_KEY not set in settings or environment");
+                let _ = tx.send(StreamMessage::Error {
+                    message: "⚠️ **API Key Not Configured**\n\nPlease set your Gemini API key in Settings → AI Model to use Hobbes.".to_string(),
+                });
+                return;
+            }
         };
 
         let mut model = self.config.chat_model.clone();
@@ -1209,23 +1211,15 @@ impl LlmConnector for GeminiConnector {
                             for event in events {
                                 match event {
                                     StreamEvent::Text { content } => {
-                                        // Check for structured JSON unwrapping
-                                        let (final_content, thought_summary) =
-                                            if content.trim().starts_with('{') {
-                                                unparse_json_response(&content)
-                                            } else {
-                                                (content.clone(), None)
-                                            };
-
-                                        if !final_content.is_empty() || thought_summary.is_some() {
+                                        if !content.is_empty() {
                                             current_attempt_parts.push(Part::Text {
-                                                text: content, // Keep raw for context history
+                                                text: content.clone(),
                                                 thought: None,
                                             });
                                             let _ = tx.send(StreamMessage::Text {
-                                                content: final_content,
+                                                content,
                                                 thought_signature: None,
-                                                thought_summary,
+                                                thought_summary: None,
                                             });
                                             has_sent_data = true;
                                         }
@@ -1518,20 +1512,10 @@ impl LlmConnector for GeminiConnector {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!(model = %self.config.summary_model, "LLM: Summarizing conversation");
 
-        let api_key = match self.config.api_key.clone() {
-            Some(key) => key,
-            None => match std::env::var("GEMINI_API_KEY") {
-                Ok(key) => key,
-                Err(_) => {
-                    tracing::warn!("Skipping summarization: GEMINI_API_KEY not set");
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "GEMINI_API_KEY not configured",
-                    ))
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-            },
-        };
+        let api_key = self.resolve_api_key().map_err(|e| {
+            tracing::warn!("Skipping summarization: {}", e);
+            e
+        })?;
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()
@@ -1650,7 +1634,7 @@ Recent Messages:
         if let Some(candidate) = response_json.candidates.first() {
             if let Some(part) = candidate.content.parts.first() {
                 // The model's response is expected to be a JSON string.
-                tracing::debug!("Raw LLM summary response: {}", part.text);
+                tracing::trace!("Raw LLM summary response: {}", part.text);
 
                 // Attempt to parse the text directly as JSON.
                 if let Ok(json_value) = serde_json::from_str(&part.text) {
@@ -1792,6 +1776,7 @@ mod tests {
             thinking_level: "high".to_string(),
             thinking_budget: Some(1024),
             model_slots: vec![],
+            context_tuning: Default::default(),
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -1877,6 +1862,7 @@ mod tests {
             thinking_level: "high".to_string(),
             thinking_budget: None,
             model_slots: vec![],
+            context_tuning: Default::default(),
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -1943,6 +1929,7 @@ mod tests {
             thinking_level: "high".to_string(),
             thinking_budget: None,
             model_slots: vec![],
+            context_tuning: Default::default(),
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -2013,6 +2000,7 @@ mod tests {
             thinking_level: "high".to_string(),
             thinking_budget: None,
             model_slots: vec![],
+            context_tuning: Default::default(),
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -2281,6 +2269,7 @@ mod tests {
             thinking_level: "high".to_string(),
             thinking_budget: None,
             model_slots: vec![],
+            context_tuning: Default::default(),
         };
         let connector = GeminiConnector::new(config);
         let url =

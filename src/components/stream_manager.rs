@@ -31,6 +31,12 @@ pub struct StreamManagerContext {
     pub content_generated: Signal<std::collections::HashSet<Uuid>>,
     save_error_signal: Signal<Option<String>>,
     usage_log: Signal<crate::usage_log::UsageLog>,
+    /// Guard: prevents overlapping proactive summarization tasks.
+    /// Multiple continuation turns can fire in quick succession; without this
+    /// flag each would independently spawn a summarization LLM call.
+    /// Last-write-wins is still acceptable during the brief race window
+    /// between the flag check and the `spawn` call.
+    proactive_summary_running: Signal<bool>,
 }
 
 impl StreamManagerContext {
@@ -122,14 +128,13 @@ impl StreamManagerContext {
                                 thought_summary_for_this_turn = Some(summary.clone());
                             }
                         }
-                        // Only forward to the UI stream when there's actual content to render.
-                        // Pure thinking-only messages (content="" + thought_summary only) are
-                        // accumulated silently and attached to whatever follows (tool call or text).
-                        // This prevents separate "Thinking Process" bubbles from appearing before
-                        // tool call cards — matching Gemini's behavior where thinking is absorbed
-                        // into the tool call card.
+                        // Only forward to the UI stream when there's something to render.
+                        // Pure thinking-only messages (content="" + thought_summary only) ARE forwarded
+                        // so the chat component can show the thinking content in the "Considering..."
+                        // bubble. They don't create standalone bubbles because has_generated_content
+                        // (which controls bubble persistence) still requires non-empty content.
                         let has_renderable_content =
-                            !content.is_empty() || thought_signature.is_some();
+                            !content.is_empty() || thought_signature.is_some() || thought_summary.is_some();
                         if has_renderable_content {
                             if stream_tx
                                 .send(StreamMessage::Text {
@@ -329,6 +334,45 @@ impl StreamManagerContext {
                                     .unwrap_or(serde_json::Value::Null);
                             let profile_id = profile_id_inner;
 
+                            // Intercept HOBBES_PAGE_RESULT before MCP dispatch —
+                            // requires SessionState.page_queue which McpManager doesn't have.
+                            if tool_call.tool_name == "HOBBES_PAGE_RESULT" {
+                                let (status, response_str) =
+                                    session_state.write().handle_page_result(&args_json, "");
+
+
+                                // Update message with result
+                                {
+                                    let mut state = session_state.write();
+                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
+                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                                            tc.status = status;
+                                            tc.response = response_str.clone();
+                                        }
+                                    }
+                                    state.touch_session(&session_id_inner);
+                                }
+
+                                let record = crate::components::shared::ToolCallRecord {
+                                    call: tool_call.clone(),
+                                    result: crate::components::shared::ToolResult {
+                                        status,
+                                        response: response_str,
+                                    },
+                                    profile_color: {
+                                        let settings_read = self.settings.read();
+                                        crate::components::shared::resolve_profile_color(
+                                            profile_id.as_ref(),
+                                            &settings_read,
+                                        )
+                                    },
+                                };
+                                let _ = tool_results_tx_clone.send(record);
+                                completed_tool_tasks_clone
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            }
+
                             let result_receiver = mcp_manager
                                 .read()
                                 .use_mcp_tool(
@@ -516,7 +560,7 @@ impl StreamManagerContext {
                 }
             }
 
-            if !final_text_for_this_turn.is_empty() {
+            if !final_text_for_this_turn.trim().is_empty() {
                 let mut state = self.session_state.write();
                 if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
                     if let crate::components::shared::MessageContent::Text {
@@ -531,12 +575,12 @@ impl StreamManagerContext {
                     }
                 }
             } else if tool_call_count == 0 && thought_summary_for_this_turn.is_some() {
-                // No text content, no tool calls, but thinking WAS produced.
-                // This is the model's entire response (e.g., Qwen thinking-only response).
-                // Use a visible marker as content so should_render passes (it no longer
-                // triggers on thought_summary alone — that change prevents empty bubbles
-                // when thinking is absorbed into ToolCall cards for OpenAI providers).
-                let thinking_marker = "💭".to_string();
+                // No meaningful text content, no tool calls, but thinking WAS produced.
+                // This happens with vLLM --enable-reasoning: the model puts its entire
+                // analysis in the `reasoning` field and only emits whitespace as `content`.
+                // Promote the thinking content to be the visible response text so the
+                // user sees the analysis directly instead of a hidden "Thinking Process."
+                let promoted_text = thought_summary_for_this_turn.clone().unwrap_or_default();
                 let mut state = self.session_state.write();
                 if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
                     if let crate::components::shared::MessageContent::Text {
@@ -545,16 +589,19 @@ impl StreamManagerContext {
                         thought_summary,
                     } = &mut msg.content
                     {
-                        *content = thinking_marker.clone();
+                        *content = promoted_text.clone();
                         *thought_signature = thought_signature_for_this_turn.clone();
-                        *thought_summary = thought_summary_for_this_turn.clone();
+                        // Clear thought_summary since we promoted it to content —
+                        // no need to show it twice under "Thinking Process"
+                        *thought_summary = None;
                     }
                 }
                 // Also forward to UI so the bubble renders
                 let _ = stream_tx.send(StreamMessage::Text {
-                    content: thinking_marker,
+                    content: promoted_text,
                     thought_signature: thought_signature_for_this_turn.clone(),
-                    thought_summary: thought_summary_for_this_turn.clone(),
+                    // Don't send thought_summary — the content IS the thinking
+                    thought_summary: None,
                 });
             } else if tool_call_count == 0 {
                 // Truly empty response: no text, no thinking, no tool calls.
@@ -631,6 +678,101 @@ impl StreamManagerContext {
                 // Clean up the current stream state before triggering the next one
                 on_complete();
                 self.is_sending.set(false);
+
+                // Proactive summarization: when messages approach the history limit,
+                // fire off a background summary before the next continuation turn.
+                // Without this, turns chain too fast for the 5s idle timer to fire,
+                // causing the model to lose context on long tool loops.
+                {
+                    let msg_count = self.session_state.read()
+                        .sessions.get(&session_id)
+                        .map(|s| s.messages.len())
+                        .unwrap_or(0);
+                    let history_limit = self.settings.read()
+                        .effective_context_tuning()
+                        .chat_history_length;
+                    let threshold = history_limit.saturating_sub(4);
+
+                    if msg_count >= threshold && msg_count > 0 && self.settings.read().enable_summarization {
+                        // Overlap guard: skip if a proactive summary is already in-flight.
+                        // Multiple continuation turns can fire faster than the LLM can respond;
+                        // spawning redundant calls wastes tokens and creates write races.
+                        if *self.proactive_summary_running.read() {
+                            tracing::debug!(
+                                "Proactive summarization skipped — already in-flight"
+                            );
+                        } else {
+                            tracing::info!(
+                                msg_count, history_limit, threshold,
+                                "Proactive summarization: messages approaching history limit"
+                            );
+                            let session_snapshot = self.session_state.read()
+                                .get_active_session().cloned();
+                            let settings_snapshot = self.settings.read().clone();
+                            if let Some(active_session) = session_snapshot {
+                                let connector = self.llm_connector.read().clone();
+                                let prev_summary = serde_json::to_string(
+                                    &active_session.active_context.conversation_summary
+                                ).unwrap_or_else(|_| "{}".to_string());
+
+                                // Format last 5 messages for the summarizer
+                                let messages_text: Vec<String> = active_session.messages.iter()
+                                    .rev().take(5).rev()
+                                    .map(|m| format!("{}: {}", m.author, m.content.display_summary()))
+                                    .collect();
+
+                                let active_profile_name = settings_snapshot
+                                    .active_composio_profile.as_deref()
+                                    .and_then(|id| settings_snapshot.profile_name_for_id(id))
+                                    .unwrap_or("None")
+                                    .to_string();
+                                let system_note = format!(
+                                    "[System: Active Profile '{}']", active_profile_name
+                                );
+                                let recent = std::iter::once(system_note)
+                                    .chain(messages_text)
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+
+                                if !recent.is_empty() {
+                                    // Mark in-flight before spawning
+                                    self.proactive_summary_running.set(true);
+                                    let mut proactive_flag = self.proactive_summary_running;
+                                    
+                                    // Timeout safety net: blindly clear the flag after 30 seconds
+                                    dioxus::prelude::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                        if *proactive_flag.peek() {
+                                            tracing::warn!("Proactive summarization timed out, forcibly resetting flag.");
+                                            proactive_flag.set(false);
+                                        }
+                                    });
+
+                                    // Fire-and-forget: don't block continuation on LLM call.
+                                    // If the summary lands before the next prompt build, great;
+                                    // if not, the next build uses the stale summary (acceptable).
+                                    let mut session_state = self.session_state;
+                                    dioxus::prelude::spawn(async move {
+                                        match connector.summarize_conversation(prev_summary, recent).await {
+                                            Ok(summary_json) => {
+                                                if let Ok(summary) = serde_json::from_value::<crate::session::ConversationSummary>(summary_json) {
+                                                    tracing::info!("Proactive summary updated (background)");
+                                                    let mut state = session_state.write();
+                                                    if let Some(session) = state.get_active_session_mut() {
+                                                        session.active_context.conversation_summary = summary;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => tracing::warn!("Proactive summarization failed: {}", e),
+                                        }
+                                        proactive_flag.set(false);
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
                 self.scheduler.send(SchedulerSignal::Activity);
 
                 // Check turn limit BEFORE triggering continuation.
@@ -661,7 +803,7 @@ impl StreamManagerContext {
                     return; // Stop — user must send a message to reset and continue.
                 }
 
-                self.continuation_controller.write().trigger_continuation();
+                self.continuation_controller.write().trigger_continuation(session_id.clone());
                 return; // End this stream task. The continuation will start a new one.
             }
 
@@ -796,6 +938,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         content_generated: Signal::new(std::collections::HashSet::new()),
         save_error_signal: consume_context::<crate::components::shared::SaveErrorContext>().0,
         usage_log,
+        proactive_summary_running: Signal::new(false),
     });
 
     // Provide the context to children.
@@ -826,6 +969,7 @@ mod tests {
                     PathBuf::new(),
                     permission_manager,
                     secret_manager,
+                    settings,
                 ))
             });
             let continuation_controller =
@@ -852,6 +996,7 @@ mod tests {
                 content_generated: Signal::new(std::collections::HashSet::new()),
                 save_error_signal: Signal::new(None),
                 usage_log: Signal::new(crate::usage_log::UsageLog::default()),
+                proactive_summary_running: Signal::new(false),
             });
 
             let message_id = Uuid::new_v4();
@@ -896,6 +1041,7 @@ mod tests {
                     PathBuf::new(),
                     permission_manager,
                     secret_manager,
+                    settings,
                 ))
             });
             let continuation_controller =
@@ -922,6 +1068,7 @@ mod tests {
                 content_generated: Signal::new(std::collections::HashSet::new()),
                 save_error_signal: Signal::new(None),
                 usage_log: Signal::new(crate::usage_log::UsageLog::default()),
+                proactive_summary_running: Signal::new(false),
             });
 
             let message_id = Uuid::new_v4();

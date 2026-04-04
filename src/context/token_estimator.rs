@@ -6,8 +6,13 @@ use crate::llm::types::{ChatMessage, ContentBlock, LlmPrompt};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Safety margin — reserve this fraction of the context for output + API overhead.
-/// 15% means a 32K context budget becomes ~27K for input.
-const SAFETY_MARGIN: f64 = 0.15;
+/// For small models (<32K), JSON tokenization overhead means our character-based
+/// estimator significantly underestimates actual tokens. We use a sliding scale:
+/// - 16K model → 30% margin (aggressive, needed for JSON-heavy tool use)
+/// - 32K model → 20% margin
+/// - 128K+ model → 15% margin (heuristic works well at scale)
+const MIN_SAFETY_MARGIN: f64 = 0.15;
+const MAX_SAFETY_MARGIN: f64 = 0.30;
 
 /// Estimate token count for a text string.
 pub fn estimate_tokens(text: &str) -> usize {
@@ -27,12 +32,16 @@ pub fn estimate_message_tokens(message: &ChatMessage) -> usize {
             ContentBlock::ToolCall {
                 name, arguments, ..
             } => {
+                // JSON structures tokenize more expensively (~3 chars/token)
                 tokens += estimate_tokens(name);
-                tokens += estimate_tokens(&arguments.to_string());
+                let arg_str = arguments.to_string();
+                tokens += arg_str.chars().count().div_ceil(3);
             }
             ContentBlock::ToolResult { name, content, .. } => {
+                // JSON structures tokenize more expensively (~3 chars/token)
                 tokens += estimate_tokens(name);
-                tokens += estimate_tokens(&content.to_string());
+                let content_str = content.to_string();
+                tokens += content_str.chars().count().div_ceil(3);
             }
             ContentBlock::Image { .. } => {
                 // Images vary wildly; use a conservative fixed estimate
@@ -62,9 +71,12 @@ pub fn estimate_prompt_tokens(prompt: &LlmPrompt) -> usize {
 
     // Tool definitions (JSON schemas are token-heavy)
     for tool in &prompt.tools {
+        // Tool schemas have JSON-heavy structure — use 3 chars/token
+        let desc_str = tool.description.clone();
+        let param_str = tool.parameters.to_string();
         tokens += estimate_tokens(&tool.name);
-        tokens += estimate_tokens(&tool.description);
-        tokens += estimate_tokens(&tool.parameters.to_string());
+        tokens += desc_str.chars().count().div_ceil(3);
+        tokens += param_str.chars().count().div_ceil(3);
         tokens += 10; // structural overhead per tool
     }
 
@@ -72,9 +84,13 @@ pub fn estimate_prompt_tokens(prompt: &LlmPrompt) -> usize {
 }
 
 /// Calculate the effective input budget given a max context window.
-/// Applies the safety margin to reserve space for output.
+/// Applies a scaled safety margin: larger for small models (JSON overhead
+/// makes our char-based estimator less accurate), smaller for big models.
 pub fn effective_input_budget(max_context_tokens: usize) -> usize {
-    let reserved = (max_context_tokens as f64 * SAFETY_MARGIN) as usize;
+    // Linear interpolation: 30% margin at 16K, tapering to 15% at 128K+
+    let t = ((max_context_tokens as f64 - 16_000.0) / (128_000.0 - 16_000.0)).clamp(0.0, 1.0);
+    let margin = MAX_SAFETY_MARGIN + t * (MIN_SAFETY_MARGIN - MAX_SAFETY_MARGIN);
+    let reserved = (max_context_tokens as f64 * margin) as usize;
     max_context_tokens.saturating_sub(reserved)
 }
 
@@ -138,8 +154,7 @@ pub fn messages_to_drop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::types::{ChatRole, ToolDefinition};
-    use serde_json::json;
+    use crate::llm::types::ChatRole;
 
     #[test]
     fn test_estimate_tokens_basic() {
@@ -151,10 +166,19 @@ mod tests {
 
     #[test]
     fn test_effective_budget() {
-        // 32768 * 0.85 ≈ 27852
+        // 32K model: margin interpolates between 30% and 15%, budget ≈ 23,674
         let budget = effective_input_budget(32768);
-        assert!(budget > 27000);
-        assert!(budget < 28000);
+        assert!(budget > 22000, "Budget {} should be > 22000 for 32K model", budget);
+        assert!(budget < 26000, "Budget {} should be < 26000 for 32K model", budget);
+        
+        // 16K model: gets 30% margin, budget ≈ 11,200
+        let small_budget = effective_input_budget(16000);
+        assert!(small_budget > 10000, "Small budget {} should be > 10000", small_budget);
+        assert!(small_budget < 12000, "Small budget {} should be < 12000", small_budget);
+        
+        // 128K+ model: gets 15% margin, budget ≈ 108,800
+        let large_budget = effective_input_budget(128000);
+        assert!(large_budget > 108000, "Large budget {} should be > 108000", large_budget);
     }
 
     #[test]

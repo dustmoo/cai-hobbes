@@ -63,3 +63,18 @@ context_store.json
 # Windows build artifacts
 scripts/Output/
 MicrosoftEdgeWebview2Setup.exe
+
+# Build artifacts and binaries — CI publishes to GitHub Releases
+downloads/
+*.dmg
+*.exe
+
+# Temporary/archived directories that shouldn't be in version control
+tmp_pro_icons/
+archive/
+
+# Python virtual environments
+.venv/
+
+# Playwright MCP logs
+.playwright-mcp/

@@ -50,6 +50,15 @@ pub enum ChatCommand {
     CloseTab,
 }
 
+/// Distinguishes which autocomplete context is active in the chat input.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AutocompleteMode {
+    /// Standard skill activation: `/skillname`
+    Skill,
+    /// Unload a loaded skill: `/unload skillname`
+    Unload,
+}
+
 /// Provider-aware model display name. For Gemini, uses the curated display name
 /// from GeminiModel. For other providers, the raw slug is already human-readable
 /// (e.g. `gpt-4o-mini`, `Qwen/Qwen3-235B`).
@@ -94,6 +103,7 @@ pub fn ChatInput(
     let mut show_skill_autocomplete = use_signal(|| false);
     let mut skill_autocomplete_index = use_signal(|| 0usize);
     let mut filtered_skills = use_signal(Vec::<Skill>::new);
+    let mut autocomplete_mode = use_signal(|| AutocompleteMode::Skill);
 
     // Active Focus Management: Reclaim focus when context reverts to ChatInput
     use_effect(move || {
@@ -205,8 +215,14 @@ pub fn ChatInput(
                 }
                 ChatCommand::TriggerAiAnalysis => {
                     tracing::info!("ChatCommand::TriggerAiAnalysis triggered");
+                    // Signal the centralized execution loop in chat.rs (use_effect
+                    // monitoring has_pending_approvals). That loop handles both tool
+                    // approvals AND skill continuations — when no tools are pending,
+                    // it calls continuation_controller.trigger_continuation() which
+                    // is the single correct path to resume the AI turn.
+                    // DO NOT also call on_send / has_new_comments here — that would
+                    // create a second parallel LLM stream (double-turn regression).
                     has_pending_approvals.set(true);
-                    on_send.call((String::new(), Vec::new()));
                 }
             }
 
@@ -230,6 +246,39 @@ pub fn ChatInput(
 
         // Skill Command Detection
         if user_message.starts_with('/') {
+            // /unload command — remove a loaded skill from session context
+            let trimmed = user_message.trim();
+            if trimmed.starts_with("/unload ") {
+                let skill_name = trimmed.trim_start_matches("/unload ").trim();
+                if !skill_name.is_empty() {
+                    let mut state = session_state.write();
+                    if let Some(session) = state.get_active_session_mut() {
+                        if session.loaded_skills.remove(skill_name).is_some() {
+                            // Push a confirmation message
+                            session.messages.push(crate::components::chat::Message {
+                                id: uuid::Uuid::new_v4(),
+                                author: "User".to_string(),
+                                content: crate::components::shared::MessageContent::Text {
+                                    content: format!("Unloaded skill '{}' from session context.", skill_name),
+                                    thought_signature: None,
+                                    thought_summary: None,
+                                },
+                                attachments: Vec::new(),
+                                comments: Vec::new(),
+                                created_at: chrono::Utc::now(),
+                                usage: None,
+                            });
+                            tracing::info!("Unloaded skill '{}' from session.loaded_skills", skill_name);
+                        } else {
+                            tracing::warn!("Skill '{}' not found in loaded_skills", skill_name);
+                        }
+                    }
+                }
+                draft.set(String::new());
+                attachments.set(Vec::new());
+                return;
+            }
+
             let parts: Vec<&str> = user_message.split_whitespace().collect();
             if !parts.is_empty() {
                 let skill_name = parts[0].trim_start_matches('/');
@@ -341,7 +390,16 @@ pub fn ChatInput(
                                         {
                                             sc_clone.status = result.status;
                                             sc_clone.response = result.output;
-                                            msg.content = crate::components::shared::MessageContent::SkillCall(sc_clone);
+                                            msg.content = crate::components::shared::MessageContent::SkillCall(sc_clone.clone());
+                                        }
+                                        // Persist skill into session.loaded_skills so it
+                                        // remains in system context across all future turns
+                                        if sc_clone.status == crate::components::shared::SkillCallStatus::Completed {
+                                            session.loaded_skills.insert(
+                                                sc_clone.skill_name.clone(),
+                                                sc_clone.response.clone(),
+                                            );
+                                            tracing::info!("Persisted skill '{}' into session.loaded_skills", sc_clone.skill_name);
                                         }
                                     }
                                     drop(state); // Release lock before triggering
@@ -740,7 +798,40 @@ pub fn ChatInput(
 
                         // Skill Autocomplete Detection
                         let val = event.value();
-                        if let Some(query) = val.strip_prefix('/') {
+                        if let Some(unload_query) = val.strip_prefix("/unload ") {
+                            // Autocomplete for /unload — source from session.loaded_skills
+                            autocomplete_mode.set(AutocompleteMode::Unload);
+                            let state = session_state.read();
+                            if let Some(session) = state.get_active_session() {
+                                let matches: Vec<Skill> = session.loaded_skills.keys()
+                                    .filter(|name| {
+                                        unload_query.is_empty() || name.to_lowercase().contains(&unload_query.to_lowercase())
+                                    })
+                                    .map(|name| {
+                                        // Build a lightweight Skill for the autocomplete UI
+                                        Skill {
+                                            metadata: crate::skills::parser::SkillMetadata {
+                                                name: name.clone(),
+                                                description: "Loaded skill".to_string(),
+                                                disable_model_invocation: false,
+                                                user_invocable: true,
+                                                allowed_tools: None,
+                                                argument_hint: None,
+                                            },
+                                            instructions: String::new(),
+                                            path: std::path::PathBuf::new(),
+                                            root_path: std::path::PathBuf::new(),
+                                            scripts: Vec::new(),
+                                            resources: Vec::new(),
+                                        }
+                                    })
+                                    .collect();
+                                filtered_skills.set(matches);
+                                skill_autocomplete_index.set(0);
+                                show_skill_autocomplete.set(true);
+                            }
+                        } else if let Some(query) = val.strip_prefix('/') {
+                            autocomplete_mode.set(AutocompleteMode::Skill);
                             let registry = skill_registry.read();
                             let all_skills = registry.list_skills();
                             let matches: Vec<Skill> = all_skills
@@ -860,19 +951,27 @@ pub fn ChatInput(
                                             // Current draft looks like: "/tim args" or "/timestamp +%s"
                                             // We want to: replace the "/query" part with "/skillname" but keep args
                                             let current_draft = draft.read().clone();
-                                            let args = if current_draft.starts_with('/') {
-                                                // Extract everything after the first space (the arguments)
-                                                current_draft.split_once(' ')
-                                                    .map(|(_, args_part)| args_part.to_string())
-                                                    .unwrap_or_default()
-                                            } else {
-                                                String::new()
-                                            };
 
-                                            let skill_command = if args.is_empty() {
-                                                format!("/{} ", skill.metadata.name)
-                                            } else {
-                                                format!("/{} {}", skill.metadata.name, args)
+                                            let skill_command = match *autocomplete_mode.read() {
+                                                AutocompleteMode::Unload => {
+                                                    // For unload, always fill the full command
+                                                    format!("/unload {}", skill.metadata.name)
+                                                }
+                                                AutocompleteMode::Skill => {
+                                                    // Preserve existing text as arguments
+                                                    let args = if current_draft.starts_with('/') {
+                                                        current_draft.split_once(' ')
+                                                            .map(|(_, args_part)| args_part.to_string())
+                                                            .unwrap_or_default()
+                                                    } else {
+                                                        String::new()
+                                                    };
+                                                    if args.is_empty() {
+                                                        format!("/{} ", skill.metadata.name)
+                                                    } else {
+                                                        format!("/{} {}", skill.metadata.name, args)
+                                                    }
+                                                }
                                             };
                                             draft.set(skill_command.clone());
                                             show_skill_autocomplete.set(false);
@@ -957,7 +1056,8 @@ pub fn ChatInput(
 
                                                         let settings_reader = settings.read();
                                                         let builder = PromptBuilder::new(&session_for_debug, &settings_reader, &state);
-                                                        let prompt_data = builder.build_prompt("[DEBUG USER MESSAGE]".to_string(), None);
+                                                        let result = builder.build_prompt("[DEBUG USER MESSAGE]".to_string(), None);
+                                                        let prompt_data = result.prompt;
                                                         format!("{:#?}", prompt_data)
                                                     } else {
                                                         "[No active session]".to_string()
@@ -1210,35 +1310,41 @@ fn SessionCostIcon() -> Element {
     let total_tokens = session.total_tokens();
     let avg_tokens = session.average_tokens_per_turn();
 
-    // Session switch detection: reset silently (no animation)
-    if *prev_session_id.peek() != current_session_id {
-        prev_session_id.set(current_session_id);
-        prev_cost.set(total_cost);
-        animation_target.set(total_cost);
-    }
+    use_effect(move || {
+        let current_id = current_target_id.read().clone();
+        let s_state = session_state.read();
+        let cost = match s_state.sessions.get(&current_id) {
+            Some(s) => s.total_cost(),
+            None => return,
+        };
 
-    // Trigger CSS animation when cost increases
-    // animation_target prevents strobe: only trigger once per distinct cost value
-    let old_cost = *prev_cost.peek();
-    let last_target = *animation_target.peek();
-    if total_cost > old_cost
-        && (total_cost - old_cost).abs() > 0.0001
-        && (total_cost - last_target).abs() > 0.0001
-    {
-        prev_cost.set(total_cost);
-        animation_target.set(total_cost);
-        cost_animating.set(true);
-        spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(650)).await;
-            cost_animating.set(false);
-        });
-    } else if (total_cost - old_cost).abs() > 0.0001 {
-        // Cost decreased (e.g. session switch fallthrough) — silently update
-        prev_cost.set(total_cost);
-        animation_target.set(total_cost);
-    }
+        if *prev_session_id.peek() != current_id {
+            prev_session_id.set(current_id);
+            prev_cost.set(cost);
+            animation_target.set(cost);
+            return;
+        }
 
-    let cost_class = if *cost_animating.peek() {
+        let old_cost = *prev_cost.peek();
+        let last_target = *animation_target.peek();
+        if cost > old_cost
+            && (cost - old_cost).abs() > 0.0001
+            && (cost - last_target).abs() > 0.0001
+        {
+            prev_cost.set(cost);
+            animation_target.set(cost);
+            cost_animating.set(true);
+            spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+                cost_animating.set(false);
+            });
+        } else if (cost - old_cost).abs() > 0.0001 {
+            prev_cost.set(cost);
+            animation_target.set(cost);
+        }
+    });
+
+    let cost_class = if *cost_animating.read() {
         "text-xs font-mono font-medium cost-tick"
     } else {
         "text-xs font-mono font-medium"

@@ -1,4 +1,3 @@
-use crate::components::shared::MessageContent;
 use crate::llm::LlmConnector;
 use crate::session::{ConversationSummary, Session};
 use crate::settings::Settings;
@@ -41,21 +40,7 @@ impl ConversationProcessor {
             .rev()
             .take(5)
             .rev()
-            .map(|m| {
-                let content_str = match &m.content {
-                    MessageContent::Text { content: text, .. } => text.clone(),
-                    MessageContent::ToolCall(tc) => format!("[Tool Call: {}]", tc.tool_name),
-                    MessageContent::PermissionRequest(tc) => {
-                        format!("[Permission Request for Tool: {}]", tc.tool_name)
-                    }
-                    MessageContent::SkillCall(sc) => format!("[Skill Call: {}]", sc.skill_name),
-                    MessageContent::SkillPermissionRequest(sc) => {
-                        format!("[Permission Request for Skill: {}]", sc.skill_name)
-                    }
-                    MessageContent::Error { message } => format!("[Error: {}]", message),
-                };
-                format!("{}: {}", m.author, content_str)
-            })
+            .map(|m| format!("{}: {}", m.author, m.content.display_summary()))
             .collect();
 
         // Inject active profile context to help the summarizer detect profile switches

@@ -22,6 +22,7 @@ fn create_test_session() -> Session {
         accumulated_turns: 0,
         memory_optimization_summary: None,
         composio_profile: None,
+        loaded_skills: std::collections::HashMap::new(),
     }
 }
 
@@ -52,7 +53,7 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
     let prompt = builder.build_prompt("Hello".to_string(), None);
 
     // Extract the system instruction text
-    let full_text = prompt.system.expect("Should have system instruction");
+    let full_text = prompt.prompt.system.expect("Should have system instruction");
 
     // Assert: Composio context should be present
     assert!(
@@ -89,7 +90,7 @@ fn test_composio_context_not_injected_when_profile_missing_api_key() {
     let builder = PromptBuilder::new(&session, &settings, &session_state);
     let prompt = builder.build_prompt("Hello".to_string(), None);
 
-    let full_text = prompt.system.expect("Should have system instruction");
+    let full_text = prompt.prompt.system.expect("Should have system instruction");
 
     // Assert: Composio context should NOT be present
     assert!(
@@ -118,7 +119,7 @@ fn test_composio_context_not_injected_when_profile_missing_user_id() {
     let builder = PromptBuilder::new(&session, &settings, &session_state);
     let prompt = builder.build_prompt("Hello".to_string(), None);
 
-    let full_text = prompt.system.expect("Should have system instruction");
+    let full_text = prompt.prompt.system.expect("Should have system instruction");
 
     // Assert: Composio context should NOT be present
     assert!(
@@ -158,7 +159,7 @@ fn test_oversized_entities_stripped_from_system_context() {
     let builder = PromptBuilder::new(&session, &settings, &session_state);
     let prompt = builder.build_prompt("Hello".to_string(), None);
 
-    let full_text = prompt.system.expect("Should have system instruction");
+    let full_text = prompt.prompt.system.expect("Should have system instruction");
 
     // user_name should be preserved (explicitly exempted from size check)
     assert!(
@@ -175,4 +176,93 @@ fn test_oversized_entities_stripped_from_system_context() {
         !full_text.contains("message_history"),
         "Oversized entities (>500 chars) should be stripped from system context"
     );
+}
+
+// =========================================================================
+// Multi-byte UTF-8 Pagination Tests
+// =========================================================================
+
+#[test]
+fn test_floor_char_boundary_multibyte() {
+    // Emoji: 🦀 = 4 bytes, 🎯 = 4 bytes
+    let s = "Hello🦀World🎯End";
+    // "Hello" = 5 bytes, 🦀 = 4 bytes (bytes 5..9), "World" = 5 bytes (9..14),
+    // 🎯 = 4 bytes (14..18), "End" = 3 bytes (18..21)
+    assert_eq!(s.len(), 21);
+
+    // Snap to boundary inside 🦀 (byte 7 is mid-emoji) → should snap to 5
+    assert_eq!(super::floor_char_boundary(s, 7), 5);
+    // Snap to boundary inside 🎯 (byte 16 is mid-emoji) → should snap to 14
+    assert_eq!(super::floor_char_boundary(s, 16), 14);
+    // Exact boundary at start of 🦀 → should stay at 5
+    assert_eq!(super::floor_char_boundary(s, 5), 5);
+    // Beyond string length → clamp to len
+    assert_eq!(super::floor_char_boundary(s, 100), 21);
+    // Zero → zero
+    assert_eq!(super::floor_char_boundary(s, 0), 0);
+}
+
+#[test]
+fn test_segment_into_pages_multibyte_no_panic() {
+    // Build a string with mixed multi-byte content:
+    // - ASCII, emoji (4-byte), CJK (3-byte), Cyrillic (2-byte)
+    let content = "Hello 🦀 世界 Привет!\n\
+                   Line two with emoji: 🎯🎯🎯\n\
+                   第三行：中文内容测试\n\
+                   Fourth line: normal ASCII text here\n\
+                   Пятая строка: кириллица\n\
+                   Sixth: more 🎉🎊🎋 emoji fun";
+
+    // Use a page_size that forces splitting mid-multibyte territory
+    // (intentionally small to stress the boundary logic)
+    let page_size = 30;
+    let pages = PromptBuilder::segment_into_pages(content, page_size);
+
+    // 1. No panic occurred (implicit — we reached here)
+    // 2. All pages must be valid UTF-8 (they are Strings, so this is guaranteed by Rust's type system)
+    // 3. No page should exceed page_size (with small tolerance for the fallback path)
+    for (i, page) in pages.iter().enumerate() {
+        assert!(
+            !page.is_empty(),
+            "Page {} should not be empty",
+            i
+        );
+    }
+
+    // 4. Concatenation must reproduce the original content
+    let reconstructed: String = pages.concat();
+    assert_eq!(
+        reconstructed, content,
+        "Concatenated pages must exactly reproduce the original content"
+    );
+
+    // 5. Should have more than 1 page (content is ~200 bytes, page_size is 30)
+    assert!(
+        pages.len() > 1,
+        "Should produce multiple pages, got {}",
+        pages.len()
+    );
+}
+
+#[test]
+fn test_segment_into_pages_single_page() {
+    let content = "Short string";
+    let pages = PromptBuilder::segment_into_pages(content, 1000);
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0], content);
+}
+
+#[test]
+fn test_segment_into_pages_all_multibyte() {
+    // Pure CJK + emoji content — every character is multi-byte
+    let content = "这是一个完整的中文段落，包含很多汉字。🦀🎯🎉每个字符都是多字节的。";
+    let page_size = 20; // Forces splits inside multi-byte sequences
+    let pages = PromptBuilder::segment_into_pages(content, page_size);
+
+    let reconstructed: String = pages.concat();
+    assert_eq!(
+        reconstructed, content,
+        "Pure multi-byte content must reconstruct correctly after pagination"
+    );
+    assert!(pages.len() > 1, "Should produce multiple pages");
 }

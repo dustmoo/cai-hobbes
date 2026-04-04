@@ -21,7 +21,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
 
     rsx! {
         div {
-            class: "flex items-center bg-section border-b border-primary-700/50 h-10 shrink-0 overflow-x-auto no-scrollbar",
+            class: "flex items-center bg-section border-b border-primary-700/50 h-10 shrink-0 overflow-hidden",
 
             // Tab items
             for (idx, session_id) in props.open_tabs.iter().enumerate() {
@@ -43,9 +43,9 @@ pub fn TabBar(props: TabBarProps) -> Element {
                         div {
                             key: "{session_id_key}",
                             class: if is_active {
-                                "group flex items-center h-full px-3 cursor-pointer min-w-32 max-w-64 select-none bg-card border-b-2 border-b-primary-500"
+                                "group flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink select-none bg-card border-b-2 border-b-primary-500"
                             } else {
-                                "group flex items-center h-full px-3 cursor-pointer min-w-32 max-w-64 select-none hover:bg-card"
+                                "group flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink select-none hover:bg-card"
                             },
                             onclick: move |_| {
                                 if !is_editing {
@@ -153,7 +153,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
 
             // New tab button
             button {
-                class: "flex items-center justify-center h-full px-3 text-fg-muted hover:bg-card hover:text-fg transition-colors",
+                class: "flex items-center justify-center h-full px-3 shrink-0 text-fg-muted hover:bg-card hover:text-fg transition-colors",
                 onclick: move |_| props.on_new_tab.call(()),
                 title: "New Tab (Cmd+Shift+N)",
                 Icon {

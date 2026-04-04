@@ -97,297 +97,331 @@ impl LlmConnector for OpenAiCompatConnector {
             );
         }
 
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .expect("Failed to build reqwest client");
+        // Autorecovery: retry once on transient stream decode errors (e.g. "error decoding response body").
+        // These are likely vLLM hiccups, not real model errors. If the error repeats, surface it.
+        const MAX_STREAM_RETRIES: u32 = 1;
 
-        let body_str = serde_json::to_string(&native_request)
-            .expect("Failed to serialize OpenAI request body");
+        'retry: for attempt in 0..=MAX_STREAM_RETRIES {
+            let client = Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .expect("Failed to build reqwest client");
 
-        let mut request_builder = client
-            .post(&endpoint)
-            .header("Content-Type", "application/json")
-            .body(body_str);
+            let body_str = serde_json::to_string(&native_request)
+                .expect("Failed to serialize OpenAI request body");
 
-        if let Some(api_key) = &self.config.api_key {
-            request_builder =
-                request_builder.header("Authorization", format!("Bearer {}", api_key));
-        } else {
-            tracing::warn!("OpenAI Compat: No API key configured — request will be unauthenticated");
-        }
+            let mut request_builder = client
+                .post(&endpoint)
+                .header("Content-Type", "application/json")
+                .body(body_str);
 
-        let response = match request_builder.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.send(StreamMessage::Error {
-                    message: format!("Network error: {}", e),
-                });
-                return;
+            if let Some(api_key) = &self.config.api_key {
+                request_builder =
+                    request_builder.header("Authorization", format!("Bearer {}", api_key));
+            } else {
+                tracing::warn!("OpenAI Compat: No API key configured — request will be unauthenticated");
             }
-        };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let _ = tx.send(StreamMessage::Error {
-                message: format!("OpenAI API Error [{}]: {}", status, body),
-            });
-            return;
-        }
-
-        let mut stream = response.bytes_stream();
-
-        // State for tracking <think>/<thinking> tag boundaries across chunks
-        // Disabled for real OpenAI — GPT-5.x uses hidden reasoning tokens, never <think> tags
-        let is_real_openai = self.is_real_openai();
-        let mut inside_think = false;
-        let mut think_buffer = String::new();
-
-        // State for detecting inline <tool_call> tags (Hermes/Qwen format)
-        // When vLLM doesn't produce structured tool_calls, Qwen wraps them as:
-        //   <tool_call>{"name": "fn_name", "arguments": {"key": "value"}}</tool_call>
-        let mut inside_tool_call = false;
-        let mut tool_call_buffer = String::new();
-
-        // State for accumulating tool calls across streaming chunks.
-        // OpenAI sends tool calls incrementally: `name` and `id` in the first chunk,
-        // then `arguments` as partial JSON strings across subsequent chunks.
-        // We accumulate here and flush when Done or stream ends.
-        #[allow(dead_code)]
-        struct PendingToolCall {
-            id: String,
-            name: String,
-            server_name: String,
-            arguments: String,
-        }
-        let mut pending_tool_calls: Vec<PendingToolCall> = Vec::new();
-
-        // Thought summary accumulated during thinking phase (to attach to tool calls)
-        let mut accumulated_thought_summary: Option<String> = None;
-
-        // Helper closure: flush all pending tool calls as StreamMessage::ToolCall
-        let flush_tool_calls =
-            |pending: &mut Vec<PendingToolCall>,
-             tx: &mpsc::UnboundedSender<StreamMessage>,
-             thought_summary: &mut Option<String>| {
-                for tc in pending.drain(..) {
-                    let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
-                    let tool_call = ToolCall::new(
-                        tc.server_name,
-                        tc.name,
-                        args,
-                        None, // thought_signature - not available from OpenAI compat
-                        thought_summary.take(), // attach thinking to the first tool call
-                    );
-                    tracing::info!(
-                        "OpenAI Compat: Sending tool call '{}' on server '{}'",
-                        tool_call.tool_name,
-                        tool_call.server_name
-                    );
-                    let _ = tx.send(StreamMessage::ToolCall(tool_call));
-                }
-            };
-
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(bytes) => {
-                    let chunk = String::from_utf8_lossy(&bytes);
-                    let events = self.parse_stream_chunk(&chunk);
-                    for event in events {
-                        match event {
-                            StreamEvent::Thinking { text, .. } => {
-                                // Native reasoning_content from DeepSeek API
-                                // Accumulate for potential attachment to tool calls
-                                if let Some(ref mut summary) = accumulated_thought_summary {
-                                    summary.push_str(&text);
-                                } else {
-                                    accumulated_thought_summary = Some(text.clone());
-                                }
-                                let _ = tx.send(StreamMessage::Text {
-                                    content: String::new(),
-                                    thought_signature: None,
-                                    thought_summary: Some(text),
-                                });
-                            }
-                            StreamEvent::Text { content } => {
-                                // First, check for inline <tool_call> tags (Hermes/Qwen format)
-                                // These appear when vLLM doesn't produce structured tool_calls
-                                let mut text_to_process = content;
-                                let mut remaining_text = String::new();
-
-                                // Handle tool_call tag boundaries in the text stream
-                                loop {
-                                    if inside_tool_call {
-                                        // We're accumulating a tool call — look for </tool_call>
-                                        if let Some(end_pos) = text_to_process.find("</tool_call>")
-                                        {
-                                            // Complete the tool call buffer
-                                            tool_call_buffer.push_str(&text_to_process[..end_pos]);
-                                            let after = text_to_process[end_pos + 12..].to_string(); // skip "</tool_call>"
-
-                                            // Parse the buffered JSON and emit as tool call
-                                            Self::parse_inline_tool_call(
-                                                &tool_call_buffer,
-                                                &tx,
-                                                &mut accumulated_thought_summary,
-                                                &|sanitized| self.resolve_tool_call(sanitized),
-                                            );
-
-                                            tool_call_buffer.clear();
-                                            inside_tool_call = false;
-
-                                            // Continue processing remaining text after </tool_call>
-                                            text_to_process = after;
-                                            continue;
-                                        } else {
-                                            // No closing tag yet — buffer everything
-                                            tool_call_buffer.push_str(&text_to_process);
-                                            break;
-                                        }
-                                    } else {
-                                        // Not inside a tool call — look for <tool_call>
-                                        if let Some(start_pos) = text_to_process.find("<tool_call>")
-                                        {
-                                            // Emit text before the tag
-                                            remaining_text.push_str(&text_to_process[..start_pos]);
-                                            inside_tool_call = true;
-                                            text_to_process =
-                                                text_to_process[start_pos + 11..].to_string(); // skip "<tool_call>"
-                                            continue;
-                                        } else {
-                                            // No tool_call tag — pass through
-                                            remaining_text.push_str(&text_to_process);
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                // Process remaining (non-tool-call) text through think tag detection
-                                // Skip for real OpenAI — GPT-5.x uses hidden reasoning tokens,
-                                // never produces <think>/<thinking> tags. Parsing them would
-                                // only catch echoed tags from our own history injection.
-                                if !remaining_text.is_empty() {
-                                    if is_real_openai {
-                                        // Real OpenAI: pass text straight through, no tag parsing
-                                        let _ = tx.send(StreamMessage::Text {
-                                            content: remaining_text,
-                                            thought_signature: None,
-                                            thought_summary: None,
-                                        });
-                                    } else {
-                                        let processed = self.split_think_tags(
-                                            &remaining_text,
-                                            &mut inside_think,
-                                            &mut think_buffer,
-                                        );
-                                        for (is_thinking, text) in processed {
-                                            if is_thinking {
-                                                // Accumulate thinking for potential tool call attachment
-                                                if let Some(ref mut summary) =
-                                                    accumulated_thought_summary
-                                                {
-                                                    summary.push_str(&text);
-                                                } else {
-                                                    accumulated_thought_summary = Some(text.clone());
-                                                }
-                                                let _ = tx.send(StreamMessage::Text {
-                                                    content: String::new(),
-                                                    thought_signature: None,
-                                                    thought_summary: Some(text),
-                                                });
-                                            } else if !text.is_empty() {
-                                                let _ = tx.send(StreamMessage::Text {
-                                                    content: text,
-                                                    thought_signature: None,
-                                                    thought_summary: None,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            StreamEvent::ToolCall {
-                                id,
-                                name,
-                                arguments,
-                                ..
-                            } => {
-                                // OpenAI streams tool calls incrementally:
-                                //   Chunk 1: id + name (arguments empty)
-                                //   Chunk 2+: arguments fragments
-                                // We match by index position in our pending_tool_calls vec.
-                                // If `name` is non-empty, it's a new tool call declaration.
-                                // If `name` is empty, it's an argument fragment for the last pending call.
-                                if !name.is_empty() {
-                                    // Resolve server/tool name using the pre-built map.
-                                    // The map uses get_prefixed_tool_name format (same as prompt_builder)
-                                    // to ensure definitions and history names are consistent.
-                                    let (resolved_server, resolved_tool) = if let Some((
-                                        server,
-                                        tool,
-                                    )) =
-                                        tool_name_map.get(&name)
-                                    {
-                                        (server.clone(), tool.clone())
-                                    } else {
-                                        // Fallback: split at first underscore for names not in the map
-                                        tracing::warn!(
-                                            "OpenAI Compat: Tool name '{}' not found in tool_name_map, falling back to underscore split",
-                                            name
-                                        );
-                                        self.resolve_tool_call(&name)
-                                    };
-                                    pending_tool_calls.push(PendingToolCall {
-                                        id,
-                                        name: resolved_tool,
-                                        server_name: resolved_server,
-                                        // CRITICAL: Use .as_str() not .to_string()!
-                                        // arguments is a serde_json::Value wrapping a string fragment.
-                                        // .to_string() produces quoted JSON repr ("\"\""), but we need
-                                        // raw string for accumulation with subsequent fragments.
-                                        arguments: arguments.as_str().unwrap_or("").to_string(),
-                                    });
-                                } else if let Some(last) = pending_tool_calls.last_mut() {
-                                    // Argument fragment — append to last pending tool call
-                                    let frag = arguments.as_str().unwrap_or("");
-                                    last.arguments.push_str(frag);
-                                }
-                            }
-                            StreamEvent::Usage(usage) => {
-                                let _ = tx.send(StreamMessage::Usage(usage));
-                            }
-                            StreamEvent::Done => {
-                                // Flush any pending tool calls before returning
-                                flush_tool_calls(
-                                    &mut pending_tool_calls,
-                                    &tx,
-                                    &mut accumulated_thought_summary,
-                                );
-                                return;
-                            }
-                            StreamEvent::Error { message } => {
-                                let _ = tx.send(StreamMessage::Error { message });
-                                return;
-                            }
-                        }
-                    }
-                }
+            let response = match request_builder.send().await {
+                Ok(r) => r,
                 Err(e) => {
                     let _ = tx.send(StreamMessage::Error {
-                        message: format!("Stream error: {}", e),
+                        message: format!("Network error: {}", e),
                     });
                     return;
                 }
-            }
-        }
+            };
 
-        // Stream ended without explicit [DONE] — flush any pending tool calls
-        flush_tool_calls(
-            &mut pending_tool_calls,
-            &tx,
-            &mut accumulated_thought_summary,
-        );
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let friendly_message = Self::format_api_error(status.as_u16(), &body, &self.config);
+                let _ = tx.send(StreamMessage::Error {
+                    message: friendly_message,
+                });
+                return;
+            }
+
+            let mut stream = response.bytes_stream();
+
+            // State for tracking <think>/<thinking> tag boundaries across chunks
+            // Disabled for real OpenAI — GPT-5.x uses hidden reasoning tokens, never <think> tags
+            let is_real_openai = self.is_real_openai();
+            let mut inside_think = false;
+            let mut think_buffer = String::new();
+
+            // State for detecting inline <tool_call> tags (Hermes/Qwen format)
+            // When vLLM doesn't produce structured tool_calls, Qwen wraps them as:
+            //   <tool_call>{"name": "fn_name", "arguments": {"key": "value"}}</tool_call>
+            let mut inside_tool_call = false;
+            let mut tool_call_buffer = String::new();
+
+            // State for accumulating tool calls across streaming chunks.
+            // OpenAI sends tool calls incrementally: `name` and `id` in the first chunk,
+            // then `arguments` as partial JSON strings across subsequent chunks.
+            // We accumulate here and flush when Done or stream ends.
+            #[allow(dead_code)]
+            struct PendingToolCall {
+                id: String,
+                name: String,
+                server_name: String,
+                arguments: String,
+            }
+            let mut pending_tool_calls: Vec<PendingToolCall> = Vec::new();
+
+            // Thought summary accumulated during thinking phase (to attach to tool calls)
+            let mut accumulated_thought_summary: Option<String> = None;
+
+            // Track whether we've sent any data to the UI — if so, retrying would duplicate output
+            let mut has_sent_data = false;
+
+            // Helper closure: flush all pending tool calls as StreamMessage::ToolCall
+            let flush_tool_calls =
+                |pending: &mut Vec<PendingToolCall>,
+                 tx: &mpsc::UnboundedSender<StreamMessage>,
+                 thought_summary: &mut Option<String>| {
+                    for tc in pending.drain(..) {
+                        let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+                        let tool_call = ToolCall::new(
+                            tc.server_name,
+                            tc.name,
+                            args,
+                            None, // thought_signature - not available from OpenAI compat
+                            thought_summary.take(), // attach thinking to the first tool call
+                        );
+                        tracing::debug!(
+                            "OpenAI Compat: Sending tool call '{}' on server '{}'",
+                            tool_call.tool_name,
+                            tool_call.server_name
+                        );
+                        let _ = tx.send(StreamMessage::ToolCall(tool_call));
+                    }
+                };
+
+            let mut last_raw_chunk = String::new();
+
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(bytes) => {
+                        let chunk = String::from_utf8_lossy(&bytes);
+                        last_raw_chunk = chunk.to_string();
+                        let events = self.parse_stream_chunk(&chunk);
+                        for event in events {
+                            match event {
+                                StreamEvent::Thinking { text, .. } => {
+                                    // Native reasoning from provider (reasoning_content or reasoning field)
+                                    // Accumulate for potential attachment to tool calls
+                                    if let Some(ref mut summary) = accumulated_thought_summary {
+                                        summary.push_str(&text);
+                                    } else {
+                                        accumulated_thought_summary = Some(text.clone());
+                                    }
+                                    let _ = tx.send(StreamMessage::Text {
+                                        content: String::new(),
+                                        thought_signature: None,
+                                        thought_summary: Some(text),
+                                    });
+                                    has_sent_data = true;
+                                }
+                                StreamEvent::Text { content } => {
+                                    // First, check for inline <tool_call> tags (Hermes/Qwen format)
+                                    // These appear when vLLM doesn't produce structured tool_calls
+                                    let mut text_to_process = content;
+                                    let mut remaining_text = String::new();
+
+                                    // Handle tool_call tag boundaries in the text stream
+                                    loop {
+                                        if inside_tool_call {
+                                            // We're accumulating a tool call — look for </tool_call>
+                                            if let Some(end_pos) = text_to_process.find("</tool_call>")
+                                            {
+                                                // Complete the tool call buffer
+                                                tool_call_buffer.push_str(&text_to_process[..end_pos]);
+                                                let after = text_to_process[end_pos + 12..].to_string(); // skip "</tool_call>"
+
+                                                // Parse the buffered JSON and emit as tool call
+                                                Self::parse_inline_tool_call(
+                                                    &tool_call_buffer,
+                                                    &tx,
+                                                    &mut accumulated_thought_summary,
+                                                    &|sanitized| self.resolve_tool_call(sanitized),
+                                                );
+
+                                                tool_call_buffer.clear();
+                                                inside_tool_call = false;
+
+                                                // Continue processing remaining text after </tool_call>
+                                                text_to_process = after;
+                                                continue;
+                                            } else {
+                                                // No closing tag yet — buffer everything
+                                                tool_call_buffer.push_str(&text_to_process);
+                                                break;
+                                            }
+                                        } else {
+                                            // Not inside a tool call — look for <tool_call>
+                                            if let Some(start_pos) = text_to_process.find("<tool_call>")
+                                            {
+                                                // Emit text before the tag
+                                                remaining_text.push_str(&text_to_process[..start_pos]);
+                                                inside_tool_call = true;
+                                                text_to_process =
+                                                    text_to_process[start_pos + 11..].to_string(); // skip "<tool_call>"
+                                                continue;
+                                            } else {
+                                                // No tool_call tag — pass through
+                                                remaining_text.push_str(&text_to_process);
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    // Process remaining (non-tool-call) text through think tag detection
+                                    // Skip for real OpenAI — GPT-5.x uses hidden reasoning tokens,
+                                    // never produces <think>/<thinking> tags. Parsing them would
+                                    // only catch echoed tags from our own history injection.
+                                    if !remaining_text.is_empty() {
+                                        if is_real_openai {
+                                            // Real OpenAI: pass text straight through, no tag parsing
+                                            let _ = tx.send(StreamMessage::Text {
+                                                content: remaining_text,
+                                                thought_signature: None,
+                                                thought_summary: None,
+                                            });
+                                        } else {
+                                            let processed = self.split_think_tags(
+                                                &remaining_text,
+                                                &mut inside_think,
+                                                &mut think_buffer,
+                                            );
+                                            for (is_thinking, text) in processed {
+                                                if is_thinking {
+                                                    // Accumulate thinking for potential tool call attachment
+                                                    if let Some(ref mut summary) =
+                                                        accumulated_thought_summary
+                                                    {
+                                                        summary.push_str(&text);
+                                                    } else {
+                                                        accumulated_thought_summary = Some(text.clone());
+                                                    }
+                                                    let _ = tx.send(StreamMessage::Text {
+                                                        content: String::new(),
+                                                        thought_signature: None,
+                                                        thought_summary: Some(text),
+                                                    });
+                                                } else if !text.is_empty() {
+                                                    let _ = tx.send(StreamMessage::Text {
+                                                        content: text,
+                                                        thought_signature: None,
+                                                        thought_summary: None,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        has_sent_data = true;
+                                    }
+                                }
+                                StreamEvent::ToolCall {
+                                    id,
+                                    name,
+                                    arguments,
+                                    ..
+                                } => {
+                                    // OpenAI streams tool calls incrementally:
+                                    //   Chunk 1: id + name (arguments empty)
+                                    //   Chunk 2+: arguments fragments
+                                    // We match by index position in our pending_tool_calls vec.
+                                    // If `name` is non-empty, it's a new tool call declaration.
+                                    // If `name` is empty, it's an argument fragment for the last pending call.
+                                    if !name.is_empty() {
+                                        // Resolve server/tool name using the pre-built map.
+                                        // The map uses get_prefixed_tool_name format (same as prompt_builder)
+                                        // to ensure definitions and history names are consistent.
+                                        let (resolved_server, resolved_tool) = if let Some((
+                                            server,
+                                            tool,
+                                        )) =
+                                            tool_name_map.get(&name)
+                                        {
+                                            (server.clone(), tool.clone())
+                                        } else {
+                                            // Fallback: split at first underscore for names not in the map
+                                            tracing::warn!(
+                                                "OpenAI Compat: Tool name '{}' not found in tool_name_map, falling back to underscore split",
+                                                name
+                                            );
+                                            self.resolve_tool_call(&name)
+                                        };
+                                        pending_tool_calls.push(PendingToolCall {
+                                            id,
+                                            name: resolved_tool,
+                                            server_name: resolved_server,
+                                            // CRITICAL: Use .as_str() not .to_string()!
+                                            // arguments is a serde_json::Value wrapping a string fragment.
+                                            // .to_string() produces quoted JSON repr ("\"\""), but we need
+                                            // raw string for accumulation with subsequent fragments.
+                                            arguments: arguments.as_str().unwrap_or("").to_string(),
+                                        });
+                                    } else if let Some(last) = pending_tool_calls.last_mut() {
+                                        // Argument fragment — append to last pending tool call
+                                        let frag = arguments.as_str().unwrap_or("");
+                                        last.arguments.push_str(frag);
+                                    }
+                                    has_sent_data = true;
+                                }
+                                StreamEvent::Usage(usage) => {
+                                    let _ = tx.send(StreamMessage::Usage(usage));
+                                }
+                                StreamEvent::Done => {
+                                    // Flush any pending tool calls before returning
+                                    flush_tool_calls(
+                                        &mut pending_tool_calls,
+                                        &tx,
+                                        &mut accumulated_thought_summary,
+                                    );
+                                    return;
+                                }
+                                StreamEvent::Error { message } => {
+                                    let _ = tx.send(StreamMessage::Error { message });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Dump the exact payload returned by vLLM before error decoding failure
+                        tracing::error!(
+                            "OpenAI Compat Stream Error! Last received chunk before drop:\n---\n{}\n---",
+                            last_raw_chunk
+                        );
+
+                        // Autorecovery: if no data has been sent yet and we have retries left,
+                        // retry the full request. This handles transient stream decode errors
+                        // (e.g. "error decoding response body") from vLLM.
+                        if !has_sent_data && attempt < MAX_STREAM_RETRIES {
+                            tracing::warn!(
+                                "OpenAI Compat: Stream error on attempt {} (no data sent yet), retrying: {}",
+                                attempt + 1, e
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue 'retry;
+                        }
+                        let _ = tx.send(StreamMessage::Error {
+                            message: format!("Stream error: {}", e),
+                        });
+                        return;
+                    }
+                }
+            }
+
+            // Stream ended without explicit [DONE] — flush any pending tool calls
+            flush_tool_calls(
+                &mut pending_tool_calls,
+                &tx,
+                &mut accumulated_thought_summary,
+            );
+            break; // success — don't retry
+        }
     }
 
     async fn summarize_conversation(
@@ -399,6 +433,7 @@ impl LlmConnector for OpenAiCompatConnector {
             .config
             .summary_model
             .as_ref()
+            .filter(|s| !s.is_empty())
             .unwrap_or(&self.config.model)
             .clone();
 
@@ -413,7 +448,7 @@ impl LlmConnector for OpenAiCompatConnector {
             )) as Box<dyn std::error::Error + Send + Sync>);
         }
 
-        tracing::info!(model = %summary_model, "LLM: Summarizing (OpenAI Compat)");
+        tracing::debug!(model = %summary_model, "LLM: Summarizing (OpenAI Compat)");
 
         let base = self.config.endpoint.trim_end_matches('/');
         let endpoint = if base.ends_with("/v1") {
@@ -455,7 +490,7 @@ You MUST respond with valid JSON containing exactly these fields:
 
         // Dump truncated JSON to verify model is actually in the serialized body
         let body_str = serde_json::to_string(&request_body).unwrap_or_default();
-        tracing::info!(
+        tracing::debug!(
             "Summarizer request: endpoint='{}', body_start='{}'",
             endpoint,
             &body_str[..body_str.len().min(200)],
@@ -818,8 +853,13 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                                 }
                             }
 
-                            // Native reasoning_content (DeepSeek API, some OpenAI-compat providers)
-                            if let Some(reasoning) = choice["delta"]["reasoning_content"].as_str() {
+                            // Native reasoning content (multiple field names across providers):
+                            // - "reasoning_content": DeepSeek API
+                            // - "reasoning": vLLM with Qwen 3.5 (--enable-reasoning)
+                            let reasoning = choice["delta"]["reasoning_content"]
+                                .as_str()
+                                .or_else(|| choice["delta"]["reasoning"].as_str());
+                            if let Some(reasoning) = reasoning {
                                 if !reasoning.is_empty() {
                                     events.push(StreamEvent::Thinking {
                                         text: reasoning.to_string(),
@@ -981,7 +1021,7 @@ impl OpenAiCompatConnector {
         resolve_fn: &dyn Fn(&str) -> (String, String),
     ) {
         let trimmed = buffer.trim();
-        tracing::debug!("OpenAI Compat: Parsing inline tool_call: {}", trimmed);
+        tracing::trace!("OpenAI Compat: Parsing inline tool_call: {}", trimmed);
 
         match serde_json::from_str::<Value>(trimmed) {
             Ok(val) => {
@@ -1016,7 +1056,7 @@ impl OpenAiCompatConnector {
                     None,
                     thought_summary.take(),
                 );
-                tracing::info!(
+                tracing::debug!(
                     "OpenAI Compat: Inline tool call '{}' on server '{}'",
                     tool_name,
                     server_name
@@ -1038,4 +1078,65 @@ impl OpenAiCompatConnector {
             }
         }
     }
+
+    /// Parse common OpenAI-compatible API error patterns and produce user-friendly
+    /// error messages that guide users to the correct settings.
+    fn format_api_error(status: u16, body: &str, config: &OpenAiCompatConfig) -> String {
+        let body_lower = body.to_lowercase();
+
+        // Context length / input token overflow
+        if body_lower.contains("context length")
+            || body_lower.contains("input_tokens")
+            || body_lower.contains("maximum context")
+            || body_lower.contains("reduce the length")
+        {
+            let max_ctx = config
+                .max_context_tokens
+                .map(|t| format!("{}", t))
+                .unwrap_or_else(|| "not set".to_string());
+            return format!(
+                "⚠️ **Prompt Too Large**\n\n\
+                Your prompt exceeds this model's context window \
+                (auto-detected: **{}** tokens).\n\n\
+                Try reducing conversation history, loaded tools, \
+                or switch to a model with a larger context window.",
+                max_ctx
+            );
+        }
+
+        // Model not found / invalid model
+        if body_lower.contains("model_not_found")
+            || body_lower.contains("model not found")
+            || body_lower.contains("does not exist")
+        {
+            return format!(
+                "⚠️ **Model Not Found**\n\n\
+                The model '{}' was not found on this server.\n\n\
+                **→ Go to Settings → LLM Configuration** and click \
+                **Refresh** to see available models.",
+                config.model
+            );
+        }
+
+        // Authentication errors
+        if status == 401
+            || status == 403
+            || body_lower.contains("unauthorized")
+            || body_lower.contains("invalid api key")
+            || body_lower.contains("authentication")
+        {
+            return "⚠️ **Authentication Failed**\n\n\
+                The server rejected your API key.\n\n\
+                **→ Go to Settings → LLM Configuration** and check your API Key."
+                .to_string();
+        }
+
+        // Fallback: show raw error with guidance
+        format!(
+            "⚠️ **Server Error [{}]**\n\n{}\n\n\
+            If this persists, check **Settings → LLM Configuration**.",
+            status, body
+        )
+    }
 }
+

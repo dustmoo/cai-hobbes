@@ -982,10 +982,12 @@ fn StatusView(trigger_search: Signal<i32>) -> Element {
     let (total_tools, loaded_tools) = match server_statuses.read().as_ref() {
         Some(statuses) => {
             let total: usize = statuses.iter().map(|s| s.tools).sum();
+            // Use loaded_tools (not tools) so on-demand servers only count
+            // tools they've explicitly loaded via MCP_LOAD_SERVER_TOOLS.
             let loaded: usize = statuses
                 .iter()
                 .filter(|s| s.is_loaded)
-                .map(|s| s.tools)
+                .map(|s| s.loaded_tools)
                 .sum();
             (total, loaded)
         }
@@ -1862,7 +1864,7 @@ fn McpServerCard(
                                         class: "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors",
                                         onclick: {
                                             if mcp.name == "news_api" {
-                                                tracing::error!("DEBUG: Rendering Connect button for news_api. Auth: {:?}, Managed: {}", mcp.auth_scheme, mcp.use_managed_auth);
+                                                tracing::trace!("Rendering Connect button for news_api. Auth: {:?}, Managed: {}", mcp.auth_scheme, mcp.use_managed_auth);
                                             }
                                             let toolkit_slug = mcp.name.clone();
                                             let auth_scheme = mcp.auth_scheme.clone();

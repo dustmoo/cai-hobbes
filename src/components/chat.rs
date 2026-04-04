@@ -18,6 +18,7 @@ use crate::session::ActiveContext;
 use crate::settings::Settings;
 use dioxus::html::geometry::euclid::Rect;
 use dioxus::prelude::*;
+use std::collections::HashMap;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use feature_clipboard::copy_to_clipboard;
 use hobbes_core::models::Attachment;
@@ -76,6 +77,9 @@ pub struct Message {
     pub usage: Option<crate::components::shared::UsageData>,
 }
 
+#[derive(Clone, Copy)]
+pub struct ExpansionStateContext(pub Signal<HashMap<String, bool>>);
+
 // The main ChatWindow component
 #[component]
 pub fn ChatWindow(
@@ -86,8 +90,13 @@ pub fn ChatWindow(
     let mut settings = use_context::<Signal<Settings>>();
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
-    let permission_manager = use_context::<Signal<PermissionManager>>();
+    let mut permission_manager = use_context::<Signal<PermissionManager>>();
     let mut chat_command = use_context::<Signal<Option<super::chat_input::ChatCommand>>>();
+
+    // Shared expansion state for <details> blocks in MarkdownRenderer.
+    // Key format: "message_id:block_index"
+    let expansion_state = use_signal(HashMap::<String, bool>::new);
+    use_context_provider(|| ExpansionStateContext(expansion_state));
 
     // Consume current_session_id from global context
     let SessionIdContext(current_session_id_signal) = use_context::<SessionIdContext>();
@@ -212,6 +221,10 @@ pub fn ChatWindow(
         last_session_id.with_mut(|last_id| {
             if current_session_id != *last_id {
                 is_session_switch = true;
+                // Reset continuation guard on tab switch (Pattern 138.1 cleanup)
+                continuation_controller.write().force_reset();
+                // Reset turn count so the new tab starts fresh
+                permission_manager.write().reset_turn_count();
                 *last_id = current_session_id;
             }
         });
@@ -319,8 +332,13 @@ pub fn ChatWindow(
                 }
 
                 if tools_to_run.is_empty() {
-                    // This could be a Skill continuation (no tools to run)
-                    continuation_controller.write().trigger_continuation();
+                    // This could be a Skill continuation (no tools to run).
+                    // Reset is_sending since we won't be executing any tools —
+                    // the continuation_controller handles the LLM trigger.
+                    stream_manager_is_sending.set(false);
+                    // Force-clear in case a previous continuation left the guard stale
+                    continuation_controller.write().force_reset();
+                    continuation_controller.write().trigger_continuation(active_session_id.clone());
                     return;
                 }
 
@@ -328,23 +346,30 @@ pub fn ChatWindow(
                 for (msg_id, tool_call) in tools_to_run {
                     let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                         .unwrap_or(serde_json::Value::Null);
-                    // Bypass permission check since user explicitly approved this instance
-                    let manager = mcp_manager.read().clone();
-                    let result_receiver = manager
-                        .use_mcp_tool(
-                            &tool_call.server_name,
-                            &tool_call.tool_name,
-                            args_json,
-                            true,
-                            composio_profile.clone(),
-                        )
-                        .await;
 
-                    let (status, response_str, _) = match result_receiver {
-                        Ok(receiver) => {
-                            crate::mcp::manager::McpManager::process_tool_output(receiver).await
-                        }
-                        Err(e) => (crate::components::shared::ToolCallStatus::Error, e, false),
+                    // Intercept HOBBES_PAGE_RESULT before MCP dispatch
+                    let (status, response_str) = if tool_call.tool_name == "HOBBES_PAGE_RESULT" {
+                        session_state.write().handle_page_result(&args_json, "")
+                    } else {
+                        // Normal MCP tool dispatch
+                        let manager = mcp_manager.read().clone();
+                        let result_receiver = manager
+                            .use_mcp_tool(
+                                &tool_call.server_name,
+                                &tool_call.tool_name,
+                                args_json,
+                                true,
+                                composio_profile.clone(),
+                            )
+                            .await;
+
+                        let (s, r, _) = match result_receiver {
+                            Ok(receiver) => {
+                                crate::mcp::manager::McpManager::process_tool_output(receiver).await
+                            }
+                            Err(e) => (crate::components::shared::ToolCallStatus::Error, e, false),
+                        };
+                        (s, r)
                     };
 
                     // Update session state with result
@@ -382,7 +407,7 @@ pub fn ChatWindow(
                 }
 
                 // 3. Trigger continuation to send results back to LLM
-                continuation_controller.write().trigger_continuation();
+                continuation_controller.write().trigger_continuation(active_session_id.clone());
             });
         }
     });
@@ -504,16 +529,21 @@ pub fn ChatWindow(
                                 fetch_fresh_mcp_context(target_id.clone(), settings_read.clone())
                                     .await;
 
-                            let prompt_data = {
+                            let (prompt_data, pages) = {
                                 let state = session_state.read();
                                 if let Some(session) = state.sessions.get(&target_id) {
                                     let builder =
                                         PromptBuilder::new(session, &settings_read, &state);
-                                    builder.build_prompt("".to_string(), None)
+                                    let result = builder.build_prompt("".to_string(), None);
+                                    (result.prompt, result.pages_to_store)
                                 } else {
                                     return;
                                 }
                             };
+                            // Store paginated pages in a separate write scope (clean borrow separation)
+                            if !pages.is_empty() {
+                                session_state.write().store_pages(pages);
+                            }
 
                             let mcp_context = if fresh_mcp_context.servers.is_empty() {
                                 None
@@ -614,17 +644,22 @@ pub fn ChatWindow(
                         }
                     }
 
-                    let prompt_data = {
+                    let (prompt_data, pages) = {
                         let user_prompt = user_message.clone();
                         let state = session_state.read();
                         if let Some(session) = state.sessions.get(&target_id) {
                             let builder = PromptBuilder::new(session, &settings_read, &state);
-                            builder.build_prompt(user_prompt, None)
+                            let result = builder.build_prompt(user_prompt, None);
+                            (result.prompt, result.pages_to_store)
                         } else {
                             tracing::error!("No active session found when building prompt");
                             return;
                         }
                     };
+                    // Store paginated pages in a separate write scope (clean borrow separation)
+                    if !pages.is_empty() {
+                        session_state.write().store_pages(pages);
+                    }
 
                     crate::session::SessionState::save_async(&session_state.read(), None);
 
@@ -655,15 +690,14 @@ pub fn ChatWindow(
     };
 
     let continue_prompt_flow = {
-        Rc::new(move || {
-            tracing::debug!("continue_prompt_flow callback INVOKED.");
+        Rc::new(move |target_id: String| {
+            tracing::debug!("continue_prompt_flow callback INVOKED for session '{}'", target_id);
             spawn(async move {
-                tracing::debug!("continue_prompt_flow task SPAWNED.");
+                tracing::debug!(session_id = %target_id, "continue_prompt_flow task SPAWNED.");
                 let mut session_state = session_state;
                 let settings = settings.read().clone();
 
                 let hobbes_message_id = Uuid::new_v4();
-                let target_id = current_target_id.read().clone();
                 {
                     let mut state = session_state.write();
                     if let Some(session) = state.sessions.get_mut(&target_id) {
@@ -688,11 +722,12 @@ pub fn ChatWindow(
                 let fresh_mcp_context =
                     fetch_fresh_mcp_context(target_id.clone(), settings.clone()).await;
 
-                let prompt_data = {
+                let (prompt_data, pages) = {
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&target_id) {
                         let builder = PromptBuilder::new(session, &settings, &state);
-                        builder.build_prompt("".to_string(), None)
+                        let result = builder.build_prompt("".to_string(), None);
+                        (result.prompt, result.pages_to_store)
                     } else {
                         tracing::error!(
                             "Active session lost during continuation flow - aborting prompt build"
@@ -700,6 +735,10 @@ pub fn ChatWindow(
                         return;
                     }
                 };
+                // Store paginated pages in a separate write scope (clean borrow separation)
+                if !pages.is_empty() {
+                    session_state.write().store_pages(pages);
+                }
 
                 crate::session::SessionState::save_async(&session_state.read(), None);
 
@@ -1213,7 +1252,7 @@ pub fn MessageBubble(
                     while let Ok(msg) = eval.recv().await {
                         if let Ok(data) = serde_json::from_value::<SelectionData>(msg) {
                             if data.hide {
-                                if !*is_mouse_over_toolbar.read() {
+                                if !*is_mouse_over_toolbar.read() && *selection_mode.read() == SelectionMode::Toolbar {
                                     selection_mode.set(SelectionMode::None);
                                 }
                             } else if !data.text.trim().is_empty() {
@@ -1341,9 +1380,10 @@ pub fn MessageBubble(
                                 }
                             } else {
                                 MarkdownRenderer {
+                                    id: Some(message.id),
                                     content: content(),
                                     comments: message.comments.clone(),
-                                    pending_highlight: if *selection_mode.read() != SelectionMode::None && *selection_mode.read() != SelectionMode::CommentEdit {
+                                    pending_highlight: if *selection_mode.read() == SelectionMode::CommentInput {
                                         Some(selection_data.read().text.clone())
                                     } else {
                                         None
@@ -1377,11 +1417,15 @@ pub fn MessageBubble(
                                     }
                                 }
 
-                                if content().starts_with("[Hobbes encountered a persistent error") {
+                                if content().starts_with("[Hobbes encountered a persistent error") 
+                                    || content().starts_with("⚠️ **Tool Not Available")
+                                    || content().starts_with("⚠️ **Tool Connection Issue")
+                                    || content().starts_with("⚠️ **Tool Call Error") {
                                     QuickFix {
                                         suggestions: vec![
+                                            "Check your tool syntax and try again.".to_string(),
+                                            "Loaded filesystem use directly please.".to_string(),
                                             "You are using bad syntax, the user has loaded the tools please try again.".to_string(),
-                                            "Please check your tool syntax & attributes and try again..".to_string(),
                                         ],
                                         on_select: move |suggestion: String| {
                                             chat_input_draft.set(suggestion);

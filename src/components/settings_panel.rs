@@ -79,25 +79,48 @@ pub fn SettingsPanel() -> Element {
     });
 
     // Effect to fetch OpenAI-compat models — trigger-only (not endpoint-reactive)
-    // Uses peek() for config reads to avoid firing on every keystroke
+    // Uses peek() for config reads to avoid firing on every keystroke.
+    // Uses the context-aware discovery to auto-detect max_model_len from vLLM.
     use_effect(move || {
         let _trigger = oai_models_fetch_trigger.read(); // Only subscribe to trigger
         let endpoint = local_settings.peek().openai_compat_config.endpoint.clone();
         let api_key = local_settings.peek().openai_compat_config.api_key.clone();
+        let current_model = local_settings.peek().openai_compat_config.model.clone();
 
         if !endpoint.is_empty() {
             oai_models_loading.set(true);
             oai_models_error.set(None);
 
             spawn(async move {
-                match crate::services::openai_compat_validation::fetch_openai_compat_models(
+                match crate::services::openai_compat_validation::fetch_openai_compat_models_with_context(
                     &endpoint,
                     api_key.as_deref(),
                 )
                 .await
                 {
-                    Ok(models) => {
-                        oai_available_models.set(models);
+                    Ok(discovered) => {
+                        // Auto-detect context length from the currently selected model.
+                        // IMPORTANT: Write to global `settings` (not `local_settings`) to avoid
+                        // dirtying the unsaved-changes tracker. The sync-back effect propagates
+                        // global → local cleanly without triggering scroll-resetting re-renders.
+                        if !current_model.is_empty() {
+                            if let Some(model_info) = discovered.iter().find(|m| m.id == current_model) {
+                                if let Some(ctx_len) = model_info.context_length {
+                                    let existing = settings.peek().openai_compat_config.max_context_tokens;
+                                    if existing != Some(ctx_len) {
+                                        tracing::info!(
+                                            "Auto-detected context window: {} tokens for model '{}'",
+                                            ctx_len, current_model
+                                        );
+                                        settings.write().openai_compat_config.max_context_tokens = Some(ctx_len);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Extract model IDs for the dropdown
+                        let model_ids: Vec<String> = discovered.into_iter().map(|m| m.id).collect();
+                        oai_available_models.set(model_ids);
                         oai_models_loading.set(false);
                     }
                     Err(e) => {
@@ -728,6 +751,52 @@ pub fn SettingsPanel() -> Element {
                                         }
                                     }
 
+                                    // Image Generation Model
+                                    div {
+                                        class: "mb-4",
+                                        label { class: "block text-sm font-medium text-fg-muted", "Image Generation Model" }
+                                        if local_settings.read().gemini_config.api_key.is_none() {
+                                            p {
+                                                class: "mt-1 text-sm text-fg-muted italic",
+                                                "Please configure your API key above to load available models"
+                                            }
+                                        } else if *models_loading.read() {
+                                            p {
+                                                class: "mt-1 text-sm text-fg-muted italic",
+                                                "Loading available models..."
+                                            }
+                                        } else {
+                                            select {
+                                                class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                value: "{local_settings.read().image_generation_config.model}",
+                                                onchange: move |event| {
+                                                    local_settings.write().image_generation_config.model = event.value();
+                                                },
+                                                {
+                                                    let current = local_settings.read().image_generation_config.model.clone();
+                                                    let models = available_models.read();
+                                                    // Filter for image-capable models (name contains "image")
+                                                    let image_models: Vec<_> = models.iter()
+                                                        .filter(|m| m.name.to_lowercase().contains("image"))
+                                                        .collect();
+                                                    let in_list = image_models.iter().any(|m| m.name == current);
+                                                    rsx! {
+                                                        if !current.is_empty() && !in_list {
+                                                            option { value: "{current}", selected: true, "{GeminiModel::from_slug(&current).display_name()}" }
+                                                        }
+                                                        for model in image_models.iter() {
+                                                            option {
+                                                                value: "{model.name}",
+                                                                selected: model.name == current,
+                                                                "{model.display_name}"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // Thinking Mode Section
                                     div {
                                         class: "mb-4 pt-4 border-t border-subtle",
@@ -1095,30 +1164,261 @@ pub fn SettingsPanel() -> Element {
                                         }
                                     }
 
-                                    // Max Context Tokens
+                                    // Context window is auto-detected from /v1/models (max_model_len)
+                                    // No UI element needed — budget enforcement happens transparently
+
+                                    // Per-Provider Context Tuning Overrides
                                     div {
-                                        class: "mb-4",
-                                        label { class: "block text-sm font-medium text-fg-muted", "Max Context Tokens" }
-                                        input {
-                                            class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                            r#type: "number",
-                                            placeholder: "None (unlimited)",
-                                            value: match local_settings.read().openai_compat_config.max_context_tokens {
-                                                Some(v) => v.to_string(),
-                                                None => String::new(),
+                                        class: "mb-4 border border-faint rounded-lg overflow-hidden",
+                                        div {
+                                            class: "p-3 cursor-pointer flex justify-between items-center",
+                                            onclick: move |_| {
+                                                // Toggle inline — no extra state needed, use a simple detail/summary approach via class
                                             },
-                                            onchange: move |event: FormEvent| {
-                                                let val = event.value();
-                                                if val.trim().is_empty() {
-                                                    local_settings.write().openai_compat_config.max_context_tokens = None;
-                                                } else if let Ok(n) = val.trim().parse::<usize>() {
-                                                    local_settings.write().openai_compat_config.max_context_tokens = Some(n);
+                                            h4 { class: "text-sm font-medium text-fg-muted", "Context Tuning (Override Defaults)" }
+                                        }
+                                        div {
+                                            class: "px-3 pb-3 space-y-2",
+                                            p { class: "text-xs text-fg-muted mb-2", "Leave empty to use global defaults from Behavior tab." }
+                                            // Chat History Length Override
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label { class: "text-xs text-fg-muted w-32 shrink-0", "Chat History Length" }
+                                                input {
+                                                    r#type: "number",
+                                                    class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                    placeholder: format!("{} (global)", local_settings.read().chat_history_length),
+                                                    value: match local_settings.read().openai_compat_config.context_tuning.chat_history_length {
+                                                        Some(v) => v.to_string(),
+                                                        None => String::new(),
+                                                    },
+                                                    onchange: move |event: FormEvent| {
+                                                        let val = event.value();
+                                                        if val.trim().is_empty() {
+                                                            local_settings.write().openai_compat_config.context_tuning.chat_history_length = None;
+                                                        } else if let Ok(n) = val.trim().parse::<usize>() {
+                                                            local_settings.write().openai_compat_config.context_tuning.chat_history_length = Some(n);
+                                                        }
+                                                    }
                                                 }
                                             }
-                                        }
-                                        p {
-                                            class: "text-xs text-fg-muted mt-1",
-                                            "Model's context window size in tokens. Older messages are automatically trimmed to fit. Leave empty for unlimited (Gemini)."
+                                            // Max Tool Output Override
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label { class: "text-xs text-fg-muted w-32 shrink-0", "Max Tool Output" }
+                                                input {
+                                                    r#type: "number",
+                                                    class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                    placeholder: format!("{} (global)", local_settings.read().max_tool_output_length),
+                                                    value: match local_settings.read().openai_compat_config.context_tuning.max_tool_output_length {
+                                                        Some(v) => v.to_string(),
+                                                        None => String::new(),
+                                                    },
+                                                    onchange: move |event: FormEvent| {
+                                                        let val = event.value();
+                                                        if val.trim().is_empty() {
+                                                            local_settings.write().openai_compat_config.context_tuning.max_tool_output_length = None;
+                                                        } else if let Ok(n) = val.trim().parse::<usize>() {
+                                                            local_settings.write().openai_compat_config.context_tuning.max_tool_output_length = Some(n);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Max Active Tool Output Override
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label { class: "text-xs text-fg-muted w-32 shrink-0", "Max Active Tool Out" }
+                                                input {
+                                                    r#type: "number",
+                                                    class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                    placeholder: format!("{} (global)", local_settings.read().max_active_tool_output_length),
+                                                    value: match local_settings.read().openai_compat_config.context_tuning.max_active_tool_output_length {
+                                                        Some(v) => v.to_string(),
+                                                        None => String::new(),
+                                                    },
+                                                    onchange: move |event: FormEvent| {
+                                                        let val = event.value();
+                                                        if val.trim().is_empty() {
+                                                            local_settings.write().openai_compat_config.context_tuning.max_active_tool_output_length = None;
+                                                        } else if let Ok(n) = val.trim().parse::<usize>() {
+                                                            local_settings.write().openai_compat_config.context_tuning.max_active_tool_output_length = Some(n);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Max Summary Chars Override
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label { class: "text-xs text-fg-muted w-32 shrink-0", "Max Summary Chars" }
+                                                input {
+                                                    r#type: "number",
+                                                    class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                    placeholder: format!("{} (global)", local_settings.read().max_summary_chars),
+                                                    value: match local_settings.read().openai_compat_config.context_tuning.max_summary_chars {
+                                                        Some(v) => v.to_string(),
+                                                        None => String::new(),
+                                                    },
+                                                    onchange: move |event: FormEvent| {
+                                                        let val = event.value();
+                                                        if val.trim().is_empty() {
+                                                            local_settings.write().openai_compat_config.context_tuning.max_summary_chars = None;
+                                                        } else if let Ok(n) = val.trim().parse::<usize>() {
+                                                            local_settings.write().openai_compat_config.context_tuning.max_summary_chars = Some(n);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Max Entities Override
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label { class: "text-xs text-fg-muted w-32 shrink-0", "Max Entities" }
+                                                input {
+                                                    r#type: "number",
+                                                    class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                    placeholder: format!("{} (global)", local_settings.read().max_entity_count),
+                                                    value: match local_settings.read().openai_compat_config.context_tuning.max_entity_count {
+                                                        Some(v) => v.to_string(),
+                                                        None => String::new(),
+                                                    },
+                                                    onchange: move |event: FormEvent| {
+                                                        let val = event.value();
+                                                        if val.trim().is_empty() {
+                                                            local_settings.write().openai_compat_config.context_tuning.max_entity_count = None;
+                                                        } else if let Ok(n) = val.trim().parse::<usize>() {
+                                                            local_settings.write().openai_compat_config.context_tuning.max_entity_count = Some(n);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Tool Result Budget % Override
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label { class: "text-xs text-fg-muted w-32 shrink-0", "Tool Budget %" }
+                                                input {
+                                                    r#type: "number",
+                                                    class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                    min: "5",
+                                                    max: "95",
+                                                    step: "5",
+                                                    placeholder: format!("{}% (global)", (local_settings.read().tool_result_budget_ratio * 100.0).round() as u32),
+                                                    value: match local_settings.read().openai_compat_config.context_tuning.tool_result_budget_ratio {
+                                                        Some(v) => format!("{}", (v * 100.0).round() as u32),
+                                                        None => String::new(),
+                                                    },
+                                                    onchange: move |event: FormEvent| {
+                                                        let val = event.value();
+                                                        if val.trim().is_empty() {
+                                                            local_settings.write().openai_compat_config.context_tuning.tool_result_budget_ratio = None;
+                                                        } else if let Ok(pct) = val.trim().parse::<f64>() {
+                                                            local_settings.write().openai_compat_config.context_tuning.tool_result_budget_ratio = Some(crate::llm::config::ContextTuningPreset::clamp_budget_ratio(pct / 100.0));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Active Result Share % Override
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label { class: "text-xs text-fg-muted w-32 shrink-0", "Active Result %" }
+                                                input {
+                                                    r#type: "number",
+                                                    class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                    min: "5",
+                                                    max: "95",
+                                                    step: "5",
+                                                    placeholder: format!("{}% (global)", (local_settings.read().active_result_budget_ratio * 100.0).round() as u32),
+                                                    value: match local_settings.read().openai_compat_config.context_tuning.active_result_budget_ratio {
+                                                        Some(v) => format!("{}", (v * 100.0).round() as u32),
+                                                        None => String::new(),
+                                                    },
+                                                    onchange: move |event: FormEvent| {
+                                                        let val = event.value();
+                                                        if val.trim().is_empty() {
+                                                            local_settings.write().openai_compat_config.context_tuning.active_result_budget_ratio = None;
+                                                        } else if let Ok(pct) = val.trim().parse::<f64>() {
+                                                            local_settings.write().openai_compat_config.context_tuning.active_result_budget_ratio = Some(crate::llm::config::ContextTuningPreset::clamp_budget_ratio(pct / 100.0));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Context Safety Margin % Override
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label { class: "text-xs text-fg-muted w-32 shrink-0", "Safety Margin %" }
+                                                input {
+                                                    r#type: "number",
+                                                    class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                    min: "5",
+                                                    max: "95",
+                                                    step: "5",
+                                                    placeholder: format!("{}% (global)", (local_settings.read().context_safety_margin * 100.0).round() as u32),
+                                                    value: match local_settings.read().openai_compat_config.context_tuning.context_safety_margin {
+                                                        Some(v) => format!("{}", (v * 100.0).round() as u32),
+                                                        None => String::new(),
+                                                    },
+                                                    onchange: move |event: FormEvent| {
+                                                        let val = event.value();
+                                                        if val.trim().is_empty() {
+                                                            local_settings.write().openai_compat_config.context_tuning.context_safety_margin = None;
+                                                        } else if let Ok(pct) = val.trim().parse::<f64>() {
+                                                            local_settings.write().openai_compat_config.context_tuning.context_safety_margin = Some(crate::llm::config::ContextTuningPreset::clamp_budget_ratio(pct / 100.0));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // System Prompt Budget % Override
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label { class: "text-xs text-fg-muted w-32 shrink-0", "System Prompt %" }
+                                                input {
+                                                    r#type: "number",
+                                                    class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                    min: "5",
+                                                    max: "95",
+                                                    step: "5",
+                                                    placeholder: format!("{}% (global)", (local_settings.read().system_prompt_budget_ratio * 100.0).round() as u32),
+                                                    value: match local_settings.read().openai_compat_config.context_tuning.system_prompt_budget_ratio {
+                                                        Some(v) => format!("{}", (v * 100.0).round() as u32),
+                                                        None => String::new(),
+                                                    },
+                                                    onchange: move |event: FormEvent| {
+                                                        let val = event.value();
+                                                        if val.trim().is_empty() {
+                                                            local_settings.write().openai_compat_config.context_tuning.system_prompt_budget_ratio = None;
+                                                        } else if let Ok(pct) = val.trim().parse::<f64>() {
+                                                            local_settings.write().openai_compat_config.context_tuning.system_prompt_budget_ratio = Some(crate::llm::config::ContextTuningPreset::clamp_budget_ratio(pct / 100.0));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Chars/Token Ratio Override
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label {
+                                                    class: "text-xs text-fg-muted w-32 shrink-0",
+                                                    title: "Characters per token ratio used for context budget calculations. English prose ≈ 4.0, CJK or code-heavy content ≈ 2.0. Lower values allocate more tokens per character, giving the model more room for non-English or dense content.",
+                                                    "Chars/Token ⓘ"
+                                                }
+                                                input {
+                                                    r#type: "number",
+                                                    class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                    min: "1.0",
+                                                    max: "8.0",
+                                                    step: "0.5",
+                                                    placeholder: format!("{:.1} (default)", crate::settings::DEFAULT_CHARS_PER_TOKEN),
+                                                    value: match local_settings.read().openai_compat_config.context_tuning.chars_per_token {
+                                                        Some(v) => format!("{:.1}", v),
+                                                        None => String::new(),
+                                                    },
+                                                    onchange: move |event: FormEvent| {
+                                                        let val = event.value();
+                                                        if val.trim().is_empty() {
+                                                            local_settings.write().openai_compat_config.context_tuning.chars_per_token = None;
+                                                        } else if let Ok(v) = val.trim().parse::<f64>() {
+                                                            local_settings.write().openai_compat_config.context_tuning.chars_per_token = Some(v.clamp(1.0, 8.0));
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
 
@@ -1847,9 +2147,10 @@ pub fn SettingsPanel() -> Element {
                                 }
                             }
 
-                            // 1. Context & History
+                            // 1. Context & History (Global Defaults)
                             div {
-                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Context & History" }
+                                h4 { class: "text-sm font-semibold text-fg-muted mb-1", "Context & History (Global Defaults)" }
+                                p { class: "text-xs text-fg-muted mb-3 opacity-70", "These apply unless overridden per-provider in LLM Configuration above." }
                                 div {
                                     class: "space-y-3",
                                     // Chat History Length
@@ -1932,6 +2233,86 @@ pub fn SettingsPanel() -> Element {
                                             oninput: move |e| {
                                                 if let Ok(value) = e.value().parse::<usize>() {
                                                     local_settings.write().max_entity_count = value;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Tool Result Budget Ratio
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-fg-muted", "Tool Result Budget %" }
+                                        p { class: "text-xs text-fg-muted", "Percentage of context window reserved for active tool results (5–95%)" }
+                                        input {
+                                            r#type: "number",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            min: "5",
+                                            max: "95",
+                                            step: "5",
+                                            value: "{(local_settings.read().tool_result_budget_ratio * 100.0).round() as u32}",
+                                            oninput: move |e| {
+                                                if let Ok(pct) = e.value().parse::<f64>() {
+                                                    local_settings.write().tool_result_budget_ratio = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(pct / 100.0);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Active Result Budget Ratio
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-fg-muted", "Active Result Share %" }
+                                        p { class: "text-xs text-fg-muted", "Fraction of remaining context allocated to the active tool result (5–95%)" }
+                                        input {
+                                            r#type: "number",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            min: "5",
+                                            max: "95",
+                                            step: "5",
+                                            value: "{(local_settings.read().active_result_budget_ratio * 100.0).round() as u32}",
+                                            oninput: move |e| {
+                                                if let Ok(pct) = e.value().parse::<f64>() {
+                                                    local_settings.write().active_result_budget_ratio = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(pct / 100.0);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Context Safety Margin
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-fg-muted", "Context Safety Margin %" }
+                                        p { class: "text-xs text-fg-muted", "Reserved fraction of context window to prevent overflow (5–95%)" }
+                                        input {
+                                            r#type: "number",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            min: "5",
+                                            max: "95",
+                                            step: "5",
+                                            value: "{(local_settings.read().context_safety_margin * 100.0).round() as u32}",
+                                            oninput: move |e| {
+                                                if let Ok(pct) = e.value().parse::<f64>() {
+                                                    local_settings.write().context_safety_margin = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(pct / 100.0);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // System Prompt Budget Ratio
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        label { class: "text-sm font-medium text-fg-muted", "System Prompt Budget %" }
+                                        p { class: "text-xs text-fg-muted", "Maximum fraction of context window for system instructions (5–95%)" }
+                                        input {
+                                            r#type: "number",
+                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            min: "5",
+                                            max: "95",
+                                            step: "5",
+                                            value: "{(local_settings.read().system_prompt_budget_ratio * 100.0).round() as u32}",
+                                            oninput: move |e| {
+                                                if let Ok(pct) = e.value().parse::<f64>() {
+                                                    local_settings.write().system_prompt_budget_ratio = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(pct / 100.0);
                                                 }
                                             }
                                         }
@@ -2281,6 +2662,23 @@ pub fn SettingsPanel() -> Element {
                                             oninput: move |e| {
                                                 let value = e.value();
                                                 local_settings.write().user_name = if value.is_empty() { None } else { Some(value) };
+                                            }
+                                        }
+                                    }
+
+                                    // Background Summarization
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        div {
+                                            label { class: "text-sm font-medium text-fg-muted", "Background Summarization" }
+                                            p { class: "text-xs text-fg-muted", "Automatically summarize conversation context during idle periods and tool loops" }
+                                        }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                            checked: "{local_settings.read().enable_summarization}",
+                                            onchange: move |e| {
+                                                local_settings.write().enable_summarization = e.value() == "true";
                                             }
                                         }
                                     }
@@ -3137,7 +3535,12 @@ pub fn SettingsPanel() -> Element {
                         }
                     }
                 }
-                   } // End About
+                   }, // End About
+                   // ImageGen tab removed — image model is now inline in General.
+                   // Keep the arm for serialization backwards compat; render nothing.
+                   crate::settings::SettingsTab::ImageGen => rsx! {
+                       p { class: "text-sm text-fg-muted p-4", "Image model settings have moved to the Model tab above." }
+                   },
                    } // End Match
                 } // End Scrollable Content
 

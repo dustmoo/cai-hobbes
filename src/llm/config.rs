@@ -15,6 +15,9 @@ pub struct GeminiConfig {
     pub thinking_budget: Option<i32>,
     #[serde(default = "default_model_slots")]
     pub model_slots: Vec<String>,
+    /// Per-provider context tuning overrides (None = use global defaults)
+    #[serde(default)]
+    pub context_tuning: ContextTuningPreset,
 }
 
 impl Default for GeminiConfig {
@@ -31,6 +34,7 @@ impl Default for GeminiConfig {
             thinking_level: default_thinking_level(),
             thinking_budget: None,
             model_slots: default_model_slots(),
+            context_tuning: ContextTuningPreset::default(),
         }
     }
 }
@@ -66,6 +70,41 @@ fn default_empty_model_slots() -> Vec<String> {
     vec!["".to_string(); 10]
 }
 
+
+/// Per-provider overrides for context tuning.
+/// All fields are Option — None means "use global Settings default".
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ContextTuningPreset {
+    pub chat_history_length: Option<usize>,
+    pub max_tool_output_length: Option<usize>,
+    pub max_active_tool_output_length: Option<usize>,
+    pub max_summary_chars: Option<usize>,
+    pub max_entity_count: Option<usize>,
+    /// Convert tool results from JSON to compact markdown for smaller models.
+    /// None = use provider default (true for OpenAI-compat, false for others).
+    pub compact_tool_results: Option<bool>,
+    /// Fraction of the context window to allocate for active tool results (0.0–1.0).
+    /// None = use global default (0.30 = 30%).
+    pub tool_result_budget_ratio: Option<f64>,
+    /// Characters per token ratio for context budget calculations.
+    /// English prose ≈ 4.0, CJK/code-heavy content ≈ 2.0.
+    /// None = use global default (4.0).
+    pub chars_per_token: Option<f64>,
+    /// Fraction of remaining context allocated to the currently active tool result
+    pub active_result_budget_ratio: Option<f64>,
+    /// Reserved fraction of context window to prevent overflow
+    pub context_safety_margin: Option<f64>,
+    /// Maximum fraction of context window for system instructions
+    pub system_prompt_budget_ratio: Option<f64>,
+}
+
+impl ContextTuningPreset {
+    /// Clamp a budget ratio to the valid 5–95% range.
+    /// Centralizes the magic numbers used in prompt_builder and settings_panel.
+    pub fn clamp_budget_ratio(ratio: f64) -> f64 {
+        ratio.clamp(0.05, 0.95)
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct OpenAiCompatConfig {
     pub endpoint: String, // "http://localhost:11434/v1"
@@ -81,11 +120,15 @@ pub struct OpenAiCompatConfig {
     /// Default: false — tools are NOT sent unless explicitly opted in.
     #[serde(default)]
     pub tools_enabled: bool,
+
     /// Maximum context window in tokens. Auto-populated from model discovery
     /// (vLLM's max_model_len, Ollama's num_ctx). User-overridable in settings.
     /// None = no enforcement (backwards-compatible, safe for Gemini's 1M+ context).
     #[serde(default)]
     pub max_context_tokens: Option<usize>,
+    /// Per-provider context tuning overrides (None = use global defaults)
+    #[serde(default)]
+    pub context_tuning: ContextTuningPreset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -99,6 +142,9 @@ pub struct ClaudeConfig {
     pub extended_thinking: bool,
     #[serde(default = "default_empty_model_slots")]
     pub model_slots: Vec<String>, // Provider-scoped quick-switch slots
+    /// Per-provider context tuning overrides (None = use global defaults)
+    #[serde(default)]
+    pub context_tuning: ContextTuningPreset,
 }
 
 #[cfg(test)]
