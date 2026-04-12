@@ -36,6 +36,7 @@ pub enum ChatCommand {
     DeleteSession(String),
     CancelGeneration,
     CopyToDraft(String),
+    RestoreToDraft(String, Vec<hobbes_core::models::Attachment>),
     TriggerAiAnalysis,
     SwitchToSettingsTab(crate::settings::SettingsTab, Option<String>),
     SwitchTab(usize),
@@ -212,6 +213,26 @@ pub fn ChatInput(
                 ChatCommand::CopyToDraft(text) => {
                     tracing::info!("ChatCommand::CopyToDraft triggered: {} chars", text.len());
                     draft.set(text);
+                }
+                ChatCommand::RestoreToDraft(text, restore_attachments) => {
+                    tracing::info!("ChatCommand::RestoreToDraft triggered: {} chars, {} attachments", text.len(), restore_attachments.len());
+                    draft.set(text);
+                    attachments.set(restore_attachments);
+                    // Resize the textarea to fit the restored content and focus it.
+                    // requestAnimationFrame ensures the DOM has updated with the new
+                    // value before we measure scrollHeight.
+                    spawn(async move {
+                        let _ = document::eval(r#"
+                            const el = document.getElementById('chat-textarea');
+                            if (el) {
+                                el.focus();
+                                requestAnimationFrame(() => {
+                                    el.style.height = 'auto';
+                                    el.style.height = (el.scrollHeight) + 'px';
+                                });
+                            }
+                        "#);
+                    });
                 }
                 ChatCommand::TriggerAiAnalysis => {
                     tracing::info!("ChatCommand::TriggerAiAnalysis triggered");

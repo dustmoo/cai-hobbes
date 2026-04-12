@@ -388,6 +388,17 @@ pub enum McpClientType {
     NativeImage(Arc<crate::mcp::image_client::ImageClient>),
 }
 
+impl McpClientType {
+    /// Check if a service's transport is still alive.
+    /// Native clients don't use child-process transports, so they're always "healthy".
+    fn is_healthy(&self) -> bool {
+        match self {
+            McpClientType::Service(arc) => !arc.is_transport_closed(),
+            McpClientType::NativeComposio(_) | McpClientType::NativeImage(_) => true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ActiveMcpClient {
     pub config: McpServerConfig,
@@ -1380,6 +1391,13 @@ impl McpManager {
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped());
 
+                    // Set a sane working directory. macOS .app bundles launched from
+                    // Finder inherit cwd="/" which causes tools like Playwright to
+                    // attempt mkdir at the root (e.g. '/.playwright-mcp').
+                    if let Some(home) = dirs::home_dir() {
+                        cmd.current_dir(home);
+                    }
+
                     match TokioChildProcess::new(cmd) {
                         Ok(transport) => {
                             match tokio::time::timeout(
@@ -1773,7 +1791,7 @@ impl McpManager {
         };
         let effective_server_name = resolved_server_name.as_deref().unwrap_or(server_name);
 
-        let servers_guard = self.servers.lock().await;
+        let mut servers_guard = self.servers.lock().await;
 
         // Resolve composio-native to the actual profile-suffixed key.
         // The LLM may send:
@@ -1854,6 +1872,51 @@ impl McpManager {
                     ));
                 }
                 return Err(format!("Server not found: {}", server_name));
+            }
+        };
+
+        // PRE-EMPTIVE HEALTH CHECK: If the stdio transport is already dead (child process
+        // exited, pipe broken, etc.), attempt to reconnect before dispatching the call.
+        // This avoids a wasted call_tool round-trip that would just return TransportClosed.
+        if !client.service.is_healthy() {
+            let config_for_reconnect = client.config.clone();
+            tracing::warn!(
+                "[RECONNECT] Transport for stdio server '{}' is dead — attempting auto-reconnect before tool call",
+                actual_server_name
+            );
+            // Drop the lock before reconnecting (reconnect_stdio_server needs it)
+            drop(servers_guard);
+
+            match self
+                .reconnect_stdio_server(&actual_server_name, config_for_reconnect)
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "[RECONNECT] Successfully reconnected stdio server '{}'",
+                        actual_server_name
+                    );
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Server '{}' transport is dead and reconnect failed: {}",
+                        actual_server_name, e
+                    ));
+                }
+            }
+
+            // Re-acquire the lock with the fresh client
+            servers_guard = self.servers.lock().await;
+        }
+
+        // Re-resolve client (in case reconnect replaced it, or on first pass)
+        let client = match servers_guard.get(&actual_server_name) {
+            Some(c) => c,
+            None => {
+                return Err(format!(
+                    "Server '{}' disappeared after reconnect attempt",
+                    actual_server_name
+                ));
             }
         };
 
@@ -1946,6 +2009,12 @@ impl McpManager {
         // Pattern 30: Also read image model fresh from settings at call time
         let native_image_model = self.settings.peek().image_generation_config.model.clone();
 
+        // Capture reconnect info for potential retry inside the spawn block.
+        // We need the server name and config in case call_tool returns TransportClosed.
+        let reconnect_server_name = actual_server_name.clone();
+        let reconnect_config = client.config.clone();
+        let reconnect_manager = self.clone();
+
         spawn(async move {
             let result = match service {
                 McpClientType::Service(service_arc) => {
@@ -1961,11 +2030,75 @@ impl McpManager {
                     };
                     let request = CallToolRequestParam {
                         name: tool.name.clone(),
-                        arguments: Some(arguments),
+                        arguments: Some(arguments.clone()),
                     };
                     match service_arc.call_tool(request).await {
                         Ok(result) => Ok(result),
-                        Err(e) => Err(format!("Failed to use tool: {}", e)),
+                        Err(e) => {
+                            let error_str = format!("{}", e);
+                            // AUTO-RECONNECT: If the transport closed (child process died),
+                            // attempt to restart the server and retry the tool call once.
+                            if error_str.contains("Transport closed") {
+                                tracing::warn!(
+                                    "[RECONNECT] call_tool returned TransportClosed for '{}' — attempting reconnect + retry",
+                                    reconnect_server_name
+                                );
+                                match reconnect_manager
+                                    .reconnect_stdio_server(
+                                        &reconnect_server_name,
+                                        reconnect_config,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        // Retry once with the fresh service
+                                        let servers = reconnect_manager.servers.lock().await;
+                                        if let Some(fresh_client) =
+                                            servers.get(&reconnect_server_name)
+                                        {
+                                            if let McpClientType::Service(ref fresh_svc) =
+                                                fresh_client.service
+                                            {
+                                                let retry_request = CallToolRequestParam {
+                                                    name: tool.name.clone(),
+                                                    arguments: Some(arguments),
+                                                };
+                                                match fresh_svc.call_tool(retry_request).await {
+                                                    Ok(result) => {
+                                                        tracing::info!(
+                                                            "[RECONNECT] Retry succeeded for '{}' on server '{}'",
+                                                            tool.name,
+                                                            reconnect_server_name
+                                                        );
+                                                        Ok(result)
+                                                    }
+                                                    Err(retry_e) => Err(format!(
+                                                        "Failed to use tool after reconnect: {}",
+                                                        retry_e
+                                                    )),
+                                                }
+                                            } else {
+                                                Err(format!(
+                                                    "Server '{}' is not a stdio service after reconnect",
+                                                    reconnect_server_name
+                                                ))
+                                            }
+                                        } else {
+                                            Err(format!(
+                                                "Server '{}' not found after reconnect",
+                                                reconnect_server_name
+                                            ))
+                                        }
+                                    }
+                                    Err(reconnect_err) => Err(format!(
+                                        "Failed to use tool (transport closed) and reconnect failed: {}",
+                                        reconnect_err
+                                    )),
+                                }
+                            } else {
+                                Err(format!("Failed to use tool: {}", e))
+                            }
+                        }
                     }
                 }
                 McpClientType::NativeImage(image_client) => {
@@ -3517,7 +3650,20 @@ impl McpManager {
                                 cmd.arg(arg);
                             }
                         }
-                        cmd.envs(&server_config_clone_for_spawn.env);
+                        // Inject critical env vars (HOME, USER, etc.) + sane PATH
+                        let mut envs = server_config_clone_for_spawn.env.clone();
+                        for (key, value) in Self::get_critical_env_vars() {
+                            envs.entry(key).or_insert(value);
+                        }
+                        let current_path = std::env::var("PATH").unwrap_or_default();
+                        let sane_path = Self::get_sane_path();
+                        let final_path = if current_path.is_empty() {
+                            sane_path
+                        } else {
+                            format!("{}:{}", sane_path, current_path)
+                        };
+                        envs.insert("PATH".to_string(), final_path);
+                        cmd.envs(&envs);
                         if let Err(e) = cmd.status().await {
                             tracing::error!(
                                 "Failed to launch command for MCP server '{}': {}",
@@ -3642,12 +3788,33 @@ impl McpManager {
                     }
                 }
 
+                // Inject sane PATH and critical environment variables (HOME, USER, SHELL, TMPDIR)
+                // Without HOME, tools like Playwright fail trying to create dirs at '/'
+                let mut envs = server_config_clone.env.clone();
+                for (key, value) in Self::get_critical_env_vars() {
+                    envs.entry(key).or_insert(value);
+                }
+
+                let current_path = std::env::var("PATH").unwrap_or_default();
+                let sane_path = Self::get_sane_path();
+                let final_path = if current_path.is_empty() {
+                    sane_path
+                } else {
+                    format!("{}:{}", sane_path, current_path)
+                };
+                envs.insert("PATH".to_string(), final_path);
+
                 cmd.arg("-c")
                     .arg(&command_string)
-                    .envs(&server_config_clone.env)
+                    .envs(&envs)
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
+
+                // Set a sane working directory (see note at line ~1395)
+                if let Some(home) = dirs::home_dir() {
+                    cmd.current_dir(home);
+                }
 
                 match TokioChildProcess::new(cmd) {
                     Ok(transport) => ().serve(transport).await,
@@ -3774,6 +3941,159 @@ impl McpManager {
 
         Ok(())
     }
+
+    /// Attempt to restart a dead stdio MCP server inline (blocking the caller).
+    /// This is used by `use_mcp_tool` when it detects a TransportClosed error.
+    /// Unlike `retry_server` (which spawns and returns immediately), this method
+    /// awaits the full reconnect lifecycle so the caller can retry the tool call.
+    async fn reconnect_stdio_server(
+        &self,
+        server_name: &str,
+        config: McpServerConfig,
+    ) -> Result<(), String> {
+        tracing::info!(
+            "[RECONNECT] Restarting stdio MCP server '{}'",
+            server_name
+        );
+
+        // 1. Remove the dead server entry
+        {
+            let mut servers = self.servers.lock().await;
+            servers.remove(server_name);
+        }
+
+        // 2. Rebuild the Command (same logic as launch_servers for stdio)
+        let command_base = config
+            .command
+            .as_deref()
+            .ok_or_else(|| {
+                format!(
+                    "Cannot reconnect '{}': no command configured (SSE servers cannot be reconnected this way)",
+                    server_name
+                )
+            })?;
+
+        let mut cmd = Command::new(command_base);
+
+        if let Some(ref args) = config.args {
+            for arg in args {
+                cmd.arg(arg);
+            }
+        }
+
+        // Special handling for filesystem server
+        if server_name == "filesystem" {
+            let settings = self.settings.peek().clone();
+            if let Some(project_folder) = &settings.project_folder {
+                cmd.arg(project_folder);
+            }
+        }
+
+        // Inject sane PATH and critical environment variables
+        let mut envs = config.env.clone();
+        for (key, value) in Self::get_critical_env_vars() {
+            envs.entry(key).or_insert(value);
+        }
+
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let sane_path = Self::get_sane_path();
+        let final_path = if current_path.is_empty() {
+            sane_path
+        } else {
+            format!("{}:{}", sane_path, current_path)
+        };
+        envs.insert("PATH".to_string(), final_path);
+
+        cmd.envs(&envs)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        // Set a sane working directory (see note at line ~1395)
+        if let Some(home) = dirs::home_dir() {
+            cmd.current_dir(home);
+        }
+
+        // 3. Spawn the child process and initialize the rmcp service
+        let transport = TokioChildProcess::new(cmd).map_err(|e| {
+            format!(
+                "Failed to launch stdio MCP server '{}': {}",
+                server_name, e
+            )
+        })?;
+
+        let service = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            ().serve(transport),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "Timeout waiting for stdio MCP server '{}' to initialize",
+                server_name
+            )
+        })?
+        .map_err(|e| format!("Failed to serve MCP server '{}': {}", server_name, e))?;
+
+        // 4. Discover tools from the new server
+        let mut all_tools = Vec::new();
+        let mut next_cursor: Option<String> = None;
+
+        loop {
+            let cursor = next_cursor.clone();
+            let request_param = cursor.map(|c| PaginatedRequestParam { cursor: Some(c) });
+
+            match service.list_tools(request_param).await {
+                Ok(result) => {
+                    all_tools.extend(result.tools);
+                    if let Some(cursor) = result.next_cursor {
+                        if !cursor.is_empty() {
+                            next_cursor = Some(cursor);
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to list tools after reconnecting '{}': {}",
+                        server_name, e
+                    ));
+                }
+            }
+        }
+
+        tracing::info!(
+            "[RECONNECT] Discovered {} tools for reconnected server '{}'",
+            all_tools.len(),
+            server_name
+        );
+
+        // 5. Insert the fresh client into the servers map
+        let active_client = ActiveMcpClient {
+            config: config.clone(),
+            service: McpClientType::Service(Arc::new(service)),
+            tools: all_tools,
+            warning_message: None,
+            profile_id: None,
+        };
+
+        {
+            let mut servers = self.servers.lock().await;
+            servers.insert(server_name.to_string(), active_client);
+        }
+
+        // 6. Invalidate the status cache
+        self.invalidate_status_cache();
+
+        tracing::info!(
+            "[RECONNECT] Successfully restarted stdio MCP server '{}'",
+            server_name
+        );
+
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub async fn install_mcp_server(
         &self,

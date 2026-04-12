@@ -127,6 +127,9 @@ impl Session {
                 let count = self.messages.len() - index;
                 // Harvest cost/token data from the messages being deleted
                 // so the session totals never drop when messages are pruned.
+                // Also collect execution_ids from ToolCall messages so we can
+                // remove their stale tool_snapshot entries from active_context.
+                let mut deleted_execution_ids: Vec<String> = Vec::new();
                 for msg in &self.messages[index..] {
                     if let Some(usage) = &msg.usage {
                         if let Some(cost) = usage.cost {
@@ -134,8 +137,32 @@ impl Session {
                         }
                         self.accumulated_tokens += usage.total_tokens;
                     }
+                    if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
+                        deleted_execution_ids.push(tc.execution_id.clone());
+                    }
                 }
                 self.messages.truncate(index);
+
+                // Remove tool_snapshot_* entries for deleted tool calls.
+                // These are inserted by ToolCallSummarizer at end-of-turn and
+                // serialized into SYSTEM_CONTEXT via #[serde(flatten)]. Without
+                // this cleanup, the LLM sees phantom tool results from undone
+                // turns, causing it to loop on stale context.
+                for exec_id in &deleted_execution_ids {
+                    let key = format!("tool_snapshot_{}", exec_id);
+                    if self.active_context.extra.remove(&key).is_some() {
+                        tracing::debug!("Removed stale tool snapshot after undo: {}", key);
+                    }
+                }
+
+                // Reset conversation_summary to prevent stale context from
+                // deleted turns leaking into future prompts. The summarizer
+                // will re-populate it on the next turn's completion.
+                if count > 0 {
+                    self.active_context.conversation_summary = Default::default();
+                    tracing::debug!("Reset conversation_summary after undo ({} messages removed)", count);
+                }
+
                 self.last_updated = Utc::now();
                 count
             } else {
@@ -1512,5 +1539,149 @@ mod tests {
         let (content2, _, remaining2) = state.fetch_next_page("page-A").unwrap();
         assert_eq!(content2, "Page 2 content");
         assert_eq!(remaining2, 1);
+    }
+
+    /// Test that delete_message_and_after cleans up stale tool_snapshot entries
+    /// and resets conversation_summary to prevent undo-loop bugs.
+    #[test]
+    fn test_delete_message_and_after_cleans_up_turn_state() {
+        use crate::components::chat::Message;
+        use crate::components::shared::{MessageContent, ToolCall, ToolCallStatus};
+
+        let exec_id_1 = "exec-aaaa-1111";
+        let exec_id_2 = "exec-bbbb-2222";
+        let msg1_id = uuid::Uuid::new_v4();
+        let msg2_id = uuid::Uuid::new_v4(); // user message
+        let msg3_id = uuid::Uuid::new_v4(); // tool call message (will be deleted)
+        let msg4_id = uuid::Uuid::new_v4(); // another tool call (will be deleted)
+
+        let mut session = Session {
+            id: "test-session".to_string(),
+            name: "Test".to_string(),
+            messages: vec![
+                Message {
+                    id: msg1_id,
+                    author: "User".to_string(),
+                    content: MessageContent::Text {
+                        content: "Hello".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                    },
+                    attachments: vec![],
+                    comments: vec![],
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                },
+                Message {
+                    id: msg2_id,
+                    author: "User".to_string(),
+                    content: MessageContent::Text {
+                        content: "Do something".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                    },
+                    attachments: vec![],
+                    comments: vec![],
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                },
+                Message {
+                    id: msg3_id,
+                    author: "Hobbes".to_string(),
+                    content: MessageContent::ToolCall(ToolCall {
+                        execution_id: exec_id_1.to_string(),
+                        server_name: "test-server".to_string(),
+                        tool_name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                        status: ToolCallStatus::Completed,
+                        response: "file contents".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                    }),
+                    attachments: vec![],
+                    comments: vec![],
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                },
+                Message {
+                    id: msg4_id,
+                    author: "Hobbes".to_string(),
+                    content: MessageContent::ToolCall(ToolCall {
+                        execution_id: exec_id_2.to_string(),
+                        server_name: "test-server".to_string(),
+                        tool_name: "write_file".to_string(),
+                        arguments: "{}".to_string(),
+                        status: ToolCallStatus::Completed,
+                        response: "ok".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                    }),
+                    attachments: vec![],
+                    comments: vec![],
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                },
+            ],
+            active_context: ActiveContext {
+                conversation_summary: ConversationSummary {
+                    summary: "User asked to read and write files.".to_string(),
+                    sentiment: "neutral".to_string(),
+                    entities: ConversationSummaryEntities::default(),
+                },
+                ..Default::default()
+            },
+            last_updated: chrono::Utc::now(),
+            accumulated_cost: 0.0,
+            accumulated_tokens: 0,
+            accumulated_turns: 0,
+            memory_optimization_summary: None,
+            composio_profile: None,
+            loaded_skills: HashMap::new(),
+        };
+
+        // Simulate ToolCallSummarizer having inserted snapshots
+        session.active_context.extra.insert(
+            format!("tool_snapshot_{}", exec_id_1),
+            serde_json::json!({"tool_name": "read_file", "result_summary": "completed"}),
+        );
+        session.active_context.extra.insert(
+            format!("tool_snapshot_{}", exec_id_2),
+            serde_json::json!({"tool_name": "write_file", "result_summary": "completed"}),
+        );
+        // Also add an unrelated extra entry that should NOT be removed
+        session.active_context.extra.insert(
+            "unrelated_key".to_string(),
+            serde_json::json!("should survive"),
+        );
+
+        assert_eq!(session.active_context.extra.len(), 3);
+        assert!(!session.active_context.conversation_summary.summary.is_empty());
+
+        // Undo: delete msg2 and everything after (msg2, msg3, msg4)
+        let deleted = session.delete_message_and_after(&msg2_id.to_string());
+        assert_eq!(deleted, 3, "Should have deleted 3 messages");
+        assert_eq!(session.messages.len(), 1, "Only first message should remain");
+
+        // Tool snapshots for the deleted tool calls should be gone
+        assert!(
+            !session.active_context.extra.contains_key(&format!("tool_snapshot_{}", exec_id_1)),
+            "tool_snapshot for exec_id_1 should be removed"
+        );
+        assert!(
+            !session.active_context.extra.contains_key(&format!("tool_snapshot_{}", exec_id_2)),
+            "tool_snapshot for exec_id_2 should be removed"
+        );
+
+        // Unrelated extra entries should survive
+        assert!(
+            session.active_context.extra.contains_key("unrelated_key"),
+            "Unrelated extra entries must not be removed"
+        );
+
+        // Conversation summary should be reset
+        assert!(
+            session.active_context.conversation_summary.summary.is_empty(),
+            "Conversation summary should be cleared after undo"
+        );
     }
 }

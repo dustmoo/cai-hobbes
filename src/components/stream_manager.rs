@@ -881,10 +881,54 @@ impl StreamManagerContext {
         // Cleanup generated state
         self.content_generated.write().remove(message_id);
 
-        // 2. Remove the message from the originating session
-        self.session_state
-            .write()
-            .remove_message_in_session(session_id, message_id);
+        // 2. Remove the placeholder message and any orphaned tool call messages
+        //    from this cancelled turn.
+        //
+        //    During a multi-tool-call turn the stream_manager pushes additional
+        //    messages with NEW UUIDs (one per parallel tool call). cancel_stream
+        //    only knows the original placeholder message_id, so those extra
+        //    ToolCall messages remain in the session with status=Running and an
+        //    empty response. On the next turn, the prompt builder serializes
+        //    them as functionCall + empty functionResponse, causing Gemini to
+        //    return no data ("Gemini finished without sending any data").
+        //
+        //    Fix: after removing the placeholder, also trim any trailing
+        //    messages that are Running ToolCalls (orphans from this turn).
+        {
+            let mut state = self.session_state.write();
+            state.remove_message_in_session(session_id, message_id);
+
+            // Trim trailing orphaned Running tool calls
+            if let Some(session) = state.sessions.get_mut(session_id) {
+                let mut removed_count = 0;
+                while let Some(last) = session.messages.last() {
+                    if let crate::components::shared::MessageContent::ToolCall(tc) = &last.content {
+                        if tc.status == crate::components::shared::ToolCallStatus::Running {
+                            let orphan_id = last.id;
+                            session.messages.pop();
+                            removed_count += 1;
+                            tracing::info!(
+                                message_id = %orphan_id,
+                                "Removed orphaned Running tool call after cancel."
+                            );
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if removed_count > 0 {
+                    tracing::info!(
+                        "Removed {} orphaned Running tool call(s) after stream cancellation.",
+                        removed_count
+                    );
+                }
+            }
+
+            // Clear stale tool_call_history from the cancelled turn so the
+            // next prompt doesn't include CRITICAL RECOVERY INSTRUCTION or
+            // stale tool context.
+            state.tool_call_history.clear();
+        }
 
         // 3. Remove the stream receiver
         if self.stream_receivers.write().remove(message_id).is_some() {
