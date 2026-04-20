@@ -337,8 +337,11 @@ impl StreamManagerContext {
                             // Intercept HOBBES_PAGE_RESULT before MCP dispatch —
                             // requires SessionState.page_queue which McpManager doesn't have.
                             if tool_call.tool_name == "HOBBES_PAGE_RESULT" {
+                                let page_budget = crate::session::compute_page_budget(
+                                    &self.settings.read(),
+                                );
                                 let (status, response_str) =
-                                    session_state.write().handle_page_result(&args_json, "");
+                                    session_state.write().handle_page_result(&args_json, "", page_budget);
 
 
                                 // Update message with result
@@ -373,6 +376,44 @@ impl StreamManagerContext {
                                 return;
                             }
 
+                            // Intercept HOBBES_UPDATE_SCRATCHPAD before MCP dispatch.
+                            if tool_call.tool_name == "HOBBES_UPDATE_SCRATCHPAD" {
+                                let (status, response_str) =
+                                    session_state.write().handle_scratchpad_update(&args_json, &session_id_inner, &self.settings.read());
+
+                                // Persist so the scratchpad survives app restart
+                                {
+                                    let mut state = session_state.write();
+                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
+                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                                            tc.status = status;
+                                            tc.response = response_str.clone();
+                                        }
+                                    }
+                                    state.touch_session(&session_id_inner);
+                                }
+                                crate::session::SessionState::save_async(&session_state.read(), None);
+
+                                let record = crate::components::shared::ToolCallRecord {
+                                    call: tool_call.clone(),
+                                    result: crate::components::shared::ToolResult {
+                                        status,
+                                        response: response_str,
+                                    },
+                                    profile_color: {
+                                        let settings_read = self.settings.read();
+                                        crate::components::shared::resolve_profile_color(
+                                            profile_id.as_ref(),
+                                            &settings_read,
+                                        )
+                                    },
+                                };
+                                let _ = tool_results_tx_clone.send(record);
+                                completed_tool_tasks_clone
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            }
+
                             let result_receiver = mcp_manager
                                 .read()
                                 .use_mcp_tool(
@@ -384,7 +425,7 @@ impl StreamManagerContext {
                                 )
                                 .await;
 
-                            let (status, response_str, is_permission_request) =
+                            let (status, response_str, is_permission_request, image_path) =
                                 match result_receiver {
                                     Ok(mut receiver) => {
                                         let mut aggregated_content: Vec<rmcp::model::Content> =
@@ -422,15 +463,15 @@ impl StreamManagerContext {
                                                 {
                                                     Ok(url) => {
                                                         tracing::info!("Successfully initiated Composio auth flow. URL: {}", url);
-                                                        (ToolCallStatus::AuthRequired, url, false)
+                                                        (ToolCallStatus::AuthRequired, url, false, None)
                                                     }
                                                     Err(e) => {
                                                         tracing::error!("Failed to initiate Composio auth flow: {}", e);
-                                                        (final_status, err_msg, false)
+                                                        (final_status, err_msg, false, None)
                                                     }
                                                 }
                                             } else {
-                                                (final_status, err_msg, false)
+                                                (final_status, err_msg, false, None)
                                             }
                                         } else {
                                             // Check for auth requirement
@@ -455,17 +496,76 @@ impl StreamManagerContext {
                                             }
 
                                             if let Some(url) = auth_url {
-                                                (ToolCallStatus::AuthRequired, url, false)
+                                                (ToolCallStatus::AuthRequired, url, false, None)
                                             } else {
-                                                let final_json =
-                                                    serde_json::to_value(aggregated_content)
+                                                // ── Image-aware content extraction ───────────────────────────
+                                                // Scan aggregated_content for image blobs. Save them to disk
+                                                // (max 768px tall) and build a text-only response string.
+                                                // The file path is stored in tc.cached_image_path so
+                                                // prompt_builder can inject it as ContentBlock::Image on the
+                                                // next continuation turn.
+                                                let mut text_parts: Vec<String> = Vec::new();
+                                                let mut captured_image_path: Option<String> = None;
+
+                                                for content in &aggregated_content {
+                                                    let json_val = serde_json::to_value(content)
                                                         .unwrap_or(serde_json::Value::Null);
-                                                (
-                                                    final_status,
-                                                    serde_json::to_string_pretty(&final_json)
-                                                        .unwrap_or_default(),
-                                                    false,
-                                                )
+
+                                                    // MCP image content: {"type":"image","data":"<b64>","mimeType":"image/png"}
+                                                    // Also handle nested {"blob":"<b64>"} from EmbeddedResource.
+                                                    let b64_candidate = json_val.get("data")
+                                                        .or_else(|| json_val.get("blob"))
+                                                        .and_then(|v| v.as_str());
+
+                                                    if let Some(b64) = b64_candidate {
+                                                        let mime = json_val.get("mimeType")
+                                                            .or_else(|| json_val.get("mime_type"))
+                                                            .and_then(|m| m.as_str())
+                                                            .unwrap_or("image/png");
+                                                        // Only save actual image types, not arbitrary blobs
+                                                        if mime.starts_with("image/") {
+                                                            if let Some(path) = save_tool_image(b64, mime).await {
+                                                                let path_str = format!("file://{}", path.display());
+                                                                // Keep only the most recent image per tool loop
+                                                                captured_image_path = Some(path_str.clone());
+                                                                let file_name = path.file_name()
+                                                                    .unwrap_or_default()
+                                                                    .to_string_lossy();
+                                                                text_parts.push(format!(
+                                                                    "[Screenshot captured — cached at {}]",
+                                                                    file_name
+                                                                ));
+                                                                tracing::info!(
+                                                                    "Tool image cached: {} ({} bytes b64)",
+                                                                    path.display(), b64.len()
+                                                                );
+                                                            } else {
+                                                                tracing::warn!("Failed to cache tool image");
+                                                                text_parts.push("[Screenshot captured but failed to save]".to_string());
+                                                            }
+                                                            continue; // don't also serialize as text
+                                                        }
+                                                    }
+
+                                                    // Text content
+                                                    if let Some(text) = json_val.get("text").and_then(|t| t.as_str()) {
+                                                        text_parts.push(text.to_string());
+                                                    } else {
+                                                        // Fallback: compact JSON for non-image, non-text blobs
+                                                        let s = serde_json::to_string(&json_val).unwrap_or_default();
+                                                        if !s.is_empty() && s != "null" {
+                                                            text_parts.push(s);
+                                                        }
+                                                    }
+                                                }
+
+                                                let text_response = if text_parts.is_empty() {
+                                                    "[Tool returned no text output]".to_string()
+                                                } else {
+                                                    text_parts.join("\n")
+                                                };
+
+                                                (final_status, text_response, false, captured_image_path)
                                             }
                                         }
                                     }
@@ -476,9 +576,9 @@ impl StreamManagerContext {
                                                 crate::components::shared::ToolCall,
                                             >(&e)
                                         {
-                                            (ToolCallStatus::Error, e, true)
+                                            (ToolCallStatus::Error, e, true, None)
                                         } else {
-                                            (ToolCallStatus::Error, e, false)
+                                            (ToolCallStatus::Error, e, false, None)
                                         }
                                     }
                                 };
@@ -503,6 +603,10 @@ impl StreamManagerContext {
                                 {
                                     tc.status = status;
                                     tc.response = response_str.clone();
+                                    // Store image path for prompt_builder vision injection
+                                    if image_path.is_some() {
+                                        tc.cached_image_path = image_path.clone();
+                                    }
                                 }
                             }
 
@@ -1127,4 +1231,58 @@ mod tests {
         dom.rebuild_in_place();
         dom.wait_for_suspense().await;
     }
+}
+
+// ============================================================================
+// Image caching helper
+// ============================================================================
+
+/// Decode a base64 image blob from an MCP tool result, resize it to at most
+/// 768 px tall (preserving aspect ratio), re-encode as JPEG, persist to the
+/// same `generated_images/` directory used by `image_client.rs`, and return
+/// the saved path.
+///
+/// Returns `None` on any decode/resize/write failure (non-fatal; the call site
+/// will substitute a placeholder text instead).
+async fn save_tool_image(data_b64: &str, _mime_type: &str) -> Option<std::path::PathBuf> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64)
+        .ok()?;
+
+    // Resize on a blocking thread so we don't stall the async executor.
+    let resized_bytes = tokio::task::spawn_blocking(move || {
+        use image::imageops::FilterType;
+        use image::ImageFormat;
+
+        let img = image::load_from_memory(&bytes).ok()?;
+
+        // Cap at 768 px tall; scale width proportionally.
+        let resized = if img.height() > 768 {
+            img.resize(u32::MAX, 768, FilterType::Lanczos3)
+        } else {
+            img
+        };
+
+        let mut buf = std::io::Cursor::new(Vec::new());
+        resized.write_to(&mut buf, ImageFormat::Jpeg).ok()?;
+        Some(buf.into_inner())
+    })
+    .await
+    .ok()
+    .flatten()?;
+
+    // Build the output path inside the persistent app directory.
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis(); // millis to avoid collisions when multiple screenshots arrive in the same second
+    let mut dir = dirs::config_dir()?
+        .join("com.hobbes.app")
+        .join("generated_images");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.push(format!("hobbes_screenshot_{}.jpg", timestamp));
+
+    tokio::fs::write(&dir, resized_bytes).await.ok()?;
+    Some(dir)
 }

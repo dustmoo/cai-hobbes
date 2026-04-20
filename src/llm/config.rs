@@ -88,7 +88,7 @@ pub struct ContextTuningPreset {
     pub tool_result_budget_ratio: Option<f64>,
     /// Characters per token ratio for context budget calculations.
     /// English prose ≈ 4.0, CJK/code-heavy content ≈ 2.0.
-    /// None = use global default (4.0).
+    /// None = use global default (3.0).
     pub chars_per_token: Option<f64>,
     /// Fraction of remaining context allocated to the currently active tool result
     pub active_result_budget_ratio: Option<f64>,
@@ -120,6 +120,13 @@ pub struct OpenAiCompatConfig {
     /// Default: false — tools are NOT sent unless explicitly opted in.
     #[serde(default)]
     pub tools_enabled: bool,
+
+    /// Enable thinking/reasoning mode for models that support it (e.g. Gemma 4, Qwen3).
+    /// When enabled, sends `chat_template_kwargs: {"enable_thinking": true}` to vLLM
+    /// so the server activates the reasoning parser and separates thinking from response.
+    /// Default: false.
+    #[serde(default)]
+    pub thinking_enabled: bool,
 
     /// Maximum context window in tokens. Auto-populated from model discovery
     /// (vLLM's max_model_len, Ollama's num_ctx). User-overridable in settings.

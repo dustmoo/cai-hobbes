@@ -206,8 +206,8 @@ pub struct Settings {
     pub confirm_on_delete: bool,
     #[serde(default = "default_true")]
     pub confirm_on_save: bool,
-    #[serde(default = "default_true")]
-    pub confirm_on_message_delete: bool,
+    #[serde(default = "default_true", alias = "confirm_on_message_delete")]
+    pub confirm_on_message_edit: bool,
     #[serde(default = "default_true")]
     pub confirm_forget_memory: bool,
     #[serde(skip)]
@@ -267,6 +267,11 @@ pub struct Settings {
     /// When false, both the idle-timer and proactive (tool-loop) summarizers are skipped.
     #[serde(default = "default_true")]
     pub enable_summarization: bool,
+    /// When true, convert tool results from JSON to TOON (compact tabular notation)
+    /// before sending to the AI. Reduces token usage by 30-50% for structured tool output.
+    /// Can be overridden per-provider in Context Tuning config.
+    #[serde(default = "default_true")]
+    pub compact_tool_results: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -505,7 +510,7 @@ impl Default for Settings {
             },
             confirm_on_delete: true,
             confirm_on_save: true,
-            confirm_on_message_delete: true,
+            confirm_on_message_edit: true,
             confirm_forget_memory: true,
             smithery_api_key: None,
             preferred_mcp_source: McpSource::default(),
@@ -528,6 +533,7 @@ impl Default for Settings {
             tos_accepted_version: None,
             model_icons: HashMap::new(),
             enable_summarization: true,
+            compact_tool_results: true,
         }
     }
 }
@@ -621,6 +627,21 @@ impl Settings {
         }
     }
 
+    /// Resolve the effective context window (in tokens) for the active provider.
+    /// Returns `None` only for unconfigured providers with no known context limit.
+    pub fn resolve_context_window(&self) -> Option<usize> {
+        match self.active_llm {
+            LlmProvider::OpenAiCompat => self.openai_compat_config.max_context_tokens,
+            LlmProvider::Claude => self.claude_config.max_tokens.map(|t| t as usize),
+            LlmProvider::Gemini => {
+                let model = crate::llm::gemini::GeminiModel::from_slug(
+                    &self.gemini_config.chat_model,
+                );
+                Some(model.context_window_tokens())
+            }
+        }
+    }
+
     /// Resolve the effective context tuning for the current active provider.
     /// Provider preset overrides → Global settings → Compiled defaults.
     pub fn effective_context_tuning(&self) -> ResolvedContextTuning {
@@ -642,9 +663,7 @@ impl Settings {
                 .unwrap_or(self.max_summary_chars),
             max_entity_count: preset.max_entity_count
                 .unwrap_or(self.max_entity_count),
-            compact_tool_results: preset.compact_tool_results.unwrap_or(
-                matches!(self.active_llm, LlmProvider::OpenAiCompat)
-            ),
+            compact_tool_results: preset.compact_tool_results.unwrap_or(self.compact_tool_results),
             tool_result_budget_ratio: preset.tool_result_budget_ratio
                 .unwrap_or(self.tool_result_budget_ratio),
             active_result_budget_ratio: preset.active_result_budget_ratio
@@ -897,7 +916,7 @@ impl Settings {
     }
 }
 fn default_max_tool_output_length() -> usize {
-    2000
+    8000
 }
 
 fn default_max_active_tool_output_length() -> usize {
@@ -916,9 +935,10 @@ fn default_tool_result_budget_ratio() -> f64 {
     0.30
 }
 
-/// Default chars/token ratio. English prose averages ~4 chars per token;
-/// CJK/code-heavy content is closer to ~2. Exposed in settings for tuning.
-pub const DEFAULT_CHARS_PER_TOKEN: f64 = 4.0;
+/// Default chars/token ratio. 3.0 balances English prose (~4 chars/token) with
+/// JSON/code-heavy content (~2.5 chars/token). Intentionally conservative to
+/// prevent "Prompt Too Large" errors on small context models (16K–32K).
+pub const DEFAULT_CHARS_PER_TOKEN: f64 = 3.0;
 
 /// Fully-resolved context tuning values (no Options — all guaranteed).
 /// Created by `Settings::effective_context_tuning()` which cascades:

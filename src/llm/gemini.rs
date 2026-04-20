@@ -867,6 +867,33 @@ impl GeminiModel {
         }
     }
 
+    /// Returns the context window size in tokens for this model.
+    /// Source: https://ai.google.dev/gemini-api/docs/models
+    pub fn context_window_tokens(&self) -> usize {
+        match self {
+            // Gemini 3.x: 1M context
+            GeminiModel::Gemini3_1ProPreview
+            | GeminiModel::Gemini3_1FlashPreview
+            | GeminiModel::Gemini3_1FlashLitePreview
+            | GeminiModel::Gemini3_0ProPreview
+            | GeminiModel::Gemini3_0FlashPreview => 1_000_000,
+            // Gemini 2.5: 1M context
+            GeminiModel::Gemini2_5Pro
+            | GeminiModel::Gemini2_5Flash
+            | GeminiModel::Gemini2_5FlashLite
+            | GeminiModel::Gemini2_5ComputerUsePreview => 1_000_000,
+            // Gemini 2.0: 1M context
+            GeminiModel::Gemini2_0Flash
+            | GeminiModel::Gemini2_0FlashThinking
+            | GeminiModel::Gemini2_0FlashLite => 1_000_000,
+            // Gemma/Nano: smaller windows
+            GeminiModel::Gemma3 => 128_000,
+            GeminiModel::NanoBanana | GeminiModel::NanoBananaPro => 32_000,
+            // Unknown: conservative default
+            GeminiModel::Unknown(_) => 1_000_000,
+        }
+    }
+
     /// Returns the API version this model requires.
     /// Centralizes version routing so model-specific overrides are trivial.
     pub fn api_version(&self) -> &'static str {
@@ -1158,6 +1185,20 @@ impl LlmConnector for GeminiConnector {
             if !response.status().is_success() {
                 let status = response.status();
                 let body_text = response.text().await.unwrap_or_default();
+
+                // Retry on server errors (5xx) if attempts remain — preview models often 500 transiently
+                if status.is_server_error() && attempt + 1 < MAX_RETRIES {
+                    tracing::warn!(
+                        "Gemini API server error [{}] on attempt {}, retrying in {}s: {}",
+                        status,
+                        attempt + 1,
+                        2u64.pow(attempt),
+                        &body_text[..body_text.len().min(200)]
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
+                    continue;
+                }
+
                 let msg = if let Ok(err) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
                     err.error.message
                 } else {
@@ -1182,6 +1223,17 @@ impl LlmConnector for GeminiConnector {
             // prevent duplicate execution.
             let mut emitted_tool_calls: std::collections::HashSet<(String, u64)> =
                 std::collections::HashSet::new();
+
+            // Buffer for usage data: Gemini emits usage_metadata on EVERY SSE chunk,
+            // not just the final one. With thinking models, early chunks report thinking
+            // tokens inside candidates_token_count; the final chunk correctly separates
+            // them into thoughts_token_count, reducing the total. We hold the last-seen
+            // usage and emit it once after the stream ends to avoid the "33 → 27" jitter.
+            let mut pending_usage: Option<crate::components::shared::UsageData> = None;
+
+            // State for tracking leaked <|channel>thought / <|channel>response tokens.
+            // These can leak from Gemma models even through the Gemini API.
+            let mut inside_channel_think = false;
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -1212,15 +1264,34 @@ impl LlmConnector for GeminiConnector {
                                 match event {
                                     StreamEvent::Text { content } => {
                                         if !content.is_empty() {
-                                            current_attempt_parts.push(Part::Text {
-                                                text: content.clone(),
-                                                thought: None,
-                                            });
-                                            let _ = tx.send(StreamMessage::Text {
-                                                content,
-                                                thought_signature: None,
-                                                thought_summary: None,
-                                            });
+                                            // Strip leaked <|channel>thought tokens before display
+                                            let channel_segments = super::convert::strip_channel_tokens(
+                                                &content,
+                                                &mut inside_channel_think,
+                                            );
+                                            for (is_thinking, seg_text) in channel_segments {
+                                                if is_thinking {
+                                                    current_attempt_parts.push(Part::Text {
+                                                        text: seg_text.clone(),
+                                                        thought: Some(true),
+                                                    });
+                                                    let _ = tx.send(StreamMessage::Text {
+                                                        content: String::new(),
+                                                        thought_signature: None,
+                                                        thought_summary: Some(seg_text),
+                                                    });
+                                                } else if !seg_text.is_empty() {
+                                                    current_attempt_parts.push(Part::Text {
+                                                        text: seg_text.clone(),
+                                                        thought: None,
+                                                    });
+                                                    let _ = tx.send(StreamMessage::Text {
+                                                        content: seg_text,
+                                                        thought_signature: None,
+                                                        thought_summary: None,
+                                                    });
+                                                }
+                                            }
                                             has_sent_data = true;
                                         }
                                     }
@@ -1374,15 +1445,15 @@ impl LlmConnector for GeminiConnector {
                                         }
                                     }
                                     StreamEvent::Usage(usage) => {
-                                        let _ = tx.send(StreamMessage::Usage(
-                                            crate::components::shared::UsageData {
-                                                prompt_tokens: usage.prompt_tokens,
-                                                completion_tokens: usage.completion_tokens,
-                                                total_tokens: usage.total_tokens,
-                                                cost: usage.cost,
-                                                ..Default::default()
-                                            },
-                                        ));
+                                        // Buffer — emit only the final authoritative values
+                                        // after the stream completes (see pending_usage flush below).
+                                        pending_usage = Some(crate::components::shared::UsageData {
+                                            prompt_tokens: usage.prompt_tokens,
+                                            completion_tokens: usage.completion_tokens,
+                                            total_tokens: usage.total_tokens,
+                                            cost: usage.cost,
+                                            ..Default::default()
+                                        });
                                     }
                                     StreamEvent::Error { message } => {
                                         let _ = tx.send(StreamMessage::Error { message });
@@ -1403,6 +1474,13 @@ impl LlmConnector for GeminiConnector {
                         return;
                     }
                 }
+            }
+
+            // Emit the final canonical usage now that the stream has ended.
+            // Flushing here rather than per-chunk avoids the "high → low" display
+            // jitter caused by Gemini re-bucketing thinking tokens in the final chunk.
+            if let Some(usage) = pending_usage.take() {
+                let _ = tx.send(StreamMessage::Usage(usage));
             }
 
             // Specific Gemini retry/grounding logic

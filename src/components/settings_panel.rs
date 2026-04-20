@@ -113,7 +113,36 @@ pub fn SettingsPanel() -> Element {
                                             ctx_len, current_model
                                         );
                                         settings.write().openai_compat_config.max_context_tokens = Some(ctx_len);
+                                        // Persist immediately so this value survives the next restart
+                                        // without requiring a manual Settings → Save cycle.
+                                        let sm = settings_manager.peek().clone();
+                                        let s  = settings.peek().clone();
+                                        let _ = sm.save(&s);
                                     }
+                                }
+                            }
+
+                            // Auto-calibrate chars_per_token by probing the tokenizer.
+                            // Only runs if not manually overridden by the user.
+                            // This gives the budget enforcement the real tokenizer ratio
+                            // instead of a heuristic guess.
+                            if settings.peek().openai_compat_config.context_tuning.chars_per_token.is_none() {
+                                if let Some(ratio) = crate::services::openai_compat_validation::calibrate_tokenizer(
+                                    &endpoint,
+                                    &current_model,
+                                    api_key.as_deref(),
+                                ).await {
+                                    // Round to 1 decimal place for cleanliness
+                                    let rounded = (ratio * 10.0).round() / 10.0;
+                                    tracing::info!(
+                                        "Auto-calibrated chars/token: {:.1} for model '{}'",
+                                        rounded, current_model
+                                    );
+                                    settings.write().openai_compat_config.context_tuning.chars_per_token = Some(rounded);
+                                    // Persist so the calibrated ratio survives the next restart.
+                                    let sm = settings_manager.peek().clone();
+                                    let s  = settings.peek().clone();
+                                    let _ = sm.save(&s);
                                 }
                             }
                         }
@@ -1164,6 +1193,31 @@ pub fn SettingsPanel() -> Element {
                                         }
                                     }
 
+                                    // Thinking Mode toggle
+                                    div {
+                                        class: "mb-4 pt-2",
+                                        div {
+                                            class: "flex items-center justify-between",
+                                            label { class: "block text-sm font-medium text-fg-muted", "Thinking Mode" }
+                                            label {
+                                                class: "relative inline-flex items-center cursor-pointer",
+                                                input {
+                                                    r#type: "checkbox",
+                                                    class: "sr-only peer",
+                                                    checked: local_settings.read().openai_compat_config.thinking_enabled,
+                                                    onchange: move |event| {
+                                                        local_settings.write().openai_compat_config.thinking_enabled = event.checked();
+                                                    }
+                                                }
+                                                div { class: "w-11 h-6 bg-input peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
+                                            }
+                                        }
+                                        p {
+                                            class: "text-xs text-fg-muted mt-1",
+                                            "Enable reasoning/thinking for models that support it (Gemma 4, Qwen3). Requires vLLM with --enable-reasoning --reasoning-parser."
+                                        }
+                                    }
+
                                     // Context window is auto-detected from /v1/models (max_model_len)
                                     // No UI element needed — budget enforcement happens transparently
 
@@ -1417,6 +1471,27 @@ pub fn SettingsPanel() -> Element {
                                                             local_settings.write().openai_compat_config.context_tuning.chars_per_token = Some(v.clamp(1.0, 8.0));
                                                         }
                                                     }
+                                                }
+                                            }
+                                            // Compact Tool Results toggle
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label {
+                                                    class: "text-xs text-fg-muted w-32 shrink-0",
+                                                    title: "Convert tool results from JSON to TOON (Token-Oriented Object Notation) for compact display. Reduces token usage by 30–50% for structured tool output.",
+                                                    "Compact Results ⓘ"
+                                                }
+                                                label {
+                                                    class: "relative inline-flex items-center cursor-pointer",
+                                                    input {
+                                                        r#type: "checkbox",
+                                                        class: "sr-only peer",
+                                                        checked: local_settings.read().openai_compat_config.context_tuning.compact_tool_results.unwrap_or(true),
+                                                        onchange: move |event| {
+                                                            local_settings.write().openai_compat_config.context_tuning.compact_tool_results = Some(event.checked());
+                                                        }
+                                                    }
+                                                    div { class: "w-9 h-5 bg-input peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary-500" }
                                                 }
                                             }
                                         }
@@ -2469,13 +2544,13 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Confirm before deleting messages" }
+                                        label { class: "text-sm text-fg-muted", "Confirm before editing messages" }
                                         input {
                                             r#type: "checkbox",
                                             class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().confirm_on_message_delete}",
+                                            checked: "{local_settings.read().confirm_on_message_edit}",
                                             onchange: move |e| {
-                                                local_settings.write().confirm_on_message_delete = e.value() == "true";
+                                                local_settings.write().confirm_on_message_edit = e.value() == "true";
                                             }
                                         }
                                     }
@@ -2679,6 +2754,23 @@ pub fn SettingsPanel() -> Element {
                                             checked: "{local_settings.read().enable_summarization}",
                                             onchange: move |e| {
                                                 local_settings.write().enable_summarization = e.value() == "true";
+                                            }
+                                        }
+                                    }
+
+                                    // Compact Tool Results
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        div {
+                                            label { class: "text-sm font-medium text-fg-muted", "Compact Tool Results (TOON)" }
+                                            p { class: "text-xs text-fg-muted", "Convert tool results to a compact tabular format before sending to the AI. Reduces token usage by ~30–50%. Can be overridden per-provider in Context Tuning." }
+                                        }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                            checked: "{local_settings.read().compact_tool_results}",
+                                            onchange: move |e| {
+                                                local_settings.write().compact_tool_results = e.value() == "true";
                                             }
                                         }
                                     }

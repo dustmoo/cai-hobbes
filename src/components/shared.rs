@@ -71,6 +71,12 @@ pub struct ToolCall {
     /// The actual thinking content (human-readable), separate from the encrypted signature
     #[serde(default)]
     pub thought_summary: Option<String>,
+    /// Filesystem path (`file:///…`) of a screenshot/image returned by this tool call.
+    /// Set by stream_manager when MCP returns image content; read by prompt_builder to
+    /// inject a `ContentBlock::Image` as vision input on the next continuation turn.
+    /// Never embedded in tc.response — stays on disk to keep the session file small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_image_path: Option<String>,
 }
 
 pub enum StreamMessage {
@@ -118,6 +124,7 @@ impl ToolCall {
             response: String::new(),
             thought_signature,
             thought_summary,
+            cached_image_path: None,
         }
     }
 }

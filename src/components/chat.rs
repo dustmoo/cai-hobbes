@@ -349,7 +349,8 @@ pub fn ChatWindow(
 
                     // Intercept HOBBES_PAGE_RESULT before MCP dispatch
                     let (status, response_str) = if tool_call.tool_name == "HOBBES_PAGE_RESULT" {
-                        session_state.write().handle_page_result(&args_json, "")
+                        let page_budget = crate::session::compute_page_budget(&settings.read());
+                        session_state.write().handle_page_result(&args_json, "", page_budget)
                     } else {
                         // Normal MCP tool dispatch
                         let manager = mcp_manager.read().clone();
@@ -534,7 +535,7 @@ pub fn ChatWindow(
                                 if let Some(session) = state.sessions.get(&target_id) {
                                     let builder =
                                         PromptBuilder::new(session, &settings_read, &state);
-                                    let result = builder.build_prompt("".to_string(), None);
+                                    let result = builder.build_prompt("".to_string());
                                     (result.prompt, result.pages_to_store)
                                 } else {
                                     return;
@@ -649,7 +650,7 @@ pub fn ChatWindow(
                         let state = session_state.read();
                         if let Some(session) = state.sessions.get(&target_id) {
                             let builder = PromptBuilder::new(session, &settings_read, &state);
-                            let result = builder.build_prompt(user_prompt, None);
+                            let result = builder.build_prompt(user_prompt);
                             (result.prompt, result.pages_to_store)
                         } else {
                             tracing::error!("No active session found when building prompt");
@@ -726,7 +727,7 @@ pub fn ChatWindow(
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&target_id) {
                         let builder = PromptBuilder::new(session, &settings, &state);
-                        let result = builder.build_prompt("".to_string(), None);
+                        let result = builder.build_prompt("".to_string());
                         (result.prompt, result.pages_to_store)
                     } else {
                         tracing::error!(
@@ -767,8 +768,26 @@ pub fn ChatWindow(
     let root_classes =
         "relative flex flex-col bg-app text-fg rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
 
+    let restore_message_to_draft = move |message_id: Uuid| {
+        let mut local_cmd = chat_command;
+        let (text_content, msg_attachments) = {
+            let state = session_state.read();
+            state.sessions.get(&*current_target_id.read())
+                .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
+                .map(|msg| (
+                    msg.content.get_text_content().unwrap_or_default(),
+                    msg.attachments.clone(),
+                ))
+                .unwrap_or_default()
+        };
+        local_cmd.set(Some(super::chat_input::ChatCommand::RestoreToDraft(
+            text_content,
+            msg_attachments,
+        )));
+    };
+
     let delete_message = move |message_id: Uuid| {
-        let confirm = settings.read().confirm_on_message_delete;
+        let confirm = settings.read().confirm_on_message_edit;
         if confirm {
             if let Some(index) = session_state
                 .read()
@@ -788,7 +807,9 @@ pub fn ChatWindow(
                 show_delete_confirm_modal.set(true);
             }
         } else {
-            // Delete immediately
+            restore_message_to_draft(message_id);
+
+            // Delete the message and everything after
             let message_id_str = message_id.to_string();
             let active_session_id = current_target_id.read().clone();
             if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
@@ -796,6 +817,7 @@ pub fn ChatWindow(
                 // Trigger update
                 stream_update_trigger.set(stream_update_trigger() + 1);
             }
+            crate::session::SessionState::save_async(&session_state.read(), None);
         }
     };
 
@@ -934,21 +956,26 @@ pub fn ChatWindow(
 
                 ConfirmDeleteModal {
                     is_visible: show_delete_confirm_modal,
-                    title: "Delete Messages",
-                    message: format!("Are you sure you want to delete this message and the {} messages that follow? This cannot be undone.", delete_message_count().saturating_sub(1)),
-                    confirm_button_text: "Delete",
+                    title: "Edit Message",
+                    message: format!("This will remove this message and the {} messages that follow, and restore the content to your input box for editing.", delete_message_count().saturating_sub(1)),
+                    confirm_button_text: "Edit",
                     show_dont_ask_again: true,
                     on_confirm: move |dont_ask_again: bool| {
                         if dont_ask_again {
-                            settings.write().confirm_on_message_delete = false;
+                            settings.write().confirm_on_message_edit = false;
                         }
                         if let Some(id) = pending_delete_message_id.read().as_ref() {
+                            if let Ok(uuid) = uuid::Uuid::parse_str(id) {
+                                restore_message_to_draft(uuid);
+                            }
+
                             let active_session_id = current_target_id.read().clone();
                             if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
                                 session.delete_message_and_after(id);
                                 // Trigger update
                                 stream_update_trigger.set(stream_update_trigger() + 1);
                             }
+                            crate::session::SessionState::save_async(&session_state.read(), None);
                         }
                         show_delete_confirm_modal.set(false);
                         pending_delete_message_id.set(None);
@@ -1423,9 +1450,9 @@ pub fn MessageBubble(
                                     || content().starts_with("⚠️ **Tool Call Error") {
                                     QuickFix {
                                         suggestions: vec![
-                                            "Check your tool syntax and try again.".to_string(),
-                                            "Loaded filesystem use directly please.".to_string(),
-                                            "You are using bad syntax, the user has loaded the tools please try again.".to_string(),
+                                            "Please try a different approach without using that tool.".to_string(),
+                                            "Can you retry with the correct tool name?".to_string(),
+                                            "Please continue without tools and answer from your knowledge.".to_string(),
                                         ],
                                         on_select: move |suggestion: String| {
                                             chat_input_draft.set(suggestion);
@@ -1592,11 +1619,13 @@ pub fn MessageBubble(
                                     }
                                 }
 
-                                button {
-                                    class: "p-1.5 text-fg-muted hover:text-red-400 rounded transition-colors",
-                                    onclick: move |_| on_delete.call(()),
-                                    title: "Delete message",
-                                    Icon { width: 14, height: 14, icon: fi_icons::FiTrash2 }
+                                if is_user {
+                                    button {
+                                        class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors",
+                                        onclick: move |_| on_delete.call(()),
+                                        title: "Edit message",
+                                        Icon { width: 14, height: 14, icon: fi_icons::FiEdit2 }
+                                    }
                                 }
                             }
                         }

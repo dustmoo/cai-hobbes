@@ -21,6 +21,7 @@ mod biometric_auth;
 mod components;
 mod constants;
 mod context;
+mod formatters;
 mod gemini;
 mod hotkey;
 #[cfg(target_os = "macos")]
@@ -44,6 +45,7 @@ use secret_manager_generic as secret_manager;
 pub use secret_types::SecretManagerTrait;
 mod services;
 mod session;
+mod str_utils;
 mod usage_log;
 mod settings;
 mod skills;
@@ -816,6 +818,92 @@ fn app() -> Element {
             .await;
     });
 
+    // Startup context auto-detection for OpenAI-compat provider.
+    // Runs once after secrets are loaded so the API key is hydrated before we hit
+    // the endpoint. Ensures max_context_tokens and chars_per_token are always
+    // populated — even if the user never opens the Settings panel.
+    use_effect(move || {
+        // Reactive on secrets_loaded only; peek() for everything else so this
+        // fires exactly once (when secrets_loaded → true) and not on every keystroke.
+        if !secrets_loaded() {
+            return;
+        }
+
+        let active_llm = settings.peek().active_llm;
+        if active_llm != crate::settings::LlmProvider::OpenAiCompat {
+            return;
+        }
+
+        let endpoint = settings.peek().openai_compat_config.endpoint.clone();
+        let model    = settings.peek().openai_compat_config.model.clone();
+        let api_key  = settings.peek().openai_compat_config.api_key.clone();
+
+        if endpoint.is_empty() || model.is_empty() {
+            tracing::debug!("Startup context auto-detect: skipping — endpoint or model not configured");
+            return;
+        }
+
+        spawn(async move {
+            // ── Step 1: Context window discovery ──────────────────────────────
+            match crate::services::openai_compat_validation
+                ::fetch_openai_compat_models_with_context(&endpoint, api_key.as_deref())
+                .await
+            {
+                Ok(discovered) => {
+                    if let Some(info) = discovered.iter().find(|m| m.id == model) {
+                        if let Some(ctx_len) = info.context_length {
+                            let existing = settings.peek().openai_compat_config.max_context_tokens;
+                            if existing != Some(ctx_len) {
+                                tracing::info!(
+                                    "Startup: auto-detected context window {} tokens for model '{}'",
+                                    ctx_len, model
+                                );
+                                settings.write().openai_compat_config.max_context_tokens = Some(ctx_len);
+                                // Persist immediately so the value survives the next restart
+                                // without requiring a manual Settings → Save cycle.
+                                let sm = settings_manager.peek().clone();
+                                let s  = settings.peek().clone();
+                                let _ = sm.save(&s);
+                            } else {
+                                tracing::debug!(
+                                    "Startup: context window already set to {} tokens for '{}', skipping write",
+                                    ctx_len, model
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            "Startup: model '{}' not found in /v1/models response — cannot auto-detect context window",
+                            model
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Startup context auto-detect: discovery failed — {}", e);
+                }
+            }
+
+            // ── Step 2: Tokenizer calibration (skip if manually overridden) ──
+            if settings.peek().openai_compat_config.context_tuning.chars_per_token.is_none() {
+                if let Some(ratio) = crate::services::openai_compat_validation
+                    ::calibrate_tokenizer(&endpoint, &model, api_key.as_deref())
+                    .await
+                {
+                    let rounded = (ratio * 10.0).round() / 10.0;
+                    tracing::info!(
+                        "Startup: auto-calibrated {:.1} chars/token for model '{}'",
+                        rounded, model
+                    );
+                    settings.write().openai_compat_config.context_tuning.chars_per_token = Some(rounded);
+                    // Persist calibration ratio alongside the context window value
+                    let sm = settings_manager.peek().clone();
+                    let s  = settings.peek().clone();
+                    let _ = sm.save(&s);
+                }
+            }
+        });
+    });
+
     // Reinitialize Composio client when active profile changes
     // This use_effect subscribes to changes in active_composio_profile
     {
@@ -1378,6 +1466,7 @@ fn app() -> Element {
                 | ChatCommand::FocusChat
                 | ChatCommand::CancelGeneration
                 | ChatCommand::CopyToDraft(_)
+                | ChatCommand::RestoreToDraft(_, _)
                 | ChatCommand::TriggerAiAnalysis
                 | ChatCommand::ToggleModelSelector => {}
             }

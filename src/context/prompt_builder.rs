@@ -8,24 +8,35 @@ use crate::settings::Settings;
 use chrono::Local;
 use serde_json::{self, json};
 
-/// Snap a byte index DOWN to the nearest valid UTF-8 char boundary.
-/// Prevents panics when slicing multi-byte characters (emojis, CJK, etc.).
-fn floor_char_boundary(s: &str, idx: usize) -> usize {
-    let mut i = idx.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
+/// Convenience re-export so code in this file doesn't need fully-qualified paths.
+use crate::str_utils::{find_split_point, floor_char_boundary};
+
+/// Tracks a tool result message's position in the `messages` buffer for Pass 2
+/// budget allocation. Collected during Pass 1 (message linearisation loop) and
+/// consumed by Pass 2 (dynamic pagination).
+struct ToolResultPosition {
+    /// Index into the `messages` Vec where the ToolResult ContentBlock lives.
+    msg_idx: usize,
+    /// Sanitised tool name (server-prefixed, e.g. `mcp__fs__read_file`).
+    tool_name: String,
+    /// Execution UUID, used to build stable page-queue IDs.
+    execution_id: String,
+    /// True if this is the most recent (active) tool call this turn.
+    is_active: bool,
+    /// True if Pass 1 TOON condensation already stashed this result in the
+    /// PageQueue. When set, Pass 2 must skip this entry so it doesn't corrupt
+    /// the HOBBES_PAGE_RESULT footer that Pass 1 already embedded.
+    already_condensed: bool,
 }
 
 /// Recursively unwrap JSON values that are stringified JSON.
 /// Composio (and similar wrappers) often return tool results where the actual
 /// data is embedded inside a string field, e.g.:
 ///   `{"result": {"type": "text", "text": "{\"successfull\":true,...}"}}`
-/// The `json2markdown` crate treats `Value::String` as plain text, so these
+/// The TOON formatter treats `Value::String` as plain text, so these
 /// nested JSON payloads render as raw escaped strings. This function detects
 /// string values that parse as JSON objects/arrays and replaces them in-place,
-/// allowing the markdown renderer to recurse into the full structure.
+/// allowing the TOON renderer to recurse into the full structure.
 fn unwrap_json_strings(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => {
@@ -157,7 +168,6 @@ impl<'a> PromptBuilder<'a> {
     pub fn build_prompt(
         &self,
         user_message: String,
-        _last_agent_message: Option<String>,
     ) -> PromptBuildResult {
         // 1. Extract and format tools from the session context.
         let mut tools = Vec::new();
@@ -361,6 +371,126 @@ impl<'a> PromptBuilder<'a> {
             }
         }
 
+        // Inject skills from session.loaded_skills using turn-relevant lazy loading.
+        //
+        // Strategy: Scan the last 5 messages to detect which skill's tools were recently
+        // used. Only that skill receives its full `instruction_manual`; all others are
+        // stubbed (name + tool list only). This eliminates Tier 2 compression under
+        // normal single-skill workflows while still supporting multi-skill turns.
+        //
+        // Fallback: If no active skill is detected via tool matching, ALL loaded skills
+        // get their full manuals (current behavior) — we never silently degrade context.
+        if !self.session.loaded_skills.is_empty() {
+            // Step 1: Collect tool server prefixes used in the last 5 messages.
+            let recently_used_servers: std::collections::HashSet<String> = self
+                .session
+                .messages
+                .iter()
+                .rev()
+                .take(5)
+                .filter_map(|m| {
+                    if let MessageContent::ToolCall(tc) = &m.content {
+                        Some(tc.server_name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Step 2: Identify which loaded skills have tools on those servers.
+            // A skill is "turn-active" if any of its resolved_tools match a recently
+            // used server prefix.
+            let active_skill_names: std::collections::HashSet<String> = self
+                .session
+                .loaded_skills
+                .iter()
+                .filter_map(|(skill_name, payload_json)| {
+                    let payload = serde_json::from_str::<
+                        crate::components::shared::CapabilityContextPayload,
+                    >(payload_json)
+                    .ok()?;
+                    let is_active = payload.resolved_tools.values().any(|tool_str| {
+                        recently_used_servers.iter().any(|server| {
+                            tool_str.contains(server.as_str())
+                        })
+                    });
+                    if is_active { Some(skill_name.clone()) } else { None }
+                })
+                .collect();
+
+            // Step 3: Build the loaded_skills array for the system context map.
+            // Full manual → turn-active skills; stub only → inactive skills.
+            // If no active skills were detected, fall back to injecting all skills fully.
+            let use_lazy = !active_skill_names.is_empty();
+            let skills_array: Vec<serde_json::Value> = self
+                .session
+                .loaded_skills
+                .iter()
+                .filter_map(|(skill_name, payload_json)| {
+                    let payload = serde_json::from_str::<
+                        crate::components::shared::CapabilityContextPayload,
+                    >(payload_json)
+                    .ok()?;
+                    let tool_mappings: Vec<serde_json::Value> = payload
+                        .resolved_tools
+                        .iter()
+                        .map(|(cap, tool)| json!({"capability": cap, "use_tool": tool}))
+                        .collect();
+
+                    let is_active = !use_lazy || active_skill_names.contains(skill_name);
+                    if is_active {
+                        tracing::debug!(
+                            "Loaded skill '{}': full instruction_manual injected ({} chars)",
+                            skill_name, payload.instruction_manual.len()
+                        );
+                        Some(json!({
+                            "name": skill_name,
+                            "instruction_manual": payload.instruction_manual,
+                            "resolved_tools": tool_mappings,
+                            "warnings": payload.warnings,
+                        }))
+                    } else {
+                        tracing::debug!(
+                            "Loaded skill '{}': stub only (not active this turn)",
+                            skill_name
+                        );
+                        Some(json!({
+                            "name": skill_name,
+                            "resolved_tools": tool_mappings,
+                            "note": "Skill loaded but not active this turn. Full instructions available if needed.",
+                        }))
+                    }
+                })
+                .collect();
+
+            if !skills_array.is_empty() {
+                system_context_map.insert(
+                    "loaded_skills".to_string(),
+                    serde_json::Value::Array(skills_array),
+                );
+                tracing::info!(
+                    "Loaded skills injected: {} total, {} active (lazy={})",
+                    self.session.loaded_skills.len(),
+                    active_skill_names.len(),
+                    use_lazy
+                );
+            }
+        }
+
+        // Inject the AI-authored scratchpad as a Tier 1 core payload.
+        // This is never trimmed by compose_system_for_budget — it is the AI's
+        // persistent working memory for the current session, written via
+        // HOBBES_UPDATE_SCRATCHPAD and immune to history scrolling and compression.
+        if !self.session.scratchpad.is_empty() {
+            system_context_map.insert(
+                "scratchpad".to_string(),
+                json!({
+                    "content": self.session.scratchpad,
+                    "instruction": "This is your persistent working memory for this session. You wrote it and may update it at any time by calling HOBBES_UPDATE_SCRATCHPAD. Refer to it for key facts that should not be forgotten."
+                }),
+            );
+        }
+
         // Skill-scoped tool filtering: when a skill has resolved specific tools,
         // only include those tool definitions instead of ALL tools from ALL servers.
         // IMPORTANT: Only apply this filter when the skill call is the LAST meaningful
@@ -450,13 +580,7 @@ impl<'a> PromptBuilder<'a> {
         // Apply system context composition for finite context windows.
         // This compresses/omits low-priority sections to fit the system prompt
         // within ~20% of the provider's context budget.
-        let provider_context: Option<usize> = match self.settings.active_llm {
-            crate::settings::LlmProvider::OpenAiCompat =>
-                self.settings.openai_compat_config.max_context_tokens,
-            crate::settings::LlmProvider::Claude =>
-                self.settings.claude_config.max_tokens.map(|t| t as usize),
-            _ => None,
-        };
+        let provider_context = self.settings.resolve_context_window();
         Self::compose_system_for_budget(&mut system_context_map, &persona, provider_context, &tuning);
 
         let context_json = serde_json::to_string_pretty(&system_context_map).unwrap_or_default();
@@ -473,11 +597,11 @@ impl<'a> PromptBuilder<'a> {
         let mut messages: Vec<ChatMessage> = Vec::new();
         let mut last_thought_signature: Option<String> = None;
         // Track positions of ToolResult messages for Pass 2 budget allocation
-        let mut tool_result_positions: Vec<(usize, String, String, bool)> = Vec::new();
+        let mut tool_result_positions: Vec<ToolResultPosition> = Vec::new();
         // Pages to store in PageQueue (for both historical stashes and active pagination)
         let mut pages_to_store: Vec<(String, crate::session::PagedResult)> = Vec::new();
 
-        let history_len = self.settings.chat_history_length;
+        let history_len = tuning.chat_history_length;
         let session_messages = &self.session.messages;
         let mut first_message_id = None;
 
@@ -606,15 +730,19 @@ impl<'a> PromptBuilder<'a> {
                         // Resolve whether to apply compact markdown conversion
                         // (uses `tuning` already resolved at line 176 for the entire build)
                         let use_compact = tuning.compact_tool_results;
+                        // Tracks whether Pass 1 TOON condensation already stashed this result.
+                        // When true, Pass 2 will skip re-paginating to avoid corrupting the
+                        // HOBBES_PAGE_RESULT footer that Pass 1 already embedded.
+                        let mut already_condensed_by_pass1 = false;
 
                         let result_value: serde_json::Value = if use_compact {
                             // Parse to JSON for markdown conversion
                             let mut json_val: serde_json::Value =
                                 serde_json::from_str(&result_string).unwrap_or(json!(result_string));
                             // Recursively unwrap stringified JSON (e.g. Composio's result.text)
-                            // so json2markdown can render the full structure as markdown.
+                            // so TOON can render the full structure efficiently.
                             unwrap_json_strings(&mut json_val);
-                            let md = json2markdown::MarkdownRenderer::new(1, 2).render(&json_val);
+                            let md = crate::formatters::toon::to_toon(&json_val);
 
                             if !is_active_tool_call {
                                 // Historical result: condense for context, stash full data
@@ -629,7 +757,7 @@ impl<'a> PromptBuilder<'a> {
                                     pages_to_store.push((
                                         stash_id.clone(),
                                         crate::session::PagedResult {
-                                            pages: std::collections::VecDeque::from(vec![md.clone()]),
+                                            remaining_content: md.clone(),
                                             tool_name: sanitized_tool_name.clone(),
                                         },
                                     ));
@@ -646,6 +774,9 @@ impl<'a> PromptBuilder<'a> {
                                         "Condensed historical result for {} ({} chars → {} chars, stash_id={})",
                                         sanitized_tool_name, result_string.len(), condensed.len(), stash_id
                                     );
+                                    // Mark as already_condensed so Pass 2 doesn't re-paginate
+                                    // and corrupt the HOBBES_PAGE_RESULT footer we just added.
+                                    already_condensed_by_pass1 = true;
                                     json!(condensed)
                                 } else {
                                     // Fits within budget — use full markdown
@@ -664,8 +795,10 @@ impl<'a> PromptBuilder<'a> {
                                 json!(md)
                             }
                         } else {
-                            // compact_tool_results OFF: original JSON behavior
-                            let mut rs = result_string;
+                            // compact_tool_results OFF: original JSON behavior.
+                            // Oversized results are paginated (not silently truncated) so the
+                            // model can fetch the remainder via HOBBES_PAGE_RESULT.
+                            let rs = result_string;
                             let max_len = if is_active_tool_call {
                                 self.effective_tool_result_limit(&tuning)
                             } else {
@@ -673,18 +806,46 @@ impl<'a> PromptBuilder<'a> {
                             };
 
                             if rs.len() > max_len {
-                                let original_len = rs.len();
-                                let truncated_len = floor_char_boundary(&rs, max_len);
-                                rs.truncate(truncated_len);
-                                rs.push_str(&format!(
-                                    "... [Output truncated from {} bytes]",
-                                    original_len
-                                ));
-                            }
-
-                            match serde_json::from_str::<serde_json::Value>(&rs) {
-                                Ok(val) => val,
-                                Err(_) => json!(rs),
+                                let split_at = find_split_point(&rs, max_len);
+                                if split_at < rs.len() {
+                                    // Stash the remainder so the model can page through it.
+                                    let stash_id = format!(
+                                        "raw-{}-{}",
+                                        sanitized_tool_name,
+                                        &tc.execution_id[..8.min(tc.execution_id.len())]
+                                    );
+                                    pages_to_store.push((
+                                        stash_id.clone(),
+                                        crate::session::PagedResult {
+                                            remaining_content: rs[split_at..].to_string(),
+                                            tool_name: sanitized_tool_name.clone(),
+                                        },
+                                    ));
+                                    let page1 = format!(
+                                        "{}\n\n[Result truncated. Full data available: call HOBBES_PAGE_RESULT with tool_call_id \"{}\"]",
+                                        &rs[..split_at], stash_id
+                                    );
+                                    already_condensed_by_pass1 = true;
+                                    tracing::debug!(
+                                        "compact=OFF: stashed raw result for '{}' ({} chars, stash_id={})",
+                                        sanitized_tool_name, rs.len(), stash_id
+                                    );
+                                    match serde_json::from_str::<serde_json::Value>(&page1) {
+                                        Ok(val) => val,
+                                        Err(_) => json!(page1),
+                                    }
+                                } else {
+                                    // split_at == rs.len(): entire content fits at split boundary
+                                    match serde_json::from_str::<serde_json::Value>(&rs) {
+                                        Ok(val) => val,
+                                        Err(_) => json!(rs),
+                                    }
+                                }
+                            } else {
+                                match serde_json::from_str::<serde_json::Value>(&rs) {
+                                    Ok(val) => val,
+                                    Err(_) => json!(rs),
+                                }
                             }
                         };
 
@@ -696,13 +857,60 @@ impl<'a> PromptBuilder<'a> {
                                 content: result_value,
                             }],
                         });
-                        // Track position for Pass 2 budget allocation
-                        tool_result_positions.push((
-                            messages.len() - 1,
-                            sanitized_tool_name,
-                            tc.execution_id.to_string(),
-                            is_active_tool_call,
-                        ));
+
+                        // Capture the ToolResult index BEFORE any vision message is pushed
+                        // so Pass 2 budget allocation always targets the correct message.
+                        let tool_result_msg_idx = messages.len() - 1;
+
+                        // ── Vision injection ─────────────────────────────────────────────
+                        // If this tool call produced a screenshot, inject it as a vision
+                        // message so the model can see the image on the next turn.
+                        // The image was already resized to max 768px and saved as JPEG by
+                        // stream_manager::save_tool_image — we just need to load and re-encode.
+                        if let Some(ref img_path) = tc.cached_image_path {
+                            let fs_path = img_path.strip_prefix("file://").unwrap_or(img_path);
+                            match std::fs::read(fs_path) {
+                                Ok(bytes) => {
+                                    use base64::Engine;
+                                    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                    messages.push(ChatMessage {
+                                        role: ChatRole::User,
+                                        content: vec![
+                                            ContentBlock::Text {
+                                                text: "[Vision context from previous tool result — screenshot captured by browser:]".to_string(),
+                                            },
+                                            ContentBlock::Image {
+                                                mime_type: "image/jpeg".to_string(),
+                                                data,
+                                            },
+                                        ],
+                                    });
+                                    tracing::debug!(
+                                        "Injected cached screenshot '{}' as vision context for '{}'",
+                                        fs_path, tc.tool_name
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Could not load cached tool image '{}': {}",
+                                        fs_path, e
+                                    );
+                                }
+                            }
+                        }
+
+                        // Track position for Pass 2 budget allocation.
+                        // Uses the pre-captured index so vision messages don't shift it.
+                        // The bool signals whether Pass 1 TOON condensation already handled
+                        // pagination — if so, Pass 2 skips this entry.
+                        tool_result_positions.push(ToolResultPosition {
+                            msg_idx: tool_result_msg_idx,
+                            tool_name: sanitized_tool_name,
+                            execution_id: tc.execution_id.to_string(),
+                            is_active: is_active_tool_call,
+                            already_condensed: already_condensed_by_pass1,
+                        });
+
                     }
                     MessageContent::SkillCall(sc) => {
                         if let crate::components::shared::SkillCallStatus::Completed = sc.status {
@@ -748,7 +956,7 @@ impl<'a> PromptBuilder<'a> {
 
             let non_result_chars: usize = messages.iter()
                 .enumerate()
-                .filter(|(idx, _)| !tool_result_positions.iter().any(|(mi, _, _, _)| mi == idx))
+                .filter(|(idx, _)| !tool_result_positions.iter().any(|trp| trp.msg_idx == *idx))
                 .map(|(_, m)| m.content.iter().map(|b| match b {
                     ContentBlock::Text { text } => text.len(),
                     ContentBlock::Thinking { text, .. } => text.len(),
@@ -758,7 +966,7 @@ impl<'a> PromptBuilder<'a> {
                 }).sum::<usize>())
                 .sum();
 
-            let active_idx = tool_result_positions.iter().position(|(_, _, _, is_active)| *is_active);
+            let active_idx = tool_result_positions.iter().position(|trp| trp.is_active);
 
             if let Some(budgets) = Self::compute_tool_result_budget(
                 system_chars,
@@ -769,56 +977,67 @@ impl<'a> PromptBuilder<'a> {
                 provider_context,
                 &tuning,
             ) {
-                // Apply budgets: paginate results that exceed their allocation
-                for (pos_idx, (msg_idx, tool_name, execution_id, _is_active)) in tool_result_positions.iter().enumerate() {
+                // Apply budgets: paginate results that exceed their allocation.
+                // Uses find_split_point directly (instead of the old segment_into_pages)
+                // so all content beyond page 1 is stored in the PageQueue as a raw
+                // string for dynamic re-segmentation at delivery time. This guarantees
+                // the model can always fetch content via HOBBES_PAGE_RESULT rather than
+                // hitting a silent hard truncation.
+                for (pos_idx, trp) in tool_result_positions.iter().enumerate() {
                     let budget_chars = budgets[pos_idx];
+                    let ToolResultPosition { msg_idx, tool_name, execution_id, already_condensed, .. } = trp;
+
+                    // Skip entries already condensed by Pass 1 TOON stashing.
+                    // Their HOBBES_PAGE_RESULT footer must not be overwritten.
+                    if *already_condensed {
+                        tracing::debug!(
+                            "Pass 2 skipping '{}' — already condensed by Pass 1",
+                            tool_name
+                        );
+                        continue;
+                    }
 
                     if let Some(msg) = messages.get_mut(*msg_idx) {
                         if let Some(ContentBlock::ToolResult { content, .. }) = msg.content.first() {
                             // Extract raw content for pagination. If the value is a string
-                            // (e.g., markdown from compact_tool_results), use it directly to
-                            // avoid JSON-escaping (\n → \\n). For objects/arrays, fall back
+                            // (e.g., TOON markdown from compact_tool_results), use it directly
+                            // to avoid JSON-escaping (\n → \\n). For objects/arrays, fall back
                             // to JSON serialization which preserves structure.
                             let serialized = content.as_str()
                                 .map(|s| s.to_string())
                                 .unwrap_or_else(|| serde_json::to_string_pretty(content).unwrap_or_else(|_| content.to_string()));
+
                             if serialized.len() > budget_chars {
-                                // Paginate: segment into pages that fit the budget.
-                                let pages = Self::segment_into_pages(&serialized, budget_chars);
-                                if pages.len() > 1 {
+                                // Find where page 1 ends using a single smart split.
+                                // Store everything after it as a raw string so delivery
+                                // can re-split dynamically at the budget of each future turn.
+                                let split_at = find_split_point(&serialized, budget_chars);
+
+                                if split_at < serialized.len() {
                                     let short_suffix: String = execution_id.chars()
                                         .filter(|c| c.is_alphanumeric())
                                         .take(6)
                                         .collect();
                                     let tool_call_id = format!("page-{}-{}", tool_name, short_suffix);
                                     pages_to_store.push((tool_call_id.clone(), crate::session::PagedResult {
-                                        pages: pages.iter().skip(1).cloned().collect::<std::collections::VecDeque<_>>(),
+                                        remaining_content: serialized[split_at..].to_string(),
                                         tool_name: tool_name.clone(),
                                     }));
-                                    let total_pages = pages.len();
-                                    let remaining = total_pages - 1;
                                     let page1_with_footer = format!(
-                                        "{}\n\n[Page 1 of {}. {} more page(s) available. To view the next page, use the HOBBES_PAGE_RESULT tool with tool_call_id \"{}\"]",
-                                        pages[0], total_pages, remaining, tool_call_id
+                                        "{}\n\n[More content available. To view the next page, use the HOBBES_PAGE_RESULT tool with tool_call_id \"{}\"]",
+                                        &serialized[..split_at], tool_call_id
                                     );
                                     tracing::info!(
-                                        "Dynamic budget: paginated '{}' ({} bytes → {} chars budget) into {} pages (id={})",
-                                        tool_name, serialized.len(), budget_chars, total_pages, tool_call_id
+                                        "Pass 2: paginated '{}' ({} bytes → {} chars budget, id={})",
+                                        tool_name, serialized.len(), budget_chars, tool_call_id
                                     );
                                     if let Some(ContentBlock::ToolResult { content, .. }) = msg.content.first_mut() {
                                         *content = json!(page1_with_footer);
                                     }
-                                } else {
-                                    // Single page after segmentation — truncate
-                                    let trunc_len = floor_char_boundary(&serialized, budget_chars);
-                                    let truncated = format!(
-                                        "{} ... [Output truncated from {} bytes to fit context]",
-                                        &serialized[..trunc_len], serialized.len()
-                                    );
-                                    if let Some(ContentBlock::ToolResult { content, .. }) = msg.content.first_mut() {
-                                        *content = json!(truncated);
-                                    }
                                 }
+                                // else: split_at == serialized.len() means find_split_point
+                                // found no good boundary and returned the full length —
+                                // content fits as-is, no truncation needed.
                             }
                         }
                     }
@@ -851,7 +1070,25 @@ impl<'a> PromptBuilder<'a> {
             );
         }
 
-        // Strip historical thinking blocks for finite context windows.
+        // Inject HOBBES_UPDATE_SCRATCHPAD — always present so the AI can
+        // save key facts to its persistent session memory at any time.
+        // This is a Tier 1 meta-tool; its content is never compressed or trimmed.
+        tools.push(ToolDefinition {
+            name: "HOBBES_UPDATE_SCRATCHPAD".to_string(),
+            description: "Write important facts, decisions, or discoveries to your persistent session scratchpad. The scratchpad survives context compression and history scrolling. OVERWRITE: include all information you want to retain — anything not in this call is lost.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The full new scratchpad content. Be concise but complete — include any facts from the previous scratchpad you want to keep."
+                    }
+                },
+                "required": ["content"]
+            }),
+            server_name: "hobbes-local-meta".to_string(),
+        });
+
         // For small models (Qwen 3.5, etc.), re-injected <thinking> tags from
         // previous turns can consume 30-50% of the context budget. We keep
         // thinking only on the most recent assistant message and strip it
@@ -962,12 +1199,16 @@ impl<'a> PromptBuilder<'a> {
         Some(budgets)
     }
 
-    /// Split a large string into pages that each fit within `page_size` characters.
-    /// Tries to split at clean boundaries in this priority order:
-    /// 1. JSON array/object boundaries (`},`, `],`)
-    /// 2. Paragraph breaks (`\n\n`)
-    /// 3. Line breaks (`\n`)
-    /// 4. Raw char-boundary splitting (fallback)
+    /// Split `content` into a `Vec<String>` of pages that each fit within `page_size` chars.
+    ///
+    /// **Note:** Production code no longer calls this function — Pass 2 uses
+    /// `crate::str_utils::find_split_point` directly so page 1 is served inline and
+    /// the remainder is stored in the `PageQueue` for dynamic re-segmentation at
+    /// delivery time. This function is preserved for unit-test coverage only.
+    ///
+    /// The split strategy (JSON boundaries → paragraph → line → char fallback) matches
+    /// `str_utils::find_split_point` exactly because it delegates to it.
+    #[cfg(test)]
     fn segment_into_pages(content: &str, page_size: usize) -> Vec<String> {
         if content.len() <= page_size {
             return vec![content.to_string()];
@@ -981,38 +1222,7 @@ impl<'a> PromptBuilder<'a> {
                 pages.push(remaining.to_string());
                 break;
             }
-
-            // Snap page_size to a valid char boundary in `remaining`
-            let safe_end = floor_char_boundary(remaining, page_size);
-            let mut split_at = safe_end;
-
-            // Look for clean split points within last 20% of page
-            let search_start = floor_char_boundary(remaining, (page_size as f64 * 0.8) as usize);
-            if search_start < safe_end {
-                let search_slice = &remaining[search_start..safe_end];
-                if let Some(pos) = search_slice.rfind("},") {
-                    // JSON object boundary
-                    split_at = search_start + pos + 2;
-                } else if let Some(pos) = search_slice.rfind("],") {
-                    // JSON array boundary
-                    split_at = search_start + pos + 2;
-                } else if let Some(pos) = search_slice.rfind("\n\n") {
-                    // Paragraph break (markdown-friendly)
-                    split_at = search_start + pos + 2;
-                } else if let Some(pos) = search_slice.rfind('\n') {
-                    // Line break
-                    split_at = search_start + pos + 1;
-                }
-            }
-
-            if split_at == 0 {
-                // Absolute fallback: take at least one character
-                split_at = remaining.char_indices()
-                    .nth(1)
-                    .map(|(i, _)| i)
-                    .unwrap_or(remaining.len());
-            }
-
+            let split_at = crate::str_utils::find_split_point(remaining, page_size);
             pages.push(remaining[..split_at].to_string());
             remaining = &remaining[split_at..];
         }
@@ -1027,15 +1237,7 @@ impl<'a> PromptBuilder<'a> {
     fn effective_tool_result_limit(&self, tuning: &crate::settings::ResolvedContextTuning) -> usize {
         let user_max = tuning.max_active_tool_output_length;
 
-        let provider_context_tokens: Option<usize> = match self.settings.active_llm {
-            crate::settings::LlmProvider::OpenAiCompat => {
-                self.settings.openai_compat_config.max_context_tokens
-            }
-            crate::settings::LlmProvider::Claude => {
-                self.settings.claude_config.max_tokens.map(|t| t as usize)
-            }
-            crate::settings::LlmProvider::Gemini => None, // Gemini has huge context, no cap needed
-        };
+        let provider_context_tokens = self.settings.resolve_context_window();
 
         if let Some(max_tokens) = provider_context_tokens {
             let ratio = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(tuning.tool_result_budget_ratio);
@@ -1053,7 +1255,7 @@ impl<'a> PromptBuilder<'a> {
 
     /// Compress system context map to fit within a budget when the provider has
     /// a finite context window. Uses a 4-tier priority system:
-    /// 1. Core (never omit): system_persona, user_name, current_time
+    /// 1. Core (never omit): system_persona, user_name, current_time, scratchpad
     /// 2. Skill (compress before omit): loaded_skills instruction_manuals
     /// 3. Context (trim): conversation_summary, entities
     /// 4. Enrichment (omit first): composio_context, mcp_servers, user_instruction
@@ -1076,6 +1278,20 @@ impl<'a> PromptBuilder<'a> {
 
         if running_size <= system_budget_chars { return; }
 
+        // Warn if the scratchpad alone consumes a large share of the system budget.
+        // The scratchpad is Tier 1 protected — we never remove it — but this log
+        // helps diagnose why system context is being aggressively compressed.
+        if let Some(scratch) = system_context_map.get("scratchpad") {
+            let scratch_chars = serde_json::to_string(scratch).map(|s| s.len()).unwrap_or(0);
+            if scratch_chars > system_budget_chars / 2 {
+                tracing::warn!(
+                    "Scratchpad ({} chars) exceeds 50% of system budget ({} chars). \
+                     Consider calling HOBBES_UPDATE_SCRATCHPAD to condense it.",
+                    scratch_chars, system_budget_chars
+                );
+            }
+        }
+
         tracing::info!(
             "System context composition: {} chars vs {} budget ({}K model). Compressing.",
             running_size, system_budget_chars, max_tokens / 1000
@@ -1085,6 +1301,10 @@ impl<'a> PromptBuilder<'a> {
         let value_size = |v: &serde_json::Value| -> usize {
             serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)
         };
+
+        // Tier 1 (protected — never touched): system_persona, user_name, current_time, scratchpad
+        // These keys are NEVER removed or modified by any compression tier.
+        // scratchpad is the AI's persistent session memory — immune to all compression.
 
         // Tier 4: Drop enrichment sections
         for key in ["composio_context", "mcp_servers", "user_instruction"] {

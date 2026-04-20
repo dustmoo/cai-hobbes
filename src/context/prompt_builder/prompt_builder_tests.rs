@@ -23,6 +23,7 @@ fn create_test_session() -> Session {
         memory_optimization_summary: None,
         composio_profile: None,
         loaded_skills: std::collections::HashMap::new(),
+        scratchpad: String::new(),
     }
 }
 
@@ -50,7 +51,7 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
     };
 
     let builder = PromptBuilder::new(&session, &settings, &session_state);
-    let prompt = builder.build_prompt("Hello".to_string(), None);
+    let prompt = builder.build_prompt("Hello".to_string());
 
     // Extract the system instruction text
     let full_text = prompt.prompt.system.expect("Should have system instruction");
@@ -88,7 +89,7 @@ fn test_composio_context_not_injected_when_profile_missing_api_key() {
     };
 
     let builder = PromptBuilder::new(&session, &settings, &session_state);
-    let prompt = builder.build_prompt("Hello".to_string(), None);
+    let prompt = builder.build_prompt("Hello".to_string());
 
     let full_text = prompt.prompt.system.expect("Should have system instruction");
 
@@ -117,7 +118,7 @@ fn test_composio_context_not_injected_when_profile_missing_user_id() {
     };
 
     let builder = PromptBuilder::new(&session, &settings, &session_state);
-    let prompt = builder.build_prompt("Hello".to_string(), None);
+    let prompt = builder.build_prompt("Hello".to_string());
 
     let full_text = prompt.prompt.system.expect("Should have system instruction");
 
@@ -157,7 +158,7 @@ fn test_oversized_entities_stripped_from_system_context() {
     };
 
     let builder = PromptBuilder::new(&session, &settings, &session_state);
-    let prompt = builder.build_prompt("Hello".to_string(), None);
+    let prompt = builder.build_prompt("Hello".to_string());
 
     let full_text = prompt.prompt.system.expect("Should have system instruction");
 

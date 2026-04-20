@@ -1077,7 +1077,7 @@ pub fn ChatInput(
 
                                                         let settings_reader = settings.read();
                                                         let builder = PromptBuilder::new(&session_for_debug, &settings_reader, &state);
-                                                        let result = builder.build_prompt("[DEBUG USER MESSAGE]".to_string(), None);
+                                                        let result = builder.build_prompt("[DEBUG USER MESSAGE]".to_string());
                                                         let prompt_data = result.prompt;
                                                         format!("{:#?}", prompt_data)
                                                     } else {

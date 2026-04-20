@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -118,6 +118,12 @@ pub struct Session {
     /// Skills persist here until explicitly unloaded via /unload.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub loaded_skills: HashMap<String, String>,
+    /// AI-authored persistent scratchpad.
+    /// Written by the AI via HOBBES_UPDATE_SCRATCHPAD (overwrite semantics).
+    /// Injected as a Tier 1 core payload — never trimmed by context compression.
+    /// Survives history scrolling and all 4 compression tiers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scratchpad: String,
 }
 
 impl Session {
@@ -222,16 +228,50 @@ impl Session {
 
 /// A large tool result that has been split into pages for small context windows.
 /// Stored ephemerally in SessionState — not persisted to disk.
+///
+/// Pages are **not** pre-segmented. Instead, the full remaining content is stored
+/// and dynamically sliced at delivery time using the model's current context budget.
+/// This ensures page sizes adapt to context pressure changes between turns.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PagedResult {
-    /// Remaining pages (front-pop for O(1) delivery).
-    pub pages: VecDeque<String>,
+    /// Full remaining content. Consumed incrementally from the front
+    /// using a dynamic `page_budget` supplied at delivery time.
+    pub remaining_content: String,
     pub tool_name: String,
 }
 
 /// Session-scoped store for paginated tool results.
 /// Keys are tool_call_id (execution_id). Cleared on session switch.
 pub type PageQueue = HashMap<String, PagedResult>;
+
+// floor_char_boundary and find_split_point live in crate::str_utils
+// to avoid duplication with context/prompt_builder.rs.
+
+/// Compute the dynamic page delivery budget based on the current model's context window.
+/// Returns a character-count budget for a single page of HOBBES_PAGE_RESULT.
+///
+/// Uses the same provider-context resolution as `effective_tool_result_limit` in
+/// prompt_builder.rs, ensuring page sizes scale proportionally with the model.
+pub fn compute_page_budget(settings: &crate::settings::Settings) -> usize {
+    let tuning = settings.effective_context_tuning();
+    let provider_context_tokens = settings.resolve_context_window();
+
+    if let Some(max_tokens) = provider_context_tokens {
+        let ratio = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(
+            tuning.tool_result_budget_ratio,
+        );
+        let budget = (max_tokens as f64 * ratio * tuning.chars_per_token) as usize;
+        tracing::debug!(
+            "HOBBES_PAGE_RESULT budget: {} chars (ratio: {:.0}%, provider: {} tokens)",
+            budget,
+            ratio * 100.0,
+            max_tokens
+        );
+        budget
+    } else {
+        tuning.max_active_tool_output_length
+    }
+}
 
 /// Schema version for SessionState persistence.
 /// Bump this when adding new migrations to `load()`.
@@ -279,31 +319,72 @@ fn get_sessions_path() -> Option<PathBuf> {
 
 impl SessionState {
     /// Fetch the next page of a paginated tool result.
-    /// Returns `(page_content, tool_name, remaining)` or `None` if the
-    /// tool_call_id is not found. Automatically cleans up the entry when
-    /// all pages have been consumed.
-    pub fn fetch_next_page(&mut self, tool_call_id: &str) -> Option<(String, String, usize)> {
-        let entry = self.page_queue.get_mut(tool_call_id)?;
-        if entry.pages.is_empty() {
-            self.page_queue.remove(tool_call_id);
+    ///
+    /// `page_budget` controls how many characters to include in this page,
+    /// allowing dynamic sizing based on the current model's context window.
+    /// Returns `(page_content, tool_name, estimated_remaining)` or `None`
+    /// if the tool_call_id is not found. Automatically cleans up the entry
+    /// when all content has been consumed.
+    pub fn fetch_next_page(
+        &mut self,
+        tool_call_id: &str,
+        page_budget: usize,
+    ) -> Option<(String, String, usize)> {
+        // Remove the entry to avoid borrow conflicts during splitting.
+        // Re-insert after if content remains.
+        let mut entry = self.page_queue.remove(tool_call_id)?;
+
+        if entry.remaining_content.is_empty() {
             return None;
         }
-        let page_content = entry.pages.pop_front()?; // O(1) with VecDeque
-        let remaining = entry.pages.len();
+
         let tool_name = entry.tool_name.clone();
-        if remaining == 0 {
-            self.page_queue.remove(tool_call_id);
+
+        if entry.remaining_content.len() <= page_budget {
+            // Last page — return everything, don't re-insert
+            return Some((entry.remaining_content, tool_name, 0));
         }
-        Some((page_content, tool_name, remaining))
+
+        // Dynamically split at the current budget
+        let split_at = crate::str_utils::find_split_point(&entry.remaining_content, page_budget);
+        let page = entry.remaining_content[..split_at].to_string();
+        entry.remaining_content = entry.remaining_content[split_at..].to_string();
+
+        // Remaining page count is an ESTIMATE based on current budget.
+        // Limitations:
+        //  1. The budget may change between calls (model switch, context pressure)
+        //     so the actual number of remaining pages can drift from this estimate.
+        //  2. Assumes roughly uniform content density; highly variable content
+        //     (e.g., large JSON array followed by short metadata) will skew the prediction.
+        //  3. Smart splitting at semantic boundaries means actual page sizes are
+        //     slightly smaller than `page_budget`, so remaining count may underestimate.
+        let remaining_estimate = if entry.remaining_content.is_empty() {
+            0
+        } else {
+            ((entry.remaining_content.len() as f64) / (page_budget as f64)).ceil() as usize
+        };
+
+        // Re-insert if there's remaining content
+        if !entry.remaining_content.is_empty() {
+            self.page_queue
+                .insert(tool_call_id.to_string(), entry);
+        }
+
+        Some((page, tool_name, remaining_estimate))
     }
 
     /// Handle a HOBBES_PAGE_RESULT tool call. Extracts `tool_call_id` from
     /// `args_json`, fetches the next page, and returns `(status, response_string)`.
     /// Single authority for all HOBBES_PAGE_RESULT dispatch sites.
+    ///
+    /// `page_budget` controls how many characters to include in this page,
+    /// computed by the caller using `compute_page_budget(&settings)` to
+    /// dynamically match the model's current context window.
     pub fn handle_page_result(
         &mut self,
         args_json: &serde_json::Value,
         tool_call_id_arg: &str,
+        page_budget: usize,
     ) -> (crate::components::shared::ToolCallStatus, String) {
         let tool_call_id = if tool_call_id_arg.is_empty() {
             args_json
@@ -322,18 +403,21 @@ impl SessionState {
             );
         }
 
-        match self.fetch_next_page(&tool_call_id) {
+        match self.fetch_next_page(&tool_call_id, page_budget) {
             Some((content, tool_name, remaining)) => {
+                // NOTE: remaining count is an estimate (prefixed with ~) because
+                // dynamic page sizing means the budget may differ on each call.
+                // The actual number of pages may vary as context pressure changes.
                 let footer = if remaining > 0 {
                     format!(
-                        "\n\n[{} more page(s) remaining. Call HOBBES_PAGE_RESULT with tool_call_id=\"{}\" to see the next page.]",
+                        "\n\n[~{} more page(s) remaining. Call HOBBES_PAGE_RESULT with tool_call_id=\"{}\" to see the next page.]",
                         remaining, tool_call_id
                     )
                 } else {
                     "\n\n[All pages delivered.]".to_string()
                 };
                 tracing::info!(
-                    "HOBBES_PAGE_RESULT: Delivered page for '{}' (tool_call_id={}, remaining={})",
+                    "HOBBES_PAGE_RESULT: Delivered page for '{}' (tool_call_id={}, remaining=~{})",
                     tool_name, tool_call_id, remaining
                 );
                 (
@@ -351,6 +435,72 @@ impl SessionState {
         }
     }
 
+    /// Handle a HOBBES_UPDATE_SCRATCHPAD tool call.
+    /// Overwrites the active session's `scratchpad` field with the provided content.
+    /// Returns `(status, confirmation_string)` matching the pattern of `handle_page_result`.
+    pub fn handle_scratchpad_update(
+        &mut self,
+        args_json: &serde_json::Value,
+        session_id: &str,
+        settings: &crate::settings::Settings,
+    ) -> (crate::components::shared::ToolCallStatus, String) {
+        // Limit scratchpad to 2% of the context window in chars.
+        // e.g. 128K tokens × 4 chars/token × 2% ≈ 10,240 chars.
+        // Floor at 4K so small/unconfigured models still get meaningful space.
+        // Cap at 32K so even enormous context windows don't allow bloat.
+        let tuning = settings.effective_context_tuning();
+        let max_scratchpad_chars: usize = settings
+            .resolve_context_window()
+            .map(|tokens| {
+                let chars = (tokens as f64 * tuning.chars_per_token * 0.02) as usize;
+                chars.clamp(4_000, 32_000)
+            })
+            .unwrap_or(16_000);
+
+        let content = args_json
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if content.is_empty() {
+            return (
+                crate::components::shared::ToolCallStatus::Error,
+                "Missing 'content' argument for HOBBES_UPDATE_SCRATCHPAD".to_string(),
+            );
+        }
+
+        let char_count = content.chars().count();
+
+        if char_count > max_scratchpad_chars {
+            return (
+                crate::components::shared::ToolCallStatus::Error,
+                format!(
+                    "Scratchpad too large ({} chars, max {} for this model). Please condense.",
+                    char_count, max_scratchpad_chars
+                ),
+            );
+        }
+
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.scratchpad = content;
+            tracing::info!(
+                "HOBBES_UPDATE_SCRATCHPAD: Scratchpad updated ({} chars, limit {})",
+                char_count, max_scratchpad_chars
+            );
+            (
+                crate::components::shared::ToolCallStatus::Completed,
+                format!("Scratchpad updated ({} chars). Content is now persistent for this session.", char_count),
+            )
+        } else {
+            tracing::warn!("HOBBES_UPDATE_SCRATCHPAD: Session '{}' not found", session_id);
+            (
+                crate::components::shared::ToolCallStatus::Error,
+                format!("Session '{}' not found", session_id),
+            )
+        }
+    }
+
     /// Store newly-generated paginated pages into the queue.
     /// Call this after `PromptBuilder::build_prompt` in a separate write scope.
     ///
@@ -365,9 +515,9 @@ impl SessionState {
         for (id, paged) in pages {
             if self.page_queue.contains_key(&id) {
                 tracing::debug!(
-                    "Skipping page queue entry (already exists): id={} (remaining={})",
+                    "Skipping page queue entry (already exists): id={} (remaining={} bytes)",
                     id,
-                    self.page_queue.get(&id).map_or(0, |p| p.pages.len())
+                    self.page_queue.get(&id).map_or(0, |p| p.remaining_content.len())
                 );
             } else {
                 tracing::debug!("Storing page queue entry: id={}", id);
@@ -706,6 +856,7 @@ impl SessionState {
             memory_optimization_summary: None,
             composio_profile: initial_profile,
             loaded_skills: HashMap::new(),
+            scratchpad: String::new(),
         };
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id.clone();
@@ -1495,50 +1646,89 @@ mod tests {
     fn test_store_pages_idempotency() {
         let mut state = SessionState::default();
 
-        // Store initial pages: ID "page-A" with 3 pages
+        // Store initial content: ID "page-A" with ~45 chars of remaining content
         let initial_pages = vec![
             ("page-A".to_string(), PagedResult {
-                pages: VecDeque::from(vec![
-                    "Page 1 content".to_string(),
-                    "Page 2 content".to_string(),
-                    "Page 3 content".to_string(),
-                ]),
+                remaining_content: "Page 1 content\nPage 2 content\nPage 3 content".to_string(),
                 tool_name: "test_tool".to_string(),
             }),
         ];
         state.store_pages(initial_pages);
-        assert_eq!(state.page_queue.get("page-A").unwrap().pages.len(), 3);
+        assert_eq!(
+            state.page_queue.get("page-A").unwrap().remaining_content.len(),
+            45 - 1  // "Page 1 content\nPage 2 content\nPage 3 content" = 44 chars
+        );
 
-        // Consume one page via fetch_next_page
-        let (content, name, remaining) = state.fetch_next_page("page-A").unwrap();
-        assert_eq!(content, "Page 1 content");
+        // Consume one page via fetch_next_page with a 15-char budget
+        let (content, name, remaining) = state.fetch_next_page("page-A", 15).unwrap();
         assert_eq!(name, "test_tool");
-        assert_eq!(remaining, 2);
+        assert!(!content.is_empty(), "Should return a non-empty page");
+        assert!(content.len() <= 15, "Page should respect budget");
+        assert!(remaining > 0, "Should have remaining pages");
 
-        // Simulate continuation turn: store_pages called again with same ID but fresh 3 pages
+        // Record how much content remains after consuming one page
+        let remaining_after_first = state.page_queue.get("page-A")
+            .unwrap()
+            .remaining_content
+            .len();
+
+        // Simulate continuation turn: store_pages called again with same ID but fresh content
         let re_generated = vec![
             ("page-A".to_string(), PagedResult {
-                pages: VecDeque::from(vec![
-                    "Page 1 content".to_string(),
-                    "Page 2 content".to_string(),
-                    "Page 3 content".to_string(),
-                ]),
+                remaining_content: "Page 1 content\nPage 2 content\nPage 3 content".to_string(),
                 tool_name: "test_tool".to_string(),
             }),
         ];
         state.store_pages(re_generated);
 
-        // CRITICAL: the queue should still have 2 pages (not reset to 3)
+        // CRITICAL: the queue should still have the partially-consumed content (not reset)
         assert_eq!(
-            state.page_queue.get("page-A").unwrap().pages.len(),
-            2,
+            state.page_queue.get("page-A").unwrap().remaining_content.len(),
+            remaining_after_first,
             "store_pages must NOT overwrite partially-consumed entries"
         );
 
-        // Verify we get page 2 next (not page 1 again)
-        let (content2, _, remaining2) = state.fetch_next_page("page-A").unwrap();
-        assert_eq!(content2, "Page 2 content");
-        assert_eq!(remaining2, 1);
+        // Verify we get the next portion of content (not starting over)
+        let (content2, _, _remaining2) = state.fetch_next_page("page-A", 15).unwrap();
+        assert!(!content2.is_empty(), "Should return next page content");
+        assert!(content2.len() <= 15, "Second page should also respect budget");
+    }
+
+    /// Test: fetch_next_page dynamically sizes pages based on page_budget.
+    /// Verifies that the same content produces differently-sized pages
+    /// when called with different budgets.
+    #[test]
+    fn test_dynamic_page_sizing() {
+        let mut state = SessionState::default();
+
+        // Store content (~100 chars)
+        let content = "Line one of the result.\nLine two of the result.\nLine three of the result.\nLine four of the result.";
+        state.store_pages(vec![
+            ("page-dynamic".to_string(), PagedResult {
+                remaining_content: content.to_string(),
+                tool_name: "dynamic_tool".to_string(),
+            }),
+        ]);
+
+        // Fetch with a small budget (30 chars)
+        let (page1, _, remaining1) = state.fetch_next_page("page-dynamic", 30).unwrap();
+        assert!(page1.len() <= 30, "Small budget: page should be ≤30 chars, got {}", page1.len());
+        assert!(remaining1 > 0, "Should have remaining content");
+
+        // Fetch with a large budget (remaining content should fit in one page)
+        let (page2, _, remaining2) = state.fetch_next_page("page-dynamic", 10000).unwrap();
+        assert!(page2.len() > 30, "Large budget: page should be larger than small-budget page");
+        assert_eq!(remaining2, 0, "Large budget should consume all remaining content");
+
+        // All content consumed — entry should be cleaned up
+        assert!(
+            state.page_queue.get("page-dynamic").is_none(),
+            "Entry should be removed after all content consumed"
+        );
+
+        // Concatenated pages should reproduce original content
+        let reconstructed = format!("{}{}", page1, page2);
+        assert_eq!(reconstructed, content, "Pages must reconstruct original content");
     }
 
     /// Test that delete_message_and_after cleans up stale tool_snapshot entries
@@ -1597,6 +1787,7 @@ mod tests {
                         response: "file contents".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        cached_image_path: None,
                     }),
                     attachments: vec![],
                     comments: vec![],
@@ -1615,6 +1806,7 @@ mod tests {
                         response: "ok".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        cached_image_path: None,
                     }),
                     attachments: vec![],
                     comments: vec![],
@@ -1637,6 +1829,7 @@ mod tests {
             memory_optimization_summary: None,
             composio_profile: None,
             loaded_skills: HashMap::new(),
+            scratchpad: String::new(),
         };
 
         // Simulate ToolCallSummarizer having inserted snapshots
