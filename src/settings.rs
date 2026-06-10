@@ -33,11 +33,9 @@ impl LlmProvider {
         }
     }
 
-    /// All provider variants for UI iteration
-    /// NOTE: Claude is excluded from this version's UI — the stub connector isn't ready.
-    /// The LlmProvider::Claude enum variant remains for structural completeness.
+    /// All provider variants for UI iteration.
     pub fn all_variants() -> &'static [LlmProvider] {
-        &[Self::Gemini, Self::OpenAiCompat]
+        &[Self::Gemini, Self::OpenAiCompat, Self::Claude]
     }
 }
 
@@ -499,7 +497,7 @@ impl Default for Settings {
             user_name: None,
             force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available. When using the fetch tool, you MUST provide markdown links as sources. When you use tools you MUST use the information from the tool, if you don't have it, look up fresh information instead of guessing.".to_string()),
             project_folder: None,
-            chat_history_length: 8,
+            chat_history_length: 75,
             show_tray_icon: true,
             permission_settings: PermissionSettings {
                 auto_approval_enabled: true,

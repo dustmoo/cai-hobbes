@@ -66,6 +66,9 @@ enum AutocompleteMode {
 fn display_name_for_provider(provider: &LlmProvider, model_slug: &str) -> String {
     match provider {
         LlmProvider::Gemini => GeminiModel::from_slug(model_slug).display_name(),
+        LlmProvider::Claude => {
+            crate::llm::claude_models::ClaudeModel::from_slug(model_slug).display_name()
+        }
         _ => model_slug.to_string(),
     }
 }

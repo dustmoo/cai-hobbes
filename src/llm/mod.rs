@@ -1,7 +1,9 @@
 pub mod claude;
+pub mod claude_models;
 pub mod config;
 pub mod convert;
 pub mod gemini;
+pub mod gemini_cache;
 pub mod openai_compat;
 pub mod types;
 
@@ -28,7 +30,12 @@ pub trait LlmConnector: Send + Sync {
         prompt_data: LlmPrompt,
         tx: mpsc::UnboundedSender<StreamMessage>,
         mcp_context: Option<McpContext>,
+        session_id: Option<String>,
     );
+
+    /// Optional: Invalidate any cached context for the given session.
+    /// Default implementation is a no-op for non-caching providers.
+    async fn invalidate_session_cache(&self, _session_id: &str) {}
 
     /// Summarize a conversation into a structured JSON payload.
     async fn summarize_conversation(
