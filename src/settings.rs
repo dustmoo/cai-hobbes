@@ -897,6 +897,24 @@ impl Settings {
         }
     }
 
+    /// Seed default Claude quick-switch slots when none are assigned.
+    /// Non-destructive: only fills when every slot is empty (covers a missing,
+    /// empty, or all-blank persisted vec). If any slot holds a model, the
+    /// configuration is left untouched. Call this AFTER `sync_chat_model_to_slots`
+    /// so a user's active chat model is never reset by the seeded slots.
+    pub fn seed_default_claude_slots_if_empty(&mut self) {
+        let has_any = self
+            .claude_config
+            .model_slots
+            .iter()
+            .any(|s| !s.is_empty());
+        if !has_any {
+            self.claude_config.model_slots =
+                crate::llm::config::default_claude_model_slots();
+            tracing::info!("Seeded default Claude quick-switch slots (none were set).");
+        }
+    }
+
     /// Ensure all profiles have a valid UUID.
     /// If an ID is missing or empty, generate a new one.
     pub fn ensure_profile_ids(&mut self) {
@@ -998,6 +1016,7 @@ impl SettingsManager {
             // paths must independently guarantee the value is ID-based before the app boots.
             settings.migrate_active_profile_name_to_id();
             settings.sync_chat_model_to_slots();
+            settings.seed_default_claude_slots_if_empty();
             return settings;
         }
 
@@ -1125,6 +1144,7 @@ impl SettingsManager {
         }
 
         settings.sync_chat_model_to_slots();
+        settings.seed_default_claude_slots_if_empty();
         settings
     }
 
@@ -1435,4 +1455,37 @@ pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
 
     tracing::debug!("Discovered {} Chrome profiles", profiles.len());
     profiles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_fills_empty_claude_slots() {
+        let mut s = Settings::default();
+        s.claude_config.model_slots = vec![]; // simulate a persisted empty vec
+        s.seed_default_claude_slots_if_empty();
+        assert_eq!(s.claude_config.model_slots.len(), 10);
+        assert_eq!(s.claude_config.model_slots[0], "claude-opus-4-8");
+    }
+
+    #[test]
+    fn seed_fills_all_blank_claude_slots() {
+        let mut s = Settings::default();
+        s.claude_config.model_slots = vec!["".to_string(); 10];
+        s.seed_default_claude_slots_if_empty();
+        assert!(!s.claude_config.model_slots[0].is_empty());
+    }
+
+    #[test]
+    fn seed_preserves_user_assigned_slots() {
+        let mut s = Settings::default();
+        let mut slots = vec!["".to_string(); 10];
+        slots[2] = "claude-haiku-4-5".to_string();
+        s.claude_config.model_slots = slots.clone();
+        s.seed_default_claude_slots_if_empty();
+        // Any assigned slot means the configuration is left untouched.
+        assert_eq!(s.claude_config.model_slots, slots);
+    }
 }
