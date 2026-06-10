@@ -160,8 +160,7 @@ impl ClaudeModel {
     }
 
     /// Whether the model supports extended/adaptive thinking.
-    /// Consumed by the thinking phase (settings toggle gating + request param).
-    #[allow(dead_code)]
+    /// Gates the settings toggle and the `thinking` request param.
     pub fn supports_thinking(&self) -> bool {
         match self {
             ClaudeModel::Fable5

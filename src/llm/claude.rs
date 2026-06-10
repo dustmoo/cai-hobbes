@@ -147,53 +147,17 @@ impl LlmConnector for ClaudeConnector {
         let body_str = serde_json::to_string(&native_request)
             .expect("Failed to serialize Claude request body");
 
-        let response = match client
-            .post(ANTHROPIC_API_URL)
-            .header("content-type", "application/json")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .body(body_str)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.send(StreamMessage::Error {
-                    message: format!("Network error: {}", e),
-                });
-                return;
-            }
-        };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let _ = tx.send(StreamMessage::Error {
-                message: Self::format_api_error(status.as_u16(), &body),
-            });
-            return;
-        }
-
-        // ── Accumulators held across SSE events (parse_stream_chunk is stateless) ──
+        let model_for_cost = ClaudeModel::from_slug(&self.config.model);
 
         // Pending tool calls: Anthropic emits a `tool_use` content_block_start
         // (carries id+name), then a run of `input_json_delta` fragments for that
-        // block, then content_block_stop. We accumulate the partial JSON here and
+        // block, then content_block_stop. We accumulate the partial JSON and
         // flush complete calls at the end (same shape as the OpenAI-compat path).
         struct PendingToolCall {
             name: String,
             server_name: String,
             arguments: String,
         }
-        let mut pending_tool_calls: Vec<PendingToolCall> = Vec::new();
-
-        // Usage is split across message_start (input) and message_delta (output);
-        // accumulate and emit a single StreamMessage::Usage at the end.
-        let mut usage_prompt: i32 = 0;
-        let mut usage_completion: i32 = 0;
-        let mut usage_cached: Option<i32> = None;
-
-        let model_for_cost = ClaudeModel::from_slug(&self.config.model);
 
         let flush_tool_calls = |pending: &mut Vec<PendingToolCall>,
                                 tx: &mpsc::UnboundedSender<StreamMessage>| {
@@ -228,98 +192,192 @@ impl LlmConnector for ClaudeConnector {
             }));
         };
 
-        let mut stream = response.bytes_stream();
-        let mut buffer: Vec<u8> = Vec::new();
+        // Retry transient failures (network errors, 429, 529, 5xx) with backoff —
+        // but only while NO content has been streamed to the UI yet, so a
+        // mid-stream failure never duplicates output. Honors `retry-after`.
+        const MAX_RETRIES: u32 = 2;
+        for attempt in 0..=MAX_RETRIES {
+            let backoff = std::time::Duration::from_millis(500u64 * (1u64 << attempt));
 
-        // Gemini-style buffered-line SSE reading: accumulate raw bytes, drain
-        // complete lines on '\n', and parse each line. Anthropic emits one SSE
-        // `data:` JSON object per line, so a complete line is always a complete
-        // event payload — no partial-line risk.
-        'outer: while let Some(item) = stream.next().await {
-            match item {
-                Ok(bytes) => {
-                    buffer.extend_from_slice(&bytes);
-                    while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
-                        let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
-                        let line = String::from_utf8_lossy(&line_bytes);
+            let response = match client
+                .post(ANTHROPIC_API_URL)
+                .header("content-type", "application/json")
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .body(body_str.clone())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt < MAX_RETRIES {
+                        tracing::warn!(
+                            "Claude: network error (attempt {}), retrying: {}",
+                            attempt + 1,
+                            e
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    let _ = tx.send(StreamMessage::Error {
+                        message: format!("Network error: {}", e),
+                    });
+                    return;
+                }
+            };
 
-                        for event in self.parse_stream_chunk(&line) {
-                            match event {
-                                StreamEvent::Text { content } => {
-                                    if !content.is_empty() {
-                                        let _ = tx.send(StreamMessage::Text {
-                                            content,
-                                            thought_signature: None,
-                                            thought_summary: None,
-                                        });
-                                    }
+            if !response.status().is_success() {
+                let code = response.status().as_u16();
+                let retryable = code == 429 || code == 529 || response.status().is_server_error();
+                if retryable && attempt < MAX_RETRIES {
+                    let delay = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or(backoff);
+                    tracing::warn!(
+                        "Claude: HTTP {} (attempt {}), retrying in {:?}",
+                        code,
+                        attempt + 1,
+                        delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                let body = response.text().await.unwrap_or_default();
+                let _ = tx.send(StreamMessage::Error {
+                    message: Self::format_api_error(code, &body),
+                });
+                return;
+            }
+
+            // ── Per-attempt accumulators (reset on each retry) ──
+            let mut pending_tool_calls: Vec<PendingToolCall> = Vec::new();
+            // Usage is split across message_start (input) and message_delta
+            // (output, cumulative); last non-zero value wins, emit once at end.
+            let mut usage_prompt: i32 = 0;
+            let mut usage_completion: i32 = 0;
+            let mut usage_cached: Option<i32> = None;
+            // Only Text/Thinking are streamed to the UI mid-flight; tool calls and
+            // usage are buffered and emitted at the end. So this gates retry safely.
+            let mut has_sent_data = false;
+
+            let mut stream = response.bytes_stream();
+            let mut buffer: Vec<u8> = Vec::new();
+
+            // Gemini-style buffered-line SSE reading: accumulate raw bytes, drain
+            // complete lines on '\n'. Anthropic emits one SSE `data:` JSON object
+            // per line, so a complete line is always a complete event payload.
+            let stream_failed = loop {
+                let item = match stream.next().await {
+                    Some(it) => it,
+                    None => break false, // stream ended cleanly
+                };
+                let bytes = match item {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // Retry only if nothing was streamed yet (avoids dup output).
+                        if !has_sent_data && attempt < MAX_RETRIES {
+                            tracing::warn!(
+                                "Claude: stream error (attempt {}, no data yet), retrying: {}",
+                                attempt + 1,
+                                e
+                            );
+                            break true;
+                        }
+                        let _ = tx.send(StreamMessage::Error {
+                            message: format!("Stream error: {}", e),
+                        });
+                        return;
+                    }
+                };
+
+                buffer.extend_from_slice(&bytes);
+                while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
+                    let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
+                    let line = String::from_utf8_lossy(&line_bytes);
+
+                    for event in self.parse_stream_chunk(&line) {
+                        match event {
+                            StreamEvent::Text { content } => {
+                                if !content.is_empty() {
+                                    has_sent_data = true;
+                                    let _ = tx.send(StreamMessage::Text {
+                                        content,
+                                        thought_signature: None,
+                                        thought_summary: None,
+                                    });
                                 }
-                                StreamEvent::Thinking { text, .. } => {
-                                    // Phase 1/2: surface thinking text for display only.
-                                    // (Signature round-trip is handled in a later phase.)
-                                    if !text.is_empty() {
-                                        let _ = tx.send(StreamMessage::Text {
-                                            content: String::new(),
-                                            thought_signature: None,
-                                            thought_summary: Some(text),
-                                        });
-                                    }
+                            }
+                            StreamEvent::Thinking { text, signature } => {
+                                // Stream thinking text for display AND carry the
+                                // signature (arrives via signature_delta at the end
+                                // of the thinking block) so stream_manager persists
+                                // it for the next-turn round-trip.
+                                let summary = if text.is_empty() { None } else { Some(text) };
+                                if summary.is_some() || signature.is_some() {
+                                    has_sent_data = true;
+                                    let _ = tx.send(StreamMessage::Text {
+                                        content: String::new(),
+                                        thought_signature: signature,
+                                        thought_summary: summary,
+                                    });
                                 }
-                                StreamEvent::ToolCall {
-                                    name, arguments, ..
-                                } => {
-                                    if !name.is_empty() {
-                                        // New tool_use block — resolve server/tool.
-                                        let (server, tool) = tool_name_map
-                                            .get(&name)
-                                            .cloned()
-                                            .unwrap_or_else(|| self.resolve_tool_call(&name));
-                                        pending_tool_calls.push(PendingToolCall {
-                                            name: tool,
-                                            server_name: server,
-                                            arguments: arguments.as_str().unwrap_or("").to_string(),
-                                        });
-                                    } else if let Some(last) = pending_tool_calls.last_mut() {
-                                        // input_json_delta fragment for the current block.
-                                        last.arguments.push_str(arguments.as_str().unwrap_or(""));
-                                    }
+                            }
+                            StreamEvent::ToolCall { name, arguments, .. } => {
+                                if !name.is_empty() {
+                                    // New tool_use block — resolve server/tool.
+                                    let (server, tool) = tool_name_map
+                                        .get(&name)
+                                        .cloned()
+                                        .unwrap_or_else(|| self.resolve_tool_call(&name));
+                                    pending_tool_calls.push(PendingToolCall {
+                                        name: tool,
+                                        server_name: server,
+                                        arguments: arguments.as_str().unwrap_or("").to_string(),
+                                    });
+                                } else if let Some(last) = pending_tool_calls.last_mut() {
+                                    // input_json_delta fragment for the current block.
+                                    last.arguments.push_str(arguments.as_str().unwrap_or(""));
                                 }
-                                StreamEvent::Usage(u) => {
-                                    if u.prompt_tokens > 0 {
-                                        usage_prompt = u.prompt_tokens;
-                                    }
-                                    if u.completion_tokens > 0 {
-                                        usage_completion = u.completion_tokens;
-                                    }
-                                    if u.cached_content_tokens.is_some() {
-                                        usage_cached = u.cached_content_tokens;
-                                    }
+                            }
+                            StreamEvent::Usage(u) => {
+                                if u.prompt_tokens > 0 {
+                                    usage_prompt = u.prompt_tokens;
                                 }
-                                StreamEvent::Done => {
-                                    flush_tool_calls(&mut pending_tool_calls, &tx);
-                                    emit_usage(usage_prompt, usage_completion, usage_cached, &tx);
-                                    return;
+                                if u.completion_tokens > 0 {
+                                    usage_completion = u.completion_tokens;
                                 }
-                                StreamEvent::Error { message } => {
-                                    let _ = tx.send(StreamMessage::Error { message });
-                                    return;
+                                if u.cached_content_tokens.is_some() {
+                                    usage_cached = u.cached_content_tokens;
                                 }
+                            }
+                            StreamEvent::Done => {
+                                flush_tool_calls(&mut pending_tool_calls, &tx);
+                                emit_usage(usage_prompt, usage_completion, usage_cached, &tx);
+                                return;
+                            }
+                            StreamEvent::Error { message } => {
+                                let _ = tx.send(StreamMessage::Error { message });
+                                return;
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    let _ = tx.send(StreamMessage::Error {
-                        message: format!("Stream error: {}", e),
-                    });
-                    break 'outer;
-                }
-            }
-        }
+            };
 
-        // Stream ended without an explicit message_stop — flush what we have.
-        flush_tool_calls(&mut pending_tool_calls, &tx);
-        emit_usage(usage_prompt, usage_completion, usage_cached, &tx);
+            if stream_failed {
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+
+            // Stream ended without an explicit message_stop — flush what we have.
+            flush_tool_calls(&mut pending_tool_calls, &tx);
+            emit_usage(usage_prompt, usage_completion, usage_cached, &tx);
+            return;
+        }
     }
 
     async fn summarize_conversation(
@@ -439,6 +497,11 @@ You MUST respond with ONLY valid JSON (no prose, no markdown fences) containing 
 
 impl LlmFormatConverter for ClaudeConnector {
     fn to_native_request(&self, prompt: &LlmPrompt, streaming: bool) -> serde_json::Value {
+        // Extended thinking is only sent when enabled AND the model supports it.
+        // Gated here so thinking blocks in history are serialized consistently.
+        let thinking_enabled = self.config.extended_thinking
+            && ClaudeModel::from_slug(&self.config.model).supports_thinking();
+
         // Build the Anthropic `messages` array. Claude only allows "user" and
         // "assistant" roles; tool results ride inside user-turn content blocks.
         let mut messages: Vec<serde_json::Value> = Vec::new();
@@ -453,11 +516,26 @@ impl LlmFormatConverter for ClaudeConnector {
                             content.push(json!({ "type": "text", "text": text }));
                         }
                     }
-                    // Phase 1/2: omit thinking blocks from history. Replaying a
-                    // thinking block WITHOUT its signature returns a 400 when it
-                    // precedes tool_use; omitting is safe. The signature round-trip
-                    // is added in the thinking phase.
-                    ContentBlock::Thinking { .. } => {}
+                    ContentBlock::Thinking { text, signature } => {
+                        // Anthropic requires a thinking block to be replayed with
+                        // its signature and to appear first in the assistant turn
+                        // (history is already ordered thinking-first). Only include
+                        // when thinking is enabled AND we have a non-empty signature
+                        // — a thinking block without a valid signature returns a 400.
+                        // Otherwise omit (safe: we never end on an assistant turn, so
+                        // the "must start with thinking" rule never applies here).
+                        if thinking_enabled {
+                            if let Some(sig) = signature {
+                                if !sig.is_empty() && !text.is_empty() {
+                                    content.push(json!({
+                                        "type": "thinking",
+                                        "thinking": text,
+                                        "signature": sig,
+                                    }));
+                                }
+                            }
+                        }
+                    }
                     ContentBlock::ToolCall {
                         id,
                         name,
@@ -532,6 +610,13 @@ impl LlmFormatConverter for ClaudeConnector {
             if !system.is_empty() {
                 request["system"] = json!(system);
             }
+        }
+
+        // Adaptive thinking (GA on modern models; auto-enables interleaved
+        // thinking with tools). budget_tokens is intentionally NOT used — it is
+        // removed on current models and returns 400.
+        if thinking_enabled {
+            request["thinking"] = json!({ "type": "adaptive" });
         }
 
         // Tools — sent with prompt_builder-consistent prefixed names so the
@@ -645,7 +730,16 @@ impl LlmFormatConverter for ClaudeConnector {
                                 });
                             }
                         }
-                        // signature_delta is handled in the thinking phase.
+                        Some("signature_delta") => {
+                            // Arrives once at the end of a thinking block; carries
+                            // the signature needed to replay the block next turn.
+                            if let Some(sig) = delta["signature"].as_str() {
+                                events.push(StreamEvent::Thinking {
+                                    text: String::new(),
+                                    signature: Some(sig.to_string()),
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -836,5 +930,96 @@ mod tests {
             other => panic!("expected Usage, got {:?}", other),
         }
         assert!(matches!(c.parse_stream_chunk(stop)[0], StreamEvent::Done));
+    }
+
+    fn thinking_connector(enabled: bool) -> ClaudeConnector {
+        ClaudeConnector::new(ClaudeConfig {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: Some(4096),
+            extended_thinking: enabled,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn thinking_param_sent_only_when_enabled() {
+        let prompt = LlmPrompt {
+            system: None,
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }],
+            tools: vec![],
+        };
+        let off = thinking_connector(false).to_native_request(&prompt, true);
+        assert!(off.get("thinking").is_none());
+
+        let on = thinking_connector(true).to_native_request(&prompt, true);
+        assert_eq!(on["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn thinking_block_serialized_only_with_signature() {
+        let with_sig = LlmPrompt {
+            system: None,
+            messages: vec![ChatMessage {
+                role: ChatRole::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        text: "reasoning".into(),
+                        signature: Some("sig-abc".into()),
+                    },
+                    ContentBlock::Text { text: "answer".into() },
+                ],
+            }],
+            tools: vec![],
+        };
+        let req = thinking_connector(true).to_native_request(&with_sig, true);
+        let blocks = req["messages"][0]["content"].as_array().unwrap();
+        // thinking block first, then text
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "reasoning");
+        assert_eq!(blocks[0]["signature"], "sig-abc");
+        assert_eq!(blocks[1]["type"], "text");
+
+        // Without a signature, the thinking block is omitted (would 400).
+        let no_sig = LlmPrompt {
+            system: None,
+            messages: vec![ChatMessage {
+                role: ChatRole::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        text: "reasoning".into(),
+                        signature: None,
+                    },
+                    ContentBlock::Text { text: "answer".into() },
+                ],
+            }],
+            tools: vec![],
+        };
+        let req2 = thinking_connector(true).to_native_request(&no_sig, true);
+        let blocks2 = req2["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks2.len(), 1);
+        assert_eq!(blocks2[0]["type"], "text");
+
+        // Even with a signature, thinking is omitted when the feature is off.
+        let req3 = thinking_connector(false).to_native_request(&with_sig, true);
+        let blocks3 = req3["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks3.len(), 1);
+        assert_eq!(blocks3[0]["type"], "text");
+    }
+
+    #[test]
+    fn parses_signature_delta() {
+        let line = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-xyz\"}}\n";
+        let events = connector().parse_stream_chunk(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::Thinking { text, signature } => {
+                assert!(text.is_empty());
+                assert_eq!(signature.as_deref(), Some("sig-xyz"));
+            }
+            other => panic!("expected Thinking signature, got {:?}", other),
+        }
     }
 }

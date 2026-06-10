@@ -1986,6 +1986,36 @@ pub fn SettingsPanel() -> Element {
                                             "Claude requires an explicit output cap. Clamped to the model's ceiling."
                                         }
                                     }
+                                    // Extended Thinking toggle (only for models that support it)
+                                    {
+                                        let supports = crate::llm::claude_models::ClaudeModel::from_slug(
+                                            &local_settings.read().claude_config.model,
+                                        ).supports_thinking();
+                                        let enabled = local_settings.read().claude_config.extended_thinking;
+                                        rsx! {
+                                            if supports {
+                                                div {
+                                                    class: "mb-4 flex items-center justify-between",
+                                                    div {
+                                                        label { class: "block text-sm font-medium text-fg-muted", "Extended Thinking" }
+                                                        p { class: "text-xs text-fg-muted", "Adaptive reasoning before responding." }
+                                                    }
+                                                    button {
+                                                        class: if enabled {
+                                                            "px-3 py-1 rounded-md text-sm font-medium bg-btn-primary text-fg"
+                                                        } else {
+                                                            "px-3 py-1 rounded-md text-sm font-medium bg-input text-fg-muted hover:text-fg"
+                                                        },
+                                                        onclick: move |_| {
+                                                            let cur = local_settings.read().claude_config.extended_thinking;
+                                                            local_settings.write().claude_config.extended_thinking = !cur;
+                                                        },
+                                                        if enabled { "On" } else { "Off" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     // Model Quick-Switch Slots
                                     div {
                                         class: "mb-2",
