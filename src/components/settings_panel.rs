@@ -2024,36 +2024,36 @@ pub fn SettingsPanel() -> Element {
                                             class: "text-xs text-fg-muted mb-2",
                                             "Assign models to slots ^1–^9 for fast switching in the chat bar."
                                         }
-                                        {
-                                            let slots = local_settings.read().claude_config.model_slots.clone();
-                                            rsx! {
-                                                for (i, slot) in slots.iter().enumerate() {
-                                                    div {
-                                                        key: "{i}",
-                                                        class: "flex items-center gap-2 mb-1",
-                                                        span { class: "text-[10px] text-fg-muted font-mono w-6 text-right", "^{i+1}" }
-                                                        select {
-                                                            class: "flex-1 px-2 py-1 bg-input border border-subtle rounded-md text-sm",
-                                                            value: "{slot}",
-                                                            onchange: move |event| {
-                                                                local_settings.write().claude_config.model_slots[i] = event.value();
-                                                            },
-                                                            option { value: "", "— empty —" }
-                                                            {
-                                                                let current = slot.clone();
-                                                                let models = crate::llm::claude_models::ClaudeModel::all_models();
-                                                                let in_list = models.iter().any(|m| m.canonical_slug() == current);
-                                                                rsx! {
-                                                                    if !current.is_empty() && !in_list {
-                                                                        option { value: "{current}", selected: true,
-                                                                            "{crate::llm::claude_models::ClaudeModel::from_slug(&current).display_name()}" }
-                                                                    }
-                                                                    for m in models.iter() {
-                                                                        option {
-                                                                            value: "{m.canonical_slug()}",
-                                                                            selected: m.canonical_slug() == current,
-                                                                            "{m.display_name()}"
-                                                                        }
+                                        div {
+                                            class: "space-y-1",
+                                            // Fixed 10 slots (^1–^9, ^0). Uses the provider-agnostic
+                                            // helpers so a short/empty persisted vec still renders all
+                                            // rows and writes resize safely — same as Gemini/OpenAI.
+                                            for i in 0..10 {
+                                                div {
+                                                    key: "claude-slot-{i}",
+                                                    class: "flex items-center gap-2",
+                                                    span { class: "text-[10px] text-fg-muted font-mono w-6 text-right", "^{i + 1}" }
+                                                    select {
+                                                        class: "flex-1 px-2 py-1 bg-input border border-subtle rounded-md text-sm",
+                                                        onchange: move |event| {
+                                                            local_settings.write().update_active_model_slot(i, event.value());
+                                                        },
+                                                        {
+                                                            let current = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                            let models = crate::llm::claude_models::ClaudeModel::all_models();
+                                                            let in_list = models.iter().any(|m| m.canonical_slug() == current);
+                                                            rsx! {
+                                                                option { value: "", selected: current.is_empty(), "— empty —" }
+                                                                if !current.is_empty() && !in_list {
+                                                                    option { value: "{current}", selected: true,
+                                                                        "{crate::llm::claude_models::ClaudeModel::from_slug(&current).display_name()}" }
+                                                                }
+                                                                for m in models.iter() {
+                                                                    option {
+                                                                        value: "{m.canonical_slug()}",
+                                                                        selected: m.canonical_slug() == current,
+                                                                        "{m.display_name()}"
                                                                     }
                                                                 }
                                                             }
