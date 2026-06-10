@@ -126,7 +126,10 @@ impl ClaudeModel {
             | ClaudeModel::Opus4_5
             | ClaudeModel::Haiku4_5 => 64_000,
             ClaudeModel::Opus4_1 => 32_000,
-            ClaudeModel::Unknown(_) => 8_192,
+            // Unknown/custom or future slug: use a generous ceiling so the
+            // streaming-safe default isn't silently truncated. If the real model
+            // caps lower, Anthropic returns a loud 400 (preferable to silent loss).
+            ClaudeModel::Unknown(_) => 64_000,
         }
     }
 
