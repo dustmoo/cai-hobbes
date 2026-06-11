@@ -34,7 +34,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
 
     - name: Install Dioxus CLI
-      run: cargo install dioxus-cli
+      run: cargo install dioxus-cli --version 0.6.3
 
     - name: Prepare Keychain & Identities
       env:
