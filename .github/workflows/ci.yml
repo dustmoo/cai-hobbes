@@ -87,13 +87,12 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
 
-    - name: Install cargo-binstall
-      uses: cargo-bins/cargo-binstall@main
-
     - name: Install Dioxus CLI
       run: |
-        cargo binstall dioxus-cli --version 0.6.3 --no-confirm
-        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "arm64" ]; then TARGET="aarch64-apple-darwin"; else TARGET="x86_64-apple-darwin"; fi
+        curl -fsSL "https://github.com/DioxusLabs/dioxus/releases/download/v0.6.3/dx-${TARGET}-v0.6.3.tar.gz" | tar -xz -C /usr/local/bin
+        dx --version
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -116,8 +115,8 @@ jobs:
     needs: build-check
     permissions:
       contents: write
-      id-token: write # Required for Azure OIDC authentication
-    if: github.ref == 'refs/heads/main'
+      id-token: write # Required for Azure OIDC authentication (main only)
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feat/')
 
     steps:
     - uses: actions/checkout@v4
@@ -154,6 +153,7 @@ jobs:
         }
 
     - name: Azure OIDC Login
+      if: github.ref == 'refs/heads/main'
       uses: azure/login@v2
       with:
         client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -161,6 +161,7 @@ jobs:
         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
     - name: Sign Main Binary
+      if: github.ref == 'refs/heads/main'
       uses: azure/artifact-signing-action@v1.2.0
       with:
         endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
