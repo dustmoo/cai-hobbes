@@ -929,7 +929,7 @@ impl StreamManagerContext {
                                 .sessions.get(&session_id).cloned();
                             let settings_snapshot = self.settings.read().clone();
                             if let Some(active_session) = session_snapshot {
-                                let connector = self.llm_connector.read().clone();
+                                let connector = self.connector_for_session(&session_id);
                                 let prev_summary = serde_json::to_string(
                                     &active_session.active_context.conversation_summary
                                 ).unwrap_or_else(|_| "{}".to_string());

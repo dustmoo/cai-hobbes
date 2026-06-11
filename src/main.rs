@@ -1445,12 +1445,8 @@ fn app() -> Element {
                                     }
                                 }
                             } // write lock dropped here
-                            // ...and update the provider's default for sessions without
-                            // an override (mirrors SwitchProfile semantics).
-                            settings.write().set_chat_model_for(provider, new_model);
-                            settings_manager
-                                .read()
-                                .save_async(settings.peek().clone(), Some(save_error));
+                            // Session-only pin: do NOT update global settings so other
+                            // tabs keep their current provider/model unaffected.
                             if session_changed {
                                 SessionState::save_async(&session_state.read(), Some(save_error));
                             }
@@ -1485,23 +1481,16 @@ fn app() -> Element {
                                     }
                                 }
                             } // write lock dropped here
-                            // Update the global default for sessions without an override
-                            // (mirrors SwitchProfile semantics).
-                            let settings_stale = settings.peek().active_llm != provider;
-                            if settings_stale {
-                                settings.write().active_llm = provider;
-                                settings_manager
-                                    .read()
-                                    .save_async(settings.peek().clone(), Some(save_error));
-                            }
+                            // Session-only pin: do NOT touch settings.active_llm so other
+                            // tabs keep their current provider unaffected. Global provider
+                            // changes belong in the Settings panel, not the per-tab picker.
                             if session_changed {
                                 SessionState::save_async(&session_state.read(), Some(save_error));
                             }
                             tracing::info!(
-                                "SwitchProvider: switched to {} (session_changed={} global_changed={})",
+                                "SwitchProvider: pinned session to {} (session_changed={})",
                                 provider.display_name(),
-                                session_changed,
-                                settings_stale
+                                session_changed
                             );
                         }
                     }
