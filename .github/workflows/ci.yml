@@ -87,8 +87,11 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
 
+    - name: Install cargo-binstall
+      uses: cargo-bins/cargo-binstall@main
+
     - name: Install Dioxus CLI
-      run: cargo install dioxus-cli --version 0.6.3
+      run: cargo binstall dioxus-cli --version 0.6.3 --no-confirm
 
 
     - name: Setup Node.js
