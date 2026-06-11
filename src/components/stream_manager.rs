@@ -3,11 +3,12 @@
 
 use super::continuation_controller::ContinuationController;
 use crate::components::shared::{StreamMessage, ToolCallStatus};
+
 use crate::services::tool_call_summarizer::ToolCallSummarizer;
 use crate::session::SessionState;
 use crate::settings::Settings;
 use dioxus::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use uuid::Uuid;
@@ -27,16 +28,14 @@ pub struct StreamManagerContext {
     scheduler: Coroutine<SchedulerSignal>,
     permission_manager: Signal<crate::context::permissions::PermissionManager>,
     pub stream_activity: Signal<u64>,
-    pub is_sending: Signal<bool>,
-    pub content_generated: Signal<std::collections::HashSet<Uuid>>,
+    pub streaming_sessions: Signal<HashSet<String>>,
+    stream_session_map: Signal<HashMap<Uuid, String>>,
+    pub content_generated: Signal<HashSet<Uuid>>,
     save_error_signal: Signal<Option<String>>,
     usage_log: Signal<crate::usage_log::UsageLog>,
     /// Guard: prevents overlapping proactive summarization tasks.
-    /// Multiple continuation turns can fire in quick succession; without this
-    /// flag each would independently spawn a summarization LLM call.
-    /// Last-write-wins is still acceptable during the brief race window
-    /// between the flag check and the `spawn` call.
-    proactive_summary_running: Signal<bool>,
+    /// Keyed by session_id to allow concurrent summarization across tabs.
+    summarizing_sessions: Signal<HashSet<String>>,
 }
 
 impl StreamManagerContext {
@@ -52,8 +51,74 @@ impl StreamManagerContext {
         self.content_generated.read().contains(message_id)
     }
 
-    pub fn is_any_generating(self) -> bool {
-        !self.active_stream_handles.read().is_empty()
+    pub fn is_session_streaming(self, session_id: &str) -> bool {
+        if self.streaming_sessions.read().contains(session_id) {
+            return true;
+        }
+        // Fallback: check map of active stream handles to catch continuations
+        self.stream_session_map.read().values().any(|v| v == session_id)
+    }
+
+    /// Find the active message_id for a given session (for cancel).
+    /// Reverse-lookups stream_session_map: message_id → session_id.
+    pub fn active_message_for_session(self, session_id: &str) -> Option<Uuid> {
+        self.stream_session_map
+            .read()
+            .iter()
+            .find(|(_, sid)| sid.as_str() == session_id)
+            .map(|(mid, _)| *mid)
+    }
+
+    /// The provider a session resolves to (session override → global settings).
+    fn effective_provider(&self, session_id: &str) -> crate::settings::LlmProvider {
+        let settings = self.settings.read();
+        self.session_state
+            .read()
+            .sessions
+            .get(session_id)
+            .map(|s| settings.provider_for_session(s))
+            .unwrap_or(settings.active_llm)
+    }
+
+    /// The chat model a session resolves to (session override → provider default).
+    fn effective_model(&self, session_id: &str) -> String {
+        let settings = self.settings.read();
+        match self.session_state.read().sessions.get(session_id) {
+            Some(s) => settings.chat_model_for_session(s),
+            None => settings.active_chat_model(),
+        }
+    }
+
+    /// Resolve the connector for a session. Sessions without overrides (or whose
+    /// overrides match the global selection) use the shared global connector;
+    /// otherwise a connector is built for the session's provider + model.
+    fn connector_for_session(&self, session_id: &str) -> Arc<dyn crate::llm::LlmConnector> {
+        let (provider, model, matches_global) = {
+            let settings = self.settings.read();
+            let state = self.session_state.read();
+            let (provider, model) = match state.sessions.get(session_id) {
+                Some(s) => (
+                    settings.provider_for_session(s),
+                    settings.chat_model_for_session(s),
+                ),
+                None => (settings.active_llm, settings.active_chat_model()),
+            };
+            let matches_global =
+                provider == settings.active_llm && model == settings.active_chat_model();
+            (provider, model, matches_global)
+        };
+
+        if matches_global {
+            self.llm_connector.read().clone()
+        } else {
+            tracing::info!(
+                session_id,
+                provider = provider.display_name(),
+                model,
+                "Session overrides global LLM selection — building session connector"
+            );
+            crate::llm::build_connector_for(&self.settings.read(), provider, &model)
+        }
     }
 
     pub fn start_stream(
@@ -65,7 +130,8 @@ impl StreamManagerContext {
         mcp_context: Option<crate::mcp::manager::McpContext>,
         profile_id: Option<String>,
     ) {
-        self.is_sending.set(true);
+        self.streaming_sessions.write().insert(session_id.clone());
+        self.stream_session_map.write().insert(message_id, session_id.clone());
         tracing::info!(message_id = %message_id, session_id = %session_id, "'start_stream' entered.");
         // Create a channel for the MessageBubble to receive chunks.
         let (stream_tx, stream_rx) = mpsc::unbounded_channel::<StreamMessage>();
@@ -79,10 +145,11 @@ impl StreamManagerContext {
             tracing::info!(message_id = %message_id, "Stream master task SPAWNED.");
             let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<StreamMessage>();
 
-            let llm_connector = self.llm_connector.read().clone();
+            let llm_connector = self.connector_for_session(&session_id);
+            let session_id_for_cache = session_id.clone();
             spawn(async move {
                 llm_connector
-                    .generate_content_stream(prompt_data, llm_tx, mcp_context)
+                    .generate_content_stream(prompt_data, llm_tx, mcp_context, Some(session_id_for_cache))
                     .await;
             });
 
@@ -102,6 +169,14 @@ impl StreamManagerContext {
             let mut final_text_for_this_turn = String::new();
             let mut thought_signature_for_this_turn: Option<String> = None;
             let mut thought_summary_for_this_turn: Option<String> = None;
+            // Tracks whether the UI consumer (MessageBubble) has disconnected,
+            // e.g. due to a tab switch unmounting the component. When true,
+            // we stop sending chunks to stream_tx but continue processing
+            // the LLM stream and writing to session_state.
+            let mut ui_disconnected = false;
+            // Tracks whether the stream ended due to a provider error (e.g., decode failure).
+            // When true AND auto-recovery is enabled, we retry the continuation.
+            let mut stream_error_occurred = false;
 
             while let Some(message) = llm_rx.recv().await {
                 match message {
@@ -116,7 +191,6 @@ impl StreamManagerContext {
                         }
 
                         // Append the content to the buffer
-                        let was_empty = final_text_for_this_turn.is_empty();
                         final_text_for_this_turn.push_str(&content);
                         if thought_signature.is_some() {
                             thought_signature_for_this_turn = thought_signature.clone();
@@ -128,14 +202,14 @@ impl StreamManagerContext {
                                 thought_summary_for_this_turn = Some(summary.clone());
                             }
                         }
-                        // Only forward to the UI stream when there's something to render.
-                        // Pure thinking-only messages (content="" + thought_summary only) ARE forwarded
-                        // so the chat component can show the thinking content in the "Considering..."
-                        // bubble. They don't create standalone bubbles because has_generated_content
-                        // (which controls bubble persistence) still requires non-empty content.
+                        // Forward to UI stream if the consumer is still alive.
+                        // When the user switches tabs, MessageBubble unmounts and drops
+                        // its receiver — stream_tx.send() returns Err. We must NOT break
+                        // the loop here; the background LLM stream must continue running
+                        // and writing to session_state so the data is preserved.
                         let has_renderable_content =
                             !content.is_empty() || thought_signature.is_some() || thought_summary.is_some();
-                        if has_renderable_content {
+                        if has_renderable_content && !ui_disconnected {
                             if stream_tx
                                 .send(StreamMessage::Text {
                                     content: content.clone(),
@@ -144,19 +218,22 @@ impl StreamManagerContext {
                                 })
                                 .is_err()
                             {
-                                break;
+                                // UI consumer dropped (tab switch). Continue processing
+                                // the LLM stream in data-only mode.
+                                tracing::info!(
+                                    message_id = %message_id,
+                                    session_id = %session_id,
+                                    "UI consumer disconnected (tab switch). Continuing stream in background."
+                                );
+                                ui_disconnected = true;
                             }
                         }
                         self.scheduler.send(SchedulerSignal::Activity);
 
-                        // Critical Fix: Update session state immediately on the first CONTENT chunk.
-                        // This ensures that the parent `MessageList` sees that the message has content
-                        // and continues to render the `MessageBubble` even if `is_generating` momentarily flips to false
-                        // or if the stream ends abruptly. Solving the "disappearing bubble" regression.
-                        // IMPORTANT: Only trigger this for actual text content, NOT for thinking-only messages.
-                        // Thinking-only messages (content="") should NOT persist as separate bubbles —
-                        // they get absorbed into the ToolCall card via thought_summary_for_this_turn.
-                        if was_empty && !final_text_for_this_turn.is_empty() {
+                        // Write accumulated text to session_state on every chunk.
+                        // This ensures that when the user switches back to this tab,
+                        // they see the current content — not just the first chunk snapshot.
+                        if !final_text_for_this_turn.is_empty() {
                             let mut state = self.session_state.write();
                             if let Some(msg) =
                                 state.get_message_mut_in_session(&session_id, &message_id)
@@ -215,15 +292,13 @@ impl StreamManagerContext {
                             }
                         }
 
-                        // Forward error to UI
-                        if stream_tx
-                            .send(StreamMessage::Error { message: error_msg })
-                            .is_err()
-                        {
-                            break;
+                        // Forward error to UI (if consumer still alive)
+                        if !ui_disconnected {
+                            let _ = stream_tx.send(StreamMessage::Error { message: error_msg });
                         }
 
                         // Error ends the stream
+                        stream_error_occurred = true;
                         break;
                     }
                     StreamMessage::ToolCall(mut tool_call) => {
@@ -339,6 +414,7 @@ impl StreamManagerContext {
                             if tool_call.tool_name == "HOBBES_PAGE_RESULT" {
                                 let page_budget = crate::session::compute_page_budget(
                                     &self.settings.read(),
+                                    session_state.read().sessions.get(&session_id_inner),
                                 );
                                 let (status, response_str) =
                                     session_state.write().handle_page_result(&args_json, "", page_budget);
@@ -757,9 +833,11 @@ impl StreamManagerContext {
                     }
                     self.active_stream_handles.write().remove(&message_id);
                     self.content_generated.write().remove(&message_id); // Cleanup
+                    self.stream_session_map.write().remove(&message_id);
                     crate::session::SessionState::save_async(&self.session_state.read(), None);
                     on_complete();
-                    self.is_sending.set(false);
+                    self.streaming_sessions.write().remove(&session_id);
+                    *self.stream_activity.write() += 1; // Notify TabBar: stream ended
                     self.scheduler.send(SchedulerSignal::Activity);
                     return; // Wait for user to approve
                 }
@@ -769,19 +847,23 @@ impl StreamManagerContext {
                     .tool_call_history
                     .extend(collected_records.clone());
                 // Tools were called in this turn. Increment the turn counter and trigger a continuation.
-                self.permission_manager.write().increment_turn_count();
+                if let Some(session) = self.session_state.write().sessions.get_mut(&session_id) {
+                    session.increment_turn_count();
+                }
 
                 // CRITICAL FIX: Remove the active stream handle for THIS message before triggering the continuation.
                 // The continuation will spawn a NEW task with a NEW message ID.
                 // If we don't remove this one, is_any_generating() will remain true forever because this task never "completes" normally.
                 self.active_stream_handles.write().remove(&message_id);
                 self.content_generated.write().remove(&message_id); // Cleanup
+                self.stream_session_map.write().remove(&message_id);
 
                 crate::session::SessionState::save_async(&self.session_state.read(), None);
 
                 // Clean up the current stream state before triggering the next one
                 on_complete();
-                self.is_sending.set(false);
+                self.streaming_sessions.write().remove(&session_id);
+                *self.stream_activity.write() += 1; // Notify TabBar: stream ended
 
                 // Proactive summarization: when messages approach the history limit,
                 // fire off a background summary before the next continuation turn.
@@ -792,26 +874,59 @@ impl StreamManagerContext {
                         .sessions.get(&session_id)
                         .map(|s| s.messages.len())
                         .unwrap_or(0);
-                    let history_limit = self.settings.read()
-                        .effective_context_tuning()
-                        .chat_history_length;
-                    let threshold = history_limit.saturating_sub(4);
+                    let (tuning, context_tokens, enable_summarization) = {
+                        let settings_guard = self.settings.read();
+                        let state_guard = self.session_state.read();
+                        let (provider, model) = match state_guard.sessions.get(&session_id) {
+                            Some(s) => (
+                                settings_guard.provider_for_session(s),
+                                settings_guard.chat_model_for_session(s),
+                            ),
+                            None => (settings_guard.active_llm, settings_guard.active_chat_model()),
+                        };
+                        (
+                            settings_guard.effective_context_tuning_for(provider),
+                            settings_guard.resolve_context_window_for(provider, &model),
+                            settings_guard.enable_summarization,
+                        )
+                    };
+                    // Compute a dynamic threshold: how many messages actually fit
+                    // in this model's context budget, then trigger summarization
+                    // 4 messages before that limit.
+                    // stream_manager doesn't have the built system/tool sizes that
+                    // prompt_builder has, so we use a 50% overhead estimate
+                    // (system + tools + safety typically consume 30–40%).
+                    // The conservative factor means we fire slightly early — correct direction.
+                    let effective_limit = if let Some(ctx) = context_tokens {
+                        let total_chars = (ctx as f64 * tuning.chars_per_token) as usize;
+                        let history_budget = (total_chars as f64 * 0.50) as usize;
+                        let avg_msg_chars: usize = 800;
+                        let dynamic_max = (history_budget / avg_msg_chars).max(4);
+                        tuning.chat_history_length.min(dynamic_max)
+                    } else {
+                        tuning.chat_history_length
+                    };
+                    let threshold = effective_limit.saturating_sub(4);
+                    tracing::debug!(
+                        effective_limit,
+                        threshold,
+                        "Proactive summarizer: dynamic threshold resolved"
+                    );
 
-                    if msg_count >= threshold && msg_count > 0 && self.settings.read().enable_summarization {
-                        // Overlap guard: skip if a proactive summary is already in-flight.
-                        // Multiple continuation turns can fire faster than the LLM can respond;
-                        // spawning redundant calls wastes tokens and creates write races.
-                        if *self.proactive_summary_running.read() {
+                    if msg_count >= threshold && msg_count > 0 && enable_summarization {
+                        // Overlap guard: skip if a proactive summary is already in-flight for THIS session.
+                        if self.summarizing_sessions.read().contains(&session_id) {
                             tracing::debug!(
-                                "Proactive summarization skipped — already in-flight"
+                                session_id,
+                                "Proactive summarization skipped — already in-flight for this session"
                             );
                         } else {
                             tracing::info!(
-                                msg_count, history_limit, threshold,
+                                session_id, msg_count, effective_limit, threshold,
                                 "Proactive summarization: messages approaching history limit"
                             );
                             let session_snapshot = self.session_state.read()
-                                .get_active_session().cloned();
+                                .sessions.get(&session_id).cloned();
                             let settings_snapshot = self.settings.read().clone();
                             if let Some(active_session) = session_snapshot {
                                 let connector = self.llm_connector.read().clone();
@@ -840,36 +955,36 @@ impl StreamManagerContext {
 
                                 if !recent.is_empty() {
                                     // Mark in-flight before spawning
-                                    self.proactive_summary_running.set(true);
-                                    let mut proactive_flag = self.proactive_summary_running;
+                                    self.summarizing_sessions.write().insert(session_id.clone());
+                                    let mut summarizing_sessions = self.summarizing_sessions;
+                                    let session_id_clone = session_id.clone();
                                     
                                     // Timeout safety net: blindly clear the flag after 30 seconds
+                                    let sid = session_id.clone();
                                     dioxus::prelude::spawn(async move {
                                         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                                        if *proactive_flag.peek() {
-                                            tracing::warn!("Proactive summarization timed out, forcibly resetting flag.");
-                                            proactive_flag.set(false);
+                                        if summarizing_sessions.peek().contains(&sid) {
+                                            tracing::warn!(session_id = %sid, "Proactive summarization timed out, forcibly resetting flag.");
+                                            summarizing_sessions.write().remove(&sid);
                                         }
                                     });
 
                                     // Fire-and-forget: don't block continuation on LLM call.
-                                    // If the summary lands before the next prompt build, great;
-                                    // if not, the next build uses the stale summary (acceptable).
                                     let mut session_state = self.session_state;
                                     dioxus::prelude::spawn(async move {
                                         match connector.summarize_conversation(prev_summary, recent).await {
                                             Ok(summary_json) => {
                                                 if let Ok(summary) = serde_json::from_value::<crate::session::ConversationSummary>(summary_json) {
-                                                    tracing::info!("Proactive summary updated (background)");
+                                                    tracing::info!(session_id = %session_id_clone, "Proactive summary updated (background)");
                                                     let mut state = session_state.write();
-                                                    if let Some(session) = state.get_active_session_mut() {
+                                                    if let Some(session) = state.sessions.get_mut(&session_id_clone) {
                                                         session.active_context.conversation_summary = summary;
                                                     }
                                                 }
                                             }
-                                            Err(e) => tracing::warn!("Proactive summarization failed: {}", e),
+                                            Err(e) => tracing::warn!(session_id = %session_id_clone, "Proactive summarization failed: {}", e),
                                         }
-                                        proactive_flag.set(false);
+                                        summarizing_sessions.write().remove(&session_id_clone);
                                     });
                                 }
                             }
@@ -881,9 +996,11 @@ impl StreamManagerContext {
 
                 // Check turn limit BEFORE triggering continuation.
                 // Without this gate the AI continuation loop runs indefinitely.
-                if self.permission_manager.read().is_turn_limit_reached() {
+                let turn_count = self.session_state.read().sessions.get(&session_id)
+                    .map(|s| s.current_ai_turn_count).unwrap_or(0);
+                if self.permission_manager.read().is_turn_limit_reached_for(turn_count) {
                     let max_turns = self.settings.read().permission_settings.max_ai_turns;
-                    tracing::info!("Turn limit reached ({} turns). Halting continuation.", max_turns);
+                    tracing::info!(session_id, "Turn limit reached ({} turns). Halting continuation.", max_turns);
                     let warning_msg = format!(
                         "Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.",
                         max_turns
@@ -911,9 +1028,90 @@ impl StreamManagerContext {
                 return; // End this stream task. The continuation will start a new one.
             }
 
-            // If we reach here, it means tool_call_count was 0. The turn is over.
+            // If we reach here, it means tool_call_count was 0.
+            // Before finalizing the turn, check for watch word matches
+            // that indicate the model stalled mid-response (OpenAI-compat only).
+            if self.check_watch_word_recovery(&session_id, &final_text_for_this_turn, &message_id).await {
+                return; // Watch word recovery triggered continuation — end this stream task.
+            }
 
-            // This block now runs only when the conversation turn is truly complete.
+            // Stream error auto-recovery: if the stream died with a provider error
+            // (e.g., "error decoding response body") and auto-recovery is enabled,
+            // retry the continuation instead of leaving the user stranded.
+            if stream_error_occurred {
+                let session_provider = self.effective_provider(&session_id);
+                let settings = self.settings.read();
+                if session_provider == crate::settings::LlmProvider::OpenAiCompat
+                    && settings.openai_compat_config.watch_words_enabled
+                {
+                    let max_recoveries = settings.openai_compat_config.max_watch_word_recoveries;
+                    drop(settings);
+
+                    let recovery_count = self.session_state.read().sessions.get(&session_id)
+                        .map(|s| s.watch_word_recovery_count).unwrap_or(0);
+
+                    if recovery_count < max_recoveries {
+                        tracing::info!(
+                            session_id,
+                            recovery = recovery_count + 1,
+                            max = max_recoveries,
+                            "Stream error detected. Triggering auto-recovery retry."
+                        );
+
+                        let recovery_text =
+                            "[System: Auto-recovery triggered — the previous response was interrupted by a stream error]\n\
+                             The connection to the model was interrupted. Please continue where you left off and complete the task.".to_string();
+
+                        {
+                            let mut state = self.session_state.write();
+                            if let Some(session) = state.sessions.get_mut(&session_id) {
+                                session.watch_word_recovery_count += 1;
+                                session.messages.push(crate::components::chat::Message {
+                                    id: Uuid::new_v4(),
+                                    author: "User".to_string(),
+                                    content: crate::components::shared::MessageContent::Text {
+                                        content: recovery_text,
+                                        thought_signature: None,
+                                        thought_summary: None,
+                                    },
+                                    attachments: Vec::new(),
+                                    comments: Vec::new(),
+                                    created_at: chrono::Utc::now(),
+                                    usage: None,
+                                });
+                                session.increment_turn_count();
+                            }
+                        }
+
+                        // Check turn limit before triggering continuation
+                        let turn_count = self.session_state.read().sessions.get(&session_id)
+                            .map(|s| s.current_ai_turn_count).unwrap_or(0);
+                        if self.permission_manager.read().is_turn_limit_reached_for(turn_count) {
+                            tracing::info!(session_id, "Stream error recovery halted: turn limit reached.");
+                        } else {
+                            // Clean up current stream state before triggering retry.
+                            self.active_stream_handles.write().remove(&message_id);
+                            self.content_generated.write().remove(&message_id);
+                            self.stream_session_map.write().remove(&message_id);
+                            crate::session::SessionState::save_async(&self.session_state.read(), None);
+                            on_complete();
+                            self.streaming_sessions.write().remove(&session_id);
+                            *self.stream_activity.write() += 1;
+
+                            self.continuation_controller.write().trigger_continuation(session_id.clone());
+                            return; // End this stream task. Continuation will retry.
+                        }
+                    } else {
+                        tracing::info!(
+                            session_id,
+                            max = max_recoveries,
+                            "Stream error detected but recovery limit reached. Halting."
+                        );
+                    }
+                }
+            }
+
+            // The turn is truly over — no tool calls, no watch word recovery, no error recovery.
             tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
 
             // Record usage to the standalone usage log (audit ledger).
@@ -925,7 +1123,7 @@ impl StreamManagerContext {
                     .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
                 {
                     if let Some(usage) = &msg.usage {
-                        let model = self.settings.read().active_chat_model().to_string();
+                        let model = self.effective_model(&session_id);
                         self.usage_log.write().record(crate::usage_log::UsageLogEntry {
                             timestamp: chrono::Utc::now(),
                             session_id: session_id.clone(),
@@ -957,13 +1155,15 @@ impl StreamManagerContext {
                 .summarize_and_cleanup(&mut self.session_state.write(), &settings, &session_id)
                 .await;
             on_complete();
-            self.is_sending.set(false);
+            self.streaming_sessions.write().remove(&session_id);
+            *self.stream_activity.write() += 1; // Notify TabBar: stream ended
             self.scheduler.send(SchedulerSignal::Activity);
             tracing::info!(message_id = %message_id, "Completion signal SENT.");
 
             // Remove the handle from the map upon completion
             self.active_stream_handles.write().remove(&message_id);
             self.content_generated.write().remove(&message_id); // Cleanup
+            self.stream_session_map.write().remove(&message_id);
             tracing::info!(message_id = %message_id, "Active stream handle removed.");
         });
 
@@ -971,6 +1171,139 @@ impl StreamManagerContext {
         self.active_stream_handles
             .write()
             .insert(message_id, master_task_handle);
+    }
+
+    /// Check for watch word matches in the model's final text output and trigger
+    /// auto-recovery if appropriate. Returns `true` when recovery was triggered
+    /// and the caller should `return` (ending the current stream task).
+    ///
+    /// Watch words are patterns (e.g. "Let me check that...") that indicate a local
+    /// LLM stalled mid-response. This is gated by:
+    /// - OpenAI-compat provider only
+    /// - `watch_words_enabled` setting
+    /// - Non-empty response text
+    /// - Response length below `watch_word_max_response_chars` (long responses are legit)
+    /// - Per-session recovery count below `max_watch_word_recoveries`
+    async fn check_watch_word_recovery(
+        &mut self,
+        session_id: &str,
+        final_text: &str,
+        message_id: &Uuid,
+    ) -> bool {
+        let session_provider = self.effective_provider(session_id);
+        let settings = self.settings.read();
+        if session_provider != crate::settings::LlmProvider::OpenAiCompat
+            || !settings.openai_compat_config.watch_words_enabled
+            || final_text.is_empty()
+        {
+            return false;
+        }
+
+        let max_recoveries = settings.openai_compat_config.max_watch_word_recoveries;
+        let max_response_chars = settings.openai_compat_config.watch_word_max_response_chars;
+        let watch_words = settings.openai_compat_config.watch_words.clone();
+        drop(settings); // Release before accessing session_state
+
+        // Skip watch word detection on long responses — they're almost
+        // certainly complete even if they contain a watch word pattern.
+        let response_len = final_text.trim().len();
+        if response_len > max_response_chars {
+            tracing::debug!(
+                session_id,
+                response_len,
+                max_response_chars,
+                "Skipping watch word check: response exceeds max_response_chars threshold."
+            );
+            return false;
+        }
+
+        let recovery_count = self.session_state.read().sessions.get(session_id)
+            .map(|s| s.watch_word_recovery_count).unwrap_or(0);
+
+        if recovery_count >= max_recoveries {
+            if watch_words.iter().any(|ww| ww.matches(final_text)) {
+                tracing::info!(
+                    session_id,
+                    max = max_recoveries,
+                    "Watch word detected but recovery limit reached. Halting."
+                );
+            }
+            return false;
+        }
+
+        let matched = match watch_words.iter().find(|ww| ww.matches(final_text)) {
+            Some(m) => m,
+            None => return false,
+        };
+
+        let pattern = matched.pattern.clone();
+        let instruction = matched.effective_instruction();
+        tracing::info!(
+            session_id,
+            pattern = %pattern,
+            recovery = recovery_count + 1,
+            max = max_recoveries,
+            "Watch word detected in AI output. Triggering auto-recovery."
+        );
+
+        // Build recovery message with context from the stalled output.
+        // Truncate to avoid bloating the prompt (max 300 chars of stalled text).
+        let stalled_preview = if final_text.len() > 300 {
+            let boundary = crate::str_utils::floor_char_boundary(final_text, 300);
+            format!("{}...", &final_text[..boundary])
+        } else {
+            final_text.to_string()
+        };
+        let recovery_text = format!(
+            "[System: Auto-recovery triggered — watch word \"{}\" detected in your output]\n\
+             Your previous response ended abruptly after:\n\
+             \"{}\"\n\n\
+             {}",
+            pattern,
+            stalled_preview.trim(),
+            instruction,
+        );
+
+        // Inject as a User message so the model sees clear direction on its next turn.
+        {
+            let mut state = self.session_state.write();
+            if let Some(session) = state.sessions.get_mut(session_id) {
+                session.watch_word_recovery_count += 1;
+                session.messages.push(crate::components::chat::Message {
+                    id: Uuid::new_v4(),
+                    author: "User".to_string(),
+                    content: crate::components::shared::MessageContent::Text {
+                        content: recovery_text,
+                        thought_signature: None,
+                        thought_summary: None,
+                    },
+                    attachments: Vec::new(),
+                    comments: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                });
+                session.increment_turn_count();
+            }
+        }
+
+        // Check turn limit before triggering continuation
+        let turn_count = self.session_state.read().sessions.get(session_id)
+            .map(|s| s.current_ai_turn_count).unwrap_or(0);
+        if self.permission_manager.read().is_turn_limit_reached_for(turn_count) {
+            tracing::info!(session_id, "Watch word recovery halted: turn limit reached.");
+            return false;
+        }
+
+        // Clean up current stream state before triggering the next one.
+        self.active_stream_handles.write().remove(message_id);
+        self.content_generated.write().remove(message_id);
+        self.stream_session_map.write().remove(message_id);
+        crate::session::SessionState::save_async(&self.session_state.read(), None);
+        self.streaming_sessions.write().remove(session_id);
+        *self.stream_activity.write() += 1;
+
+        self.continuation_controller.write().trigger_continuation(session_id.to_string());
+        true
     }
 
     pub fn cancel_stream(mut self, message_id: &Uuid, session_id: &str) {
@@ -985,22 +1318,29 @@ impl StreamManagerContext {
         // Cleanup generated state
         self.content_generated.write().remove(message_id);
 
-        // 2. Remove the placeholder message and any orphaned tool call messages
-        //    from this cancelled turn.
-        //
-        //    During a multi-tool-call turn the stream_manager pushes additional
-        //    messages with NEW UUIDs (one per parallel tool call). cancel_stream
-        //    only knows the original placeholder message_id, so those extra
-        //    ToolCall messages remain in the session with status=Running and an
-        //    empty response. On the next turn, the prompt builder serializes
-        //    them as functionCall + empty functionResponse, causing Gemini to
-        //    return no data ("Gemini finished without sending any data").
-        //
-        //    Fix: after removing the placeholder, also trim any trailing
-        //    messages that are Running ToolCalls (orphans from this turn).
+        // 2. Preserve the AI's partial response — do NOT delete the message.
+        //    The model may have already produced useful text/thinking content
+        //    that the user wants to keep. Only remove orphaned Running tool
+        //    call messages (they have no results and break the next prompt).
         {
             let mut state = self.session_state.write();
-            state.remove_message_in_session(session_id, message_id);
+
+            // Check if the AI message has any content worth preserving.
+            let has_content = state.sessions.get(session_id)
+                .and_then(|s| s.messages.iter().find(|m| m.id == *message_id))
+                .map(|msg| {
+                    if let crate::components::shared::MessageContent::Text { content, .. } = &msg.content {
+                        !content.trim().is_empty()
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+
+            if !has_content {
+                // No content was generated — remove the empty placeholder.
+                state.remove_message_in_session(session_id, message_id);
+            }
 
             // Trim trailing orphaned Running tool calls
             if let Some(session) = state.sessions.get_mut(session_id) {
@@ -1041,7 +1381,9 @@ impl StreamManagerContext {
             tracing::warn!(message_id = %message_id, "No stream receiver found to remove.");
         }
 
-        self.is_sending.set(false);
+        self.streaming_sessions.write().remove(session_id);
+        *self.stream_activity.write() += 1; // Notify TabBar: stream cancelled
+        self.stream_session_map.write().remove(message_id);
         tracing::info!(message_id = %message_id, "Stream cancellation process complete.");
     }
 
@@ -1082,11 +1424,12 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         scheduler,
         permission_manager,
         stream_activity: Signal::new(0),
-        is_sending: Signal::new(false),
-        content_generated: Signal::new(std::collections::HashSet::new()),
+        streaming_sessions: Signal::new(HashSet::new()),
+        stream_session_map: Signal::new(HashMap::new()),
+        content_generated: Signal::new(HashSet::new()),
         save_error_signal: consume_context::<crate::components::shared::SaveErrorContext>().0,
         usage_log,
-        proactive_summary_running: Signal::new(false),
+        summarizing_sessions: Signal::new(HashSet::new()),
     });
 
     // Provide the context to children.
@@ -1140,11 +1483,12 @@ mod tests {
                 scheduler,
                 permission_manager,
                 stream_activity: Signal::new(0),
-                is_sending: Signal::new(false),
-                content_generated: Signal::new(std::collections::HashSet::new()),
+                streaming_sessions: Signal::new(HashSet::new()),
+                stream_session_map: Signal::new(HashMap::new()),
+                content_generated: Signal::new(HashSet::new()),
                 save_error_signal: Signal::new(None),
                 usage_log: Signal::new(crate::usage_log::UsageLog::default()),
-                proactive_summary_running: Signal::new(false),
+                summarizing_sessions: Signal::new(HashSet::new()),
             });
 
             let message_id = Uuid::new_v4();
@@ -1212,11 +1556,12 @@ mod tests {
                 scheduler,
                 permission_manager,
                 stream_activity: Signal::new(0),
-                is_sending: Signal::new(false),
-                content_generated: Signal::new(std::collections::HashSet::new()),
+                streaming_sessions: Signal::new(HashSet::new()),
+                stream_session_map: Signal::new(HashMap::new()),
+                content_generated: Signal::new(HashSet::new()),
                 save_error_signal: Signal::new(None),
                 usage_log: Signal::new(crate::usage_log::UsageLog::default()),
-                proactive_summary_running: Signal::new(false),
+                summarizing_sessions: Signal::new(HashSet::new()),
             });
 
             let message_id = Uuid::new_v4();

@@ -100,6 +100,7 @@ Ensure the "optimized_summary" maintains the correct schema."#,
                     response_mime_type: None,
                     response_schema: None,
                 }),
+                cached_content: None,
             };
 
             match connector.generate_content(request_body).await {

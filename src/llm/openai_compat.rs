@@ -28,6 +28,7 @@ impl LlmConnector for OpenAiCompatConnector {
         mut prompt_data: LlmPrompt,
         tx: mpsc::UnboundedSender<StreamMessage>,
         _mcp_context: Option<McpContext>,
+        _session_id: Option<String>,
     ) {
         let base = self.config.endpoint.trim_end_matches('/');
         let endpoint = if base.ends_with("/v1") {
@@ -499,6 +500,7 @@ Preserve existing information while incorporating new facts, entities, or user p
 You MUST respond with valid JSON containing exactly these fields:
 - "summary": A concise, updated summary of the entire conversation so far.
 - "sentiment": A brief string describing the user's current mood (e.g., "curious and collaborative", "frustrated but focused").
+- "current_task": A one-sentence description of the specific task or goal the user is CURRENTLY working on. This is the active goal anchor — critical for small-context models. Example: "Implementing a dynamic history cap in prompt_builder.rs". Leave empty string if no clear active task.
 - "entities": An object with:
   - "user_name": The user's name if mentioned.
   - "project_name": The active project or codebase name.

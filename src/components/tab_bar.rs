@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+use crate::components::stream_manager::StreamManagerContext;
 use crate::session::SessionState;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
@@ -16,8 +17,24 @@ pub struct TabBarProps {
 pub fn TabBar(props: TabBarProps) -> Element {
     // Write-only: used only for update_session_name in editing handlers
     let mut session_state = use_context::<Signal<SessionState>>();
+    let stream_manager = consume_context::<StreamManagerContext>();
     let mut editing_tab_id = use_signal(|| None::<String>);
     let mut temp_name = use_signal(String::new);
+
+    // Use a memo to create a proper reactive subscription to the streaming state.
+    // This ensures the component re-renders when stream_activity changes,
+    // even though the component's Props haven't changed.
+    let open_tabs_for_memo = props.open_tabs.clone();
+    let streaming_states = use_memo(move || {
+        // Read stream_activity to subscribe to stream start/end events
+        let _activity = stream_manager.stream_activity.read();
+        // Also directly subscribe to streaming_sessions for immediate updates
+        let _sessions = stream_manager.streaming_sessions.read();
+        let states: Vec<bool> = open_tabs_for_memo.iter()
+            .map(|id| stream_manager.is_session_streaming(id))
+            .collect();
+        states
+    });
 
     rsx! {
         div {
@@ -30,6 +47,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     let session_name = props.tab_names.get(idx)
                         .cloned()
                         .unwrap_or_else(|| "Unknown Session".to_string());
+                    let is_streaming = streaming_states.read().get(idx).cloned().unwrap_or(false);
                     let session_id_key = session_id.clone();
                     let id_edit = session_id.clone();
                     let id_save_keydown = session_id.clone();
@@ -43,15 +61,22 @@ pub fn TabBar(props: TabBarProps) -> Element {
                         div {
                             key: "{session_id_key}",
                             class: if is_active {
-                                "group flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink select-none bg-card border-b-2 border-b-primary-500"
+                                "group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink select-none bg-card border-b-2 border-b-primary-500"
                             } else {
-                                "group flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink select-none hover:bg-card"
+                                "group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink select-none hover:bg-card"
                             },
                             onclick: move |_| {
                                 if !is_editing {
                                     on_select.call(idx);
                                 }
                             },
+
+                            // Glowing base line while this tab's chat is actively streaming
+                            if is_streaming {
+                                div {
+                                    class: "absolute bottom-0 left-0 right-0 h-[2px] bg-primary-400 shadow-[0_0_8px_2px_rgba(91,134,193,0.75)] animate-pulse pointer-events-none",
+                                }
+                            }
 
                             if is_editing {
                                 div {
@@ -118,6 +143,11 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                     }
                                 }
                             } else {
+                                if is_streaming {
+                                    div {
+                                        class: "w-2 h-2 rounded-full bg-primary-400 animate-pulse mr-1.5 shrink-0",
+                                    }
+                                }
                                 span {
                                     class: if is_active { "flex-1 truncate text-xs text-fg font-medium" } else { "flex-1 truncate text-xs text-fg-muted" },
                                     onclick: move |evt| {

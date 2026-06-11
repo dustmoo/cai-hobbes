@@ -40,8 +40,19 @@ fn composio_server_key(profile_id: &str) -> String {
 /// Gemini's practical tool limit for FunctionDeclarations.
 const GEMINI_TOOL_LIMIT: usize = 128;
 
-/// Virtual server name for the built-in local on-demand meta-tools.
-const LOCAL_META_SERVER_NAME: &str = "hobbes-local-meta";
+/// Canonical server name for built-in Hobbes session-management tools
+/// (`HOBBES_PAGE_RESULT`, `HOBBES_UPDATE_SCRATCHPAD`).
+/// Registered in `McpManager::servers` so the AI can accurately introspect
+/// all built-in tools and their origins.
+pub const HOBBES_CORE_SERVER: &str = "hobbes-core";
+
+/// Canonical server name for built-in on-demand MCP management tools
+/// (`MCP_LOAD_SERVER_TOOLS`, `MCP_UNLOAD_SERVER_TOOLS`).
+/// Registered in `McpManager::servers` so the AI can accurately introspect
+/// all built-in tools and their origins.
+pub const HOBBES_META_SERVER: &str = "hobbes-meta";
+
+
 
 /// Get meta-tools for local MCP server on-demand loading.
 /// These allow the AI to load/unload tools from servers set to "On-demand" mode.
@@ -386,6 +397,14 @@ pub enum McpClientType {
     Service(Arc<RunningService<RoleClient, ()>>),
     NativeComposio(Arc<crate::mcp::composio_client::ComposioClient>),
     NativeImage(Arc<crate::mcp::image_client::ImageClient>),
+    /// Built-in Hobbes session tools (HOBBES_PAGE_RESULT, HOBBES_UPDATE_SCRATCHPAD).
+    /// Dispatch is intercepted upstream in stream_manager.rs (requires SessionState).
+    /// This variant exists so the server is visible / introspectable in McpManager.
+    NativeCore,
+    /// Built-in on-demand MCP management tools (MCP_LOAD_SERVER_TOOLS, MCP_UNLOAD_SERVER_TOOLS).
+    /// Dispatch is intercepted in use_mcp_tool() before the match arm runs.
+    /// This variant exists so the server is visible / introspectable in McpManager.
+    NativeMeta,
 }
 
 impl McpClientType {
@@ -394,7 +413,10 @@ impl McpClientType {
     fn is_healthy(&self) -> bool {
         match self {
             McpClientType::Service(arc) => !arc.is_transport_closed(),
-            McpClientType::NativeComposio(_) | McpClientType::NativeImage(_) => true,
+            McpClientType::NativeComposio(_)
+            | McpClientType::NativeImage(_)
+            | McpClientType::NativeCore
+            | McpClientType::NativeMeta => true,
         }
     }
 }
@@ -667,22 +689,7 @@ impl McpManager {
             on_demand.insert(server_name.to_string());
         }
         // Clear any dynamically loaded tools for this server
-        // LOCK ORDERING INVARIANT (P-010): Always acquire `servers` before
-        // `dynamic_local_tools` to match `call_tool`'s acquisition order
-        // and prevent ABBA deadlocks.
-        {
-            let servers = self.servers.lock().await;
-            let mut dynamic = self.dynamic_local_tools.lock().await;
-            let mut sources = self.dynamic_local_tool_sources.lock().await;
-            if let Some(client) = servers.get(server_name) {
-                let server_tool_names: HashSet<String> =
-                    client.tools.iter().map(|t| t.name.to_string()).collect();
-                dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
-                for name in &server_tool_names {
-                    sources.remove(name);
-                }
-            }
-        }
+        self.clear_dynamic_tools_for(server_name).await;
         self.invalidate_status_cache();
         tracing::info!(
             "Set server '{}' to on-demand mode - tools discoverable via MCP_LOAD_SERVER_TOOLS",
@@ -703,25 +710,32 @@ impl McpManager {
             unloaded.remove(server_name);
         }
         // Clear dynamically loaded tools for this server (they'll now be in the main set)
-        // LOCK ORDERING INVARIANT (P-010): servers → dynamic_local_tools
-        {
-            let servers = self.servers.lock().await;
-            let mut dynamic = self.dynamic_local_tools.lock().await;
-            let mut sources = self.dynamic_local_tool_sources.lock().await;
-            if let Some(client) = servers.get(server_name) {
-                let server_tool_names: HashSet<String> =
-                    client.tools.iter().map(|t| t.name.to_string()).collect();
-                dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
-                for name in &server_tool_names {
-                    sources.remove(name);
-                }
-            }
-        }
+        self.clear_dynamic_tools_for(server_name).await;
         self.invalidate_status_cache();
         tracing::info!(
             "Set server '{}' to loaded mode - all tools visible in every prompt",
             server_name
         );
+    }
+
+    /// Remove dynamically loaded tools belonging to `server_name` from the
+    /// `dynamic_local_tools` cache and `dynamic_local_tool_sources` reverse-lookup.
+    ///
+    /// LOCK ORDERING INVARIANT (P-010): Always acquire `servers` before
+    /// `dynamic_local_tools` to match `call_tool`'s acquisition order
+    /// and prevent ABBA deadlocks.
+    async fn clear_dynamic_tools_for(&self, server_name: &str) {
+        let servers = self.servers.lock().await;
+        let mut dynamic = self.dynamic_local_tools.lock().await;
+        let mut sources = self.dynamic_local_tool_sources.lock().await;
+        if let Some(client) = servers.get(server_name) {
+            let server_tool_names: HashSet<String> =
+                client.tools.iter().map(|t| t.name.to_string()).collect();
+            dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
+            for name in &server_tool_names {
+                sources.remove(name);
+            }
+        }
     }
 
     /// Reloads the MCP configuration and restarts servers.
@@ -742,6 +756,30 @@ impl McpManager {
             // So clearing everything is safer to avoid duplicates.
             servers.clear();
             tracing::info!("Cleared existing MCP servers for reload.");
+        }
+
+        // Clear dynamic tool caches
+        {
+            let mut dynamic = self.dynamic_composio_tools.lock().await;
+            if !dynamic.is_empty() {
+                tracing::info!(
+                    "Clearing {} stale dynamic Composio tools on config reload",
+                    dynamic.len()
+                );
+                dynamic.clear();
+            }
+        }
+        {
+            let mut dynamic_local = self.dynamic_local_tools.lock().await;
+            let mut sources = self.dynamic_local_tool_sources.lock().await;
+            if !dynamic_local.is_empty() {
+                tracing::info!(
+                    "Clearing {} stale dynamic local tools on config reload",
+                    dynamic_local.len()
+                );
+                dynamic_local.clear();
+                sources.clear();
+            }
         }
 
         // 2. Clear failed servers map
@@ -807,6 +845,31 @@ impl McpManager {
             }
             tracing::info!("Cleared existing Composio native clients for reinitialization.");
         }
+
+        // Clear dynamic tool caches from the old profile
+        {
+            let mut dynamic = self.dynamic_composio_tools.lock().await;
+            if !dynamic.is_empty() {
+                tracing::info!(
+                    "Clearing {} stale dynamic Composio tools from previous profile",
+                    dynamic.len()
+                );
+                dynamic.clear();
+            }
+        }
+        {
+            let mut dynamic_local = self.dynamic_local_tools.lock().await;
+            let mut sources = self.dynamic_local_tool_sources.lock().await;
+            if !dynamic_local.is_empty() {
+                tracing::info!(
+                    "Clearing {} stale dynamic local tools from previous profile",
+                    dynamic_local.len()
+                );
+                dynamic_local.clear();
+                sources.clear();
+            }
+        }
+
         tracing::info!(
             "Profile switch in progress for '{}'. Composio tools temporarily unavailable.",
             profile.name
@@ -1055,6 +1118,53 @@ impl McpManager {
 
                 if tx_clone.send(active_client).is_err() {
                     tracing::error!("Failed to send initialized virtual Image client");
+                }
+            });
+        }
+
+        // Initialize Native Core Client (HOBBES_PAGE_RESULT, HOBBES_UPDATE_SCRATCHPAD)
+        {
+            let tx_clone = tx.clone();
+            spawn(async move {
+                tracing::info!("Initializing Hobbes Core built-in tools server");
+                let core_client = Arc::new(crate::mcp::core_client::CoreClient::new());
+                let tools = core_client.list_tools();
+                let config = McpServerConfig::native_stub(
+                    HOBBES_CORE_SERVER.to_string(),
+                    "Built-in Hobbes session tools (scratchpad, pagination).".to_string(),
+                );
+                let active_client = ActiveMcpClient {
+                    config,
+                    service: McpClientType::NativeCore,
+                    tools,
+                    warning_message: None,
+                    profile_id: None,
+                };
+                if tx_clone.send(active_client).is_err() {
+                    tracing::error!("Failed to send initialized Hobbes Core client");
+                }
+            });
+        }
+
+        // Initialize Native Meta Client (MCP_LOAD_SERVER_TOOLS, MCP_UNLOAD_SERVER_TOOLS)
+        {
+            let tx_clone = tx.clone();
+            spawn(async move {
+                tracing::info!("Initializing Hobbes Meta built-in tools server");
+                let meta_tools = get_local_meta_tools();
+                let config = McpServerConfig::native_stub(
+                    HOBBES_META_SERVER.to_string(),
+                    "Built-in tools to load/unload on-demand MCP server tools.".to_string(),
+                );
+                let active_client = ActiveMcpClient {
+                    config,
+                    service: McpClientType::NativeMeta,
+                    tools: meta_tools,
+                    warning_message: None,
+                    profile_id: None,
+                };
+                if tx_clone.send(active_client).is_err() {
+                    tracing::error!("Failed to send initialized Hobbes Meta client");
                 }
             });
         }
@@ -1667,7 +1777,7 @@ impl McpManager {
         profile_id: Option<String>,
     ) -> Result<UnboundedReceiver<Result<CallToolResult, String>>, String> {
         // Intercept local on-demand meta-tools before normal dispatch
-        if server_name == LOCAL_META_SERVER_NAME || tool_name == "MCP_LOAD_SERVER_TOOLS" || tool_name == "MCP_UNLOAD_SERVER_TOOLS" {
+        if server_name == HOBBES_META_SERVER || tool_name == "MCP_LOAD_SERVER_TOOLS" || tool_name == "MCP_UNLOAD_SERVER_TOOLS" {
             let (tx, rx) = mpsc::unbounded_channel();
 
             if tool_name == "MCP_LOAD_SERVER_TOOLS" {
@@ -2107,6 +2217,26 @@ impl McpManager {
                         Ok(result) => Ok(result),
                         Err(e) => Err(e),
                     }
+                }
+                McpClientType::NativeCore => {
+                    // HOBBES_PAGE_RESULT and HOBBES_UPDATE_SCRATCHPAD are intercepted
+                    // upstream in stream_manager.rs before use_mcp_tool() is called.
+                    // If we land here it means a dispatch path was missed.
+                    Err(format!(
+                        "Built-in core tool '{}' was not intercepted before MCP dispatch. \
+                        This is a Hobbes bug — please report it.",
+                        tool.name
+                    ))
+                }
+                McpClientType::NativeMeta => {
+                    // MCP_LOAD_SERVER_TOOLS and MCP_UNLOAD_SERVER_TOOLS are intercepted
+                    // at the top of use_mcp_tool() before reaching this match arm.
+                    // If we land here it means a dispatch path was missed.
+                    Err(format!(
+                        "Built-in meta tool '{}' was not intercepted before MCP dispatch. \
+                        This is a Hobbes bug — please report it.",
+                        tool.name
+                    ))
                 }
                 McpClientType::NativeComposio(composio_client) => {
                     // Tool Router: Handle meta-tools for on-demand discovery
@@ -2690,17 +2820,8 @@ impl McpManager {
             server_contexts.push(server_context);
         }
 
-        // Inject MCP_LOAD_SERVER_TOOLS / MCP_UNLOAD_SERVER_TOOLS meta-tools
-        // when any on-demand local servers exist
-        if !on_demand_server_info.is_empty() {
-            let meta_tools = get_local_meta_tools();
-            server_contexts.push(McpServerContext {
-                name: LOCAL_META_SERVER_NAME.to_string(),
-                description: "Built-in tools for loading/unloading on-demand MCP server tools"
-                    .to_string(),
-                tools: meta_tools,
-            });
-        }
+        // hobbes-core and hobbes-meta are now registered in McpManager::servers
+        // and included in the main server loop above — no manual injection needed.
 
         // Include dynamically loaded local MCP tools (from MCP_LOAD_SERVER_TOOLS)
         let dynamic_local = self.dynamic_local_tools.lock().await;
@@ -3378,18 +3499,19 @@ impl McpManager {
             }
         }
 
-        // Status reporting for the native Image Generation client
-        {
-            let active_image: Option<(&String, &ActiveMcpClient)> =
-                servers.iter().find(|(k, _)| k.as_str() == "hobbes-native-image");
-
-            if let Some((_name, client)) = active_image {
+        // Status reporting for native built-in clients
+        for (server_key, display_name) in [
+            ("hobbes-native-image", "Image Generation"),
+            (HOBBES_CORE_SERVER, "Hobbes Core Tools"),
+            (HOBBES_META_SERVER, "Hobbes Meta Tools"),
+        ] {
+            if let Some((_k, client)) = servers.iter().find(|(k, _)| k.as_str() == server_key) {
                 statuses.push(McpServerStatus {
-                    display_name: "Image Generation".to_string(),
+                    display_name: display_name.to_string(),
                     tools: client.tools.len(),
                     loaded_tools: client.tools.len(),
                     is_loaded: true,
-                    ..McpServerStatus::new("hobbes-native-image".to_string(), client.config.description.clone(), ServerStatus::Loaded)
+                    ..McpServerStatus::new(server_key.to_string(), client.config.description.clone(), ServerStatus::Loaded)
                 });
             }
         }

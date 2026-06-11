@@ -1,4 +1,5 @@
 use super::*;
+use crate::str_utils::floor_char_boundary;
 use crate::session::ActiveContext;
 use crate::session::Session;
 use crate::settings::Settings;
@@ -22,8 +23,12 @@ fn create_test_session() -> Session {
         accumulated_turns: 0,
         memory_optimization_summary: None,
         composio_profile: None,
+        llm_provider: None,
+        chat_model: None,
         loaded_skills: std::collections::HashMap::new(),
         scratchpad: String::new(),
+        current_ai_turn_count: 0,
+        watch_word_recovery_count: 0,
     }
 }
 
@@ -151,6 +156,7 @@ fn test_oversized_entities_stripped_from_system_context() {
     session.active_context.conversation_summary = ConversationSummary {
         summary: "Test conversation".to_string(),
         sentiment: "neutral".to_string(),
+        current_task: String::new(),
         entities: ConversationSummaryEntities {
             user_name: "Dustin".to_string(),
             other_entities,
@@ -192,15 +198,15 @@ fn test_floor_char_boundary_multibyte() {
     assert_eq!(s.len(), 21);
 
     // Snap to boundary inside 🦀 (byte 7 is mid-emoji) → should snap to 5
-    assert_eq!(super::floor_char_boundary(s, 7), 5);
+    assert_eq!(floor_char_boundary(s, 7), 5);
     // Snap to boundary inside 🎯 (byte 16 is mid-emoji) → should snap to 14
-    assert_eq!(super::floor_char_boundary(s, 16), 14);
+    assert_eq!(floor_char_boundary(s, 16), 14);
     // Exact boundary at start of 🦀 → should stay at 5
-    assert_eq!(super::floor_char_boundary(s, 5), 5);
+    assert_eq!(floor_char_boundary(s, 5), 5);
     // Beyond string length → clamp to len
-    assert_eq!(super::floor_char_boundary(s, 100), 21);
+    assert_eq!(floor_char_boundary(s, 100), 21);
     // Zero → zero
-    assert_eq!(super::floor_char_boundary(s, 0), 0);
+    assert_eq!(floor_char_boundary(s, 0), 0);
 }
 
 #[test]

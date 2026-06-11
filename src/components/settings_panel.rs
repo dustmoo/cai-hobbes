@@ -2018,46 +2018,133 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     // Model Quick-Switch Slots
                                     div {
-                                        class: "mb-2",
-                                        label { class: "block text-sm font-medium text-fg-muted mb-1", "Model Quick-Switch Slots" }
-                                        p {
-                                            class: "text-xs text-fg-muted mb-2",
-                                            "Assign models to slots ^1–^9 for fast switching in the chat bar."
-                                        }
+                                        class: "mb-4 pt-4 border-t border-subtle",
                                         div {
-                                            class: "space-y-1",
-                                            // Fixed 10 slots (^1–^9, ^0). Uses the provider-agnostic
-                                            // helpers so a short/empty persisted vec still renders all
-                                            // rows and writes resize safely — same as Gemini/OpenAI.
-                                            for i in 0..10 {
-                                                div {
-                                                    key: "claude-slot-{i}",
-                                                    class: "flex items-center gap-2",
-                                                    span { class: "text-[10px] text-fg-muted font-mono w-6 text-right", "^{i + 1}" }
-                                                    select {
-                                                        class: "flex-1 px-2 py-1 bg-input border border-subtle rounded-md text-sm",
-                                                        onchange: move |event| {
-                                                            local_settings.write().update_active_model_slot(i, event.value());
-                                                        },
+                                            class: "flex justify-between items-center cursor-pointer mb-2 group",
+                                            onclick: move |_| {
+                                                let mut state = ui_state.write();
+                                                state.show_model_slots = !state.show_model_slots;
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            },
+                                            label { class: "block text-sm font-medium text-fg-muted group-hover:text-fg transition-colors", "Model Quick-Switch Slots" }
+                                            span { class: "text-xs text-fg-muted", if ui_state.read().show_model_slots { "▼" } else { "▶" } }
+                                        }
+                                        if ui_state.read().show_model_slots {
+                                            p {
+                                                class: "text-xs text-fg-muted mb-3",
+                                                "Assign models to slots ^1–^9 for fast switching in the chat bar."
+                                            }
+                                            div {
+                                                class: "space-y-3 pl-2 mb-4",
+                                                for i in 0..10 {
+                                                    div {
+                                                        key: "claude-slot-{i}",
+                                                        class: "flex items-center gap-3",
                                                         {
-                                                            let current = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
-                                                            let models = crate::llm::claude_models::ClaudeModel::all_models();
-                                                            let in_list = models.iter().any(|m| m.canonical_slug() == current);
+                                                            let slot_model = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                            let effective_icon = if !slot_model.is_empty() {
+                                                                local_settings.read().model_icons.get(&slot_model).cloned()
+                                                                    .unwrap_or_else(|| get_slot_icon(i))
+                                                            } else {
+                                                                get_slot_icon(i)
+                                                            };
+                                                            let has_model = !slot_model.is_empty();
                                                             rsx! {
-                                                                option { value: "", selected: current.is_empty(), "— empty —" }
-                                                                if !current.is_empty() && !in_list {
-                                                                    option { value: "{current}", selected: true,
-                                                                        "{crate::llm::claude_models::ClaudeModel::from_slug(&current).display_name()}" }
+                                                                div {
+                                                                    class: if has_model {
+                                                                        "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm shrink-0 cursor-pointer hover:border-primary-500 transition-all"
+                                                                    } else {
+                                                                        "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm shrink-0"
+                                                                    },
+                                                                    title: if has_model { "Click to change icon" } else { "" },
+                                                                    onclick: move |_| {
+                                                                        if has_model {
+                                                                            let current = picker_open_for_slot();
+                                                                            if current == Some(i) {
+                                                                                picker_open_for_slot.set(None);
+                                                                            } else {
+                                                                                picker_open_for_slot.set(Some(i));
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    "{effective_icon}"
                                                                 }
-                                                                for m in models.iter() {
-                                                                    option {
-                                                                        value: "{m.canonical_slug()}",
-                                                                        selected: m.canonical_slug() == current,
-                                                                        "{m.display_name()}"
+                                                            }
+                                                        }
+                                                        div {
+                                                            class: "flex-1",
+                                                            select {
+                                                                class: "block w-full px-2 py-1 bg-input border border-subtle rounded text-xs",
+                                                                onchange: move |evt| {
+                                                                    local_settings.write().update_active_model_slot(i, evt.value());
+                                                                },
+                                                                {
+                                                                    let current = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                    let models = crate::llm::claude_models::ClaudeModel::all_models();
+                                                                    let in_list = models.iter().any(|m| m.canonical_slug() == current);
+                                                                    rsx! {
+                                                                        option { value: "", selected: current.is_empty(), "None" }
+                                                                        if !current.is_empty() && !in_list {
+                                                                            option { value: "{current}", selected: true,
+                                                                                "{crate::llm::claude_models::ClaudeModel::from_slug(&current).display_name()}" }
+                                                                        }
+                                                                        for m in models.iter() {
+                                                                            option {
+                                                                                value: "{m.canonical_slug()}",
+                                                                                selected: m.canonical_slug() == current,
+                                                                                "{m.display_name()}"
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            if picker_open_for_slot() == Some(i) {
+                                                                {
+                                                                    let slot_model_for_picker = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                    if !slot_model_for_picker.is_empty() {
+                                                                        let current_custom = local_settings.read().model_icons.get(&slot_model_for_picker).cloned().unwrap_or_default();
+                                                                        rsx! {
+                                                                            div {
+                                                                                class: "flex gap-1 flex-wrap mt-1 p-1.5 bg-card border border-subtle rounded-lg shadow-lg",
+                                                                                for emoji in ["\u{26a1}", "\u{1f9e0}", "\u{1f34c}", "\u{1f916}", "\u{1f48e}", "\u{1f525}", "\u{2728}", "\u{1f680}", "\u{1f319}", "\u{2b50}"] {
+                                                                                    button {
+                                                                                        class: format!("w-7 h-7 rounded-full bg-section border flex items-center justify-center text-sm transition-all {}",
+                                                                                            if current_custom == emoji { "border-primary-500 ring-1 ring-primary-500/30 scale-110" } else { "border-subtle hover:border-primary-500 hover:scale-110" }
+                                                                                        ),
+                                                                                        onclick: {
+                                                                                            let model = slot_model_for_picker.clone();
+                                                                                            let icon = emoji.to_string();
+                                                                                            move |_| {
+                                                                                                local_settings.write().model_icons.insert(model.clone(), icon.clone());
+                                                                                                picker_open_for_slot.set(None);
+                                                                                            }
+                                                                                        },
+                                                                                        "{emoji}"
+                                                                                    }
+                                                                                }
+                                                                                button {
+                                                                                    class: "w-7 h-7 rounded-full bg-section border border-subtle flex items-center justify-center text-[10px] text-fg-muted hover:border-red-500 hover:text-red-400 transition-all",
+                                                                                    title: "Reset to default",
+                                                                                    onclick: {
+                                                                                        let model = slot_model_for_picker.clone();
+                                                                                        move |_| {
+                                                                                            local_settings.write().model_icons.remove(&model);
+                                                                                            picker_open_for_slot.set(None);
+                                                                                        }
+                                                                                    },
+                                                                                    "✕"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    } else {
+                                                                        rsx! {}
                                                                     }
                                                                 }
                                                             }
                                                         }
+                                                        span { class: "text-[10px] text-fg-muted font-mono w-6 text-right", "^{i+1}" }
                                                     }
                                                 }
                                             }
@@ -2815,6 +2902,24 @@ pub fn SettingsPanel() -> Element {
                                             onchange: move |e| {
                                                 let mut state = ui_state.write();
                                                 state.show_profile_selector = e.value() == "true";
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+
+                                    // Provider Selector
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-fg-muted", "Show Provider Selector" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                            checked: "{ui_state.read().show_provider_selector}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.show_provider_selector = e.value() == "true";
                                                 let state_clone = (*state).clone();
                                                 let manager = ui_state_manager.read().clone();
                                                 spawn(async move { let _ = manager.save(&state_clone); });
@@ -3672,6 +3777,15 @@ pub fn SettingsPanel() -> Element {
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_profile.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_profile = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Open Provider Selector" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_provider.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_provider = v,
                                         }
                                     }
 

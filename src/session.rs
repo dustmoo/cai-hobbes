@@ -31,6 +31,12 @@ pub struct ConversationSummary {
     pub summary: String,
     #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
     pub sentiment: String,
+    /// The active task or goal the user is currently pursuing.
+    /// Populated automatically by the summarizer on each turn — no model tool call needed.
+    /// Injected as part of `conversation_summary` in the system context (Tier 3).
+    /// For small-context models this acts as a goal anchor so the task survives history scrolling.
+    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
+    pub current_task: String,
     #[serde(default)]
     pub entities: ConversationSummaryEntities,
 }
@@ -113,6 +119,13 @@ pub struct Session {
     /// Acts as the live authority for tool-calling/MCP context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composio_profile: Option<String>,
+    /// Per-session LLM provider override. None → follow global `Settings::active_llm`.
+    /// Set together with `chat_model` by the chat-bar pickers so the pair stays consistent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_provider: Option<crate::settings::LlmProvider>,
+    /// Per-session chat model override. None → the effective provider's configured model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_model: Option<String>,
     /// Skills actively loaded into this session's context.
     /// Maps skill_name → CapabilityContextPayload JSON (the response from execute_skill).
     /// Skills persist here until explicitly unloaded via /unload.
@@ -124,9 +137,27 @@ pub struct Session {
     /// Survives history scrolling and all 4 compression tiers.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub scratchpad: String,
+    /// Track the number of automated AI turns in a single loop.
+    /// Scoped per-session to prevent cross-tab interference and reset-bypasses.
+    #[serde(default)]
+    pub current_ai_turn_count: u32,
+    /// Track how many times watch words have triggered auto-recovery in the
+    /// current user turn. Resets when the user sends a new message.
+    /// Prevents infinite recovery loops when the model keeps stalling.
+    #[serde(default)]
+    pub watch_word_recovery_count: u32,
 }
 
 impl Session {
+    pub fn increment_turn_count(&mut self) {
+        self.current_ai_turn_count += 1;
+    }
+
+    pub fn reset_turn_count(&mut self) {
+        self.current_ai_turn_count = 0;
+        self.watch_word_recovery_count = 0;
+    }
+
     pub fn delete_message_and_after(&mut self, message_id: &str) -> usize {
         if let Ok(uuid) = uuid::Uuid::parse_str(message_id) {
             if let Some(index) = self.messages.iter().position(|m| m.id == uuid) {
@@ -252,9 +283,19 @@ pub type PageQueue = HashMap<String, PagedResult>;
 ///
 /// Uses the same provider-context resolution as `effective_tool_result_limit` in
 /// prompt_builder.rs, ensuring page sizes scale proportionally with the model.
-pub fn compute_page_budget(settings: &crate::settings::Settings) -> usize {
-    let tuning = settings.effective_context_tuning();
-    let provider_context_tokens = settings.resolve_context_window();
+pub fn compute_page_budget(
+    settings: &crate::settings::Settings,
+    session: Option<&Session>,
+) -> usize {
+    let (provider, model) = match session {
+        Some(s) => (
+            settings.provider_for_session(s),
+            settings.chat_model_for_session(s),
+        ),
+        None => (settings.active_llm, settings.active_chat_model()),
+    };
+    let tuning = settings.effective_context_tuning_for(provider);
+    let provider_context_tokens = settings.resolve_context_window_for(provider, &model);
 
     if let Some(max_tokens) = provider_context_tokens {
         let ratio = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(
@@ -448,9 +489,17 @@ impl SessionState {
         // e.g. 128K tokens × 4 chars/token × 2% ≈ 10,240 chars.
         // Floor at 4K so small/unconfigured models still get meaningful space.
         // Cap at 32K so even enormous context windows don't allow bloat.
-        let tuning = settings.effective_context_tuning();
+        let session = self.sessions.get(session_id);
+        let (provider, model) = match session {
+            Some(s) => (
+                settings.provider_for_session(s),
+                settings.chat_model_for_session(s),
+            ),
+            None => (settings.active_llm, settings.active_chat_model()),
+        };
+        let tuning = settings.effective_context_tuning_for(provider);
         let max_scratchpad_chars: usize = settings
-            .resolve_context_window()
+            .resolve_context_window_for(provider, &model)
             .map(|tokens| {
                 let chars = (tokens as f64 * tuning.chars_per_token * 0.02) as usize;
                 chars.clamp(4_000, 32_000)
@@ -855,8 +904,12 @@ impl SessionState {
             accumulated_turns: 0,
             memory_optimization_summary: None,
             composio_profile: initial_profile,
+            llm_provider: None,
+            chat_model: None,
             loaded_skills: HashMap::new(),
             scratchpad: String::new(),
+            current_ai_turn_count: 0,
+            watch_word_recovery_count: 0,
         };
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id.clone();
@@ -893,6 +946,31 @@ impl SessionState {
     pub fn delete_session(&mut self, id: &str) {
         self.delete_session_raw(id);
         Self::save_async(self, None);
+    }
+
+    /// Remove sessions that are not in any open tab and haven't been
+    /// updated in `max_age` days. Harvests cost/token data before removal.
+    pub fn gc_closed_sessions(&mut self, open_tab_ids: &[String], max_age_days: i64) {
+        let cutoff = Utc::now() - chrono::Duration::days(max_age_days);
+        let open_set: std::collections::HashSet<&str> = open_tab_ids.iter().map(|s| s.as_str()).collect();
+
+        let stale_ids: Vec<String> = self.sessions.iter()
+            .filter(|(id, session)| {
+                !open_set.contains(id.as_str())
+                    && *id != &self.active_session_id
+                    && session.last_updated < cutoff
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in &stale_ids {
+            self.delete_session_raw(id); // Harvests cost/tokens into lifetime counters
+        }
+
+        if !stale_ids.is_empty() {
+            tracing::info!("GC: Removed {} stale sessions (older than {} days)", stale_ids.len(), max_age_days);
+            Self::save_async(self, None);
+        }
     }
 
     pub fn get_active_session(&self) -> Option<&Session> {
@@ -1818,6 +1896,7 @@ mod tests {
                 conversation_summary: ConversationSummary {
                     summary: "User asked to read and write files.".to_string(),
                     sentiment: "neutral".to_string(),
+                    current_task: String::new(),
                     entities: ConversationSummaryEntities::default(),
                 },
                 ..Default::default()
@@ -1828,8 +1907,12 @@ mod tests {
             accumulated_turns: 0,
             memory_optimization_summary: None,
             composio_profile: None,
+            llm_provider: None,
+            chat_model: None,
             loaded_skills: HashMap::new(),
             scratchpad: String::new(),
+            current_ai_turn_count: 0,
+            watch_word_recovery_count: 0,
         };
 
         // Simulate ToolCallSummarizer having inserted snapshots
@@ -1876,5 +1959,37 @@ mod tests {
             session.active_context.conversation_summary.summary.is_empty(),
             "Conversation summary should be cleared after undo"
         );
+    }
+
+    #[test]
+    fn test_gc_closed_sessions() {
+        let mut state = SessionState::default();
+
+        let active_id = state.create_session_raw(None);
+        let open_id = state.create_session_raw(None);
+        let stale_id = state.create_session_raw(None);
+        let fresh_id = state.create_session_raw(None);
+
+        state.active_session_id = active_id.clone();
+
+        let now = Utc::now();
+        let old_time = now - chrono::Duration::days(10);
+        let fresh_time = now - chrono::Duration::days(2);
+
+        // Mutate their times
+        state.sessions.get_mut(&active_id).unwrap().last_updated = old_time;
+        state.sessions.get_mut(&open_id).unwrap().last_updated = old_time;
+        state.sessions.get_mut(&stale_id).unwrap().last_updated = old_time;
+        state.sessions.get_mut(&fresh_id).unwrap().last_updated = fresh_time;
+
+        state.save_disabled = true; // prevent file saving in test
+
+        let open_tabs = vec![open_id.clone()];
+        state.gc_closed_sessions(&open_tabs, 7);
+
+        assert!(state.sessions.contains_key(&active_id), "Active session must survive GC");
+        assert!(state.sessions.contains_key(&open_id), "Open session must survive GC");
+        assert!(state.sessions.contains_key(&fresh_id), "Fresh session must survive GC");
+        assert!(!state.sessions.contains_key(&stale_id), "Stale closed session must be removed by GC");
     }
 }

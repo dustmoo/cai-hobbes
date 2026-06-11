@@ -669,7 +669,7 @@ fn app() -> Element {
         let settings = settings.read();
         let connector: Arc<dyn LlmConnector> = match settings.active_llm {
             crate::settings::LlmProvider::Gemini => {
-                Arc::new(GeminiConnector::new(settings.gemini_config.clone()))
+                Arc::new(GeminiConnector::new_shared(settings.gemini_config.clone()))
             }
             crate::settings::LlmProvider::OpenAiCompat => Arc::new(OpenAiCompatConnector::new(
                 settings.openai_compat_config.clone(),
@@ -696,7 +696,9 @@ fn app() -> Element {
         };
         // Now the read borrow is dropped, safe to set the connector
         let new_connector: Arc<dyn LlmConnector> = match active_llm {
-            crate::settings::LlmProvider::Gemini => Arc::new(GeminiConnector::new(gemini_config)),
+            crate::settings::LlmProvider::Gemini => {
+                Arc::new(GeminiConnector::new_shared(gemini_config))
+            }
             crate::settings::LlmProvider::OpenAiCompat => {
                 tracing::info!(
                     "Recreating OpenAI-compat connector: model='{}', endpoint='{}', api_key={}",
@@ -750,18 +752,7 @@ fn app() -> Element {
             .unwrap_or(false);
 
         // Check if the current provider is configured
-        let provider_configured = match settings.active_llm {
-            crate::settings::LlmProvider::Gemini => {
-                settings.gemini_config.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok()
-            }
-            crate::settings::LlmProvider::OpenAiCompat => {
-                !settings.openai_compat_config.endpoint.is_empty()
-            }
-            crate::settings::LlmProvider::Claude => {
-                settings.claude_config.api_key.is_some()
-                    || std::env::var("ANTHROPIC_API_KEY").is_ok()
-            }
-        };
+        let provider_configured = settings.is_provider_configured(settings.active_llm);
 
         // Need onboarding if either TOS not accepted or active provider missing config
         !tos_accepted || !provider_configured
@@ -1070,6 +1061,12 @@ fn app() -> Element {
         state.delete_session(&id_to_delete);
         drop(state);
 
+        let conn = llm_connector.read().clone();
+        let id_to_delete_clone = id_to_delete.clone();
+        tokio::spawn(async move {
+            conn.invalidate_session_cache(&id_to_delete_clone).await;
+        });
+
         let mut tabs = open_tabs.read().clone();
         if let Some(tab_idx) = tabs.iter().position(|id| id == &id_to_delete) {
             tabs.remove(tab_idx);
@@ -1094,7 +1091,29 @@ fn app() -> Element {
     let mut close_tab_fn = move |idx: usize| {
         let mut tabs = open_tabs.read().clone();
         if idx < tabs.len() {
+            let closing_session_id = tabs[idx].clone();
             tabs.remove(idx);
+
+            // Delete the session if it has no messages (empty tab).
+            // Sessions with messages are preserved in History.
+            {
+                let state = session_state.read();
+                let is_empty = state.sessions.get(&closing_session_id)
+                    .map(|s| s.messages.is_empty())
+                    .unwrap_or(true);
+                if is_empty {
+                    drop(state);
+                    session_state.write().delete_session(&closing_session_id);
+                    tracing::info!("close_tab: deleted empty session {}", closing_session_id);
+
+                    let conn = llm_connector.read().clone();
+                    let closing_id_clone = closing_session_id.clone();
+                    tokio::spawn(async move {
+                        conn.invalidate_session_cache(&closing_id_clone).await;
+                    });
+                }
+            }
+
             let mut new_idx = *active_tab_index.read();
             if tabs.is_empty() {
                 let new_id = session_state.write().create_session(active_profile_id());
@@ -1168,6 +1187,15 @@ fn app() -> Element {
                     chat_command.set(Some(ChatCommand::OpenAttachments));
                 }
             }
+        }
+    });
+
+    // Background session GC — runs every 30 minutes
+    use_coroutine(move |_rx: UnboundedReceiver<()>| async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(30 * 60)).await;
+            let tabs = open_tabs.peek().clone();
+            session_state.write().gc_closed_sessions(&tabs, 7);
         }
     });
 
@@ -1379,24 +1407,103 @@ fn app() -> Element {
                     }
                 }
                 ChatCommand::SwitchModel(idx) => {
-                    let slots = settings.peek().active_model_slots();
+                    // Slots come from the session's effective provider so the picker
+                    // works in tabs pinned to a non-global provider.
+                    let (provider, slots) = {
+                        let settings_read = settings.peek();
+                        let state = session_state.peek();
+                        let provider = state
+                            .sessions
+                            .get(&*current_session_id.read())
+                            .map(|s| settings_read.provider_for_session(s))
+                            .unwrap_or(settings_read.active_llm);
+                        (provider, settings_read.model_slots_for(provider))
+                    };
                     if idx < slots.len() {
                         let new_model = slots[idx].clone();
                         if !new_model.is_empty() {
                             tracing::info!(
-                                "SwitchModel: switching to slot {} model '{}'",
+                                "SwitchModel: switching to slot {} model '{}' ({})",
                                 idx,
-                                new_model
+                                new_model,
+                                provider.display_name()
                             );
-                            settings.write().set_active_chat_model(new_model);
+                            // Pin the session to the chosen provider+model pair...
+                            let mut session_changed = false;
+                            {
+                                let mut state = session_state.write();
+                                if let Some(session) =
+                                    state.sessions.get_mut(&*current_session_id.read())
+                                {
+                                    if session.llm_provider != Some(provider)
+                                        || session.chat_model.as_deref()
+                                            != Some(new_model.as_str())
+                                    {
+                                        session.llm_provider = Some(provider);
+                                        session.chat_model = Some(new_model.clone());
+                                        session_changed = true;
+                                    }
+                                }
+                            } // write lock dropped here
+                            // ...and update the provider's default for sessions without
+                            // an override (mirrors SwitchProfile semantics).
+                            settings.write().set_chat_model_for(provider, new_model);
                             settings_manager
                                 .read()
                                 .save_async(settings.peek().clone(), Some(save_error));
+                            if session_changed {
+                                SessionState::save_async(&session_state.read(), Some(save_error));
+                            }
                         } else {
                             tracing::info!("SwitchModel: slot {} is empty, ignoring", idx);
                         }
                     } else {
                         tracing::warn!("SwitchModel: slot {} out of range ({})", idx, slots.len());
+                    }
+                }
+                ChatCommand::SwitchProvider(idx) => {
+                    let providers = crate::settings::LlmProvider::all_variants();
+                    if let Some(&provider) = providers.get(idx) {
+                        if !settings.peek().is_provider_configured(provider) {
+                            tracing::info!(
+                                "SwitchProvider: {} is not configured, ignoring",
+                                provider.display_name()
+                            );
+                        } else {
+                            // Pin the session to the chosen provider; the model follows
+                            // that provider's configured default.
+                            let mut session_changed = false;
+                            {
+                                let mut state = session_state.write();
+                                if let Some(session) =
+                                    state.sessions.get_mut(&*current_session_id.read())
+                                {
+                                    if session.llm_provider != Some(provider) {
+                                        session.llm_provider = Some(provider);
+                                        session.chat_model = None;
+                                        session_changed = true;
+                                    }
+                                }
+                            } // write lock dropped here
+                            // Update the global default for sessions without an override
+                            // (mirrors SwitchProfile semantics).
+                            let settings_stale = settings.peek().active_llm != provider;
+                            if settings_stale {
+                                settings.write().active_llm = provider;
+                                settings_manager
+                                    .read()
+                                    .save_async(settings.peek().clone(), Some(save_error));
+                            }
+                            if session_changed {
+                                SessionState::save_async(&session_state.read(), Some(save_error));
+                            }
+                            tracing::info!(
+                                "SwitchProvider: switched to {} (session_changed={} global_changed={})",
+                                provider.display_name(),
+                                session_changed,
+                                settings_stale
+                            );
+                        }
                     }
                 }
                 ChatCommand::ToggleSettings => {
@@ -1468,7 +1575,8 @@ fn app() -> Element {
                 | ChatCommand::CopyToDraft(_)
                 | ChatCommand::RestoreToDraft(_, _)
                 | ChatCommand::TriggerAiAnalysis
-                | ChatCommand::ToggleModelSelector => {}
+                | ChatCommand::ToggleModelSelector
+                | ChatCommand::ToggleProviderSelector => {}
             }
 
             // Centralized command clearing to avoid loops

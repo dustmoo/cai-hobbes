@@ -12,25 +12,35 @@ fn main() {
         println!("cargo:rustc-env=BUNDLE_IDENTIFIER=ai.clearmirror.cai-hobbes");
     }
 
-    // Run tailwindcss to build the CSS file
-    let npx = if cfg!(target_os = "windows") {
-        "npx.cmd"
-    } else {
-        "npx"
-    };
-    let status = Command::new(npx)
-        .args([
-            "tailwindcss",
-            "-i",
-            "./assets/tailwind.css",
-            "-o",
-            "./assets/output.css",
-            "--minify",
-        ])
-        .status()
-        .expect("failed to execute tailwindcss");
+    // Run tailwindcss to build the CSS file.
+    // Try local node_modules binary first, fall back to npx.
+    // Skip gracefully if neither is available — output.css is committed to the repo.
+    let tailwind_args = [
+        "-i",
+        "./assets/tailwind.css",
+        "-o",
+        "./assets/output.css",
+        "--minify",
+    ];
 
-    if !status.success() {
-        panic!("tailwindcss failed to build");
+    let result = Command::new("./node_modules/.bin/tailwindcss")
+        .args(tailwind_args)
+        .status()
+        .or_else(|_| {
+            let npx = if cfg!(target_os = "windows") { "npx.cmd" } else { "npx" };
+            Command::new(npx)
+                .args(["tailwindcss"])
+                .args(tailwind_args)
+                .status()
+        });
+
+    match result {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            println!("cargo:warning=tailwindcss exited with status {}. Using existing output.css.", status);
+        }
+        Err(_) => {
+            println!("cargo:warning=tailwindcss not found. Using existing output.css.");
+        }
     }
 }

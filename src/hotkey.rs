@@ -90,6 +90,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
     //   Cmd+1..9                → Switch Tab (by index)
     //   Control+1..9            → Switch Model (by index)
     //   Cmd+Option+1..9         → Switch Profile (by index)
+    //   Cmd+Option+Shift+1..9   → Switch Provider (by index)
     //
     // User-configurable hotkeys (from settings.hotkeys) are checked FIRST in the JS listener.
     // If a configurable hotkey collides with a reserved one, the configurable one wins (shadows).
@@ -101,6 +102,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 "toggle_history" => chat_command.set(Some(ChatCommand::ToggleHistory)),
                 "toggle_mcp" => chat_command.set(Some(ChatCommand::ToggleMcp)),
                 "toggle_profile" => chat_command.set(Some(ChatCommand::ToggleProfile)),
+                "toggle_provider" => chat_command.set(Some(ChatCommand::ToggleProviderSelector)),
                 "open_attachments" => chat_command.set(Some(ChatCommand::OpenAttachments)),
                 "new_chat" => chat_command.set(Some(ChatCommand::NewChat)),
                 "new_chat_memory" => chat_command.set(Some(ChatCommand::NewChatWithMemory)),
@@ -129,6 +131,11 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 s if s.starts_with("switch_model_") => {
                     if let Ok(idx) = s.replace("switch_model_", "").parse::<usize>() {
                         chat_command.set(Some(ChatCommand::SwitchModel(idx)));
+                    }
+                }
+                s if s.starts_with("switch_provider_") => {
+                    if let Ok(idx) = s.replace("switch_provider_", "").parse::<usize>() {
+                        chat_command.set(Some(ChatCommand::SwitchProvider(idx)));
                     }
                 }
                 _ => tracing::warn!("Unknown JS hotkey action: {}", msg),
@@ -202,6 +209,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                         else if (check(config.toggle_history, event)) action = "toggle_history";
                         else if (check(config.toggle_mcp, event)) action = "toggle_mcp";
                         else if (check(config.toggle_profile, event)) action = "toggle_profile";
+                        else if (check(config.toggle_provider, event)) action = "toggle_provider";
                         else if (check(config.toggle_attachments, event)) action = "open_attachments";
                         else if (check(config.toggle_new_chat, event)) action = "new_chat";
                         else if (check(config.toggle_new_chat_with_memory, event)) action = "new_chat_memory";
@@ -243,9 +251,24 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                              }}
                         }}
                         // Profile switching: Cmd+Option+1..9
+                        // event.code fallback: with Option held, macOS composes event.key
+                        // into a symbol (e.g. Option+1 -> "¡"), so the digit check alone
+                        // never matches on mac keyboards.
                         else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.altKey) {{
-                             if (event.key >= '1' && event.key <= '9') {{
-                                 action = "switch_profile_" + (parseInt(event.key) - 1);
+                             const profileDigit = (event.key >= '1' && event.key <= '9')
+                                 ? event.key
+                                 : ((event.code || '').match(/^Digit([1-9])$/) || [])[1];
+                             if (profileDigit) {{
+                                 action = "switch_profile_" + (parseInt(profileDigit) - 1);
+                             }}
+                        }}
+                        // Provider switching: Cmd+Option+Shift+1..9
+                        // Use event.code: with Option+Shift held, event.key is a composed
+                        // character on macOS (e.g. Option+Shift+1 -> "⁄"), never the digit.
+                        else if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.altKey) {{
+                             const providerDigit = ((event.code || '').match(/^Digit([1-9])$/) || [])[1];
+                             if (providerDigit) {{
+                                 action = "switch_provider_" + (parseInt(providerDigit) - 1);
                              }}
                         }}
     

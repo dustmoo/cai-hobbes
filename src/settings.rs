@@ -37,6 +37,24 @@ impl LlmProvider {
     pub fn all_variants() -> &'static [LlmProvider] {
         &[Self::Gemini, Self::OpenAiCompat, Self::Claude]
     }
+
+    /// Single-letter badge for the chat-bar provider picker.
+    pub fn initial(&self) -> &'static str {
+        match self {
+            Self::Gemini => "G",
+            Self::OpenAiCompat => "O",
+            Self::Claude => "C",
+        }
+    }
+
+    /// Tailwind background class for the provider badge (mirrors profile colors).
+    pub fn color_class(&self) -> &'static str {
+        match self {
+            Self::Gemini => "bg-blue-600",
+            Self::OpenAiCompat => "bg-emerald-600",
+            Self::Claude => "bg-orange-600",
+        }
+    }
 }
 
 /// Application color theme
@@ -58,6 +76,8 @@ pub struct HotkeySettings {
     pub toggle_mcp: String,
     #[serde(default = "default_toggle_profile")]
     pub toggle_profile: String,
+    #[serde(default = "default_toggle_provider")]
+    pub toggle_provider: String,
     #[serde(default = "default_toggle_attachments")]
     pub toggle_attachments: String,
     #[serde(default = "default_toggle_tray")]
@@ -101,6 +121,7 @@ impl Default for HotkeySettings {
             toggle_history: default_toggle_history(),
             toggle_mcp: default_toggle_mcp(),
             toggle_profile: default_toggle_profile(),
+            toggle_provider: default_toggle_provider(),
             toggle_attachments: default_toggle_attachments(),
             toggle_tray: default_toggle_tray(),
             toggle_new_chat: default_toggle_new_chat(),
@@ -133,6 +154,9 @@ fn default_toggle_mcp() -> String {
 }
 fn default_toggle_profile() -> String {
     "CmdOrCtrl+Shift+P".to_string()
+}
+fn default_toggle_provider() -> String {
+    "CmdOrCtrl+Shift+L".to_string()
 }
 fn default_toggle_attachments() -> String {
     "CmdOrCtrl+Shift+A".to_string()
@@ -618,33 +642,70 @@ pub fn get_slot_icon(slot_index: usize) -> String {
 
 impl Settings {
     pub fn active_model_slots(&self) -> Vec<String> {
-        match self.active_llm {
+        self.model_slots_for(self.active_llm)
+    }
+
+    /// Quick-switch model slots for a specific provider.
+    pub fn model_slots_for(&self, provider: LlmProvider) -> Vec<String> {
+        match provider {
             LlmProvider::Gemini => self.gemini_config.model_slots.clone(),
             LlmProvider::OpenAiCompat => self.openai_compat_config.model_slots.clone(),
             LlmProvider::Claude => self.claude_config.model_slots.clone(),
         }
     }
 
-    /// Resolve the effective context window (in tokens) for the active provider.
-    /// Returns `None` only for unconfigured providers with no known context limit.
-    pub fn resolve_context_window(&self) -> Option<usize> {
-        match self.active_llm {
-            LlmProvider::OpenAiCompat => self.openai_compat_config.max_context_tokens,
-            LlmProvider::Claude => self.claude_config.max_tokens.map(|t| t as usize),
+    /// The provider a session should use: its override, else the global default.
+    pub fn provider_for_session(&self, session: &crate::session::Session) -> LlmProvider {
+        session.llm_provider.unwrap_or(self.active_llm)
+    }
+
+    /// The chat model a session should use: its override (when set for the
+    /// effective provider), else that provider's configured model.
+    pub fn chat_model_for_session(&self, session: &crate::session::Session) -> String {
+        let provider = self.provider_for_session(session);
+        session
+            .chat_model
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| self.chat_model_for(provider))
+    }
+
+    /// Whether a provider has the minimum configuration needed to serve requests.
+    pub fn is_provider_configured(&self, provider: LlmProvider) -> bool {
+        match provider {
             LlmProvider::Gemini => {
-                let model = crate::llm::gemini::GeminiModel::from_slug(
-                    &self.gemini_config.chat_model,
-                );
+                self.gemini_config.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok()
+            }
+            LlmProvider::OpenAiCompat => !self.openai_compat_config.endpoint.is_empty(),
+            LlmProvider::Claude => {
+                self.claude_config.api_key.is_some() || std::env::var("ANTHROPIC_API_KEY").is_ok()
+            }
+        }
+    }
+
+    /// Resolve the effective context window for a specific provider + model.
+    /// Returns `None` only for unconfigured providers with no known context limit.
+    pub fn resolve_context_window_for(&self, provider: LlmProvider, model: &str) -> Option<usize> {
+        match provider {
+            LlmProvider::OpenAiCompat => self.openai_compat_config.max_context_tokens,
+            // NOTE: claude_config.max_tokens is the OUTPUT token cap (required by the
+            // Messages API), not the context window — budget by the model's window.
+            LlmProvider::Claude => {
+                let model = crate::llm::claude_models::ClaudeModel::from_slug(model);
+                Some(model.context_window_tokens())
+            }
+            LlmProvider::Gemini => {
+                let model = crate::llm::gemini::GeminiModel::from_slug(model);
                 Some(model.context_window_tokens())
             }
         }
     }
 
-    /// Resolve the effective context tuning for the current active provider.
+    /// Resolve the effective context tuning for a specific provider.
     /// Provider preset overrides → Global settings → Compiled defaults.
-    pub fn effective_context_tuning(&self) -> ResolvedContextTuning {
+    pub fn effective_context_tuning_for(&self, provider: LlmProvider) -> ResolvedContextTuning {
         use crate::llm::config::ContextTuningPreset;
-        let preset: &ContextTuningPreset = match self.active_llm {
+        let preset: &ContextTuningPreset = match provider {
             LlmProvider::Gemini => &self.gemini_config.context_tuning,
             LlmProvider::OpenAiCompat => &self.openai_compat_config.context_tuning,
             LlmProvider::Claude => &self.claude_config.context_tuning,
@@ -676,15 +737,21 @@ impl Settings {
     }
 
     pub fn active_chat_model(&self) -> String {
-        match self.active_llm {
+        self.chat_model_for(self.active_llm)
+    }
+
+    /// The configured chat model for a specific provider.
+    pub fn chat_model_for(&self, provider: LlmProvider) -> String {
+        match provider {
             LlmProvider::Gemini => self.gemini_config.chat_model.clone(),
             LlmProvider::OpenAiCompat => self.openai_compat_config.model.clone(),
             LlmProvider::Claude => self.claude_config.model.clone(),
         }
     }
 
-    pub fn set_active_chat_model(&mut self, model: String) {
-        match self.active_llm {
+    /// Set the configured chat model for a specific provider.
+    pub fn set_chat_model_for(&mut self, provider: LlmProvider, model: String) {
+        match provider {
             LlmProvider::Gemini => self.gemini_config.chat_model = model,
             LlmProvider::OpenAiCompat => self.openai_compat_config.model = model,
             LlmProvider::Claude => self.claude_config.model = model,
@@ -1250,6 +1317,9 @@ pub struct UiState {
     pub show_mcp_icon: bool,
     #[serde(default = "default_true")]
     pub show_profile_selector: bool,
+    /// Whether to show the LLM provider picker in the chat bar
+    #[serde(default = "default_true")]
+    pub show_provider_selector: bool,
     #[serde(default = "default_true")]
     pub show_attachments_icon: bool,
     #[serde(default = "default_true")]
@@ -1296,6 +1366,7 @@ impl Default for UiState {
             show_history_icon: true,
             show_mcp_icon: true,
             show_profile_selector: true,
+            show_provider_selector: true,
             show_attachments_icon: true,
             show_model_selector: true,
             show_model_slots: true,
