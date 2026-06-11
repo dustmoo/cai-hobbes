@@ -160,7 +160,7 @@ jobs:
         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
     - name: Sign Main Binary
-      uses: azure/trusted-sign-action@v0.5.0
+      uses: azure/artifact-signing-action@v1.2.0
       with:
         endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
         signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT_NAME }}
