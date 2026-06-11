@@ -91,8 +91,9 @@ jobs:
       uses: cargo-bins/cargo-binstall@main
 
     - name: Install Dioxus CLI
-      run: cargo binstall dioxus-cli --version 0.6.3 --no-confirm
-
+      run: |
+        cargo binstall dioxus-cli --version 0.6.3 --no-confirm
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -116,7 +117,7 @@ jobs:
     permissions:
       contents: write
       id-token: write # Required for Azure OIDC authentication
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feat/')
+    if: github.ref == 'refs/heads/main'
 
     steps:
     - uses: actions/checkout@v4
