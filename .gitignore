@@ -78,3 +78,11 @@ archive/
 
 # Playwright MCP logs
 .playwright-mcp/
+
+# Signing credentials
+credentials/
+
+# Scratch/test artifacts
+*.pdf
+out.txt
+test_actual.py

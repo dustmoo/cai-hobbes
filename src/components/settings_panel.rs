@@ -113,7 +113,36 @@ pub fn SettingsPanel() -> Element {
                                             ctx_len, current_model
                                         );
                                         settings.write().openai_compat_config.max_context_tokens = Some(ctx_len);
+                                        // Persist immediately so this value survives the next restart
+                                        // without requiring a manual Settings → Save cycle.
+                                        let sm = settings_manager.peek().clone();
+                                        let s  = settings.peek().clone();
+                                        let _ = sm.save(&s);
                                     }
+                                }
+                            }
+
+                            // Auto-calibrate chars_per_token by probing the tokenizer.
+                            // Only runs if not manually overridden by the user.
+                            // This gives the budget enforcement the real tokenizer ratio
+                            // instead of a heuristic guess.
+                            if settings.peek().openai_compat_config.context_tuning.chars_per_token.is_none() {
+                                if let Some(ratio) = crate::services::openai_compat_validation::calibrate_tokenizer(
+                                    &endpoint,
+                                    &current_model,
+                                    api_key.as_deref(),
+                                ).await {
+                                    // Round to 1 decimal place for cleanliness
+                                    let rounded = (ratio * 10.0).round() / 10.0;
+                                    tracing::info!(
+                                        "Auto-calibrated chars/token: {:.1} for model '{}'",
+                                        rounded, current_model
+                                    );
+                                    settings.write().openai_compat_config.context_tuning.chars_per_token = Some(rounded);
+                                    // Persist so the calibrated ratio survives the next restart.
+                                    let sm = settings_manager.peek().clone();
+                                    let s  = settings.peek().clone();
+                                    let _ = sm.save(&s);
                                 }
                             }
                         }
@@ -553,7 +582,7 @@ pub fn SettingsPanel() -> Element {
                                     },
                                     option { value: "Gemini", selected: local_settings.read().active_llm == crate::settings::LlmProvider::Gemini, "Gemini" }
                                     option { value: "OpenAiCompat", selected: local_settings.read().active_llm == crate::settings::LlmProvider::OpenAiCompat, "OpenAI Compatible" }
-                                    // Claude hidden from UI — stub connector not ready for this version
+                                    option { value: "Claude", selected: local_settings.read().active_llm == crate::settings::LlmProvider::Claude, "Claude" }
                                 }
                             }
                             if local_settings.read().active_llm == crate::settings::LlmProvider::Gemini {
@@ -889,6 +918,50 @@ pub fn SettingsPanel() -> Element {
                                         }
                                     }
 
+                                    // Context Caching Section
+                                    div {
+                                        class: "mb-4 pt-4 border-t border-subtle",
+                                        div {
+                                            class: "flex items-center justify-between mb-2",
+                                            label { class: "block text-sm font-medium text-fg-muted", "Context Caching" }
+                                            label {
+                                                class: "relative inline-flex items-center cursor-pointer",
+                                                input {
+                                                    r#type: "checkbox",
+                                                    class: "sr-only peer",
+                                                    checked: local_settings.read().gemini_config.context_caching_enabled,
+                                                    onchange: move |event: FormEvent| {
+                                                        local_settings.write().gemini_config.context_caching_enabled = event.checked();
+                                                    }
+                                                }
+                                                div { class: "w-11 h-6 bg-input peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
+                                            }
+                                        }
+                                        p {
+                                            class: "text-xs text-fg-muted mb-3",
+                                            "Enable explicit context caching via the cachedContents API for ~75% discount on input tokens. Recommended for long conversation histories or many active tools."
+                                        }
+
+                                        if local_settings.read().gemini_config.context_caching_enabled {
+                                            div {
+                                                class: "mb-3",
+                                                label { class: "block text-sm font-medium text-fg-muted mb-1", "Cache TTL (seconds)" }
+                                                input {
+                                                    r#type: "number",
+                                                    class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                    min: "60",
+                                                    value: "{local_settings.read().gemini_config.cache_ttl_seconds}",
+                                                    onchange: move |event: FormEvent| {
+                                                        if let Ok(val) = event.value().trim().parse::<u32>() {
+                                                            local_settings.write().gemini_config.cache_ttl_seconds = val.max(60);
+                                                        }
+                                                    }
+                                                }
+                                                p { class: "text-xs text-fg-muted mt-1", "Duration the cache is stored server-side. Shorter TTL minimizes storage fees; longer TTL improves hit rate for infrequent turns (minimum 60s)." }
+                                            }
+                                        }
+                                    }
+
                                     // Model Quick-Switch Slots Section
                                     div {
                                         class: "mb-4 pt-4 border-t border-subtle",
@@ -1164,6 +1237,160 @@ pub fn SettingsPanel() -> Element {
                                         }
                                     }
 
+                                    // Thinking Mode toggle
+                                    div {
+                                        class: "mb-4 pt-2",
+                                        div {
+                                            class: "flex items-center justify-between",
+                                            label { class: "block text-sm font-medium text-fg-muted", "Thinking Mode" }
+                                            label {
+                                                class: "relative inline-flex items-center cursor-pointer",
+                                                input {
+                                                    r#type: "checkbox",
+                                                    class: "sr-only peer",
+                                                    checked: local_settings.read().openai_compat_config.thinking_enabled,
+                                                    onchange: move |event| {
+                                                        local_settings.write().openai_compat_config.thinking_enabled = event.checked();
+                                                    }
+                                                }
+                                                div { class: "w-11 h-6 bg-input peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
+                                            }
+                                        }
+                                        p {
+                                            class: "text-xs text-fg-muted mt-1",
+                                            "Enable reasoning/thinking for models that support it (Gemma 4, Qwen3). Requires vLLM with --enable-reasoning --reasoning-parser."
+                                        }
+                                    }
+
+                                    // Watch Words (Auto-Recovery) Section
+                                    div {
+                                        class: "mb-4 pt-2",
+                                        div {
+                                            class: "flex items-center justify-between",
+                                            label { class: "block text-sm font-medium text-fg-muted", "Watch Words (Auto-Recovery)" }
+                                            label {
+                                                class: "relative inline-flex items-center cursor-pointer",
+                                                input {
+                                                    r#type: "checkbox",
+                                                    class: "sr-only peer",
+                                                    checked: local_settings.read().openai_compat_config.watch_words_enabled,
+                                                    onchange: move |event| {
+                                                        local_settings.write().openai_compat_config.watch_words_enabled = event.checked();
+                                                    }
+                                                }
+                                                div { class: "w-11 h-6 bg-input peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500" }
+                                            }
+                                        }
+                                        p {
+                                            class: "text-xs text-fg-muted mt-1",
+                                            "Detect stalled output patterns and automatically continue the AI's turn. Useful for models like Qwen that halt mid-response."
+                                        }
+
+                                        if local_settings.read().openai_compat_config.watch_words_enabled {
+                                            div {
+                                                class: "mt-3 space-y-3 pl-2 border-l-2 border-primary-700/50",
+                                                {
+                                                    let watch_words_len = local_settings.read().openai_compat_config.watch_words.len();
+                                                    rsx! {
+                                                        for i in 0..watch_words_len {
+                                                            div {
+                                                                key: "watch-word-{i}",
+                                                                class: "p-3 bg-section rounded-lg border border-subtle space-y-2",
+                                                                div {
+                                                                    class: "flex items-center justify-between",
+                                                                    label { class: "text-xs text-fg-muted font-medium", "Pattern {i + 1}" }
+                                                                    button {
+                                                                        class: "text-xs text-red-400 hover:text-red-300 transition-colors",
+                                                                        onclick: move |_| {
+                                                                            local_settings.write().openai_compat_config.watch_words.remove(i);
+                                                                        },
+                                                                        "✕ Remove"
+                                                                    }
+                                                                }
+                                                                input {
+                                                                    class: "block w-full px-3 py-1.5 bg-input border border-primary-600 rounded text-sm",
+                                                                    r#type: "text",
+                                                                    placeholder: "e.g., Let me ",
+                                                                    value: "{local_settings.read().openai_compat_config.watch_words.get(i).map(|w| w.pattern.as_str()).unwrap_or(\"\")}",
+                                                                    oninput: move |event| {
+                                                                        if let Some(ww) = local_settings.write().openai_compat_config.watch_words.get_mut(i) {
+                                                                            ww.pattern = event.value();
+                                                                        }
+                                                                    }
+                                                                }
+                                                                label { class: "text-xs text-fg-muted", "Recovery instruction (optional)" }
+                                                                textarea {
+                                                                    class: "block w-full px-3 py-1.5 bg-input border border-primary-600 rounded text-sm resize-y min-h-[2.5rem]",
+                                                                    rows: "2",
+                                                                    placeholder: "Leave empty for default: \"Your previous response appears to have been cut off...\"",
+                                                                    value: "{local_settings.read().openai_compat_config.watch_words.get(i).map(|w| w.instruction.as_str()).unwrap_or(\"\")}",
+                                                                    oninput: move |event| {
+                                                                        if let Some(ww) = local_settings.write().openai_compat_config.watch_words.get_mut(i) {
+                                                                            ww.instruction = event.value();
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                button {
+                                                    class: "w-full py-1.5 text-xs text-primary-400 hover:text-primary-300 border border-dashed border-primary-700/50 rounded-lg hover:border-primary-500/50 transition-all",
+                                                    onclick: move |_| {
+                                                        local_settings.write().openai_compat_config.watch_words.push(
+                                                            crate::llm::config::WatchWord {
+                                                                pattern: String::new(),
+                                                                instruction: String::new(),
+                                                            }
+                                                        );
+                                                    },
+                                                    "+ Add Watch Word"
+                                                }
+                                                div {
+                                                    class: "flex items-center gap-2 min-w-0 pt-1",
+                                                    label {
+                                                        class: "text-xs text-fg-muted w-40 shrink-0",
+                                                        title: "Maximum number of automatic recovery attempts per user turn. Prevents infinite loops if the model keeps stalling.",
+                                                        "Max recoveries ⓘ"
+                                                    }
+                                                    input {
+                                                        r#type: "number",
+                                                        class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                        min: "1",
+                                                        max: "20",
+                                                        value: "{local_settings.read().openai_compat_config.max_watch_word_recoveries}",
+                                                        onchange: move |event: FormEvent| {
+                                                            if let Ok(n) = event.value().trim().parse::<u32>() {
+                                                                local_settings.write().openai_compat_config.max_watch_word_recoveries = n.clamp(1, 20);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                div {
+                                                    class: "flex items-center gap-2 min-w-0 pt-1",
+                                                    label {
+                                                        class: "text-xs text-fg-muted w-40 shrink-0",
+                                                        title: "Watch words are only checked when the AI's response is shorter than this many characters. Long responses are likely complete even if they contain a watch word.",
+                                                        "Max response length ⓘ"
+                                                    }
+                                                    input {
+                                                        r#type: "number",
+                                                        class: "flex-1 min-w-0 bg-input border border-primary-600 rounded px-2 py-1 text-sm",
+                                                        min: "100",
+                                                        max: "5000",
+                                                        step: "100",
+                                                        value: "{local_settings.read().openai_compat_config.watch_word_max_response_chars}",
+                                                        onchange: move |event: FormEvent| {
+                                                            if let Ok(n) = event.value().trim().parse::<usize>() {
+                                                                local_settings.write().openai_compat_config.watch_word_max_response_chars = n.clamp(100, 5000);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // Context window is auto-detected from /v1/models (max_model_len)
                                     // No UI element needed — budget enforcement happens transparently
 
@@ -1419,6 +1646,27 @@ pub fn SettingsPanel() -> Element {
                                                     }
                                                 }
                                             }
+                                            // Compact Tool Results toggle
+                                            div {
+                                                class: "flex items-center gap-2 min-w-0",
+                                                label {
+                                                    class: "text-xs text-fg-muted w-32 shrink-0",
+                                                    title: "Convert tool results from JSON to TOON (Token-Oriented Object Notation) for compact display. Reduces token usage by 30–50% for structured tool output.",
+                                                    "Compact Results ⓘ"
+                                                }
+                                                label {
+                                                    class: "relative inline-flex items-center cursor-pointer",
+                                                    input {
+                                                        r#type: "checkbox",
+                                                        class: "sr-only peer",
+                                                        checked: local_settings.read().openai_compat_config.context_tuning.compact_tool_results.unwrap_or(true),
+                                                        onchange: move |event| {
+                                                            local_settings.write().openai_compat_config.context_tuning.compact_tool_results = Some(event.checked());
+                                                        }
+                                                    }
+                                                    div { class: "w-9 h-5 bg-input peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary-500" }
+                                                }
+                                            }
                                         }
                                     }
 
@@ -1641,7 +1889,269 @@ pub fn SettingsPanel() -> Element {
                                     }
                                 }
                             }
-                            // Claude config section hidden — stub connector not ready for this version
+                            if local_settings.read().active_llm == crate::settings::LlmProvider::Claude {
+                                div {
+                                    class: "pl-4 border-l-2 border-subtle",
+                                    // API Key
+                                    div {
+                                        class: "mb-4",
+                                        label { class: "block text-sm font-medium text-fg-muted", "API Key" }
+                                        input {
+                                            class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                            r#type: "password",
+                                            placeholder: "Enter your Anthropic (Claude) API key",
+                                            value: "{local_settings.read().claude_config.api_key.as_deref().unwrap_or(\"\")}",
+                                            oninput: move |event| local_settings.write().claude_config.api_key = Some(event.value())
+                                        }
+                                        p {
+                                            class: "text-xs text-fg-muted mt-1",
+                                            "Stored securely in your keychain. Also reads ANTHROPIC_API_KEY if unset."
+                                        }
+                                    }
+                                    // Active Chat Model
+                                    div {
+                                        class: "mb-4",
+                                        label { class: "block text-sm font-medium text-fg-muted mb-1", "Active Chat Model" }
+                                        select {
+                                            class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                            value: "{local_settings.read().claude_config.model}",
+                                            onchange: move |event| {
+                                                local_settings.write().claude_config.model = event.value();
+                                            },
+                                            {
+                                                let current = local_settings.read().claude_config.model.clone();
+                                                let models = crate::llm::claude_models::ClaudeModel::all_models();
+                                                let in_list = models.iter().any(|m| m.canonical_slug() == current);
+                                                rsx! {
+                                                    if !current.is_empty() && !in_list {
+                                                        option { value: "{current}", selected: true,
+                                                            "{crate::llm::claude_models::ClaudeModel::from_slug(&current).display_name()}" }
+                                                    }
+                                                    for m in models.iter() {
+                                                        option {
+                                                            value: "{m.canonical_slug()}",
+                                                            selected: m.canonical_slug() == current,
+                                                            "{m.display_name()}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Summary Model
+                                    div {
+                                        class: "mb-4",
+                                        label { class: "block text-sm font-medium text-fg-muted mb-1", "Summary Model" }
+                                        select {
+                                            class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                            value: "{local_settings.read().claude_config.summary_model.as_deref().unwrap_or(\"\")}",
+                                            onchange: move |event| {
+                                                let v = event.value();
+                                                local_settings.write().claude_config.summary_model =
+                                                    if v.is_empty() { None } else { Some(v) };
+                                            },
+                                            option { value: "", "Same as chat model" }
+                                            {
+                                                let current = local_settings.read().claude_config.summary_model.clone().unwrap_or_default();
+                                                rsx! {
+                                                    for m in crate::llm::claude_models::ClaudeModel::all_models().iter() {
+                                                        option {
+                                                            value: "{m.canonical_slug()}",
+                                                            selected: m.canonical_slug() == current,
+                                                            "{m.display_name()}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Max Output Tokens
+                                    div {
+                                        class: "mb-4",
+                                        label { class: "block text-sm font-medium text-fg-muted mb-1", "Max Output Tokens" }
+                                        input {
+                                            class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                            r#type: "number",
+                                            min: "1",
+                                            placeholder: "32000",
+                                            value: "{local_settings.read().claude_config.max_tokens.map(|v| v.to_string()).unwrap_or_default()}",
+                                            oninput: move |event| {
+                                                let v = event.value();
+                                                local_settings.write().claude_config.max_tokens =
+                                                    v.trim().parse::<u32>().ok();
+                                            }
+                                        }
+                                        p {
+                                            class: "text-xs text-fg-muted mt-1",
+                                            "Claude requires an explicit output cap. Clamped to the model's ceiling."
+                                        }
+                                    }
+                                    // Extended Thinking toggle (only for models that support it)
+                                    {
+                                        let supports = crate::llm::claude_models::ClaudeModel::from_slug(
+                                            &local_settings.read().claude_config.model,
+                                        ).supports_thinking();
+                                        let enabled = local_settings.read().claude_config.extended_thinking;
+                                        rsx! {
+                                            if supports {
+                                                div {
+                                                    class: "mb-4 flex items-center justify-between",
+                                                    div {
+                                                        label { class: "block text-sm font-medium text-fg-muted", "Extended Thinking" }
+                                                        p { class: "text-xs text-fg-muted", "Adaptive reasoning before responding." }
+                                                    }
+                                                    button {
+                                                        class: if enabled {
+                                                            "px-3 py-1 rounded-md text-sm font-medium bg-btn-primary text-fg"
+                                                        } else {
+                                                            "px-3 py-1 rounded-md text-sm font-medium bg-input text-fg-muted hover:text-fg"
+                                                        },
+                                                        onclick: move |_| {
+                                                            let cur = local_settings.read().claude_config.extended_thinking;
+                                                            local_settings.write().claude_config.extended_thinking = !cur;
+                                                        },
+                                                        if enabled { "On" } else { "Off" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Model Quick-Switch Slots
+                                    div {
+                                        class: "mb-4 pt-4 border-t border-subtle",
+                                        div {
+                                            class: "flex justify-between items-center cursor-pointer mb-2 group",
+                                            onclick: move |_| {
+                                                let mut state = ui_state.write();
+                                                state.show_model_slots = !state.show_model_slots;
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            },
+                                            label { class: "block text-sm font-medium text-fg-muted group-hover:text-fg transition-colors", "Model Quick-Switch Slots" }
+                                            span { class: "text-xs text-fg-muted", if ui_state.read().show_model_slots { "▼" } else { "▶" } }
+                                        }
+                                        if ui_state.read().show_model_slots {
+                                            p {
+                                                class: "text-xs text-fg-muted mb-3",
+                                                "Assign models to slots ^1–^9 for fast switching in the chat bar."
+                                            }
+                                            div {
+                                                class: "space-y-3 pl-2 mb-4",
+                                                for i in 0..10 {
+                                                    div {
+                                                        key: "claude-slot-{i}",
+                                                        class: "flex items-center gap-3",
+                                                        {
+                                                            let slot_model = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                            let effective_icon = if !slot_model.is_empty() {
+                                                                local_settings.read().model_icons.get(&slot_model).cloned()
+                                                                    .unwrap_or_else(|| get_slot_icon(i))
+                                                            } else {
+                                                                get_slot_icon(i)
+                                                            };
+                                                            let has_model = !slot_model.is_empty();
+                                                            rsx! {
+                                                                div {
+                                                                    class: if has_model {
+                                                                        "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm shrink-0 cursor-pointer hover:border-primary-500 transition-all"
+                                                                    } else {
+                                                                        "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm shrink-0"
+                                                                    },
+                                                                    title: if has_model { "Click to change icon" } else { "" },
+                                                                    onclick: move |_| {
+                                                                        if has_model {
+                                                                            let current = picker_open_for_slot();
+                                                                            if current == Some(i) {
+                                                                                picker_open_for_slot.set(None);
+                                                                            } else {
+                                                                                picker_open_for_slot.set(Some(i));
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    "{effective_icon}"
+                                                                }
+                                                            }
+                                                        }
+                                                        div {
+                                                            class: "flex-1",
+                                                            select {
+                                                                class: "block w-full px-2 py-1 bg-input border border-subtle rounded text-xs",
+                                                                onchange: move |evt| {
+                                                                    local_settings.write().update_active_model_slot(i, evt.value());
+                                                                },
+                                                                {
+                                                                    let current = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                    let models = crate::llm::claude_models::ClaudeModel::all_models();
+                                                                    let in_list = models.iter().any(|m| m.canonical_slug() == current);
+                                                                    rsx! {
+                                                                        option { value: "", selected: current.is_empty(), "None" }
+                                                                        if !current.is_empty() && !in_list {
+                                                                            option { value: "{current}", selected: true,
+                                                                                "{crate::llm::claude_models::ClaudeModel::from_slug(&current).display_name()}" }
+                                                                        }
+                                                                        for m in models.iter() {
+                                                                            option {
+                                                                                value: "{m.canonical_slug()}",
+                                                                                selected: m.canonical_slug() == current,
+                                                                                "{m.display_name()}"
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            if picker_open_for_slot() == Some(i) {
+                                                                {
+                                                                    let slot_model_for_picker = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                    if !slot_model_for_picker.is_empty() {
+                                                                        let current_custom = local_settings.read().model_icons.get(&slot_model_for_picker).cloned().unwrap_or_default();
+                                                                        rsx! {
+                                                                            div {
+                                                                                class: "flex gap-1 flex-wrap mt-1 p-1.5 bg-card border border-subtle rounded-lg shadow-lg",
+                                                                                for emoji in ["\u{26a1}", "\u{1f9e0}", "\u{1f34c}", "\u{1f916}", "\u{1f48e}", "\u{1f525}", "\u{2728}", "\u{1f680}", "\u{1f319}", "\u{2b50}"] {
+                                                                                    button {
+                                                                                        class: format!("w-7 h-7 rounded-full bg-section border flex items-center justify-center text-sm transition-all {}",
+                                                                                            if current_custom == emoji { "border-primary-500 ring-1 ring-primary-500/30 scale-110" } else { "border-subtle hover:border-primary-500 hover:scale-110" }
+                                                                                        ),
+                                                                                        onclick: {
+                                                                                            let model = slot_model_for_picker.clone();
+                                                                                            let icon = emoji.to_string();
+                                                                                            move |_| {
+                                                                                                local_settings.write().model_icons.insert(model.clone(), icon.clone());
+                                                                                                picker_open_for_slot.set(None);
+                                                                                            }
+                                                                                        },
+                                                                                        "{emoji}"
+                                                                                    }
+                                                                                }
+                                                                                button {
+                                                                                    class: "w-7 h-7 rounded-full bg-section border border-subtle flex items-center justify-center text-[10px] text-fg-muted hover:border-red-500 hover:text-red-400 transition-all",
+                                                                                    title: "Reset to default",
+                                                                                    onclick: {
+                                                                                        let model = slot_model_for_picker.clone();
+                                                                                        move |_| {
+                                                                                            local_settings.write().model_icons.remove(&model);
+                                                                                            picker_open_for_slot.set(None);
+                                                                                        }
+                                                                                    },
+                                                                                    "✕"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    } else {
+                                                                        rsx! {}
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        span { class: "text-[10px] text-fg-muted font-mono w-6 text-right", "^{i+1}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2157,7 +2667,7 @@ pub fn SettingsPanel() -> Element {
                                     div {
                                         class: "flex flex-col gap-1",
                                         label { class: "text-sm font-medium text-fg-muted", "Chat History Length" }
-                                        p { class: "text-xs text-fg-muted", "Number of past messages included in context window" }
+                                        p { class: "text-xs text-fg-muted", "Max past messages included in context (dynamically capped to fit the model's window)" }
                                         input {
                                             r#type: "number",
                                             class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
@@ -2399,6 +2909,24 @@ pub fn SettingsPanel() -> Element {
                                         }
                                     }
 
+                                    // Provider Selector
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-fg-muted", "Show Provider Selector" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                            checked: "{ui_state.read().show_provider_selector}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.show_provider_selector = e.value() == "true";
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+
                                     // Attachments Icon
                                     div {
                                         class: "flex items-center justify-between",
@@ -2469,13 +2997,13 @@ pub fn SettingsPanel() -> Element {
                                     }
                                     div {
                                         class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Confirm before deleting messages" }
+                                        label { class: "text-sm text-fg-muted", "Confirm before editing messages" }
                                         input {
                                             r#type: "checkbox",
                                             class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().confirm_on_message_delete}",
+                                            checked: "{local_settings.read().confirm_on_message_edit}",
                                             onchange: move |e| {
-                                                local_settings.write().confirm_on_message_delete = e.value() == "true";
+                                                local_settings.write().confirm_on_message_edit = e.value() == "true";
                                             }
                                         }
                                     }
@@ -2679,6 +3207,23 @@ pub fn SettingsPanel() -> Element {
                                             checked: "{local_settings.read().enable_summarization}",
                                             onchange: move |e| {
                                                 local_settings.write().enable_summarization = e.value() == "true";
+                                            }
+                                        }
+                                    }
+
+                                    // Compact Tool Results
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        div {
+                                            label { class: "text-sm font-medium text-fg-muted", "Compact Tool Results (TOON)" }
+                                            p { class: "text-xs text-fg-muted", "Convert tool results to a compact tabular format before sending to the AI. Reduces token usage by ~30–50%. Can be overridden per-provider in Context Tuning." }
+                                        }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                            checked: "{local_settings.read().compact_tool_results}",
+                                            onchange: move |e| {
+                                                local_settings.write().compact_tool_results = e.value() == "true";
                                             }
                                         }
                                     }
@@ -3232,6 +3777,15 @@ pub fn SettingsPanel() -> Element {
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_profile.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_profile = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Open Provider Selector" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_provider.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_provider = v,
                                         }
                                     }
 

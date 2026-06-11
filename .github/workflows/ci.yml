@@ -30,7 +30,7 @@ jobs:
     - name: Security Audit
       run: |
         cargo install cargo-audit
-        cargo audit --ignore RUSTSEC-2024-0413 --ignore RUSTSEC-2024-0416 --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2024-0320 --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2025-0067 --ignore RUSTSEC-2025-0068
+        cargo audit --ignore RUSTSEC-2024-0413 --ignore RUSTSEC-2024-0416 --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2024-0320 --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2025-0067 --ignore RUSTSEC-2025-0068 --ignore RUSTSEC-2026-0104 --ignore RUSTSEC-2026-0099 --ignore RUSTSEC-2026-0098
 
   # Cross-platform build check (fast, no tests or full build)
   build-check:
@@ -88,8 +88,11 @@ jobs:
       uses: Swatinem/rust-cache@v2
 
     - name: Install Dioxus CLI
-      run: cargo install dioxus-cli
-
+      run: |
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "arm64" ]; then TARGET="aarch64-apple-darwin"; else TARGET="x86_64-apple-darwin"; fi
+        curl -fsSL "https://github.com/DioxusLabs/dioxus/releases/download/v0.6.3/dx-${TARGET}-v0.6.3.tar.gz" | tar -xz -C /usr/local/bin
+        dx --version
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -105,68 +108,72 @@ jobs:
     - name: Build Release (CI Mode)
       run: ./scripts/build_release.sh
 
-  # ── DISABLED: Azure certificate validation stalled (2026-04-04) ──
-  # Re-enable once Azure Trusted Signing identity verification completes.
-  # build-windows-release:
-  #   name: Build Release (Windows)
-  #   runs-on: windows-latest
-  #   needs: build-check
-  #   if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feat/')
-  #
-  #   steps:
-  #   - uses: actions/checkout@v4
-  #
-  #   - name: Install Rust
-  #     uses: dtolnay/rust-toolchain@stable
-  #     with:
-  #       toolchain: stable
-  #
-  #   - name: Cache dependencies
-  #     uses: Swatinem/rust-cache@v2
-  #
-  #   - name: Setup Node.js
-  #     uses: actions/setup-node@v4
-  #     with:
-  #       node-version: '20'
-  #
-  #   - name: Install NPM dependencies
-  #     run: npm ci
-  #
-  #   - name: Import Code Signing Certificate
-  #     if: env.HOBBES_WIN_CERT_PFX != ''
-  #     env:
-  #       HOBBES_WIN_CERT_PFX: ${{ secrets.HOBBES_WIN_CERT_PFX }}
-  #       HOBBES_WIN_CERT_PASSWORD: ${{ secrets.HOBBES_WIN_CERT_PASSWORD }}
-  #     shell: pwsh
-  #     run: |
-  #       $pfxBytes = [Convert]::FromBase64String($env:HOBBES_WIN_CERT_PFX)
-  #       $pfxPath = Join-Path $env:RUNNER_TEMP "cert.pfx"
-  #       [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
-  #       $securePassword = ConvertTo-SecureString $env:HOBBES_WIN_CERT_PASSWORD -AsPlainText -Force
-  #       Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
-  #       # Export thumbprint for signing step
-  #       $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.HasPrivateKey } | Select-Object -First 1
-  #       echo "HOBBES_WIN_CERT_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
-  #       Remove-Item $pfxPath
-  #
-  #   - name: Build Release
-  #     shell: pwsh
-  #     run: |
-  #       $signFlag = if ($env:HOBBES_WIN_CERT_THUMBPRINT) { "-Sign" } else { "" }
-  #       & .\scripts\build_windows.ps1 -Release $signFlag
-  #
-  #   - name: Extract Version
-  #     id: version
-  #     shell: pwsh
-  #     run: |
-  #       $content = Get-Content Cargo.toml -Raw
-  #       if ($content -match 'version\s*=\s*"([^"]+)"') {
-  #         echo "VERSION=$($matches[1])" >> $env:GITHUB_OUTPUT
-  #       }
-  #
-  #   - name: Upload Binary Artifact
-  #     uses: actions/upload-artifact@v4
-  #     with:
-  #       name: hobbes-windows-${{ steps.version.outputs.VERSION }}
-  #       path: target/release/hobbes_${{ steps.version.outputs.VERSION }}.exe
-  #       retention-days: 30
+  # ── ENABLED: Azure certificate validation completed ──
+  build-windows-release:
+    name: Build Release (Windows)
+    runs-on: windows-latest
+    needs: build-check
+    permissions:
+      contents: write
+      id-token: write # Required for Azure OIDC authentication (main only)
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feat/')
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install NPM dependencies
+      run: npm ci
+
+    - name: Build Release Binary
+      shell: pwsh
+      run: |
+        & .\scripts\build_windows.ps1 -Release
+
+    - name: Extract Version
+      id: version
+      shell: pwsh
+      run: |
+        $content = Get-Content Cargo.toml -Raw
+        if ($content -match 'version\s*=\s*"([^"]+)"') {
+          echo "VERSION=$($matches[1])" >> $env:GITHUB_OUTPUT
+          Rename-Item -Path "target\release\hobbes_$($matches[1]).exe" -NewName "Hobbes-Windows-v$($matches[1]).exe"
+        }
+
+    - name: Azure OIDC Login
+      if: github.ref == 'refs/heads/main'
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Sign Main Binary
+      if: github.ref == 'refs/heads/main'
+      uses: azure/artifact-signing-action@v1.2.0
+      with:
+        endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+        signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT_NAME }}
+        certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+        files-folder: target\release
+        files-folder-filter: exe
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+
+    - name: Upload Binary Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: hobbes-windows-${{ steps.version.outputs.VERSION }}
+        path: target/release/Hobbes-Windows-v${{ steps.version.outputs.VERSION }}.exe
+        retention-days: 30

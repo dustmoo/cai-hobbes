@@ -90,7 +90,7 @@ pub fn ChatWindow(
     let mut settings = use_context::<Signal<Settings>>();
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
-    let mut permission_manager = use_context::<Signal<PermissionManager>>();
+    let permission_manager = use_context::<Signal<PermissionManager>>();
     let mut chat_command = use_context::<Signal<Option<super::chat_input::ChatCommand>>>();
 
     // Shared expansion state for <details> blocks in MarkdownRenderer.
@@ -107,9 +107,7 @@ pub fn ChatWindow(
     use_context_provider(|| DraftContext(draft));
 
     let mut container_element = use_signal(|| None as Option<Rc<MountedData>>);
-    let stream_manager = consume_context::<StreamManagerContext>();
-    let active_message_id = use_signal(|| None::<Uuid>);
-    let active_session_for_stream = use_signal(|| None::<String>);
+    let mut stream_manager = consume_context::<StreamManagerContext>();
     let mut continuation_controller = consume_context::<Signal<ContinuationController>>();
     let mut is_initial_load = use_signal(|| true);
     let mut last_session_id = use_signal(|| session_state.read().active_session_id.clone());
@@ -221,10 +219,8 @@ pub fn ChatWindow(
         last_session_id.with_mut(|last_id| {
             if current_session_id != *last_id {
                 is_session_switch = true;
-                // Reset continuation guard on tab switch (Pattern 138.1 cleanup)
-                continuation_controller.write().force_reset();
-                // Reset turn count so the new tab starts fresh
-                permission_manager.write().reset_turn_count();
+                // No force_reset() needed — continuation guards are now
+                // session-keyed and don't interfere across tabs.
                 *last_id = current_session_id;
             }
         });
@@ -299,10 +295,9 @@ pub fn ChatWindow(
                 let mcp_manager = mcp_manager;
                 let active_session_id = current_target_id.read().clone();
                 let mut tools_to_run = Vec::new();
-                let mut stream_manager_is_sending = stream_manager.is_sending;
 
                 // Indicate activity immediately
-                stream_manager_is_sending.set(true);
+                stream_manager.streaming_sessions.write().insert(active_session_id.clone());
                 // Clear the signal so we don't re-trigger loop
                 has_pending_approvals.set(false);
 
@@ -333,11 +328,10 @@ pub fn ChatWindow(
 
                 if tools_to_run.is_empty() {
                     // This could be a Skill continuation (no tools to run).
-                    // Reset is_sending since we won't be executing any tools —
-                    // the continuation_controller handles the LLM trigger.
-                    stream_manager_is_sending.set(false);
-                    // Force-clear in case a previous continuation left the guard stale
-                    continuation_controller.write().force_reset();
+                    // Reset streaming state since we won't be executing any tools
+                    stream_manager.streaming_sessions.write().remove(&active_session_id);
+                    // Clear this session's in-flight guard before re-triggering
+                    continuation_controller.write().clear_in_flight(&active_session_id);
                     continuation_controller.write().trigger_continuation(active_session_id.clone());
                     return;
                 }
@@ -347,9 +341,16 @@ pub fn ChatWindow(
                     let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                         .unwrap_or(serde_json::Value::Null);
 
-                    // Intercept HOBBES_PAGE_RESULT before MCP dispatch
+                    // Intercept HOBBES_PAGE_RESULT and HOBBES_UPDATE_SCRATCHPAD before MCP
+                    // dispatch — these tools require SessionState which McpManager doesn't own.
                     let (status, response_str) = if tool_call.tool_name == "HOBBES_PAGE_RESULT" {
-                        session_state.write().handle_page_result(&args_json, "")
+                        let page_budget = crate::session::compute_page_budget(
+                            &settings.read(),
+                            session_state.read().sessions.get(&active_session_id),
+                        );
+                        session_state.write().handle_page_result(&args_json, "", page_budget)
+                    } else if tool_call.tool_name == "HOBBES_UPDATE_SCRATCHPAD" {
+                        session_state.write().handle_scratchpad_update(&args_json, &active_session_id, &settings.read())
                     } else {
                         // Normal MCP tool dispatch
                         let manager = mcp_manager.read().clone();
@@ -371,6 +372,7 @@ pub fn ChatWindow(
                         };
                         (s, r)
                     };
+
 
                     // Update session state with result
                     {
@@ -419,25 +421,17 @@ pub fn ChatWindow(
               hobbes_message_id: Uuid,
               session_id: String| {
             spawn(async move {
-                let mut active_message_id = active_message_id;
-                let mut active_session_for_stream = active_session_for_stream;
-
-                active_message_id.set(Some(hobbes_message_id));
-                active_session_for_stream.set(Some(session_id.clone()));
-                tracing::debug!("Lock ACQUIRED.");
+                tracing::debug!(session_id = %session_id, "Stream lock ACQUIRED.");
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<()>();
 
                 let on_complete = {
-                    let mut active_message_id = active_message_id;
-                    let mut active_session_for_stream = active_session_for_stream;
                     let mut continuation_controller = continuation_controller;
+                    let session_id_for_cleanup = session_id.clone();
                     move || {
-                        active_message_id.set(None);
-                        active_session_for_stream.set(None);
-                        // Reset the continuation in-flight guard so the next
-                        // trigger_continuation() from stream_manager can proceed.
-                        continuation_controller.write().clear_in_flight();
+                        // Clear the session-scoped continuation guard so the next
+                        // trigger_continuation() for THIS session can proceed.
+                        continuation_controller.write().clear_in_flight(&session_id_for_cleanup);
                         let _ = tx.send(());
                     }
                 };
@@ -460,7 +454,7 @@ pub fn ChatWindow(
                 rx.recv().await;
                 tracing::debug!(message_id = %hobbes_message_id, "Stream completion signal RECEIVED.");
 
-                tracing::debug!("Lock RELEASED.");
+                tracing::debug!(session_id = %session_id, "Stream lock RELEASED.");
             });
         }
     };
@@ -471,7 +465,7 @@ pub fn ChatWindow(
                 let mut session_state = session_state;
                 let settings = settings;
                 let send_prompt_to_llm = send_prompt_to_llm;
-                let mut permission_manager = permission_manager;
+                let permission_manager = permission_manager;
                 let mut stream_update_trigger = stream_update_trigger;
                 let mut has_new_comments = has_new_comments;
 
@@ -480,7 +474,9 @@ pub fn ChatWindow(
                     let target_id = current_target_id.read().clone();
 
                     // Reset the AI turn count every time the user sends a message.
-                    permission_manager.write().reset_turn_count();
+                    if let Some(session) = session_state.write().sessions.get_mut(&target_id) {
+                        session.reset_turn_count();
+                    }
 
                     // Clear the tool call history to ensure a fresh start for the new turn.
                     session_state.write().tool_call_history.clear();
@@ -497,7 +493,9 @@ pub fn ChatWindow(
                 });
 
                     if last_message_was_warning {
-                        permission_manager.write().reset_turn_count();
+                        if let Some(session) = session_state.write().sessions.get_mut(&target_id) {
+                            session.reset_turn_count();
+                        }
                     }
 
                     if user_message.trim().is_empty() && attachments.is_empty() {
@@ -534,7 +532,7 @@ pub fn ChatWindow(
                                 if let Some(session) = state.sessions.get(&target_id) {
                                     let builder =
                                         PromptBuilder::new(session, &settings_read, &state);
-                                    let result = builder.build_prompt("".to_string(), None);
+                                    let result = builder.build_prompt("".to_string());
                                     (result.prompt, result.pages_to_store)
                                 } else {
                                     return;
@@ -562,7 +560,9 @@ pub fn ChatWindow(
 
                     has_new_comments.set(false);
 
-                    if permission_manager.read().is_turn_limit_reached() {
+                    let turn_count = session_state.read().sessions.get(&target_id)
+                        .map(|s| s.current_ai_turn_count).unwrap_or(0);
+                    if permission_manager.read().is_turn_limit_reached_for(turn_count) {
                         let mut state = session_state.write();
                         if let Some(session) = state.sessions.get_mut(&target_id) {
                             session.messages.push(Message {
@@ -649,7 +649,7 @@ pub fn ChatWindow(
                         let state = session_state.read();
                         if let Some(session) = state.sessions.get(&target_id) {
                             let builder = PromptBuilder::new(session, &settings_read, &state);
-                            let result = builder.build_prompt(user_prompt, None);
+                            let result = builder.build_prompt(user_prompt);
                             (result.prompt, result.pages_to_store)
                         } else {
                             tracing::error!("No active session found when building prompt");
@@ -680,12 +680,9 @@ pub fn ChatWindow(
     );
 
     let cancel_message = move || {
-        if let Some(id) = *active_message_id.read() {
-            let session_id = active_session_for_stream
-                .read()
-                .clone()
-                .unwrap_or_else(|| current_target_id.read().clone());
-            stream_manager.cancel_stream(&id, &session_id);
+        let session_id = current_target_id.read().clone();
+        if let Some(msg_id) = stream_manager.active_message_for_session(&session_id) {
+            stream_manager.cancel_stream(&msg_id, &session_id);
         }
     };
 
@@ -726,7 +723,7 @@ pub fn ChatWindow(
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&target_id) {
                         let builder = PromptBuilder::new(session, &settings, &state);
-                        let result = builder.build_prompt("".to_string(), None);
+                        let result = builder.build_prompt("".to_string());
                         (result.prompt, result.pages_to_store)
                     } else {
                         tracing::error!(
@@ -767,8 +764,26 @@ pub fn ChatWindow(
     let root_classes =
         "relative flex flex-col bg-app text-fg rounded-lg shadow-2xl h-full w-full flex-1 min-h-0";
 
+    let restore_message_to_draft = move |message_id: Uuid| {
+        let mut local_cmd = chat_command;
+        let (text_content, msg_attachments) = {
+            let state = session_state.read();
+            state.sessions.get(&*current_target_id.read())
+                .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
+                .map(|msg| (
+                    msg.content.get_text_content().unwrap_or_default(),
+                    msg.attachments.clone(),
+                ))
+                .unwrap_or_default()
+        };
+        local_cmd.set(Some(super::chat_input::ChatCommand::RestoreToDraft(
+            text_content,
+            msg_attachments,
+        )));
+    };
+
     let delete_message = move |message_id: Uuid| {
-        let confirm = settings.read().confirm_on_message_delete;
+        let confirm = settings.read().confirm_on_message_edit;
         if confirm {
             if let Some(index) = session_state
                 .read()
@@ -788,7 +803,9 @@ pub fn ChatWindow(
                 show_delete_confirm_modal.set(true);
             }
         } else {
-            // Delete immediately
+            restore_message_to_draft(message_id);
+
+            // Delete the message and everything after
             let message_id_str = message_id.to_string();
             let active_session_id = current_target_id.read().clone();
             if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
@@ -796,6 +813,7 @@ pub fn ChatWindow(
                 // Trigger update
                 stream_update_trigger.set(stream_update_trigger() + 1);
             }
+            crate::session::SessionState::save_async(&session_state.read(), None);
         }
     };
 
@@ -876,7 +894,7 @@ pub fn ChatWindow(
                     on_comment: move |_| has_new_comments.set(true),
                 },
                 ChatInput {
-                    is_sending: Signal::new(*stream_manager.is_sending.read() || stream_manager.is_any_generating()),
+                    is_sending: Signal::new(stream_manager.is_session_streaming(&*current_target_id.read())),
                     has_new_comments: has_new_comments,
                     has_pending_approvals: has_pending_approvals,
                     on_send: {
@@ -934,21 +952,26 @@ pub fn ChatWindow(
 
                 ConfirmDeleteModal {
                     is_visible: show_delete_confirm_modal,
-                    title: "Delete Messages",
-                    message: format!("Are you sure you want to delete this message and the {} messages that follow? This cannot be undone.", delete_message_count().saturating_sub(1)),
-                    confirm_button_text: "Delete",
+                    title: "Edit Message",
+                    message: format!("This will remove this message and the {} messages that follow, and restore the content to your input box for editing.", delete_message_count().saturating_sub(1)),
+                    confirm_button_text: "Edit",
                     show_dont_ask_again: true,
                     on_confirm: move |dont_ask_again: bool| {
                         if dont_ask_again {
-                            settings.write().confirm_on_message_delete = false;
+                            settings.write().confirm_on_message_edit = false;
                         }
                         if let Some(id) = pending_delete_message_id.read().as_ref() {
+                            if let Ok(uuid) = uuid::Uuid::parse_str(id) {
+                                restore_message_to_draft(uuid);
+                            }
+
                             let active_session_id = current_target_id.read().clone();
                             if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
                                 session.delete_message_and_after(id);
                                 // Trigger update
                                 stream_update_trigger.set(stream_update_trigger() + 1);
                             }
+                            crate::session::SessionState::save_async(&session_state.read(), None);
                         }
                         show_delete_confirm_modal.set(false);
                         pending_delete_message_id.set(None);
@@ -1423,9 +1446,9 @@ pub fn MessageBubble(
                                     || content().starts_with("⚠️ **Tool Call Error") {
                                     QuickFix {
                                         suggestions: vec![
-                                            "Check your tool syntax and try again.".to_string(),
-                                            "Loaded filesystem use directly please.".to_string(),
-                                            "You are using bad syntax, the user has loaded the tools please try again.".to_string(),
+                                            "Please try a different approach without using that tool.".to_string(),
+                                            "Can you retry with the correct tool name?".to_string(),
+                                            "Please continue without tools and answer from your knowledge.".to_string(),
                                         ],
                                         on_select: move |suggestion: String| {
                                             chat_input_draft.set(suggestion);
@@ -1592,11 +1615,13 @@ pub fn MessageBubble(
                                     }
                                 }
 
-                                button {
-                                    class: "p-1.5 text-fg-muted hover:text-red-400 rounded transition-colors",
-                                    onclick: move |_| on_delete.call(()),
-                                    title: "Delete message",
-                                    Icon { width: 14, height: 14, icon: fi_icons::FiTrash2 }
+                                if is_user {
+                                    button {
+                                        class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors",
+                                        onclick: move |_| on_delete.call(()),
+                                        title: "Edit message",
+                                        Icon { width: 14, height: 14, icon: fi_icons::FiEdit2 }
+                                    }
                                 }
                             }
                         }
@@ -1693,6 +1718,14 @@ pub fn MessageBubble(
                                                             div { class: "flex justify-between gap-4",
                                                                 span { "Prompt:" }
                                                                 span { "{usage.prompt_tokens}" }
+                                                            }
+                                                            if let Some(cached) = usage.cached_content_tokens {
+                                                                if cached > 0 {
+                                                                    div { class: "flex justify-between gap-4 text-emerald-400",
+                                                                        span { "⚡ Cached:" }
+                                                                        span { "-{cached}" }
+                                                                    }
+                                                                }
                                                             }
                                                             div { class: "flex justify-between gap-4",
                                                                 span { "Completion:" }

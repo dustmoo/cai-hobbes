@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 use super::types::LlmPrompt;
 use super::GeminiConfig;
@@ -45,6 +47,8 @@ pub struct GeminiRequest {
     pub tool_config: Option<ToolConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<GenerationConfig>,
+    #[serde(rename = "cachedContent", skip_serializing_if = "Option::is_none")]
+    pub cached_content: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -151,6 +155,8 @@ pub struct UsageMetadata {
 /// Supported Gemini Models for Pricing
 #[derive(Debug, PartialEq, Clone)]
 pub enum GeminiModel {
+    Gemini3_5Pro,
+    Gemini3_5Flash,
     Gemini3_1ProPreview,
     Gemini3_1FlashPreview,
     Gemini3_1FlashLitePreview,
@@ -176,7 +182,11 @@ impl GeminiModel {
         let s = slug.strip_prefix("models/").unwrap_or(slug);
 
         match s {
-            // Gemini 3 Series - STRICT PREFIX MATCHING FIRST
+            // Gemini 3.5 Series - HIGHEST PRIORITY
+            _ if s.starts_with("gemini-3.5-pro") => GeminiModel::Gemini3_5Pro,
+            _ if s.starts_with("gemini-3.5-flash") => GeminiModel::Gemini3_5Flash,
+
+            // Gemini 3.x Series - STRICT PREFIX MATCHING
             _ if s.starts_with("gemini-3.1-pro") => GeminiModel::Gemini3_1ProPreview,
             _ if s.starts_with("gemini-3.1-flash-lite") => GeminiModel::Gemini3_1FlashLitePreview,
             _ if s.starts_with("gemini-3.1-flash") => GeminiModel::Gemini3_1FlashPreview,
@@ -238,9 +248,9 @@ impl GeminiModel {
             _ if s.contains("nano") => GeminiModel::NanoBanana,
             _ if s.contains("gemma") => GeminiModel::Gemma3,
             _ if s.contains("flash-lite") => GeminiModel::Gemini3_1FlashLitePreview, // 3.1 is current gen
-            _ if s.contains("flash") => GeminiModel::Gemini2_0Flash,          // assume mid-tier
-            // Jan 2026: 1.5 deprecated, use 2.5 Pro (has thinking budget support)
-            _ if s.contains("pro") => GeminiModel::Gemini2_5Pro,
+            _ if s.contains("flash") => GeminiModel::Gemini3_5Flash,          // assume latest gen
+            // May 2026: default pro fallback to 3.5 Pro (upcoming June 2026)
+            _ if s.contains("pro") => GeminiModel::Gemini3_5Pro,
 
             _ => {
                 tracing::warn!("Unknown Gemini model slug encountered: '{}'. Defaulting to Gemini 2.0 Flash pricing.", s);
@@ -251,6 +261,18 @@ impl GeminiModel {
 
     pub fn get_rates(&self, prompt_tokens: i32) -> (f64, f64) {
         match self {
+            // Gemini 3.5 Series
+            GeminiModel::Gemini3_5Flash => (1.50, 9.00),
+            // 3.5 Pro: not yet released (June 2026); using 3.1 Pro rates as placeholder
+            GeminiModel::Gemini3_5Pro => {
+                if prompt_tokens > 200_000 {
+                    (4.00, 18.00)
+                } else {
+                    (2.00, 12.00)
+                }
+            }
+
+            // Gemini 3.x Series
             GeminiModel::Gemini3_1ProPreview | GeminiModel::Gemini3_0ProPreview => {
                 if prompt_tokens > 200_000 {
                     (4.00, 18.00)
@@ -577,6 +599,7 @@ impl LlmFormatConverter for GeminiConnector {
             system_instruction,
             tool_config,
             generation_config,
+            cached_content: None,
         };
 
         serde_json::to_value(request).unwrap_or(serde_json::Value::Null)
@@ -753,6 +776,7 @@ impl GeminiConnector {
 pub struct GeminiConnector {
     config: GeminiConfig,
     base_url: String,
+    cache_store: Arc<Mutex<crate::llm::gemini_cache::GeminiCacheStore>>,
 }
 
 /// Thinking configuration variants per Google AI docs
@@ -779,10 +803,11 @@ impl GeminiModel {
     /// Returns the thinking config style for this model
     pub fn thinking_config_style(&self) -> ThinkingConfigStyle {
         match self {
-            GeminiModel::Gemini3_1ProPreview | GeminiModel::Gemini3_0ProPreview => {
-                ThinkingConfigStyle::LevelPro
-            }
-            GeminiModel::Gemini3_1FlashPreview
+            GeminiModel::Gemini3_5Pro
+            | GeminiModel::Gemini3_1ProPreview
+            | GeminiModel::Gemini3_0ProPreview => ThinkingConfigStyle::LevelPro,
+            GeminiModel::Gemini3_5Flash
+            | GeminiModel::Gemini3_1FlashPreview
             | GeminiModel::Gemini3_1FlashLitePreview
             | GeminiModel::Gemini3_0FlashPreview
             | GeminiModel::Gemini2_0FlashThinking => ThinkingConfigStyle::LevelFlash,
@@ -797,6 +822,8 @@ impl GeminiModel {
     /// Returns the official human-readable name for this model
     pub fn display_name(&self) -> String {
         match self {
+            GeminiModel::Gemini3_5Pro => "Gemini 3.5 Pro".to_string(),
+            GeminiModel::Gemini3_5Flash => "Gemini 3.5 Flash".to_string(),
             GeminiModel::Gemini3_1ProPreview => "Gemini 3.1 Pro".to_string(),
             GeminiModel::Gemini3_1FlashPreview => "Gemini 3.1 Flash".to_string(),
             GeminiModel::Gemini3_1FlashLitePreview => "Gemini 3.1 Flash Lite".to_string(),
@@ -848,6 +875,8 @@ impl GeminiModel {
     /// This is the authoritative source for model identifiers sent to the API.
     pub fn canonical_slug(&self) -> &str {
         match self {
+            GeminiModel::Gemini3_5Pro => "gemini-3.5-pro",
+            GeminiModel::Gemini3_5Flash => "gemini-3.5-flash",
             GeminiModel::Gemini3_1ProPreview => "gemini-3.1-pro-preview",
             GeminiModel::Gemini3_1FlashPreview => "gemini-3.1-flash-preview",
             GeminiModel::Gemini3_1FlashLitePreview => "gemini-3.1-flash-lite-preview",
@@ -867,6 +896,35 @@ impl GeminiModel {
         }
     }
 
+    /// Returns the context window size in tokens for this model.
+    /// Source: https://ai.google.dev/gemini-api/docs/models
+    pub fn context_window_tokens(&self) -> usize {
+        match self {
+            // Gemini 3.5: 1M context
+            GeminiModel::Gemini3_5Pro | GeminiModel::Gemini3_5Flash => 1_000_000,
+            // Gemini 3.x: 1M context
+            GeminiModel::Gemini3_1ProPreview
+            | GeminiModel::Gemini3_1FlashPreview
+            | GeminiModel::Gemini3_1FlashLitePreview
+            | GeminiModel::Gemini3_0ProPreview
+            | GeminiModel::Gemini3_0FlashPreview => 1_000_000,
+            // Gemini 2.5: 1M context
+            GeminiModel::Gemini2_5Pro
+            | GeminiModel::Gemini2_5Flash
+            | GeminiModel::Gemini2_5FlashLite
+            | GeminiModel::Gemini2_5ComputerUsePreview => 1_000_000,
+            // Gemini 2.0: 1M context
+            GeminiModel::Gemini2_0Flash
+            | GeminiModel::Gemini2_0FlashThinking
+            | GeminiModel::Gemini2_0FlashLite => 1_000_000,
+            // Gemma/Nano: smaller windows
+            GeminiModel::Gemma3 => 128_000,
+            GeminiModel::NanoBanana | GeminiModel::NanoBananaPro => 32_000,
+            // Unknown: conservative default
+            GeminiModel::Unknown(_) => 1_000_000,
+        }
+    }
+
     /// Returns the API version this model requires.
     /// Centralizes version routing so model-specific overrides are trivial.
     pub fn api_version(&self) -> &'static str {
@@ -876,11 +934,34 @@ impl GeminiModel {
     }
 }
 
+/// Process-wide Gemini cache store. Shared across connector instances so that
+/// server-side cachedContents entries survive connector rebuilds (settings
+/// changes, per-session provider/model overrides) instead of being orphaned
+/// until their TTL expires.
+fn shared_cache_store() -> Arc<Mutex<crate::llm::gemini_cache::GeminiCacheStore>> {
+    static STORE: std::sync::OnceLock<Arc<Mutex<crate::llm::gemini_cache::GeminiCacheStore>>> =
+        std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| Arc::new(Mutex::new(crate::llm::gemini_cache::GeminiCacheStore::new())))
+        .clone()
+}
+
 impl GeminiConnector {
     pub fn new(config: GeminiConfig) -> Self {
         Self {
             config,
             base_url: "https://generativelanguage.googleapis.com".to_string(),
+            cache_store: Arc::new(Mutex::new(crate::llm::gemini_cache::GeminiCacheStore::new())),
+        }
+    }
+
+    /// Production constructor: uses the process-wide shared cache store.
+    /// Tests use `new()` to keep cache state isolated per instance.
+    pub fn new_shared(config: GeminiConfig) -> Self {
+        Self {
+            config,
+            base_url: "https://generativelanguage.googleapis.com".to_string(),
+            cache_store: shared_cache_store(),
         }
     }
 
@@ -965,6 +1046,7 @@ impl GeminiConnector {
             system_instruction: None,
             tool_config: None,
             generation_config: None,
+            cached_content: None,
         };
 
         let url =
@@ -1088,6 +1170,7 @@ impl LlmConnector for GeminiConnector {
         prompt_data: LlmPrompt,
         tx: mpsc::UnboundedSender<StreamMessage>,
         mcp_context: Option<McpContext>,
+        session_id: Option<String>,
     ) {
         let api_key = match self.resolve_api_key() {
             Ok(key) => key,
@@ -1125,6 +1208,78 @@ impl LlmConnector for GeminiConnector {
             }
         };
 
+        // Explicit Context Caching check/create
+        let mut cache_entry_opt = None;
+        if self.config.context_caching_enabled {
+            if let Some(ref sess_id) = session_id {
+                if request_body.contents.len() > 1 {
+                    let prefix_contents = &request_body.contents[0 .. request_body.contents.len() - 1];
+                    let prefix_hash = crate::llm::gemini_cache::compute_prefix_hash(
+                        request_body.system_instruction.as_ref(),
+                        request_body.tools.as_deref(),
+                        prefix_contents,
+                    );
+
+                    let mut store = self.cache_store.lock().await;
+                    store.cleanup_expired();
+                    if let Some(entry) = store.get_valid_cache(sess_id, &model, prefix_hash) {
+                        cache_entry_opt = Some(entry.clone());
+                    } else {
+                        let chars_per_token = self.config.context_tuning.chars_per_token
+                            .unwrap_or(crate::context::token_estimator::DEFAULT_CHARS_PER_TOKEN);
+                        
+                        let system_tokens = prompt_data.system.as_ref().map_or(0, |s| crate::context::token_estimator::estimate_tokens_with_ratio(s, chars_per_token));
+                        let tool_tokens: usize = prompt_data.tools.iter().map(|t| crate::context::token_estimator::estimate_tool_definition_tokens(t, chars_per_token)).sum();
+                        let prefix_messages_tokens: usize = prompt_data.messages.iter().take(prompt_data.messages.len().saturating_sub(1))
+                            .map(|m| crate::context::token_estimator::estimate_message_tokens_with_ratio(m, chars_per_token)).sum();
+
+                        let estimated_prefix_tokens = system_tokens + tool_tokens + prefix_messages_tokens;
+
+                        if estimated_prefix_tokens >= 4096 {
+                            let system_instr = request_body.system_instruction.clone();
+                            let t_list = request_body.tools.clone();
+                            let contents_prefix = prefix_contents.to_vec();
+
+                            drop(store); // release lock during network request
+
+                            match crate::llm::gemini_cache::api_create_cache(
+                                &client,
+                                &self.base_url,
+                                &api_key,
+                                &model,
+                                sess_id,
+                                system_instr,
+                                t_list,
+                                contents_prefix,
+                                self.config.cache_ttl_seconds,
+                                prefix_hash,
+                            ).await {
+                                Ok(new_entry) => {
+                                    let mut store_lock = self.cache_store.lock().await;
+                                    store_lock.insert_entry(sess_id.clone(), new_entry.clone());
+                                    cache_entry_opt = Some(new_entry);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Gemini Context Caching: failed to create cache: {}. Proceeding without cache.", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(entry) = cache_entry_opt {
+            request_body.cached_content = Some(entry.cache_id.clone());
+            request_body.system_instruction = None;
+            request_body.tools = None;
+            request_body.tool_config = None;
+            if request_body.contents.len() >= entry.cached_message_count {
+                request_body.contents.drain(0..entry.cached_message_count);
+            }
+            tracing::info!("Using Gemini explicit context cache: id={}, cached messages count={}", entry.cache_id, entry.cached_message_count);
+        }
+
         // --- Logging Block ---
         {
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -1158,6 +1313,20 @@ impl LlmConnector for GeminiConnector {
             if !response.status().is_success() {
                 let status = response.status();
                 let body_text = response.text().await.unwrap_or_default();
+
+                // Retry on server errors (5xx) if attempts remain — preview models often 500 transiently
+                if status.is_server_error() && attempt + 1 < MAX_RETRIES {
+                    tracing::warn!(
+                        "Gemini API server error [{}] on attempt {}, retrying in {}s: {}",
+                        status,
+                        attempt + 1,
+                        2u64.pow(attempt),
+                        &body_text[..body_text.len().min(200)]
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
+                    continue;
+                }
+
                 let msg = if let Ok(err) = serde_json::from_str::<GeminiErrorResponse>(&body_text) {
                     err.error.message
                 } else {
@@ -1174,7 +1343,6 @@ impl LlmConnector for GeminiConnector {
             let mut current_attempt_parts = Vec::<Part>::new();
             let mut malformed_call_detected = false;
             let mut unexpected_tool_call_detected = false;
-            let mut has_sent_data = false;
             let mut tool_not_found_count: u32 = 0;
             let mut finish_reason: Option<String> = None;
             // Dedup guard: Gemini SSE sends cumulative candidate snapshots, so the same
@@ -1182,6 +1350,17 @@ impl LlmConnector for GeminiConnector {
             // prevent duplicate execution.
             let mut emitted_tool_calls: std::collections::HashSet<(String, u64)> =
                 std::collections::HashSet::new();
+
+            // Buffer for usage data: Gemini emits usage_metadata on EVERY SSE chunk,
+            // not just the final one. With thinking models, early chunks report thinking
+            // tokens inside candidates_token_count; the final chunk correctly separates
+            // them into thoughts_token_count, reducing the total. We hold the last-seen
+            // usage and emit it once after the stream ends to avoid the "33 → 27" jitter.
+            let mut pending_usage: Option<crate::components::shared::UsageData> = None;
+
+            // State for tracking leaked <|channel>thought / <|channel>response tokens.
+            // These can leak from Gemma models even through the Gemini API.
+            let mut inside_channel_think = false;
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -1212,16 +1391,34 @@ impl LlmConnector for GeminiConnector {
                                 match event {
                                     StreamEvent::Text { content } => {
                                         if !content.is_empty() {
-                                            current_attempt_parts.push(Part::Text {
-                                                text: content.clone(),
-                                                thought: None,
-                                            });
-                                            let _ = tx.send(StreamMessage::Text {
-                                                content,
-                                                thought_signature: None,
-                                                thought_summary: None,
-                                            });
-                                            has_sent_data = true;
+                                            // Strip leaked <|channel>thought tokens before display
+                                            let channel_segments = super::convert::strip_channel_tokens(
+                                                &content,
+                                                &mut inside_channel_think,
+                                            );
+                                            for (is_thinking, seg_text) in channel_segments {
+                                                if is_thinking {
+                                                    current_attempt_parts.push(Part::Text {
+                                                        text: seg_text.clone(),
+                                                        thought: Some(true),
+                                                    });
+                                                    let _ = tx.send(StreamMessage::Text {
+                                                        content: String::new(),
+                                                        thought_signature: None,
+                                                        thought_summary: Some(seg_text),
+                                                    });
+                                                } else if !seg_text.is_empty() {
+                                                    current_attempt_parts.push(Part::Text {
+                                                        text: seg_text.clone(),
+                                                        thought: None,
+                                                    });
+                                                    let _ = tx.send(StreamMessage::Text {
+                                                        content: seg_text,
+                                                        thought_signature: None,
+                                                        thought_summary: None,
+                                                    });
+                                                }
+                                            }
                                         }
                                     }
                                     StreamEvent::Thinking { text, signature } => {
@@ -1234,7 +1431,6 @@ impl LlmConnector for GeminiConnector {
                                             thought_signature: signature,
                                             thought_summary: Some(text),
                                         });
-                                        has_sent_data = true;
                                     }
                                     StreamEvent::ToolCall {
                                         id: _,
@@ -1342,7 +1538,6 @@ impl LlmConnector for GeminiConnector {
                                                     None,
                                                 );
                                                 let _ = tx.send(StreamMessage::ToolCall(tool_call));
-                                                has_sent_data = true;
                                             }
                                         } else {
                                             // Tool not found in mcp_context - send user-friendly error
@@ -1366,29 +1561,25 @@ impl LlmConnector for GeminiConnector {
                                                 thought_signature: None,
                                                 thought_summary: None,
                                             });
-                                            has_sent_data = true;
-                                            // Circuit breaker: stop the stream after persistent tool-not-found
-                                            if tool_not_found_count >= 2 {
-                                                return;
-                                            }
                                         }
                                     }
                                     StreamEvent::Usage(usage) => {
-                                        let _ = tx.send(StreamMessage::Usage(
-                                            crate::components::shared::UsageData {
-                                                prompt_tokens: usage.prompt_tokens,
-                                                completion_tokens: usage.completion_tokens,
-                                                total_tokens: usage.total_tokens,
-                                                cost: usage.cost,
-                                                ..Default::default()
-                                            },
-                                        ));
+                                        // Buffer — emit only the final authoritative values
+                                        // after the stream completes (see pending_usage flush below).
+                                        pending_usage = Some(crate::components::shared::UsageData {
+                                            prompt_tokens: usage.prompt_tokens,
+                                            completion_tokens: usage.completion_tokens,
+                                            total_tokens: usage.total_tokens,
+                                            cost: usage.cost,
+                                            cached_content_tokens: usage.cached_content_tokens,
+                                            thoughts_tokens: usage.thoughts_tokens,
+                                        });
                                     }
                                     StreamEvent::Error { message } => {
                                         let _ = tx.send(StreamMessage::Error { message });
-                                        return;
+                                        break;
                                     }
-                                    StreamEvent::Done => return,
+                                    StreamEvent::Done => break,
                                 }
                             }
                         }
@@ -1400,9 +1591,16 @@ impl LlmConnector for GeminiConnector {
                         let _ = tx.send(StreamMessage::Error {
                             message: format!("Stream error: {}", e),
                         });
-                        return;
+                        break;
                     }
                 }
+            }
+
+            // Emit the final canonical usage now that the stream has ended.
+            // Flushing here rather than per-chunk avoids the "high → low" display
+            // jitter caused by Gemini re-bucketing thinking tokens in the final chunk.
+            if let Some(usage) = pending_usage.take() {
+                let _ = tx.send(StreamMessage::Usage(usage));
             }
 
             // Specific Gemini retry/grounding logic
@@ -1470,37 +1668,19 @@ impl LlmConnector for GeminiConnector {
                 return;
             }
 
-            if !has_sent_data {
-                let default_message = match finish_reason.as_deref() {
-                    Some("SAFETY") => "[Hobbes did not provide a response due to the safety filter.]".to_string(),
-                    Some("UNEXPECTED_TOOL_CALL") => {
-                        "⚠️ **Tool Connection Issue**\n\n\
-                        Hobbes tried to use a tool that isn't currently available. Please check:\n\n\
-                        1. **Is the MCP server running?** Open Settings → MCP Integration and verify the server status.\n\
-                        2. **Is the tool connected?** For Composio tools, ensure the profile is active and connected.\n\
-                        3. **Try refreshing** the tool list by toggling the MCP server off and on.\n\n\
-                        If the issue persists, the tool may need to be re-authorized or the server restarted.".to_string()
-                    },
-                    Some("MALFORMED_FUNCTION_CALL") => {
-                        "⚠️ **Tool Call Error**\n\n\
-                        Hobbes encountered an issue formatting a tool request. This is usually temporary.\n\
-                        Please try your request again.".to_string()
-                    },
-                    Some(reason) => format!(
-                        "⚠️ **Response Issue**\n\n\
-                        Hobbes could not complete the response.\n\
-                        **Reason:** {}\n\n\
-                        If this persists, try simplifying your request or checking your tool connections.",
-                        reason
-                    ),
-                    None => "Gemini finished without sending any data.".to_string(),
-                };
-                let _ = tx.send(StreamMessage::Text {
-                    content: default_message,
-                    thought_signature: None,
-                    thought_summary: None,
-                });
+            // Handle safety filter stop reason
+            if let Some(reason) = &finish_reason {
+                if reason == "SAFETY" {
+                    tracing::error!("Gemini generation stopped by safety filter.");
+                    let _ = tx.send(StreamMessage::Text {
+                        content: "[The response was blocked by the safety filter. Please try rephrasing your request.]".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                    });
+                    return;
+                }
             }
+
             break;
         }
     }
@@ -1533,6 +1713,7 @@ Analyze the sentiment and mood of the user in the "Recent Messages".
 Populate the JSON response with:
 - "summary": A concise, updated summary of the entire conversation so far.
 - "sentiment": A brief string describing the user's current mood (e.g., "curious and collaborative", "frustrated but focused").
+- "current_task": A one-sentence description of the specific task or goal the user is CURRENTLY working on. This is the active goal anchor — critical for small-context models. Example: "Implementing a dynamic history cap in prompt_builder.rs". Leave empty if no clear active task.
 - "entities": An object with:
   - "user_name": The user's name if mentioned.
   - "project_name": The active project or codebase name.
@@ -1560,6 +1741,7 @@ Recent Messages:
             "properties": {
                 "summary": { "type": "STRING", "description": "Concise updated summary of the conversation" },
                 "sentiment": { "type": "STRING", "description": "User's current mood" },
+                "current_task": { "type": "STRING", "description": "One-sentence description of the specific task the user is currently working on. Leave empty if unclear." },
                 "entities": {
                     "type": "OBJECT",
                     "properties": {
@@ -1591,6 +1773,7 @@ Recent Messages:
                 response_mime_type: Some("application/json".to_string()),
                 response_schema: Some(summary_schema),
             }),
+            cached_content: None,
         };
 
         tracing::info!("Using summary model: {}", self.config.summary_model);
@@ -1665,6 +1848,22 @@ Recent Messages:
         }
 
         Ok(serde_json::Value::Null)
+    }
+
+    async fn invalidate_session_cache(&self, session_id: &str) {
+        let mut store = self.cache_store.lock().await;
+        if let Some(entry) = store.invalidate(session_id) {
+            if let Ok(api_key) = self.resolve_api_key() {
+                let client = Client::new();
+                let base_url = self.base_url.clone();
+                let cache_id = entry.cache_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::llm::gemini_cache::api_delete_cache(&client, &base_url, &api_key, &cache_id).await {
+                        tracing::warn!("Failed to delete Gemini cache {} upon invalidation: {}", cache_id, e);
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -1777,6 +1976,8 @@ mod tests {
             thinking_budget: Some(1024),
             model_slots: vec![],
             context_tuning: Default::default(),
+            context_caching_enabled: false,
+            cache_ttl_seconds: 300,
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -1798,7 +1999,7 @@ mod tests {
 
         // Run generate_content_stream
         connector
-            .generate_content_stream(prompt_data, tx, None)
+            .generate_content_stream(prompt_data, tx, None, None)
             .await;
 
         // Verify results
@@ -1863,6 +2064,8 @@ mod tests {
             thinking_budget: None,
             model_slots: vec![],
             context_tuning: Default::default(),
+            context_caching_enabled: false,
+            cache_ttl_seconds: 300,
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -1880,7 +2083,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         connector
-            .generate_content_stream(prompt_data, tx, None)
+            .generate_content_stream(prompt_data, tx, None, None)
             .await;
 
         let mut received_error_guidance = false;
@@ -1930,6 +2133,8 @@ mod tests {
             thinking_budget: None,
             model_slots: vec![],
             context_tuning: Default::default(),
+            context_caching_enabled: false,
+            cache_ttl_seconds: 300,
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -1947,7 +2152,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         connector
-            .generate_content_stream(prompt_data, tx, None)
+            .generate_content_stream(prompt_data, tx, None, None)
             .await;
 
         let mut received_safety_message = false;
@@ -2001,6 +2206,8 @@ mod tests {
             thinking_budget: None,
             model_slots: vec![],
             context_tuning: Default::default(),
+            context_caching_enabled: false,
+            cache_ttl_seconds: 300,
         };
 
         let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
@@ -2024,7 +2231,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         connector
-            .generate_content_stream(prompt_data, tx, mcp_context)
+            .generate_content_stream(prompt_data, tx, mcp_context, None)
             .await;
 
         let mut received_tool_error = false;
@@ -2116,6 +2323,8 @@ mod tests {
 
     #[test]
     fn test_supports_thinking() {
+        assert!(GeminiModel::Gemini3_5Pro.supports_thinking());
+        assert!(GeminiModel::Gemini3_5Flash.supports_thinking());
         assert!(GeminiModel::Gemini3_1ProPreview.supports_thinking());
         assert!(GeminiModel::Gemini3_1FlashPreview.supports_thinking());
         assert!(GeminiModel::Gemini3_1FlashLitePreview.supports_thinking());
@@ -2225,16 +2434,37 @@ mod tests {
         assert!(ft.supports_thinking());
         assert_eq!(ft.thinking_config_style(), ThinkingConfigStyle::LevelFlash);
 
-        // Pro heuristic now maps to 2.5 Pro (has thinking support)
+        // Pro heuristic now maps to 3.5 Pro
         let pro_unknown = GeminiModel::from_slug("some-new-pro-model");
-        assert_eq!(pro_unknown, GeminiModel::Gemini2_5Pro);
+        assert_eq!(pro_unknown, GeminiModel::Gemini3_5Pro);
         assert!(pro_unknown.supports_thinking());
+
+        // Gemini 3.5 Flash slugs
+        assert_eq!(
+            GeminiModel::from_slug("gemini-3.5-flash"),
+            GeminiModel::Gemini3_5Flash
+        );
+        assert_eq!(
+            GeminiModel::from_slug("gemini-3.5-pro"),
+            GeminiModel::Gemini3_5Pro
+        );
+        // With preview suffix (future-proofing)
+        assert_eq!(
+            GeminiModel::from_slug("gemini-3.5-flash-preview"),
+            GeminiModel::Gemini3_5Flash
+        );
+        assert_eq!(
+            GeminiModel::from_slug("gemini-3.5-pro-preview"),
+            GeminiModel::Gemini3_5Pro
+        );
     }
 
     #[test]
     fn test_canonical_slug_round_trip() {
         // Ensure canonical slugs resolve back to the correct model
         let models = [
+            GeminiModel::Gemini3_5Pro,
+            GeminiModel::Gemini3_5Flash,
             GeminiModel::Gemini3_1ProPreview,
             GeminiModel::Gemini3_1FlashPreview,
             GeminiModel::Gemini3_1FlashLitePreview,
@@ -2270,6 +2500,8 @@ mod tests {
             thinking_budget: None,
             model_slots: vec![],
             context_tuning: Default::default(),
+            context_caching_enabled: false,
+            cache_ttl_seconds: 300,
         };
         let connector = GeminiConnector::new(config);
         let url =

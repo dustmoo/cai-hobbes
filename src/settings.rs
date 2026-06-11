@@ -33,11 +33,27 @@ impl LlmProvider {
         }
     }
 
-    /// All provider variants for UI iteration
-    /// NOTE: Claude is excluded from this version's UI — the stub connector isn't ready.
-    /// The LlmProvider::Claude enum variant remains for structural completeness.
+    /// All provider variants for UI iteration.
     pub fn all_variants() -> &'static [LlmProvider] {
-        &[Self::Gemini, Self::OpenAiCompat]
+        &[Self::Gemini, Self::OpenAiCompat, Self::Claude]
+    }
+
+    /// Single-letter badge for the chat-bar provider picker.
+    pub fn initial(&self) -> &'static str {
+        match self {
+            Self::Gemini => "G",
+            Self::OpenAiCompat => "O",
+            Self::Claude => "C",
+        }
+    }
+
+    /// Tailwind background class for the provider badge (mirrors profile colors).
+    pub fn color_class(&self) -> &'static str {
+        match self {
+            Self::Gemini => "bg-blue-600",
+            Self::OpenAiCompat => "bg-emerald-600",
+            Self::Claude => "bg-orange-600",
+        }
     }
 }
 
@@ -60,6 +76,8 @@ pub struct HotkeySettings {
     pub toggle_mcp: String,
     #[serde(default = "default_toggle_profile")]
     pub toggle_profile: String,
+    #[serde(default = "default_toggle_provider")]
+    pub toggle_provider: String,
     #[serde(default = "default_toggle_attachments")]
     pub toggle_attachments: String,
     #[serde(default = "default_toggle_tray")]
@@ -103,6 +121,7 @@ impl Default for HotkeySettings {
             toggle_history: default_toggle_history(),
             toggle_mcp: default_toggle_mcp(),
             toggle_profile: default_toggle_profile(),
+            toggle_provider: default_toggle_provider(),
             toggle_attachments: default_toggle_attachments(),
             toggle_tray: default_toggle_tray(),
             toggle_new_chat: default_toggle_new_chat(),
@@ -135,6 +154,9 @@ fn default_toggle_mcp() -> String {
 }
 fn default_toggle_profile() -> String {
     "CmdOrCtrl+Shift+P".to_string()
+}
+fn default_toggle_provider() -> String {
+    "CmdOrCtrl+Shift+L".to_string()
 }
 fn default_toggle_attachments() -> String {
     "CmdOrCtrl+Shift+A".to_string()
@@ -206,8 +228,8 @@ pub struct Settings {
     pub confirm_on_delete: bool,
     #[serde(default = "default_true")]
     pub confirm_on_save: bool,
-    #[serde(default = "default_true")]
-    pub confirm_on_message_delete: bool,
+    #[serde(default = "default_true", alias = "confirm_on_message_delete")]
+    pub confirm_on_message_edit: bool,
     #[serde(default = "default_true")]
     pub confirm_forget_memory: bool,
     #[serde(skip)]
@@ -267,6 +289,11 @@ pub struct Settings {
     /// When false, both the idle-timer and proactive (tool-loop) summarizers are skipped.
     #[serde(default = "default_true")]
     pub enable_summarization: bool,
+    /// When true, convert tool results from JSON to TOON (compact tabular notation)
+    /// before sending to the AI. Reduces token usage by 30-50% for structured tool output.
+    /// Can be overridden per-provider in Context Tuning config.
+    #[serde(default = "default_true")]
+    pub compact_tool_results: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -494,7 +521,7 @@ impl Default for Settings {
             user_name: None,
             force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available. When using the fetch tool, you MUST provide markdown links as sources. When you use tools you MUST use the information from the tool, if you don't have it, look up fresh information instead of guessing.".to_string()),
             project_folder: None,
-            chat_history_length: 8,
+            chat_history_length: 75,
             show_tray_icon: true,
             permission_settings: PermissionSettings {
                 auto_approval_enabled: true,
@@ -505,7 +532,7 @@ impl Default for Settings {
             },
             confirm_on_delete: true,
             confirm_on_save: true,
-            confirm_on_message_delete: true,
+            confirm_on_message_edit: true,
             confirm_forget_memory: true,
             smithery_api_key: None,
             preferred_mcp_source: McpSource::default(),
@@ -528,6 +555,7 @@ impl Default for Settings {
             tos_accepted_version: None,
             model_icons: HashMap::new(),
             enable_summarization: true,
+            compact_tool_results: true,
         }
     }
 }
@@ -614,18 +642,70 @@ pub fn get_slot_icon(slot_index: usize) -> String {
 
 impl Settings {
     pub fn active_model_slots(&self) -> Vec<String> {
-        match self.active_llm {
+        self.model_slots_for(self.active_llm)
+    }
+
+    /// Quick-switch model slots for a specific provider.
+    pub fn model_slots_for(&self, provider: LlmProvider) -> Vec<String> {
+        match provider {
             LlmProvider::Gemini => self.gemini_config.model_slots.clone(),
             LlmProvider::OpenAiCompat => self.openai_compat_config.model_slots.clone(),
             LlmProvider::Claude => self.claude_config.model_slots.clone(),
         }
     }
 
-    /// Resolve the effective context tuning for the current active provider.
+    /// The provider a session should use: its override, else the global default.
+    pub fn provider_for_session(&self, session: &crate::session::Session) -> LlmProvider {
+        session.llm_provider.unwrap_or(self.active_llm)
+    }
+
+    /// The chat model a session should use: its override (when set for the
+    /// effective provider), else that provider's configured model.
+    pub fn chat_model_for_session(&self, session: &crate::session::Session) -> String {
+        let provider = self.provider_for_session(session);
+        session
+            .chat_model
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| self.chat_model_for(provider))
+    }
+
+    /// Whether a provider has the minimum configuration needed to serve requests.
+    pub fn is_provider_configured(&self, provider: LlmProvider) -> bool {
+        match provider {
+            LlmProvider::Gemini => {
+                self.gemini_config.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok()
+            }
+            LlmProvider::OpenAiCompat => !self.openai_compat_config.endpoint.is_empty(),
+            LlmProvider::Claude => {
+                self.claude_config.api_key.is_some() || std::env::var("ANTHROPIC_API_KEY").is_ok()
+            }
+        }
+    }
+
+    /// Resolve the effective context window for a specific provider + model.
+    /// Returns `None` only for unconfigured providers with no known context limit.
+    pub fn resolve_context_window_for(&self, provider: LlmProvider, model: &str) -> Option<usize> {
+        match provider {
+            LlmProvider::OpenAiCompat => self.openai_compat_config.max_context_tokens,
+            // NOTE: claude_config.max_tokens is the OUTPUT token cap (required by the
+            // Messages API), not the context window — budget by the model's window.
+            LlmProvider::Claude => {
+                let model = crate::llm::claude_models::ClaudeModel::from_slug(model);
+                Some(model.context_window_tokens())
+            }
+            LlmProvider::Gemini => {
+                let model = crate::llm::gemini::GeminiModel::from_slug(model);
+                Some(model.context_window_tokens())
+            }
+        }
+    }
+
+    /// Resolve the effective context tuning for a specific provider.
     /// Provider preset overrides → Global settings → Compiled defaults.
-    pub fn effective_context_tuning(&self) -> ResolvedContextTuning {
+    pub fn effective_context_tuning_for(&self, provider: LlmProvider) -> ResolvedContextTuning {
         use crate::llm::config::ContextTuningPreset;
-        let preset: &ContextTuningPreset = match self.active_llm {
+        let preset: &ContextTuningPreset = match provider {
             LlmProvider::Gemini => &self.gemini_config.context_tuning,
             LlmProvider::OpenAiCompat => &self.openai_compat_config.context_tuning,
             LlmProvider::Claude => &self.claude_config.context_tuning,
@@ -642,9 +722,7 @@ impl Settings {
                 .unwrap_or(self.max_summary_chars),
             max_entity_count: preset.max_entity_count
                 .unwrap_or(self.max_entity_count),
-            compact_tool_results: preset.compact_tool_results.unwrap_or(
-                matches!(self.active_llm, LlmProvider::OpenAiCompat)
-            ),
+            compact_tool_results: preset.compact_tool_results.unwrap_or(self.compact_tool_results),
             tool_result_budget_ratio: preset.tool_result_budget_ratio
                 .unwrap_or(self.tool_result_budget_ratio),
             active_result_budget_ratio: preset.active_result_budget_ratio
@@ -659,15 +737,21 @@ impl Settings {
     }
 
     pub fn active_chat_model(&self) -> String {
-        match self.active_llm {
+        self.chat_model_for(self.active_llm)
+    }
+
+    /// The configured chat model for a specific provider.
+    pub fn chat_model_for(&self, provider: LlmProvider) -> String {
+        match provider {
             LlmProvider::Gemini => self.gemini_config.chat_model.clone(),
             LlmProvider::OpenAiCompat => self.openai_compat_config.model.clone(),
             LlmProvider::Claude => self.claude_config.model.clone(),
         }
     }
 
-    pub fn set_active_chat_model(&mut self, model: String) {
-        match self.active_llm {
+    /// Set the configured chat model for a specific provider.
+    pub fn set_chat_model_for(&mut self, provider: LlmProvider, model: String) {
+        match provider {
             LlmProvider::Gemini => self.gemini_config.chat_model = model,
             LlmProvider::OpenAiCompat => self.openai_compat_config.model = model,
             LlmProvider::Claude => self.claude_config.model = model,
@@ -880,6 +964,24 @@ impl Settings {
         }
     }
 
+    /// Seed default Claude quick-switch slots when none are assigned.
+    /// Non-destructive: only fills when every slot is empty (covers a missing,
+    /// empty, or all-blank persisted vec). If any slot holds a model, the
+    /// configuration is left untouched. Call this AFTER `sync_chat_model_to_slots`
+    /// so a user's active chat model is never reset by the seeded slots.
+    pub fn seed_default_claude_slots_if_empty(&mut self) {
+        let has_any = self
+            .claude_config
+            .model_slots
+            .iter()
+            .any(|s| !s.is_empty());
+        if !has_any {
+            self.claude_config.model_slots =
+                crate::llm::config::default_claude_model_slots();
+            tracing::info!("Seeded default Claude quick-switch slots (none were set).");
+        }
+    }
+
     /// Ensure all profiles have a valid UUID.
     /// If an ID is missing or empty, generate a new one.
     pub fn ensure_profile_ids(&mut self) {
@@ -897,7 +999,7 @@ impl Settings {
     }
 }
 fn default_max_tool_output_length() -> usize {
-    2000
+    8000
 }
 
 fn default_max_active_tool_output_length() -> usize {
@@ -916,9 +1018,10 @@ fn default_tool_result_budget_ratio() -> f64 {
     0.30
 }
 
-/// Default chars/token ratio. English prose averages ~4 chars per token;
-/// CJK/code-heavy content is closer to ~2. Exposed in settings for tuning.
-pub const DEFAULT_CHARS_PER_TOKEN: f64 = 4.0;
+/// Default chars/token ratio. 3.0 balances English prose (~4 chars/token) with
+/// JSON/code-heavy content (~2.5 chars/token). Intentionally conservative to
+/// prevent "Prompt Too Large" errors on small context models (16K–32K).
+pub const DEFAULT_CHARS_PER_TOKEN: f64 = 3.0;
 
 /// Fully-resolved context tuning values (no Options — all guaranteed).
 /// Created by `Settings::effective_context_tuning()` which cascades:
@@ -980,6 +1083,7 @@ impl SettingsManager {
             // paths must independently guarantee the value is ID-based before the app boots.
             settings.migrate_active_profile_name_to_id();
             settings.sync_chat_model_to_slots();
+            settings.seed_default_claude_slots_if_empty();
             return settings;
         }
 
@@ -1107,6 +1211,7 @@ impl SettingsManager {
         }
 
         settings.sync_chat_model_to_slots();
+        settings.seed_default_claude_slots_if_empty();
         settings
     }
 
@@ -1212,6 +1317,9 @@ pub struct UiState {
     pub show_mcp_icon: bool,
     #[serde(default = "default_true")]
     pub show_profile_selector: bool,
+    /// Whether to show the LLM provider picker in the chat bar
+    #[serde(default = "default_true")]
+    pub show_provider_selector: bool,
     #[serde(default = "default_true")]
     pub show_attachments_icon: bool,
     #[serde(default = "default_true")]
@@ -1258,6 +1366,7 @@ impl Default for UiState {
             show_history_icon: true,
             show_mcp_icon: true,
             show_profile_selector: true,
+            show_provider_selector: true,
             show_attachments_icon: true,
             show_model_selector: true,
             show_model_slots: true,
@@ -1417,4 +1526,37 @@ pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
 
     tracing::debug!("Discovered {} Chrome profiles", profiles.len());
     profiles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_fills_empty_claude_slots() {
+        let mut s = Settings::default();
+        s.claude_config.model_slots = vec![]; // simulate a persisted empty vec
+        s.seed_default_claude_slots_if_empty();
+        assert_eq!(s.claude_config.model_slots.len(), 10);
+        assert_eq!(s.claude_config.model_slots[0], "claude-opus-4-8");
+    }
+
+    #[test]
+    fn seed_fills_all_blank_claude_slots() {
+        let mut s = Settings::default();
+        s.claude_config.model_slots = vec!["".to_string(); 10];
+        s.seed_default_claude_slots_if_empty();
+        assert!(!s.claude_config.model_slots[0].is_empty());
+    }
+
+    #[test]
+    fn seed_preserves_user_assigned_slots() {
+        let mut s = Settings::default();
+        let mut slots = vec!["".to_string(); 10];
+        slots[2] = "claude-haiku-4-5".to_string();
+        s.claude_config.model_slots = slots.clone();
+        s.seed_default_claude_slots_if_empty();
+        // Any assigned slot means the configuration is left untouched.
+        assert_eq!(s.claude_config.model_slots, slots);
+    }
 }

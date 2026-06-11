@@ -40,8 +40,19 @@ fn composio_server_key(profile_id: &str) -> String {
 /// Gemini's practical tool limit for FunctionDeclarations.
 const GEMINI_TOOL_LIMIT: usize = 128;
 
-/// Virtual server name for the built-in local on-demand meta-tools.
-const LOCAL_META_SERVER_NAME: &str = "hobbes-local-meta";
+/// Canonical server name for built-in Hobbes session-management tools
+/// (`HOBBES_PAGE_RESULT`, `HOBBES_UPDATE_SCRATCHPAD`).
+/// Registered in `McpManager::servers` so the AI can accurately introspect
+/// all built-in tools and their origins.
+pub const HOBBES_CORE_SERVER: &str = "hobbes-core";
+
+/// Canonical server name for built-in on-demand MCP management tools
+/// (`MCP_LOAD_SERVER_TOOLS`, `MCP_UNLOAD_SERVER_TOOLS`).
+/// Registered in `McpManager::servers` so the AI can accurately introspect
+/// all built-in tools and their origins.
+pub const HOBBES_META_SERVER: &str = "hobbes-meta";
+
+
 
 /// Get meta-tools for local MCP server on-demand loading.
 /// These allow the AI to load/unload tools from servers set to "On-demand" mode.
@@ -386,6 +397,28 @@ pub enum McpClientType {
     Service(Arc<RunningService<RoleClient, ()>>),
     NativeComposio(Arc<crate::mcp::composio_client::ComposioClient>),
     NativeImage(Arc<crate::mcp::image_client::ImageClient>),
+    /// Built-in Hobbes session tools (HOBBES_PAGE_RESULT, HOBBES_UPDATE_SCRATCHPAD).
+    /// Dispatch is intercepted upstream in stream_manager.rs (requires SessionState).
+    /// This variant exists so the server is visible / introspectable in McpManager.
+    NativeCore,
+    /// Built-in on-demand MCP management tools (MCP_LOAD_SERVER_TOOLS, MCP_UNLOAD_SERVER_TOOLS).
+    /// Dispatch is intercepted in use_mcp_tool() before the match arm runs.
+    /// This variant exists so the server is visible / introspectable in McpManager.
+    NativeMeta,
+}
+
+impl McpClientType {
+    /// Check if a service's transport is still alive.
+    /// Native clients don't use child-process transports, so they're always "healthy".
+    fn is_healthy(&self) -> bool {
+        match self {
+            McpClientType::Service(arc) => !arc.is_transport_closed(),
+            McpClientType::NativeComposio(_)
+            | McpClientType::NativeImage(_)
+            | McpClientType::NativeCore
+            | McpClientType::NativeMeta => true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -656,22 +689,7 @@ impl McpManager {
             on_demand.insert(server_name.to_string());
         }
         // Clear any dynamically loaded tools for this server
-        // LOCK ORDERING INVARIANT (P-010): Always acquire `servers` before
-        // `dynamic_local_tools` to match `call_tool`'s acquisition order
-        // and prevent ABBA deadlocks.
-        {
-            let servers = self.servers.lock().await;
-            let mut dynamic = self.dynamic_local_tools.lock().await;
-            let mut sources = self.dynamic_local_tool_sources.lock().await;
-            if let Some(client) = servers.get(server_name) {
-                let server_tool_names: HashSet<String> =
-                    client.tools.iter().map(|t| t.name.to_string()).collect();
-                dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
-                for name in &server_tool_names {
-                    sources.remove(name);
-                }
-            }
-        }
+        self.clear_dynamic_tools_for(server_name).await;
         self.invalidate_status_cache();
         tracing::info!(
             "Set server '{}' to on-demand mode - tools discoverable via MCP_LOAD_SERVER_TOOLS",
@@ -692,25 +710,32 @@ impl McpManager {
             unloaded.remove(server_name);
         }
         // Clear dynamically loaded tools for this server (they'll now be in the main set)
-        // LOCK ORDERING INVARIANT (P-010): servers → dynamic_local_tools
-        {
-            let servers = self.servers.lock().await;
-            let mut dynamic = self.dynamic_local_tools.lock().await;
-            let mut sources = self.dynamic_local_tool_sources.lock().await;
-            if let Some(client) = servers.get(server_name) {
-                let server_tool_names: HashSet<String> =
-                    client.tools.iter().map(|t| t.name.to_string()).collect();
-                dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
-                for name in &server_tool_names {
-                    sources.remove(name);
-                }
-            }
-        }
+        self.clear_dynamic_tools_for(server_name).await;
         self.invalidate_status_cache();
         tracing::info!(
             "Set server '{}' to loaded mode - all tools visible in every prompt",
             server_name
         );
+    }
+
+    /// Remove dynamically loaded tools belonging to `server_name` from the
+    /// `dynamic_local_tools` cache and `dynamic_local_tool_sources` reverse-lookup.
+    ///
+    /// LOCK ORDERING INVARIANT (P-010): Always acquire `servers` before
+    /// `dynamic_local_tools` to match `call_tool`'s acquisition order
+    /// and prevent ABBA deadlocks.
+    async fn clear_dynamic_tools_for(&self, server_name: &str) {
+        let servers = self.servers.lock().await;
+        let mut dynamic = self.dynamic_local_tools.lock().await;
+        let mut sources = self.dynamic_local_tool_sources.lock().await;
+        if let Some(client) = servers.get(server_name) {
+            let server_tool_names: HashSet<String> =
+                client.tools.iter().map(|t| t.name.to_string()).collect();
+            dynamic.retain(|t| !server_tool_names.contains(t.name.as_ref()));
+            for name in &server_tool_names {
+                sources.remove(name);
+            }
+        }
     }
 
     /// Reloads the MCP configuration and restarts servers.
@@ -731,6 +756,30 @@ impl McpManager {
             // So clearing everything is safer to avoid duplicates.
             servers.clear();
             tracing::info!("Cleared existing MCP servers for reload.");
+        }
+
+        // Clear dynamic tool caches
+        {
+            let mut dynamic = self.dynamic_composio_tools.lock().await;
+            if !dynamic.is_empty() {
+                tracing::info!(
+                    "Clearing {} stale dynamic Composio tools on config reload",
+                    dynamic.len()
+                );
+                dynamic.clear();
+            }
+        }
+        {
+            let mut dynamic_local = self.dynamic_local_tools.lock().await;
+            let mut sources = self.dynamic_local_tool_sources.lock().await;
+            if !dynamic_local.is_empty() {
+                tracing::info!(
+                    "Clearing {} stale dynamic local tools on config reload",
+                    dynamic_local.len()
+                );
+                dynamic_local.clear();
+                sources.clear();
+            }
         }
 
         // 2. Clear failed servers map
@@ -796,6 +845,31 @@ impl McpManager {
             }
             tracing::info!("Cleared existing Composio native clients for reinitialization.");
         }
+
+        // Clear dynamic tool caches from the old profile
+        {
+            let mut dynamic = self.dynamic_composio_tools.lock().await;
+            if !dynamic.is_empty() {
+                tracing::info!(
+                    "Clearing {} stale dynamic Composio tools from previous profile",
+                    dynamic.len()
+                );
+                dynamic.clear();
+            }
+        }
+        {
+            let mut dynamic_local = self.dynamic_local_tools.lock().await;
+            let mut sources = self.dynamic_local_tool_sources.lock().await;
+            if !dynamic_local.is_empty() {
+                tracing::info!(
+                    "Clearing {} stale dynamic local tools from previous profile",
+                    dynamic_local.len()
+                );
+                dynamic_local.clear();
+                sources.clear();
+            }
+        }
+
         tracing::info!(
             "Profile switch in progress for '{}'. Composio tools temporarily unavailable.",
             profile.name
@@ -1044,6 +1118,53 @@ impl McpManager {
 
                 if tx_clone.send(active_client).is_err() {
                     tracing::error!("Failed to send initialized virtual Image client");
+                }
+            });
+        }
+
+        // Initialize Native Core Client (HOBBES_PAGE_RESULT, HOBBES_UPDATE_SCRATCHPAD)
+        {
+            let tx_clone = tx.clone();
+            spawn(async move {
+                tracing::info!("Initializing Hobbes Core built-in tools server");
+                let core_client = Arc::new(crate::mcp::core_client::CoreClient::new());
+                let tools = core_client.list_tools();
+                let config = McpServerConfig::native_stub(
+                    HOBBES_CORE_SERVER.to_string(),
+                    "Built-in Hobbes session tools (scratchpad, pagination).".to_string(),
+                );
+                let active_client = ActiveMcpClient {
+                    config,
+                    service: McpClientType::NativeCore,
+                    tools,
+                    warning_message: None,
+                    profile_id: None,
+                };
+                if tx_clone.send(active_client).is_err() {
+                    tracing::error!("Failed to send initialized Hobbes Core client");
+                }
+            });
+        }
+
+        // Initialize Native Meta Client (MCP_LOAD_SERVER_TOOLS, MCP_UNLOAD_SERVER_TOOLS)
+        {
+            let tx_clone = tx.clone();
+            spawn(async move {
+                tracing::info!("Initializing Hobbes Meta built-in tools server");
+                let meta_tools = get_local_meta_tools();
+                let config = McpServerConfig::native_stub(
+                    HOBBES_META_SERVER.to_string(),
+                    "Built-in tools to load/unload on-demand MCP server tools.".to_string(),
+                );
+                let active_client = ActiveMcpClient {
+                    config,
+                    service: McpClientType::NativeMeta,
+                    tools: meta_tools,
+                    warning_message: None,
+                    profile_id: None,
+                };
+                if tx_clone.send(active_client).is_err() {
+                    tracing::error!("Failed to send initialized Hobbes Meta client");
                 }
             });
         }
@@ -1380,6 +1501,13 @@ impl McpManager {
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped());
 
+                    // Set a sane working directory. macOS .app bundles launched from
+                    // Finder inherit cwd="/" which causes tools like Playwright to
+                    // attempt mkdir at the root (e.g. '/.playwright-mcp').
+                    if let Some(home) = dirs::home_dir() {
+                        cmd.current_dir(home);
+                    }
+
                     match TokioChildProcess::new(cmd) {
                         Ok(transport) => {
                             match tokio::time::timeout(
@@ -1649,7 +1777,7 @@ impl McpManager {
         profile_id: Option<String>,
     ) -> Result<UnboundedReceiver<Result<CallToolResult, String>>, String> {
         // Intercept local on-demand meta-tools before normal dispatch
-        if server_name == LOCAL_META_SERVER_NAME || tool_name == "MCP_LOAD_SERVER_TOOLS" || tool_name == "MCP_UNLOAD_SERVER_TOOLS" {
+        if server_name == HOBBES_META_SERVER || tool_name == "MCP_LOAD_SERVER_TOOLS" || tool_name == "MCP_UNLOAD_SERVER_TOOLS" {
             let (tx, rx) = mpsc::unbounded_channel();
 
             if tool_name == "MCP_LOAD_SERVER_TOOLS" {
@@ -1773,7 +1901,7 @@ impl McpManager {
         };
         let effective_server_name = resolved_server_name.as_deref().unwrap_or(server_name);
 
-        let servers_guard = self.servers.lock().await;
+        let mut servers_guard = self.servers.lock().await;
 
         // Resolve composio-native to the actual profile-suffixed key.
         // The LLM may send:
@@ -1854,6 +1982,51 @@ impl McpManager {
                     ));
                 }
                 return Err(format!("Server not found: {}", server_name));
+            }
+        };
+
+        // PRE-EMPTIVE HEALTH CHECK: If the stdio transport is already dead (child process
+        // exited, pipe broken, etc.), attempt to reconnect before dispatching the call.
+        // This avoids a wasted call_tool round-trip that would just return TransportClosed.
+        if !client.service.is_healthy() {
+            let config_for_reconnect = client.config.clone();
+            tracing::warn!(
+                "[RECONNECT] Transport for stdio server '{}' is dead — attempting auto-reconnect before tool call",
+                actual_server_name
+            );
+            // Drop the lock before reconnecting (reconnect_stdio_server needs it)
+            drop(servers_guard);
+
+            match self
+                .reconnect_stdio_server(&actual_server_name, config_for_reconnect)
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "[RECONNECT] Successfully reconnected stdio server '{}'",
+                        actual_server_name
+                    );
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Server '{}' transport is dead and reconnect failed: {}",
+                        actual_server_name, e
+                    ));
+                }
+            }
+
+            // Re-acquire the lock with the fresh client
+            servers_guard = self.servers.lock().await;
+        }
+
+        // Re-resolve client (in case reconnect replaced it, or on first pass)
+        let client = match servers_guard.get(&actual_server_name) {
+            Some(c) => c,
+            None => {
+                return Err(format!(
+                    "Server '{}' disappeared after reconnect attempt",
+                    actual_server_name
+                ));
             }
         };
 
@@ -1946,6 +2119,12 @@ impl McpManager {
         // Pattern 30: Also read image model fresh from settings at call time
         let native_image_model = self.settings.peek().image_generation_config.model.clone();
 
+        // Capture reconnect info for potential retry inside the spawn block.
+        // We need the server name and config in case call_tool returns TransportClosed.
+        let reconnect_server_name = actual_server_name.clone();
+        let reconnect_config = client.config.clone();
+        let reconnect_manager = self.clone();
+
         spawn(async move {
             let result = match service {
                 McpClientType::Service(service_arc) => {
@@ -1961,11 +2140,75 @@ impl McpManager {
                     };
                     let request = CallToolRequestParam {
                         name: tool.name.clone(),
-                        arguments: Some(arguments),
+                        arguments: Some(arguments.clone()),
                     };
                     match service_arc.call_tool(request).await {
                         Ok(result) => Ok(result),
-                        Err(e) => Err(format!("Failed to use tool: {}", e)),
+                        Err(e) => {
+                            let error_str = format!("{}", e);
+                            // AUTO-RECONNECT: If the transport closed (child process died),
+                            // attempt to restart the server and retry the tool call once.
+                            if error_str.contains("Transport closed") {
+                                tracing::warn!(
+                                    "[RECONNECT] call_tool returned TransportClosed for '{}' — attempting reconnect + retry",
+                                    reconnect_server_name
+                                );
+                                match reconnect_manager
+                                    .reconnect_stdio_server(
+                                        &reconnect_server_name,
+                                        reconnect_config,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        // Retry once with the fresh service
+                                        let servers = reconnect_manager.servers.lock().await;
+                                        if let Some(fresh_client) =
+                                            servers.get(&reconnect_server_name)
+                                        {
+                                            if let McpClientType::Service(ref fresh_svc) =
+                                                fresh_client.service
+                                            {
+                                                let retry_request = CallToolRequestParam {
+                                                    name: tool.name.clone(),
+                                                    arguments: Some(arguments),
+                                                };
+                                                match fresh_svc.call_tool(retry_request).await {
+                                                    Ok(result) => {
+                                                        tracing::info!(
+                                                            "[RECONNECT] Retry succeeded for '{}' on server '{}'",
+                                                            tool.name,
+                                                            reconnect_server_name
+                                                        );
+                                                        Ok(result)
+                                                    }
+                                                    Err(retry_e) => Err(format!(
+                                                        "Failed to use tool after reconnect: {}",
+                                                        retry_e
+                                                    )),
+                                                }
+                                            } else {
+                                                Err(format!(
+                                                    "Server '{}' is not a stdio service after reconnect",
+                                                    reconnect_server_name
+                                                ))
+                                            }
+                                        } else {
+                                            Err(format!(
+                                                "Server '{}' not found after reconnect",
+                                                reconnect_server_name
+                                            ))
+                                        }
+                                    }
+                                    Err(reconnect_err) => Err(format!(
+                                        "Failed to use tool (transport closed) and reconnect failed: {}",
+                                        reconnect_err
+                                    )),
+                                }
+                            } else {
+                                Err(format!("Failed to use tool: {}", e))
+                            }
+                        }
                     }
                 }
                 McpClientType::NativeImage(image_client) => {
@@ -1974,6 +2217,26 @@ impl McpManager {
                         Ok(result) => Ok(result),
                         Err(e) => Err(e),
                     }
+                }
+                McpClientType::NativeCore => {
+                    // HOBBES_PAGE_RESULT and HOBBES_UPDATE_SCRATCHPAD are intercepted
+                    // upstream in stream_manager.rs before use_mcp_tool() is called.
+                    // If we land here it means a dispatch path was missed.
+                    Err(format!(
+                        "Built-in core tool '{}' was not intercepted before MCP dispatch. \
+                        This is a Hobbes bug — please report it.",
+                        tool.name
+                    ))
+                }
+                McpClientType::NativeMeta => {
+                    // MCP_LOAD_SERVER_TOOLS and MCP_UNLOAD_SERVER_TOOLS are intercepted
+                    // at the top of use_mcp_tool() before reaching this match arm.
+                    // If we land here it means a dispatch path was missed.
+                    Err(format!(
+                        "Built-in meta tool '{}' was not intercepted before MCP dispatch. \
+                        This is a Hobbes bug — please report it.",
+                        tool.name
+                    ))
                 }
                 McpClientType::NativeComposio(composio_client) => {
                     // Tool Router: Handle meta-tools for on-demand discovery
@@ -2557,17 +2820,8 @@ impl McpManager {
             server_contexts.push(server_context);
         }
 
-        // Inject MCP_LOAD_SERVER_TOOLS / MCP_UNLOAD_SERVER_TOOLS meta-tools
-        // when any on-demand local servers exist
-        if !on_demand_server_info.is_empty() {
-            let meta_tools = get_local_meta_tools();
-            server_contexts.push(McpServerContext {
-                name: LOCAL_META_SERVER_NAME.to_string(),
-                description: "Built-in tools for loading/unloading on-demand MCP server tools"
-                    .to_string(),
-                tools: meta_tools,
-            });
-        }
+        // hobbes-core and hobbes-meta are now registered in McpManager::servers
+        // and included in the main server loop above — no manual injection needed.
 
         // Include dynamically loaded local MCP tools (from MCP_LOAD_SERVER_TOOLS)
         let dynamic_local = self.dynamic_local_tools.lock().await;
@@ -3245,18 +3499,19 @@ impl McpManager {
             }
         }
 
-        // Status reporting for the native Image Generation client
-        {
-            let active_image: Option<(&String, &ActiveMcpClient)> =
-                servers.iter().find(|(k, _)| k.as_str() == "hobbes-native-image");
-
-            if let Some((_name, client)) = active_image {
+        // Status reporting for native built-in clients
+        for (server_key, display_name) in [
+            ("hobbes-native-image", "Image Generation"),
+            (HOBBES_CORE_SERVER, "Hobbes Core Tools"),
+            (HOBBES_META_SERVER, "Hobbes Meta Tools"),
+        ] {
+            if let Some((_k, client)) = servers.iter().find(|(k, _)| k.as_str() == server_key) {
                 statuses.push(McpServerStatus {
-                    display_name: "Image Generation".to_string(),
+                    display_name: display_name.to_string(),
                     tools: client.tools.len(),
                     loaded_tools: client.tools.len(),
                     is_loaded: true,
-                    ..McpServerStatus::new("hobbes-native-image".to_string(), client.config.description.clone(), ServerStatus::Loaded)
+                    ..McpServerStatus::new(server_key.to_string(), client.config.description.clone(), ServerStatus::Loaded)
                 });
             }
         }
@@ -3517,7 +3772,20 @@ impl McpManager {
                                 cmd.arg(arg);
                             }
                         }
-                        cmd.envs(&server_config_clone_for_spawn.env);
+                        // Inject critical env vars (HOME, USER, etc.) + sane PATH
+                        let mut envs = server_config_clone_for_spawn.env.clone();
+                        for (key, value) in Self::get_critical_env_vars() {
+                            envs.entry(key).or_insert(value);
+                        }
+                        let current_path = std::env::var("PATH").unwrap_or_default();
+                        let sane_path = Self::get_sane_path();
+                        let final_path = if current_path.is_empty() {
+                            sane_path
+                        } else {
+                            format!("{}:{}", sane_path, current_path)
+                        };
+                        envs.insert("PATH".to_string(), final_path);
+                        cmd.envs(&envs);
                         if let Err(e) = cmd.status().await {
                             tracing::error!(
                                 "Failed to launch command for MCP server '{}': {}",
@@ -3642,12 +3910,33 @@ impl McpManager {
                     }
                 }
 
+                // Inject sane PATH and critical environment variables (HOME, USER, SHELL, TMPDIR)
+                // Without HOME, tools like Playwright fail trying to create dirs at '/'
+                let mut envs = server_config_clone.env.clone();
+                for (key, value) in Self::get_critical_env_vars() {
+                    envs.entry(key).or_insert(value);
+                }
+
+                let current_path = std::env::var("PATH").unwrap_or_default();
+                let sane_path = Self::get_sane_path();
+                let final_path = if current_path.is_empty() {
+                    sane_path
+                } else {
+                    format!("{}:{}", sane_path, current_path)
+                };
+                envs.insert("PATH".to_string(), final_path);
+
                 cmd.arg("-c")
                     .arg(&command_string)
-                    .envs(&server_config_clone.env)
+                    .envs(&envs)
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
+
+                // Set a sane working directory (see note at line ~1395)
+                if let Some(home) = dirs::home_dir() {
+                    cmd.current_dir(home);
+                }
 
                 match TokioChildProcess::new(cmd) {
                     Ok(transport) => ().serve(transport).await,
@@ -3774,6 +4063,159 @@ impl McpManager {
 
         Ok(())
     }
+
+    /// Attempt to restart a dead stdio MCP server inline (blocking the caller).
+    /// This is used by `use_mcp_tool` when it detects a TransportClosed error.
+    /// Unlike `retry_server` (which spawns and returns immediately), this method
+    /// awaits the full reconnect lifecycle so the caller can retry the tool call.
+    async fn reconnect_stdio_server(
+        &self,
+        server_name: &str,
+        config: McpServerConfig,
+    ) -> Result<(), String> {
+        tracing::info!(
+            "[RECONNECT] Restarting stdio MCP server '{}'",
+            server_name
+        );
+
+        // 1. Remove the dead server entry
+        {
+            let mut servers = self.servers.lock().await;
+            servers.remove(server_name);
+        }
+
+        // 2. Rebuild the Command (same logic as launch_servers for stdio)
+        let command_base = config
+            .command
+            .as_deref()
+            .ok_or_else(|| {
+                format!(
+                    "Cannot reconnect '{}': no command configured (SSE servers cannot be reconnected this way)",
+                    server_name
+                )
+            })?;
+
+        let mut cmd = Command::new(command_base);
+
+        if let Some(ref args) = config.args {
+            for arg in args {
+                cmd.arg(arg);
+            }
+        }
+
+        // Special handling for filesystem server
+        if server_name == "filesystem" {
+            let settings = self.settings.peek().clone();
+            if let Some(project_folder) = &settings.project_folder {
+                cmd.arg(project_folder);
+            }
+        }
+
+        // Inject sane PATH and critical environment variables
+        let mut envs = config.env.clone();
+        for (key, value) in Self::get_critical_env_vars() {
+            envs.entry(key).or_insert(value);
+        }
+
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let sane_path = Self::get_sane_path();
+        let final_path = if current_path.is_empty() {
+            sane_path
+        } else {
+            format!("{}:{}", sane_path, current_path)
+        };
+        envs.insert("PATH".to_string(), final_path);
+
+        cmd.envs(&envs)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        // Set a sane working directory (see note at line ~1395)
+        if let Some(home) = dirs::home_dir() {
+            cmd.current_dir(home);
+        }
+
+        // 3. Spawn the child process and initialize the rmcp service
+        let transport = TokioChildProcess::new(cmd).map_err(|e| {
+            format!(
+                "Failed to launch stdio MCP server '{}': {}",
+                server_name, e
+            )
+        })?;
+
+        let service = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            ().serve(transport),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "Timeout waiting for stdio MCP server '{}' to initialize",
+                server_name
+            )
+        })?
+        .map_err(|e| format!("Failed to serve MCP server '{}': {}", server_name, e))?;
+
+        // 4. Discover tools from the new server
+        let mut all_tools = Vec::new();
+        let mut next_cursor: Option<String> = None;
+
+        loop {
+            let cursor = next_cursor.clone();
+            let request_param = cursor.map(|c| PaginatedRequestParam { cursor: Some(c) });
+
+            match service.list_tools(request_param).await {
+                Ok(result) => {
+                    all_tools.extend(result.tools);
+                    if let Some(cursor) = result.next_cursor {
+                        if !cursor.is_empty() {
+                            next_cursor = Some(cursor);
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to list tools after reconnecting '{}': {}",
+                        server_name, e
+                    ));
+                }
+            }
+        }
+
+        tracing::info!(
+            "[RECONNECT] Discovered {} tools for reconnected server '{}'",
+            all_tools.len(),
+            server_name
+        );
+
+        // 5. Insert the fresh client into the servers map
+        let active_client = ActiveMcpClient {
+            config: config.clone(),
+            service: McpClientType::Service(Arc::new(service)),
+            tools: all_tools,
+            warning_message: None,
+            profile_id: None,
+        };
+
+        {
+            let mut servers = self.servers.lock().await;
+            servers.insert(server_name.to_string(), active_client);
+        }
+
+        // 6. Invalidate the status cache
+        self.invalidate_status_cache();
+
+        tracing::info!(
+            "[RECONNECT] Successfully restarted stdio MCP server '{}'",
+            server_name
+        );
+
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub async fn install_mcp_server(
         &self,

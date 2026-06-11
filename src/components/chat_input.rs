@@ -36,6 +36,7 @@ pub enum ChatCommand {
     DeleteSession(String),
     CancelGeneration,
     CopyToDraft(String),
+    RestoreToDraft(String, Vec<hobbes_core::models::Attachment>),
     TriggerAiAnalysis,
     SwitchToSettingsTab(crate::settings::SettingsTab, Option<String>),
     SwitchTab(usize),
@@ -44,9 +45,14 @@ pub enum ChatCommand {
     SwitchProfile(usize),
     /// Switch the current session's model to the model at this index in the available models list.
     SwitchModel(usize),
+    /// Switch the current session's LLM provider to the provider at this index
+    /// in `LlmProvider::all_variants()`.
+    SwitchProvider(usize),
     /// Toggle the model selector dropdown in the chat bar.
     #[allow(dead_code)] // Constructed and consumed locally via signal pattern
     ToggleModelSelector,
+    /// Toggle the provider selector dropdown in the chat bar.
+    ToggleProviderSelector,
     CloseTab,
 }
 
@@ -65,6 +71,9 @@ enum AutocompleteMode {
 fn display_name_for_provider(provider: &LlmProvider, model_slug: &str) -> String {
     match provider {
         LlmProvider::Gemini => GeminiModel::from_slug(model_slug).display_name(),
+        LlmProvider::Claude => {
+            crate::llm::claude_models::ClaudeModel::from_slug(model_slug).display_name()
+        }
         _ => model_slug.to_string(),
     }
 }
@@ -92,6 +101,7 @@ pub fn ChatInput(
     let mut is_processing_attachments = use_signal(|| false);
     let mut show_profile_selector = use_signal(|| false);
     let mut show_model_selector = use_signal(|| false);
+    let mut show_provider_selector = use_signal(|| false);
     let mut show_new_chat_menu = use_signal(|| false);
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
     let focus_context = use_context::<Signal<FocusContext>>();
@@ -132,6 +142,9 @@ pub fn ChatInput(
                 ChatCommand::ToggleModelSelector => {
                     show_model_selector.set(!show_model_selector());
                 }
+                ChatCommand::ToggleProviderSelector => {
+                    show_provider_selector.set(!show_provider_selector());
+                }
                 ChatCommand::ToggleSettings
                 | ChatCommand::ToggleHistory
                 | ChatCommand::ToggleMcp
@@ -142,6 +155,7 @@ pub fn ChatInput(
                 | ChatCommand::DeleteSession(_)
                 | ChatCommand::SwitchProfile(_)
                 | ChatCommand::SwitchModel(_)
+                | ChatCommand::SwitchProvider(_)
                 | ChatCommand::CloseTab => {
                     // Handled globally in main.rs
                 }
@@ -212,6 +226,26 @@ pub fn ChatInput(
                 ChatCommand::CopyToDraft(text) => {
                     tracing::info!("ChatCommand::CopyToDraft triggered: {} chars", text.len());
                     draft.set(text);
+                }
+                ChatCommand::RestoreToDraft(text, restore_attachments) => {
+                    tracing::info!("ChatCommand::RestoreToDraft triggered: {} chars, {} attachments", text.len(), restore_attachments.len());
+                    draft.set(text);
+                    attachments.set(restore_attachments);
+                    // Resize the textarea to fit the restored content and focus it.
+                    // requestAnimationFrame ensures the DOM has updated with the new
+                    // value before we measure scrollHeight.
+                    spawn(async move {
+                        let _ = document::eval(r#"
+                            const el = document.getElementById('chat-textarea');
+                            if (el) {
+                                el.focus();
+                                requestAnimationFrame(() => {
+                                    el.style.height = 'auto';
+                                    el.style.height = (el.scrollHeight) + 'px';
+                                });
+                            }
+                        "#);
+                    });
                 }
                 ChatCommand::TriggerAiAnalysis => {
                     tracing::info!("ChatCommand::TriggerAiAnalysis triggered");
@@ -555,10 +589,106 @@ pub fn ChatInput(
                 }
                 SessionCostIcon {}
 
-                // Model Selector Dropdown
+                // LLM Provider Selector (session-scoped, mirrors the profile picker)
+                { if ui_state.read().show_provider_selector {
+                    {
+                        let active_provider = {
+                            let settings_read = settings.read();
+                            session_state.read().get_active_session()
+                                .map(|s| settings_read.provider_for_session(s))
+                                .unwrap_or(settings_read.active_llm)
+                        };
+                        let other_providers: Vec<(usize, LlmProvider)> = LlmProvider::all_variants()
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .filter(|(_, p)| *p != active_provider)
+                            .collect();
+
+                        if !other_providers.is_empty() {
+                            rsx! {
+                                div {
+                                    class: "relative",
+                                    button {
+                                        class: format!("w-8 h-8 rounded-full {} border border-subtle flex items-center justify-center text-xs font-bold text-fg hover:brightness-110 hover:border-primary-500 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600 shadow-md", active_provider.color_class()),
+                                        title: "Provider: {active_provider.display_name()}",
+                                        onclick: move |_| show_provider_selector.set(!show_provider_selector()),
+                                        "{active_provider.initial()}"
+                                    }
+
+                                    if show_provider_selector() {
+                                        div {
+                                            class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                                            for (index, provider) in other_providers.into_iter() {
+                                                {
+                                                    let index = index;
+                                                    let provider = provider;
+                                                    let configured = settings.read().is_provider_configured(provider);
+
+                                                    rsx! {
+                                                        button {
+                                                            class: if configured {
+                                                                "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between"
+                                                            } else {
+                                                                "w-full text-left px-4 py-2 text-sm text-fg-muted/40 hover:bg-primary-900/50 hover:text-fg-muted transition-colors flex items-center justify-between"
+                                                            },
+                                                            onclick: move |_| {
+                                                                if configured {
+                                                                    chat_command.set(Some(ChatCommand::SwitchProvider(index)));
+                                                                } else {
+                                                                    chat_command.set(Some(ChatCommand::SwitchToSettingsTab(crate::settings::SettingsTab::General, None)));
+                                                                }
+                                                                show_provider_selector.set(false);
+                                                            },
+                                                            div {
+                                                                class: "flex items-center space-x-2",
+                                                                span {
+                                                                    class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm shrink-0", provider.color_class()),
+                                                                    "{provider.initial()}"
+                                                                }
+                                                                span { class: "truncate", "{provider.display_name()}" }
+                                                            }
+                                                            if index < 9 {
+                                                                span {
+                                                                    class: "text-xs text-fg-muted font-mono",
+                                                                    "⇧⌥⌘{index + 1}"
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Click outside handler to close dropdown
+                                    if show_provider_selector() {
+                                        div {
+                                            class: "fixed inset-0 z-40",
+                                            onclick: move |_| show_provider_selector.set(false)
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            rsx!({})
+                        }
+                    }
+                } else { rsx!({}) } }
+
+                // Model Selector Dropdown (session-scoped: slots/model follow the
+                // session's effective provider, falling back to global settings)
                 { if ui_state.read().show_model_selector {
-                    let current_model = settings.read().active_chat_model();
-                    let slots = settings.read().active_model_slots();
+                    let (session_provider, current_model) = {
+                        let settings_read = settings.read();
+                        match session_state.read().get_active_session() {
+                            Some(s) => (
+                                settings_read.provider_for_session(s),
+                                settings_read.chat_model_for_session(s),
+                            ),
+                            None => (settings_read.active_llm, settings_read.active_chat_model()),
+                        }
+                    };
+                    let slots = settings.read().model_slots_for(session_provider);
                     let user_icons = settings.read().model_icons.clone();
                     // Icon priority: user-set icon > slot position icon > default
                     let current_slot_idx = slots.iter().position(|s| s == &current_model);
@@ -571,7 +701,7 @@ pub fn ChatInput(
                             class: "relative",
                             button {
                                 class: "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm hover:border-primary-500 transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-primary-600",
-                                title: "{display_name_for_provider(&settings.read().active_llm, &current_model)}",
+                                title: "{display_name_for_provider(&session_provider, &current_model)}",
                                 onclick: move |_| show_model_selector.set(!show_model_selector()),
                                 "{model_icon}"
                             }
@@ -587,7 +717,7 @@ pub fn ChatInput(
                                             let icon = user_icons.get(model_slug).cloned()
                                                 .unwrap_or_else(|| get_slot_icon(index));
                                             // Display name: strip common prefixes for readability
-                                            let display_name = display_name_for_provider(&settings.read().active_llm, model_slug);
+                                            let display_name = display_name_for_provider(&session_provider, model_slug);
 
                                             rsx! {
                                                 button {
@@ -1056,7 +1186,7 @@ pub fn ChatInput(
 
                                                         let settings_reader = settings.read();
                                                         let builder = PromptBuilder::new(&session_for_debug, &settings_reader, &state);
-                                                        let result = builder.build_prompt("[DEBUG USER MESSAGE]".to_string(), None);
+                                                        let result = builder.build_prompt("[DEBUG USER MESSAGE]".to_string());
                                                         let prompt_data = result.prompt;
                                                         format!("{:#?}", prompt_data)
                                                     } else {

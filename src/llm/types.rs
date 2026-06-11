@@ -107,25 +107,21 @@ impl LlmPrompt {
         &mut self,
         max_context_tokens: usize,
         protected_window: usize,
+        chars_per_token: f64,
     ) -> usize {
         use crate::context::token_estimator::{
-            effective_input_budget, estimate_tokens, messages_to_drop,
+            effective_input_budget, estimate_tool_definition_tokens, estimate_tokens_with_ratio, messages_to_drop,
         };
 
         let budget = effective_input_budget(max_context_tokens);
 
         // Phase 1: Trim tool definitions if fixed cost (system + tools) exceeds budget.
         // This handles the degenerate case where tool schemas alone consume most of the context.
-        let system_cost = self.system.as_ref().map_or(0, |s| estimate_tokens(s));
+        let system_cost = self.system.as_ref().map_or(0, |s| estimate_tokens_with_ratio(s, chars_per_token));
         let tool_cost: usize = self
             .tools
             .iter()
-            .map(|t| {
-                estimate_tokens(&t.name)
-                    + estimate_tokens(&t.description)
-                    + estimate_tokens(&t.parameters.to_string())
-                    + 10
-            })
+            .map(|t| estimate_tool_definition_tokens(t, chars_per_token))
             .sum();
 
         if system_cost + tool_cost > budget && !self.tools.is_empty() {
@@ -143,14 +139,8 @@ impl LlmPrompt {
 
             // Sort tools by estimated token cost (largest schemas first) for trimming
             self.tools.sort_by(|a, b| {
-                let cost_a = estimate_tokens(&a.name)
-                    + estimate_tokens(&a.description)
-                    + estimate_tokens(&a.parameters.to_string())
-                    + 10;
-                let cost_b = estimate_tokens(&b.name)
-                    + estimate_tokens(&b.description)
-                    + estimate_tokens(&b.parameters.to_string())
-                    + 10;
+                let cost_a = estimate_tool_definition_tokens(a, chars_per_token);
+                let cost_b = estimate_tool_definition_tokens(b, chars_per_token);
                 cost_b.cmp(&cost_a)
             });
 
@@ -168,10 +158,7 @@ impl LlmPrompt {
                     continue;
                 }
 
-                let this_cost = estimate_tokens(&tool.name)
-                    + estimate_tokens(&tool.description)
-                    + estimate_tokens(&tool.parameters.to_string())
-                    + 10;
+                let this_cost = estimate_tool_definition_tokens(tool, chars_per_token);
                 current_tool_cost -= this_cost;
                 to_remove.push(i);
             }
@@ -235,12 +222,12 @@ impl LlmPrompt {
         // Phase 2: Message trimming (last resort)
         // (Tool result sizing is now handled dynamically by PromptBuilder::compute_tool_result_budget()
         // which paginates results based on the remaining token budget).
-        let (drop_count, estimated_tokens) = messages_to_drop(self, budget, protected_window);
+        let (drop_count, _estimated_tokens) = messages_to_drop(self, budget, protected_window, chars_per_token);
 
         if drop_count > 0 {
             tracing::warn!(
-                "Context budget exceeded: estimated {} tokens, budget {} (max {} - 15% safety). Dropping {} oldest messages.",
-                crate::context::token_estimator::estimate_prompt_tokens(self),
+                "Context budget exceeded: estimated {} tokens, budget {} (max {} - safety margin). Dropping {} oldest messages.",
+                crate::context::token_estimator::estimate_prompt_tokens_with_ratio(self, chars_per_token),
                 budget,
                 max_context_tokens,
                 drop_count
@@ -249,13 +236,17 @@ impl LlmPrompt {
             // Remove oldest messages
             self.messages.drain(..drop_count);
 
-            // Inject a context-trimmed marker as the first message
+            // Inject a context-trimmed marker as the first message.
+            // Framed explicitly as a system annotation so the model does not
+            // confuse it with the user's actual request.
             self.messages.insert(0, ChatMessage {
                 role: ChatRole::User,
                 content: vec![ContentBlock::Text {
                     text: format!(
-                        "[Earlier conversation history ({} messages) was omitted to fit within the model's {} token context window. Estimated {} tokens used.]",
-                        drop_count, max_context_tokens, estimated_tokens
+                        "[SYSTEM NOTE — DO NOT treat this as a user message. \
+                        Earlier conversation history ({} messages) was omitted to fit the context window. \
+                        Continue the conversation normally based on the messages that follow.]",
+                        drop_count
                     ),
                 }],
             });

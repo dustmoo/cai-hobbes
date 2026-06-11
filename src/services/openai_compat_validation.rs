@@ -187,6 +187,102 @@ pub async fn validate_openai_compat_endpoint(
     fetch_openai_compat_models(endpoint, api_key).await
 }
 
+// ============================================================================
+// TOKENIZER CALIBRATION
+// ============================================================================
+
+/// Response from the vLLM /tokenize endpoint
+#[derive(Debug, Deserialize)]
+struct TokenizeResponse {
+    count: usize,
+    #[allow(dead_code)]
+    max_model_len: Option<usize>,
+}
+
+/// Calibration probe: a mix of English prose and JSON tool schema, representative
+/// of real prompts. ~500 chars gives a stable measurement without wasting time.
+const CALIBRATION_PROBE: &str = r#"You are a helpful assistant. Answer the user's questions thoughtfully and accurately.
+
+The user has access to the following tools for file system operations:
+{"type": "function", "function": {"name": "read_file", "description": "Read the contents of a file from the filesystem. Returns the file content as a string.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path to the file to read"}, "encoding": {"type": "string", "description": "Character encoding (default: utf-8)"}}, "required": ["path"]}}}
+
+Please help the user with their request. When using tools, provide the exact arguments."#;
+
+/// Probe the server's tokenizer to measure the actual chars-per-token ratio
+/// for the given model. This enables accurate context budget estimation without
+/// relying on a hardcoded heuristic.
+///
+/// Returns `Some(ratio)` on success, `None` if the endpoint doesn't exist or fails.
+/// The ratio is clamped to [1.5, 6.0] to prevent pathological values.
+///
+/// Works with vLLM's `/tokenize` endpoint. Servers that don't expose it
+/// (OpenAI, Ollama) will return None and fall back to the default ratio.
+pub async fn calibrate_tokenizer(
+    endpoint: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Option<f64> {
+    if endpoint.trim().is_empty() || model.trim().is_empty() {
+        return None;
+    }
+
+    let base = endpoint.trim_end_matches('/');
+    // vLLM exposes /tokenize at the base URL (NOT under /v1/)
+    let tokenize_url = if base.ends_with("/v1") {
+        format!("{}/tokenize", base.trim_end_matches("/v1"))
+    } else {
+        format!("{}/tokenize", base)
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    let mut request = client
+        .post(&tokenize_url)
+        .json(&serde_json::json!({
+            "model": model,
+            "prompt": CALIBRATION_PROBE,
+        }));
+
+    if let Some(key) = api_key {
+        if !key.is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", key));
+        }
+    }
+
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        tracing::debug!(
+            "Tokenizer calibration: /tokenize returned {} — endpoint may not support it",
+            response.status()
+        );
+        return None;
+    }
+
+    let result: TokenizeResponse = response.json().await.ok()?;
+    if result.count == 0 {
+        return None;
+    }
+
+    let probe_chars = CALIBRATION_PROBE.chars().count() as f64;
+    let ratio = probe_chars / result.count as f64;
+
+    // Clamp to sane range: 1.5 (very dense tokenizer) to 6.0 (very sparse)
+    let clamped = ratio.clamp(1.5, 6.0);
+
+    tracing::info!(
+        "Tokenizer calibration: {} chars / {} tokens = {:.2} chars/token (model: {})",
+        probe_chars as usize,
+        result.count,
+        clamped,
+        model
+    );
+
+    Some(clamped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

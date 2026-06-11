@@ -1,9 +1,10 @@
-use crate::llm::types::{ChatMessage, ContentBlock, LlmPrompt};
+use crate::llm::types::{ChatMessage, ContentBlock, LlmPrompt, ToolDefinition};
 
-/// Lightweight token estimator using a characters-per-token heuristic.
-/// Uses ~4 chars/token (conservative for English text, slightly aggressive for code/JSON).
-/// This avoids external tokenizer dependencies while providing useful bounds.
-const CHARS_PER_TOKEN: usize = 4;
+/// Default chars-per-token ratio (used when no configurable value is provided).
+/// 3.0 balances English prose (~4 chars/token) with JSON/code (~2.5 chars/token).
+/// This is intentionally conservative — overestimating tokens is safer than
+/// underestimating, which causes "Prompt Too Large" errors from the server.
+pub const DEFAULT_CHARS_PER_TOKEN: f64 = 3.0;
 
 /// Safety margin — reserve this fraction of the context for output + API overhead.
 /// For small models (<32K), JSON tokenization overhead means our character-based
@@ -14,73 +15,96 @@ const CHARS_PER_TOKEN: usize = 4;
 const MIN_SAFETY_MARGIN: f64 = 0.15;
 const MAX_SAFETY_MARGIN: f64 = 0.30;
 
-/// Estimate token count for a text string.
-pub fn estimate_tokens(text: &str) -> usize {
+/// Estimate token count for a text string using configurable ratio.
+pub fn estimate_tokens_with_ratio(text: &str, chars_per_token: f64) -> usize {
     // Use char count (not byte count) for better accuracy with Unicode
-    text.chars().count().div_ceil(CHARS_PER_TOKEN)
+    (text.chars().count() as f64 / chars_per_token).ceil() as usize
 }
 
-/// Estimate token count for a single ChatMessage.
-pub fn estimate_message_tokens(message: &ChatMessage) -> usize {
+/// Estimate token count for a text string using default ratio.
+#[allow(dead_code)]
+pub fn estimate_tokens(text: &str) -> usize {
+    estimate_tokens_with_ratio(text, DEFAULT_CHARS_PER_TOKEN)
+}
+
+/// Estimate token cost of a single tool definition.
+/// Uses json_ratio (capped at 2.5) for description + parameter schemas,
+/// since JSON structures tokenize more expensively than prose.
+pub fn estimate_tool_definition_tokens(tool: &ToolDefinition, chars_per_token: f64) -> usize {
+    let json_ratio = chars_per_token.min(2.5);
+    estimate_tokens_with_ratio(&tool.name, chars_per_token)
+        + (tool.description.chars().count() as f64 / json_ratio).ceil() as usize
+        + (tool.parameters.to_string().chars().count() as f64 / json_ratio).ceil() as usize
+        + 10 // structural overhead per tool
+}
+
+/// Estimate token count for a single ChatMessage using configurable ratio.
+pub fn estimate_message_tokens_with_ratio(message: &ChatMessage, chars_per_token: f64) -> usize {
     // Each message has ~4 tokens of structural overhead (role, delimiters)
     let mut tokens = 4;
+    // JSON structures tokenize more expensively — use a tighter ratio
+    let json_ratio = chars_per_token.min(2.5);
     for block in &message.content {
         match block {
             ContentBlock::Text { text } => {
-                tokens += estimate_tokens(text);
+                tokens += estimate_tokens_with_ratio(text, chars_per_token);
             }
             ContentBlock::ToolCall {
                 name, arguments, ..
             } => {
-                // JSON structures tokenize more expensively (~3 chars/token)
-                tokens += estimate_tokens(name);
+                tokens += estimate_tokens_with_ratio(name, chars_per_token);
                 let arg_str = arguments.to_string();
-                tokens += arg_str.chars().count().div_ceil(3);
+                tokens += (arg_str.chars().count() as f64 / json_ratio).ceil() as usize;
             }
             ContentBlock::ToolResult { name, content, .. } => {
-                // JSON structures tokenize more expensively (~3 chars/token)
-                tokens += estimate_tokens(name);
+                tokens += estimate_tokens_with_ratio(name, chars_per_token);
                 let content_str = content.to_string();
-                tokens += content_str.chars().count().div_ceil(3);
+                tokens += (content_str.chars().count() as f64 / json_ratio).ceil() as usize;
             }
             ContentBlock::Image { .. } => {
                 // Images vary wildly; use a conservative fixed estimate
                 tokens += 256;
             }
             ContentBlock::Thinking { text, .. } => {
-                tokens += estimate_tokens(text);
+                tokens += estimate_tokens_with_ratio(text, chars_per_token);
             }
         }
     }
     tokens
 }
 
-/// Estimate total token count for an entire LlmPrompt.
-pub fn estimate_prompt_tokens(prompt: &LlmPrompt) -> usize {
+/// Estimate token count for a single ChatMessage using default ratio.
+#[allow(dead_code)]
+pub fn estimate_message_tokens(message: &ChatMessage) -> usize {
+    estimate_message_tokens_with_ratio(message, DEFAULT_CHARS_PER_TOKEN)
+}
+
+/// Estimate total token count for an entire LlmPrompt using configurable ratio.
+pub fn estimate_prompt_tokens_with_ratio(prompt: &LlmPrompt, chars_per_token: f64) -> usize {
     let mut tokens = 0;
 
     // System prompt
     if let Some(system) = &prompt.system {
-        tokens += estimate_tokens(system);
+        tokens += estimate_tokens_with_ratio(system, chars_per_token);
     }
 
     // All messages
     for msg in &prompt.messages {
-        tokens += estimate_message_tokens(msg);
+        tokens += estimate_message_tokens_with_ratio(msg, chars_per_token);
     }
 
     // Tool definitions (JSON schemas are token-heavy)
     for tool in &prompt.tools {
-        // Tool schemas have JSON-heavy structure — use 3 chars/token
-        let desc_str = tool.description.clone();
-        let param_str = tool.parameters.to_string();
-        tokens += estimate_tokens(&tool.name);
-        tokens += desc_str.chars().count().div_ceil(3);
-        tokens += param_str.chars().count().div_ceil(3);
-        tokens += 10; // structural overhead per tool
+        tokens += estimate_tool_definition_tokens(tool, chars_per_token);
     }
 
     tokens
+}
+
+/// Estimate total token count for an entire LlmPrompt using default ratio.
+#[allow(dead_code)]
+pub fn estimate_prompt_tokens(prompt: &LlmPrompt) -> usize {
+    estimate_prompt_tokens_with_ratio(prompt, DEFAULT_CHARS_PER_TOKEN)
 }
 
 /// Calculate the effective input budget given a max context window.
@@ -99,27 +123,24 @@ pub fn effective_input_budget(max_context_tokens: usize) -> usize {
 /// Returns the number of messages to drop, and the estimated final token count.
 ///
 /// Never drops: system prompt, tools, the last `protected_window` messages.
+/// `chars_per_token`: configurabe ratio for token estimation accuracy.
 pub fn messages_to_drop(
     prompt: &LlmPrompt,
     budget: usize,
     protected_window: usize,
+    chars_per_token: f64,
 ) -> (usize, usize) {
-    let total = estimate_prompt_tokens(prompt);
+    let total = estimate_prompt_tokens_with_ratio(prompt, chars_per_token);
     if total <= budget {
         return (0, total);
     }
 
     // Cost of fixed elements (system + tools) — these are never dropped
-    let fixed_cost = prompt.system.as_ref().map_or(0, |s| estimate_tokens(s))
+    let fixed_cost = prompt.system.as_ref().map_or(0, |s| estimate_tokens_with_ratio(s, chars_per_token))
         + prompt
             .tools
             .iter()
-            .map(|t| {
-                estimate_tokens(&t.name)
-                    + estimate_tokens(&t.description)
-                    + estimate_tokens(&t.parameters.to_string())
-                    + 10
-            })
+            .map(|t| estimate_tool_definition_tokens(t, chars_per_token))
             .sum::<usize>();
 
     // Protected messages (last N) — never dropped
@@ -129,7 +150,7 @@ pub fn messages_to_drop(
     // Cost of protected messages
     let protected_cost: usize = prompt.messages[protected_start..]
         .iter()
-        .map(estimate_message_tokens)
+        .map(|m| estimate_message_tokens_with_ratio(m, chars_per_token))
         .sum();
 
     let available_for_history = budget.saturating_sub(fixed_cost + protected_cost);
@@ -138,7 +159,7 @@ pub fn messages_to_drop(
     let mut kept_cost = 0usize;
     let mut first_kept = 0usize;
     for (i, msg) in prompt.messages[..protected_start].iter().enumerate().rev() {
-        let msg_cost = estimate_message_tokens(msg);
+        let msg_cost = estimate_message_tokens_with_ratio(msg, chars_per_token);
         if kept_cost + msg_cost > available_for_history {
             first_kept = i + 1;
             break;
@@ -158,8 +179,8 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens_basic() {
-        // 12 chars → 3 tokens
-        assert_eq!(estimate_tokens("hello world!"), 3);
+        // 12 chars / 3.0 = 4 tokens
+        assert_eq!(estimate_tokens("hello world!"), 4);
         // Empty string → 0 tokens
         assert_eq!(estimate_tokens(""), 0);
     }
@@ -193,7 +214,7 @@ mod tests {
             }],
             tools: vec![],
         };
-        let (dropped, _) = messages_to_drop(&prompt, 1000, 2);
+        let (dropped, _) = messages_to_drop(&prompt, 1000, 2, DEFAULT_CHARS_PER_TOKEN);
         assert_eq!(dropped, 0);
     }
 
@@ -219,7 +240,7 @@ mod tests {
             tools: vec![],
         };
         // Budget of 300 tokens — should drop most messages
-        let (dropped, estimate) = messages_to_drop(&prompt, 300, 4);
+        let (dropped, estimate) = messages_to_drop(&prompt, 300, 4, DEFAULT_CHARS_PER_TOKEN);
         assert!(dropped > 0, "Should drop some messages");
         assert!(estimate <= 300, "Estimate should be within budget");
     }

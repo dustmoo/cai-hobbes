@@ -1,6 +1,6 @@
 use crate::settings::Settings;
 use dioxus::prelude::Signal;
-use dioxus_signals::{Readable, Writable};
+use dioxus_signals::Readable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -44,15 +44,11 @@ impl Default for PermissionSettings {
 #[derive(Debug, Clone, Copy)]
 pub struct PermissionManager {
     settings: Signal<Settings>,
-    turn_count: Signal<u32>,
 }
 
 impl PermissionManager {
     pub fn new(settings: Signal<Settings>) -> Self {
-        Self {
-            settings,
-            turn_count: Signal::new(0),
-        }
+        Self { settings }
     }
 
     pub fn check_mcp_permission(&self, server_name: &str) -> PermissionStatus {
@@ -93,17 +89,9 @@ impl PermissionManager {
         }
     }
 
-    pub fn increment_turn_count(&mut self) {
-        *self.turn_count.write() += 1;
-    }
-
-    pub fn reset_turn_count(&mut self) {
-        *self.turn_count.write() = 0;
-    }
-
-    pub fn is_turn_limit_reached(&self) -> bool {
+    pub fn is_turn_limit_reached_for(&self, turn_count: u32) -> bool {
         let settings = self.settings.read();
-        *self.turn_count.read() >= settings.permission_settings.max_ai_turns
+        turn_count >= settings.permission_settings.max_ai_turns
     }
 
     /// Check if skill execution is allowed based on permission settings.
@@ -144,22 +132,16 @@ mod tests {
         let mut dom = VirtualDom::new(|| {
             let settings = use_context_provider(|| Signal::new(Settings::default()));
             use_context_provider(|| Signal::new(PermissionManager::new(settings)));
-            let mut permission_manager = consume_context::<Signal<PermissionManager>>();
+            let pm = consume_context::<Signal<PermissionManager>>();
 
             use_effect(move || {
-                let mut pm = permission_manager.write();
+                let pm_read = pm.read();
 
-                assert!(!pm.is_turn_limit_reached());
-
-                for _ in 0..25 {
-                    pm.increment_turn_count();
-                }
-
-                assert!(pm.is_turn_limit_reached());
-
-                pm.reset_turn_count();
-
-                assert!(!pm.is_turn_limit_reached());
+                // Default limit is 25
+                assert!(!pm_read.is_turn_limit_reached_for(0));
+                assert!(!pm_read.is_turn_limit_reached_for(24));
+                assert!(pm_read.is_turn_limit_reached_for(25));
+                assert!(pm_read.is_turn_limit_reached_for(100));
             });
 
             rsx! { div {} }

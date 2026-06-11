@@ -353,6 +353,7 @@ fn align_class(idx: usize, alignments: &[pulldown_cmark::Alignment]) -> &'static
     }
 }
 
+#[allow(clippy::only_used_in_recursion)]
 fn render_node(
     node: RenderNode,
     comments: Option<&Vec<Comment>>,

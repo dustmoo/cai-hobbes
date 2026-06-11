@@ -177,7 +177,7 @@ impl ImageClient {
                 let file_name = format!("hobbes_gen_{}.{}", timestamp, extension);
                 // Save to persistent app directory (not temp) so images survive reboots
                 let mut path = dirs::config_dir()
-                    .unwrap_or_else(|| std::env::temp_dir())
+                    .unwrap_or_else(std::env::temp_dir)
                     .join("com.hobbes.app")
                     .join("generated_images");
                 if let Err(e) = std::fs::create_dir_all(&path) {

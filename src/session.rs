@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -31,6 +31,12 @@ pub struct ConversationSummary {
     pub summary: String,
     #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
     pub sentiment: String,
+    /// The active task or goal the user is currently pursuing.
+    /// Populated automatically by the summarizer on each turn — no model tool call needed.
+    /// Injected as part of `conversation_summary` in the system context (Tier 3).
+    /// For small-context models this acts as a goal anchor so the task survives history scrolling.
+    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
+    pub current_task: String,
     #[serde(default)]
     pub entities: ConversationSummaryEntities,
 }
@@ -113,20 +119,54 @@ pub struct Session {
     /// Acts as the live authority for tool-calling/MCP context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composio_profile: Option<String>,
+    /// Per-session LLM provider override. None → follow global `Settings::active_llm`.
+    /// Set together with `chat_model` by the chat-bar pickers so the pair stays consistent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_provider: Option<crate::settings::LlmProvider>,
+    /// Per-session chat model override. None → the effective provider's configured model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_model: Option<String>,
     /// Skills actively loaded into this session's context.
     /// Maps skill_name → CapabilityContextPayload JSON (the response from execute_skill).
     /// Skills persist here until explicitly unloaded via /unload.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub loaded_skills: HashMap<String, String>,
+    /// AI-authored persistent scratchpad.
+    /// Written by the AI via HOBBES_UPDATE_SCRATCHPAD (overwrite semantics).
+    /// Injected as a Tier 1 core payload — never trimmed by context compression.
+    /// Survives history scrolling and all 4 compression tiers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scratchpad: String,
+    /// Track the number of automated AI turns in a single loop.
+    /// Scoped per-session to prevent cross-tab interference and reset-bypasses.
+    #[serde(default)]
+    pub current_ai_turn_count: u32,
+    /// Track how many times watch words have triggered auto-recovery in the
+    /// current user turn. Resets when the user sends a new message.
+    /// Prevents infinite recovery loops when the model keeps stalling.
+    #[serde(default)]
+    pub watch_word_recovery_count: u32,
 }
 
 impl Session {
+    pub fn increment_turn_count(&mut self) {
+        self.current_ai_turn_count += 1;
+    }
+
+    pub fn reset_turn_count(&mut self) {
+        self.current_ai_turn_count = 0;
+        self.watch_word_recovery_count = 0;
+    }
+
     pub fn delete_message_and_after(&mut self, message_id: &str) -> usize {
         if let Ok(uuid) = uuid::Uuid::parse_str(message_id) {
             if let Some(index) = self.messages.iter().position(|m| m.id == uuid) {
                 let count = self.messages.len() - index;
                 // Harvest cost/token data from the messages being deleted
                 // so the session totals never drop when messages are pruned.
+                // Also collect execution_ids from ToolCall messages so we can
+                // remove their stale tool_snapshot entries from active_context.
+                let mut deleted_execution_ids: Vec<String> = Vec::new();
                 for msg in &self.messages[index..] {
                     if let Some(usage) = &msg.usage {
                         if let Some(cost) = usage.cost {
@@ -134,8 +174,32 @@ impl Session {
                         }
                         self.accumulated_tokens += usage.total_tokens;
                     }
+                    if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
+                        deleted_execution_ids.push(tc.execution_id.clone());
+                    }
                 }
                 self.messages.truncate(index);
+
+                // Remove tool_snapshot_* entries for deleted tool calls.
+                // These are inserted by ToolCallSummarizer at end-of-turn and
+                // serialized into SYSTEM_CONTEXT via #[serde(flatten)]. Without
+                // this cleanup, the LLM sees phantom tool results from undone
+                // turns, causing it to loop on stale context.
+                for exec_id in &deleted_execution_ids {
+                    let key = format!("tool_snapshot_{}", exec_id);
+                    if self.active_context.extra.remove(&key).is_some() {
+                        tracing::debug!("Removed stale tool snapshot after undo: {}", key);
+                    }
+                }
+
+                // Reset conversation_summary to prevent stale context from
+                // deleted turns leaking into future prompts. The summarizer
+                // will re-populate it on the next turn's completion.
+                if count > 0 {
+                    self.active_context.conversation_summary = Default::default();
+                    tracing::debug!("Reset conversation_summary after undo ({} messages removed)", count);
+                }
+
                 self.last_updated = Utc::now();
                 count
             } else {
@@ -195,16 +259,60 @@ impl Session {
 
 /// A large tool result that has been split into pages for small context windows.
 /// Stored ephemerally in SessionState — not persisted to disk.
+///
+/// Pages are **not** pre-segmented. Instead, the full remaining content is stored
+/// and dynamically sliced at delivery time using the model's current context budget.
+/// This ensures page sizes adapt to context pressure changes between turns.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PagedResult {
-    /// Remaining pages (front-pop for O(1) delivery).
-    pub pages: VecDeque<String>,
+    /// Full remaining content. Consumed incrementally from the front
+    /// using a dynamic `page_budget` supplied at delivery time.
+    pub remaining_content: String,
     pub tool_name: String,
 }
 
 /// Session-scoped store for paginated tool results.
 /// Keys are tool_call_id (execution_id). Cleared on session switch.
 pub type PageQueue = HashMap<String, PagedResult>;
+
+// floor_char_boundary and find_split_point live in crate::str_utils
+// to avoid duplication with context/prompt_builder.rs.
+
+/// Compute the dynamic page delivery budget based on the current model's context window.
+/// Returns a character-count budget for a single page of HOBBES_PAGE_RESULT.
+///
+/// Uses the same provider-context resolution as `effective_tool_result_limit` in
+/// prompt_builder.rs, ensuring page sizes scale proportionally with the model.
+pub fn compute_page_budget(
+    settings: &crate::settings::Settings,
+    session: Option<&Session>,
+) -> usize {
+    let (provider, model) = match session {
+        Some(s) => (
+            settings.provider_for_session(s),
+            settings.chat_model_for_session(s),
+        ),
+        None => (settings.active_llm, settings.active_chat_model()),
+    };
+    let tuning = settings.effective_context_tuning_for(provider);
+    let provider_context_tokens = settings.resolve_context_window_for(provider, &model);
+
+    if let Some(max_tokens) = provider_context_tokens {
+        let ratio = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(
+            tuning.tool_result_budget_ratio,
+        );
+        let budget = (max_tokens as f64 * ratio * tuning.chars_per_token) as usize;
+        tracing::debug!(
+            "HOBBES_PAGE_RESULT budget: {} chars (ratio: {:.0}%, provider: {} tokens)",
+            budget,
+            ratio * 100.0,
+            max_tokens
+        );
+        budget
+    } else {
+        tuning.max_active_tool_output_length
+    }
+}
 
 /// Schema version for SessionState persistence.
 /// Bump this when adding new migrations to `load()`.
@@ -252,31 +360,72 @@ fn get_sessions_path() -> Option<PathBuf> {
 
 impl SessionState {
     /// Fetch the next page of a paginated tool result.
-    /// Returns `(page_content, tool_name, remaining)` or `None` if the
-    /// tool_call_id is not found. Automatically cleans up the entry when
-    /// all pages have been consumed.
-    pub fn fetch_next_page(&mut self, tool_call_id: &str) -> Option<(String, String, usize)> {
-        let entry = self.page_queue.get_mut(tool_call_id)?;
-        if entry.pages.is_empty() {
-            self.page_queue.remove(tool_call_id);
+    ///
+    /// `page_budget` controls how many characters to include in this page,
+    /// allowing dynamic sizing based on the current model's context window.
+    /// Returns `(page_content, tool_name, estimated_remaining)` or `None`
+    /// if the tool_call_id is not found. Automatically cleans up the entry
+    /// when all content has been consumed.
+    pub fn fetch_next_page(
+        &mut self,
+        tool_call_id: &str,
+        page_budget: usize,
+    ) -> Option<(String, String, usize)> {
+        // Remove the entry to avoid borrow conflicts during splitting.
+        // Re-insert after if content remains.
+        let mut entry = self.page_queue.remove(tool_call_id)?;
+
+        if entry.remaining_content.is_empty() {
             return None;
         }
-        let page_content = entry.pages.pop_front()?; // O(1) with VecDeque
-        let remaining = entry.pages.len();
+
         let tool_name = entry.tool_name.clone();
-        if remaining == 0 {
-            self.page_queue.remove(tool_call_id);
+
+        if entry.remaining_content.len() <= page_budget {
+            // Last page — return everything, don't re-insert
+            return Some((entry.remaining_content, tool_name, 0));
         }
-        Some((page_content, tool_name, remaining))
+
+        // Dynamically split at the current budget
+        let split_at = crate::str_utils::find_split_point(&entry.remaining_content, page_budget);
+        let page = entry.remaining_content[..split_at].to_string();
+        entry.remaining_content = entry.remaining_content[split_at..].to_string();
+
+        // Remaining page count is an ESTIMATE based on current budget.
+        // Limitations:
+        //  1. The budget may change between calls (model switch, context pressure)
+        //     so the actual number of remaining pages can drift from this estimate.
+        //  2. Assumes roughly uniform content density; highly variable content
+        //     (e.g., large JSON array followed by short metadata) will skew the prediction.
+        //  3. Smart splitting at semantic boundaries means actual page sizes are
+        //     slightly smaller than `page_budget`, so remaining count may underestimate.
+        let remaining_estimate = if entry.remaining_content.is_empty() {
+            0
+        } else {
+            ((entry.remaining_content.len() as f64) / (page_budget as f64)).ceil() as usize
+        };
+
+        // Re-insert if there's remaining content
+        if !entry.remaining_content.is_empty() {
+            self.page_queue
+                .insert(tool_call_id.to_string(), entry);
+        }
+
+        Some((page, tool_name, remaining_estimate))
     }
 
     /// Handle a HOBBES_PAGE_RESULT tool call. Extracts `tool_call_id` from
     /// `args_json`, fetches the next page, and returns `(status, response_string)`.
     /// Single authority for all HOBBES_PAGE_RESULT dispatch sites.
+    ///
+    /// `page_budget` controls how many characters to include in this page,
+    /// computed by the caller using `compute_page_budget(&settings)` to
+    /// dynamically match the model's current context window.
     pub fn handle_page_result(
         &mut self,
         args_json: &serde_json::Value,
         tool_call_id_arg: &str,
+        page_budget: usize,
     ) -> (crate::components::shared::ToolCallStatus, String) {
         let tool_call_id = if tool_call_id_arg.is_empty() {
             args_json
@@ -295,18 +444,21 @@ impl SessionState {
             );
         }
 
-        match self.fetch_next_page(&tool_call_id) {
+        match self.fetch_next_page(&tool_call_id, page_budget) {
             Some((content, tool_name, remaining)) => {
+                // NOTE: remaining count is an estimate (prefixed with ~) because
+                // dynamic page sizing means the budget may differ on each call.
+                // The actual number of pages may vary as context pressure changes.
                 let footer = if remaining > 0 {
                     format!(
-                        "\n\n[{} more page(s) remaining. Call HOBBES_PAGE_RESULT with tool_call_id=\"{}\" to see the next page.]",
+                        "\n\n[~{} more page(s) remaining. Call HOBBES_PAGE_RESULT with tool_call_id=\"{}\" to see the next page.]",
                         remaining, tool_call_id
                     )
                 } else {
                     "\n\n[All pages delivered.]".to_string()
                 };
                 tracing::info!(
-                    "HOBBES_PAGE_RESULT: Delivered page for '{}' (tool_call_id={}, remaining={})",
+                    "HOBBES_PAGE_RESULT: Delivered page for '{}' (tool_call_id={}, remaining=~{})",
                     tool_name, tool_call_id, remaining
                 );
                 (
@@ -324,6 +476,80 @@ impl SessionState {
         }
     }
 
+    /// Handle a HOBBES_UPDATE_SCRATCHPAD tool call.
+    /// Overwrites the active session's `scratchpad` field with the provided content.
+    /// Returns `(status, confirmation_string)` matching the pattern of `handle_page_result`.
+    pub fn handle_scratchpad_update(
+        &mut self,
+        args_json: &serde_json::Value,
+        session_id: &str,
+        settings: &crate::settings::Settings,
+    ) -> (crate::components::shared::ToolCallStatus, String) {
+        // Limit scratchpad to 2% of the context window in chars.
+        // e.g. 128K tokens × 4 chars/token × 2% ≈ 10,240 chars.
+        // Floor at 4K so small/unconfigured models still get meaningful space.
+        // Cap at 32K so even enormous context windows don't allow bloat.
+        let session = self.sessions.get(session_id);
+        let (provider, model) = match session {
+            Some(s) => (
+                settings.provider_for_session(s),
+                settings.chat_model_for_session(s),
+            ),
+            None => (settings.active_llm, settings.active_chat_model()),
+        };
+        let tuning = settings.effective_context_tuning_for(provider);
+        let max_scratchpad_chars: usize = settings
+            .resolve_context_window_for(provider, &model)
+            .map(|tokens| {
+                let chars = (tokens as f64 * tuning.chars_per_token * 0.02) as usize;
+                chars.clamp(4_000, 32_000)
+            })
+            .unwrap_or(16_000);
+
+        let content = args_json
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if content.is_empty() {
+            return (
+                crate::components::shared::ToolCallStatus::Error,
+                "Missing 'content' argument for HOBBES_UPDATE_SCRATCHPAD".to_string(),
+            );
+        }
+
+        let char_count = content.chars().count();
+
+        if char_count > max_scratchpad_chars {
+            return (
+                crate::components::shared::ToolCallStatus::Error,
+                format!(
+                    "Scratchpad too large ({} chars, max {} for this model). Please condense.",
+                    char_count, max_scratchpad_chars
+                ),
+            );
+        }
+
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.scratchpad = content;
+            tracing::info!(
+                "HOBBES_UPDATE_SCRATCHPAD: Scratchpad updated ({} chars, limit {})",
+                char_count, max_scratchpad_chars
+            );
+            (
+                crate::components::shared::ToolCallStatus::Completed,
+                format!("Scratchpad updated ({} chars). Content is now persistent for this session.", char_count),
+            )
+        } else {
+            tracing::warn!("HOBBES_UPDATE_SCRATCHPAD: Session '{}' not found", session_id);
+            (
+                crate::components::shared::ToolCallStatus::Error,
+                format!("Session '{}' not found", session_id),
+            )
+        }
+    }
+
     /// Store newly-generated paginated pages into the queue.
     /// Call this after `PromptBuilder::build_prompt` in a separate write scope.
     ///
@@ -338,9 +564,9 @@ impl SessionState {
         for (id, paged) in pages {
             if self.page_queue.contains_key(&id) {
                 tracing::debug!(
-                    "Skipping page queue entry (already exists): id={} (remaining={})",
+                    "Skipping page queue entry (already exists): id={} (remaining={} bytes)",
                     id,
-                    self.page_queue.get(&id).map_or(0, |p| p.pages.len())
+                    self.page_queue.get(&id).map_or(0, |p| p.remaining_content.len())
                 );
             } else {
                 tracing::debug!("Storing page queue entry: id={}", id);
@@ -678,7 +904,12 @@ impl SessionState {
             accumulated_turns: 0,
             memory_optimization_summary: None,
             composio_profile: initial_profile,
+            llm_provider: None,
+            chat_model: None,
             loaded_skills: HashMap::new(),
+            scratchpad: String::new(),
+            current_ai_turn_count: 0,
+            watch_word_recovery_count: 0,
         };
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id.clone();
@@ -715,6 +946,31 @@ impl SessionState {
     pub fn delete_session(&mut self, id: &str) {
         self.delete_session_raw(id);
         Self::save_async(self, None);
+    }
+
+    /// Remove sessions that are not in any open tab and haven't been
+    /// updated in `max_age` days. Harvests cost/token data before removal.
+    pub fn gc_closed_sessions(&mut self, open_tab_ids: &[String], max_age_days: i64) {
+        let cutoff = Utc::now() - chrono::Duration::days(max_age_days);
+        let open_set: std::collections::HashSet<&str> = open_tab_ids.iter().map(|s| s.as_str()).collect();
+
+        let stale_ids: Vec<String> = self.sessions.iter()
+            .filter(|(id, session)| {
+                !open_set.contains(id.as_str())
+                    && *id != &self.active_session_id
+                    && session.last_updated < cutoff
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in &stale_ids {
+            self.delete_session_raw(id); // Harvests cost/tokens into lifetime counters
+        }
+
+        if !stale_ids.is_empty() {
+            tracing::info!("GC: Removed {} stale sessions (older than {} days)", stale_ids.len(), max_age_days);
+            Self::save_async(self, None);
+        }
     }
 
     pub fn get_active_session(&self) -> Option<&Session> {
@@ -1468,49 +1724,272 @@ mod tests {
     fn test_store_pages_idempotency() {
         let mut state = SessionState::default();
 
-        // Store initial pages: ID "page-A" with 3 pages
+        // Store initial content: ID "page-A" with ~45 chars of remaining content
         let initial_pages = vec![
             ("page-A".to_string(), PagedResult {
-                pages: VecDeque::from(vec![
-                    "Page 1 content".to_string(),
-                    "Page 2 content".to_string(),
-                    "Page 3 content".to_string(),
-                ]),
+                remaining_content: "Page 1 content\nPage 2 content\nPage 3 content".to_string(),
                 tool_name: "test_tool".to_string(),
             }),
         ];
         state.store_pages(initial_pages);
-        assert_eq!(state.page_queue.get("page-A").unwrap().pages.len(), 3);
+        assert_eq!(
+            state.page_queue.get("page-A").unwrap().remaining_content.len(),
+            45 - 1  // "Page 1 content\nPage 2 content\nPage 3 content" = 44 chars
+        );
 
-        // Consume one page via fetch_next_page
-        let (content, name, remaining) = state.fetch_next_page("page-A").unwrap();
-        assert_eq!(content, "Page 1 content");
+        // Consume one page via fetch_next_page with a 15-char budget
+        let (content, name, remaining) = state.fetch_next_page("page-A", 15).unwrap();
         assert_eq!(name, "test_tool");
-        assert_eq!(remaining, 2);
+        assert!(!content.is_empty(), "Should return a non-empty page");
+        assert!(content.len() <= 15, "Page should respect budget");
+        assert!(remaining > 0, "Should have remaining pages");
 
-        // Simulate continuation turn: store_pages called again with same ID but fresh 3 pages
+        // Record how much content remains after consuming one page
+        let remaining_after_first = state.page_queue.get("page-A")
+            .unwrap()
+            .remaining_content
+            .len();
+
+        // Simulate continuation turn: store_pages called again with same ID but fresh content
         let re_generated = vec![
             ("page-A".to_string(), PagedResult {
-                pages: VecDeque::from(vec![
-                    "Page 1 content".to_string(),
-                    "Page 2 content".to_string(),
-                    "Page 3 content".to_string(),
-                ]),
+                remaining_content: "Page 1 content\nPage 2 content\nPage 3 content".to_string(),
                 tool_name: "test_tool".to_string(),
             }),
         ];
         state.store_pages(re_generated);
 
-        // CRITICAL: the queue should still have 2 pages (not reset to 3)
+        // CRITICAL: the queue should still have the partially-consumed content (not reset)
         assert_eq!(
-            state.page_queue.get("page-A").unwrap().pages.len(),
-            2,
+            state.page_queue.get("page-A").unwrap().remaining_content.len(),
+            remaining_after_first,
             "store_pages must NOT overwrite partially-consumed entries"
         );
 
-        // Verify we get page 2 next (not page 1 again)
-        let (content2, _, remaining2) = state.fetch_next_page("page-A").unwrap();
-        assert_eq!(content2, "Page 2 content");
-        assert_eq!(remaining2, 1);
+        // Verify we get the next portion of content (not starting over)
+        let (content2, _, _remaining2) = state.fetch_next_page("page-A", 15).unwrap();
+        assert!(!content2.is_empty(), "Should return next page content");
+        assert!(content2.len() <= 15, "Second page should also respect budget");
+    }
+
+    /// Test: fetch_next_page dynamically sizes pages based on page_budget.
+    /// Verifies that the same content produces differently-sized pages
+    /// when called with different budgets.
+    #[test]
+    fn test_dynamic_page_sizing() {
+        let mut state = SessionState::default();
+
+        // Store content (~100 chars)
+        let content = "Line one of the result.\nLine two of the result.\nLine three of the result.\nLine four of the result.";
+        state.store_pages(vec![
+            ("page-dynamic".to_string(), PagedResult {
+                remaining_content: content.to_string(),
+                tool_name: "dynamic_tool".to_string(),
+            }),
+        ]);
+
+        // Fetch with a small budget (30 chars)
+        let (page1, _, remaining1) = state.fetch_next_page("page-dynamic", 30).unwrap();
+        assert!(page1.len() <= 30, "Small budget: page should be ≤30 chars, got {}", page1.len());
+        assert!(remaining1 > 0, "Should have remaining content");
+
+        // Fetch with a large budget (remaining content should fit in one page)
+        let (page2, _, remaining2) = state.fetch_next_page("page-dynamic", 10000).unwrap();
+        assert!(page2.len() > 30, "Large budget: page should be larger than small-budget page");
+        assert_eq!(remaining2, 0, "Large budget should consume all remaining content");
+
+        // All content consumed — entry should be cleaned up
+        assert!(
+            state.page_queue.get("page-dynamic").is_none(),
+            "Entry should be removed after all content consumed"
+        );
+
+        // Concatenated pages should reproduce original content
+        let reconstructed = format!("{}{}", page1, page2);
+        assert_eq!(reconstructed, content, "Pages must reconstruct original content");
+    }
+
+    /// Test that delete_message_and_after cleans up stale tool_snapshot entries
+    /// and resets conversation_summary to prevent undo-loop bugs.
+    #[test]
+    fn test_delete_message_and_after_cleans_up_turn_state() {
+        use crate::components::chat::Message;
+        use crate::components::shared::{MessageContent, ToolCall, ToolCallStatus};
+
+        let exec_id_1 = "exec-aaaa-1111";
+        let exec_id_2 = "exec-bbbb-2222";
+        let msg1_id = uuid::Uuid::new_v4();
+        let msg2_id = uuid::Uuid::new_v4(); // user message
+        let msg3_id = uuid::Uuid::new_v4(); // tool call message (will be deleted)
+        let msg4_id = uuid::Uuid::new_v4(); // another tool call (will be deleted)
+
+        let mut session = Session {
+            id: "test-session".to_string(),
+            name: "Test".to_string(),
+            messages: vec![
+                Message {
+                    id: msg1_id,
+                    author: "User".to_string(),
+                    content: MessageContent::Text {
+                        content: "Hello".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                    },
+                    attachments: vec![],
+                    comments: vec![],
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                },
+                Message {
+                    id: msg2_id,
+                    author: "User".to_string(),
+                    content: MessageContent::Text {
+                        content: "Do something".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                    },
+                    attachments: vec![],
+                    comments: vec![],
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                },
+                Message {
+                    id: msg3_id,
+                    author: "Hobbes".to_string(),
+                    content: MessageContent::ToolCall(ToolCall {
+                        execution_id: exec_id_1.to_string(),
+                        server_name: "test-server".to_string(),
+                        tool_name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                        status: ToolCallStatus::Completed,
+                        response: "file contents".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                        cached_image_path: None,
+                    }),
+                    attachments: vec![],
+                    comments: vec![],
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                },
+                Message {
+                    id: msg4_id,
+                    author: "Hobbes".to_string(),
+                    content: MessageContent::ToolCall(ToolCall {
+                        execution_id: exec_id_2.to_string(),
+                        server_name: "test-server".to_string(),
+                        tool_name: "write_file".to_string(),
+                        arguments: "{}".to_string(),
+                        status: ToolCallStatus::Completed,
+                        response: "ok".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                        cached_image_path: None,
+                    }),
+                    attachments: vec![],
+                    comments: vec![],
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                },
+            ],
+            active_context: ActiveContext {
+                conversation_summary: ConversationSummary {
+                    summary: "User asked to read and write files.".to_string(),
+                    sentiment: "neutral".to_string(),
+                    current_task: String::new(),
+                    entities: ConversationSummaryEntities::default(),
+                },
+                ..Default::default()
+            },
+            last_updated: chrono::Utc::now(),
+            accumulated_cost: 0.0,
+            accumulated_tokens: 0,
+            accumulated_turns: 0,
+            memory_optimization_summary: None,
+            composio_profile: None,
+            llm_provider: None,
+            chat_model: None,
+            loaded_skills: HashMap::new(),
+            scratchpad: String::new(),
+            current_ai_turn_count: 0,
+            watch_word_recovery_count: 0,
+        };
+
+        // Simulate ToolCallSummarizer having inserted snapshots
+        session.active_context.extra.insert(
+            format!("tool_snapshot_{}", exec_id_1),
+            serde_json::json!({"tool_name": "read_file", "result_summary": "completed"}),
+        );
+        session.active_context.extra.insert(
+            format!("tool_snapshot_{}", exec_id_2),
+            serde_json::json!({"tool_name": "write_file", "result_summary": "completed"}),
+        );
+        // Also add an unrelated extra entry that should NOT be removed
+        session.active_context.extra.insert(
+            "unrelated_key".to_string(),
+            serde_json::json!("should survive"),
+        );
+
+        assert_eq!(session.active_context.extra.len(), 3);
+        assert!(!session.active_context.conversation_summary.summary.is_empty());
+
+        // Undo: delete msg2 and everything after (msg2, msg3, msg4)
+        let deleted = session.delete_message_and_after(&msg2_id.to_string());
+        assert_eq!(deleted, 3, "Should have deleted 3 messages");
+        assert_eq!(session.messages.len(), 1, "Only first message should remain");
+
+        // Tool snapshots for the deleted tool calls should be gone
+        assert!(
+            !session.active_context.extra.contains_key(&format!("tool_snapshot_{}", exec_id_1)),
+            "tool_snapshot for exec_id_1 should be removed"
+        );
+        assert!(
+            !session.active_context.extra.contains_key(&format!("tool_snapshot_{}", exec_id_2)),
+            "tool_snapshot for exec_id_2 should be removed"
+        );
+
+        // Unrelated extra entries should survive
+        assert!(
+            session.active_context.extra.contains_key("unrelated_key"),
+            "Unrelated extra entries must not be removed"
+        );
+
+        // Conversation summary should be reset
+        assert!(
+            session.active_context.conversation_summary.summary.is_empty(),
+            "Conversation summary should be cleared after undo"
+        );
+    }
+
+    #[test]
+    fn test_gc_closed_sessions() {
+        let mut state = SessionState::default();
+
+        let active_id = state.create_session_raw(None);
+        let open_id = state.create_session_raw(None);
+        let stale_id = state.create_session_raw(None);
+        let fresh_id = state.create_session_raw(None);
+
+        state.active_session_id = active_id.clone();
+
+        let now = Utc::now();
+        let old_time = now - chrono::Duration::days(10);
+        let fresh_time = now - chrono::Duration::days(2);
+
+        // Mutate their times
+        state.sessions.get_mut(&active_id).unwrap().last_updated = old_time;
+        state.sessions.get_mut(&open_id).unwrap().last_updated = old_time;
+        state.sessions.get_mut(&stale_id).unwrap().last_updated = old_time;
+        state.sessions.get_mut(&fresh_id).unwrap().last_updated = fresh_time;
+
+        state.save_disabled = true; // prevent file saving in test
+
+        let open_tabs = vec![open_id.clone()];
+        state.gc_closed_sessions(&open_tabs, 7);
+
+        assert!(state.sessions.contains_key(&active_id), "Active session must survive GC");
+        assert!(state.sessions.contains_key(&open_id), "Open session must survive GC");
+        assert!(state.sessions.contains_key(&fresh_id), "Fresh session must survive GC");
+        assert!(!state.sessions.contains_key(&stale_id), "Stale closed session must be removed by GC");
     }
 }

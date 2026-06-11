@@ -28,6 +28,7 @@ impl LlmConnector for OpenAiCompatConnector {
         mut prompt_data: LlmPrompt,
         tx: mpsc::UnboundedSender<StreamMessage>,
         _mcp_context: Option<McpContext>,
+        _session_id: Option<String>,
     ) {
         let base = self.config.endpoint.trim_end_matches('/');
         let endpoint = if base.ends_with("/v1") {
@@ -40,35 +41,38 @@ impl LlmConnector for OpenAiCompatConnector {
         // Silently trims oldest messages to fit; logs a warning when trimming occurs.
         // Protected window of 6 messages ensures recent context is always preserved.
         if let Some(max_tokens) = self.config.max_context_tokens {
+            // Use the per-provider chars_per_token ratio for accurate estimation
+            let chars_per_token = self.config.context_tuning.chars_per_token
+                .unwrap_or(crate::context::token_estimator::DEFAULT_CHARS_PER_TOKEN);
+
             // Log token budget breakdown for diagnostics
             let system_tokens = prompt_data
                 .system
                 .as_ref()
-                .map_or(0, |s| crate::context::token_estimator::estimate_tokens(s));
+                .map_or(0, |s| crate::context::token_estimator::estimate_tokens_with_ratio(s, chars_per_token));
             let message_tokens: usize = prompt_data
                 .messages
                 .iter()
-                .map(crate::context::token_estimator::estimate_message_tokens)
+                .map(|m| crate::context::token_estimator::estimate_message_tokens_with_ratio(m, chars_per_token))
                 .sum();
+            let json_ratio = chars_per_token.min(2.5);
             let tool_tokens: usize = prompt_data
                 .tools
                 .iter()
                 .map(|t| {
-                    crate::context::token_estimator::estimate_tokens(&t.name)
-                        + crate::context::token_estimator::estimate_tokens(&t.description)
-                        + crate::context::token_estimator::estimate_tokens(
-                            &t.parameters.to_string(),
-                        )
+                    crate::context::token_estimator::estimate_tokens_with_ratio(&t.name, chars_per_token)
+                        + (t.description.chars().count() as f64 / json_ratio).ceil() as usize
+                        + (t.parameters.to_string().chars().count() as f64 / json_ratio).ceil() as usize
                         + 10
                 })
                 .sum();
             let total = system_tokens + message_tokens + tool_tokens;
             tracing::debug!(
-                "Context budget: {}/{} tokens (system: {}, messages: {} ({} msgs), tools: {} ({} tools))",
-                total, max_tokens, system_tokens, message_tokens, prompt_data.messages.len(), tool_tokens, prompt_data.tools.len()
+                "Context budget: {}/{} tokens @ {:.1} chars/tok (system: {}, messages: {} ({} msgs), tools: {} ({} tools))",
+                total, max_tokens, chars_per_token, system_tokens, message_tokens, prompt_data.messages.len(), tool_tokens, prompt_data.tools.len()
             );
 
-            let dropped = prompt_data.enforce_context_budget(max_tokens, 6);
+            let dropped = prompt_data.enforce_context_budget(max_tokens, 6, chars_per_token);
             if dropped > 0 {
                 tracing::warn!(
                     "OpenAI Compat: Trimmed {} oldest messages to fit {} token context window",
@@ -149,6 +153,11 @@ impl LlmConnector for OpenAiCompatConnector {
             let is_real_openai = self.is_real_openai();
             let mut inside_think = false;
             let mut think_buffer = String::new();
+
+            // State for tracking <|channel>thought / <|channel>response token boundaries.
+            // These leak from Gemma 4 and similar models when vLLM doesn't separate
+            // thinking into the reasoning_content field. Persisted across chunk boundaries.
+            let mut inside_channel_think = false;
 
             // State for detecting inline <tool_call> tags (Hermes/Qwen format)
             // When vLLM doesn't produce structured tool_calls, Qwen wraps them as:
@@ -281,40 +290,66 @@ impl LlmConnector for OpenAiCompatConnector {
                                     // never produces <think>/<thinking> tags. Parsing them would
                                     // only catch echoed tags from our own history injection.
                                     if !remaining_text.is_empty() {
-                                        if is_real_openai {
-                                            // Real OpenAI: pass text straight through, no tag parsing
-                                            let _ = tx.send(StreamMessage::Text {
-                                                content: remaining_text,
-                                                thought_signature: None,
-                                                thought_summary: None,
-                                            });
-                                        } else {
-                                            let processed = self.split_think_tags(
-                                                &remaining_text,
-                                                &mut inside_think,
-                                                &mut think_buffer,
-                                            );
-                                            for (is_thinking, text) in processed {
-                                                if is_thinking {
-                                                    // Accumulate thinking for potential tool call attachment
-                                                    if let Some(ref mut summary) =
-                                                        accumulated_thought_summary
-                                                    {
-                                                        summary.push_str(&text);
-                                                    } else {
-                                                        accumulated_thought_summary = Some(text.clone());
-                                                    }
+                                        // Phase 1: Strip leaked <|channel>thought / <|channel>response
+                                        // special tokens (Gemma 4, etc.) BEFORE XML tag parsing.
+                                        // These can appear even when thinking mode is disabled.
+                                        let channel_segments = super::convert::strip_channel_tokens(
+                                            &remaining_text,
+                                            &mut inside_channel_think,
+                                        );
+
+                                        for (is_channel_thinking, segment_text) in channel_segments {
+                                            if is_channel_thinking {
+                                                // Route to thinking display
+                                                if let Some(ref mut summary) = accumulated_thought_summary {
+                                                    summary.push_str(&segment_text);
+                                                } else {
+                                                    accumulated_thought_summary = Some(segment_text.clone());
+                                                }
+                                                let _ = tx.send(StreamMessage::Text {
+                                                    content: String::new(),
+                                                    thought_signature: None,
+                                                    thought_summary: Some(segment_text),
+                                                });
+                                            } else if !segment_text.is_empty() {
+                                                // Phase 2: Process non-thinking segments through
+                                                // XML think tag detection (<think>/<thinking>)
+                                                if is_real_openai {
+                                                    // Real OpenAI: pass text straight through, no tag parsing
                                                     let _ = tx.send(StreamMessage::Text {
-                                                        content: String::new(),
-                                                        thought_signature: None,
-                                                        thought_summary: Some(text),
-                                                    });
-                                                } else if !text.is_empty() {
-                                                    let _ = tx.send(StreamMessage::Text {
-                                                        content: text,
+                                                        content: segment_text,
                                                         thought_signature: None,
                                                         thought_summary: None,
                                                     });
+                                                } else {
+                                                    let processed = self.split_think_tags(
+                                                        &segment_text,
+                                                        &mut inside_think,
+                                                        &mut think_buffer,
+                                                    );
+                                                    for (is_thinking, text) in processed {
+                                                        if is_thinking {
+                                                            // Accumulate thinking for potential tool call attachment
+                                                            if let Some(ref mut summary) =
+                                                                accumulated_thought_summary
+                                                            {
+                                                                summary.push_str(&text);
+                                                            } else {
+                                                                accumulated_thought_summary = Some(text.clone());
+                                                            }
+                                                            let _ = tx.send(StreamMessage::Text {
+                                                                content: String::new(),
+                                                                thought_signature: None,
+                                                                thought_summary: Some(text),
+                                                            });
+                                                        } else if !text.is_empty() {
+                                                            let _ = tx.send(StreamMessage::Text {
+                                                                content: text,
+                                                                thought_signature: None,
+                                                                thought_summary: None,
+                                                            });
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -465,6 +500,7 @@ Preserve existing information while incorporating new facts, entities, or user p
 You MUST respond with valid JSON containing exactly these fields:
 - "summary": A concise, updated summary of the entire conversation so far.
 - "sentiment": A brief string describing the user's current mood (e.g., "curious and collaborative", "frustrated but focused").
+- "current_task": A one-sentence description of the specific task or goal the user is CURRENTLY working on. This is the active goal anchor — critical for small-context models. Example: "Implementing a dynamic history cap in prompt_builder.rs". Leave empty string if no clear active task.
 - "entities": An object with:
   - "user_name": The user's name if mentioned.
   - "project_name": The active project or codebase name.
@@ -586,6 +622,7 @@ impl LlmFormatConverter for OpenAiCompatConnector {
             // Separate content blocks by type: text/thinking go in `content`,
             // tool calls go in `tool_calls`, tool results are separate messages.
             let mut text_parts: Vec<String> = Vec::new();
+            let mut image_parts: Vec<(String, String)> = Vec::new(); // (mime_type, base64_data)
             let mut tool_calls_array: Vec<serde_json::Value> = Vec::new();
             let mut tool_result: Option<(String, String, String)> = None; // (call_id, name, content)
 
@@ -595,13 +632,15 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                         text_parts.push(text.clone());
                     }
                     ContentBlock::Thinking { text, .. } => {
-                        if self.is_real_openai() {
-                            // Real OpenAI: STRIP thinking entirely. GPT-5.x doesn't
-                            // understand <thinking> tags — injecting them causes a
-                            // feedback loop where the model echoes them back.
-                            // Thinking is handled internally via hidden reasoning tokens.
+                        if self.is_real_openai() || self.config.thinking_enabled {
+                            // Real OpenAI / thinking-enabled models (Gemma 4, Qwen3):
+                            // STRIP thinking from history. These models use native tokens
+                            // (<|channel>thought for Gemma, <|think|> for Qwen) — not XML
+                            // tags. Injecting <thinking> tags confuses the model and can
+                            // cause thinking text to leak into the response content.
                         } else {
-                            // vLLM/DeepSeek/Qwen: wrap in tags so models parse them back.
+                            // Local models without native thinking: wrap in tags so
+                            // models can parse them back if they use <think>/<thinking>.
                             text_parts.push(format!("<thinking>\n{}\n</thinking>", text));
                         }
                     }
@@ -652,11 +691,8 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                             name
                         );
                     }
-                    ContentBlock::Image { mime_type, .. } => {
-                        tracing::warn!(
-                            "OpenAI Compat: Image content block (mime_type={}) not yet supported in request serialization, skipping",
-                            mime_type
-                        );
+                    ContentBlock::Image { mime_type, data } => {
+                        image_parts.push((mime_type.clone(), data.clone()));
                     }
                 }
             }
@@ -687,11 +723,39 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                     msg_value["content"] = json!(text_parts.join("\n"));
                 }
                 messages.push(msg_value);
-            } else {
-                // Regular text message
+            } else if image_parts.is_empty() {
+                // Regular text message (no images)
                 messages.push(json!({
                     "role": role_str,
                     "content": text_parts.join("\n"),
+                }));
+            } else {
+                // Multimodal message — use structured content array (OpenAI Vision format)
+                // Supported by vLLM, Ollama, LM Studio, and the real OpenAI API.
+                let mut content_array: Vec<serde_json::Value> = Vec::new();
+                let joined_text = text_parts.join("\n");
+                if !joined_text.is_empty() {
+                    content_array.push(json!({
+                        "type": "text",
+                        "text": joined_text,
+                    }));
+                }
+                for (mime_type, data) in &image_parts {
+                    content_array.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{}", mime_type, data),
+                        }
+                    }));
+                }
+                tracing::debug!(
+                    "OpenAI Compat: Multimodal message with {} text + {} image parts",
+                    if joined_text.is_empty() { 0 } else { 1 },
+                    image_parts.len()
+                );
+                messages.push(json!({
+                    "role": role_str,
+                    "content": content_array,
                 }));
             }
         }
@@ -756,12 +820,31 @@ impl LlmFormatConverter for OpenAiCompatConnector {
             Some(openai_tools)
         };
 
-        let request = json!({
+        let mut request = json!({
             "model": self.config.model,
             "messages": messages,
             "tools": tools,
             "stream": streaming,
         });
+
+        // When thinking mode is enabled, configure the request so vLLM correctly
+        // separates thinking content into the `reasoning`/`reasoning_content` delta
+        // fields instead of leaking it into the text content.
+        //
+        // Two parameters are required:
+        //   1. chat_template_kwargs: {"enable_thinking": true}
+        //      Activates the model's thinking template (e.g. Gemma 4's <|channel> tokens).
+        //   2. skip_special_tokens: false
+        //      CRITICAL: vLLM defaults to stripping special tokens. Gemma 4 uses
+        //      <|channel>thought / <|channel>response tokens as delimiters. If these
+        //      are stripped (default), the reasoning parser cannot separate thinking
+        //      from response content, causing thinking text to leak into `content`
+        //      as raw text with no way to parse it.
+        if self.config.thinking_enabled && !self.is_real_openai() {
+            request["chat_template_kwargs"] = json!({"enable_thinking": true});
+            request["skip_special_tokens"] = json!(false);
+            tracing::debug!("OpenAI Compat: Thinking mode enabled — injecting chat_template_kwargs + skip_special_tokens=false");
+        }
 
         if self.config.model.is_empty() {
             tracing::error!(
@@ -771,11 +854,12 @@ impl LlmFormatConverter for OpenAiCompatConnector {
         }
 
         tracing::debug!(
-            "OpenAI Compat request: model='{}', {} messages, {} tools, endpoint='{}'",
+            "OpenAI Compat request: model='{}', {} messages, {} tools, endpoint='{}', thinking={}",
             self.config.model,
             messages.len(),
             tools.as_ref().map_or(0, |t| t.len()),
             self.config.endpoint,
+            self.config.thinking_enabled,
         );
 
         request
