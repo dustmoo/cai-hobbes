@@ -33,11 +33,12 @@ jobs:
     - name: Cache cargo
       uses: Swatinem/rust-cache@v2
 
-    - name: Install cargo-binstall
-      uses: cargo-bins/cargo-binstall@main
-
     - name: Install Dioxus CLI
-      run: cargo binstall dioxus-cli --version 0.6.3 --no-confirm
+      run: |
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "arm64" ]; then TARGET="aarch64-apple-darwin"; else TARGET="x86_64-apple-darwin"; fi
+        curl -fsSL "https://github.com/DioxusLabs/dioxus/releases/download/v0.6.3/dx-${TARGET}-v0.6.3.tar.gz" | tar -xz -C /usr/local/bin
+        dx --version
 
     - name: Prepare Keychain & Identities
       env:
