@@ -142,7 +142,6 @@ jobs:
         $content = Get-Content Cargo.toml -Raw
         if ($content -match 'version\s*=\s*"([^"]+)"') {
           echo "VERSION=$($matches[1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Rename-Item -Path "target\release\hobbes_$($matches[1]).exe" -NewName "Hobbes-Windows-v$($matches[1]).exe"
         }
 
     - name: Azure OIDC Login
@@ -165,9 +164,9 @@ jobs:
     - name: Build Installer
       shell: pwsh
       run: |
-        # Use Inno Setup to build the installer with the signed binary
         iscc scripts\hobbes_installer.iss /DVersion=${{ steps.version.outputs.VERSION }}
-        # It drops the file in scripts\Output\hobbes_VERSION_setup.exe
+        # Rename the binary now that the installer has been built using the original name
+        Rename-Item -Path "target\release\hobbes_${{ steps.version.outputs.VERSION }}.exe" -NewName "Hobbes-Windows-v${{ steps.version.outputs.VERSION }}.exe"
 
     - name: Sign Installer
       uses: azure/artifact-signing-action@v1.2.0
