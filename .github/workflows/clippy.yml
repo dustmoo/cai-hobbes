@@ -31,12 +31,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install Dioxus CLI
-        run: cargo install dioxus-cli
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "arm64" ]; then TARGET="aarch64-apple-darwin"; else TARGET="x86_64-apple-darwin"; fi
+          curl -fsSL "https://github.com/DioxusLabs/dioxus/releases/download/v0.6.3/dx-${TARGET}-v0.6.3.tar.gz" | tar -xz -C /usr/local/bin
+          dx --version
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Install NPM dependencies
         run: npm ci
