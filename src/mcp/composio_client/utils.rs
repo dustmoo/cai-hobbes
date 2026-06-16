@@ -149,3 +149,37 @@ pub fn snake_to_camel(s: &str) -> String {
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snake_to_camel_converts_known_argument_names() {
+        // The cases that actually flow through Composio argument remapping.
+        assert_eq!(snake_to_camel("workspace_id"), "workspaceId");
+        assert_eq!(snake_to_camel("connected_account_id"), "connectedAccountId");
+    }
+
+    #[test]
+    fn snake_to_camel_leaves_single_words_untouched() {
+        assert_eq!(snake_to_camel("gmail"), "gmail");
+        assert_eq!(snake_to_camel(""), "");
+    }
+
+    #[test]
+    fn snake_to_camel_handles_edge_underscores() {
+        // A trailing underscore has no following char to capitalize → dropped.
+        assert_eq!(snake_to_camel("foo_"), "foo");
+        // A leading underscore capitalizes the first real char.
+        assert_eq!(snake_to_camel("_foo"), "Foo");
+        // Consecutive underscores collapse (each just arms capitalize_next).
+        assert_eq!(snake_to_camel("a__b"), "aB");
+    }
+
+    #[test]
+    fn snake_to_camel_is_idempotent_on_camel_input() {
+        // Already-camelCase strings contain no underscores, so they round-trip.
+        assert_eq!(snake_to_camel("alreadyCamel"), "alreadyCamel");
+    }
+}

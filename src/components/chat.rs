@@ -1032,10 +1032,20 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
         });
     };
 
-    let lang_for_memo = lang.clone();
-    let highlighted_html = use_memo(move || {
+    // ⚠️  DO NOT WRAP THIS IN `use_memo` ⚠️
+    //
+    // `code` and `lang` are plain `String` props, not Signals. In Dioxus 0.6
+    // `use_memo` only re-runs when a captured *Signal* changes — a memo over a
+    // String prop captures it by value on first render and never recomputes,
+    // even though the component re-renders with a longer `code` on every
+    // streaming chunk. The visible symptom is a code block whose highlighted
+    // content (and rendered height) freezes at the first chunk and only
+    // corrects after a remount (e.g. switching tabs). Compute inline so the
+    // highlight tracks the streaming `code`. See the matching warning in
+    // markdown_renderer.rs.
+    let highlighted_html = {
         let syntax = SYNTAX_SET
-            .find_syntax_by_token(&lang_for_memo)
+            .find_syntax_by_token(&lang)
             .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
         let mut h = HighlightLines::new(syntax, &THEME);
         let mut html = String::new();
@@ -1050,7 +1060,7 @@ pub fn CodeBlock(code: String, lang: String) -> Element {
             html.pop();
         }
         html
-    });
+    };
 
     rsx! {
         div {

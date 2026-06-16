@@ -423,3 +423,198 @@ pub struct PaginatedToolResult {
     #[serde(alias = "nextCursor", alias = "next_cursor")]
     pub next_cursor: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Build a failed (`successful: false`) tool response with the given `data`
+    /// payload and optional `error` string — the two inputs `is_auth_error`
+    /// inspects.
+    fn failed(data: Value, error: Option<&str>) -> ToolExecuteResponse {
+        ToolExecuteResponse {
+            data,
+            error: error.map(|s| s.to_string()),
+            successful: false,
+            log_id: None,
+            session_info: None,
+        }
+    }
+
+    // ── is_auth_error: this is the single authority for auth-error detection
+    // (P-007). If it under-detects, auth failures silently bypass the reconnect
+    // lifecycle; if it over-detects, our own auth-redirect responses are
+    // mistaken for upstream errors and trigger reconnect loops. Both failure
+    // modes have shipped as production regressions, so each documented pattern
+    // and guard gets a locked-in case here.
+
+    #[test]
+    fn successful_response_is_never_an_auth_error() {
+        // The short-circuit must win even if the payload looks like a 401.
+        let resp = ToolExecuteResponse {
+            data: json!({ "status_code": 401 }),
+            error: Some("401 Unauthorized".to_string()),
+            successful: true,
+            log_id: None,
+            session_info: None,
+        };
+        assert!(!resp.is_auth_error());
+    }
+
+    #[test]
+    fn pattern_1_numeric_status_code() {
+        assert!(failed(json!({ "status_code": 401 }), None).is_auth_error());
+        assert!(failed(json!({ "status_code": 403 }), None).is_auth_error());
+        // Non-auth statuses must not match.
+        assert!(!failed(json!({ "status_code": 200 }), None).is_auth_error());
+        assert!(!failed(json!({ "status_code": 500 }), None).is_auth_error());
+    }
+
+    #[test]
+    fn pattern_2_statuscode_string_or_numeric() {
+        assert!(failed(json!({ "statusCode": "401" }), None).is_auth_error());
+        assert!(failed(json!({ "statusCode": 403 }), None).is_auth_error());
+        assert!(!failed(json!({ "statusCode": "200" }), None).is_auth_error());
+    }
+
+    #[test]
+    fn pattern_3_ecode_auth_prefixes() {
+        assert!(failed(json!({ "ECODE": "AUTH_018" }), None).is_auth_error());
+        assert!(failed(json!({ "ECODE": "OAUTH_401" }), None).is_auth_error());
+        // Non-auth ECODEs (e.g. rate limiting) must not trigger reconnect.
+        assert!(!failed(json!({ "ECODE": "RATE_LIMIT" }), None).is_auth_error());
+    }
+
+    #[test]
+    fn pattern_4_http_error_substring() {
+        assert!(failed(json!({ "http_error": "HTTP 401 Unauthorized" }), None).is_auth_error());
+        assert!(failed(json!({ "http_error": "403 Forbidden" }), None).is_auth_error());
+        assert!(!failed(json!({ "http_error": "500 Internal Server Error" }), None).is_auth_error());
+    }
+
+    #[test]
+    fn pattern_5_nested_data_status_code() {
+        assert!(failed(json!({ "data": { "status_code": 403 } }), None).is_auth_error());
+        assert!(failed(json!({ "data": { "statusCode": "401" } }), None).is_auth_error());
+        assert!(failed(json!({ "data": { "statusCode": 403 } }), None).is_auth_error());
+        assert!(!failed(json!({ "data": { "status_code": 404 } }), None).is_auth_error());
+    }
+
+    #[test]
+    fn pattern_6_error_string_fallback() {
+        assert!(failed(json!({}), Some("Request failed with 401")).is_auth_error());
+        assert!(failed(json!({}), Some("403 Forbidden")).is_auth_error());
+        assert!(!failed(json!({}), Some("500 Internal Server Error")).is_auth_error());
+    }
+
+    #[test]
+    fn cycle_guard_our_own_redirect_is_not_an_error() {
+        // A response carrying a redirectUrl is our own generated auth redirect,
+        // not a fresh upstream failure — even alongside a 401 status code it
+        // must return false, or reconnect would destroy the new credentials.
+        let resp = failed(
+            json!({ "redirectUrl": "https://composio.dev/auth", "status_code": 401 }),
+            Some("401 Unauthorized"),
+        );
+        assert!(!resp.is_auth_error());
+    }
+
+    #[test]
+    fn false_positive_guard_status_active_is_not_auth_error() {
+        // `data.status` is ubiquitous in Composio payloads (e.g. account
+        // status = "ACTIVE") and must never be read as an auth signal.
+        assert!(!failed(json!({ "status": "ACTIVE" }), None).is_auth_error());
+    }
+
+    #[test]
+    fn false_positive_guard_authentication_required_text_alone() {
+        // Our own redirect messages contain "Authentication required"; the
+        // error-string fallback matches only deterministic status codes, so
+        // this phrase alone must not trip detection.
+        assert!(!failed(json!({}), Some("Authentication required to continue")).is_auth_error());
+    }
+
+    #[test]
+    fn no_signal_at_all_is_not_an_auth_error() {
+        assert!(!failed(json!({ "message": "tool ran but returned nothing" }), None).is_auth_error());
+        assert!(!failed(json!({}), None).is_auth_error());
+    }
+
+    // ── Pure accessor helpers ────────────────────────────────────────────────
+
+    fn listing_from(value: Value) -> ComposioToolkitListing {
+        serde_json::from_value(value).expect("valid toolkit listing fixture")
+    }
+
+    #[test]
+    fn primary_auth_scheme_skips_no_auth() {
+        let oauth = listing_from(json!({
+            "slug": "gmail", "name": "Gmail", "auth_schemes": ["OAUTH2", "API_KEY"]
+        }));
+        assert_eq!(oauth.primary_auth_scheme().as_deref(), Some("OAUTH2"));
+
+        let no_auth = listing_from(json!({
+            "slug": "weather", "name": "Weather", "auth_schemes": ["NO_AUTH"]
+        }));
+        assert_eq!(no_auth.primary_auth_scheme(), None);
+
+        let none = listing_from(json!({ "slug": "x", "name": "X" }));
+        assert_eq!(none.primary_auth_scheme(), None);
+    }
+
+    #[test]
+    fn supports_managed_auth_requires_nonempty_schemes() {
+        let managed = listing_from(json!({
+            "slug": "gmail", "name": "Gmail", "composio_managed_auth_schemes": ["OAUTH2"]
+        }));
+        assert!(managed.supports_managed_auth());
+
+        let empty = listing_from(json!({
+            "slug": "gmail", "name": "Gmail", "composio_managed_auth_schemes": []
+        }));
+        assert!(!empty.supports_managed_auth());
+
+        let absent = listing_from(json!({ "slug": "gmail", "name": "Gmail" }));
+        assert!(!absent.supports_managed_auth());
+    }
+
+    #[test]
+    fn description_prefers_nested_meta() {
+        let listing = listing_from(json!({
+            "slug": "gmail", "name": "Gmail", "meta": { "description": "Send email" }
+        }));
+        assert_eq!(listing.description().as_deref(), Some("Send email"));
+
+        let no_meta = listing_from(json!({ "slug": "gmail", "name": "Gmail" }));
+        assert_eq!(no_meta.description(), None);
+    }
+
+    #[test]
+    fn category_display_falls_back_through_name_then_slug() {
+        let display = serde_json::from_value::<ComposioCategory>(
+            json!({ "id": "prod", "name": "Productivity", "displayName": "Productivity Tools" }),
+        )
+        .unwrap();
+        assert_eq!(display.display(), "Productivity Tools");
+
+        let name_only =
+            serde_json::from_value::<ComposioCategory>(json!({ "id": "prod", "name": "Productivity" }))
+                .unwrap();
+        assert_eq!(name_only.display(), "Productivity");
+
+        let slug_only = serde_json::from_value::<ComposioCategory>(json!({ "id": "prod" })).unwrap();
+        assert_eq!(slug_only.display(), "prod");
+    }
+
+    #[test]
+    fn get_all_tools_merges_items_and_tools() {
+        let resp: ToolListResponse = serde_json::from_value(json!({
+            "items": [{ "name": "A" }],
+            "tools": [{ "name": "B" }, { "name": "C" }]
+        }))
+        .unwrap();
+        let names: Vec<_> = resp.get_all_tools().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["A", "B", "C"]);
+    }
+}

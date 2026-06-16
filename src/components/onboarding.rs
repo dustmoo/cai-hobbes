@@ -222,7 +222,7 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                     current_settings.claude_config.api_key = Some(api_key_for_keychain);
                     if current_settings.claude_config.model.is_empty() {
                         current_settings.claude_config.model =
-                            "claude-sonnet-4-20250514".to_string();
+                            crate::llm::claude_models::ClaudeModel::DEFAULT_CHAT_SLUG.to_string();
                     }
                 }
                 LlmProvider::OpenAiCompat => {

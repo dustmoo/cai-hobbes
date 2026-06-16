@@ -1,7 +1,7 @@
 # SYSTEM_PATTERNS.md - Hobbes Beta Architecture & Critical Mandates
 
 > **Version**: Beta (v0.9.x)  
-> **Last Updated**: 2026-02-22
+> **Last Updated**: 2026-06-15
 
 This document consolidates critical system patterns, anti-patterns, and architectural mandates for the Hobbes codebase. It serves as the authoritative reference for implementation patterns discovered through production experience.
 
@@ -114,18 +114,20 @@ OAuth flows for Composio toolkits **MUST**:
 > **Pattern ID**: P-004  
 > **Anti-Pattern**: Caching all accounts without filtering
 
-Always filter connected accounts by target user **before** caching:
+Connected-account listings **MUST** be scoped to the target user. As of the
+`composio_client/` split, this is enforced at the request layer — the listing
+call sends the resolved user as `user_id` / `user_uuid` query params so the API
+only ever returns that user's accounts:
 
 ```rust
-let target_id = self.entity_id.as_deref().or(self.user_id.as_deref());
-
-let should_insert = match target_id {
-    Some(target) => account.user_id == Some(target),
-    None => true, // Fallback
-};
+let user_uuid = client.user_id.clone().or(client.entity_id.clone());
+if let Some(uid) = &user_uuid {
+    params.insert("user_id", uid.clone());
+    params.insert("user_uuid", uid.clone());
+}
 ```
 
-**Location**: `src/mcp/composio_client.rs` → `cache_accounts`
+**Location**: `src/mcp/composio_client/auth.rs` → `list_connected_accounts`
 
 **If broken**: User A uses User B's credentials; OAuth never triggers for User A.
 
@@ -162,6 +164,7 @@ mod secret_manager_generic; // keyring crate
 | AP-005 | Direct keychain_ffi Import | Cross-platform build fails | Use secret_manager module |
 | AP-006 | Direct Keychain Save Bypass | Duplicated fallback logic, inconsistent behavior | Use `save_secret_to_keychain()` or `SecretManager::set()` |
 | AP-007 | Reversed MCP Lock Order | App deadlock (hangs forever) | Always lock `servers` before `dynamic_local_tools` |
+| AP-008 | `use_memo` Over a Prop | Streaming code/markdown freezes at first chunk | Compute inline; reserve `use_memo` for Signals (P-012) |
 
 ---
 
@@ -296,3 +299,35 @@ crate::secret_manager::save_secret_to_keychain(key, value, use_biometric)
 ```
 
 **Location**: `src/secret_manager.rs` → `save_secret_to_keychain()`
+
+---
+
+### 12. Never `use_memo` Over a Non-Signal Prop in a Streaming Render
+
+> **Pattern ID**: P-012  
+> **Anti-Pattern**: Memoizing a computation that depends on a plain prop
+
+In Dioxus 0.6, `use_memo` only re-runs when a captured **Signal** changes. A memo
+that depends on a plain prop (e.g. a `String` `code`/`lang` passed into a child)
+captures that value **by reference on first render and never recomputes** — even
+though the parent re-renders the child with new prop values on every streaming
+chunk.
+
+```rust
+// ❌ ANTI-PATTERN: freezes at the first streamed chunk
+let highlighted = use_memo(move || highlight(&code, &lang)); // code/lang are props
+
+// ✅ CORRECT: compute inline so it tracks the re-rendered props
+let highlighted = highlight(&code, &lang);
+```
+
+**Symptom**: a syntax-highlighted code block (or rendered markdown) whose content
+and height freeze at the first chunk and only correct after a remount — e.g.
+switching tabs and back.
+
+**Rule**: inside a component that renders streaming text, derive from props
+**inline**. Reserve `use_memo` for values derived from Signals. Both known
+hot spots carry an inline `⚠️ DO NOT WRAP THIS IN use_memo ⚠️` warning — do not
+"optimize" them back into a memo.
+
+**Location**: `src/components/chat.rs` → `CodeBlock`, `src/components/markdown_renderer.rs`
