@@ -1,3 +1,18 @@
+# Hobbes v0.9.61 — OpenAI Cost Tracking & Windows Settings Reliability
+
+## ✨ New Features
+
+### OpenAI API cost tracking
+- **Real per-turn USD cost** for OpenAI models — input/output token pricing for the gpt-5.5 / 5.4 families, gpt-5 / mini / nano / pro, gpt-4.1, gpt-4o, and the o-series.
+- **Billed only for the real OpenAI API** (an API key present **and** an `api.openai.com` endpoint). Local / self-hosted / keyless endpoints (Ollama, vLLM, LM Studio, proxies) stay free — no fabricated costs. Unknown models report no cost rather than a wrong one.
+
+## 🐛 Fixes
+
+### Windows settings reliability
+- **Settings now save reliably on Windows.** `settings.json` is written atomically (temp file → fsync → rename) instead of a non-atomic truncate-and-write, eliminating the corruption/race that made settings silently revert to defaults after the first save. Save failures now surface in the UI toast instead of failing silently.
+
+---
+
 # Hobbes v0.9.60 — OpenAI Responses API Support
 
 ## ✨ New Features
