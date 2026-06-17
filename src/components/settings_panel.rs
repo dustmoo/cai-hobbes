@@ -426,12 +426,11 @@ pub fn SettingsPanel() -> Element {
                                 Err(e) => tracing::error!("Keychain task failed: {}", e),
                             }
 
-                            // Save settings.json (fast enough for main thread usually, or we could spawn another blocking task if we could clone path)
-                            // Since we didn't solve the SettingsManager Clone issue easily without editing settings.rs,
-                            // we'll run this here. It's just a file write.
-                            if let Err(e) = settings_manager.read().save(&settings_to_save) {
-                                tracing::error!("Failed to save settings: {}", e);
-                            }
+                            // Persist settings.json off the UI thread via the
+                            // atomic writer, surfacing any failure to the toast
+                            // (otherwise a Windows write failure is silent and
+                            // the change appears to "not save" after restart).
+                            settings_manager.read().save_async(settings_to_save, Some(save_error));
                         });
 
                         show_confirm_save_modal.set(false);
@@ -4196,9 +4195,11 @@ pub fn SettingsPanel() -> Element {
                                     Err(e) => tracing::error!("Keychain task failed: {}", e),
                                 }
 
-                                if let Err(e) = settings_manager.read().save(&settings_to_save) {
-                                    tracing::error!("Failed to save settings: {}", e);
-                                }
+                                // Persist off the UI thread via the atomic
+                                // writer; surface failures to the toast so a
+                                // silent Windows write error can't masquerade as
+                                // a successful save.
+                                settings_manager.read().save_async(settings_to_save, Some(save_error));
                             });
                         }
                     }
