@@ -53,13 +53,25 @@ const PRICES: &[(&str, OpenAiPrice)] = &[
     ("o1", OpenAiPrice { input_per_1m: 15.0, cached_input_per_1m: 7.50, output_per_1m: 60.0 }),
 ];
 
+/// Whether `model` belongs to the family named by `prefix`. Matches the exact
+/// slug or a `-`-delimited suffix (a dated snapshot, e.g. `gpt-5-2026-01-15`),
+/// but NOT a different minor version: `gpt-5.1` must not match `gpt-5`. A bare
+/// `starts_with` would silently price `gpt-5.1` / `gpt-5.2` at gpt-5's rate.
+fn matches_family(model: &str, prefix: &str) -> bool {
+    match model.strip_prefix(prefix) {
+        Some(rest) => rest.is_empty() || rest.starts_with('-'),
+        None => false,
+    }
+}
+
 /// Look up per-1M pricing for a model slug. Returns `None` for models not in the
-/// table so callers can leave the cost unset rather than display a fabricated $0.
+/// table (including unrecognized version families) so callers can leave the cost
+/// unset rather than display a fabricated or wrong price.
 pub fn price_for_model(model: &str) -> Option<OpenAiPrice> {
     let m = model.trim();
     PRICES
         .iter()
-        .find(|(prefix, _)| m.starts_with(prefix))
+        .find(|(prefix, _)| matches_family(m, prefix))
         .map(|(_, price)| *price)
 }
 
@@ -135,6 +147,22 @@ mod tests {
         assert!(price_for_model("llama-3.3-70b").is_none());
         assert!(price_for_model("qwen2.5-coder").is_none());
         assert!(estimate_cost("some-local-model", 1000, 1000).is_none());
+    }
+
+    #[test]
+    fn unrecognized_minor_versions_do_not_inherit_bare_gpt5_price() {
+        // The bug this guards: `starts_with("gpt-5")` would price gpt-5.1/5.2/5.3
+        // at gpt-5's $1.25/$10. Without explicit entries they must resolve to
+        // None (no fabricated/too-cheap cost), never to bare gpt-5.
+        let gpt5 = price_for_model("gpt-5").unwrap();
+        for v in ["gpt-5.1", "gpt-5.2", "gpt-5.3", "gpt-5.1-mini", "gpt-5.9"] {
+            let p = price_for_model(v);
+            assert!(p.is_none() || p != Some(gpt5), "{v} must not inherit bare gpt-5 pricing");
+            assert!(p.is_none(), "{v} has no confirmed price → expected None, got {:?}", p);
+        }
+        // Sanity: the families we DO know still resolve correctly across the dot.
+        assert_eq!(price_for_model("gpt-5.4").unwrap().output_per_1m, 15.0);
+        assert_eq!(price_for_model("gpt-5.5").unwrap().output_per_1m, 30.0);
     }
 
     #[test]
