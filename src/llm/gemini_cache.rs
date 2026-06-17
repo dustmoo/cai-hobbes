@@ -120,6 +120,7 @@ pub fn compute_prefix_hash(
 }
 
 /// Call the Gemini API to create a cache for the prefix.
+#[allow(clippy::too_many_arguments)]
 pub async fn api_create_cache(
     client: &Client,
     base_url: &str,
@@ -170,8 +171,7 @@ pub async fn api_create_cache(
             error_body
         };
         tracing::warn!("Failed to create Gemini cache [{}]: {}", status, error_msg);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("Failed to create Gemini cache [{}]: {}", status, error_msg),
         ).into());
     }
@@ -223,8 +223,7 @@ pub async fn api_delete_cache(
         let status = response.status();
         let error_body = response.text().await.unwrap_or_default();
         tracing::warn!("Failed to delete Gemini cache [{}]: {}", status, error_body);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("Failed to delete Gemini cache [{}]: {}", status, error_body),
         ).into());
     }

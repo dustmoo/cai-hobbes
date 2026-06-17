@@ -753,8 +753,6 @@ pub fn ChatInput(
                                             class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
                                             for (index, provider) in other_providers.into_iter() {
                                                 {
-                                                    let index = index;
-                                                    let provider = provider;
                                                     let configured = settings.read().is_provider_configured(provider);
 
                                                     rsx! {

@@ -5,6 +5,8 @@ pub mod convert;
 pub mod gemini;
 pub mod gemini_cache;
 pub mod openai_compat;
+pub mod openai_pricing;
+pub mod openai_responses;
 pub mod types;
 
 pub use config::{ClaudeConfig, GeminiConfig, OpenAiCompatConfig};
@@ -12,7 +14,6 @@ pub use config::{ClaudeConfig, GeminiConfig, OpenAiCompatConfig};
 pub use crate::components::shared::UsageData;
 pub use claude::ClaudeConnector;
 pub use gemini::*;
-pub use openai_compat::OpenAiCompatConnector;
 #[allow(unused_imports)]
 pub use types::{ChatMessage, ChatRole, ContentBlock, LlmPrompt, ToolDefinition};
 
@@ -41,7 +42,7 @@ pub fn build_connector_for(
         LlmProvider::OpenAiCompat => {
             let mut config = settings.openai_compat_config.clone();
             config.model = model.to_string();
-            std::sync::Arc::new(OpenAiCompatConnector::new(config))
+            openai_responses::build_openai_connector(config)
         }
         LlmProvider::Claude => {
             let mut config = settings.claude_config.clone();

@@ -172,7 +172,7 @@ use crate::{
         shared::{SessionIdContext, SessionToDeleteContext},
         stream_manager::StreamManager,
     },
-    llm::{ClaudeConnector, GeminiConnector, LlmConnector, OpenAiCompatConnector},
+    llm::{ClaudeConnector, GeminiConnector, LlmConnector},
     mcp::manager::McpManager,
 };
 use std::path::PathBuf;
@@ -671,9 +671,11 @@ fn app() -> Element {
             crate::settings::LlmProvider::Gemini => {
                 Arc::new(GeminiConnector::new_shared(settings.gemini_config.clone()))
             }
-            crate::settings::LlmProvider::OpenAiCompat => Arc::new(OpenAiCompatConnector::new(
-                settings.openai_compat_config.clone(),
-            )),
+            crate::settings::LlmProvider::OpenAiCompat => {
+                crate::llm::openai_responses::build_openai_connector(
+                    settings.openai_compat_config.clone(),
+                )
+            }
             crate::settings::LlmProvider::Claude => {
                 Arc::new(ClaudeConnector::new(settings.claude_config.clone()))
             }
@@ -706,7 +708,7 @@ fn app() -> Element {
                     openai_compat_config.endpoint,
                     if openai_compat_config.api_key.is_some() { "present" } else { "MISSING" },
                 );
-                Arc::new(OpenAiCompatConnector::new(openai_compat_config))
+                crate::llm::openai_responses::build_openai_connector(openai_compat_config)
             }
             crate::settings::LlmProvider::Claude => Arc::new(ClaudeConnector::new(claude_config)),
         };

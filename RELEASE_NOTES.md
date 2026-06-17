@@ -1,3 +1,46 @@
+# Hobbes v0.9.62 — Pricing Accuracy
+
+## 🐛 Fixes
+- **OpenAI cost no longer mis-prices version families.** Model matching is now version-aware: `gpt-5.1` / `gpt-5.2` / `gpt-5.3` can no longer silently inherit bare `gpt-5`'s cheaper rate. Recognized families (gpt-5, gpt-5.4, gpt-5.5, gpt-4o, o-series) resolve correctly; an unrecognized model reports no cost rather than a wrong one.
+
+## 🛠 Maintenance
+- Verified Gemini and Claude pricing tables against current published rates (all correct as of 2026-06-17).
+- Documented the model pricing tables as manually-maintained and drift-prone (SYSTEM_PATTERNS P-013), with per-table "last verified" dates.
+
+---
+
+# Hobbes v0.9.61 — OpenAI Cost Tracking & Windows Settings Reliability
+
+## ✨ New Features
+
+### OpenAI API cost tracking
+- **Real per-turn USD cost** for OpenAI models — input/output token pricing for the gpt-5.5 / 5.4 families, gpt-5 / mini / nano / pro, gpt-4.1, gpt-4o, and the o-series.
+- **Billed only for the real OpenAI API** (an API key present **and** an `api.openai.com` endpoint). Local / self-hosted / keyless endpoints (Ollama, vLLM, LM Studio, proxies) stay free — no fabricated costs. Unknown models report no cost rather than a wrong one.
+
+## 🐛 Fixes
+
+### Windows settings reliability
+- **Settings now save reliably on Windows.** `settings.json` is written atomically (temp file → fsync → rename) instead of a non-atomic truncate-and-write, eliminating the corruption/race that made settings silently revert to defaults after the first save. Save failures now surface in the UI toast instead of failing silently.
+
+---
+
+# Hobbes v0.9.60 — OpenAI Responses API Support
+
+## ✨ New Features
+
+### OpenAI Responses API (gpt-5 / o-series)
+- **Support for OpenAI's newest models** — gpt-5 and o-series reasoning models are served only by the Responses API (`/v1/responses`), which previously failed with a `404 — only supported in v1/responses` error. Hobbes now speaks both protocols.
+- **Automatic routing** — Under the default `Auto` API style, OpenAI's gpt-5/o-series models on `api.openai.com` use the Responses API; everything else (older OpenAI models, local servers like vLLM/Ollama/LM Studio, OpenRouter) continues to use Chat Completions. No regression to existing setups.
+- **Reasoning summaries** — With Thinking Mode enabled, reasoning summaries stream into the "Considering…" bubble.
+- **Robust streaming** — Function calling, multi-turn tool history, vision input, and usage reporting are mapped to the Responses item/event model. A final-text fallback ensures models that reason silently before answering still surface their output.
+
+## 🛠 Maintenance
+- Added regression tests for Composio auth-error detection and toolkit-name conversion.
+- Documented the Dioxus `use_memo`-over-props streaming footgun (SYSTEM_PATTERNS P-012).
+- Cleared all CI clippy warnings.
+
+---
+
 # Hobbes v0.9.58 — Image Generation, Context Tuning & Hardening
 
 ## ✨ New Features

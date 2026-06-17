@@ -750,6 +750,9 @@ impl Settings {
     }
 
     /// Set the configured chat model for a specific provider.
+    /// Part of the provider-aware Settings API; retained for completeness even
+    /// when no current call site uses it.
+    #[allow(dead_code)]
     pub fn set_chat_model_for(&mut self, provider: LlmProvider, model: String) {
         match provider {
             LlmProvider::Gemini => self.gemini_config.chat_model = model,
@@ -1053,6 +1056,45 @@ pub struct SettingsManager {
     settings_path: PathBuf,
 }
 
+/// Atomically write `bytes` to `target` by staging a temp file in the same
+/// directory, fsyncing it, then replacing the target in a single rename.
+///
+/// This mirrors the session-persistence pattern (P-009). Plain `fs::write`
+/// truncates the file in place, which is neither atomic nor resilient on
+/// Windows: a concurrent reader/writer (overlapping save tasks, an AV scanner,
+/// or the search indexer holding a handle) can observe or produce a
+/// half-written `settings.json`, which then fails to deserialize and silently
+/// reverts to defaults on the next launch. The rename is atomic on both Unix
+/// and Windows (`MoveFileExW` with replace-existing); the short retry rides out
+/// transient Windows sharing violations.
+fn write_atomic(
+    target: &std::path::Path,
+    dir: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..3u32 {
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        temp.write_all(bytes)?;
+        temp.as_file().sync_all()?;
+        match temp.persist(target) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "Atomic settings write attempt {} failed: {}",
+                    attempt + 1,
+                    e.error
+                );
+                last_err = Some(e.error);
+                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1) as u64));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("atomic settings write failed")))
+}
+
 impl SettingsManager {
     pub fn new(settings_path: PathBuf) -> Self {
         Self { settings_path }
@@ -1217,17 +1259,23 @@ impl SettingsManager {
 
     pub fn save(&self, settings: &Settings) -> Result<(), std::io::Error> {
         let content = serde_json::to_string_pretty(settings)?;
-        if let Some(parent) = self.settings_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        // Safety net: backup before overwrite to prevent data loss from deserialization regressions
+        let parent = self.settings_path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "settings path has no parent directory",
+            )
+        })?;
+        fs::create_dir_all(parent)?;
+
+        // Safety net: backup before overwrite to guard against deserialization regressions.
         if self.settings_path.exists() {
             let backup_path = self.settings_path.with_extension("json.bak");
             if let Err(e) = fs::copy(&self.settings_path, &backup_path) {
                 tracing::warn!("Failed to create settings backup: {}", e);
             }
         }
-        fs::write(&self.settings_path, content)
+
+        write_atomic(&self.settings_path, parent, content.as_bytes())
     }
 
     pub fn save_async(
@@ -1558,5 +1606,40 @@ mod tests {
         s.seed_default_claude_slots_if_empty();
         // Any assigned slot means the configuration is left untouched.
         assert_eq!(s.claude_config.model_slots, slots);
+    }
+
+    #[test]
+    fn write_atomic_creates_and_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+
+        write_atomic(&target, dir.path(), b"first").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "first");
+
+        // Overwrite in place via atomic replace — new contents only.
+        write_atomic(&target, dir.path(), b"second-and-longer").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "second-and-longer");
+
+        // No stray temp files left behind.
+        let count = fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(count, 1, "only settings.json should remain");
+    }
+
+    #[test]
+    fn settings_manager_save_load_roundtrip_repeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SettingsManager::new(dir.path().join("settings.json"));
+
+        let mut settings = Settings::default();
+        settings.user_name = Some("Ada".to_string());
+        mgr.save(&settings).unwrap();
+
+        // The second save (previously the non-atomic + backup path) must persist
+        // the new value rather than revert it — the Windows "doesn't save after
+        // the first save" symptom.
+        settings.user_name = Some("Grace".to_string());
+        mgr.save(&settings).unwrap();
+
+        assert_eq!(mgr.load().user_name.as_deref(), Some("Grace"));
     }
 }

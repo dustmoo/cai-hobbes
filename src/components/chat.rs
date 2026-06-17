@@ -894,7 +894,7 @@ pub fn ChatWindow(
                     on_comment: move |_| has_new_comments.set(true),
                 },
                 ChatInput {
-                    is_sending: Signal::new(stream_manager.is_session_streaming(&*current_target_id.read())),
+                    is_sending: Signal::new(stream_manager.is_session_streaming(&current_target_id.read())),
                     has_new_comments: has_new_comments,
                     has_pending_approvals: has_pending_approvals,
                     on_send: {

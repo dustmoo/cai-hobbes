@@ -331,3 +331,38 @@ hot spots carry an inline `⚠️ DO NOT WRAP THIS IN use_memo ⚠️` warning �
 "optimize" them back into a memo.
 
 **Location**: `src/components/chat.rs` → `CodeBlock`, `src/components/markdown_renderer.rs`
+
+---
+
+### 13. Model Pricing Tables Are Manually Maintained (and Drift)
+
+> **Pattern ID**: P-013  
+> **Anti-Pattern**: Trusting a hardcoded price as current
+
+Per-token cost estimation uses **hand-maintained** USD-per-1M-token tables, one
+per provider. Provider pricing changes (new models, rate cuts, renamed tiers),
+so these tables **drift out of date** and must be re-verified periodically
+against the official pricing pages.
+
+| Provider | Table | Pricing page |
+|----------|-------|--------------|
+| OpenAI | `src/llm/openai_pricing.rs` → `PRICES` | developers.openai.com/api/docs/pricing |
+| Gemini | `src/llm/gemini.rs` → `GeminiModel::get_rates` | ai.google.dev/gemini-api/docs/pricing |
+| Claude | `src/llm/claude_models.rs` → `input_price_per_mtok` / `output_price_per_mtok` | platform.claude.com/docs/en/about-claude/pricing |
+
+> **Last verified**: 2026-06-17 (all three confirmed against published rates).
+
+**Rules**:
+- Match models by **family with a version/dash boundary**, never a bare
+  `starts_with`. `gpt-5.1` must NOT inherit `gpt-5` pricing — see
+  `openai_pricing::matches_family`. A loose prefix silently mis-prices new
+  minor versions.
+- **Unknown model → no cost** (`None`), never a fabricated or nearest-guess
+  price. An absent number is honest; a wrong one is not.
+- Cost is only charged for **paid, first-party APIs**. The OpenAI connector
+  gates on `billable()` (api key + `api.openai.com`); local/self-hosted/keyless
+  endpoints are free.
+- When you touch a table, bump the **Last verified** date above.
+
+**If broken**: the in-app cost counter and `usage_log` totals quietly diverge
+from the real bill.
