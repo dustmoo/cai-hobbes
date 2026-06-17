@@ -846,6 +846,13 @@ impl LlmFormatConverter for OpenAiCompatConnector {
             tracing::debug!("OpenAI Compat: Thinking mode enabled — injecting chat_template_kwargs + skip_special_tokens=false");
         }
 
+        // Real OpenAI omits usage from streamed responses unless asked. Request
+        // it so cost tracking has token counts to work with. Gated to real
+        // OpenAI — some local servers reject unknown request fields.
+        if streaming && self.is_real_openai() {
+            request["stream_options"] = json!({ "include_usage": true });
+        }
+
         if self.config.model.is_empty() {
             tracing::error!(
                 "OpenAI Compat request: model is EMPTY — this will cause a 400 error. \
@@ -968,7 +975,15 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                                 total_tokens: t as i32,
                                 cached_content_tokens: None,
                                 thoughts_tokens: None,
-                                cost: Some(0.0), // Cost calculation for OpenAI compat is complex due to varied models
+                                // Billed only for the real OpenAI API with a key;
+                                // local/keyless endpoints are free (Some(0.0)).
+                                cost: crate::llm::openai_pricing::turn_cost(
+                                    &self.config.endpoint,
+                                    self.config.api_key.is_some(),
+                                    &self.config.model,
+                                    p as i64,
+                                    c as i64,
+                                ),
                             }));
                         }
                     }

@@ -5,6 +5,7 @@ pub mod convert;
 pub mod gemini;
 pub mod gemini_cache;
 pub mod openai_compat;
+pub mod openai_pricing;
 pub mod openai_responses;
 pub mod types;
 
