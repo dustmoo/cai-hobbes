@@ -599,7 +599,15 @@ impl LlmConnector for OpenAiResponsesConnector {
                                 thought_summary: None,
                             });
                         }
-                        if let Some(usage) = usage {
+                        if let Some(mut usage) = usage {
+                            // Billed only for the real OpenAI API with a key.
+                            usage.cost = crate::llm::openai_pricing::turn_cost(
+                                &self.config.endpoint,
+                                self.config.api_key.is_some(),
+                                &self.config.model,
+                                usage.prompt_tokens as i64,
+                                usage.completion_tokens as i64,
+                            );
                             let _ = tx.send(StreamMessage::Usage(usage));
                         }
                         flush(&mut pending, &tx);
