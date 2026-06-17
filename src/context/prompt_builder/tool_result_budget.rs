@@ -6,11 +6,13 @@ use super::types::ToolResultPosition;
 
 impl<'a> PromptBuilder<'a> {
     /// Pass 2: Apply dynamic per-tool-result budgets and paginate results that
-    /// exceed their allocation. Mutates `messages` in-place and appends any
-    /// new PageQueue entries to `pages_to_store`.
+    /// exceed their allocation. Edits `messages` elements in-place (never changes
+    /// their count) and appends any new PageQueue entries to `pages_to_store`.
+    // Cohesive single-purpose budgeting pass; each argument is a distinct input.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_pass2_budget(
         &self,
-        messages: &mut Vec<ChatMessage>,
+        messages: &mut [ChatMessage],
         tool_result_positions: &[ToolResultPosition],
         pages_to_store: &mut Vec<(String, crate::session::PagedResult)>,
         tools: &[ToolDefinition],

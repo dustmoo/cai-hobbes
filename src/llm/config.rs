@@ -189,10 +189,29 @@ pub fn default_watch_word_max_response_chars() -> usize {
     500
 }
 
+/// Which OpenAI API surface to target. The newest OpenAI reasoning models
+/// (gpt-5 / o-series) are served only by the Responses API; everything else
+/// (local servers, OpenRouter, older OpenAI models) uses Chat Completions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiStyle {
+    /// Use the Responses API for OpenAI's gpt-5/o-series on api.openai.com;
+    /// Chat Completions everywhere else.
+    #[default]
+    Auto,
+    /// Always use Chat Completions (`/v1/chat/completions`).
+    ChatCompletions,
+    /// Always use the Responses API (`/v1/responses`).
+    Responses,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OpenAiCompatConfig {
     pub endpoint: String, // "http://localhost:11434/v1"
     pub model: String,    // "llama3.2"
+    /// Which OpenAI API surface to target (Auto routes by endpoint + model).
+    #[serde(default)]
+    pub api_style: ApiStyle,
     #[serde(skip)]
     pub api_key: Option<String>, // Optional for local providers
     pub summary_model: Option<String>, // Falls back to model
@@ -251,6 +270,7 @@ impl Default for OpenAiCompatConfig {
         Self {
             endpoint: String::new(),
             model: String::new(),
+            api_style: ApiStyle::default(),
             api_key: None,
             summary_model: None,
             model_slots: default_empty_model_slots(),

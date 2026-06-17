@@ -1,3 +1,20 @@
+# Hobbes v0.9.60 — OpenAI Responses API Support
+
+## ✨ New Features
+
+### OpenAI Responses API (gpt-5 / o-series)
+- **Support for OpenAI's newest models** — gpt-5 and o-series reasoning models are served only by the Responses API (`/v1/responses`), which previously failed with a `404 — only supported in v1/responses` error. Hobbes now speaks both protocols.
+- **Automatic routing** — Under the default `Auto` API style, OpenAI's gpt-5/o-series models on `api.openai.com` use the Responses API; everything else (older OpenAI models, local servers like vLLM/Ollama/LM Studio, OpenRouter) continues to use Chat Completions. No regression to existing setups.
+- **Reasoning summaries** — With Thinking Mode enabled, reasoning summaries stream into the "Considering…" bubble.
+- **Robust streaming** — Function calling, multi-turn tool history, vision input, and usage reporting are mapped to the Responses item/event model. A final-text fallback ensures models that reason silently before answering still surface their output.
+
+## 🛠 Maintenance
+- Added regression tests for Composio auth-error detection and toolkit-name conversion.
+- Documented the Dioxus `use_memo`-over-props streaming footgun (SYSTEM_PATTERNS P-012).
+- Cleared all CI clippy warnings.
+
+---
+
 # Hobbes v0.9.58 — Image Generation, Context Tuning & Hardening
 
 ## ✨ New Features

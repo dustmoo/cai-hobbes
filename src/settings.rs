@@ -750,6 +750,9 @@ impl Settings {
     }
 
     /// Set the configured chat model for a specific provider.
+    /// Part of the provider-aware Settings API; retained for completeness even
+    /// when no current call site uses it.
+    #[allow(dead_code)]
     pub fn set_chat_model_for(&mut self, provider: LlmProvider, model: String) {
         match provider {
             LlmProvider::Gemini => self.gemini_config.chat_model = model,
