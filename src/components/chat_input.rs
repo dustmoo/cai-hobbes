@@ -15,9 +15,11 @@ use crate::llm::GeminiModel;
 use crate::settings::{get_default_model_icon, get_slot_icon, LlmProvider, Settings, SettingsManager, UiState};
 use hobbes_core::models::Attachment;
 
+use crate::components::chat_queue::{self, QueuedMessage, CHAT_QUEUE};
 use crate::components::focus_context::FocusContext;
 use crate::components::shared::{ChatBarIconButton, DraftContext, SessionIdContext};
 use crate::components::skill_autocomplete::SkillAutocomplete;
+use crate::components::stream_manager::StreamManagerContext;
 use crate::hotkey::matches_hotkey;
 use crate::processing::summarization_scheduler::SchedulerSignal;
 use crate::skills::{Skill, SkillRegistry};
@@ -65,6 +67,20 @@ enum AutocompleteMode {
     Unload,
 }
 
+/// One-line preview of a queued message for its chip. Trims, caps length with an
+/// ellipsis, and labels attachment-only queue entries so the chip isn't blank.
+fn queue_preview(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "(attachment only)".to_string();
+    }
+    let mut preview: String = trimmed.chars().take(80).collect();
+    if trimmed.chars().count() > 80 {
+        preview.push('…');
+    }
+    preview
+}
+
 /// Provider-aware model display name. For Gemini, uses the curated display name
 /// from GeminiModel. For other providers, the raw slug is already human-readable
 /// (e.g. `gpt-4o-mini`, `Qwen/Qwen3-235B`).
@@ -89,7 +105,7 @@ pub fn ChatInput(
     on_new_chat_with_memory: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let SessionIdContext(_current_session_id) = use_context::<SessionIdContext>();
+    let SessionIdContext(current_session_id) = use_context::<SessionIdContext>();
     let mut settings = use_context::<Signal<Settings>>();
     let _settings_manager = use_context::<Signal<SettingsManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
@@ -107,6 +123,12 @@ pub fn ChatInput(
     let focus_context = use_context::<Signal<FocusContext>>();
     let mut textarea_mounted =
         use_signal(|| Option::<std::rc::Rc<dioxus::html::MountedData>>::None);
+
+    // Streaming state + skill permissions, hoisted to render scope so the
+    // shared `submit` callback and the queue-drain effect can use them.
+    let stream_manager = consume_context::<StreamManagerContext>();
+    let permission_manager =
+        use_context::<Signal<crate::context::permissions::PermissionManager>>();
 
     // Skill Autocomplete State
     let skill_registry = use_context::<Signal<SkillRegistry>>();
@@ -264,20 +286,12 @@ pub fn ChatInput(
         }
     });
 
-    let mut send_message = move || {
-        if *is_sending.read() || *is_processing_attachments.read() {
-            tracing::warn!("'send_message' blocked: already sending or processing attachments.");
-            return;
-        }
-        let user_message = draft.read().clone();
-        if user_message.is_empty()
-            && attachments.read().is_empty()
-            && !*has_new_comments.read()
-            && !*has_pending_approvals.read()
-        {
-            return;
-        }
-
+    // Core submission path, shared by live sends and queued-message drains.
+    // Takes explicit `(text, attachments)` so a drained queue entry runs through
+    // the exact same skill-detection + send logic as a freshly typed message.
+    // Deliberately does NOT touch the draft — when draining a queued message the
+    // draft may hold unrelated live text; clearing it is the caller's job.
+    let submit = use_callback(move |(user_message, atts): (String, Vec<Attachment>)| {
         // Skill Command Detection
         if user_message.starts_with('/') {
             // /unload command — remove a loaded skill from session context
@@ -308,16 +322,12 @@ pub fn ChatInput(
                         }
                     }
                 }
-                draft.set(String::new());
-                attachments.set(Vec::new());
                 return;
             }
 
             let parts: Vec<&str> = user_message.split_whitespace().collect();
             if !parts.is_empty() {
                 let skill_name = parts[0].trim_start_matches('/');
-                let skill_registry =
-                    use_context::<Signal<crate::skills::registry::SkillRegistry>>();
                 let skill_opt = {
                     let registry = skill_registry.read();
                     registry.get_skill(skill_name)
@@ -325,8 +335,6 @@ pub fn ChatInput(
 
                 if let Some(skill) = skill_opt {
                     let arguments = parts[1..].join(" ");
-                    let permission_manager =
-                        use_context::<Signal<crate::context::permissions::PermissionManager>>();
                     let permission_status = permission_manager
                         .read()
                         .check_skill_permission(&skill.metadata.name);
@@ -371,7 +379,7 @@ pub fn ChatInput(
                             thought_signature: None,
                             thought_summary: None,
                         },
-                        attachments: attachments.read().clone(),
+                        attachments: atts.clone(),
                         comments: Vec::new(),
                         created_at: chrono::Utc::now(),
                         usage: None,
@@ -478,16 +486,16 @@ pub fn ChatInput(
                         }
                     }
 
-                    draft.set(String::new());
-                    attachments.set(Vec::new());
                     return;
                 }
             }
         }
 
-        on_send.call((user_message, attachments.read().clone()));
-        draft.set("".to_string());
-        attachments.set(Vec::new());
+        on_send.call((user_message, atts));
+    });
+
+    // Reset the auto-grown textarea back to its base height after a send/queue.
+    let reset_textarea_height = move || {
         let _ = document::eval(
             r#"
             const el = document.getElementById('chat-textarea');
@@ -495,6 +503,81 @@ pub fn ChatInput(
         "#,
         );
     };
+
+    let mut send_message = move || {
+        if *is_processing_attachments.read() {
+            tracing::warn!("'send_message' blocked: still processing attachments.");
+            return;
+        }
+        let user_message = draft.read().clone();
+        let atts = attachments.read().clone();
+        if user_message.is_empty()
+            && atts.is_empty()
+            && !*has_new_comments.read()
+            && !*has_pending_approvals.read()
+        {
+            return;
+        }
+
+        // If this session's turn is still in flight, queue the message instead of
+        // sending. The turn drains it on completion (see the drain effect below).
+        let session_id = current_session_id.read().clone();
+        if stream_manager.is_session_streaming(&session_id) {
+            if !user_message.is_empty() || !atts.is_empty() {
+                chat_queue::queue_push(
+                    &mut CHAT_QUEUE.write(),
+                    &session_id,
+                    QueuedMessage::new(user_message, atts),
+                );
+                draft.set(String::new());
+                attachments.set(Vec::new());
+                reset_textarea_height();
+            }
+            // Comment/approval-only submits aren't queueable; keep their prior
+            // "blocked while streaming" behavior (just fall through to return).
+            return;
+        }
+
+        submit.call((user_message, atts));
+        draft.set(String::new());
+        attachments.set(Vec::new());
+        reset_textarea_height();
+    };
+
+    // Drain one queued message whenever the active session is idle — either it
+    // just finished a turn, or the user switched back to a session that has a
+    // backlog. `dispatching` guards the async gap between dispatching a message
+    // and its stream actually starting, so a burst of other-tab stream activity
+    // can't pop a second message and race two turns on one session.
+    let mut dispatching = use_signal(|| false);
+    use_effect(move || {
+        // Re-run on any stream state change and on active-session switches.
+        let _ = stream_manager.stream_activity.read();
+        let session_id = current_session_id.read().clone();
+
+        if stream_manager.is_session_streaming(&session_id) {
+            // The message we dispatched has started streaming — release the guard.
+            if *dispatching.peek() {
+                dispatching.set(false);
+            }
+            return;
+        }
+        if *dispatching.peek() {
+            return;
+        }
+
+        if let Some(qm) = chat_queue::queue_pop_next(&mut CHAT_QUEUE.write(), &session_id) {
+            dispatching.set(true);
+            submit.call((qm.text, qm.attachments));
+            // Failsafe: a queued no-op (e.g. a command that starts no stream)
+            // must not wedge the queue. Real turns clear the guard sooner via the
+            // is_streaming branch above; this only fires if nothing ever streams.
+            spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                dispatching.set(false);
+            });
+        }
+    });
 
     rsx! {
         if !attachments.read().is_empty() {
@@ -516,6 +599,55 @@ pub fn ChatInput(
                                 width: 16,
                                 height: 16,
                                 icon: fi_icons::FiX
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Queued messages waiting for the in-flight turn to finish.
+        {
+            let session_id = current_session_id.read().clone();
+            let chips: Vec<(uuid::Uuid, String)> = CHAT_QUEUE
+                .read()
+                .get(&session_id)
+                .map(|q| q.iter().map(|m| (m.id, queue_preview(&m.text))).collect())
+                .unwrap_or_default();
+            if chips.is_empty() {
+                rsx! {}
+            } else {
+                rsx! {
+                    div {
+                        class: "flex flex-col gap-1 px-3 pt-2 pb-1 bg-section border-t border-subtle",
+                        div {
+                            class: "flex items-center justify-between text-xs text-fg-muted",
+                            span { "Queued ({chips.len()}) · sends when the current turn finishes" }
+                            button {
+                                class: "px-2 py-0.5 rounded hover:bg-card hover:text-fg transition-colors",
+                                onclick: move |_| {
+                                    let sid = current_session_id.read().clone();
+                                    chat_queue::queue_clear(&mut CHAT_QUEUE.write(), &sid);
+                                },
+                                "Clear all"
+                            }
+                        }
+                        for (id, preview) in chips {
+                            div {
+                                key: "{id}",
+                                class: "flex items-center justify-between gap-2 bg-card rounded px-2 py-1",
+                                span {
+                                    class: "text-sm text-fg truncate",
+                                    "{preview}"
+                                }
+                                button {
+                                    class: "p-1 rounded-full text-fg-muted hover:bg-input hover:text-fg shrink-0",
+                                    title: "Remove from queue",
+                                    onclick: move |_| {
+                                        let sid = current_session_id.read().clone();
+                                        chat_queue::queue_remove(&mut CHAT_QUEUE.write(), &sid, id);
+                                    },
+                                    Icon { width: 14, height: 14, icon: fi_icons::FiX }
+                                }
                             }
                         }
                     }

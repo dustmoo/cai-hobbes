@@ -1061,6 +1061,12 @@ fn app() -> Element {
         state.delete_session(&id_to_delete);
         drop(state);
 
+        // Drop any messages queued for the now-deleted session.
+        crate::components::chat_queue::queue_clear(
+            &mut crate::components::chat_queue::CHAT_QUEUE.write(),
+            &id_to_delete,
+        );
+
         let conn = llm_connector.read().clone();
         let id_to_delete_clone = id_to_delete.clone();
         tokio::spawn(async move {
@@ -1093,6 +1099,12 @@ fn app() -> Element {
         if idx < tabs.len() {
             let closing_session_id = tabs[idx].clone();
             tabs.remove(idx);
+
+            // A closed tab can't drain its queue; drop it (runtime-only state).
+            crate::components::chat_queue::queue_clear(
+                &mut crate::components::chat_queue::CHAT_QUEUE.write(),
+                &closing_session_id,
+            );
 
             // Delete the session if it has no messages (empty tab).
             // Sessions with messages are preserved in History.

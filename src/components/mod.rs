@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod chat_input;
+pub mod chat_queue;
 pub mod comment_modal;
 pub mod conflict_modal;
 pub mod inline_comment_popover;
