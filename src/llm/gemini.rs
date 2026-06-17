@@ -259,6 +259,9 @@ impl GeminiModel {
         }
     }
 
+    /// Per-1M-token (input, output) USD rates. Manually maintained and subject
+    /// to drift — re-verify against ai.google.dev/gemini-api/docs/pricing
+    /// (see SYSTEM_PATTERNS P-013). Last verified: 2026-06-17.
     pub fn get_rates(&self, prompt_tokens: i32) -> (f64, f64) {
         match self {
             // Gemini 3.5 Series

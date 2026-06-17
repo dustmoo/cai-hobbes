@@ -1,3 +1,14 @@
+# Hobbes v0.9.62 — Pricing Accuracy
+
+## 🐛 Fixes
+- **OpenAI cost no longer mis-prices version families.** Model matching is now version-aware: `gpt-5.1` / `gpt-5.2` / `gpt-5.3` can no longer silently inherit bare `gpt-5`'s cheaper rate. Recognized families (gpt-5, gpt-5.4, gpt-5.5, gpt-4o, o-series) resolve correctly; an unrecognized model reports no cost rather than a wrong one.
+
+## 🛠 Maintenance
+- Verified Gemini and Claude pricing tables against current published rates (all correct as of 2026-06-17).
+- Documented the model pricing tables as manually-maintained and drift-prone (SYSTEM_PATTERNS P-013), with per-table "last verified" dates.
+
+---
+
 # Hobbes v0.9.61 — OpenAI Cost Tracking & Windows Settings Reliability
 
 ## ✨ New Features

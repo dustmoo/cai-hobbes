@@ -5,7 +5,10 @@
 //! LM Studio) and proxies are free or have unknowable pricing, so we never
 //! fabricate a cost for them — see [`billable`].
 //!
-//! Prices are USD per 1M tokens, sourced from OpenAI's pricing page (June 2026).
+//! Prices are USD per 1M tokens. This is a **manually maintained** table that
+//! drifts as OpenAI revises pricing — re-verify against the official page and
+//! bump the date when you touch it (see SYSTEM_PATTERNS P-013).
+//! Last verified: 2026-06-17.
 //! Reasoning tokens are billed as output tokens and are already included in the
 //! reported output count, so no special handling is needed. Cached-input
 //! discounts are recorded for reference but not yet applied (our stream parsers

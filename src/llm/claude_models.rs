@@ -134,6 +134,9 @@ impl ClaudeModel {
     }
 
     /// USD price per 1M input tokens (for cost estimation in `UsageData`).
+    /// Manually maintained; re-verify against
+    /// platform.claude.com/docs/en/about-claude/pricing (SYSTEM_PATTERNS P-013).
+    /// Last verified: 2026-06-17.
     pub fn input_price_per_mtok(&self) -> f64 {
         match self {
             ClaudeModel::Fable5 => 10.0,
