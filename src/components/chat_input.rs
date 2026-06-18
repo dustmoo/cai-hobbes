@@ -551,8 +551,10 @@ pub fn ChatInput(
     // can't pop a second message and race two turns on one session.
     let mut dispatching = use_signal(|| false);
     use_effect(move || {
-        // Re-run on any stream state change and on active-session switches.
+        // Re-run on any stream state change, active-session switch, or explicit
+        // drain request (e.g. a fired timer enqueuing for the active session).
         let _ = stream_manager.stream_activity.read();
+        let _ = chat_queue::QUEUE_DRAIN_TICK.read();
         let session_id = current_session_id.read().clone();
 
         if stream_manager.is_session_streaming(&session_id) {

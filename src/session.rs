@@ -146,6 +146,10 @@ pub struct Session {
     /// Prevents infinite recovery loops when the model keeps stalling.
     #[serde(default)]
     pub watch_word_recovery_count: u32,
+    /// AI-scheduled timers/reminders for this session (HOBBES_SET_TIMER).
+    /// Persisted so pending timers survive a restart and can be re-scheduled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduled_timers: Vec<crate::timers::ScheduledTimer>,
 }
 
 impl Session {
@@ -550,6 +554,198 @@ impl SessionState {
         }
     }
 
+    /// HOBBES_SET_TIMER: schedule a timer/reminder for this session.
+    pub fn handle_set_timer(
+        &mut self,
+        args_json: &serde_json::Value,
+        session_id: &str,
+    ) -> (crate::components::shared::ToolCallStatus, String) {
+        use crate::components::shared::ToolCallStatus;
+        use crate::timers::{
+            parse_duration_secs, ScheduledTimer, TimerMode, TimerStatus, MAX_DELAY_SECS,
+            MIN_DELAY_SECS,
+        };
+
+        // Delay accepts either `delay_secs` (integer) or `delay` ("10m", "1h30m").
+        let delay_secs = args_json
+            .get("delay_secs")
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                args_json
+                    .get("delay")
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_duration_secs)
+            });
+        let delay_secs = match delay_secs {
+            Some(n) => n,
+            None => {
+                return (
+                    ToolCallStatus::Error,
+                    "Provide 'delay_secs' (integer seconds) or 'delay' (e.g. \"10m\", \"1h30m\")."
+                        .to_string(),
+                )
+            }
+        };
+        if delay_secs < MIN_DELAY_SECS {
+            return (
+                ToolCallStatus::Error,
+                format!("Delay too short (minimum {}s).", MIN_DELAY_SECS),
+            );
+        }
+        if delay_secs > MAX_DELAY_SECS {
+            return (
+                ToolCallStatus::Error,
+                "Delay too long (maximum 7 days).".to_string(),
+            );
+        }
+
+        let mode = match args_json.get("mode").and_then(|v| v.as_str()) {
+            Some("prompt") => TimerMode::Prompt,
+            Some("notify") | None => TimerMode::Notify,
+            Some(other) => {
+                return (
+                    ToolCallStatus::Error,
+                    format!("Unknown mode '{}'. Use 'notify' or 'prompt'.", other),
+                )
+            }
+        };
+        let prompt = args_json
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let label = args_json
+            .get("label")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        if mode == TimerMode::Prompt
+            && prompt.as_deref().map(str::trim).unwrap_or("").is_empty()
+        {
+            return (
+                ToolCallStatus::Error,
+                "mode 'prompt' requires a non-empty 'prompt' to run when the timer fires."
+                    .to_string(),
+            );
+        }
+
+        let now = Utc::now();
+        let timer = ScheduledTimer {
+            id: format!("tmr_{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            session_id: session_id.to_string(),
+            created_at: now,
+            fire_at: now + chrono::Duration::seconds(delay_secs),
+            mode,
+            label,
+            prompt,
+            status: TimerStatus::Pending,
+        };
+        let summary = timer.summary();
+
+        {
+            let Some(session) = self.sessions.get_mut(session_id) else {
+                return (
+                    ToolCallStatus::Error,
+                    format!("Session '{}' not found", session_id),
+                );
+            };
+            session.scheduled_timers.push(timer);
+        }
+        Self::save_async(self, None);
+
+        let human = {
+            let (m, s) = (delay_secs / 60, delay_secs % 60);
+            if m > 0 {
+                format!("{}m{:02}s", m, s)
+            } else {
+                format!("{}s", s)
+            }
+        };
+        (
+            ToolCallStatus::Completed,
+            format!("Timer set — fires in {}. {}", human, summary),
+        )
+    }
+
+    /// HOBBES_LIST_TIMERS: list this session's pending timers.
+    pub fn handle_list_timers(
+        &self,
+        session_id: &str,
+    ) -> (crate::components::shared::ToolCallStatus, String) {
+        use crate::components::shared::ToolCallStatus;
+        use crate::timers::TimerStatus;
+
+        let pending: Vec<String> = self
+            .sessions
+            .get(session_id)
+            .map(|s| {
+                s.scheduled_timers
+                    .iter()
+                    .filter(|t| t.status == TimerStatus::Pending)
+                    .map(|t| t.summary())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if pending.is_empty() {
+            (ToolCallStatus::Completed, "No pending timers.".to_string())
+        } else {
+            (
+                ToolCallStatus::Completed,
+                format!("Pending timers:\n{}", pending.join("\n")),
+            )
+        }
+    }
+
+    /// HOBBES_CANCEL_TIMER: cancel a pending timer by id.
+    pub fn handle_cancel_timer(
+        &mut self,
+        args_json: &serde_json::Value,
+        session_id: &str,
+    ) -> (crate::components::shared::ToolCallStatus, String) {
+        use crate::components::shared::ToolCallStatus;
+        use crate::timers::TimerStatus;
+
+        let timer_id = args_json
+            .get("timer_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if timer_id.is_empty() {
+            return (
+                ToolCallStatus::Error,
+                "Missing 'timer_id' (from the timer's confirmation or HOBBES_LIST_TIMERS).".to_string(),
+            );
+        }
+
+        let cancelled = {
+            match self.sessions.get_mut(session_id) {
+                Some(session) => session
+                    .scheduled_timers
+                    .iter_mut()
+                    .find(|t| t.id == timer_id && t.status == TimerStatus::Pending)
+                    .map(|t| {
+                        t.status = TimerStatus::Cancelled;
+                        true
+                    })
+                    .unwrap_or(false),
+                None => false,
+            }
+        };
+
+        if cancelled {
+            Self::save_async(self, None);
+            (
+                ToolCallStatus::Completed,
+                format!("Cancelled timer {}.", timer_id),
+            )
+        } else {
+            (
+                ToolCallStatus::Error,
+                format!("No pending timer with id '{}'.", timer_id),
+            )
+        }
+    }
+
     /// Store newly-generated paginated pages into the queue.
     /// Call this after `PromptBuilder::build_prompt` in a separate write scope.
     ///
@@ -910,6 +1106,7 @@ impl SessionState {
             scratchpad: String::new(),
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
+            scheduled_timers: Vec::new(),
         };
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id.clone();
@@ -1913,6 +2110,7 @@ mod tests {
             scratchpad: String::new(),
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
+            scheduled_timers: Vec::new(),
         };
 
         // Simulate ToolCallSummarizer having inserted snapshots

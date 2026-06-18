@@ -29,6 +29,7 @@ fn create_test_session() -> Session {
         scratchpad: String::new(),
         current_ai_turn_count: 0,
         watch_word_recovery_count: 0,
+        scheduled_timers: Vec::new(),
     }
 }
 

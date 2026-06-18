@@ -37,6 +37,16 @@ impl QueuedMessage {
 pub static CHAT_QUEUE: GlobalSignal<HashMap<String, VecDeque<QueuedMessage>>> =
     Signal::global(HashMap::new);
 
+/// Bumped to nudge `ChatInput`'s drain effect to run even when neither the
+/// stream state nor the active session changed — e.g. when a fired timer
+/// enqueues a prompt for the session that is *already* active.
+pub static QUEUE_DRAIN_TICK: GlobalSignal<u64> = Signal::global(|| 0);
+
+/// Ask the active session's queue to drain on the next reactive tick.
+pub fn request_drain() {
+    *QUEUE_DRAIN_TICK.write() += 1;
+}
+
 // ── Pure map operations ──────────────────────────────────────────────────────
 // All queue mutations go through these free functions so the FIFO/removal logic
 // is unit-testable without a Dioxus runtime. Each keeps the invariant that an
