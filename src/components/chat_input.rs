@@ -659,10 +659,12 @@ pub fn ChatInput(
             }
         }
         div {
+            // Directional padding (not the `p-4` shorthand) so `pb-6` isn't
+            // overridden by `p-4`'s padding-bottom in the generated CSS.
             class: if *is_dragging.read() {
-                "bg-app p-4 pb-6 border-t-2 border-dashed border-primary-500"
+                "bg-app px-4 pt-4 pb-6 border-t-2 border-dashed border-primary-500"
             } else {
-                "bg-app p-4 pb-6 border-t border-subtle"
+                "bg-app px-4 pt-4 pb-6 border-t border-subtle"
             },
             onmousedown: |e| e.stop_propagation(),
             ondragover: move |event| {
