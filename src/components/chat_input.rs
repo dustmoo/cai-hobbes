@@ -660,9 +660,9 @@ pub fn ChatInput(
         }
         div {
             class: if *is_dragging.read() {
-                "bg-app p-4 border-t-2 border-dashed border-primary-500"
+                "bg-app p-4 pb-6 border-t-2 border-dashed border-primary-500"
             } else {
-                "bg-app p-4 border-t border-subtle"
+                "bg-app p-4 pb-6 border-t border-subtle"
             },
             onmousedown: |e| e.stop_propagation(),
             ondragover: move |event| {
