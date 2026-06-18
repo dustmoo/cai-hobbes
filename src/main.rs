@@ -57,8 +57,20 @@ use tray::{APP_QUIT, WINDOW_VISIBLE};
 use tray_icon::TrayIcon;
 
 /// Transient reminder text shown as a top-of-window toast when a timer fires.
-/// Set by the timer scheduler; dismissed by the user.
+/// Set by the timer scheduler; auto-dismisses, and can be dismissed manually.
 static TIMER_TOAST: GlobalSignal<Option<String>> = Signal::global(|| None);
+
+/// Show a timer toast and auto-clear it after a few seconds (unless a newer
+/// toast replaced it in the meantime). Avoids the reminder lingering forever.
+fn flash_timer_toast(msg: String) {
+    *TIMER_TOAST.write() = Some(msg.clone());
+    spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        if TIMER_TOAST.peek().as_deref() == Some(msg.as_str()) {
+            *TIMER_TOAST.write() = None;
+        }
+    });
+}
 
 /// Debug builds (cargo run): DEBUG+ to log file, INFO+ to stderr.
 /// File goes to ~/Library/Application Support/com.hobbes.app/hobbes.log (daily rotation).
@@ -1048,7 +1060,7 @@ fn app() -> Element {
                 }
                 if !missed.is_empty() {
                     crate::session::SessionState::save_async(&session_state.read(), None);
-                    *TIMER_TOAST.write() = Some(format!(
+                    flash_timer_toast(format!(
                         "⏰ Missed {} reminder(s) while away: {}",
                         missed.len(),
                         missed.join(", ")
@@ -1094,11 +1106,10 @@ fn app() -> Element {
                         let label = timer.label.clone().unwrap_or_else(|| "Reminder".into());
                         match timer.mode {
                             crate::timers::TimerMode::Notify => {
-                                *TIMER_TOAST.write() = Some(format!("⏰ {}", label));
+                                flash_timer_toast(format!("⏰ {}", label));
                             }
                             crate::timers::TimerMode::Prompt => {
-                                *TIMER_TOAST.write() =
-                                    Some(format!("⏰ {} — running follow-up…", label));
+                                flash_timer_toast(format!("⏰ {} — running follow-up…", label));
                                 if let Some(prompt) = timer.prompt.clone() {
                                     // Reuse the chat queue: enqueue for the timer's
                                     // session, then switch to it; ChatInput's drain

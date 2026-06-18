@@ -607,6 +607,8 @@ pub fn ChatInput(
                 }
             }
         }
+        // Live "timer running" indicator for the active session.
+        PendingTimersBar {}
         // Queued messages waiting for the in-flight turn to finish.
         {
             let session_id = current_session_id.read().clone();
@@ -1542,6 +1544,64 @@ fn format_hotkey(hotkey: &str) -> String {
         .replace("Alt", "⌥")
         .replace("Shift", "⇧")
         .replace("+", "")
+}
+
+/// Minimal live indicator of pending timers for the active session, shown just
+/// above the chat bar. Owns its own 1 Hz tick so the countdown updates without
+/// re-rendering the (large) `ChatInput`. Renders nothing when no timer is pending.
+#[component]
+fn PendingTimersBar() -> Element {
+    let session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let SessionIdContext(session_id) = use_context::<SessionIdContext>();
+
+    // 1-second tick driving the live countdown.
+    let mut tick = use_signal(|| 0u64);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            *tick.write() += 1;
+        }
+    });
+    let _ = tick.read(); // subscribe so the countdown re-renders each second
+
+    let now = chrono::Utc::now();
+    let sid = session_id.read().clone();
+    let remaining: Vec<i64> = session_state
+        .read()
+        .sessions
+        .get(&sid)
+        .map(|s| {
+            s.scheduled_timers
+                .iter()
+                .filter(|t| t.status == crate::timers::TimerStatus::Pending)
+                .map(|t| (t.fire_at - now).num_seconds().max(0))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if remaining.is_empty() {
+        return rsx! {};
+    }
+
+    let count = remaining.len();
+    let soonest = remaining.iter().copied().min().unwrap_or(0);
+    let (mm, ss) = (soonest / 60, soonest % 60);
+    let label = if count == 1 {
+        "1 timer running".to_string()
+    } else {
+        format!("{} timers running", count)
+    };
+
+    rsx! {
+        div {
+            class: "flex items-center gap-1.5 px-3 pt-1 text-xs text-fg-muted",
+            span {
+                class: "inline-block w-1.5 h-1.5 rounded-full bg-primary-500 animate-pulse",
+            }
+            Icon { width: 13, height: 13, icon: fi_icons::FiClock }
+            span { "{label} · next in {mm}:{ss:02}" }
+        }
+    }
 }
 
 #[component]
