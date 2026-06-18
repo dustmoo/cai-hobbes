@@ -1755,11 +1755,7 @@ fn app() -> Element {
                         },
                     }
                         div {
-                            // pb-3 reserves a small gap at the very bottom of the
-                            // window. It lives on the shell (outside the
-                            // overflow-hidden content row below), so it can't be
-                            // clipped the way padding inside the chat bar is.
-                            class: "flex flex-col h-screen pb-3 bg-app text-fg",
+                            class: "flex flex-col h-screen bg-app text-fg",
                             // Save error toast notification
                             if let Some(err_msg) = save_error.read().as_ref() {
                                 div {

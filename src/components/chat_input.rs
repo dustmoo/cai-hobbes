@@ -1594,7 +1594,7 @@ fn PendingTimersBar() -> Element {
 
     rsx! {
         div {
-            class: "flex items-center gap-1.5 px-3 pt-1 text-xs text-fg-muted",
+            class: "flex items-center gap-1.5 px-3 pt-1 pb-3 text-xs text-fg-muted",
             span {
                 class: "inline-block w-1.5 h-1.5 rounded-full bg-primary-500 animate-pulse",
             }
