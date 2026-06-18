@@ -232,6 +232,10 @@ pub struct Settings {
     pub confirm_on_message_edit: bool,
     #[serde(default = "default_true")]
     pub confirm_forget_memory: bool,
+    /// When a timer fires, bring the Hobbes window to the front / focus it.
+    /// Off by default — stealing focus is disruptive; users opt in.
+    #[serde(default)]
+    pub timer_focus_window: bool,
     #[serde(skip)]
     pub smithery_api_key: Option<String>,
     #[serde(default)]
@@ -534,6 +538,7 @@ impl Default for Settings {
             confirm_on_save: true,
             confirm_on_message_edit: true,
             confirm_forget_memory: true,
+            timer_focus_window: false,
             smithery_api_key: None,
             preferred_mcp_source: McpSource::default(),
             keychain_storage_mode: KeychainStorageMode::default(),

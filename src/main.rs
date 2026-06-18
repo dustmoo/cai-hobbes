@@ -1035,6 +1035,7 @@ fn app() -> Element {
     {
         let mut session_state = session_state;
         let mut chat_command = chat_command;
+        let settings = settings;
         let window = window.clone();
         use_future(move || {
             let window = window.clone();
@@ -1098,10 +1099,14 @@ fn app() -> Element {
                     crate::session::SessionState::save_async(&session_state.read(), None);
 
                     for timer in fired {
-                        // Bring the window forward.
-                        *WINDOW_VISIBLE.write() = true;
-                        window.set_visible(true);
-                        window.set_focus();
+                        // Only steal focus / raise the window if the user opted
+                        // in (off by default — it's disruptive). The toast and
+                        // in-app indicator surface the timer regardless.
+                        if settings.peek().timer_focus_window {
+                            *WINDOW_VISIBLE.write() = true;
+                            window.set_visible(true);
+                            window.set_focus();
+                        }
 
                         let label = timer.label.clone().unwrap_or_else(|| "Reminder".into());
                         match timer.mode {
