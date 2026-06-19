@@ -58,9 +58,78 @@ pub fn clamp_to_learned(scope: &str, model: &str, base: Option<usize>) -> Option
     }
 }
 
+/// Heuristic: does this (already-formatted) provider error indicate the prompt
+/// exceeded the model's context window? Used to decide whether an in-turn retry
+/// with a smaller budget is worthwhile. Matches the friendly messages produced by
+/// all three connectors as well as common raw API phrasings.
+pub fn is_context_overflow(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("prompt too large")
+        || m.contains("context length")
+        || m.contains("maximum context")
+        || m.contains("context window")
+        || m.contains("too many tokens")
+        || m.contains("reduce the length")
+        || m.contains("input is too long")
+        || (m.contains("token") && m.contains("exceed"))
+}
+
+/// Best-effort extraction of an explicit context-window size (in tokens) from a
+/// raw provider error body, e.g. OpenAI's "maximum context length is 8192 tokens".
+/// Returns the first integer following a known marker phrase.
+pub fn parse_context_limit(body: &str) -> Option<usize> {
+    let lower = body.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "maximum context length is",
+        "maximum context length of",
+        "context length is",
+        "context window of",
+        "context window is",
+    ];
+    for marker in MARKERS {
+        if let Some(pos) = lower.find(marker) {
+            if let Some(n) = first_integer(&lower[pos + marker.len()..]) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn first_integer(s: &str) -> Option<usize> {
+    let digits: String = s
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_overflow_phrasings() {
+        assert!(is_context_overflow("⚠️ **Prompt Too Large**"));
+        assert!(is_context_overflow(
+            "This model's maximum context length is 8192 tokens"
+        ));
+        assert!(is_context_overflow("Input is too long for the context window"));
+        assert!(!is_context_overflow("Authentication failed"));
+    }
+
+    #[test]
+    fn parses_explicit_limit() {
+        assert_eq!(
+            parse_context_limit(
+                "This model's maximum context length is 8192 tokens. However, your messages resulted in 10000 tokens."
+            ),
+            Some(8192)
+        );
+        assert_eq!(parse_context_limit("context window of 200000"), Some(200000));
+        assert_eq!(parse_context_limit("some unrelated error"), None);
+    }
 
     #[test]
     fn records_and_clamps_to_smallest() {

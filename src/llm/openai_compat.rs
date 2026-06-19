@@ -139,6 +139,16 @@ impl LlmConnector for OpenAiCompatConnector {
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
+                // Self-calibration: if the server reported an explicit context
+                // window in the error body, learn it (scoped to this endpoint +
+                // model) so future prompts are budgeted to the real limit.
+                if let Some(limit) = crate::llm::context_cache::parse_context_limit(&body) {
+                    crate::llm::context_cache::record_window(
+                        &self.config.endpoint,
+                        &self.config.model,
+                        limit,
+                    );
+                }
                 let friendly_message = Self::format_api_error(status.as_u16(), &body, &self.config);
                 let _ = tx.send(StreamMessage::Error {
                     message: friendly_message,

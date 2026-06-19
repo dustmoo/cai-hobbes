@@ -143,15 +143,25 @@ impl StreamManagerContext {
         // Spawn a master task to manage the LLM call and state updates.
         let master_task_handle = spawn(async move {
             tracing::info!(message_id = %message_id, "Stream master task SPAWNED.");
-            let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<StreamMessage>();
+            // Keep the built prompt and MCP context so we can re-send a trimmed
+            // version if the provider rejects the prompt as too large
+            // (adapt-to-error self-calibration, handled in the Error arm).
+            let mut current_prompt = prompt_data;
+            let mut context_retry_count: u32 = 0;
+            const MAX_CONTEXT_RETRIES: u32 = 2;
 
-            let llm_connector = self.connector_for_session(&session_id);
-            let session_id_for_cache = session_id.clone();
-            spawn(async move {
-                llm_connector
-                    .generate_content_stream(prompt_data, llm_tx, mcp_context, Some(session_id_for_cache))
-                    .await;
-            });
+            let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<StreamMessage>();
+            {
+                let llm_connector = self.connector_for_session(&session_id);
+                let session_id_for_cache = session_id.clone();
+                let pd = current_prompt.clone();
+                let mcp = mcp_context.clone();
+                spawn(async move {
+                    llm_connector
+                        .generate_content_stream(pd, llm_tx, mcp, Some(session_id_for_cache))
+                        .await;
+                });
+            }
 
             let mut is_first_message = true;
             let (tool_results_tx, mut tool_results_rx) =
@@ -258,6 +268,76 @@ impl StreamManagerContext {
                         }
                     }
                     StreamMessage::Error { message: error_msg } => {
+                        // Adapt-to-error: if the provider rejected the prompt as too
+                        // large and nothing has streamed yet (clean state), trim the
+                        // prompt to a smaller, recalibrated window and retry in-turn.
+                        // The reduced window is also recorded so subsequent turns are
+                        // budgeted correctly without hitting the error again.
+                        if is_first_message
+                            && context_retry_count < MAX_CONTEXT_RETRIES
+                            && crate::llm::context_cache::is_context_overflow(&error_msg)
+                        {
+                            context_retry_count += 1;
+                            let (provider, model, scope, chars_per_token) = {
+                                let settings = self.settings.read();
+                                let state = self.session_state.read();
+                                let session = state.sessions.get(&session_id);
+                                let provider = session
+                                    .map(|s| settings.provider_for_session(s))
+                                    .unwrap_or(settings.active_llm);
+                                let model = session
+                                    .map(|s| settings.chat_model_for_session(s))
+                                    .unwrap_or_else(|| settings.active_chat_model());
+                                let scope = match provider {
+                                    crate::settings::LlmProvider::OpenAiCompat => {
+                                        settings.openai_compat_config.endpoint.clone()
+                                    }
+                                    crate::settings::LlmProvider::Claude => "claude".to_string(),
+                                    crate::settings::LlmProvider::Gemini => "gemini".to_string(),
+                                };
+                                let cpt =
+                                    settings.effective_context_tuning_for(provider).chars_per_token;
+                                (provider, model, scope, cpt)
+                            };
+
+                            // The connector may already have recorded an explicit
+                            // limit parsed from the raw body; resolve_context_window_for
+                            // reflects it. Shrink to 80% of the best estimate (8k floor)
+                            // so we make progress even when no exact number was given.
+                            let current = self
+                                .settings
+                                .read()
+                                .resolve_context_window_for(provider, &model)
+                                .unwrap_or(128_000);
+                            let new_window = current.saturating_sub(current / 5).max(8_000);
+                            crate::llm::context_cache::record_window(&scope, &model, new_window);
+
+                            // Trim the already-built prompt to fit the new window and
+                            // re-send on a fresh channel (protect the 6 most recent msgs).
+                            current_prompt.enforce_context_budget(new_window, 6, chars_per_token);
+                            tracing::warn!(
+                                session_id = %session_id,
+                                new_window,
+                                attempt = context_retry_count,
+                                "Context overflow — recalibrating budget and retrying in-turn"
+                            );
+
+                            let (new_tx, new_rx) = mpsc::unbounded_channel::<StreamMessage>();
+                            {
+                                let llm_connector = self.connector_for_session(&session_id);
+                                let sid = session_id.clone();
+                                let pd = current_prompt.clone();
+                                let mcp = mcp_context.clone();
+                                spawn(async move {
+                                    llm_connector
+                                        .generate_content_stream(pd, new_tx, mcp, Some(sid))
+                                        .await;
+                                });
+                            }
+                            llm_rx = new_rx;
+                            continue;
+                        }
+
                         tracing::error!("LLM stream error: {}", error_msg);
 
                         // Save error message to session
