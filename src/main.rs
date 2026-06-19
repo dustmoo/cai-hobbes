@@ -46,6 +46,7 @@ pub use secret_types::SecretManagerTrait;
 mod services;
 mod session;
 mod str_utils;
+mod timers;
 mod usage_log;
 mod settings;
 mod skills;
@@ -54,6 +55,22 @@ mod tray;
 
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 use tray_icon::TrayIcon;
+
+/// Transient reminder text shown as a top-of-window toast when a timer fires.
+/// Set by the timer scheduler; auto-dismisses, and can be dismissed manually.
+static TIMER_TOAST: GlobalSignal<Option<String>> = Signal::global(|| None);
+
+/// Show a timer toast and auto-clear it after a few seconds (unless a newer
+/// toast replaced it in the meantime). Avoids the reminder lingering forever.
+fn flash_timer_toast(msg: String) {
+    *TIMER_TOAST.write() = Some(msg.clone());
+    spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        if TIMER_TOAST.peek().as_deref() == Some(msg.as_str()) {
+            *TIMER_TOAST.write() = None;
+        }
+    });
+}
 
 /// Debug builds (cargo run): DEBUG+ to log file, INFO+ to stderr.
 /// File goes to ~/Library/Application Support/com.hobbes.app/hobbes.log (daily rotation).
@@ -1010,6 +1027,121 @@ fn app() -> Element {
     });
     use_context_provider(|| SessionIdContext(current_session_id));
 
+    // ── AI-settable timer scheduler ──────────────────────────────────────────
+    // Polls every 5s for due timers (HOBBES_SET_TIMER) and fires them: focus the
+    // window + toast, and for `prompt` mode enqueue the prompt and switch to its
+    // session so ChatInput's drain runs it. Timers missed while the app was
+    // closed are surfaced as a reminder but never auto-run (no surprise turns).
+    {
+        let mut session_state = session_state;
+        let mut chat_command = chat_command;
+        let settings = settings;
+        let window = window.clone();
+        use_future(move || {
+            let window = window.clone();
+            async move {
+                // Startup: handle timers that came due while the app was closed.
+                let now = chrono::Utc::now();
+                let mut missed: Vec<String> = Vec::new();
+                if session_state
+                    .read()
+                    .sessions
+                    .values()
+                    .any(|s| s.scheduled_timers.iter().any(|t| t.is_due(now)))
+                {
+                    let mut state = session_state.write();
+                    for session in state.sessions.values_mut() {
+                        for t in session.scheduled_timers.iter_mut() {
+                            if t.is_due(now) {
+                                t.status = crate::timers::TimerStatus::Fired;
+                                missed.push(t.label.clone().unwrap_or_else(|| "(timer)".into()));
+                            }
+                        }
+                    }
+                }
+                if !missed.is_empty() {
+                    crate::session::SessionState::save_async(&session_state.read(), None);
+                    flash_timer_toast(format!(
+                        "⏰ Missed {} reminder(s) while away: {}",
+                        missed.len(),
+                        missed.join(", ")
+                    ));
+                }
+
+                // Poll loop.
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let now = chrono::Utc::now();
+
+                    // Cheap read-only check first so we don't mark the signal
+                    // dirty (and re-render) every 5s when nothing is due.
+                    let any_due = session_state
+                        .read()
+                        .sessions
+                        .values()
+                        .any(|s| s.scheduled_timers.iter().any(|t| t.is_due(now)));
+                    if !any_due {
+                        continue;
+                    }
+
+                    let mut fired: Vec<crate::timers::ScheduledTimer> = Vec::new();
+                    {
+                        let mut state = session_state.write();
+                        for session in state.sessions.values_mut() {
+                            for t in session.scheduled_timers.iter_mut() {
+                                if t.is_due(now) {
+                                    t.status = crate::timers::TimerStatus::Fired;
+                                    fired.push(t.clone());
+                                }
+                            }
+                        }
+                    }
+                    crate::session::SessionState::save_async(&session_state.read(), None);
+
+                    for timer in fired {
+                        // Only steal focus / raise the window if the user opted
+                        // in (off by default — it's disruptive). The toast and
+                        // in-app indicator surface the timer regardless.
+                        if settings.peek().timer_focus_window {
+                            *WINDOW_VISIBLE.write() = true;
+                            window.set_visible(true);
+                            window.set_focus();
+                        }
+
+                        let label = timer.label.clone().unwrap_or_else(|| "Reminder".into());
+                        match timer.mode {
+                            crate::timers::TimerMode::Notify => {
+                                flash_timer_toast(format!("⏰ {}", label));
+                            }
+                            crate::timers::TimerMode::Prompt => {
+                                flash_timer_toast(format!("⏰ {} — running follow-up…", label));
+                                if let Some(prompt) = timer.prompt.clone() {
+                                    // Reuse the chat queue: enqueue for the timer's
+                                    // session, then switch to it; ChatInput's drain
+                                    // runs it once that session is idle.
+                                    crate::components::chat_queue::queue_push(
+                                        &mut crate::components::chat_queue::CHAT_QUEUE.write(),
+                                        &timer.session_id,
+                                        crate::components::chat_queue::QueuedMessage::new(
+                                            prompt,
+                                            Vec::new(),
+                                        ),
+                                    );
+                                    chat_command.set(Some(ChatCommand::SwitchToSession(
+                                        timer.session_id.clone(),
+                                    )));
+                                    // Nudge the drain in case that session is
+                                    // already active (no switch → no re-trigger).
+                                    crate::components::chat_queue::request_drain();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Persist tab state to UiState (Pattern 12 & 13)
     use_effect(move || {
         let mut ui = ui_state.write();
@@ -1063,6 +1195,12 @@ fn app() -> Element {
         state.delete_session(&id_to_delete);
         drop(state);
 
+        // Drop any messages queued for the now-deleted session.
+        crate::components::chat_queue::queue_clear(
+            &mut crate::components::chat_queue::CHAT_QUEUE.write(),
+            &id_to_delete,
+        );
+
         let conn = llm_connector.read().clone();
         let id_to_delete_clone = id_to_delete.clone();
         tokio::spawn(async move {
@@ -1095,6 +1233,12 @@ fn app() -> Element {
         if idx < tabs.len() {
             let closing_session_id = tabs[idx].clone();
             tabs.remove(idx);
+
+            // A closed tab can't drain its queue; drop it (runtime-only state).
+            crate::components::chat_queue::queue_clear(
+                &mut crate::components::chat_queue::CHAT_QUEUE.write(),
+                &closing_session_id,
+            );
 
             // Delete the session if it has no messages (empty tab).
             // Sessions with messages are preserved in History.
@@ -1620,6 +1764,18 @@ fn app() -> Element {
                                     button {
                                         class: "ml-4 px-2 py-0.5 text-xs bg-red-800 hover:bg-red-700 rounded transition-colors",
                                         onclick: move |_| { save_error.set(None); },
+                                        "Dismiss"
+                                    }
+                                }
+                            }
+                            // Timer / reminder toast notification
+                            if let Some(msg) = TIMER_TOAST.read().as_ref() {
+                                div {
+                                    class: "flex items-center justify-between px-4 py-2 bg-primary-900/80 border-b border-primary-700 text-fg text-sm",
+                                    span { "{msg}" }
+                                    button {
+                                        class: "ml-4 px-2 py-0.5 text-xs bg-primary-800 hover:bg-primary-700 rounded transition-colors",
+                                        onclick: move |_| { *TIMER_TOAST.write() = None; },
                                         "Dismiss"
                                     }
                                 }

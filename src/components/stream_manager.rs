@@ -490,6 +490,55 @@ impl StreamManagerContext {
                                 return;
                             }
 
+                            // Intercept HOBBES timer tools before MCP dispatch.
+                            if matches!(
+                                tool_call.tool_name.as_str(),
+                                "HOBBES_SET_TIMER" | "HOBBES_LIST_TIMERS" | "HOBBES_CANCEL_TIMER"
+                            ) {
+                                let (status, response_str) = match tool_call.tool_name.as_str() {
+                                    "HOBBES_SET_TIMER" => session_state
+                                        .write()
+                                        .handle_set_timer(&args_json, &session_id_inner),
+                                    "HOBBES_LIST_TIMERS" => {
+                                        session_state.read().handle_list_timers(&session_id_inner)
+                                    }
+                                    _ => session_state
+                                        .write()
+                                        .handle_cancel_timer(&args_json, &session_id_inner),
+                                };
+
+                                {
+                                    let mut state = session_state.write();
+                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
+                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                                            tc.status = status;
+                                            tc.response = response_str.clone();
+                                        }
+                                    }
+                                    state.touch_session(&session_id_inner);
+                                }
+                                crate::session::SessionState::save_async(&session_state.read(), None);
+
+                                let record = crate::components::shared::ToolCallRecord {
+                                    call: tool_call.clone(),
+                                    result: crate::components::shared::ToolResult {
+                                        status,
+                                        response: response_str,
+                                    },
+                                    profile_color: {
+                                        let settings_read = self.settings.read();
+                                        crate::components::shared::resolve_profile_color(
+                                            profile_id.as_ref(),
+                                            &settings_read,
+                                        )
+                                    },
+                                };
+                                let _ = tool_results_tx_clone.send(record);
+                                completed_tool_tasks_clone
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            }
+
                             let result_receiver = mcp_manager
                                 .read()
                                 .use_mcp_tool(

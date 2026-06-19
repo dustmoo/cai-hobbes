@@ -3030,6 +3030,22 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
+                                    div {
+                                        class: "flex flex-col gap-1",
+                                        div {
+                                            class: "flex items-center justify-between",
+                                            label { class: "text-sm text-fg-muted", "Focus window when a timer fires" }
+                                            input {
+                                                r#type: "checkbox",
+                                                class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                                checked: "{local_settings.read().timer_focus_window}",
+                                                onchange: move |e| {
+                                                    local_settings.write().timer_focus_window = e.value() == "true";
+                                                }
+                                            }
+                                        }
+                                        p { class: "text-xs text-fg-muted/70", "When off, a fired timer shows a reminder without pulling the window to the front." }
+                                    }
                                 }
                             }
 
