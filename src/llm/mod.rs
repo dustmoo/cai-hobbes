@@ -1,10 +1,12 @@
 pub mod claude;
 pub mod claude_models;
 pub mod config;
+pub mod context_cache;
 pub mod convert;
 pub mod gemini;
 pub mod gemini_cache;
 pub mod openai_compat;
+pub mod openai_models;
 pub mod openai_pricing;
 pub mod openai_responses;
 pub mod types;
@@ -74,6 +76,40 @@ pub trait LlmConnector: Send + Sync {
         previous_summary: String,
         recent_messages: String,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Produce a knowledge-preserving summary of a single (large) tool result so
+    /// it can replace the raw payload once it becomes historical, keeping the
+    /// salient facts in context while reclaiming tokens.
+    ///
+    /// The default implementation reuses each provider's `summarize_conversation`
+    /// HTTP path, framing the tool output with explicit instructions to preserve
+    /// concrete facts (IDs, names, numbers, dates, statuses) and returning the
+    /// `summary` field. Providers may override for a better-tuned prompt.
+    async fn summarize_tool_result(
+        &self,
+        tool_name: &str,
+        response: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let framing = format!(
+            "You are compressing a large result from the tool '{tool_name}' so a \
+             downstream agent can rely on it later without re-fetching.\n\n\
+             Produce a DENSE, factual summary that PRESERVES every concrete detail \
+             the agent would need: ALL identifiers/IDs, names, email addresses, \
+             numbers, dates, statuses, and counts. Never invent or omit an ID. \
+             Prefer a compact list or table over prose. Do not editorialize.\n\n\
+             Tool result to summarize:\n---\n{response}\n---"
+        );
+        let value = self.summarize_conversation(String::new(), framing).await?;
+        // The conversation summarizer returns a JSON object with a `summary`
+        // field; fall back to the whole payload as text if the shape differs.
+        let summary = value
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| value.to_string());
+        Ok(summary)
+    }
 
     /// Optional: Perform tool selection for a specific toolkit.
     /// Default implementation returns "not supported".

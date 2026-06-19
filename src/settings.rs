@@ -692,16 +692,40 @@ impl Settings {
     /// Returns `None` only for unconfigured providers with no known context limit.
     pub fn resolve_context_window_for(&self, provider: LlmProvider, model: &str) -> Option<usize> {
         match provider {
-            LlmProvider::OpenAiCompat => self.openai_compat_config.max_context_tokens,
+            LlmProvider::OpenAiCompat => {
+                // Resolution order: explicit user override → known-model name table
+                // → None. The result is then clamped by any window learned at
+                // runtime from a "context length exceeded" error on this endpoint,
+                // so a too-optimistic estimate self-corrects after the first
+                // rejection. The learned cache is scoped by endpoint URL because
+                // limits are per-server.
+                let base = self
+                    .openai_compat_config
+                    .max_context_tokens
+                    .or_else(|| crate::llm::openai_models::known_context_window(model));
+                crate::llm::context_cache::clamp_to_learned(
+                    &self.openai_compat_config.endpoint,
+                    model,
+                    base,
+                )
+            }
             // NOTE: claude_config.max_tokens is the OUTPUT token cap (required by the
             // Messages API), not the context window — budget by the model's window.
             LlmProvider::Claude => {
-                let model = crate::llm::claude_models::ClaudeModel::from_slug(model);
-                Some(model.context_window_tokens())
+                let claude_model = crate::llm::claude_models::ClaudeModel::from_slug(model);
+                crate::llm::context_cache::clamp_to_learned(
+                    "claude",
+                    model,
+                    Some(claude_model.context_window_tokens()),
+                )
             }
             LlmProvider::Gemini => {
-                let model = crate::llm::gemini::GeminiModel::from_slug(model);
-                Some(model.context_window_tokens())
+                let gemini_model = crate::llm::gemini::GeminiModel::from_slug(model);
+                crate::llm::context_cache::clamp_to_learned(
+                    "gemini",
+                    model,
+                    Some(gemini_model.context_window_tokens()),
+                )
             }
         }
     }

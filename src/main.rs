@@ -175,6 +175,25 @@ fn main() {
                     + r#"<style>html, body { height: 100%; margin: 0; padding: 0; font-family: 'Inter', system-ui, sans-serif; }</style>"#
                     + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"#
                     + r#"<style>"# + include_str!("../assets/main.css") + r#"</style>"#
+                    // Windows/Linux WebView renders classic, always-visible
+                    // scrollbars (with arrow buttons) where macOS uses hidden
+                    // overlay scrollbars. Style them down to a thin, button-less
+                    // thumb so the chat input grows cleanly and panels match macOS.
+                    // Scoped off macOS so its overlay scrollbars stay untouched.
+                    + {
+                        #[cfg(not(target_os = "macos"))]
+                        { r#"<style>
+                            * { scrollbar-width: thin; scrollbar-color: var(--color-border-muted, #4B5563) transparent; }
+                            ::-webkit-scrollbar { width: 8px; height: 8px; }
+                            ::-webkit-scrollbar-track { background: transparent; }
+                            ::-webkit-scrollbar-thumb { background-color: var(--color-border-muted, #4B5563); border-radius: 4px; }
+                            ::-webkit-scrollbar-thumb:hover { background-color: var(--color-text-muted, #9CA3AF); }
+                            ::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+                            ::-webkit-scrollbar-corner { background: transparent; }
+                        </style>"# }
+                        #[cfg(target_os = "macos")]
+                        { "" }
+                    }
                 )
         )
         .launch(app)

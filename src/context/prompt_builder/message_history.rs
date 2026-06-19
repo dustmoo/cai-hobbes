@@ -1,6 +1,5 @@
 use crate::components::shared::MessageContent;
 use crate::llm::types::{ChatMessage, ChatRole, ContentBlock, ToolDefinition};
-use crate::str_utils::{find_split_point, floor_char_boundary};
 use serde_json::json;
 use super::PromptBuilder;
 use super::types::{ToolResultPosition, unwrap_json_strings};
@@ -37,8 +36,9 @@ impl<'a> PromptBuilder<'a> {
         let mut last_thought_signature: Option<String> = None;
         // Track positions of ToolResult messages for Pass 2 budget allocation
         let mut tool_result_positions: Vec<ToolResultPosition> = Vec::new();
-        // Pages to store in PageQueue (for both historical stashes and active pagination)
-        let mut pages_to_store: Vec<(String, crate::session::PagedResult)> = Vec::new();
+        // Pages to store in PageQueue. Pass 1 no longer paginates anything;
+        // Pass 2 (apply_pass2_budget) is the single authority that fills this.
+        let pages_to_store: Vec<(String, crate::session::PagedResult)> = Vec::new();
 
         let session_messages = &self.session.messages;
         let mut first_message_id = None;
@@ -101,7 +101,23 @@ impl<'a> PromptBuilder<'a> {
         // 2. Add the last `history_len` messages.
         let start_index = session_messages.len().saturating_sub(history_len);
 
-        for message in session_messages.iter().skip(start_index) {
+        // Identify the current turn's boundary: every message at or after the
+        // most recent user text message belongs to the in-progress turn, and its
+        // tool results are protected from lossy compression (Flaw A fix). Using
+        // "last user message" rather than "literally the last message" keeps a
+        // tool result full even when later tool calls or text follow it within
+        // the same turn — the Gmail-fetch-then-summarise case that previously
+        // collapsed the fetch to a fixed cap mid-turn.
+        let current_turn_start_idx = session_messages
+            .iter()
+            .rposition(|m| {
+                m.author == "User" && matches!(m.content, MessageContent::Text { .. })
+            })
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        for (offset, message) in session_messages.iter().skip(start_index).enumerate() {
+            let abs_idx = start_index + offset;
             // Avoid duplicating the first message
             if Some(message.id) != first_message_id {
                 // Skip placeholder
@@ -186,151 +202,43 @@ impl<'a> PromptBuilder<'a> {
                             content: assistant_content,
                         });
 
-                        // 2. Add the Tool Result message
-                        let last_meaningful_id = if is_continuation_placeholder {
-                            if self.session.messages.len() >= 2 {
-                                self.session
-                                    .messages
-                                    .get(self.session.messages.len() - 2)
-                                    .map(|m| m.id)
-                            } else {
-                                None
-                            }
-                        } else {
-                            last_message.map(|m| m.id)
-                        };
-
-                        let is_active_tool_call = Some(message.id) == last_meaningful_id;
+                        // 2. Add the Tool Result message.
+                        // A tool result is "active" (protected, full fidelity) when
+                        // it belongs to the current turn — its position is at or
+                        // after the last user message (see `current_turn_start_idx`).
+                        let is_active_tool_call = abs_idx >= current_turn_start_idx;
                         
                         // Why clone here?
-                        // We clone `tc.response` explicitly so we can safely perform non-destructive 
-                        // truncation, compression (json2markdown), or pagination on the *prompt copy* 
-                        // exclusively for the LLM's consumption during this specific turn.
-                        // By leaving the historical `SessionState::tc.response` entirely untouched, 
-                        // we guarantee the original (potentially massive) tool payload is perpetually 
-                        // preserved in memory. This ensures subsequent turns can dynamically re-paginate 
-                        // or re-compress the full data as the conversation window shifts.
+                        // We clone `tc.response` so we can build a non-destructive
+                        // prompt copy (TOON conversion, summary substitution, or
+                        // pagination) for this turn only. The historical
+                        // `SessionState::tc.response` is left untouched, so the full
+                        // (potentially massive) payload is always preserved for
+                        // future re-budgeting as the window shifts.
                         let result_string = tc.response.clone();
 
-                        // Resolve whether to apply compact markdown conversion
-                        // (uses `tuning` already resolved at line 176 for the entire build)
-                        let use_compact = tuning.compact_tool_results;
-                        // Tracks whether Pass 1 TOON condensation already stashed this result.
-                        // When true, Pass 2 will skip re-paginating to avoid corrupting the
-                        // HOBBES_PAGE_RESULT footer that Pass 1 already embedded.
-                        let mut already_condensed_by_pass1 = false;
-
-                        let result_value: serde_json::Value = if use_compact {
-                            // Parse to JSON for markdown conversion
+                        // Pass 1 is REPRESENTATION-ONLY: convert to compact TOON
+                        // markdown when enabled, otherwise keep raw JSON. All
+                        // budget-based work — truncation, pagination, and
+                        // knowledge-preserving summary substitution — happens in
+                        // Pass 2 (`apply_pass2_budget`), the single context-aware
+                        // authority. Crucially, a large result is NOT chopped to a
+                        // fixed cap here: on a large-context provider it stays in
+                        // full; on a small one Pass 2 trims it against the real
+                        // window.
+                        let result_value: serde_json::Value = if tuning.compact_tool_results {
+                            // Parse to JSON for markdown conversion.
                             let mut json_val: serde_json::Value =
                                 serde_json::from_str(&result_string).unwrap_or(json!(result_string));
-                            // Recursively unwrap stringified JSON (e.g. Composio's result.text)
-                            // so TOON can render the full structure efficiently.
+                            // Recursively unwrap stringified JSON (e.g. Composio's
+                            // result.text) so TOON can render the full structure.
                             unwrap_json_strings(&mut json_val);
-                            let md = crate::formatters::toon::to_toon(&json_val);
-
-                            if !is_active_tool_call {
-                                // Historical result: condense for context, stash full data
-                                let budget = tuning.max_tool_output_length;
-                                if md.len() > budget {
-                                    // Stash full markdown in PageQueue for retrieval
-                                    let stash_id = format!(
-                                        "hist-{}-{}",
-                                        sanitized_tool_name,
-                                        &tc.execution_id[..8.min(tc.execution_id.len())]
-                                    );
-                                    pages_to_store.push((
-                                        stash_id.clone(),
-                                        crate::session::PagedResult {
-                                            remaining_content: md.clone(),
-                                            tool_name: sanitized_tool_name.clone(),
-                                        },
-                                    ));
-
-                                    // Truncate for in-context display
-                                    let mut condensed = md;
-                                    let trunc_len = floor_char_boundary(&condensed, budget);
-                                    condensed.truncate(trunc_len);
-                                    condensed.push_str(&format!(
-                                        "\n... [Result condensed. Full data available: call HOBBES_PAGE_RESULT with tool_call_id \"{}\"]",
-                                        stash_id
-                                    ));
-                                    tracing::debug!(
-                                        "Condensed historical result for {} ({} chars → {} chars, stash_id={})",
-                                        sanitized_tool_name, result_string.len(), condensed.len(), stash_id
-                                    );
-                                    // Mark as already_condensed so Pass 2 doesn't re-paginate
-                                    // and corrupt the HOBBES_PAGE_RESULT footer we just added.
-                                    already_condensed_by_pass1 = true;
-                                    json!(condensed)
-                                } else {
-                                    // Fits within budget — use full markdown
-                                    tracing::debug!(
-                                        "Historical result {} converted to markdown ({} chars → {} chars)",
-                                        sanitized_tool_name, result_string.len(), md.len()
-                                    );
-                                    json!(md)
-                                }
-                            } else {
-                                // Active result: full markdown, Pass 2 handles budget
-                                tracing::debug!(
-                                    "Active result {} converted to markdown ({} chars → {} chars)",
-                                    sanitized_tool_name, result_string.len(), md.len()
-                                );
-                                json!(md)
-                            }
+                            json!(crate::formatters::toon::to_toon(&json_val))
                         } else {
-                            // compact_tool_results OFF: original JSON behavior.
-                            // Oversized results are paginated (not silently truncated) so the
-                            // model can fetch the remainder via HOBBES_PAGE_RESULT.
-                            let rs = result_string;
-                            let max_len = if is_active_tool_call {
-                                self.effective_tool_result_limit(tuning)
-                            } else {
-                                tuning.max_tool_output_length
-                            };
-
-                            if rs.len() > max_len {
-                                let split_at = find_split_point(&rs, max_len);
-                                if split_at < rs.len() {
-                                    // Stash the remainder so the model can page through it.
-                                    let stash_id = format!(
-                                        "raw-{}-{}",
-                                        sanitized_tool_name,
-                                        &tc.execution_id[..8.min(tc.execution_id.len())]
-                                    );
-                                    pages_to_store.push((
-                                        stash_id.clone(),
-                                        crate::session::PagedResult {
-                                            remaining_content: rs[split_at..].to_string(),
-                                            tool_name: sanitized_tool_name.clone(),
-                                        },
-                                    ));
-                                    let page1 = format!(
-                                        "{}\n\n[Result truncated. Full data available: call HOBBES_PAGE_RESULT with tool_call_id \"{}\"]",
-                                        &rs[..split_at], stash_id
-                                    );
-                                    already_condensed_by_pass1 = true;
-                                    tracing::debug!(
-                                        "compact=OFF: stashed raw result for '{}' ({} chars, stash_id={})",
-                                        sanitized_tool_name, rs.len(), stash_id
-                                    );
-                                    match serde_json::from_str::<serde_json::Value>(&page1) {
-                                        Ok(val) => val,
-                                        Err(_) => json!(page1),
-                                    }
-                                } else {
-                                    // split_at == rs.len(): entire content fits at split boundary
-                                    match serde_json::from_str::<serde_json::Value>(&rs) {
-                                        Ok(val) => val,
-                                        Err(_) => json!(rs),
-                                    }
-                                }
-                            } else {
-                                match serde_json::from_str::<serde_json::Value>(&rs) {
-                                    Ok(val) => val,
-                                    Err(_) => json!(rs),
-                                }
+                            // Raw JSON preserved for fidelity; Pass 2 paginates if needed.
+                            match serde_json::from_str::<serde_json::Value>(&result_string) {
+                                Ok(val) => val,
+                                Err(_) => json!(result_string),
                             }
                         };
 
@@ -386,14 +294,15 @@ impl<'a> PromptBuilder<'a> {
 
                         // Track position for Pass 2 budget allocation.
                         // Uses the pre-captured index so vision messages don't shift it.
-                        // The bool signals whether Pass 1 TOON condensation already handled
-                        // pagination — if so, Pass 2 skips this entry.
+                        // `result_summary` is populated from the tool call's
+                        // background-generated summary (Part 4); Pass 2 uses it to
+                        // compress over-budget history without losing facts.
                         tool_result_positions.push(ToolResultPosition {
                             msg_idx: tool_result_msg_idx,
                             tool_name: sanitized_tool_name,
                             execution_id: tc.execution_id.to_string(),
                             is_active: is_active_tool_call,
-                            already_condensed: already_condensed_by_pass1,
+                            result_summary: tc.result_summary.clone(),
                         });
 
                     }

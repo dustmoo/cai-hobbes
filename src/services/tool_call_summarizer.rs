@@ -88,6 +88,7 @@ mod tests {
                     thought_signature: None,
                     thought_summary: None,
                     cached_image_path: None,
+                    result_summary: None,
                 },
                 result: ToolResult {
                     status: ToolCallStatus::Completed,
