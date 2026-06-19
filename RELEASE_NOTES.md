@@ -1,3 +1,26 @@
+# Hobbes v0.10.0 — Smart Context, AI Timers & Message Queue
+
+## ✨ New Features
+
+### Smart context handling
+- **Big tool results stay intact on large-context models.** Previously, fetching a lot of data (e.g. a full inbox of emails) could get silently condensed mid-turn even on Gemini/Claude with their huge context windows — which sometimes led the model to "fill in the gaps" with plausible-but-wrong details. Tool results in the **current turn are now kept in full**, so the model always sees the real data it's working with.
+- **Per-turn budgeting is now provider-aware.** Hobbes sizes tool results against each model's *actual* context window instead of a one-size-fits-all cap. Small local models still get aggressive compression (so they don't overload); large models keep far more in context.
+- **Knowledge-preserving history summaries.** When older tool results no longer fit the budget, Hobbes replaces them with a dense summary that preserves the concrete facts (IDs, names, numbers, dates) — instead of chopping the data behind a "fetch the rest" footer. The full data is still retrievable on demand.
+- **Auto-recalibration on "prompt too large".** If a provider rejects a prompt as too big, Hobbes trims and retries in-turn, and remembers the real limit so later turns just work — no manual fiddling.
+- **Correct OpenAI context windows.** OpenAI-compatible endpoints now resolve their window from the model name (gpt-4.1 → 1M, gpt-5.4 → 1M, gpt-5.5 → 512K, gpt-5 → 400K, gpt-4o → 128K, o-series → 200K), with runtime self-correction for anything unknown.
+
+### AI-settable timers & reminders
+- The assistant can now set **timers and reminders** that notify you (or prompt a follow-up turn) when they fire, with a live pending-timer indicator above the chat bar and an auto-dismissing toast. Window-focus behavior is opt-in via a Behavior setting.
+
+### Send-while-streaming message queue
+- You can now **queue a message while a turn is still streaming** instead of waiting — it's sent automatically once the current turn completes.
+
+## 🐛 Fixes
+- **Windows scrollbars cleaned up.** The chat input and side panels no longer show chunky, always-visible scrollbars with arrow buttons on Windows/Linux — the input grows cleanly and then scrolls with a thin scrollbar, matching the macOS look. (macOS overlay scrollbars are untouched.)
+- **Chat bar spacing.** Added breathing room below the chat bar and fixed padding that was being clipped by the app shell's overflow.
+
+---
+
 # Hobbes v0.9.62 — Pricing Accuracy
 
 ## 🐛 Fixes
