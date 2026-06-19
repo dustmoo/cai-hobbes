@@ -1,10 +1,12 @@
 pub mod claude;
 pub mod claude_models;
 pub mod config;
+pub mod context_cache;
 pub mod convert;
 pub mod gemini;
 pub mod gemini_cache;
 pub mod openai_compat;
+pub mod openai_models;
 pub mod openai_pricing;
 pub mod openai_responses;
 pub mod types;

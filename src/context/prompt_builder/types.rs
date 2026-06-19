@@ -15,12 +15,18 @@ pub(crate) struct ToolResultPosition {
     pub tool_name: String,
     /// Execution UUID, used to build stable page-queue IDs.
     pub execution_id: String,
-    /// True if this is the most recent (active) tool call this turn.
+    /// True if this tool result belongs to the *current turn* — i.e. it occurs
+    /// at or after the most recent user message. Current-turn results are the
+    /// model's live working set and are protected from lossy compression so the
+    /// in-progress turn always has the data it needs. Historical results (prior
+    /// turns) may be summarised or paginated by Pass 2 to fit the budget.
     pub is_active: bool,
-    /// True if Pass 1 TOON condensation already stashed this result in the
-    /// PageQueue. When set, Pass 2 must skip this entry so it doesn't corrupt
-    /// the HOBBES_PAGE_RESULT footer that Pass 1 already embedded.
-    pub already_condensed: bool,
+    /// Knowledge-preserving summary of this tool result, if one has been
+    /// generated in the background. When a *historical* result exceeds its Pass 2
+    /// budget and a summary is available, Pass 2 substitutes the summary instead
+    /// of hard-truncating — preserving the facts while reclaiming tokens. `None`
+    /// means no summary yet; Pass 2 falls back to pagination.
+    pub result_summary: Option<String>,
 }
 
 /// Result of building a prompt, including the prompt itself and any

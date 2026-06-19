@@ -273,3 +273,184 @@ fn test_segment_into_pages_all_multibyte() {
     );
     assert!(pages.len() > 1, "Should produce multiple pages");
 }
+
+// =========================================================================
+// Smart context handling: tool-result budgeting per provider
+// =========================================================================
+
+use crate::components::chat::Message;
+use crate::components::shared::{MessageContent, ToolCall, ToolCallStatus};
+use crate::settings::LlmProvider;
+
+fn user_text_msg(text: &str) -> Message {
+    Message {
+        id: uuid::Uuid::new_v4(),
+        author: "User".to_string(),
+        content: MessageContent::Text {
+            content: text.to_string(),
+            thought_signature: None,
+            thought_summary: None,
+        },
+        attachments: vec![],
+        comments: vec![],
+        created_at: Utc::now(),
+        usage: None,
+    }
+}
+
+fn tool_call_msg(tool_name: &str, response: String, result_summary: Option<String>) -> Message {
+    Message {
+        id: uuid::Uuid::new_v4(),
+        author: "Hobbes".to_string(),
+        content: MessageContent::ToolCall(ToolCall {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            server_name: "test-server".to_string(),
+            tool_name: tool_name.to_string(),
+            arguments: "{}".to_string(),
+            status: ToolCallStatus::Completed,
+            response,
+            thought_signature: None,
+            thought_summary: None,
+            cached_image_path: None,
+            result_summary,
+        }),
+        attachments: vec![],
+        comments: vec![],
+        created_at: Utc::now(),
+        usage: None,
+    }
+}
+
+/// Build a big JSON array of fake "emails" so the raw response is well over any
+/// fixed cap (the old behaviour chopped historical results to ~8KB).
+fn big_email_payload(count: usize) -> String {
+    let emails: Vec<serde_json::Value> = (0..count)
+        .map(|i| {
+            serde_json::json!({
+                "id": format!("EMAILID{:08x}", i * 2654435761u64 as usize),
+                "subject": format!("Quarterly report and action items number {i}"),
+                "sender": format!("person{i}@example-corp.com"),
+                "snippet": "Lorem ipsum dolor sit amet, consectetur adipiscing elit, \
+                             sed do eiusmod tempor incididunt ut labore et dolore magna."
+            })
+        })
+        .collect();
+    serde_json::to_string(&serde_json::json!({ "emails": emails })).unwrap()
+}
+
+fn tool_result_text(prompt: &crate::context::prompt_builder::PromptBuildResult) -> String {
+    use crate::llm::types::{ChatRole, ContentBlock};
+    let mut out = String::new();
+    for m in &prompt.prompt.messages {
+        if m.role == ChatRole::Tool {
+            for b in &m.content {
+                if let ContentBlock::ToolResult { content, .. } = b {
+                    out.push_str(&content.as_str().map(|s| s.to_string()).unwrap_or_else(|| content.to_string()));
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The Gmail regression: a large tool result that belongs to the CURRENT turn
+/// (a later assistant message follows it, but no new user message) must stay
+/// full on a large-context provider — never condensed mid-turn.
+#[test]
+fn current_turn_tool_result_not_condensed_on_large_window() {
+    let mut session = create_test_session();
+    session.llm_provider = Some(LlmProvider::Gemini);
+    session.chat_model = Some("gemini-2.5-flash".to_string()); // 1M context
+    let payload = big_email_payload(400);
+    assert!(payload.len() > 50_000, "payload should be large");
+    session.messages = vec![
+        user_text_msg("fetch my unread emails and summarise them"),
+        tool_call_msg("GMAIL_FETCH_EMAILS", payload, None),
+        // An assistant turn follows the tool call, making it no longer the
+        // literal last message — but it's still the current turn's working set.
+    ];
+
+    let settings = Settings::default();
+    let state = create_test_session_state();
+    let builder = PromptBuilder::new(&session, &settings, &state);
+    let prompt = builder.build_prompt(String::new());
+
+    let tool_text = tool_result_text(&prompt);
+    assert!(
+        !tool_text.contains("HOBBES_PAGE_RESULT"),
+        "current-turn result on a 1M window must not be paginated/condensed"
+    );
+    // A sampling of senders from across the payload should all survive.
+    assert!(tool_text.contains("person0@example-corp.com"));
+    assert!(tool_text.contains("person399@example-corp.com"));
+}
+
+/// On a small window, an oversized HISTORICAL result (a newer user message
+/// follows it) is paginated so it can't blow the budget — preserving the
+/// small-model behaviour OpenAI users rely on.
+#[test]
+fn historical_tool_result_paginated_on_small_window() {
+    let mut session = create_test_session();
+    session.llm_provider = Some(LlmProvider::OpenAiCompat);
+    session.chat_model = Some("local-model".to_string());
+    let payload = big_email_payload(400);
+    session.messages = vec![
+        user_text_msg("first request"),
+        tool_call_msg("GMAIL_FETCH_EMAILS", payload, None),
+        user_text_msg("now do something else"), // makes the tool result historical
+    ];
+
+    let mut settings = Settings::default();
+    settings.openai_compat_config.endpoint = "http://localhost:11434/v1".to_string();
+    settings.openai_compat_config.max_context_tokens = Some(16_000);
+
+    let state = create_test_session_state();
+    let builder = PromptBuilder::new(&session, &settings, &state);
+    let prompt = builder.build_prompt(String::new());
+
+    let tool_text = tool_result_text(&prompt);
+    assert!(
+        tool_text.contains("HOBBES_PAGE_RESULT"),
+        "oversized historical result on a 16K window must be paginated"
+    );
+}
+
+/// When a historical result has a knowledge-preserving summary and exceeds its
+/// budget, Pass 2 substitutes the summary (facts kept) instead of hard-chopping.
+#[test]
+fn historical_tool_result_uses_summary_when_available() {
+    let mut session = create_test_session();
+    session.llm_provider = Some(LlmProvider::OpenAiCompat);
+    session.chat_model = Some("local-model".to_string());
+    let payload = big_email_payload(400);
+    let summary = "41 unread emails. Senders include person0@example-corp.com and \
+                   person59@example-corp.com. Topics: quarterly reports.";
+    session.messages = vec![
+        user_text_msg("first request"),
+        tool_call_msg("GMAIL_FETCH_EMAILS", payload, Some(summary.to_string())),
+        user_text_msg("now do something else"),
+    ];
+
+    let mut settings = Settings::default();
+    settings.openai_compat_config.endpoint = "http://localhost:11434/v1".to_string();
+    settings.openai_compat_config.max_context_tokens = Some(16_000);
+
+    let state = create_test_session_state();
+    let builder = PromptBuilder::new(&session, &settings, &state);
+    let prompt = builder.build_prompt(String::new());
+
+    let tool_text = tool_result_text(&prompt);
+    assert!(
+        tool_text.contains("Summary of an earlier"),
+        "over-budget historical result with a summary should be substituted"
+    );
+    assert!(
+        tool_text.contains("quarterly reports"),
+        "the summary's facts should be present in context"
+    );
+    assert!(
+        tool_text.contains("HOBBES_PAGE_RESULT"),
+        "full data should remain retrievable via pagination id"
+    );
+}

@@ -41,104 +41,166 @@ impl<'a> PromptBuilder<'a> {
             }).sum::<usize>())
             .sum();
 
-        let active_idx = tool_result_positions.iter().position(|trp| trp.is_active);
+        // All tool results that belong to the current turn are protected (full
+        // fidelity); only history may be compressed. Collect their positions so
+        // the budget split can give the working set the lion's share.
+        let active_indices: Vec<usize> = tool_result_positions
+            .iter()
+            .enumerate()
+            .filter(|(_, trp)| trp.is_active)
+            .map(|(i, _)| i)
+            .collect();
 
-        if let Some(budgets) = Self::compute_tool_result_budget(
+        // Resolve per-result budgets. With a known context window we split it
+        // proportionally; with an unknown window (an unconfigured OpenAI-compatible
+        // endpoint) we fall back to fixed caps so we never ship an unbounded
+        // payload to a server whose limit we can't see.
+        let budgets: Vec<usize> = match Self::compute_tool_result_budget(
             system_chars,
             tool_def_chars,
             non_result_chars,
             tool_result_positions.len(),
-            active_idx,
+            &active_indices,
             provider_context,
             tuning,
         ) {
-            // Apply budgets: paginate results that exceed their allocation.
-            // Uses find_split_point directly (instead of the old segment_into_pages)
-            // so all content beyond page 1 is stored in the PageQueue as a raw
-            // string for dynamic re-segmentation at delivery time. This guarantees
-            // the model can always fetch content via HOBBES_PAGE_RESULT rather than
-            // hitting a silent hard truncation.
-            for (pos_idx, trp) in tool_result_positions.iter().enumerate() {
-                let budget_chars = budgets[pos_idx];
-                let ToolResultPosition { msg_idx, tool_name, execution_id, already_condensed, .. } = trp;
+            Some(b) => b,
+            None => tool_result_positions
+                .iter()
+                .map(|trp| {
+                    if trp.is_active {
+                        tuning.max_active_tool_output_length
+                    } else {
+                        tuning.max_tool_output_length
+                    }
+                })
+                .collect(),
+        };
 
-                // Skip entries already condensed by Pass 1 TOON stashing.
-                // Their HOBBES_PAGE_RESULT footer must not be overwritten.
-                if *already_condensed {
-                    tracing::debug!(
-                        "Pass 2 skipping '{}' — already condensed by Pass 1",
-                        tool_name
+        for (pos_idx, trp) in tool_result_positions.iter().enumerate() {
+            let budget_chars = budgets[pos_idx];
+            let ToolResultPosition {
+                msg_idx,
+                tool_name,
+                execution_id,
+                is_active,
+                result_summary,
+            } = trp;
+
+            let Some(msg) = messages.get_mut(*msg_idx) else {
+                continue;
+            };
+            let Some(ContentBlock::ToolResult { content, .. }) = msg.content.first() else {
+                continue;
+            };
+
+            // Extract raw content. If the value is a string (e.g. TOON markdown
+            // from compact_tool_results), use it directly to avoid JSON-escaping
+            // (\n → \\n). For objects/arrays, serialize preserving structure.
+            let serialized = content
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    serde_json::to_string_pretty(content).unwrap_or_else(|_| content.to_string())
+                });
+
+            if serialized.len() <= budget_chars {
+                continue; // Fits — leave it in full.
+            }
+
+            let short_suffix: String = execution_id
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .take(6)
+                .collect();
+            let tool_call_id = format!("page-{}-{}", tool_name, short_suffix);
+
+            // HISTORICAL + over budget: prefer a knowledge-preserving summary if one
+            // exists. This keeps the salient facts (IDs, names, numbers) in context
+            // instead of chopping the data behind pagination the model may ignore.
+            // The full payload is still stashed for explicit retrieval.
+            if !is_active {
+                if let Some(summary) = result_summary {
+                    pages_to_store.push((
+                        tool_call_id.clone(),
+                        crate::session::PagedResult {
+                            remaining_content: serialized.clone(),
+                            tool_name: tool_name.clone(),
+                        },
+                    ));
+                    let replaced = format!(
+                        "[Summary of an earlier '{}' result — key facts preserved. Full data: call HOBBES_PAGE_RESULT with tool_call_id \"{}\"]\n\n{}",
+                        tool_name, tool_call_id, summary
                     );
+                    tracing::info!(
+                        "Pass 2: summarised historical '{}' ({} bytes → {} chars summary, id={})",
+                        tool_name,
+                        serialized.len(),
+                        replaced.len(),
+                        tool_call_id
+                    );
+                    if let Some(ContentBlock::ToolResult { content, .. }) = msg.content.first_mut() {
+                        *content = json!(replaced);
+                    }
                     continue;
                 }
+            }
 
-                if let Some(msg) = messages.get_mut(*msg_idx) {
-                    if let Some(ContentBlock::ToolResult { content, .. }) = msg.content.first() {
-                        // Extract raw content for pagination. If the value is a string
-                        // (e.g., TOON markdown from compact_tool_results), use it directly
-                        // to avoid JSON-escaping (\n → \\n). For objects/arrays, fall back
-                        // to JSON serialization which preserves structure.
-                        let serialized = content.as_str()
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| serde_json::to_string_pretty(content).unwrap_or_else(|_| content.to_string()));
-
-                        if serialized.len() > budget_chars {
-                            // Find where page 1 ends using a single smart split.
-                            // Store everything after it as a raw string so delivery
-                            // can re-split dynamically at the budget of each future turn.
-                            let split_at = find_split_point(&serialized, budget_chars);
-
-                            if split_at < serialized.len() {
-                                let short_suffix: String = execution_id.chars()
-                                    .filter(|c| c.is_alphanumeric())
-                                    .take(6)
-                                    .collect();
-                                let tool_call_id = format!("page-{}-{}", tool_name, short_suffix);
-                                pages_to_store.push((tool_call_id.clone(), crate::session::PagedResult {
-                                    remaining_content: serialized[split_at..].to_string(),
-                                    tool_name: tool_name.clone(),
-                                }));
-                                let page1_with_footer = format!(
-                                    "{}\n\n[More content available. To view the next page, use the HOBBES_PAGE_RESULT tool with tool_call_id \"{}\"]",
-                                    &serialized[..split_at], tool_call_id
-                                );
-                                tracing::info!(
-                                    "Pass 2: paginated '{}' ({} bytes → {} chars budget, id={})",
-                                    tool_name, serialized.len(), budget_chars, tool_call_id
-                                );
-                                if let Some(ContentBlock::ToolResult { content, .. }) = msg.content.first_mut() {
-                                    *content = json!(page1_with_footer);
-                                }
-                            }
-                            // else: split_at == serialized.len() means find_split_point
-                            // found no good boundary and returned the full length —
-                            // content fits as-is, no truncation needed.
-                        }
-                    }
+            // No summary available (or this is an active result we must not
+            // summarise): paginate. Page 1 is served inline; the remainder is
+            // stored as a raw string so future turns can re-split it at their own
+            // budget. The model can always fetch the rest via HOBBES_PAGE_RESULT —
+            // never a silent hard truncation.
+            let split_at = find_split_point(&serialized, budget_chars);
+            if split_at < serialized.len() {
+                pages_to_store.push((
+                    tool_call_id.clone(),
+                    crate::session::PagedResult {
+                        remaining_content: serialized[split_at..].to_string(),
+                        tool_name: tool_name.clone(),
+                    },
+                ));
+                let page1_with_footer = format!(
+                    "{}\n\n[More content available. To view the next page, use the HOBBES_PAGE_RESULT tool with tool_call_id \"{}\"]",
+                    &serialized[..split_at], tool_call_id
+                );
+                tracing::info!(
+                    "Pass 2: paginated '{}' ({} bytes → {} chars budget, id={})",
+                    tool_name,
+                    serialized.len(),
+                    budget_chars,
+                    tool_call_id
+                );
+                if let Some(ContentBlock::ToolResult { content, .. }) = msg.content.first_mut() {
+                    *content = json!(page1_with_footer);
                 }
             }
+            // else: find_split_point found no boundary and returned full length —
+            // content effectively fits, no change.
         }
-        // else: compute_tool_result_budget returned None → no context limit, skip
     }
 
     /// Compute per-tool-result budgets for fitting results within the context window.
-    /// Returns `None` if the provider has unlimited context.
+    /// Returns `None` when the context window is unknown (caller applies fixed caps).
     ///
-    /// Budget split: the active tool result receives 60% of the remaining budget,
-    /// historical results share the remaining 40% equally.
+    /// Budget split: the current turn's tool results (`active_indices`) collectively
+    /// receive `active_result_budget_ratio` of the remaining budget, divided equally
+    /// among them; historical results share the rest equally. When everything is
+    /// active (or nothing is), the budget is split evenly within that group.
     pub(crate) fn compute_tool_result_budget(
         system_chars: usize,
         tool_def_chars: usize,
         non_result_message_chars: usize,
         num_tool_results: usize,
-        active_index: Option<usize>,
+        active_indices: &[usize],
         max_context_tokens: Option<usize>,
         tuning: &crate::settings::ResolvedContextTuning,
     ) -> Option<Vec<usize>> {
         let max_tokens = max_context_tokens?;
 
         // Convert tokens to chars using the configurable ratio
-        let total_chars = (max_tokens as f64 * tuning.chars_per_token * (1.0 - tuning.context_safety_margin)) as usize;
+        let total_chars =
+            (max_tokens as f64 * tuning.chars_per_token * (1.0 - tuning.context_safety_margin)) as usize;
         let overhead = system_chars + tool_def_chars + non_result_message_chars;
 
         if overhead >= total_chars {
@@ -152,33 +214,34 @@ impl<'a> PromptBuilder<'a> {
             return Some(vec![]);
         }
 
-        let mut budgets = Vec::with_capacity(num_tool_results);
+        let active_count = active_indices.len();
+        let historical_count = num_tool_results - active_count;
+        let mut budgets = vec![0usize; num_tool_results];
 
-        if let Some(active_idx) = active_index {
-            let active_budget = (remaining as f64 * tuning.active_result_budget_ratio) as usize;
-            let historical_count = num_tool_results - 1;
-            let historical_per = if historical_count > 0 {
-                ((remaining as f64 * (1.0 - tuning.active_result_budget_ratio)) / historical_count as f64) as usize
-            } else {
-                0
-            };
-
-            for i in 0..num_tool_results {
-                if i == active_idx {
-                    budgets.push(active_budget);
-                } else {
-                    budgets.push(historical_per);
-                }
-            }
+        if active_count == 0 || historical_count == 0 {
+            // All results in one bucket — split the whole budget evenly.
+            let per = remaining / num_tool_results;
+            budgets.iter_mut().for_each(|b| *b = per);
         } else {
-            // No active result identified → split equally
-            let per_result = remaining / num_tool_results;
-            budgets.resize(num_tool_results, per_result);
+            let active_share = (remaining as f64 * tuning.active_result_budget_ratio) as usize;
+            let historical_share = remaining.saturating_sub(active_share);
+            let active_per = active_share / active_count;
+            let historical_per = historical_share / historical_count;
+            for (i, b) in budgets.iter_mut().enumerate() {
+                *b = if active_indices.contains(&i) {
+                    active_per
+                } else {
+                    historical_per
+                };
+            }
         }
 
         tracing::debug!(
-            "Tool result budgets: {} chars remaining, {} results, active_idx={:?}, budgets={:?}",
-            remaining, num_tool_results, active_index, budgets
+            "Tool result budgets: {} chars remaining, {} results ({} active), budgets={:?}",
+            remaining,
+            num_tool_results,
+            active_count,
+            budgets
         );
 
         Some(budgets)
@@ -215,26 +278,4 @@ impl<'a> PromptBuilder<'a> {
         pages
     }
 
-    /// Calculate a context-aware cap for tool result length.
-    /// For providers with finite context windows (OpenAI-compat, Claude),
-    /// caps to ~30% of the context budget (in chars, assuming ~4 chars/token).
-    /// For Gemini or unconfigured providers, falls back to the resolved setting.
-    pub(crate) fn effective_tool_result_limit(&self, tuning: &crate::settings::ResolvedContextTuning) -> usize {
-        let user_max = tuning.max_active_tool_output_length;
-
-        let provider_context_tokens = self.effective_context_window();
-
-        if let Some(max_tokens) = provider_context_tokens {
-            let ratio = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(tuning.tool_result_budget_ratio);
-            let context_cap = (max_tokens as f64 * ratio * tuning.chars_per_token) as usize;
-            let effective = context_cap.min(user_max);
-            tracing::debug!(
-                "Tool result limit: {} chars (ratio: {:.0}%, provider context: {} tokens, user max: {})",
-                effective, ratio * 100.0, max_tokens, user_max
-            );
-            effective
-        } else {
-            user_max
-        }
-    }
 }

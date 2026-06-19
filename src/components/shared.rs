@@ -77,6 +77,14 @@ pub struct ToolCall {
     /// Never embedded in tc.response — stays on disk to keep the session file small.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_image_path: Option<String>,
+    /// Knowledge-preserving summary of `response`, generated in the background
+    /// after the turn completes (see Part 4 / `ToolResultSummarizer`). Once a
+    /// result is historical and exceeds its context budget, the prompt builder
+    /// substitutes this summary instead of hard-truncating — keeping the facts
+    /// while reclaiming tokens. `None` until generated; the full `response` is
+    /// always retained for pagination/re-budgeting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
 }
 
 pub enum StreamMessage {
@@ -125,6 +133,7 @@ impl ToolCall {
             thought_signature,
             thought_summary,
             cached_image_path: None,
+            result_summary: None,
         }
     }
 }
