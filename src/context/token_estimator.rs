@@ -130,6 +130,8 @@ pub fn messages_to_drop(
     protected_window: usize,
     chars_per_token: f64,
 ) -> (usize, usize) {
+    use crate::llm::types::ChatRole;
+
     let total = estimate_prompt_tokens_with_ratio(prompt, chars_per_token);
     if total <= budget {
         return (0, total);
@@ -143,9 +145,16 @@ pub fn messages_to_drop(
             .map(|t| estimate_tool_definition_tokens(t, chars_per_token))
             .sum::<usize>();
 
-    // Protected messages (last N) — never dropped
     let msg_count = prompt.messages.len();
-    let protected_start = msg_count.saturating_sub(protected_window);
+
+    // Turn-boundary-aware protected window: snap protected_start backward to the
+    // nearest User message so we never protect a turn that's missing its user message.
+    // This ensures the protected window always starts at a complete conversation turn.
+    let raw_protected_start = msg_count.saturating_sub(protected_window);
+    let protected_start = (0..=raw_protected_start)
+        .rev()
+        .find(|&i| i == 0 || prompt.messages[i].role == ChatRole::User)
+        .unwrap_or(0);
 
     // Cost of protected messages
     let protected_cost: usize = prompt.messages[protected_start..]
@@ -165,6 +174,23 @@ pub fn messages_to_drop(
             break;
         }
         kept_cost += msg_cost;
+    }
+
+    // Turn-boundary snap: advance first_kept forward to the next User message so we
+    // never keep a history window that starts with an orphaned assistant or tool-result
+    // message. Tool call / result pairs must stay together or be dropped entirely.
+    if first_kept > 0 && first_kept < protected_start {
+        let snap = (first_kept..protected_start)
+            .find(|&i| prompt.messages[i].role == ChatRole::User)
+            .unwrap_or(protected_start);
+        if snap > first_kept {
+            // Recalculate kept_cost after snapping (we dropped a few extra messages)
+            kept_cost = prompt.messages[snap..protected_start]
+                .iter()
+                .map(|m| estimate_message_tokens_with_ratio(m, chars_per_token))
+                .sum();
+            first_kept = snap;
+        }
     }
 
     let dropped = first_kept;
@@ -216,6 +242,56 @@ mod tests {
         };
         let (dropped, _) = messages_to_drop(&prompt, 1000, 2, DEFAULT_CHARS_PER_TOKEN);
         assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn test_messages_to_drop_turn_boundary_snap() {
+        // Sequence: user, assistant+tool_call, tool_result, assistant, user, assistant
+        // With a tight budget that would normally split mid-turn, first_kept should
+        // always land on a User message, never on an orphaned assistant/tool message.
+        use crate::llm::types::ContentBlock;
+        let messages = vec![
+            ChatMessage { role: ChatRole::User, content: vec![ContentBlock::Text { text: "A".repeat(300) }] },
+            ChatMessage { role: ChatRole::Assistant, content: vec![ContentBlock::Text { text: "B".repeat(300) }] },
+            ChatMessage { role: ChatRole::User, content: vec![ContentBlock::Text { text: "C".repeat(300) }] },
+            ChatMessage { role: ChatRole::Assistant, content: vec![ContentBlock::Text { text: "D".repeat(300) }] },
+            // Protected window (last 2): these two stay
+            ChatMessage { role: ChatRole::User, content: vec![ContentBlock::Text { text: "E".repeat(50) }] },
+            ChatMessage { role: ChatRole::Assistant, content: vec![ContentBlock::Text { text: "F".repeat(50) }] },
+        ];
+        let prompt = LlmPrompt { system: None, messages, tools: vec![] };
+        // Budget tight enough to force dropping messages[0..4] (only last 2 protected)
+        let (dropped, _) = messages_to_drop(&prompt, 200, 2, DEFAULT_CHARS_PER_TOKEN);
+        // first_kept must be 0 (all old messages dropped) or a User message index
+        if dropped < prompt.messages.len() {
+            let first_kept_role = &prompt.messages[dropped].role;
+            assert_eq!(
+                *first_kept_role, ChatRole::User,
+                "first_kept must be a User message, got {:?} at index {}",
+                first_kept_role, dropped
+            );
+        }
+    }
+
+    #[test]
+    fn test_messages_to_drop_protected_start_on_turn_boundary() {
+        // If raw protected_start points to an assistant message, it should snap back
+        // to the preceding user message so the protected window includes a full turn.
+        let messages = vec![
+            ChatMessage { role: ChatRole::User, content: vec![ContentBlock::Text { text: "A".repeat(100) }] },
+            ChatMessage { role: ChatRole::Assistant, content: vec![ContentBlock::Text { text: "B".repeat(100) }] },
+            ChatMessage { role: ChatRole::User, content: vec![ContentBlock::Text { text: "C".repeat(100) }] },
+            // protected_window=2 → raw protected_start=2, which is User — no snap needed here
+            ChatMessage { role: ChatRole::Assistant, content: vec![ContentBlock::Text { text: "D".repeat(300) }] },
+            ChatMessage { role: ChatRole::Assistant, content: vec![ContentBlock::Text { text: "E".repeat(300) }] },
+        ];
+        // protected_window=3 → raw protected_start=2 (User "C") — already on a boundary
+        let prompt = LlmPrompt { system: None, messages, tools: vec![] };
+        let (dropped, _) = messages_to_drop(&prompt, 250, 3, DEFAULT_CHARS_PER_TOKEN);
+        if dropped > 0 && dropped < prompt.messages.len() {
+            assert_eq!(prompt.messages[dropped].role, ChatRole::User,
+                "first kept message must be User, got {:?}", prompt.messages[dropped].role);
+        }
     }
 
     #[test]

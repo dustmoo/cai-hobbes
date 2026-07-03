@@ -493,6 +493,81 @@ You MUST respond with ONLY valid JSON (no prose, no markdown fences) containing 
         tracing::warn!("Claude: Failed to parse summary as JSON. Using raw text.");
         Ok(json!({ "summary": text, "entities": {}, "sentiment": "neutral" }))
     }
+
+    async fn select_tools_for_toolkit(
+        &self,
+        request: &crate::mcp::tool_selection::ToolSelectionRequest,
+    ) -> Result<crate::mcp::tool_selection::ToolSelectionResponse, String> {
+        use crate::mcp::tool_selection::{build_selection_prompt, parse_selection_response};
+
+        let api_key = self
+            .resolve_api_key()
+            .map_err(|()| "No Claude API key configured for tool selection.".to_string())?;
+
+        let model = self
+            .config
+            .summary_model
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| self.config.model.clone());
+
+        tracing::info!(
+            model = %model,
+            toolkit = %request.toolkit_name,
+            tool_count = %request.available_tools.len(),
+            "LLM: Selecting tools for toolkit (Claude)"
+        );
+
+        let request_body = json!({
+            "model": model,
+            "max_tokens": 4096,
+            "messages": [
+                { "role": "user", "content": build_selection_prompt(request) }
+            ],
+        });
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let response = client
+            .post(ANTHROPIC_API_URL)
+            .header("content-type", "application/json")
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .body(serde_json::to_string(&request_body).unwrap_or_default())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Tool selection API request failed with status {}: {}",
+                status, body
+            ));
+        }
+
+        let response_json: Value = response.json().await.map_err(|e| e.to_string())?;
+        let text = response_json["content"]
+            .as_array()
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|b| b["type"] == "text")
+                    .and_then(|b| b["text"].as_str())
+            })
+            .unwrap_or_default();
+
+        if text.is_empty() {
+            return Err("No response from Claude for tool selection".to_string());
+        }
+
+        parse_selection_response(text)
+    }
 }
 
 impl LlmFormatConverter for ClaudeConnector {

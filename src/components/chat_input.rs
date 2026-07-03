@@ -625,7 +625,7 @@ pub fn ChatInput(
                         class: "flex flex-col gap-1 px-3 pt-2 pb-1 bg-section border-t border-subtle",
                         div {
                             class: "flex items-center justify-between text-xs text-fg-muted",
-                            span { "Queued ({chips.len()}) · sends when the current turn finishes" }
+                            span { "Queued ({chips.len()})" }
                             button {
                                 class: "px-2 py-0.5 rounded hover:bg-card hover:text-fg transition-colors",
                                 onclick: move |_| {

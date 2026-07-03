@@ -1197,6 +1197,75 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
+
+                                    // Summary Model Selector
+                                    div {
+                                        class: "mb-4",
+                                        div {
+                                            class: "flex justify-between items-center mb-1",
+                                            label { class: "block text-sm font-medium text-fg-muted", "Summary Model" }
+                                            if !local_settings.read().openai_compat_config.endpoint.is_empty() {
+                                                button {
+                                                    class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-fg-muted disabled:cursor-not-allowed",
+                                                    disabled: *oai_models_loading.read(),
+                                                    onclick: move |_| {
+                                                        oai_models_fetch_trigger.set(oai_models_fetch_trigger() + 1);
+                                                    },
+                                                    if *oai_models_loading.read() { "Loading..." } else { "↻ Refresh" }
+                                                }
+                                            }
+                                        }
+                                        if local_settings.read().openai_compat_config.endpoint.is_empty() {
+                                            p {
+                                                class: "mt-1 text-sm text-fg-muted italic",
+                                                "Configure endpoint above to discover models"
+                                            }
+                                        } else if oai_available_models.read().is_empty() && !*oai_models_loading.read() {
+                                            // No models discovered — fallback to text input
+                                            input {
+                                                class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                r#type: "text",
+                                                placeholder: "Enter summary model name (defaults to chat model)",
+                                                value: "{local_settings.read().openai_compat_config.summary_model.as_deref().unwrap_or(\"\")}",
+                                                oninput: move |event| {
+                                                    let val = event.value();
+                                                    local_settings.write().openai_compat_config.summary_model = if val.is_empty() { None } else { Some(val) };
+                                                }
+                                            }
+                                        } else {
+                                            select {
+                                                class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                                                value: "{local_settings.read().openai_compat_config.summary_model.as_deref().unwrap_or(\"\")}",
+                                                onchange: move |event: Event<FormData>| {
+                                                    let val = event.value();
+                                                    local_settings.write().openai_compat_config.summary_model = if val.is_empty() { None } else { Some(val) };
+                                                },
+                                                {
+                                                    let current = local_settings.read().openai_compat_config.summary_model.clone().unwrap_or_default();
+                                                    let models = oai_available_models.read();
+                                                    let in_list = models.contains(&current);
+                                                    rsx! {
+                                                        option { value: "", selected: current.is_empty(), "Use chat model" }
+                                                        if !current.is_empty() && !in_list {
+                                                            option { value: "{current}", selected: true, "{current}" }
+                                                        }
+                                                        for model in models.iter() {
+                                                            option {
+                                                                value: "{model}",
+                                                                selected: *model == current,
+                                                                "{model}"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        p {
+                                            class: "text-xs text-fg-muted mt-1",
+                                            "Model used for conversation summarization. Defaults to your chat model if not set."
+                                        }
+                                    }
+
                                     div {
                                         class: "mb-4",
                                         label { class: "block text-sm font-medium text-fg-muted", "API Key (optional)" }
@@ -1666,74 +1735,6 @@ pub fn SettingsPanel() -> Element {
                                                     div { class: "w-9 h-5 bg-input peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-primary-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary-500" }
                                                 }
                                             }
-                                        }
-                                    }
-
-                                    // Summary Model Selector
-                                    div {
-                                        class: "mb-4",
-                                        div {
-                                            class: "flex justify-between items-center mb-1",
-                                            label { class: "block text-sm font-medium text-fg-muted", "Summary Model" }
-                                            if !local_settings.read().openai_compat_config.endpoint.is_empty() {
-                                                button {
-                                                    class: "text-xs text-primary-400 hover:text-primary-300 disabled:text-fg-muted disabled:cursor-not-allowed",
-                                                    disabled: *oai_models_loading.read(),
-                                                    onclick: move |_| {
-                                                        oai_models_fetch_trigger.set(oai_models_fetch_trigger() + 1);
-                                                    },
-                                                    if *oai_models_loading.read() { "Loading..." } else { "↻ Refresh" }
-                                                }
-                                            }
-                                        }
-                                        if local_settings.read().openai_compat_config.endpoint.is_empty() {
-                                            p {
-                                                class: "mt-1 text-sm text-fg-muted italic",
-                                                "Configure endpoint above to discover models"
-                                            }
-                                        } else if oai_available_models.read().is_empty() && !*oai_models_loading.read() {
-                                            // No models discovered — fallback to text input
-                                            input {
-                                                class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                                r#type: "text",
-                                                placeholder: "Enter summary model name (defaults to chat model)",
-                                                value: "{local_settings.read().openai_compat_config.summary_model.as_deref().unwrap_or(\"\")}",
-                                                oninput: move |event| {
-                                                    let val = event.value();
-                                                    local_settings.write().openai_compat_config.summary_model = if val.is_empty() { None } else { Some(val) };
-                                                }
-                                            }
-                                        } else {
-                                            select {
-                                                class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                                value: "{local_settings.read().openai_compat_config.summary_model.as_deref().unwrap_or(\"\")}",
-                                                onchange: move |event: Event<FormData>| {
-                                                    let val = event.value();
-                                                    local_settings.write().openai_compat_config.summary_model = if val.is_empty() { None } else { Some(val) };
-                                                },
-                                                {
-                                                    let current = local_settings.read().openai_compat_config.summary_model.clone().unwrap_or_default();
-                                                    let models = oai_available_models.read();
-                                                    let in_list = models.contains(&current);
-                                                    rsx! {
-                                                        option { value: "", selected: current.is_empty(), "Use chat model" }
-                                                        if !current.is_empty() && !in_list {
-                                                            option { value: "{current}", selected: true, "{current}" }
-                                                        }
-                                                        for model in models.iter() {
-                                                            option {
-                                                                value: "{model}",
-                                                                selected: *model == current,
-                                                                "{model}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        p {
-                                            class: "text-xs text-fg-muted mt-1",
-                                            "Model used for conversation summarization. Defaults to your chat model if not set."
                                         }
                                     }
 

@@ -1868,6 +1868,16 @@ Recent Messages:
             }
         }
     }
+
+    async fn select_tools_for_toolkit(
+        &self,
+        request: &crate::mcp::tool_selection::ToolSelectionRequest,
+    ) -> Result<crate::mcp::tool_selection::ToolSelectionResponse, String> {
+        // Delegate to the inherent implementation (predates the trait method).
+        GeminiConnector::select_tools_for_toolkit(self, request)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 fn unparse_json_response(text: &str) -> (String, Option<String>) {

@@ -77,6 +77,8 @@ These calls use the `x-api-key` header for authentication and are used for admin
 | `create_mcp_server()` | POST | `/api/v3/mcp/servers/custom` | Create new MCP server. **Payload**: `toolkits` (string[]), `auth_config_ids` (string[]) |
 | `create_mcp_instance()` | POST | `/api/v3/mcp/servers/{id}/instances` | Bind user to server (required for tools visibility) |
 | `add_toolkit_to_server()` | PATCH | `/api/v3/mcp/{server_id}` | Add toolkit + auth_config binding to MCP server |
+| `get_toolkit_enabled_tools()` | GET | `/api/v3/mcp/servers` | Read a toolkit's current `allowed_tools` whitelist entries (empty = all enabled) |
+| `set_toolkit_enabled_tools()` | PATCH | `/api/v3/mcp/{server_id}` | Replace a toolkit's `allowed_tools` entries (user tool curation from the Status view), preserving other toolkits' entries |
 | `list_mcp_servers()` | GET | `/api/v3/mcp/servers` | List available servers (Dynamic Lookup) |
 | `generate_mcp_user()` | POST | `/api/v3/mcp/servers/generate` | Bind user_id to server (Mandatory User Generation) |
 | `initiate_connection()` | POST | `/api/v3/connected_accounts/link` | Generate OAuth link URL for user authentication |

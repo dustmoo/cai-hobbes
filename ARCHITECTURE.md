@@ -88,6 +88,8 @@ graph TD
     -   **Composio Integration**: Implements an "Explicit Configuration" pattern. Instead of auto-provisioning shared servers, it respects the specific `MCP_CONFIG_ID` embedded in the user's connection URL.
     -   **Auth Flow**: It strictly separates Auth Config creation (POST) from Server Association (PATCH). A crucial step is explicitly patching the MCP server with `auth_config_ids` and `allowed_tools` to enable functionality.
     -   **Tool Loading**: It handles tool enumeration via the MCP Protocol (`tools/list`). It implements smart prefix matching (e.g., matching `NEWS_API_*` to `news_api` toolkit) to correctly associate tools with their parent toolkits, ensuring correct counts even when metadata is sparse.
+    -   **Smart Tool Selection**: When a toolkit exceeds `TOOL_SELECTION_THRESHOLD` (128 tools) during connect, the manager asks an LLM to curate the most useful subset (`select_tools_for_toolkit`, implemented by every `LlmConnector`). Selection uses the **active provider** (falling back to any configured provider), not a specific vendor.
+    -   **User Tool Curation**: The MCP Status view exposes an "Edit Tools" editor per connected Composio toolkit (searchable checkbox list). Selections are persisted as `allowed_tools` on the user's Composio MCP server via `McpManager::set_composio_toolkit_tools`, replacing only that toolkit's whitelist entries.
 -   **`StreamManager`**: The central orchestrator for the entire LLM interaction. It implements an **Atomic Execution Model** for tool calls:
     1.  It receives the *entire* raw stream from the `LlmConnector`.
     2.  It buffers all text chunks and collects all tool call requests.

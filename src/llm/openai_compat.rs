@@ -11,6 +11,13 @@ use super::LlmConnector;
 use crate::components::shared::{StreamMessage, ToolCall, UsageData};
 use crate::mcp::manager::McpContext;
 
+struct PendingToolCall {
+    id: String,
+    name: String,
+    server_name: String,
+    arguments: String,
+}
+
 pub struct OpenAiCompatConnector {
     config: OpenAiCompatConfig,
 }
@@ -101,62 +108,106 @@ impl LlmConnector for OpenAiCompatConnector {
             );
         }
 
-        // Autorecovery: retry once on transient stream decode errors (e.g. "error decoding response body").
-        // These are likely vLLM hiccups, not real model errors. If the error repeats, surface it.
+        // Build body_str before the retry loop — it doesn't change between retries.
+        let body_str = serde_json::to_string(&native_request)
+            .expect("Failed to serialize OpenAI request body");
+
+        // Type alias for the unified stream used by both raw TCP and reqwest paths.
+        type SseStream = std::pin::Pin<
+            Box<dyn futures_util::Stream<Item = Result<Vec<u8>, String>> + Send>,
+        >;
+
+        // Autorecovery: retry once on transient stream decode errors (HTTPS path only).
+        // For plain HTTP / raw TCP the connection RST is handled as a clean stream end; no retry needed.
         const MAX_STREAM_RETRIES: u32 = 1;
 
         'retry: for attempt in 0..=MAX_STREAM_RETRIES {
-            let client = Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .expect("Failed to build reqwest client");
+            // Use raw TCP for plain HTTP endpoints (local vLLM).
+            // This bypasses hyper's chunked-transfer-encoding decoder, which raises
+            // "error decoding response body" when vLLM RSTs the connection mid-stream.
+            // On raw TCP, connection close simply ends the stream cleanly.
+            let use_raw_tcp = !endpoint.starts_with("https://") && !self.is_real_openai();
 
-            let body_str = serde_json::to_string(&native_request)
-                .expect("Failed to serialize OpenAI request body");
-
-            let mut request_builder = client
-                .post(&endpoint)
-                .header("Content-Type", "application/json")
-                .body(body_str);
-
-            if let Some(api_key) = &self.config.api_key {
-                request_builder =
-                    request_builder.header("Authorization", format!("Bearer {}", api_key));
-            } else {
-                tracing::warn!("OpenAI Compat: No API key configured — request will be unauthenticated");
+            // Raw TCP handles RST as a clean stream end — retrying would re-open the
+            // connection and could duplicate already-flushed output.
+            if use_raw_tcp && attempt > 0 {
+                break 'retry;
             }
 
-            let response = match request_builder.send().await {
-                Ok(r) => r,
-                Err(e) => {
+            let mut stream: SseStream = if use_raw_tcp {
+                match self.raw_tcp_stream(&endpoint, &body_str).await {
+                    Ok(s) => Box::pin(s),
+                    Err(msg) => {
+                        let _ = tx.send(StreamMessage::Error { message: msg });
+                        return;
+                    }
+                }
+            } else {
+                let client = Client::builder()
+                    .timeout(std::time::Duration::from_secs(300))
+                    // SSE streams must never be compressed: decompressing a chunked
+                    // event stream mid-flight causes "error decoding response body"
+                    // when vLLM occasionally honors Accept-Encoding on long responses.
+                    .no_gzip()
+                    .no_brotli()
+                    .no_deflate()
+                    .build()
+                    .expect("Failed to build reqwest client");
+
+                let mut request_builder = client
+                    .post(&endpoint)
+                    .header("Content-Type", "application/json")
+                    // Explicitly request identity (no) encoding. .no_gzip()/.no_brotli()/.no_deflate()
+                    // only remove those encodings from Accept-Encoding — they don't prevent vLLM from
+                    // defaulting to gzip/zstd when the header is absent. Compressed bytes over a
+                    // chunked SSE stream cause hyper's chunk decoder to fail with
+                    // "error decoding response body".
+                    .header("Accept-Encoding", "identity")
+                    .body(body_str.clone());
+
+                if let Some(api_key) = &self.config.api_key {
+                    request_builder =
+                        request_builder.header("Authorization", format!("Bearer {}", api_key));
+                } else {
+                    tracing::warn!("OpenAI Compat: No API key configured — request will be unauthenticated");
+                }
+
+                let response = match request_builder.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(StreamMessage::Error {
+                            message: format!("Network error: {}", e),
+                        });
+                        return;
+                    }
+                };
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    // Self-calibration: if the server reported an explicit context
+                    // window in the error body, learn it (scoped to this endpoint +
+                    // model) so future prompts are budgeted to the real limit.
+                    if let Some(limit) = crate::llm::context_cache::parse_context_limit(&body) {
+                        crate::llm::context_cache::record_window(
+                            &self.config.endpoint,
+                            &self.config.model,
+                            limit,
+                        );
+                    }
+                    let friendly_message =
+                        Self::format_api_error(status.as_u16(), &body, &self.config);
                     let _ = tx.send(StreamMessage::Error {
-                        message: format!("Network error: {}", e),
+                        message: friendly_message,
                     });
                     return;
                 }
+
+                let bytes_stream = response
+                    .bytes_stream()
+                    .map(|r| r.map_err(|e| e.to_string()).map(|b| b.to_vec()));
+                Box::pin(bytes_stream)
             };
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                // Self-calibration: if the server reported an explicit context
-                // window in the error body, learn it (scoped to this endpoint +
-                // model) so future prompts are budgeted to the real limit.
-                if let Some(limit) = crate::llm::context_cache::parse_context_limit(&body) {
-                    crate::llm::context_cache::record_window(
-                        &self.config.endpoint,
-                        &self.config.model,
-                        limit,
-                    );
-                }
-                let friendly_message = Self::format_api_error(status.as_u16(), &body, &self.config);
-                let _ = tx.send(StreamMessage::Error {
-                    message: friendly_message,
-                });
-                return;
-            }
-
-            let mut stream = response.bytes_stream();
 
             // State for tracking <think>/<thinking> tag boundaries across chunks
             // Disabled for real OpenAI — GPT-5.x uses hidden reasoning tokens, never <think> tags
@@ -179,13 +230,6 @@ impl LlmConnector for OpenAiCompatConnector {
             // OpenAI sends tool calls incrementally: `name` and `id` in the first chunk,
             // then `arguments` as partial JSON strings across subsequent chunks.
             // We accumulate here and flush when Done or stream ends.
-            #[allow(dead_code)]
-            struct PendingToolCall {
-                id: String,
-                name: String,
-                server_name: String,
-                arguments: String,
-            }
             let mut pending_tool_calls: Vec<PendingToolCall> = Vec::new();
 
             // Thought summary accumulated during thinking phase (to attach to tool calls)
@@ -217,14 +261,29 @@ impl LlmConnector for OpenAiCompatConnector {
                     }
                 };
 
-            let mut last_raw_chunk = String::new();
+            // Carry-over buffer: SSE frames can span multiple TCP chunks.
+            // We only parse lines up to the last \n in each delivery, holding
+            // any trailing fragment until the next chunk completes it.
+            let mut sse_buffer = String::new();
 
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(bytes) => {
                         let chunk = String::from_utf8_lossy(&bytes);
-                        last_raw_chunk = chunk.to_string();
-                        let events = self.parse_stream_chunk(&chunk);
+
+                        sse_buffer.push_str(&chunk);
+
+                        // Split at last newline: only parse complete SSE lines.
+                        let to_parse = if let Some(last_nl) = sse_buffer.rfind('\n') {
+                            let complete = sse_buffer[..=last_nl].to_string();
+                            sse_buffer = sse_buffer[last_nl + 1..].to_string();
+                            complete
+                        } else {
+                            // No complete line yet — wait for more data.
+                            continue;
+                        };
+
+                        let events = self.parse_stream_chunk(&to_parse);
                         for event in events {
                             match event {
                                 StreamEvent::Thinking { text, .. } => {
@@ -434,15 +493,15 @@ impl LlmConnector for OpenAiCompatConnector {
                         }
                     }
                     Err(e) => {
-                        // Dump the exact payload returned by vLLM before error decoding failure
                         tracing::error!(
-                            "OpenAI Compat Stream Error! Last received chunk before drop:\n---\n{}\n---",
-                            last_raw_chunk
+                            "OpenAI Compat Stream Error: {}\n  unparsed SSE buffer: {:?}",
+                            e,
+                            &sse_buffer[..sse_buffer.len().min(300)],
                         );
 
                         // Autorecovery: if no data has been sent yet and we have retries left,
                         // retry the full request. This handles transient stream decode errors
-                        // (e.g. "error decoding response body") from vLLM.
+                        // (e.g. "error decoding response body") from HTTPS endpoints.
                         if !has_sent_data && attempt < MAX_STREAM_RETRIES {
                             tracing::warn!(
                                 "OpenAI Compat: Stream error on attempt {} (no data sent yet), retrying: {}",
@@ -451,6 +510,7 @@ impl LlmConnector for OpenAiCompatConnector {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             continue 'retry;
                         }
+
                         let _ = tx.send(StreamMessage::Error {
                             message: format!("Stream error: {}", e),
                         });
@@ -547,20 +607,39 @@ You MUST respond with valid JSON containing exactly these fields:
             .build()
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        let mut request_builder = client
-            .post(&endpoint)
-            .header("Content-Type", "application/json")
-            .body(body_str);
-
-        if let Some(api_key) = &self.config.api_key {
-            request_builder =
-                request_builder.header("Authorization", format!("Bearer {}", api_key));
-        }
-
-        let response = request_builder
-            .send()
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        // Retry on transient connection errors (e.g. vLLM busy while streaming the main request).
+        // Only connection-level errors are retried; HTTP error responses are not.
+        const MAX_SUMMARIZER_RETRIES: u32 = 2;
+        let response = {
+            let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+            let mut result = None;
+            for attempt in 0..=MAX_SUMMARIZER_RETRIES {
+                let mut request_builder = client
+                    .post(&endpoint)
+                    .header("Content-Type", "application/json")
+                    .body(body_str.clone());
+                if let Some(api_key) = &self.config.api_key {
+                    request_builder =
+                        request_builder.header("Authorization", format!("Bearer {}", api_key));
+                }
+                match request_builder.send().await {
+                    Ok(r) => { result = Some(r); break; }
+                    Err(e) if attempt < MAX_SUMMARIZER_RETRIES && (e.is_connect() || e.is_timeout()) => {
+                        tracing::warn!(
+                            "OpenAI Compat summarizer: connection error on attempt {} — retrying in 2s: {}",
+                            attempt + 1, e
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        last_err = Some(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                    }
+                    Err(e) => {
+                        last_err = Some(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                        break;
+                    }
+                }
+            }
+            result.ok_or_else(|| last_err.unwrap_or_else(|| Box::new(std::io::Error::other("summarizer send failed"))))?
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -611,6 +690,86 @@ You MUST respond with valid JSON containing exactly these fields:
 
         tracing::error!("OpenAI Compat: Summarization response had no content.");
         Ok(serde_json::Value::Null)
+    }
+
+    async fn select_tools_for_toolkit(
+        &self,
+        request: &crate::mcp::tool_selection::ToolSelectionRequest,
+    ) -> Result<crate::mcp::tool_selection::ToolSelectionResponse, String> {
+        use crate::mcp::tool_selection::{build_selection_prompt, parse_selection_response};
+
+        let model = self
+            .config
+            .summary_model
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.config.model)
+            .clone();
+
+        if model.is_empty() {
+            return Err(
+                "No model configured for tool selection. Please select a model in OpenAI settings."
+                    .to_string(),
+            );
+        }
+
+        tracing::info!(
+            model = %model,
+            toolkit = %request.toolkit_name,
+            tool_count = %request.available_tools.len(),
+            "LLM: Selecting tools for toolkit (OpenAI Compat)"
+        );
+
+        let base = self.config.endpoint.trim_end_matches('/');
+        let endpoint = if base.ends_with("/v1") {
+            format!("{}/chat/completions", base)
+        } else {
+            format!("{}/v1/chat/completions", base)
+        };
+
+        let request_body = json!({
+            "model": model,
+            "messages": [
+                { "role": "user", "content": build_selection_prompt(request) }
+            ],
+            "response_format": { "type": "json_object" },
+            "stream": false
+        });
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let mut request_builder = client
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .json(&request_body);
+        if let Some(api_key) = &self.config.api_key {
+            request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+        }
+
+        let response = request_builder.send().await.map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Tool selection API request failed with status {}: {}",
+                status, body
+            ));
+        }
+
+        let response_json: Value = response.json().await.map_err(|e| e.to_string())?;
+        let content = response_json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default();
+
+        if content.is_empty() {
+            return Err("No response from LLM for tool selection".to_string());
+        }
+
+        parse_selection_response(content)
     }
 }
 
@@ -897,7 +1056,8 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                     continue;
                 }
 
-                if let Ok(val) = serde_json::from_str::<Value>(json_str) {
+                match serde_json::from_str::<Value>(json_str) {
+                Ok(val) => {
                     if let Some(choices) = val["choices"].as_array() {
                         if let Some(choice) = choices.first() {
                             // Text delta
@@ -997,6 +1157,14 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                             }));
                         }
                     }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "SSE parse: dropped non-JSON line ({}): {:?}",
+                        e,
+                        &json_str[..json_str.len().min(120)]
+                    );
+                }
                 }
             }
         }
@@ -1186,6 +1354,196 @@ impl OpenAiCompatConnector {
                 });
             }
         }
+    }
+
+    /// Open a raw TCP connection to a plain-HTTP endpoint and stream the response body.
+    ///
+    /// This bypasses reqwest/hyper entirely, so a TCP RST or unexpected EOF from the
+    /// server simply ends the stream cleanly instead of raising "error decoding response body".
+    /// Only call this for `http://` endpoints (local vLLM); HTTPS callers must use reqwest.
+    async fn raw_tcp_stream(
+        &self,
+        endpoint: &str,
+        body_str: &str,
+    ) -> Result<impl futures_util::Stream<Item = Result<Vec<u8>, String>> + use<>, String> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        // Parse http://host:port/path
+        let without_scheme = endpoint
+            .strip_prefix("http://")
+            .ok_or_else(|| format!("raw_tcp_stream: endpoint must start with http://, got: {}", endpoint))?;
+
+        let (host_port, path) = if let Some(slash_pos) = without_scheme.find('/') {
+            (&without_scheme[..slash_pos], &without_scheme[slash_pos..])
+        } else {
+            (without_scheme, "/")
+        };
+
+        let (host, port) = if let Some(colon_pos) = host_port.rfind(':') {
+            let h = &host_port[..colon_pos];
+            let p: u16 = host_port[colon_pos + 1..]
+                .parse()
+                .map_err(|e| format!("raw_tcp_stream: invalid port in '{}': {}", host_port, e))?;
+            (h, p)
+        } else {
+            (host_port, 80u16)
+        };
+
+        let tcp = tokio::net::TcpStream::connect((host, port))
+            .await
+            .map_err(|e| format!("raw_tcp_stream: connect to {}:{} failed: {}", host, port, e))?;
+
+        let (read_half, mut write_half) = tokio::io::split(tcp);
+
+        // Build and send the HTTP/1.1 request
+        let mut request = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
+            path, host, body_str.len()
+        );
+        if let Some(api_key) = &self.config.api_key {
+            request.push_str(&format!("Authorization: Bearer {}\r\n", api_key));
+        }
+        request.push_str("\r\n");
+        request.push_str(body_str);
+
+        write_half
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| format!("raw_tcp_stream: write failed: {}", e))?;
+
+        let mut reader = BufReader::new(read_half);
+
+        // Read status line
+        let mut status_line = String::new();
+        reader
+            .read_line(&mut status_line)
+            .await
+            .map_err(|e| format!("raw_tcp_stream: failed to read status line: {}", e))?;
+
+        let status_code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| {
+                format!(
+                    "raw_tcp_stream: could not parse HTTP status from: {:?}",
+                    status_line
+                )
+            })?;
+
+        // Read response headers; detect chunked transfer encoding
+        let mut is_chunked = false;
+        loop {
+            let mut header_line = String::new();
+            match reader.read_line(&mut header_line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let trimmed = header_line.trim();
+            if trimmed.is_empty() {
+                break; // blank line = end of headers
+            }
+            let lower = trimmed.to_lowercase();
+            if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
+                is_chunked = true;
+            }
+        }
+
+        // Non-200: read body, attempt context-limit self-calibration, return friendly error
+        if status_code != 200 {
+            let mut body = String::new();
+            let _ = reader.read_to_string(&mut body).await;
+            if let Some(limit) = crate::llm::context_cache::parse_context_limit(&body) {
+                crate::llm::context_cache::record_window(
+                    &self.config.endpoint,
+                    &self.config.model,
+                    limit,
+                );
+            }
+            return Err(Self::format_api_error(status_code, &body, &self.config));
+        }
+
+        // 200 OK: spawn a task that reads the body and feeds chunks into an mpsc channel.
+        // When the connection closes (RST or EOF) the task simply returns — clean end.
+        let (chunk_tx, chunk_rx) =
+            tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(64);
+
+        tokio::spawn(async move {
+            if is_chunked {
+                // Lenient chunked decoder: treats unexpected EOF / bad hex as clean end
+                loop {
+                    let mut size_line = String::new();
+                    match reader.read_line(&mut size_line).await {
+                        Ok(0) | Err(_) => return, // EOF or error = clean end
+                        Ok(_) => {}
+                    }
+                    // Strip chunk extensions (e.g. "a;ext=val")
+                    let hex_str = size_line
+                        .trim()
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    let chunk_size = match usize::from_str_radix(hex_str, 16) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            tracing::warn!(
+                                "raw_tcp_stream: invalid chunk size hex {:?} — treating as end",
+                                hex_str
+                            );
+                            return; // clean end
+                        }
+                    };
+                    if chunk_size == 0 {
+                        return; // terminal chunk
+                    }
+
+                    let mut data_vec = vec![0u8; chunk_size];
+                    let mut bytes_read = 0;
+                    while bytes_read < chunk_size {
+                        match reader.read(&mut data_vec[bytes_read..]).await {
+                            Ok(0) | Err(_) => {
+                                // EOF or error mid-chunk — send whatever we have
+                                if bytes_read > 0 {
+                                    data_vec.truncate(bytes_read);
+                                    let _ = chunk_tx.send(Ok(data_vec)).await;
+                                }
+                                return; // clean end
+                            }
+                            Ok(n) => bytes_read += n,
+                        }
+                    }
+
+                    if chunk_tx.send(Ok(data_vec)).await.is_err() {
+                        return; // receiver dropped — UI closed the stream
+                    }
+
+                    // Read trailing CRLF after each chunk (lenient — ignore errors)
+                    let mut crlf = [0u8; 2];
+                    let _ = reader.read_exact(&mut crlf).await;
+                }
+            } else {
+                // Non-chunked: read raw bytes until EOF
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) | Err(_) => return, // EOF or error = clean end
+                        Ok(n) => {
+                            let chunk = buf[..n].to_vec();
+                            if chunk_tx.send(Ok(chunk)).await.is_err() {
+                                return; // receiver dropped
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let stream = futures_util::stream::unfold(chunk_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+
+        Ok(stream)
     }
 
     /// Parse common OpenAI-compatible API error patterns and produce user-friendly

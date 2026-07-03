@@ -113,6 +113,9 @@ pub fn ChatWindow(
     let mut last_session_id = use_signal(|| session_state.read().active_session_id.clone());
     let mut stream_update_trigger = use_signal(|| 0);
     let mut show_scroll_button = use_signal(|| false);
+    // Set true when the user explicitly sends a message so the scroll effect
+    // force-scrolls regardless of the is_near_bottom threshold.
+    let mut user_just_sent = use_signal(|| false);
 
     // Shared helper: fetch fresh MCP context for a session and update its active_context.
     // Returns the fetched McpContext for downstream use (e.g. passing to send_prompt_to_llm).
@@ -246,9 +249,10 @@ pub fn ChatWindow(
                     true // Also default to true if the eval fails.
                 };
 
-                // On the very first load, we always scroll to the bottom.
-                // On subsequent loads, we only scroll if the user was already near the bottom.
-                if is_session_switch || *is_initial_load.read() || is_near_bottom {
+                // Force-scroll when: first load, session switch, user just sent a message,
+                // or user is already near the bottom (following a stream).
+                let sent = *user_just_sent.read();
+                if is_session_switch || *is_initial_load.read() || sent || is_near_bottom {
                     let _ = document::eval(
                         r#"
                         const el = document.getElementById('message-list');
@@ -258,6 +262,9 @@ pub fn ChatWindow(
                     .await;
                     if *is_initial_load.read() {
                         is_initial_load.set(false);
+                    }
+                    if sent {
+                        user_just_sent.set(false);
                     }
                 }
 
@@ -625,6 +632,7 @@ pub fn ChatWindow(
                     }
                     // Scroll to bottom immediately so the new messages are visible
                     // without waiting for the first streaming chunk.
+                    user_just_sent.set(true);
                     stream_update_trigger += 1;
 
                     let fresh_mcp_context =

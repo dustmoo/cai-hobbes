@@ -444,6 +444,184 @@ pub async fn add_toolkit_to_server(
     })
 }
 
+/// Resolve the MCP server config object for this client (id + full JSON).
+/// Mirrors the discovery logic in `add_toolkit_to_server`: prefer the server ID
+/// embedded in the client's base_url, fall back to the first listed server.
+/// Errors if the account has no MCP servers (nothing to edit).
+async fn fetch_server_config(client: &ComposioClient) -> Result<(String, Value), String> {
+    let target_server_id = client
+        .base_url
+        .split("/mcp/")
+        .nth(1)
+        .map(|s| s.split('?').next().unwrap_or(s))
+        .map(|s| s.trim_end_matches("/mcp"))
+        .unwrap_or_default();
+
+    let api_base = client.get_api_base_url();
+    let list_response = client
+        .client
+        .get(format!("{}/mcp/servers", api_base))
+        .header("x-api-key", &client.api_key)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to list MCP servers: {}", e))?;
+
+    if !list_response.status().is_success() {
+        let status = list_response.status();
+        let text = list_response.text().await.unwrap_or_default();
+        return Err(format!("Failed to list MCP servers ({}): {}", status, text));
+    }
+
+    let list_json: Value = list_response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse server list: {}", e))?;
+
+    let items = list_json
+        .get("items")
+        .and_then(|i| i.as_array())
+        .ok_or("Invalid server list response")?;
+
+    let found = items
+        .iter()
+        .find(|s| {
+            !target_server_id.is_empty()
+                && s.get("id").and_then(|id| id.as_str()) == Some(target_server_id)
+        })
+        .or_else(|| items.first())
+        .ok_or("No MCP servers found for this account")?;
+
+    let id = found
+        .get("id")
+        .and_then(|s| s.as_str())
+        .ok_or("Server object missing ID")?
+        .to_string();
+
+    Ok((id, found.clone()))
+}
+
+/// Extract the `allowed_tools` whitelist from a server config object.
+fn extract_allowed_tools(server_obj: &Value) -> Vec<String> {
+    server_obj
+        .get("allowed_tools")
+        .or_else(|| server_obj.get("custom_tools"))
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Prefix used to attribute an allowed_tools entry to a toolkit
+/// (Composio tool names follow the `TOOLKIT_ACTION` convention).
+fn toolkit_tool_prefix(toolkit_slug: &str) -> String {
+    format!("{}_", toolkit_slug.to_uppercase().replace("-", "_"))
+}
+
+/// Get the currently enabled (allowed) tools for a specific toolkit on the
+/// user's MCP server. An empty result means no whitelist entries exist for the
+/// toolkit — i.e. all of its tools are enabled by the backend default.
+pub async fn get_toolkit_enabled_tools(
+    client: &ComposioClient,
+    toolkit_slug: &str,
+) -> Result<Vec<String>, String> {
+    let (_, server_obj) = fetch_server_config(client).await?;
+    let prefix = toolkit_tool_prefix(toolkit_slug);
+    Ok(extract_allowed_tools(&server_obj)
+        .into_iter()
+        .filter(|t| t.to_uppercase().starts_with(&prefix))
+        .collect())
+}
+
+/// Replace the enabled (allowed) tools for a specific toolkit on the user's
+/// MCP server, preserving the whitelist entries of every other toolkit.
+pub async fn set_toolkit_enabled_tools(
+    client: &ComposioClient,
+    toolkit_slug: &str,
+    enabled_tools: Vec<String>,
+) -> Result<(), String> {
+    if enabled_tools.is_empty() {
+        return Err("At least one tool must remain enabled".to_string());
+    }
+
+    let (server_id, server_obj) = fetch_server_config(client).await?;
+    let prefix = toolkit_tool_prefix(toolkit_slug);
+
+    // Keep other toolkits' entries untouched; replace only this toolkit's.
+    let mut allowed_tools: Vec<String> = extract_allowed_tools(&server_obj)
+        .into_iter()
+        .filter(|t| !t.to_uppercase().starts_with(&prefix))
+        .collect();
+    for tool in enabled_tools {
+        if !allowed_tools.contains(&tool) {
+            allowed_tools.push(tool);
+        }
+    }
+
+    // PATCH with the same field set used elsewhere (Mandate 5: string arrays).
+    let toolkits: Vec<String> = server_obj
+        .get("toolkits")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    t.as_str().map(|s| s.to_string()).or_else(|| {
+                        t.get("toolkit")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let auth_config_ids: Vec<String> = server_obj
+        .get("auth_config_ids")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let patch_payload = serde_json::json!({
+        "toolkits": toolkits,
+        "auth_config_ids": auth_config_ids,
+        "allowed_tools": allowed_tools,
+    });
+
+    let config_url = format!("{}/mcp/{}", client.get_api_base_url(), server_id);
+    tracing::info!(
+        "Updating allowed_tools for toolkit '{}' ({} total entries) on server {}",
+        toolkit_slug,
+        allowed_tools.len(),
+        server_id
+    );
+
+    let patch_response = client
+        .client
+        .patch(&config_url)
+        .header("x-api-key", &client.api_key)
+        .header("Content-Type", "application/json")
+        .json(&patch_payload)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to update MCP server: {}", e))?;
+
+    if !patch_response.status().is_success() {
+        let status = patch_response.status();
+        let text = patch_response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Failed to update toolkit tools ({}): {}",
+            status, text
+        ));
+    }
+
+    Ok(())
+}
+
 /// Create a new MCP server for the user's first toolkit.
 /// Called when no servers exist for the account.
 /// Endpoint: POST /api/v3/mcp/servers/custom

@@ -113,7 +113,6 @@ pub trait LlmConnector: Send + Sync {
 
     /// Optional: Perform tool selection for a specific toolkit.
     /// Default implementation returns "not supported".
-    #[allow(dead_code)]
     async fn select_tools_for_toolkit(
         &self,
         _request: &crate::mcp::tool_selection::ToolSelectionRequest,

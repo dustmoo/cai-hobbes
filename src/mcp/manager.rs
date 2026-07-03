@@ -1,7 +1,6 @@
 use crate::components::shared::ToolCallStatus;
 use crate::components::smithery_registry::SmitheryServerDetail;
 use crate::context::permissions::{PermissionManager, PermissionStatus};
-use crate::llm::GeminiConnector;
 use crate::mcp::authenticated_sse::AuthenticatedClientError;
 use crate::mcp::composio_client::{composio_to_rmcp_tool, ComposioClient};
 use crate::mcp::tool_selection::{ToolCandidate, ToolSelectionRequest, TOOL_SELECTION_THRESHOLD};
@@ -2768,6 +2767,83 @@ impl McpManager {
         Err("Composio client not initialized or not connected".to_string())
     }
 
+    /// Find the active native Composio client, cloning its Arc so the servers
+    /// lock is released before any network call.
+    async fn find_composio_client(
+        &self,
+    ) -> Result<Arc<crate::mcp::composio_client::ComposioClient>, String> {
+        let servers = self.servers.lock().await;
+        servers
+            .iter()
+            .find(|(k, _)| is_composio_native(k))
+            .and_then(|(_, v)| match &v.service {
+                McpClientType::NativeComposio(c) => Some(c.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| "Composio client not initialized or not connected".to_string())
+    }
+
+    /// Data for the toolkit tool editor: every tool the toolkit offers
+    /// (name + description) and the currently enabled subset. An empty enabled
+    /// list means no whitelist entries exist yet — all tools are enabled.
+    pub async fn get_composio_toolkit_tool_state(
+        &self,
+        toolkit_slug: &str,
+    ) -> Result<(Vec<(String, Option<String>)>, Vec<String>), String> {
+        let composio_client = self.find_composio_client().await?;
+        let all_tools = composio_client
+            .get_toolkit_tools_detailed(toolkit_slug)
+            .await?;
+        let enabled = composio_client
+            .get_toolkit_enabled_tools(toolkit_slug)
+            .await?;
+        Ok((all_tools, enabled))
+    }
+
+    /// Persist a user-curated tool whitelist for a toolkit, then bust caches and
+    /// reload the Composio tool set so the change takes effect immediately.
+    ///
+    /// Cache busting is thorough because the edited whitelist affects tools in
+    /// several places: the client's cached toolkit-info counts, any on-demand
+    /// tools already discovered into `dynamic_composio_tools`, and the loaded
+    /// tool set on the active client.
+    pub async fn set_composio_toolkit_tools(
+        &self,
+        toolkit_slug: &str,
+        enabled_tools: Vec<String>,
+        settings: &Settings,
+    ) -> Result<(), String> {
+        let composio_client = self.find_composio_client().await?;
+        composio_client
+            .set_toolkit_enabled_tools(toolkit_slug, enabled_tools)
+            .await?;
+
+        // Bust the toolkit-info cache so tool counts re-fetch fresh from MCP.
+        composio_client.clear_cached_toolkit_info();
+
+        // Drop any on-demand tools already discovered for this toolkit — they
+        // were resolved against the OLD whitelist and must be re-discovered.
+        {
+            let prefix = format!("{}_", toolkit_slug.to_uppercase().replace('-', "_"));
+            let mut dynamic = self.dynamic_composio_tools.lock().await;
+            let before = dynamic.len();
+            dynamic.retain(|t| !t.name.to_uppercase().starts_with(&prefix));
+            let removed = before - dynamic.len();
+            if removed > 0 {
+                tracing::info!(
+                    "Cleared {} stale dynamic tools for edited toolkit '{}'",
+                    removed,
+                    toolkit_slug
+                );
+            }
+        }
+
+        // Reload the loaded/force-loaded tool set from the server.
+        self.reload_composio_tools(settings).await?;
+        self.invalidate_status_cache();
+        Ok(())
+    }
+
     pub async fn get_mcp_context(&self, profile_id: Option<String>) -> McpContext {
         let servers = self.servers.lock().await;
         let unloaded = self.unloaded_servers.lock().await;
@@ -3234,10 +3310,47 @@ impl McpManager {
 
                         let request =
                             ToolSelectionRequest::new(toolkit_slug.clone(), None, candidates);
-                        let llm_connector =
-                            GeminiConnector::new(settings_snapshot.gemini_config.clone());
 
-                        match llm_connector.select_tools_for_toolkit(&request).await {
+                        // Use the actively selected LLM provider for smart selection.
+                        // Fall back to any configured provider so selection still
+                        // works when the active provider has no credentials.
+                        let provider = {
+                            use crate::settings::LlmProvider;
+                            let active = settings_snapshot.active_llm;
+                            if settings_snapshot.is_provider_configured(active) {
+                                Some(active)
+                            } else {
+                                [
+                                    LlmProvider::Gemini,
+                                    LlmProvider::Claude,
+                                    LlmProvider::OpenAiCompat,
+                                ]
+                                .into_iter()
+                                .find(|p| settings_snapshot.is_provider_configured(*p))
+                            }
+                        };
+
+                        let selection = match provider {
+                            Some(provider) => {
+                                tracing::info!(
+                                    "Tool selection using provider {:?} for toolkit '{}'",
+                                    provider,
+                                    toolkit_slug
+                                );
+                                let model = settings_snapshot.chat_model_for(provider);
+                                let connector = crate::llm::build_connector_for(
+                                    &settings_snapshot,
+                                    provider,
+                                    &model,
+                                );
+                                connector.select_tools_for_toolkit(&request).await
+                            }
+                            None => {
+                                Err("No LLM provider is configured for tool selection".to_string())
+                            }
+                        };
+
+                        match selection {
                             Ok(selection) => Some(selection.selected_tools),
                             Err(e) => {
                                 tracing::warn!("LLM tool selection failed: {}. Using default.", e);

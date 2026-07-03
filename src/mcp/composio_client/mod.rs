@@ -222,6 +222,26 @@ impl ComposioClient {
         execution::add_toolkit_to_server(self, toolkit_slug, auth_config_id, selected_tools).await
     }
 
+    /// Currently enabled (allowed) tools for a toolkit on the user's MCP
+    /// server. Empty means no whitelist entries exist for this toolkit, i.e.
+    /// all of its tools are enabled by default.
+    pub async fn get_toolkit_enabled_tools(
+        &self,
+        toolkit_slug: &str,
+    ) -> Result<Vec<String>, String> {
+        execution::get_toolkit_enabled_tools(self, toolkit_slug).await
+    }
+
+    /// Replace the enabled (allowed) tools for a toolkit on the user's MCP
+    /// server, preserving other toolkits' entries.
+    pub async fn set_toolkit_enabled_tools(
+        &self,
+        toolkit_slug: &str,
+        enabled_tools: Vec<String>,
+    ) -> Result<(), String> {
+        execution::set_toolkit_enabled_tools(self, toolkit_slug, enabled_tools).await
+    }
+
     // --- Cache Methods ---
 
     /// Get cached toolkit info if available
@@ -233,6 +253,15 @@ impl ComposioClient {
     pub fn set_cached_toolkit_info(&self, info: Vec<ToolkitInfo>) {
         if let Ok(mut cache) = self.cached_toolkit_info.write() {
             *cache = Some(info);
+        }
+    }
+
+    /// Clear the cached toolkit info so the next `list_connected_toolkits` call
+    /// re-fetches fresh tool counts from the MCP endpoint. Used after editing a
+    /// toolkit's enabled-tool whitelist.
+    pub fn clear_cached_toolkit_info(&self) {
+        if let Ok(mut cache) = self.cached_toolkit_info.write() {
+            *cache = None;
         }
     }
 

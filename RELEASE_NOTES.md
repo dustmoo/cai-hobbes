@@ -1,3 +1,29 @@
+# Hobbes v0.11.0 — Provider-Aware Tool Selection & Composio Tool Editor
+
+## ✨ New Features
+
+### Any provider can now curate large toolkits
+- **Smart tool selection no longer depends on Gemini.** When you connect a Composio toolkit with more tools than the model limit (128), Hobbes asks an LLM to pick the most useful subset. That step was previously hardcoded to Gemini, so connecting a large toolkit failed outright if you didn't have a Gemini key. It now uses your **active provider** (Gemini, Claude, or any OpenAI-compatible endpoint), falling back to any other configured provider.
+- **All providers implement tool selection** — Claude (Messages API), OpenAI Chat Completions, and OpenAI Responses join Gemini, each using its configured summary model.
+
+### Edit a toolkit's tools directly from Hobbes
+- **New tool editor in MCP → Status.** Composio removed the easy in-dashboard way to enable/disable individual tools for a connection, so Hobbes now has its own. Each connected toolkit gets an **edit button** that opens a searchable checklist of every tool the toolkit offers.
+- **Search, bulk toggle, and live counts.** Filter a long tool list by name or description, check/uncheck everything currently shown, and watch an enabled-count badge that warns when you go above the optimal (50) or provider (128) limits.
+- **Saves apply immediately.** Your selection is written as the connection's tool whitelist and the tool set is hot-reloaded — caches are busted (toolkit counts, on-demand discovery, and the loaded set) so the AI sees the new tools right away without a restart.
+
+### OpenAI summary-model selector
+- **Pick a dedicated summarization model for OpenAI-compatible endpoints.** Settings now discovers available models from your endpoint (with a refresh button) and lets you choose a separate, usually cheaper, model for conversation summaries — or fall back to your chat model.
+
+### Session search across message text
+- **Search your history by what was actually said.** Session search now matches against message content, not just session names and summaries.
+
+## 🐛 Fixes
+- **Chat scrolls to your message on send.** Sending a message now snaps the view to the bottom immediately, instead of only following along if you were already near the bottom.
+- **Cleaner history trimming at turn boundaries.** When old messages are dropped to fit the context budget, the kept window now always starts on a complete user turn — tool-call/result pairs are never left orphaned, which could confuse the model.
+- **Windows app icon.** The Windows build now embeds the Hobbes icon into the executable.
+
+---
+
 # Hobbes v0.10.0 — Smart Context, AI Timers & Message Queue
 
 ## ✨ New Features

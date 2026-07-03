@@ -46,7 +46,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
     let filtered_sessions: Vec<_> = if query.is_empty() {
         sorted_sessions
     } else {
-        // Phase 1: Exact substring match on name + conversation summary
+        // Phase 1: Exact substring match on name + summary + message text content
         let exact: Vec<_> = sorted_sessions
             .iter()
             .filter(|s| {
@@ -56,6 +56,11 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                         .summary
                         .to_lowercase()
                         .contains(&query)
+                    || s.messages.iter().any(|m| {
+                        m.content
+                            .get_text_content()
+                            .is_some_and(|t| t.to_lowercase().contains(&query))
+                    })
             })
             .copied()
             .collect();

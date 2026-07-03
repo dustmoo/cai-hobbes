@@ -78,5 +78,8 @@ core-foundation = "0.10"
 security-framework-sys = "2.11.0"
 objc2-security = { version = "0.3", features = ["SecAccessControl", "SecItem"] }
 
+[build-dependencies]
+winres = "0.1"
+
 [dev-dependencies]
 wiremock = "0.6.5"

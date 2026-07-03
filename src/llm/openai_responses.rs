@@ -717,6 +717,71 @@ You MUST respond with valid JSON containing exactly these fields:
         tracing::error!("OpenAI Responses: summarization response had no output text.");
         Ok(Value::Null)
     }
+
+    async fn select_tools_for_toolkit(
+        &self,
+        request: &crate::mcp::tool_selection::ToolSelectionRequest,
+    ) -> Result<crate::mcp::tool_selection::ToolSelectionResponse, String> {
+        use crate::mcp::tool_selection::{build_selection_prompt, parse_selection_response};
+
+        let model = self
+            .config
+            .summary_model
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.config.model)
+            .clone();
+
+        if model.is_empty() {
+            return Err("No model configured for tool selection.".to_string());
+        }
+
+        tracing::info!(
+            model = %model,
+            toolkit = %request.toolkit_name,
+            tool_count = %request.available_tools.len(),
+            "LLM: Selecting tools for toolkit (OpenAI Responses)"
+        );
+
+        let request_body = json!({
+            "model": model,
+            "input": build_selection_prompt(request),
+            "text": { "format": { "type": "json_object" } },
+            "stream": false,
+        });
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let mut request_builder = client
+            .post(self.responses_endpoint())
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&request_body).unwrap_or_default());
+        if let Some(api_key) = &self.config.api_key {
+            request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+        }
+
+        let response = request_builder.send().await.map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Tool selection request failed with status {}: {}",
+                status, body
+            ));
+        }
+
+        let response_json: Value = response.json().await.map_err(|e| e.to_string())?;
+        let content = extract_output_text(&response_json);
+        if content.is_empty() {
+            return Err("No response from LLM for tool selection".to_string());
+        }
+
+        parse_selection_response(&content)
+    }
 }
 
 /// Concatenate the text of all `output_text` content parts in a non-streaming

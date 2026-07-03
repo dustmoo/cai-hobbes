@@ -1092,6 +1092,9 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     let mut toolkits_loading = use_signal(|| false);
     let mut toolkits_error: Signal<Option<String>> = use_signal(|| None);
 
+    // Toolkit whose tool whitelist is being edited: (slug, display_name)
+    let mut editing_toolkit: Signal<Option<(String, String)>> = use_signal(|| None);
+
     // Connection state for inline "Connect" button on disconnected toolkits
     let mut tk_is_connecting = use_signal(|| false);
     let mut tk_connection_status = use_signal(String::new);
@@ -1144,9 +1147,16 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     // Only fetch if: composio server is loaded, dropdown is expanded, no toolkits yet, not loading, and no prior error
     let status_for_fetch = status.status.clone();
     use_effect(move || {
+        let trigger = *refresh_trigger.read(); // Subscribe so a manual Refresh clears + re-fetches
         let should_fetch = is_composio
             && ui_state.read().composio_toolkit_expanded
             && status_for_fetch == ServerStatus::Loaded;
+        // On an explicit refresh (trigger > 0), clear the cached list so the guard below passes
+        // and we re-fetch fresh data. Initial mount (trigger == 0) is left alone.
+        if trigger > 0 && is_composio {
+            toolkits.set(Vec::new());
+            toolkits_error.set(None);
+        }
         // Use peek() to avoid creating a dependency on the signals we only check condition against
         // This prevents infinite loops where we write to these signals within the effect
         let no_error = toolkits_error.peek().is_none();
@@ -1544,8 +1554,21 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                     }
                                                 }
                                                 if toolkit.is_connected {
+                                                    div {
+                                                        class: "flex items-center gap-2",
+                                                        button {
+                                                            class: "p-1.5 bg-section hover:bg-btn-primary border border-faint rounded transition-colors shrink-0",
+                                                            title: "Edit tools — choose which tools of this toolkit are active",
+                                                            "aria-label": "Edit tools",
+                                                            onclick: {
+                                                                let slug = toolkit_slug.clone();
+                                                                let name = toolkit.display_name.clone();
+                                                                move |_| editing_toolkit.set(Some((slug.clone(), name.clone())))
+                                                            },
+                                                            Icon { width: 14, height: 14, icon: fi_icons::FiEdit2 }
+                                                        }
                                                     select {
-                                                        class: "px-2 py-1 bg-section border border-faint rounded text-xs",
+                                                        class: "px-2 py-1 bg-section border border-faint rounded text-xs shrink-0",
                                                         value: match load_mode {
                                                             crate::settings::ToolkitLoadMode::Loaded => "loaded",
                                                             crate::settings::ToolkitLoadMode::OnDemand => "ondemand",
@@ -1614,6 +1637,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                         option { value: "ondemand", "On-demand" }
                                                         option { value: "excluded", "Excluded" }
                                                     }
+                                                    } // end flex wrapper (Edit Tools + load mode)
                                                 } else {
                                                     // Show Connect button for disconnected toolkits
                                                     {
@@ -1698,6 +1722,326 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     "Loaded: all tools available upfront. On-demand: discover then use dynamically. Excluded: hidden from AI."
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            if editing_toolkit.read().is_some() {
+                ToolkitToolEditor {
+                    editing_toolkit,
+                    refresh_trigger,
+                }
+            }
+        }
+    }
+}
+
+/// Modal editor for a connected Composio toolkit's tool whitelist.
+/// Lets the user check/uncheck individual tools (with a search filter) and
+/// saves the selection as `allowed_tools` on the user's Composio MCP server.
+#[component]
+fn ToolkitToolEditor(
+    editing_toolkit: Signal<Option<(String, String)>>,
+    refresh_trigger: Signal<i32>,
+) -> Element {
+    let mcp_manager = use_context::<Signal<McpManager>>();
+    let mut mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let settings = use_context::<Signal<Settings>>();
+
+    let mut checked_tools: Signal<std::collections::HashSet<String>> =
+        use_signal(std::collections::HashSet::new);
+    let mut search_query = use_signal(String::new);
+    let mut is_saving = use_signal(|| false);
+    let mut save_error: Signal<Option<String>> = use_signal(|| None);
+    // Slug the checked-set was initialized for, so re-opening a different
+    // toolkit re-seeds the checkboxes from that toolkit's server state.
+    let mut initialized_for: Signal<Option<String>> = use_signal(|| None);
+
+    // (all tools with descriptions, currently enabled subset) from the server.
+    let tool_state = use_resource(move || {
+        let slug = editing_toolkit.read().as_ref().map(|(s, _)| s.clone());
+        async move {
+            let slug = slug?;
+            Some(
+                mcp_manager
+                    .read()
+                    .get_composio_toolkit_tool_state(&slug)
+                    .await,
+            )
+        }
+    });
+
+    // Seed the checkbox state once per toolkit: enabled subset if a whitelist
+    // exists, otherwise everything (backend default is all tools enabled).
+    use_effect(move || {
+        let slug = match editing_toolkit.read().as_ref() {
+            Some((s, _)) => s.clone(),
+            None => return,
+        };
+        if let Some(Some(Ok((all_tools, enabled)))) = tool_state.read().as_ref() {
+            if initialized_for.peek().as_deref() != Some(slug.as_str()) {
+                let seed: std::collections::HashSet<String> = if enabled.is_empty() {
+                    all_tools.iter().map(|(name, _)| name.clone()).collect()
+                } else {
+                    enabled.iter().cloned().collect()
+                };
+                checked_tools.set(seed);
+                search_query.set(String::new());
+                save_error.set(None);
+                initialized_for.set(Some(slug));
+            }
+        }
+    });
+
+    let Some((toolkit_slug, display_name)) = editing_toolkit.read().clone() else {
+        return rsx! {};
+    };
+
+    let close = move |_| {
+        if !*is_saving.peek() {
+            editing_toolkit.set(None);
+            initialized_for.set(None);
+        }
+    };
+
+    let on_save = {
+        let toolkit_slug = toolkit_slug.clone();
+        move |_| {
+            let slug = toolkit_slug.clone();
+            let selected: Vec<String> = {
+                let mut v: Vec<String> = checked_tools.peek().iter().cloned().collect();
+                v.sort();
+                v
+            };
+            if selected.is_empty() {
+                save_error.set(Some("Select at least one tool to keep enabled.".to_string()));
+                return;
+            }
+            is_saving.set(true);
+            save_error.set(None);
+            spawn(async move {
+                let manager = mcp_manager.read().clone();
+                let settings_snapshot = settings.peek().clone();
+                match manager
+                    .set_composio_toolkit_tools(&slug, selected, &settings_snapshot)
+                    .await
+                {
+                    Ok(()) => {
+                        let new_context = manager.get_mcp_context(None).await;
+                        mcp_context.set(new_context);
+                        let current = *refresh_trigger.peek();
+                        refresh_trigger.set(current + 1);
+                        is_saving.set(false);
+                        editing_toolkit.set(None);
+                        initialized_for.set(None);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to save tool selection for '{}': {}", slug, e);
+                        save_error.set(Some(e));
+                        is_saving.set(false);
+                    }
+                }
+            });
+        }
+    };
+
+    let checked_count = checked_tools.read().len();
+
+    rsx! {
+        div {
+            class: "fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4",
+            onclick: close,
+            div {
+                class: "bg-section rounded-lg border border-faint w-full max-w-xl max-h-[80vh] flex flex-col shadow-xl",
+                // Keep clicks inside the dialog from closing it
+                onclick: move |e| e.stop_propagation(),
+
+                // Header
+                div {
+                    class: "flex items-center justify-between p-4 border-b border-faint",
+                    div {
+                        h3 { class: "font-bold text-fg", "Edit Tools — {display_name}" }
+                        p {
+                            class: "text-xs text-fg-muted mt-1",
+                            "Checked tools are available to the AI; unchecked tools are disabled for this connection."
+                        }
+                    }
+                    button {
+                        class: "text-fg-muted hover:text-fg text-xl leading-none px-2",
+                        onclick: close,
+                        "×"
+                    }
+                }
+
+                match tool_state.read().as_ref() {
+                    Some(Some(Ok((all_tools, _)))) => {
+                        let query = search_query.read().to_lowercase();
+                        let mut sorted_tools: Vec<(String, Option<String>)> = all_tools.clone();
+                        sorted_tools.sort_by(|a, b| a.0.cmp(&b.0));
+                        let filtered: Vec<(String, Option<String>)> = sorted_tools
+                            .into_iter()
+                            .filter(|(name, desc)| {
+                                query.is_empty()
+                                    || name.to_lowercase().contains(&query)
+                                    || desc
+                                        .as_deref()
+                                        .map(|d| d.to_lowercase().contains(&query))
+                                        .unwrap_or(false)
+                            })
+                            .collect();
+                        let filtered_names: Vec<String> =
+                            filtered.iter().map(|(n, _)| n.clone()).collect();
+                        let total = all_tools.len();
+                        let count_badge_class = if checked_count > 128 {
+                            "text-xs px-2 py-0.5 rounded bg-red-900/50 text-red-300 border border-red-600"
+                        } else if checked_count > 50 {
+                            "text-xs px-2 py-0.5 rounded bg-yellow-900/50 text-yellow-300 border border-yellow-600"
+                        } else {
+                            "text-xs px-2 py-0.5 rounded bg-input text-fg-muted"
+                        };
+
+                        rsx! {
+                            // Search + bulk actions
+                            div {
+                                class: "p-4 border-b border-faint space-y-2",
+                                input {
+                                    class: "w-full px-3 py-2 bg-input border border-faint rounded text-sm placeholder:text-fg-muted focus:outline-none focus:border-subtle",
+                                    r#type: "text",
+                                    placeholder: "Search tools by name or description...",
+                                    value: "{search_query}",
+                                    oninput: move |e| search_query.set(e.value()),
+                                }
+                                div {
+                                    class: "flex items-center justify-between flex-wrap gap-2",
+                                    div {
+                                        class: "flex items-center gap-2",
+                                        span {
+                                            class: "{count_badge_class}",
+                                            "{checked_count} / {total} enabled"
+                                        }
+                                        if checked_count > 128 {
+                                            span { class: "text-xs text-red-400", "⚠️ Exceeds provider tool limit (128)" }
+                                        } else if checked_count > 50 {
+                                            span { class: "text-xs text-yellow-400", "⚠️ Above optimal (50)" }
+                                        }
+                                    }
+                                    div {
+                                        class: "flex items-center gap-2",
+                                        button {
+                                            class: "text-xs text-fg-muted hover:text-fg underline",
+                                            onclick: {
+                                                let names = filtered_names.clone();
+                                                move |_| {
+                                                    let mut set = checked_tools.peek().clone();
+                                                    set.extend(names.iter().cloned());
+                                                    checked_tools.set(set);
+                                                }
+                                            },
+                                            "Check all shown"
+                                        }
+                                        button {
+                                            class: "text-xs text-fg-muted hover:text-fg underline",
+                                            onclick: {
+                                                let names = filtered_names.clone();
+                                                move |_| {
+                                                    let mut set = checked_tools.peek().clone();
+                                                    for n in &names {
+                                                        set.remove(n);
+                                                    }
+                                                    checked_tools.set(set);
+                                                }
+                                            },
+                                            "Uncheck all shown"
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Tool list
+                            div {
+                                class: "flex-1 overflow-y-auto p-2",
+                                if filtered.is_empty() {
+                                    p { class: "text-sm text-fg-muted italic text-center py-6", "No tools match your search." }
+                                }
+                                for (name, desc) in filtered {
+                                    {
+                                        let is_checked = checked_tools.read().contains(&name);
+                                        let toggle_name = name.clone();
+                                        rsx! {
+                                            label {
+                                                key: "{name}",
+                                                class: if is_checked {
+                                                    "flex items-start gap-3 p-2 rounded cursor-pointer bg-primary-500/10 hover:bg-primary-500/20"
+                                                } else {
+                                                    "flex items-start gap-3 p-2 rounded cursor-pointer hover:bg-input"
+                                                },
+                                                input {
+                                                    class: "mt-0.5 w-5 h-5 shrink-0 rounded accent-btn-primary cursor-pointer",
+                                                    r#type: "checkbox",
+                                                    checked: is_checked,
+                                                    onchange: move |_| {
+                                                        let mut set = checked_tools.peek().clone();
+                                                        if !set.insert(toggle_name.clone()) {
+                                                            set.remove(&toggle_name);
+                                                        }
+                                                        checked_tools.set(set);
+                                                    },
+                                                }
+                                                div {
+                                                    class: "min-w-0",
+                                                    p { class: "text-sm font-mono text-fg break-all", "{name}" }
+                                                    if let Some(d) = desc {
+                                                        p { class: "text-xs text-fg-muted line-clamp-2", "{d}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Some(Err(e))) => rsx! {
+                        div {
+                            class: "p-6",
+                            p { class: "text-sm text-red-400", "Failed to load tools: {e}" }
+                        }
+                    },
+                    _ => rsx! {
+                        div {
+                            class: "p-6 text-center",
+                            p { class: "text-sm text-fg-muted italic", "Loading tools for {toolkit_slug}..." }
+                        }
+                    },
+                }
+
+                // Footer
+                div {
+                    class: "flex items-center justify-between gap-3 p-4 border-t border-faint",
+                    div {
+                        class: "flex-1 min-w-0",
+                        if let Some(err) = save_error.read().as_ref() {
+                            p { class: "text-xs text-red-400 break-all", "{err}" }
+                        }
+                    }
+                    div {
+                        class: "flex items-center gap-2",
+                        button {
+                            class: "px-3 py-1.5 bg-input hover:bg-section border border-faint rounded text-sm transition-colors",
+                            disabled: *is_saving.read(),
+                            onclick: close,
+                            "Cancel"
+                        }
+                        button {
+                            class: if *is_saving.read() {
+                                "px-3 py-1.5 bg-input rounded text-sm font-medium cursor-not-allowed"
+                            } else {
+                                "px-3 py-1.5 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors"
+                            },
+                            disabled: *is_saving.read(),
+                            onclick: on_save,
+                            if *is_saving.read() { "Saving..." } else { "Save" }
                         }
                     }
                 }
