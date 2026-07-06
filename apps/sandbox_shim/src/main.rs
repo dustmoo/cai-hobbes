@@ -47,11 +47,13 @@ mod win {
         HANDLE_FLAGS, HANDLE_FLAG_INHERIT,
     };
     use windows::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-        GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+        TRUSTEE_W,
     };
     use windows::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+        GetAppContainerFolderPath,
     };
     use windows::Win32::Security::{
         CreateWellKnownSid, WinCapabilityInternetClientSid,
@@ -296,22 +298,20 @@ mod win {
         }
     }
 
-    /// Toolchain dirs the container needs so npx/uvx work at all.
-    fn toolchain_grants() -> (Vec<String>, Vec<String>) {
-        let mut rw = Vec::new();
-        let mut ro = Vec::new();
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            rw.push(format!("{}\\npm-cache", local));
-            rw.push(format!("{}\\uv", local));
-            rw.push(format!("{}\\Temp", local));
+    /// The container's own OS-managed data folder
+    /// (`%LOCALAPPDATA%\Packages\<moniker>\AC`). Windows guarantees the
+    /// container can reach this path — it's the sanctioned writable location
+    /// for AppContainer/UWP apps — which sidesteps the fact that the rest of
+    /// the user profile (C:\Users\...) is NOT traversable by an app container
+    /// and can't be made so without elevation. We route npm/uv caches, TEMP
+    /// and the working directory here.
+    fn app_container_folder(sid: PSID) -> Option<String> {
+        unsafe {
+            let mut sid_str = PWSTR::null();
+            ConvertSidToStringSidW(sid, &mut sid_str).ok()?;
+            let folder = GetAppContainerFolderPath(PCWSTR(sid_str.0)).ok()?;
+            folder.to_string().ok()
         }
-        if let Ok(roaming) = std::env::var("APPDATA") {
-            ro.push(format!("{}\\npm", roaming));
-        }
-        if let Ok(profile) = std::env::var("USERPROFILE") {
-            ro.push(format!("{}\\.local", profile));
-        }
-        (rw, ro)
     }
 
     /// Resolve a command to its full path the way cmd.exe would: an explicit
@@ -385,28 +385,47 @@ mod win {
         let name = container_name(&opts.name);
         let sid = container_sid(&name)?;
 
-        // Filesystem grants: rw for toolchain caches + user-allowed paths,
-        // read/execute for npm's global shims and ~/.local (uv.exe). Each leaf
-        // also needs a traverse ACE up its ancestor chain or the container
-        // can't reach it (see grant_traverse_chain).
-        let mut traversed = std::collections::HashSet::new();
-        let (rw_dirs, ro_dirs) = toolchain_grants();
-        for dir in &rw_dirs {
-            let _ = std::fs::create_dir_all(dir);
-            grant_access(dir, sid, FILE_ALL_ACCESS.0);
-            grant_traverse_chain(dir, sid, &mut traversed);
-        }
-        for dir in &ro_dirs {
-            if std::path::Path::new(dir).exists() {
-                grant_access(dir, sid, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0);
-                grant_traverse_chain(dir, sid, &mut traversed);
+        // Writable state (npm/uv caches, TEMP, cwd) goes in the container's
+        // own OS-managed folder, which is the only profile-adjacent location
+        // an app container can reach without elevation. Redirect the toolchain
+        // to it via env vars so npx/uvx don't try to touch %LOCALAPPDATA%.
+        let ac_folder = app_container_folder(sid);
+        let workdir = if let Some(ac) = &ac_folder {
+            let npm_cache = format!("{}\\npm-cache", ac);
+            let uv_cache = format!("{}\\uv-cache", ac);
+            let tmp = format!("{}\\tmp", ac);
+            for d in [&npm_cache, &uv_cache, &tmp] {
+                let _ = std::fs::create_dir_all(d);
+                // The OS already grants the container access to its AC folder;
+                // this is belt-and-suspenders for the subdirs we just made.
+                grant_access(d, sid, FILE_ALL_ACCESS.0);
             }
-        }
+            // Point the toolchain at the reachable caches. The broker is
+            // single-shot, so mutating its own env (inherited by the child) is
+            // the simplest way to inject these.
+            std::env::set_var("npm_config_cache", &npm_cache);
+            std::env::set_var("NPM_CONFIG_CACHE", &npm_cache);
+            // Keep npm from reading the profile's ~/.npmrc (unreachable → would
+            // error); an absent file in the AC folder is fine.
+            std::env::set_var("npm_config_userconfig", format!("{}\\npmrc", ac));
+            std::env::set_var("UV_CACHE_DIR", &uv_cache);
+            std::env::set_var("TMP", &tmp);
+            std::env::set_var("TEMP", &tmp);
+            tmp
+        } else {
+            eprintln!(
+                "hobbes-sandbox: warning: could not resolve AppContainer folder; \
+                 caches may be unreachable"
+            );
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string())
+        };
+
         // The launched tool's own directory must be readable/executable by the
         // container. Program Files / Windows already grant that to app packages
         // by default (and aren't grantable without elevation), so only add an
-        // ACE for tools installed elsewhere (e.g. a user-local Node); either
-        // way ensure the ancestor chain is traversable.
+        // ACE for tools installed elsewhere (e.g. a user-local Node); ensure
+        // its ancestor chain is traversable in that case.
+        let mut traversed = std::collections::HashSet::new();
         if let Some(cmd_dir) = resolved_cmd
             .as_ref()
             .and_then(|p| p.parent())
@@ -417,6 +436,10 @@ mod win {
                 grant_traverse_chain(&cmd_dir, sid, &mut traversed);
             }
         }
+        // User-granted paths: grant the leaf and punch traverse ACEs up the
+        // chain. NOTE: paths under C:\Users\<u> remain unreachable — C:\Users
+        // itself isn't traversable by app containers and can't be amended
+        // without elevation. Allowed paths should live outside the profile.
         for dir in &opts.allow {
             grant_access(dir, sid, FILE_ALL_ACCESS.0);
             grant_traverse_chain(dir, sid, &mut traversed);
@@ -503,11 +526,8 @@ mod win {
             // The child must start in a directory the container can access —
             // an inherited cwd under the user profile (Hobbes sets $HOME) is
             // denied to the container SID and makes cmd.exe fail with
-            // "The current directory is invalid." Use the rw-granted temp dir.
-            let workdir = std::env::var("LOCALAPPDATA")
-                .map(|l| format!("{}\\Temp", l))
-                .or_else(|_| std::env::var("SystemRoot"))
-                .unwrap_or_else(|_| "C:\\Windows".to_string());
+            // "The current directory is invalid." Use the container-reachable
+            // temp dir resolved above.
             let workdir_w = wide(&workdir);
 
             let mut pi = PROCESS_INFORMATION::default();
