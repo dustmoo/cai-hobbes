@@ -55,8 +55,8 @@ mod win {
     };
     use windows::Win32::Security::{
         CreateWellKnownSid, WinCapabilityInternetClientSid,
-        WinCapabilityPrivateNetworkClientServerSid, ACL, DACL_SECURITY_INFORMATION, PSID,
-        SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        WinCapabilityPrivateNetworkClientServerSid, ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION,
+        PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
         WELL_KNOWN_SID_TYPE,
     };
     use windows::Win32::Storage::FileSystem::{
@@ -201,9 +201,11 @@ mod win {
         Ok(buf)
     }
 
-    /// Grant `access` on `path` to the container SID (inheritable ACE).
-    /// Failures are warnings, not fatal — the server may not need the dir.
-    fn grant_access(path: &str, sid: PSID, access: u32) {
+    /// Add an ACE granting `access` on `path` to the container SID.
+    /// `inherit` controls whether children inherit (full grants on leaf dirs)
+    /// or not (traverse-only ACEs on ancestor dirs). `quiet` suppresses the
+    /// failure warning for best-effort ancestor grants. Non-fatal throughout.
+    fn grant_ace(path: &str, sid: PSID, access: u32, inherit: ACE_FLAGS, quiet: bool) {
         let path_w = wide(path);
         unsafe {
             let mut old_dacl: *mut ACL = std::ptr::null_mut();
@@ -219,7 +221,9 @@ mod win {
                 &mut sd,
             );
             if status != ERROR_SUCCESS {
-                eprintln!("hobbes-sandbox: warning: cannot read ACL of {}", path);
+                if !quiet {
+                    eprintln!("hobbes-sandbox: warning: cannot read ACL of {}", path);
+                }
                 return;
             }
             let trustee = TRUSTEE_W {
@@ -231,13 +235,15 @@ mod win {
             let ea = EXPLICIT_ACCESS_W {
                 grfAccessPermissions: access,
                 grfAccessMode: GRANT_ACCESS,
-                grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+                grfInheritance: inherit,
                 Trustee: trustee,
             };
             let mut new_dacl: *mut ACL = std::ptr::null_mut();
             let status = SetEntriesInAclW(Some(&[ea]), Some(old_dacl), &mut new_dacl);
             if status != ERROR_SUCCESS {
-                eprintln!("hobbes-sandbox: warning: SetEntriesInAcl failed for {}", path);
+                if !quiet {
+                    eprintln!("hobbes-sandbox: warning: SetEntriesInAcl failed for {}", path);
+                }
                 return;
             }
             let status = SetNamedSecurityInfoW(
@@ -249,9 +255,44 @@ mod win {
                 Some(new_dacl),
                 None,
             );
-            if status != ERROR_SUCCESS {
+            if status != ERROR_SUCCESS && !quiet {
                 eprintln!("hobbes-sandbox: warning: cannot grant access on {}", path);
             }
+        }
+    }
+
+    /// Full (inheritable) grant on a leaf directory the tool reads/writes.
+    fn grant_access(path: &str, sid: PSID, access: u32) {
+        grant_ace(path, sid, access, SUB_CONTAINERS_AND_OBJECTS_INHERIT, false);
+    }
+
+    /// An AppContainer can only reach a directory if it can *traverse* every
+    /// ancestor. User-profile dirs (C:\Users\<u>\AppData\...) don't grant that
+    /// to app-container SIDs, so a leaf grant alone is unreachable. Walk from
+    /// the leaf's parent to the drive root adding a non-inherited execute
+    /// (traverse) ACE — enough to pass through, not to list contents. System
+    /// roots already allow traverse (grants there fail quietly); profile dirs
+    /// are user-owned so the broker can amend them. `granted` dedups shared
+    /// ancestors across multiple leaves.
+    fn grant_traverse_chain(leaf: &str, sid: PSID, granted: &mut std::collections::HashSet<String>) {
+        let mut cur = std::path::Path::new(leaf).parent();
+        while let Some(dir) = cur {
+            if dir.as_os_str().is_empty() {
+                break;
+            }
+            let key = dir.to_string_lossy().to_string();
+            // Stop once we hit a drive root like "C:\" (parent's parent is None).
+            let at_root = dir.parent().is_none();
+            if !at_root && granted.insert(key.clone()) {
+                grant_ace(
+                    &key,
+                    sid,
+                    FILE_GENERIC_EXECUTE.0,
+                    ACE_FLAGS(0), // this directory only, no inheritance
+                    true,
+                );
+            }
+            cur = dir.parent();
         }
     }
 
@@ -345,21 +386,27 @@ mod win {
         let sid = container_sid(&name)?;
 
         // Filesystem grants: rw for toolchain caches + user-allowed paths,
-        // read/execute for npm's global shims and ~/.local (uv.exe).
+        // read/execute for npm's global shims and ~/.local (uv.exe). Each leaf
+        // also needs a traverse ACE up its ancestor chain or the container
+        // can't reach it (see grant_traverse_chain).
+        let mut traversed = std::collections::HashSet::new();
         let (rw_dirs, ro_dirs) = toolchain_grants();
         for dir in &rw_dirs {
             let _ = std::fs::create_dir_all(dir);
             grant_access(dir, sid, FILE_ALL_ACCESS.0);
+            grant_traverse_chain(dir, sid, &mut traversed);
         }
         for dir in &ro_dirs {
             if std::path::Path::new(dir).exists() {
                 grant_access(dir, sid, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0);
+                grant_traverse_chain(dir, sid, &mut traversed);
             }
         }
         // The launched tool's own directory must be readable/executable by the
         // container. Program Files / Windows already grant that to app packages
         // by default (and aren't grantable without elevation), so only add an
-        // ACE for tools installed elsewhere (e.g. a user-local Node).
+        // ACE for tools installed elsewhere (e.g. a user-local Node); either
+        // way ensure the ancestor chain is traversable.
         if let Some(cmd_dir) = resolved_cmd
             .as_ref()
             .and_then(|p| p.parent())
@@ -367,10 +414,12 @@ mod win {
         {
             if !is_preauthorized_dir(&cmd_dir) {
                 grant_access(&cmd_dir, sid, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0);
+                grant_traverse_chain(&cmd_dir, sid, &mut traversed);
             }
         }
         for dir in &opts.allow {
             grant_access(dir, sid, FILE_ALL_ACCESS.0);
+            grant_traverse_chain(dir, sid, &mut traversed);
         }
 
         // Capabilities: network only when requested.
