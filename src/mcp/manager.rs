@@ -1,5 +1,4 @@
 use crate::components::shared::ToolCallStatus;
-use crate::components::smithery_registry::SmitheryServerDetail;
 use crate::context::permissions::{PermissionManager, PermissionStatus};
 use crate::mcp::authenticated_sse::AuthenticatedClientError;
 use crate::mcp::composio_client::{composio_to_rmcp_tool, ComposioClient};
@@ -240,6 +239,10 @@ async fn try_auth_recovery(
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct McpServerConfig {
     #[serde(default)]
@@ -255,13 +258,31 @@ pub struct McpServerConfig {
     pub disabled: bool,
     #[serde(default)]
     pub always_allow: Vec<String>,
+    /// Where the server was installed from ("glama" | "manual"). None for
+    /// entries that predate provenance tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// OS-level sandboxing. None resolves to the platform default: on for
+    /// registry installs (source == "glama") on macOS, off otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<bool>,
+    /// Directories the sandboxed process may read/write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_paths: Vec<String>,
+    /// Whether the sandboxed process may access the network.
+    #[serde(default = "default_true")]
+    pub allow_network: bool,
+    /// Names of env vars whose values live in the OS keychain (under
+    /// `mcp_env_<server>__<VAR>`) instead of plaintext in mcp_servers.json.
+    /// Resolved into the child environment at launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_env: Vec<String>,
 }
 
-impl McpServerConfig {
-    /// Minimal stub config for Composio virtual servers (no external command/URI).
-    pub fn composio_stub(name: String) -> Self {
+impl Default for McpServerConfig {
+    fn default() -> Self {
         Self {
-            name,
+            name: String::new(),
             command: None,
             uri: None,
             args: None,
@@ -269,6 +290,21 @@ impl McpServerConfig {
             env: HashMap::new(),
             disabled: false,
             always_allow: Vec::new(),
+            source: None,
+            sandbox: None,
+            allowed_paths: Vec::new(),
+            allow_network: true,
+            secret_env: Vec::new(),
+        }
+    }
+}
+
+impl McpServerConfig {
+    /// Minimal stub config for Composio virtual servers (no external command/URI).
+    pub fn composio_stub(name: String) -> Self {
+        Self {
+            name,
+            ..Default::default()
         }
     }
 
@@ -276,13 +312,24 @@ impl McpServerConfig {
     pub fn native_stub(name: String, description: String) -> Self {
         Self {
             name,
-            command: None,
-            uri: None,
-            args: None,
             description,
-            env: HashMap::new(),
-            disabled: false,
-            always_allow: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    /// Whether this server was installed from an unvetted public registry.
+    pub fn is_registry_install(&self) -> bool {
+        self.source.as_deref() == Some("glama")
+    }
+
+    /// Resolve the effective sandbox setting for this config.
+    /// Explicit value wins; otherwise registry installs default to sandboxed
+    /// whenever the platform sandbox is usable (macOS: sandbox-exec, Linux:
+    /// bwrap installed, Windows: hobbes-sandbox.exe shipped).
+    pub fn sandbox_enabled(&self) -> bool {
+        match self.sandbox {
+            Some(v) => v,
+            None => self.is_registry_install() && crate::mcp::sandbox::sandbox_available(),
         }
     }
 }
@@ -1001,6 +1048,66 @@ impl McpManager {
         vars
     }
 
+    /// Build the child environment for a server: configured env plus
+    /// keychain-stored secret env vars (`secret_env`) resolved via
+    /// `mcp_env_key`. Missing keychain entries are logged, not fatal —
+    /// the server surfaces its own error if the var was required.
+    fn resolved_server_env(
+        config: &McpServerConfig,
+        secret_manager: &dioxus::prelude::Signal<crate::secret_manager::SecretManager>,
+    ) -> HashMap<String, String> {
+        let mut envs = config.env.clone();
+        for var in &config.secret_env {
+            match secret_manager
+                .peek()
+                .get_cloned(&crate::secret_types::mcp_env_key(&config.name, var))
+            {
+                Some(value) => {
+                    envs.insert(var.clone(), value);
+                }
+                None => {
+                    tracing::warn!(
+                        "Secret env var '{}' for MCP server '{}' not found in keychain",
+                        var,
+                        config.name
+                    );
+                }
+            }
+        }
+        envs
+    }
+
+    /// Harden the child environment for unvetted registry installs: instead of
+    /// inheriting Hobbes' full process environment (which can include
+    /// dotenv-loaded API keys), the child gets ONLY the explicitly provided
+    /// vars. Manual/vetted servers keep inheritance for compatibility.
+    fn apply_env_policy(cmd: &mut Command, config: &McpServerConfig) {
+        if config.is_registry_install() {
+            cmd.env_clear();
+        }
+    }
+
+    /// Resolve the bearer token for a network server.
+    /// Priority: COMPOSIO_API_KEY env > MCP_BEARER_TOKEN env > per-server
+    /// keychain entry. Shared by the launch and retry paths so they can't
+    /// drift.
+    fn resolve_bearer_token(
+        config: &McpServerConfig,
+        secret_manager: &dioxus::prelude::Signal<crate::secret_manager::SecretManager>,
+        server_name: &str,
+    ) -> Option<String> {
+        config
+            .env
+            .get("COMPOSIO_API_KEY")
+            .or_else(|| config.env.get("MCP_BEARER_TOKEN"))
+            .cloned()
+            .or_else(|| {
+                secret_manager
+                    .peek()
+                    .get_cloned(&crate::secret_types::mcp_bearer_key(server_name))
+            })
+    }
+
     pub async fn launch_servers(
         &self,
         mcp_context_signal: dioxus::prelude::Signal<McpContext>,
@@ -1175,11 +1282,6 @@ impl McpManager {
             .filter(|sc| !sc.disabled && sc.name != COMPOSIO_NATIVE_PREFIX)
         {
             let mut server_config_clone = server_config.clone();
-            if let Some(key) = &settings.smithery_api_key {
-                server_config_clone
-                    .env
-                    .insert("SMITHERY_API_KEY".to_string(), key.trim().to_string());
-            }
             // Composio API Key is handled by inserting it into env or as a header
             if let Some(key) = &settings.composio_api_key {
                 server_config_clone
@@ -1307,14 +1409,17 @@ impl McpManager {
                         let server_config_clone_for_spawn = server_config_clone.clone();
                         spawn(async move {
                             let mut cmd = Command::new(&command_string);
-                            if let Some(args) = server_config_clone_for_spawn.args {
+                            if let Some(args) = &server_config_clone_for_spawn.args {
                                 for arg in args {
                                     cmd.arg(arg);
                                 }
                             }
 
                             // Inject sane PATH and critical environment variables
-                            let mut envs = server_config_clone_for_spawn.env.clone();
+                            let mut envs = Self::resolved_server_env(
+                                &server_config_clone_for_spawn,
+                                &secret_manager,
+                            );
 
                             // Add critical env vars first (HOME, USER, SHELL, TMPDIR)
                             for (key, value) in Self::get_critical_env_vars() {
@@ -1330,6 +1435,7 @@ impl McpManager {
                             };
                             envs.insert("PATH".to_string(), final_path);
 
+                            Self::apply_env_policy(&mut cmd, &server_config_clone_for_spawn);
                             cmd.envs(&envs);
                             // We run this as a detached process. We don't care if it fails,
                             // as the connection logic will handle that.
@@ -1348,12 +1454,12 @@ impl McpManager {
                         server_name,
                         uri
                     );
-                    // For SSE servers, auth tokens should be provided via env vars by the CLI
-                    // or directly in the server config as needed
-
-                    // Use authenticated transport for Bearer token support (API keys, etc.)
-                    // Check if there is a COMPOSIO_API_KEY in the env and use it
-                    let auth_token = server_config_clone.env.get("COMPOSIO_API_KEY").cloned();
+                    // Use authenticated transport for Bearer token support.
+                    let auth_token = Self::resolve_bearer_token(
+                        &server_config_clone,
+                        &secret_manager,
+                        &server_name,
+                    );
 
                     // If connecting to Composio, ensure transport=sse param is present
                     // Using POST as confirmed by manual curl test
@@ -1459,17 +1565,11 @@ impl McpManager {
                     tracing::trace!("Launching stdio MCP server: {}", server_name);
 
                     let command_base = server_config_clone.command.clone().unwrap_or_default();
-                    let mut cmd = Command::new(&command_base);
-
-                    if let Some(ref args) = server_config_clone.args {
-                        for arg in args {
-                            cmd.arg(arg);
-                        }
-                    }
+                    let mut base_args = server_config_clone.args.clone().unwrap_or_default();
 
                     if server_name == "filesystem" {
                         if let Some(project_folder) = &settings_clone.project_folder {
-                            cmd.arg(project_folder);
+                            base_args.push(project_folder.clone());
                             tracing::trace!(
                                 "Adding project folder to filesystem MCP command: {}",
                                 project_folder
@@ -1477,8 +1577,32 @@ impl McpManager {
                         }
                     }
 
+                    // Apply the OS sandbox when enabled for this server
+                    let (final_command, final_args) = match crate::mcp::sandbox::wrap_command(
+                        &server_config_clone,
+                        command_base,
+                        base_args,
+                    ) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            let error_msg = format!("Sandbox setup failed: {}", e);
+                            tracing::error!("{} ({})", error_msg, server_name);
+                            failed_servers_clone
+                                .lock()
+                                .await
+                                .insert(server_name, (server_config_clone, error_msg));
+                            return;
+                        }
+                    };
+
+                    let mut cmd = Command::new(&final_command);
+                    for arg in &final_args {
+                        cmd.arg(arg);
+                    }
+
                     // Inject sane PATH and critical environment variables
-                    let mut envs = server_config_clone.env.clone();
+                    let mut envs =
+                        Self::resolved_server_env(&server_config_clone, &secret_manager);
 
                     // Add critical env vars first (HOME, USER, SHELL, TMPDIR)
                     // These may be missing when launched from Finder/open
@@ -1495,6 +1619,7 @@ impl McpManager {
                     };
                     envs.insert("PATH".to_string(), final_path);
 
+                    Self::apply_env_policy(&mut cmd, &server_config_clone);
                     cmd.envs(&envs)
                         .stdin(std::process::Stdio::piped())
                         .stdout(std::process::Stdio::piped())
@@ -3103,6 +3228,7 @@ impl McpManager {
         toolkit_slug: String,
         auth_scheme: Option<String>,
         use_managed_auth: bool,
+        no_auth: bool,
         mut mcp_context_signal: Signal<McpContext>,
         mut settings_signal: Signal<Settings>,
         settings_manager: SettingsManager,
@@ -3113,10 +3239,11 @@ impl McpManager {
         mut connected_slugs: Signal<HashSet<String>>,
     ) -> Result<(), String> {
         tracing::info!(
-            "Consolidated 6-Point Connection: toolkit_slug={} (auth_scheme: {:?}, managed: {})",
+            "Consolidated 6-Point Connection: toolkit_slug={} (auth_scheme: {:?}, managed: {}, no_auth: {})",
             toolkit_slug,
             auth_scheme,
-            use_managed_auth
+            use_managed_auth,
+            no_auth
         );
 
         is_connecting.set(true);
@@ -3158,45 +3285,71 @@ impl McpManager {
             profile.chrome_profile_directory.clone(),
         );
 
-        // Step 1: Get or create auth config (reuse existing if available)
-        tracing::info!("[Step 1/5] Resolving Auth Config...");
-        let auth_config_id = match client.get_auth_config_id(&toolkit_slug).await {
-            Ok(id) => {
-                tracing::info!(
-                    "Resolved auth config '{}' for toolkit '{}'",
-                    id,
-                    toolkit_slug
-                );
-                id
-            }
-            Err(e) => {
-                let msg = format!("Failed to resolve auth config: {}", e);
-                tracing::error!("{}", msg);
-                connection_error.set(Some(msg.clone()));
-                is_connecting.set(false);
-                return Err(msg);
+        // Step 1: Get or create auth config (reuse existing if available).
+        // No-auth toolkits (e.g. hackernews) skip auth entirely: Composio
+        // rejects auth config creation for them with error code 303, and their
+        // tools work without a connected account.
+        let auth_config_id: Option<String> = if no_auth {
+            tracing::info!(
+                "[Step 1/5] Toolkit '{}' requires no authentication — skipping auth config",
+                toolkit_slug
+            );
+            None
+        } else {
+            tracing::info!("[Step 1/5] Resolving Auth Config...");
+            match client.get_auth_config_id(&toolkit_slug).await {
+                Ok(id) => {
+                    tracing::info!(
+                        "Resolved auth config '{}' for toolkit '{}'",
+                        id,
+                        toolkit_slug
+                    );
+                    Some(id)
+                }
+                // Self-heal: registry listings sometimes omit the no_auth flag;
+                // Composio's 303 rejection is authoritative, so fall back to the
+                // no-auth path instead of failing the connection.
+                Err(e) if crate::mcp::composio_client::auth::is_no_auth_toolkit_error(&e) => {
+                    tracing::info!(
+                        "Toolkit '{}' reported as no-auth by Composio (code 303) — continuing without auth config",
+                        toolkit_slug
+                    );
+                    None
+                }
+                Err(e) => {
+                    let msg = format!("Failed to resolve auth config: {}", e);
+                    tracing::error!("{}", msg);
+                    connection_error.set(Some(msg.clone()));
+                    is_connecting.set(false);
+                    return Err(msg);
+                }
             }
         };
 
         // Step 2: Initiate OAuth (Proxy Link) - AUTH FIRST
-        tracing::info!("[Step 2/5] Initiating OAuth...");
-        connection_status.set("Authenticating...".to_string());
+        // Skipped for no-auth toolkits: there is no account to connect.
+        if auth_config_id.is_some() {
+            tracing::info!("[Step 2/5] Initiating OAuth...");
+            connection_status.set("Authenticating...".to_string());
 
-        match client
-            .initiate_connection(&toolkit_slug, &user_id, false)
-            .await
-        {
-            Ok(result_msg) => {
-                tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
-                // Wait implied by await
+            match client
+                .initiate_connection(&toolkit_slug, &user_id, false)
+                .await
+            {
+                Ok(result_msg) => {
+                    tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
+                    // Wait implied by await
+                }
+                Err(e) => {
+                    let msg = format!("Authentication failed: {}", e);
+                    tracing::error!("{}", msg);
+                    connection_error.set(Some(msg.clone()));
+                    is_connecting.set(false);
+                    return Err(msg);
+                }
             }
-            Err(e) => {
-                let msg = format!("Authentication failed: {}", e);
-                tracing::error!("{}", msg);
-                connection_error.set(Some(msg.clone()));
-                is_connecting.set(false);
-                return Err(msg);
-            }
+        } else {
+            tracing::info!("[Step 2/5] Skipping OAuth — no authentication required");
         }
 
         // Step 3: Add Toolkit to Server (PATCH Registry)
@@ -3207,7 +3360,7 @@ impl McpManager {
         // Step 4 will trigger LLM selection if tools exceed TOOL_SELECTION_THRESHOLD,
         // UNLESS admin has pre-configured allowed_tools (security override).
         let patch_result = client
-            .add_toolkit_to_server(&toolkit_slug, &auth_config_id, None)
+            .add_toolkit_to_server(&toolkit_slug, auth_config_id.as_deref(), None)
             .await;
 
         // Track admin-curated tools detected during PATCH for Step 4 skip logic
@@ -3374,7 +3527,7 @@ impl McpManager {
             if let Some(tools) = selected_tools.clone() {
                 tracing::info!("Applying smart selection of {} tools", tools.len());
                 if let Err(e) = client
-                    .add_toolkit_to_server(&toolkit_slug, &auth_config_id, Some(tools))
+                    .add_toolkit_to_server(&toolkit_slug, auth_config_id.as_deref(), Some(tools))
                     .await
                 {
                     tracing::warn!("Failed to apply smart tool selection: {}", e);
@@ -3730,11 +3883,6 @@ impl McpManager {
             .find(|c| c.name == server_name)
             .ok_or_else(|| format!("Server '{}' not found in config", server_name))?;
 
-        if let Some(key) = &settings.smithery_api_key {
-            server_config
-                .env
-                .insert("SMITHERY_API_KEY".to_string(), key.clone());
-        }
         if let Some(key) = &settings.composio_api_key {
             server_config
                 .env
@@ -3758,23 +3906,13 @@ impl McpManager {
         let self_clone = self.clone();
         let mut mcp_context_signal_clone = mcp_context_signal;
         let access_token_clone = access_token.clone();
+        let secret_manager = self.secret_manager; // Capture signal (Copy) for the closure
 
         spawn(async move {
             let server_name = server_config_clone.name.clone();
             tracing::info!("Retrying MCP server: {}", server_name);
 
-            // Determine effective configuration (handle local -> remote upgrade with token)
-            let mut effective_config = server_config_clone.clone();
-            if effective_config.uri.is_none() && access_token_clone.is_some() {
-                tracing::info!(
-                    "Upgrading local server '{}' to remote Smithery endpoint using OAuth token",
-                    server_name
-                );
-                effective_config.uri =
-                    Some(format!("https://server.smithery.ai/{}/mcp", server_name));
-                // Don't run the local command since we are connecting remotely
-                effective_config.command = None;
-            }
+            let effective_config = server_config_clone.clone();
 
             if server_name == "composio" {
                 if let Some(profile) = settings_clone.get_active_profile() {
@@ -3880,13 +4018,16 @@ impl McpManager {
                     let server_config_clone_for_spawn = effective_config.clone();
                     spawn(async move {
                         let mut cmd = Command::new(&command_string);
-                        if let Some(args) = server_config_clone_for_spawn.args {
+                        if let Some(args) = &server_config_clone_for_spawn.args {
                             for arg in args {
                                 cmd.arg(arg);
                             }
                         }
                         // Inject critical env vars (HOME, USER, etc.) + sane PATH
-                        let mut envs = server_config_clone_for_spawn.env.clone();
+                        let mut envs = Self::resolved_server_env(
+                            &server_config_clone_for_spawn,
+                            &secret_manager,
+                        );
                         for (key, value) in Self::get_critical_env_vars() {
                             envs.entry(key).or_insert(value);
                         }
@@ -3898,6 +4039,7 @@ impl McpManager {
                             format!("{}:{}", sane_path, current_path)
                         };
                         envs.insert("PATH".to_string(), final_path);
+                        Self::apply_env_policy(&mut cmd, &server_config_clone_for_spawn);
                         cmd.envs(&envs);
                         if let Err(e) = cmd.status().await {
                             tracing::error!(
@@ -3913,14 +4055,12 @@ impl McpManager {
                     server_name,
                     uri
                 );
-                // For SSE servers, auth tokens should be provided via env vars
-                // or directly in the server config as needed
-
-                // Use authenticated transport for Bearer token support (API keys, etc.)
-                // Priority: Explicit access_token > COMPOSIO_API_KEY from env
-                let token_to_use = access_token_clone
-                    .clone()
-                    .or_else(|| effective_config.env.get("COMPOSIO_API_KEY").cloned());
+                // Use authenticated transport for Bearer token support.
+                // Priority: Explicit access_token > shared resolution
+                // (COMPOSIO_API_KEY env > MCP_BEARER_TOKEN env > keychain).
+                let token_to_use = access_token_clone.clone().or_else(|| {
+                    Self::resolve_bearer_token(&effective_config, &secret_manager, &server_name)
+                });
 
                 // If connecting to Composio, ensure transport=sse param is present
                 // Using POST as confirmed by manual curl test
@@ -4005,7 +4145,6 @@ impl McpManager {
             } else {
                 // Stdio-based server
                 tracing::trace!("Launching stdio MCP server: {}", server_name);
-                let mut cmd = Command::new("sh");
                 let mut command_string = server_config_clone.command.clone().unwrap_or_default();
 
                 if let Some(ref args) = server_config_clone.args {
@@ -4023,9 +4162,32 @@ impl McpManager {
                     }
                 }
 
+                // Apply the OS sandbox when enabled (wraps the sh -c invocation)
+                let (shell_cmd, shell_args) = match crate::mcp::sandbox::wrap_command(
+                    &server_config_clone,
+                    "sh".to_string(),
+                    vec!["-c".to_string(), command_string.clone()],
+                ) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        let error_msg = format!("Sandbox setup failed: {}", e);
+                        tracing::error!("{} ({})", error_msg, server_name);
+                        failed_servers_clone
+                            .lock()
+                            .await
+                            .insert(server_name, (server_config_clone, error_msg));
+                        self_clone.invalidate_status_cache_async().await;
+                        return;
+                    }
+                };
+                let mut cmd = Command::new(&shell_cmd);
+                for arg in &shell_args {
+                    cmd.arg(arg);
+                }
+
                 // Inject sane PATH and critical environment variables (HOME, USER, SHELL, TMPDIR)
                 // Without HOME, tools like Playwright fail trying to create dirs at '/'
-                let mut envs = server_config_clone.env.clone();
+                let mut envs = Self::resolved_server_env(&server_config_clone, &secret_manager);
                 for (key, value) in Self::get_critical_env_vars() {
                     envs.entry(key).or_insert(value);
                 }
@@ -4039,9 +4201,8 @@ impl McpManager {
                 };
                 envs.insert("PATH".to_string(), final_path);
 
-                cmd.arg("-c")
-                    .arg(&command_string)
-                    .envs(&envs)
+                Self::apply_env_policy(&mut cmd, &server_config_clone);
+                cmd.envs(&envs)
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
@@ -4200,7 +4361,7 @@ impl McpManager {
         // 2. Rebuild the Command (same logic as launch_servers for stdio)
         let command_base = config
             .command
-            .as_deref()
+            .clone()
             .ok_or_else(|| {
                 format!(
                     "Cannot reconnect '{}': no command configured (SSE servers cannot be reconnected this way)",
@@ -4208,24 +4369,28 @@ impl McpManager {
                 )
             })?;
 
-        let mut cmd = Command::new(command_base);
-
-        if let Some(ref args) = config.args {
-            for arg in args {
-                cmd.arg(arg);
-            }
-        }
+        let mut base_args = config.args.clone().unwrap_or_default();
 
         // Special handling for filesystem server
         if server_name == "filesystem" {
             let settings = self.settings.peek().clone();
             if let Some(project_folder) = &settings.project_folder {
-                cmd.arg(project_folder);
+                base_args.push(project_folder.clone());
             }
         }
 
+        // Apply the OS sandbox when enabled for this server
+        let (final_command, final_args) =
+            crate::mcp::sandbox::wrap_command(&config, command_base, base_args)
+                .map_err(|e| format!("Sandbox setup failed for '{}': {}", server_name, e))?;
+
+        let mut cmd = Command::new(&final_command);
+        for arg in &final_args {
+            cmd.arg(arg);
+        }
+
         // Inject sane PATH and critical environment variables
-        let mut envs = config.env.clone();
+        let mut envs = Self::resolved_server_env(&config, &self.secret_manager);
         for (key, value) in Self::get_critical_env_vars() {
             envs.entry(key).or_insert(value);
         }
@@ -4239,6 +4404,7 @@ impl McpManager {
         };
         envs.insert("PATH".to_string(), final_path);
 
+        Self::apply_env_policy(&mut cmd, &config);
         cmd.envs(&envs)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -4327,55 +4493,6 @@ impl McpManager {
         );
 
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn install_mcp_server(
-        &self,
-        server_config: &SmitheryServerDetail,
-    ) -> Result<(), String> {
-        let config_path = self
-            .config_path
-            .as_ref()
-            .ok_or("Config path not set")?
-            .clone();
-
-        // Find the correct config for the current platform
-        let platform = crate::components::smithery_registry::get_platform();
-        let mcp_config = server_config
-            .configs
-            .as_ref()
-            .and_then(|configs| configs.iter().find(|c| c.platform == platform))
-            .map(|c| {
-                let mut env = HashMap::new();
-                // Check for API key in args and move it to env var
-                let mut args = c.args.clone();
-                if let Some(key_index) = args.iter().position(|arg| arg.starts_with("--key")) {
-                    // This assumes the key is the next argument
-                    if key_index + 1 < args.len() {
-                        let key_value = args.remove(key_index + 1);
-                        args.remove(key_index);
-                        env.insert("SMITHERY_API_KEY".to_string(), key_value);
-                    }
-                }
-
-                let mut config =
-                    McpServerConfig::composio_stub(server_config.qualified_name.clone());
-                config.command = Some(c.command.clone());
-                config.args = Some(args);
-                config.env = env;
-                config
-            });
-
-        if let Some(new_config) = mcp_config {
-            self.add_or_update_mcp_server(&config_path, new_config)
-                .await
-        } else {
-            Err(format!(
-                "No compatible configuration found for platform '{}'",
-                platform
-            ))
-        }
     }
 
     /// Helper to process the output stream from a tool call into a final status and response string.

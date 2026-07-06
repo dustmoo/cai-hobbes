@@ -131,6 +131,23 @@ Move-Item -Force $RawBinaryPath $BinaryPath
 $BinarySize = "{0:N2} MB" -f ((Get-Item $BinaryPath).Length / 1MB)
 Write-Host "  [OK] Built: $VersionedName ($BinarySize)" -ForegroundColor Green
 
+# Build the AppContainer sandbox broker (ships next to hobbes.exe; used to
+# confine MCP servers installed from the public registry)
+$shimArgs = @("build", "-p", "hobbes_sandbox")
+if ($Release) { $shimArgs += "--release" }
+Write-Host "  > cargo $($shimArgs -join ' ')" -ForegroundColor DarkGray
+& cargo @shimArgs
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  [X] Sandbox broker build failed!" -ForegroundColor Red
+    exit 1
+}
+$ShimPath = Join-Path $ProjectDir "target\$BuildModeLabel\hobbes-sandbox.exe"
+if (-not (Test-Path $ShimPath)) {
+    Write-Host "  [X] Sandbox broker not found at: $ShimPath" -ForegroundColor Red
+    exit 1
+}
+Write-Host "  [OK] Built: hobbes-sandbox.exe" -ForegroundColor Green
+
 # =====================================================================
 # Signing (optional)
 # =====================================================================
@@ -179,6 +196,7 @@ if ($Sign) {
     Write-Host ""
     Write-Host "=== Code Signing (Binary) ===" -ForegroundColor Yellow
     Sign-Binary -FilePath $BinaryPath -Label $VersionedName
+    Sign-Binary -FilePath $ShimPath -Label "hobbes-sandbox.exe"
 }
 
 # =====================================================================

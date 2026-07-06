@@ -28,6 +28,10 @@ PrivilegesRequired=lowest
 ; Main executable (renamed from hobbes_VERSION.exe to hobbes.exe on install)
 Source: "..\target\release\hobbes_{#Version}.exe"; DestDir: "{app}"; DestName: "hobbes.exe"; Flags: ignoreversion
 
+; AppContainer sandbox broker for MCP servers installed from the public
+; registry — must live next to hobbes.exe (see apps/sandbox_shim)
+Source: "..\target\release\hobbes-sandbox.exe"; DestDir: "{app}"; Flags: ignoreversion
+
 ; WebView2 bootstrapper — installs Edge WebView2 Runtime if not already present.
 ; Download from: https://developer.microsoft.com/en-us/microsoft-edge/webview2/
 ; Place MicrosoftEdgeWebview2Setup.exe in scripts/ before building the installer.

@@ -11,8 +11,9 @@ use super::LlmConnector;
 use crate::components::shared::{StreamMessage, ToolCall, UsageData};
 use crate::mcp::manager::McpContext;
 
+// The OpenAI tool-call `id` is intentionally not kept: calls are matched
+// positionally during streaming and ToolCall carries no provider id.
 struct PendingToolCall {
-    id: String,
     name: String,
     server_name: String,
     arguments: String,
@@ -426,7 +427,6 @@ impl LlmConnector for OpenAiCompatConnector {
                                     }
                                 }
                                 StreamEvent::ToolCall {
-                                    id,
                                     name,
                                     arguments,
                                     ..
@@ -457,7 +457,6 @@ impl LlmConnector for OpenAiCompatConnector {
                                             self.resolve_tool_call(&name)
                                         };
                                         pending_tool_calls.push(PendingToolCall {
-                                            id,
                                             name: resolved_tool,
                                             server_name: resolved_server,
                                             // CRITICAL: Use .as_str() not .to_string()!

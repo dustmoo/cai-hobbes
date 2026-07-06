@@ -1,0 +1,23 @@
+[package]
+name = "hobbes_sandbox"
+version = "0.1.0"
+edition = "2021"
+description = "AppContainer launcher shim for Hobbes MCP servers (Windows)"
+publish = false
+
+[[bin]]
+name = "hobbes-sandbox"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }

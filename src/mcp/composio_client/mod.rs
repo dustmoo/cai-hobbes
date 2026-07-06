@@ -213,10 +213,11 @@ impl ComposioClient {
         execution::execute_tool(self, name, args).await
     }
 
+    /// `auth_config_id` is `None` for no-auth toolkits (bound without auth).
     pub async fn add_toolkit_to_server(
         &self,
         toolkit_slug: &str,
-        auth_config_id: &str,
+        auth_config_id: Option<&str>,
         selected_tools: Option<Vec<String>>,
     ) -> Result<execution::AddToolkitResult, String> {
         execution::add_toolkit_to_server(self, toolkit_slug, auth_config_id, selected_tools).await
@@ -407,7 +408,7 @@ impl ComposioClient {
         // SECURITY: Passing None preserves admin-configured allowed_tools (no re-selection)
         tracing::info!("[RECONNECT 5/5] Re-patching MCP server...");
         match self
-            .add_toolkit_to_server(toolkit_slug, &auth_config_id, None)
+            .add_toolkit_to_server(toolkit_slug, Some(&auth_config_id), None)
             .await
         {
             Ok(result) => {

@@ -184,4 +184,5 @@ jobs:
       with:
         files: |
           target/release/Hobbes-Windows-v${{ steps.version.outputs.VERSION }}.exe
+          target/release/hobbes-sandbox.exe
           scripts/Output/hobbes_${{ steps.version.outputs.VERSION }}_setup.exe

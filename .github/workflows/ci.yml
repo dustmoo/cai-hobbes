@@ -176,5 +176,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: hobbes-windows-${{ steps.version.outputs.VERSION }}
-        path: target/release/Hobbes-Windows-v${{ steps.version.outputs.VERSION }}.exe
+        path: |
+          target/release/Hobbes-Windows-v${{ steps.version.outputs.VERSION }}.exe
+          target/release/hobbes-sandbox.exe
         retention-days: 30

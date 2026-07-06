@@ -236,10 +236,22 @@ pub struct Settings {
     /// Off by default — stealing focus is disruptive; users opt in.
     #[serde(default)]
     pub timer_focus_window: bool,
+    /// The registry the store last browsed. Old settings files stored this as
+    /// `preferred_mcp_source` (which could be the removed `Smithery` variant);
+    /// the lenient deserializer maps any unknown value to Glama.
+    #[serde(
+        default,
+        alias = "preferred_mcp_source",
+        deserialize_with = "de_mcp_source_lenient"
+    )]
+    pub last_used_mcp_source: McpSource,
+    /// Set when an old settings file referenced Smithery — drives the one-time
+    /// migration dialog. Never persisted.
     #[serde(skip)]
-    pub smithery_api_key: Option<String>,
+    pub smithery_settings_detected: bool,
+    /// True once the user has dismissed the Smithery-removal migration dialog.
     #[serde(default)]
-    pub preferred_mcp_source: McpSource,
+    pub smithery_migration_acknowledged: bool,
     /// How API keys are stored: Biometric (device-only) or iCloud sync
     #[serde(default)]
     pub keychain_storage_mode: KeychainStorageMode,
@@ -306,16 +318,25 @@ pub struct ImageGenerationConfig {
     pub model: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum McpSource {
-    Smithery,
+    /// Glama MCP registry (public API, no key required). Always enabled.
+    #[default]
+    Glama,
+    /// Composio toolkit marketplace. Enabled when a profile is configured.
     Composio,
 }
 
-impl Default for McpSource {
-    fn default() -> Self {
-        Self::Composio
-    }
+/// Tolerates values from older settings files (e.g. the removed `Smithery`
+/// variant, or any future unknown string) by falling back to Glama.
+fn de_mcp_source_lenient<'de, D>(d: D) -> Result<McpSource, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match String::deserialize(d)?.as_str() {
+        "Composio" => McpSource::Composio,
+        _ => McpSource::Glama,
+    })
 }
 
 /// How API keys should be stored in the keychain
@@ -539,8 +560,9 @@ impl Default for Settings {
             confirm_on_message_edit: true,
             confirm_forget_memory: true,
             timer_focus_window: false,
-            smithery_api_key: None,
-            preferred_mcp_source: McpSource::default(),
+            last_used_mcp_source: McpSource::default(),
+            smithery_settings_detected: false,
+            smithery_migration_acknowledged: false,
             keychain_storage_mode: KeychainStorageMode::default(),
             max_tool_output_length: default_max_tool_output_length(),
             max_active_tool_output_length: default_max_active_tool_output_length(),
@@ -810,6 +832,32 @@ impl Settings {
                 }
                 self.claude_config.model_slots[index] = model;
             }
+        }
+    }
+
+    /// Registry sources currently available in the MCP store.
+    /// Glama is always enabled (public API, no key); Composio appears once a
+    /// profile is fully configured.
+    pub fn enabled_mcp_sources(&self) -> Vec<McpSource> {
+        let mut sources = vec![McpSource::Glama];
+        if self
+            .composio_profiles
+            .iter()
+            .any(|p| p.is_fully_configured())
+        {
+            sources.push(McpSource::Composio);
+        }
+        sources
+    }
+
+    /// The registry the store should open on: the last-used source if it is
+    /// still enabled, otherwise the first enabled source.
+    pub fn effective_mcp_source(&self) -> McpSource {
+        let enabled = self.enabled_mcp_sources();
+        if enabled.contains(&self.last_used_mcp_source) {
+            self.last_used_mcp_source
+        } else {
+            enabled[0]
         }
     }
 
@@ -1144,8 +1192,14 @@ impl SettingsManager {
             Err(_) => return Settings::default(),
         };
 
+        // Detect legacy Smithery configuration in the raw file — drives the
+        // one-time migration dialog (the field itself is gone from the struct).
+        let smithery_detected = content.contains("\"preferred_mcp_source\": \"Smithery\"")
+            || content.contains("\"preferred_mcp_source\":\"Smithery\"");
+
         // First, try to deserialize directly. If it works, we're done.
         if let Ok(mut settings) = serde_json::from_str::<Settings>(&content) {
+            settings.smithery_settings_detected = smithery_detected;
             settings.migrate_legacy_composio_settings();
             settings.ensure_profile_ids();
             // Happy-path migration: JSON deserialized cleanly but active_composio_profile
@@ -1235,11 +1289,14 @@ impl SettingsManager {
                     settings.permission_settings = permission_settings;
                 }
             }
-            if let Some(source) = value.get("preferred_mcp_source") {
-                if let Ok(source) = serde_json::from_value(source.clone()) {
-                    settings.preferred_mcp_source = source;
-                }
+            if let Some(source) = value.get("preferred_mcp_source").and_then(|v| v.as_str()) {
+                settings.last_used_mcp_source = match source {
+                    "Composio" => McpSource::Composio,
+                    // "Smithery" and anything unknown fall back to Glama
+                    _ => McpSource::Glama,
+                };
             }
+            settings.smithery_settings_detected = smithery_detected;
             if let Some(url) = value.get("composio_base_url").and_then(|v| v.as_str()) {
                 settings.composio_base_url = Some(url.to_string());
             }
@@ -1344,8 +1401,9 @@ impl Default for SettingsTab {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UiState {
     pub settings_panel_width: f64,
-    /// Default state for tool call Arguments section (expanded or collapsed)
-    #[serde(default = "default_true", alias = "show_tool_arguments")]
+    /// Default state for tool call Arguments section (expanded or collapsed).
+    /// Collapsed by default to keep tool bubbles compact.
+    #[serde(default, alias = "show_tool_arguments")]
     pub default_tool_arguments_open: bool,
     /// Default state for tool call Response section (expanded or collapsed)
     #[serde(default, alias = "show_tool_response")]
@@ -1423,7 +1481,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             settings_panel_width: 420.0, // Comfortable width for 1440px window
-            default_tool_arguments_open: true,
+            default_tool_arguments_open: false,
             default_tool_response_open: false,
             default_tool_thought_open: false,
             default_skill_arguments_open: true,
@@ -1635,6 +1693,78 @@ mod tests {
         s.seed_default_claude_slots_if_empty();
         // Any assigned slot means the configuration is left untouched.
         assert_eq!(s.claude_config.model_slots, slots);
+    }
+
+    #[test]
+    fn mcp_source_migrates_smithery_to_glama() {
+        let json = r#"{ "preferred_mcp_source": "Smithery", "active_composio_profile": null }"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.last_used_mcp_source, McpSource::Glama);
+    }
+
+    #[test]
+    fn mcp_source_migrates_composio() {
+        let json = r#"{ "preferred_mcp_source": "Composio", "active_composio_profile": null }"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.last_used_mcp_source, McpSource::Composio);
+    }
+
+    #[test]
+    fn mcp_source_defaults_to_glama_when_missing() {
+        let json = r#"{ "active_composio_profile": null }"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.last_used_mcp_source, McpSource::Glama);
+    }
+
+    #[test]
+    fn mcp_source_roundtrip_writes_new_key() {
+        let mut s = Settings::default();
+        s.last_used_mcp_source = McpSource::Composio;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"last_used_mcp_source\":\"Composio\""));
+        assert!(!json.contains("preferred_mcp_source"));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_used_mcp_source, McpSource::Composio);
+    }
+
+    #[test]
+    fn load_detects_legacy_smithery_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{ "preferred_mcp_source": "Smithery", "active_composio_profile": null }"#,
+        )
+        .unwrap();
+        let manager = SettingsManager {
+            settings_path: path,
+        };
+        let s = manager.load();
+        assert!(s.smithery_settings_detected);
+        assert_eq!(s.last_used_mcp_source, McpSource::Glama);
+        assert!(!s.smithery_migration_acknowledged);
+    }
+
+    #[test]
+    fn enabled_sources_gates_composio_on_configured_profile() {
+        let mut s = Settings::default();
+        assert_eq!(s.enabled_mcp_sources(), vec![McpSource::Glama]);
+        assert_eq!(s.effective_mcp_source(), McpSource::Glama);
+
+        let mut profile = ComposioProfile::default();
+        profile.user_id = Some("user".to_string());
+        profile.api_key = Some("key".to_string());
+        s.composio_profiles.push(profile);
+        assert_eq!(
+            s.enabled_mcp_sources(),
+            vec![McpSource::Glama, McpSource::Composio]
+        );
+
+        // Last-used survives only while enabled
+        s.last_used_mcp_source = McpSource::Composio;
+        assert_eq!(s.effective_mcp_source(), McpSource::Composio);
+        s.composio_profiles.clear();
+        assert_eq!(s.effective_mcp_source(), McpSource::Glama);
     }
 
     #[test]

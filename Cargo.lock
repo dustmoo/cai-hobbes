@@ -56,6 +56,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "toml 0.8.2",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -2755,6 +2756,13 @@ name = "hobbes_core"
 version = "0.1.1"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "hobbes_sandbox"
+version = "0.1.0"
+dependencies = [
+ "windows 0.58.0",
 ]
 
 [[package]]

@@ -14,8 +14,38 @@ pub const KNOWN_KEYS: &[&str] = &[
     "gemini_api_key",        // Gemini API key (provider-scoped)
     "claude_api_key",        // Claude API key (provider-scoped)
     "openai_compat_api_key", // OpenAI-compatible API key (provider-scoped)
-    "smithery_api_key",      // Smithery API key
 ];
+
+/// Keychain key used by the removed Smithery integration. Kept only so the
+/// migration cleanup can find and delete the orphaned entry.
+pub const LEGACY_SMITHERY_KEY: &str = "smithery_api_key";
+
+/// Prefix for remote MCP server bearer tokens (e.g., "mcp_bearer_my-server").
+pub const MCP_BEARER_PREFIX: &str = "mcp_bearer_";
+
+/// Build the keychain key for a remote MCP server's bearer token.
+pub fn mcp_bearer_key(server_name: &str) -> String {
+    format!("{}{}", MCP_BEARER_PREFIX, server_name)
+}
+
+/// Prefix for local MCP server env-var secrets
+/// (e.g., "mcp_env_my-server__GITHUB_TOKEN").
+pub const MCP_ENV_PREFIX: &str = "mcp_env_";
+
+/// Build the keychain key for a local MCP server's secret env var.
+pub fn mcp_env_key(server_name: &str, var_name: &str) -> String {
+    format!("{}{}__{}", MCP_ENV_PREFIX, server_name, var_name)
+}
+
+/// Heuristic: does an env-var name look like it holds a credential?
+/// Used by the registry install dialog to route values to the keychain
+/// instead of plaintext mcp_servers.json.
+pub fn is_secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH"]
+        .iter()
+        .any(|marker| upper.contains(marker))
+}
 
 /// Prefix for Composio profile API keys (e.g., "composio_api_key_default")
 pub const COMPOSIO_KEY_PREFIX: &str = "composio_api_key_";
@@ -256,6 +286,31 @@ pub trait SecretManagerTrait {
         Ok(())
     }
 
+    /// Store an arbitrary secret and register it in the keychain index so it
+    /// is hydrated into the cache on the next startup (used for remote MCP
+    /// server bearer tokens).
+    fn set_indexed_secret(&mut self, key: &str, value: String) -> Result<(), String> {
+        self.set(key, value)?;
+        let current_index = self.get_index_from_keychain().unwrap_or_default();
+        let new_index = add_to_index_csv(&current_index, key);
+        if new_index != current_index {
+            self.set(CUSTOM_KEYS_INDEX_KEY, new_index)?;
+            tracing::info!("Registered indexed secret: {}", key);
+        }
+        Ok(())
+    }
+
+    /// Delete an indexed secret and remove it from the keychain index.
+    fn delete_indexed_secret(&mut self, key: &str) -> Result<(), String> {
+        let _ = self.delete(key);
+        let current_index = self.get_index_from_keychain().unwrap_or_default();
+        if !current_index.is_empty() {
+            let new_index = remove_from_index_csv(&current_index, key);
+            self.set(CUSTOM_KEYS_INDEX_KEY, new_index)?;
+        }
+        Ok(())
+    }
+
     /// Get a Composio API key for a specific profile.
     fn get_composio_key(&self, profile_id: &str) -> Option<&String> {
         let key = composio_key_name(profile_id);
@@ -314,6 +369,17 @@ pub fn extract_custom_tool_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mcp_env_key_and_secret_heuristic() {
+        assert_eq!(mcp_env_key("my-server", "GITHUB_TOKEN"), "mcp_env_my-server__GITHUB_TOKEN");
+        for secret in ["GITHUB_TOKEN", "api_key", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "AUTH_HEADER", "MyCredential"] {
+            assert!(is_secret_env_name(secret), "should be secret: {}", secret);
+        }
+        for plain in ["PORT", "MCP_MODE", "OBSIDIAN_VAULT", "LOG_LEVEL", "BASE_URL"] {
+            assert!(!is_secret_env_name(plain), "should be plain: {}", plain);
+        }
+    }
 
     #[test]
     fn test_format_custom_tool_key() {

@@ -1,4 +1,4 @@
-// Authenticated SSE Client for Smithery OAuth
+// Authenticated SSE Client for remote MCP servers (Bearer/custom-header auth)
 // This module provides a custom SseClient implementation that injects
 // OAuth tokens into all requests for authenticated MCP connections.
 
@@ -60,7 +60,7 @@ impl AuthenticatedSseClient {
     ) -> Result<reqwest::Response, AuthenticatedClientError> {
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             // Simple 401 handling - no OAuth metadata extraction needed
-            // For Smithery servers, OAuth is handled by the CLI
+            // OAuth-protected servers surface an auth-required error handled upstream
             let body_bytes = response.bytes().await?;
             let body_str = String::from_utf8_lossy(&body_bytes);
             return Err(AuthenticatedClientError::AuthRequired(format!(

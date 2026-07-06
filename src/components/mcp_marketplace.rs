@@ -3,11 +3,10 @@
 
 use crate::components::mcp_search_form::McpSearchForm;
 use crate::components::shared::SessionIdContext;
-use crate::components::smithery_registry::{SmitheryClient, SmitheryServer};
-use crate::components::syntax_highlighter::highlight_json;
 use crate::mcp::composio_client::{
     ComposioCategory, ComposioClient, ComposioToolkitListing, ResolvedAuth,
 };
+use crate::mcp::glama_client::{GlamaClient, GlamaEnvVar, GlamaHosting, GlamaServer};
 use crate::mcp::manager::{McpManager, McpServerStatus, ServerStatus, COMPOSIO_NATIVE_PREFIX};
 use crate::settings::{McpSource, Settings, SettingsManager};
 use crate::SecretManagerTrait;
@@ -20,19 +19,18 @@ use std::path::PathBuf;
 #[derive(Clone, PartialEq)]
 enum ActiveTab {
     Marketplace,
-    Installed,
     Status,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct FeaturedMcp {
-    name: String,
-    display_name: String,
-    description: String,
-    command: String,
-    args: Vec<String>,
-    env_vars: Vec<String>,
-    homepage: String,
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FeaturedMcp {
+    pub name: String,
+    pub display_name: String,
+    pub description: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env_vars: Vec<String>,
+    pub homepage: String,
     /// Primary auth scheme for this toolkit (e.g., "OAUTH2", "API_KEY")
     #[serde(default)]
     auth_scheme: Option<String>,
@@ -42,9 +40,73 @@ struct FeaturedMcp {
     /// Whether the toolkit requires no authentication
     #[serde(default)]
     pub no_auth: bool,
+    /// Which registry this card came from (default: Glama).
+    #[serde(default)]
+    pub source: McpSource,
+    /// Glama hosting attribute (drives Install vs Connect actions).
+    #[serde(default)]
+    pub hosting: Option<GlamaHosting>,
+    /// Source repository (Glama servers).
+    #[serde(default)]
+    pub repository_url: Option<String>,
+    /// Env vars parsed from the Glama env-var JSON schema.
+    #[serde(default)]
+    pub glama_env_vars: Vec<GlamaEnvVar>,
+    /// The server's page on glama.ai.
+    #[serde(default)]
+    pub glama_page_url: Option<String>,
+    /// Whether the registry marks this server as an official integration.
+    #[serde(default)]
+    pub official: bool,
+    /// License name, when the registry knows it.
+    #[serde(default)]
+    pub license: Option<String>,
+    /// Whether the server passes the registry's installability gate.
+    /// Glama refuses installation of servers without a detected license
+    /// ("MCP servers without a LICENSE cannot be installed"); its public API
+    /// exposes the license but not the quality/maintenance grades, so this is
+    /// the strongest protection signal available.
+    #[serde(default = "default_installable")]
+    pub installable: bool,
 }
 
+fn default_installable() -> bool {
+    true
+}
+
+/// Target number of filtered Glama results to accumulate before rendering a
+/// page. The registry API ignores filter params, so hosting/official/installable
+/// filtering happens client-side; without accumulation, a page of 100 raw
+/// servers can collapse to 1–4 cards once a selective filter is applied.
+const GLAMA_TARGET_PER_PAGE: usize = 12;
+/// Max registry batches (100 servers each) pulled to fill one display page.
+/// Kept deliberately small to be a good API citizen: the common case (no filter
+/// or installable-only, which matches the majority of servers) fills a page in a
+/// single request; only a selective filter like official-only (a few percent of
+/// the registry) falls through to a second batch. The API caps `first` at 100,
+/// so a single larger request is not an option.
+const GLAMA_MAX_BATCHES: usize = 2;
+/// Servers requested per underlying registry call (the API's page maximum).
+const GLAMA_FETCH_BATCH: u32 = 100;
+
 impl FeaturedMcp {
+    /// Whether this Glama server passes the active marketplace filters.
+    /// Applied client-side because the registry API ignores filter params.
+    fn passes_glama_filters(
+        &self,
+        hosting: Option<GlamaHosting>,
+        official_only: bool,
+        installable_only: bool,
+    ) -> bool {
+        let hosting_ok = match hosting {
+            Some(h) => self.hosting == Some(h),
+            None => true,
+        };
+        let official_ok = !official_only || self.official;
+        let installable_ok = !installable_only || self.installable;
+        hosting_ok && official_ok && installable_ok
+    }
+
     pub fn resolve_auth(&self, has_local_creds: bool) -> ResolvedAuth {
         if has_local_creds {
             ResolvedAuth::Byoa
@@ -54,28 +116,6 @@ impl FeaturedMcp {
             ResolvedAuth::Managed
         } else {
             ResolvedAuth::RequiresSetup
-        }
-    }
-}
-
-impl From<SmitheryServer> for FeaturedMcp {
-    fn from(server: SmitheryServer) -> Self {
-        FeaturedMcp {
-            name: server.qualified_name.clone(),
-            display_name: server.display_name,
-            description: server.description,
-            command: "npx".to_string(),
-            args: vec![
-                "-y".to_string(),
-                "@smithery/cli@latest".to_string(),
-                "run".to_string(),
-                server.qualified_name,
-            ],
-            env_vars: vec![], // This will be populated by the detailed fetch
-            homepage: server.homepage,
-            auth_scheme: None, // Not applicable for Smithery
-            use_managed_auth: false,
-            no_auth: false,
         }
     }
 }
@@ -94,98 +134,44 @@ impl From<ComposioToolkitListing> for FeaturedMcp {
             display_name: toolkit.name,
             description,
             command: String::new(), // Not used for Composio
-            args: vec![],
-            env_vars: vec![],
             homepage,
             auth_scheme,
             use_managed_auth,
             no_auth,
+            source: McpSource::Composio,
+            installable: true,
+            ..Default::default()
         }
     }
 }
 
-fn get_featured_mcps() -> Vec<FeaturedMcp> {
-    vec![
+impl From<GlamaServer> for FeaturedMcp {
+    fn from(server: GlamaServer) -> Self {
+        let hosting = server.hosting();
+        let glama_env_vars = server.env_vars();
+        let official = server.is_official();
+        let repository_url = server.repository_url().map(str::to_string);
+        let homepage = repository_url.clone().unwrap_or_else(|| server.url.clone());
         FeaturedMcp {
-            name: "filesystem".to_string(),
-            display_name: "Filesystem".to_string(),
-            description: "Give the AI access to read and write files in a specific directory."
-                .to_string(),
-            command: "npx".to_string(),
-            args: vec![
-                "-y".to_string(),
-                "@modelcontextprotocol/server-filesystem".to_string(),
-                "/path/to/allowed/dir".to_string(),
-            ],
-            env_vars: vec![],
-            homepage: "".to_string(),
-            auth_scheme: None,
-            use_managed_auth: false,
-            no_auth: false,
-        },
-        FeaturedMcp {
-            name: "brave-search".to_string(),
-            display_name: "Brave Search".to_string(),
-            description: "Allow the AI to search the web using Brave Search.".to_string(),
-            command: "npx".to_string(),
-            args: vec![
-                "-y".to_string(),
-                "@modelcontextprotocol/server-brave-search".to_string(),
-            ],
-            env_vars: vec!["BRAVE_API_KEY".to_string()],
-            homepage: "".to_string(),
-            auth_scheme: None,
-            use_managed_auth: false,
-            no_auth: false,
-        },
-        FeaturedMcp {
-            name: "github".to_string(),
-            display_name: "GitHub".to_string(),
-            description: "Interact with GitHub repositories, issues, and pull requests."
-                .to_string(),
-            command: "npx".to_string(),
-            args: vec![
-                "-y".to_string(),
-                "@modelcontextprotocol/server-github".to_string(),
-            ],
-            env_vars: vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()],
-            homepage: "".to_string(),
-            auth_scheme: None,
-            use_managed_auth: false,
-            no_auth: false,
-        },
-        FeaturedMcp {
-            name: "postgres".to_string(),
-            display_name: "PostgreSQL".to_string(),
-            description: "Read and write data to a PostgreSQL database.".to_string(),
-            command: "npx".to_string(),
-            args: vec![
-                "-y".to_string(),
-                "@modelcontextprotocol/server-postgres".to_string(),
-                "<YOUR_POSTGRES_CONNECTION_STRING>".to_string(),
-            ],
-            env_vars: vec![],
-            homepage: "".to_string(),
-            auth_scheme: None,
-            use_managed_auth: false,
-            no_auth: false,
-        },
-        FeaturedMcp {
-            name: "google-maps".to_string(),
-            display_name: "Google Maps".to_string(),
-            description: "Access location data and directions via Google Maps.".to_string(),
-            command: "npx".to_string(),
-            args: vec![
-                "-y".to_string(),
-                "@modelcontextprotocol/server-google-maps".to_string(),
-            ],
-            env_vars: vec!["GOOGLE_MAPS_API_KEY".to_string()],
-            homepage: "".to_string(),
-            auth_scheme: None,
-            use_managed_auth: false,
-            no_auth: false,
-        },
-    ]
+            name: server.qualified_name(),
+            display_name: server.name.clone(),
+            description: server.description.clone().unwrap_or_default(),
+            command: String::new(), // Derived at install time
+            homepage,
+            no_auth: true, // Auth is handled per-install (env vars / remote endpoint)
+            source: McpSource::Glama,
+            hosting: Some(hosting),
+            repository_url,
+            glama_env_vars,
+            glama_page_url: Some(server.url),
+            official,
+            // Mirror Glama's own install gate: no detected license → the
+            // registry marks the server "cannot be installed".
+            installable: server.spdx_license.is_some(),
+            license: server.spdx_license.map(|l| l.name),
+            ..Default::default()
+        }
+    }
 }
 
 #[component]
@@ -194,15 +180,28 @@ pub fn McpMarketplace() -> Element {
     let search_query = use_signal(|| "".to_string());
     let mut trigger_search = use_signal(|| 0);
     let mut config_content = use_signal(|| "".to_string());
-    let mut error_message = use_signal(|| Option::<String>::None);
-    let mut success_message = use_signal(|| Option::<String>::None);
+    let error_message = use_signal(|| Option::<String>::None);
+    let success_message = use_signal(|| Option::<String>::None);
     let mcp_manager = use_context::<Signal<McpManager>>();
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let settings = use_context::<Signal<Settings>>();
+    let settings_manager = use_context::<Signal<SettingsManager>>();
 
-    let filter_verified = use_signal(|| true);
-    let filter_deployed = use_signal(|| false);
     let sort_by = use_signal(|| "usage".to_string());
+
+    // Which registry the store is currently browsing. Initialized from the
+    // last-used source (if still enabled); switching persists the choice.
+    let mut active_source = use_signal(|| settings.peek().effective_mcp_source());
+
+    // Glama search filters. Official + installable default on — the safest
+    // browsing view; users can uncheck either to see the full registry.
+    let glama_hosting_filter: Signal<Option<GlamaHosting>> = use_signal(|| None);
+    let glama_official_only = use_signal(|| true);
+    let glama_licensed_only = use_signal(|| true);
+
+    // Glama install dialogs (rendered at the marketplace root; opened per-card)
+    let install_local_dialog: Signal<Option<FeaturedMcp>> = use_signal(|| None);
+    let remote_connect_dialog: Signal<Option<FeaturedMcp>> = use_signal(|| None);
 
     // State for server list
     let mut current_page = use_signal(|| 1i32);
@@ -225,22 +224,42 @@ pub fn McpMarketplace() -> Element {
     let show_category_dropdown = use_signal(|| false);
     let categories_loading = use_signal(|| false);
 
-    // Reset cursor state when search query, categories, or sort order change
-    {
-        let mut cursor_stack = cursor_stack;
-        let mut current_cursor = current_cursor;
-        let mut current_page = current_page;
-        use_effect(move || {
-            // Subscribe to changes in search query, categories, and sort order
-            let _ = search_query.read();
-            let _ = selected_categories.read();
-            let _ = sort_by.read();
-            // Reset pagination to first page
-            cursor_stack.set(vec![]);
-            current_cursor.set(None);
-            current_page.set(1);
-        });
-    }
+    // Bumped by the search form on submit (Enter / Search button). Search is
+    // committed, not live: the text box updates `search_query` on every keystroke
+    // but only a submit triggers a fetch — important now that each Glama fetch can
+    // accumulate several API calls.
+    let search_commit = use_signal(|| 0i32);
+
+    // Single restart path. A search commit or any identity change (registry, sort,
+    // categories, Glama filters) resets pagination to page 1 and THEN bumps
+    // `trigger_search`, all in one synchronous effect body. Because the cursor is
+    // cleared before the trigger fires — and the fetch resource peeks the cursor
+    // rather than subscribing to it — the resource always fetches from a clean
+    // cursor. This is what fixes the previous effect-vs-resource race.
+    //
+    // The effect's first (mount) run is skipped: the fetch resource already
+    // performs the initial load at trigger 0, so restarting here would just fire a
+    // duplicate request at the API on every tab open.
+    let mut restart_initialized = use_signal(|| false);
+    use_effect(move || {
+        let _ = search_commit.read();
+        let _ = selected_categories.read();
+        let _ = sort_by.read();
+        let _ = active_source.read();
+        let _ = glama_hosting_filter.read();
+        let _ = glama_official_only.read();
+        let _ = glama_licensed_only.read();
+        if !*restart_initialized.peek() {
+            restart_initialized.set(true);
+            return;
+        }
+        // Reset pagination to first page, then trigger the refetch.
+        cursor_stack.set(vec![]);
+        current_cursor.set(None);
+        current_page.set(1);
+        let t = *trigger_search.peek();
+        trigger_search.set(t + 1);
+    });
 
     // Fetch categories when Composio is selected - use effect with explicit dependency
     {
@@ -249,7 +268,7 @@ pub fn McpMarketplace() -> Element {
             let mut available_categories = available_categories;
             let mut categories_loading = categories_loading;
 
-            if settings_snapshot.preferred_mcp_source != McpSource::Composio {
+            if *active_source.read() != McpSource::Composio {
                 return; // Only fetch for Composio
             }
 
@@ -352,20 +371,26 @@ pub fn McpMarketplace() -> Element {
 
     let server_resource: Resource<Result<(Vec<FeaturedMcp>, String), String>> = use_resource(
         move || {
-            // This resource will re-run whenever any of these signals change.
-            // IMPORTANT: All signals must be read at the top level of this closure for reactive tracking.
-            let page = *current_page.read();
-            let verified = *filter_verified.read();
-            let deployed = *filter_deployed.read();
-            let query = search_query.read().clone();
-            let sort = sort_by.read().clone();
-            // Track selected categories so changes trigger a refetch
-            let cats = selected_categories.read().clone();
-            // Explicit trigger counter - must be used (not just discarded) for proper reactivity
+            // Fetching is driven by a SINGLE explicit signal: `trigger_search`
+            // (plus `settings`, so a late-loading API key refetches). Every other
+            // input — query, sort, source, categories, Glama filters, and the
+            // pagination cursor — is read via `.peek()` and is NOT a dependency.
+            //
+            // This is deliberate: query/filter/sort/source changes and pagination
+            // all reset or set the cursor and THEN bump `trigger_search` in the
+            // same synchronous handler (see `restart_search` and the effect below).
+            // Reading the cursor reactively here would race that reset; reading it
+            // via peek after an explicit trigger guarantees a consistent cursor.
             let trigger = *trigger_search.read();
-
-            // Track settings changes (e.g. API key loading)
             let settings_snapshot = settings.read().clone();
+
+            let query = search_query.peek().clone();
+            let sort = sort_by.peek().clone();
+            let source = *active_source.peek();
+            let cats = selected_categories.peek().clone();
+            let glama_hosting = *glama_hosting_filter.peek();
+            let glama_official = *glama_official_only.peek();
+            let glama_licensed = *glama_licensed_only.peek();
 
             tracing::debug!(
                 "Resource triggered - sort={:?}, trigger={}, categories={:?}",
@@ -373,9 +398,6 @@ pub fn McpMarketplace() -> Element {
                 trigger,
                 cats
             );
-
-            // Get the preferred source from settings
-            let source = settings_snapshot.preferred_mcp_source.clone();
 
             async move {
                 // Ensure trigger is captured for reactive tracking
@@ -464,49 +486,94 @@ pub fn McpMarketplace() -> Element {
                             )
                         }
                     }
-                    McpSource::Smithery => {
-                        // Existing Smithery logic
-                        let api_key = settings_snapshot.smithery_api_key.clone();
+                    McpSource::Glama => {
+                        let client = GlamaClient::new();
+                        // The Glama registry API ignores attribute filter params,
+                        // so hosting/official/installable filtering is applied
+                        // client-side. Because a raw batch of 100 can collapse to
+                        // a handful of matches, accumulate whole batches (following
+                        // cursors) until we have a full page of filtered results or
+                        // exhaust the registry. Resuming at underlying-batch
+                        // boundaries keeps cursor navigation exact.
+                        let search_param = if query.is_empty() {
+                            None
+                        } else {
+                            Some(query.as_str())
+                        };
 
-                        if let Some(key) = api_key {
-                            let client = SmitheryClient::new(key);
-                            let mut filters = Vec::new();
-                            if verified {
-                                filters.push("is:verified");
-                            }
-                            if deployed {
-                                filters.push("is:deployed");
-                            }
-                            if !query.is_empty() {
-                                filters.push(&query);
-                            }
-                            let final_query = filters.join(" ");
-                            let search_param = if final_query.is_empty() {
-                                None
-                            } else {
-                                Some(final_query.as_str())
-                            };
+                        let mut accumulated: Vec<FeaturedMcp> = Vec::new();
+                        // Start from where the previous page left off (None = first).
+                        let mut batch_cursor = current_cursor.peek().clone();
+                        // Cursor to resume the *next* display page from; None once
+                        // the registry is exhausted (disables the Next button).
+                        let mut resume_cursor: Option<String> = None;
+                        let mut fetch_error: Option<String> = None;
 
+                        for _ in 0..GLAMA_MAX_BATCHES {
                             match client
-                                .fetch_servers(search_param, Some(page as u32), Some(&sort))
+                                .list_servers(
+                                    search_param,
+                                    &[],
+                                    GLAMA_FETCH_BATCH,
+                                    batch_cursor.as_deref(),
+                                )
                                 .await
                             {
-                                Ok(response) => {
-                                    total_pages.set(response.pagination.total_pages as i32);
-                                    let mcps: Vec<FeaturedMcp> =
-                                        response.servers.into_iter().map(Into::into).collect();
-                                    Ok((mcps, "Smithery".to_string()))
+                                Ok(list) => {
+                                    let has_next = list.page_info.has_next_page;
+                                    let end_cursor = list.page_info.end_cursor.clone();
+
+                                    accumulated.extend(
+                                        list.servers
+                                            .into_iter()
+                                            .map(FeaturedMcp::from)
+                                            .filter(|m| {
+                                                m.passes_glama_filters(
+                                                    glama_hosting,
+                                                    glama_official,
+                                                    glama_licensed,
+                                                )
+                                            }),
+                                    );
+
+                                    // Registry exhausted — this is the last page.
+                                    if !has_next || end_cursor.is_none() {
+                                        resume_cursor = None;
+                                        break;
+                                    }
+
+                                    // Enough to render — remember where to resume.
+                                    if accumulated.len() >= GLAMA_TARGET_PER_PAGE {
+                                        resume_cursor = end_cursor;
+                                        break;
+                                    }
+
+                                    // Otherwise pull the next batch.
+                                    resume_cursor = end_cursor.clone();
+                                    batch_cursor = end_cursor;
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Failed to fetch from Smithery: {}", e);
-                                    Ok((
-                                        get_featured_mcps(),
-                                        "Hardcoded (Smithery error)".to_string(),
-                                    ))
+                                    tracing::warn!("Failed to fetch from Glama: {}", e);
+                                    // Surface the error only if we have nothing to show;
+                                    // otherwise render what we accumulated so far.
+                                    if accumulated.is_empty() {
+                                        fetch_error = Some(format!("Glama error: {}", e));
+                                    } else {
+                                        resume_cursor = batch_cursor.clone();
+                                    }
+                                    break;
                                 }
                             }
+                        }
+
+                        if let Some(err) = fetch_error {
+                            Err(err)
                         } else {
-                            Ok((get_featured_mcps(), "Hardcoded".to_string()))
+                            next_cursor.set(resume_cursor);
+                            // Total is unknown for cursor pagination; the label
+                            // renders "Page N" for Glama.
+                            total_pages.set(0);
+                            Ok((accumulated, "Glama".to_string()))
                         }
                     }
                 }
@@ -519,18 +586,21 @@ pub fn McpMarketplace() -> Element {
 
     let (filtered_mcps, data_source, is_loading) = match &*server_resource.read() {
         Some(Ok((mcps, source))) => {
-            // Apply client-side filtering for Composio since API ignores search params
-            let filtered = if current_query.is_empty() || source != "Composio" {
-                mcps.clone()
-            } else {
-                mcps.iter()
+            let filtered: Vec<FeaturedMcp> = match source.as_str() {
+                // Composio: filter by search query (its API ignores search params)
+                "Composio" if !current_query.is_empty() => mcps
+                    .iter()
                     .filter(|mcp| {
                         mcp.display_name.to_lowercase().contains(&current_query)
                             || mcp.name.to_lowercase().contains(&current_query)
                             || mcp.description.to_lowercase().contains(&current_query)
                     })
                     .cloned()
-                    .collect()
+                    .collect(),
+                // Glama results are already filtered during the accumulating
+                // fetch (the registry API ignores attribute params), so pass
+                // them through unchanged.
+                _ => mcps.clone(),
             };
             (filtered, source.clone(), false)
         }
@@ -596,7 +666,7 @@ pub fn McpMarketplace() -> Element {
 
             let current_config_str = config_content.read().clone();
 
-            // Extract short server name (e.g., "@smithery/googlecalendar" -> "googlecalendar")
+            // Extract short server name (e.g., "owner/some-mcp" -> "some")
             // This is a rough heuristic, might need refinement for composio mapping
             let short_name = mcp
                 .name
@@ -607,31 +677,16 @@ pub fn McpMarketplace() -> Element {
 
             if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&current_config_str) {
                 if let Some(servers) = json.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
-                    match current_settings.preferred_mcp_source {
-                        crate::settings::McpSource::Smithery => {
-                            if let Some(api_key) = current_settings.smithery_api_key.clone() {
-                                // Use standard Smithery CLI pattern
-                                let new_server = serde_json::json!({
-                                    "command": "npx",
-                                    "args": [
-                                        "-y",
-                                        "@smithery/cli@latest",
-                                        "run",
-                                        short_name,
-                                        "--key",
-                                        api_key
-                                    ],
-                                    "description": mcp.description
-                                });
-                                servers.insert(short_name.clone(), new_server);
-                            } else {
-                                tracing::warn!("No Smithery API key configured");
-                                error_msg.set(Some(
-                                    "Please set your Smithery API key in Settings first"
-                                        .to_string(),
-                                ));
-                                return;
-                            }
+                    match current_settings.last_used_mcp_source {
+                        crate::settings::McpSource::Glama => {
+                            // Placeholder: Glama installs go through the dedicated
+                            // install dialogs (Phase 5), not this legacy closure.
+                            let new_server = serde_json::json!({
+                                "command": mcp.command,
+                                "args": mcp.args,
+                                "description": mcp.description
+                            });
+                            servers.insert(short_name.clone(), new_server);
                         }
                         crate::settings::McpSource::Composio => {
                             // ------------------------------------------------------------------
@@ -641,14 +696,11 @@ pub fn McpMarketplace() -> Element {
                             // in `McpServerCard` via `McpManager::connect_toolkit` because it
                             // requires local UI state signals (spinners, status updates) that
                             // are not available in this top-level closure.
-                            //
-                            // If this branch is hit, it means we are in a mixed state (e.g. Smithery
-                            // source selected but clicking a Composio tool).
                             // ------------------------------------------------------------------
 
                             tracing::warn!("Delegating Composio install to McpServerCard logic.");
                             error_msg.set(Some(
-                                "Please switch to 'Composio' source in settings to install this tool."
+                                "Use the Connect button on the card to install Composio tools."
                                     .to_string(),
                             ));
                             return;
@@ -658,7 +710,7 @@ pub fn McpMarketplace() -> Element {
                     if let Ok(new_content) = serde_json::to_string_pretty(&json) {
                         save_config_coroutine.send(new_content);
                     }
-                    active_tab.set(ActiveTab::Installed);
+                    active_tab.set(ActiveTab::Status);
                 } else {
                     tracing::error!("'mcpServers' key missing or invalid in config");
                     error_msg.set(Some("Invalid MCP config structure.".to_string()));
@@ -671,6 +723,27 @@ pub fn McpMarketplace() -> Element {
     };
 
     rsx! {
+        // Glama install dialogs (keyed per server so state resets on reopen)
+        if let Some(mcp) = install_local_dialog.read().clone() {
+            crate::components::glama_install_dialog::GlamaLocalInstallDialog {
+                key: "install-{mcp.name}",
+                mcp: mcp.clone(),
+                dialog: install_local_dialog,
+                config_content: config_content,
+                save_config: save_config_coroutine,
+                trigger_search: trigger_search,
+            }
+        }
+        if let Some(mcp) = remote_connect_dialog.read().clone() {
+            crate::components::glama_install_dialog::GlamaRemoteConnectDialog {
+                key: "connect-{mcp.name}",
+                mcp: mcp.clone(),
+                dialog: remote_connect_dialog,
+                config_content: config_content,
+                save_config: save_config_coroutine,
+                trigger_search: trigger_search,
+            }
+        }
         div {
             class: "flex flex-col h-full bg-app text-fg",
             div {
@@ -709,24 +782,11 @@ pub fn McpMarketplace() -> Element {
                         onclick: move |_| active_tab.set(ActiveTab::Marketplace),
                         "Marketplace"
                     }
-                    button {
-                        class: if *active_tab.read() == ActiveTab::Installed {
-                            "px-3 py-1 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
-                        } else {
-                            "px-3 py-1 text-sm font-medium text-fg-muted hover:text-fg"
-                        },
-                        onclick: move |_| active_tab.set(ActiveTab::Installed),
-                        "Installed / Config"
-                    }
                 }
             }
 
             div {
-                class: if *active_tab.read() == ActiveTab::Installed {
-                    "flex-1 flex flex-col overflow-hidden p-4"
-                } else {
-                    "flex-1 overflow-y-auto p-4"
-                },
+                class: "flex-1 overflow-y-auto p-4",
                 if let Some(msg) = success_message.read().as_ref() {
                     div { class: "mb-4 p-2 bg-green-900 text-green-200 rounded text-sm", "{msg}" }
                 }
@@ -738,16 +798,45 @@ pub fn McpMarketplace() -> Element {
                     let tab = (*active_tab.read()).clone();
                     match tab {
                     ActiveTab::Marketplace => rsx! {
+                        // Registry toggle — shown only when more than one source is enabled
+                        if settings.read().enabled_mcp_sources().len() > 1 {
+                            div {
+                                class: "flex items-center gap-1 mb-3 bg-input rounded-lg p-1 w-fit",
+                                for src in settings.read().enabled_mcp_sources() {
+                                    button {
+                                        class: if *active_source.read() == src {
+                                            "px-4 py-1.5 rounded-md text-sm font-medium bg-btn-primary text-fg shadow-sm"
+                                        } else {
+                                            "px-4 py-1.5 rounded-md text-sm font-medium text-fg-muted hover:text-fg transition-colors"
+                                        },
+                                        onclick: move |_| {
+                                            if *active_source.peek() != src {
+                                                active_source.set(src);
+                                                // Persist as the default for next time
+                                                let mut s = settings;
+                                                s.write().last_used_mcp_source = src;
+                                                let snapshot = s.peek().clone();
+                                                settings_manager.peek().save_async(snapshot, None);
+                                            }
+                                        },
+                                        match src {
+                                            McpSource::Glama => "Glama",
+                                            McpSource::Composio => "Composio",
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         McpSearchForm {
                             search_query: search_query,
-                            trigger_search: trigger_search,
-                            filter_verified: filter_verified,
-                            filter_deployed: filter_deployed,
-                            sort_by: sort_by,
-                            mcp_source: settings.peek().preferred_mcp_source.clone(),
+                            search_commit: search_commit,
+                            mcp_source: *active_source.read(),
                             composio_categories: selected_categories,
                             available_categories: available_categories,
                             show_category_dropdown: show_category_dropdown,
+                            glama_hosting_filter: glama_hosting_filter,
+                            glama_official_only: glama_official_only,
+                            glama_licensed_only: glama_licensed_only,
                             categories_loading: *categories_loading.read()
                         }
                         if filtered_mcps.is_empty() && !is_loading {
@@ -784,7 +873,9 @@ pub fn McpMarketplace() -> Element {
                                         mcp: mcp.clone(),
                                         add_mcp: add_mcp,
                                         trigger_search: trigger_search,
-                                        connected_slugs: connected_slugs
+                                        connected_slugs: connected_slugs,
+                                        install_local_dialog: install_local_dialog,
+                                        remote_connect_dialog: remote_connect_dialog
                                     }
                                 }
                             }
@@ -819,7 +910,17 @@ pub fn McpMarketplace() -> Element {
                             }
                             span {
                                 class: "text-sm text-fg-muted",
-                                "Page {current_page} of {total_pages}"
+                                // Composio reports a total; Glama uses cursor
+                                // pagination with no known total, so we show the
+                                // running page number and mark the final page
+                                // (reached when there's no next cursor).
+                                if *total_pages.read() > 0 {
+                                    "Page {current_page} of {total_pages}"
+                                } else if next_cursor.read().is_none() {
+                                    "Page {current_page} of {current_page}"
+                                } else {
+                                    "Page {current_page}"
+                                }
                             }
                             button {
                                 class: "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors disabled:bg-input disabled:cursor-not-allowed",
@@ -846,91 +947,6 @@ pub fn McpMarketplace() -> Element {
                                     }
                                 },
                                 "Next"
-                            }
-                        }
-                    },
-                    ActiveTab::Installed => rsx! {
-                        div {
-                            class: "flex-1 flex flex-col min-h-0",
-                            p { class: "text-sm text-fg-muted mb-2", "Directly edit the JSON configuration for your MCP servers." }
-
-                            // Syntax highlighted editor
-                            div {
-                                class: "flex-1 relative bg-section rounded-md border border-faint",
-                                id: "json-editor-container",
-
-                                // Highlighted background layer
-                                pre {
-                                    class: "absolute inset-0 p-4 text-sm font-mono pointer-events-none whitespace-pre-wrap break-words overflow-auto",
-                                    id: "json-highlight",
-                                    code {
-                                        dangerous_inner_html: "{highlight_json(config_content.read().clone())}"
-                                    }
-                                }
-
-                                // Editable overlay with scroll
-                                textarea {
-                                    class: "absolute inset-0 w-full h-full p-4 bg-transparent font-mono text-sm text-transparent caret-white border-0 focus:outline-none resize-none overflow-auto whitespace-pre-wrap break-words",
-                                    id: "json-editor",
-                                    style: "color: transparent;",
-                                    value: "{config_content}",
-                                    spellcheck: false,
-                                    oninput: move |e| {
-                                        config_content.set(e.value());
-                                        success_message.set(None);
-                                        error_message.set(None);
-                                    },
-                                    onscroll: move |_| {
-                                        let _ = document::eval(r#"
-                                            const editor = document.getElementById('json-editor');
-                                            const highlight = document.getElementById('json-highlight');
-                                            if (editor && highlight) {
-                                                highlight.scrollTop = editor.scrollTop;
-                                                highlight.scrollLeft = editor.scrollLeft;
-                                            }
-                                        "#);
-                                    },
-                                }
-                            }
-
-                            div {
-                                class: "mt-4 flex justify-end gap-2",
-                                button {
-                                    class: "px-4 py-2 bg-input hover:bg-gray-500 rounded font-medium transition-colors",
-                                    onclick: move |_| {
-                                        let content = config_content.read().clone();
-                                        match serde_json::from_str::<serde_json::Value>(&content) {
-                                            Ok(parsed) => {
-                                                if let Ok(formatted) = serde_json::to_string_pretty(&parsed) {
-                                                    config_content.set(formatted);
-                                                    error_message.set(None);
-                                                    success_message.set(Some("JSON formatted.".to_string()));
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error_message.set(Some(format!("Cannot format - Invalid JSON: {}", e)));
-                                            }
-                                        }
-                                    },
-                                    "Format JSON"
-                                }
-                                button {
-                                    class: "px-4 py-2 bg-btn-primary hover:bg-btn-primary-hover rounded font-medium transition-colors",
-                                    onclick: move |_| {
-                                        let content_to_save = config_content.read().clone();
-                                        // Validate JSON before sending to coroutine
-                                        match serde_json::from_str::<serde_json::Value>(&content_to_save) {
-                                            Ok(_) => {
-                                                save_config_coroutine.send(content_to_save);
-                                                error_message.set(None);
-                                            }
-                                            Err(e) => {
-                                                error_message.set(Some(format!("Invalid JSON: {}", e)));
-                                            }
-                                        }
-                                    },
-                                    "Save Configuration"
-                                }
                             }
                         }
                     },
@@ -1214,24 +1230,9 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
         });
     };
 
-    // OAuth authentication is now handled by Smithery CLI automatically
-    // No manual authentication needed - just ensure SMITHERY_API_KEY is set in env
-
     // Determine if this server needs OAuth authorization
-    // More deterministic checks:
     // 1. NeedsAuth status (set explicitly via is_auth_error detection)
     // 2. Error message contains 401/invalid_token (HTTP status based)
-    // 3. Server is using Smithery CLI (indicates Smithery-hosted server)
-    let is_smithery_hosted = status
-        .uri
-        .as_ref()
-        .map(|u| u.contains("smithery.ai"))
-        .unwrap_or(false)
-        || status.name.contains("google")
-        || status.name.contains("calendar")
-        || status.name.contains("drive")
-        || status.name.contains("gmail");
-
     let has_auth_error = status
         .error_message
         .as_ref()
@@ -1242,7 +1243,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
         .unwrap_or(false);
 
     let needs_oauth = status.status == ServerStatus::NeedsAuth
-        || (status.status == ServerStatus::Error && (has_auth_error || is_smithery_hosted));
+        || (status.status == ServerStatus::Error && has_auth_error);
 
     rsx! {
         div {
@@ -1388,91 +1389,26 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                     }
                 }
 
-                // Show Authorize button if OAuth is needed
+                // Show Authorize button if OAuth is needed and the server
+                // reported an authorization URL (captured by the manager when
+                // the transport returned an auth-required error).
                 if needs_oauth {
-                    div {
-                        class: "mt-4 flex justify-end gap-2",
-                        button {
-                            class: "px-3 py-1 bg-yellow-600 hover:bg-yellow-500 rounded text-sm font-medium transition-colors flex items-center gap-2",
-                            onclick: {
-                                let server_name = status.name.clone();
-                                // Redundant locals removed
-                                // mcp_manager, mcp_context, settings captured by move
-                                let settings = settings; // settings not listed as redundant in error?
-                                // wait, error 1254, 1255. 1259 was settings.
-                                // If settings was redundant, it should have been flagged.
-                                // Let's try removing it too to be safe, as it is likely redundant if others are.
-                                move |_| {
-                                    let server_name = server_name.clone();
-                                    let mcp_manager = mcp_manager;
-                                    let mcp_context = mcp_context;
-                                    let settings = settings;
-
+                    if let Some(auth_url) = status.auth_url.clone() {
+                        div {
+                            class: "mt-4 flex justify-end gap-2",
+                            button {
+                                class: "px-3 py-1 bg-yellow-600 hover:bg-yellow-500 rounded text-sm font-medium transition-colors flex items-center gap-2",
+                                onclick: move |_| {
+                                    let auth_url = auth_url.clone();
                                     spawn(async move {
-                                        use crate::mcp::smithery_client::{SmitheryOAuthClient, SmitheryOAuthConfig, SmitheryOAuthError};
-
-                                        tracing::info!("Starting OAuth flow for: {}", server_name);
-
-                                        // Create OAuth client
-                                        let server_url = format!("https://server.smithery.ai/{}/mcp", server_name);
-                                        let config = SmitheryOAuthConfig::new(&server_url);
-                                        let client = SmitheryOAuthClient::new(config);
-
-                                        // Start callback server to receive auth code
-                                        let mut callback_rx = client.start_callback_server();
-
-                                        // Try to connect - this triggers OAuth discovery
-                                        match client.connect().await {
-                                            Ok(()) => {
-                                                tracing::info!("Connected without needing auth!");
-                                            }
-                                            Err(SmitheryOAuthError::AuthRequired(auth_url)) => {
-                                                tracing::info!("Opening OAuth authorization URL: {}", auth_url);
-
-                                                // Open browser for user to authorize
-                                                if let Err(e) = crate::mcp::oauth_flow::open_browser(&auth_url, None).await {
-                                                    tracing::error!("Failed to open browser: {}", e);
-                                                    return;
-                                                }
-
-                                                // Wait for callback with auth code
-                                                tracing::debug!("Waiting for OAuth callback...");
-                                                if let Some(result) = callback_rx.recv().await {
-                                                    if result.success {
-                                                        if let Some(code) = result.auth_code {
-                                                            tracing::debug!("Received auth code, completing OAuth flow...");
-
-                                                            // Exchange code for tokens
-                                                            match client.finish_auth(&code).await {
-                                                                Ok(()) => {
-                                                                    tracing::info!("OAuth complete! Retrying server connection...");
-
-                                                                    // Retry the server now that we have auth
-                                                                    let _ = mcp_manager.read().retry_server(
-                                                                        &server_name,
-                                                                        mcp_context,
-                                                                        settings.read().clone(),
-                                                                        client.access_token().await
-                                                                    ).await;
-                                                                }
-                                                                Err(e) => {
-                                                                    tracing::error!("Token exchange failed: {}", e);
-                                                                }
-                                                            }
-                                                        }
-                                                    } else if let Some(error) = result.error {
-                                                        tracing::error!("OAuth failed: {}", error);
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::error!("OAuth connection failed: {}", e);
-                                            }
+                                        tracing::info!("Opening OAuth authorization URL: {}", auth_url);
+                                        if let Err(e) = crate::mcp::oauth_flow::open_browser(&auth_url, None).await {
+                                            tracing::error!("Failed to open browser: {}", e);
                                         }
                                     });
-                                }
-                            },
-                            "🔐 Authorize"
+                                },
+                                "🔐 Authorize"
+                            }
                         }
                     }
                 }
@@ -1684,6 +1620,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                                     slug.clone(),
                                                                                     None, // auth_scheme — use default
                                                                                     true, // use_managed_auth
+                                                                                    false, // no_auth unknown here — code-303 fallback self-heals
                                                                                     mcp_context,
                                                                                     settings,
                                                                                     settings_manager_val,
@@ -2056,6 +1993,8 @@ fn McpServerCard(
     add_mcp: EventHandler<FeaturedMcp>,
     trigger_search: Signal<i32>,
     connected_slugs: Signal<std::collections::HashSet<String>>,
+    install_local_dialog: Signal<Option<FeaturedMcp>>,
+    remote_connect_dialog: Signal<Option<FeaturedMcp>>,
 ) -> Element {
     let mcp_clone_for_add = mcp.clone();
     let mcp_manager = use_context::<Signal<McpManager>>();
@@ -2074,7 +2013,7 @@ fn McpServerCard(
 
     // Source-aware install detection:
     // - Composio: check if toolkit slug is in connected_slugs
-    // - Smithery: check if MCP server is running
+    // - Local/stdio servers: check if the MCP server is running
     let install_status = use_resource({
         let mcp = mcp.clone();
         let connected_slugs = connected_slugs;
@@ -2084,8 +2023,7 @@ fn McpServerCard(
             let mcp_manager = mcp_manager;
             let mcp_name = mcp.name.clone();
             let connected = connected_slugs.read().clone();
-            // Per-tool detection: Composio tools have no command
-            let is_composio_tool = mcp.command.is_empty();
+            let is_composio_tool = mcp.source == McpSource::Composio;
 
             async move {
                 if is_composio_tool {
@@ -2100,7 +2038,7 @@ fn McpServerCard(
                     return (is_connected, false); // (installed/connected, has_error)
                 }
 
-                // For Smithery: check MCP server status
+                // For local/stdio servers: check MCP server status
                 let guard = mcp_manager.read();
                 let servers = guard.servers.lock().await;
                 let failed = guard.failed_servers.lock().await;
@@ -2123,7 +2061,7 @@ fn McpServerCard(
     });
 
     // Source-aware status display
-    let is_composio_tool = mcp.command.is_empty();
+    let is_composio_tool = mcp.source == McpSource::Composio;
     let (status_class, _status_text) = match install_status.read().as_ref() {
         Some((true, false)) => (
             "h-2 w-2 rounded-full bg-green-500",
@@ -2158,6 +2096,31 @@ fn McpServerCard(
     };
 
     let show_setup_credentials = resolved_auth == ResolvedAuth::RequiresSetup;
+
+    // Auth-path badge so users can tell no-auth / OAuth / BYOA toolkits apart
+    // before clicking Connect.
+    let auth_badge: Option<(&str, &str)> = if is_composio_tool {
+        match resolved_auth {
+            ResolvedAuth::NoAuth => Some((
+                "No auth needed",
+                "px-2 py-0.5 rounded-full text-[10px] font-medium bg-green-900/60 text-green-300 uppercase tracking-wide",
+            )),
+            ResolvedAuth::Managed => Some((
+                "OAuth",
+                "px-2 py-0.5 rounded-full text-[10px] font-medium bg-input text-fg-muted uppercase tracking-wide",
+            )),
+            ResolvedAuth::Byoa => Some((
+                "Your credentials",
+                "px-2 py-0.5 rounded-full text-[10px] font-medium bg-input text-fg-muted uppercase tracking-wide",
+            )),
+            ResolvedAuth::RequiresSetup => Some((
+                "API key required",
+                "px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-900/60 text-amber-300 uppercase tracking-wide",
+            )),
+        }
+    } else {
+        None
+    };
 
     rsx! {
         div {
@@ -2213,6 +2176,7 @@ fn McpServerCard(
                                             let toolkit_slug = mcp.name.clone();
                                             let auth_scheme = mcp.auth_scheme.clone();
                                             let use_managed_auth = mcp.use_managed_auth;
+                                            let no_auth = mcp.no_auth;
                                             move |_| {
                                                 let toolkit_slug = toolkit_slug.clone();
                                                 let auth_scheme = auth_scheme.clone();
@@ -2237,6 +2201,7 @@ fn McpServerCard(
                                                                     toolkit_slug,
                                                                     auth_scheme,
                                                                     use_managed_auth,
+                                                                    no_auth,
                                                                     mcp_context,
                                                                     settings,
                                                                     settings_manager_val,
@@ -2276,6 +2241,44 @@ fn McpServerCard(
                                     }
                                 }
                             } // end div
+                        } else if mcp.command.is_empty() {
+                            // Glama registry server — actions depend on hosting.
+                            // Servers failing Glama's install gate (no license)
+                            // cannot be installed or connected.
+                            if !mcp.installable {
+                                button {
+                                    class: "px-3 py-1 bg-input rounded text-sm font-medium text-fg-muted cursor-not-allowed",
+                                    disabled: true,
+                                    title: "Glama marks this server as not installable: no license was found in its repository.",
+                                    "Not installable"
+                                }
+                            } else {
+                            div {
+                                class: "flex items-center gap-2",
+                                if matches!(mcp.hosting, Some(GlamaHosting::LocalOnly) | Some(GlamaHosting::Hybrid) | Some(GlamaHosting::Unknown) | None) {
+                                    button {
+                                        class: "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors",
+                                        onclick: {
+                                            let mcp = mcp.clone();
+                                            let mut dialog = install_local_dialog;
+                                            move |_| dialog.set(Some(mcp.clone()))
+                                        },
+                                        "Install"
+                                    }
+                                }
+                                if matches!(mcp.hosting, Some(GlamaHosting::RemoteCapable) | Some(GlamaHosting::Hybrid)) {
+                                    button {
+                                        class: "px-3 py-1 bg-teal-700 hover:bg-teal-600 rounded text-sm font-medium transition-colors",
+                                        onclick: {
+                                            let mcp = mcp.clone();
+                                            let mut dialog = remote_connect_dialog;
+                                            move |_| dialog.set(Some(mcp.clone()))
+                                        },
+                                        "Connect"
+                                    }
+                                }
+                            }
+                            } // end installable gate
                         } else {
                             button {
                                 class: "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors",
@@ -2296,14 +2299,70 @@ fn McpServerCard(
                 class: "flex-grow mt-2",
                 p { class: "text-sm text-fg-muted", "{mcp.description}" }
             }
-            if !mcp.homepage.is_empty() {
+            // Registry metadata badges (Glama hosting/license, Composio auth path)
+            if mcp.hosting.is_some() || mcp.official || mcp.license.is_some() || auth_badge.is_some() {
                 div {
-                    class: "flex justify-end mt-2",
+                    class: "flex items-center gap-2 mt-2 flex-wrap",
+                    if let Some((label, badge_class)) = auth_badge {
+                        span {
+                            class: "{badge_class}",
+                            "{label}"
+                        }
+                    }
+                    if let Some(hosting) = mcp.hosting {
+                        span {
+                            class: "px-2 py-0.5 rounded-full text-[10px] font-medium bg-input text-fg-muted uppercase tracking-wide",
+                            "{hosting.label()}"
+                        }
+                    }
+                    if mcp.official {
+                        span {
+                            class: "px-2 py-0.5 rounded-full text-[10px] font-medium bg-primary-900/60 text-primary-300 uppercase tracking-wide",
+                            "Official"
+                        }
+                    }
+                    if let Some(license) = mcp.license.as_ref() {
+                        span {
+                            class: "text-[10px] text-fg-muted",
+                            "{license}"
+                        }
+                    }
+                    // Glama's install gate: no license → grade F, not installable.
+                    // Links to the registry's scorecard for the full breakdown.
+                    if mcp.source == McpSource::Glama && !mcp.installable {
+                        if let Some(page_url) = mcp.glama_page_url.as_ref() {
+                            a {
+                                class: "px-2 py-0.5 rounded-full text-[10px] font-medium bg-red-900/60 text-red-300 uppercase tracking-wide hover:bg-red-900",
+                                href: "{page_url}/score",
+                                target: "_blank",
+                                title: "No license found — Glama marks this server as not installable. Click for the full scorecard.",
+                                "No license"
+                            }
+                        } else {
+                            span {
+                                class: "px-2 py-0.5 rounded-full text-[10px] font-medium bg-red-900/60 text-red-300 uppercase tracking-wide",
+                                "No license"
+                            }
+                        }
+                    }
+                }
+            }
+            div {
+                class: "flex justify-end items-center gap-3 mt-2",
+                if let Some(page_url) = mcp.glama_page_url.as_ref() {
+                    a {
+                        class: "text-xs text-primary-400 hover:text-primary-300",
+                        href: "{page_url}",
+                        target: "_blank",
+                        "View on Glama"
+                    }
+                }
+                if !mcp.homepage.is_empty() {
                     a {
                         class: "text-sm text-primary-400 hover:text-primary-300",
                         href: "{mcp.homepage}",
                         target: "_blank",
-                        title: if is_composio_tool { "View on Composio" } else { "View on Smithery" },
+                        title: if is_composio_tool { "View on Composio" } else { "View source" },
                         dioxus_free_icons::Icon {
                             icon: dioxus_free_icons::icons::fi_icons::FiExternalLink
                         }
@@ -2319,4 +2378,89 @@ fn get_mcp_config_path() -> PathBuf {
         .unwrap_or_default()
         .join("com.hobbes.app")
         .join("mcp_servers.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::glama_client::{GlamaLicense, GlamaServer};
+
+    #[test]
+    fn glama_license_gates_installability() {
+        // Unlicensed server (spdxLicense: null) — Glama marks these
+        // "cannot be installed", e.g. Trend Radar.
+        let unlicensed = GlamaServer {
+            name: "Trend Radar".to_string(),
+            namespace: "girlmoony".to_string(),
+            slug: "mcp_Trend_Radar".to_string(),
+            spdx_license: None,
+            ..Default::default()
+        };
+        let card: FeaturedMcp = unlicensed.into();
+        assert!(!card.installable);
+        assert!(card.license.is_none());
+
+        let licensed = GlamaServer {
+            name: "Filesystem".to_string(),
+            spdx_license: Some(GlamaLicense {
+                name: "MIT License".to_string(),
+                url: None,
+            }),
+            ..Default::default()
+        };
+        let card: FeaturedMcp = licensed.into();
+        assert!(card.installable);
+        assert_eq!(card.license.as_deref(), Some("MIT License"));
+    }
+
+    #[test]
+    fn composio_cards_are_always_installable() {
+        let listing: ComposioToolkitListing = serde_json::from_value(serde_json::json!({
+            "slug": "hackernews",
+            "name": "Hacker News",
+            "no_auth": true
+        }))
+        .unwrap();
+        let card: FeaturedMcp = listing.into();
+        assert!(card.installable);
+        assert!(card.no_auth);
+    }
+
+    fn glama_card(official: bool, installable: bool, hosting: GlamaHosting) -> FeaturedMcp {
+        FeaturedMcp {
+            source: McpSource::Glama,
+            official,
+            installable,
+            hosting: Some(hosting),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn glama_filter_predicate_matches_defaults() {
+        // Default marketplace view: official + installable required.
+        let good = glama_card(true, true, GlamaHosting::RemoteCapable);
+        assert!(good.passes_glama_filters(None, true, true));
+
+        // Unlicensed (not installable) is excluded by the installable filter.
+        let unlicensed = glama_card(true, false, GlamaHosting::RemoteCapable);
+        assert!(!unlicensed.passes_glama_filters(None, true, true));
+
+        // Community (not official) is excluded by the official filter.
+        let community = glama_card(false, true, GlamaHosting::RemoteCapable);
+        assert!(!community.passes_glama_filters(None, true, true));
+
+        // With both filters off, everything passes.
+        assert!(unlicensed.passes_glama_filters(None, false, false));
+        assert!(community.passes_glama_filters(None, false, false));
+    }
+
+    #[test]
+    fn glama_filter_predicate_respects_hosting() {
+        let remote = glama_card(true, true, GlamaHosting::RemoteCapable);
+        assert!(remote.passes_glama_filters(Some(GlamaHosting::RemoteCapable), false, false));
+        assert!(!remote.passes_glama_filters(Some(GlamaHosting::LocalOnly), false, false));
+        // No hosting filter accepts any hosting kind.
+        assert!(remote.passes_glama_filters(None, false, false));
+    }
 }

@@ -1,6 +1,6 @@
 // OAuth Flow Handler for MCP Servers
 // This module handles OAuth flows for MCPs that require external authorization (e.g., Google Calendar)
-// Follows Smithery SDK patterns for OAuth 2.1 with PKCE
+// OAuth 2.1 with PKCE for remote MCP servers
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::RngCore;
@@ -15,6 +15,9 @@ use tokio::sync::mpsc;
 
 /// Generate a cryptographically random code verifier for PKCE
 /// Returns a 43-128 character URL-safe string
+// Retained for the generic remote-server OAuth flow (unused since the
+// Smithery client was removed; will back a full in-app OAuth exchange).
+#[allow(dead_code)]
 pub fn generate_code_verifier() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -23,6 +26,9 @@ pub fn generate_code_verifier() -> String {
 
 /// Generate a code challenge from a code verifier using SHA256
 /// This is sent to the authorization server
+// Retained for the generic remote-server OAuth flow (unused since the
+// Smithery client was removed; will back a full in-app OAuth exchange).
+#[allow(dead_code)]
 pub fn generate_code_challenge(verifier: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(verifier.as_bytes());
@@ -50,6 +56,9 @@ pub struct OAuthTokens {
 
 /// OAuth client metadata for dynamic registration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// Retained for the generic remote-server OAuth flow (unused since the
+// Smithery client was removed; will back a full in-app OAuth exchange).
+#[allow(dead_code)]
 pub struct OAuthClientMetadata {
     pub client_name: String,
     pub redirect_uris: Vec<String>,
@@ -89,6 +98,9 @@ pub struct OAuthServerMetadata {
 
 /// OAuth client information (after registration)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// Retained for the generic remote-server OAuth flow (unused since the
+// Smithery client was removed; will back a full in-app OAuth exchange).
+#[allow(dead_code)]
 pub struct OAuthClientInfo {
     pub client_id: String,
     #[serde(default)]
@@ -107,6 +119,9 @@ pub struct OAuthProtectedResourceMetadata {
 // ============================================================================
 
 /// Exchange an authorization code for tokens
+// Retained for the generic remote-server OAuth flow (unused since the
+// Smithery client was removed; will back a full in-app OAuth exchange).
+#[allow(dead_code)]
 pub async fn exchange_code_for_tokens(
     token_endpoint: &str,
     code: &str,
@@ -190,6 +205,9 @@ pub async fn refresh_access_token(
 // ============================================================================
 
 /// Discover OAuth server metadata from well-known endpoint
+// Retained for the generic remote-server OAuth flow (unused since the
+// Smithery client was removed; will back a full in-app OAuth exchange).
+#[allow(dead_code)]
 pub async fn discover_oauth_metadata(
     server_url: &str,
     api_token: Option<&str>,
@@ -281,7 +299,7 @@ pub async fn discover_oauth_metadata(
     }
 
     if !found_metadata {
-        // Fallback: Try the ROOT of the server (origin) - strictly for Smithery-style hosts
+        // Fallback: Try the ROOT of the server (origin) for hosts that serve metadata there
         if let Ok(parsed) = url::Url::parse(server_url) {
             let origin_url = parsed.origin().ascii_serialization();
             let pr_root_url = format!(
@@ -360,7 +378,7 @@ pub async fn discover_oauth_metadata(
             .map_err(|e| format!("Failed to parse OIDC metadata: {}", e));
     }
 
-    // Fallback: If discovery fails, assume standard Smithery/OAuth paths based on the issuer
+    // Fallback: If discovery fails, assume standard OAuth paths based on the issuer
     tracing::warn!(
         "Metadata discovery failed. Falling back to constructed endpoints for: {}",
         authorization_server_url
@@ -374,6 +392,9 @@ pub async fn discover_oauth_metadata(
 }
 
 /// Build authorization URL with PKCE
+// Retained for the generic remote-server OAuth flow (unused since the
+// Smithery client was removed; will back a full in-app OAuth exchange).
+#[allow(dead_code)]
 pub fn build_authorization_url(
     authorization_endpoint: &str,
     client_id: &str,
@@ -403,6 +424,9 @@ pub fn build_authorization_url(
 
 /// Result of an OAuth flow
 #[derive(Debug, Clone)]
+// Retained for the generic remote-server OAuth flow (unused since the
+// Smithery client was removed; will back a full in-app OAuth exchange).
+#[allow(dead_code)]
 pub struct OAuthResult {
     pub success: bool,
     pub auth_code: Option<String>,

@@ -366,3 +366,42 @@ against the official pricing pages.
 
 **If broken**: the in-app cost counter and `usage_log` totals quietly diverge
 from the real bill.
+
+---
+
+### 14. Registry MCP Servers Are Hostile Until Proven Otherwise
+
+> **Pattern ID**: P-014  
+> **Anti-Pattern**: Launching a registry install like a manual server
+
+Servers installed from the public Glama registry (`source: "glama"`) are
+unvetted third-party code. Four defenses apply at launch, all in
+`src/mcp/sandbox.rs` and `src/mcp/manager.rs`:
+
+1. **OS sandbox by default** — `wrap_command()` rewrites the launch to
+   `sandbox-exec` (macOS), `bwrap` (Linux) or the `hobbes-sandbox.exe`
+   AppContainer broker (Windows). The default is gated on
+   `sandbox_available()`; an explicit `sandbox: true` with no mechanism is a
+   **launch error** recorded in `failed_servers`, never a silent unsandboxed
+   run. Every `wrap_command` error path must record to `failed_servers` so the
+   server shows as failed in the UI instead of vanishing.
+2. **`env_clear()` for registry installs** (`apply_env_policy`) — Hobbes'
+   process env can contain dotenv-loaded API keys; registry children get only
+   their configured env + critical vars. Manual servers keep inheritance for
+   compatibility.
+3. **Secrets in the keychain, not JSON** — install-dialog env vars with
+   credential-looking names (`is_secret_env_name`) are stored under
+   `mcp_env_<server>__<VAR>` and listed in the config's `secret_env`;
+   `resolved_server_env()` hydrates them at launch and the remove handler
+   deletes them.
+4. **Manifest-derived package names are validated** against the npm/PEP 508
+   grammars (`glama_client.rs`) — a repo-controlled "name" like
+   `--registry=https://evil` is flag injection into npx/uvx.
+
+**Rules**:
+- New launch paths MUST go through `wrap_command`, `apply_env_policy`, and
+  `resolved_server_env` — there are multiple launch sites (initial, retry,
+  reconnect); keep them uniform.
+- Never write a credential-looking value into `mcp_servers.json`.
+- Seatbelt path escaping (`sb_escape`) strips control characters — profile
+  strings cannot represent them and raw newlines are rule injection.

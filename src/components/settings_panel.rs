@@ -308,7 +308,6 @@ pub fn SettingsPanel() -> Element {
                                         {
                                             let mut ls = local_settings.write();
                                             ls.gemini_config.api_key = None;
-                                            ls.smithery_api_key = None;
                                             for profile in ls.composio_profiles.iter_mut() {
                                                 profile.api_key = None;
                                             }
@@ -339,8 +338,7 @@ pub fn SettingsPanel() -> Element {
                         *global_settings = local_settings.read().clone();
 
                         // 2. Prepare data for background saving (Clone cheap stuff or take ownership)
-                        let mut settings_to_save = global_settings.clone();
-                        let smithery_key_opt = settings_to_save.smithery_api_key.clone();
+                        let settings_to_save = global_settings.clone();
                         let gemini_key_opt = settings_to_save.gemini_config.api_key.clone();
                         let claude_key_opt = settings_to_save.claude_config.api_key.clone();
                         let oai_key_opt = settings_to_save.openai_compat_config.api_key.clone();
@@ -348,11 +346,6 @@ pub fn SettingsPanel() -> Element {
                         let composio_keys: Vec<(String, String)> = settings_to_save.composio_profiles.iter()
                             .filter_map(|p| p.api_key.as_ref().map(|k| (p.id.clone(), k.clone())))
                             .collect();
-
-                        let smithery_key_to_save = smithery_key_opt.map(|k| k.trim().to_string());
-                        if let Some(ref trimmed) = smithery_key_to_save {
-                             settings_to_save.smithery_api_key = Some(trimmed.clone());
-                        }
 
                         // Critical: Update the global settings signal so the app (menus, hotkeys) reacts immediately
                         *global_settings = settings_to_save.clone();
@@ -362,7 +355,6 @@ pub fn SettingsPanel() -> Element {
                         if let Some(k) = gemini_key_opt { secret_updates.push(("gemini_api_key".to_string(), k)); }
                         if let Some(k) = claude_key_opt { secret_updates.push(("claude_api_key".to_string(), k)); }
                         if let Some(k) = oai_key_opt { secret_updates.push(("openai_compat_api_key".to_string(), k)); }
-                        if let Some(k) = smithery_key_to_save { secret_updates.push(("smithery_api_key".to_string(), k)); }
                         tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(id, _)| id).collect::<Vec<_>>());
 
                         spawn(async move {
@@ -2163,68 +2155,38 @@ pub fn SettingsPanel() -> Element {
                         class: "p-4",
                         div {
                             class: "mb-4",
-                            label { class: "block text-sm font-medium text-fg-muted mb-2", "Preferred MCP Source" }
+                            label { class: "block text-sm font-medium text-fg-muted mb-2", "MCP Registries" }
                             div {
-                                class: "flex space-x-4",
-                                button {
-                                    class: if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
-                                        "flex-1 px-4 py-2 rounded-md bg-btn-primary text-fg font-medium shadow-sm ring-2 ring-primary-400"
-                                    } else {
-                                        "flex-1 px-4 py-2 rounded-md bg-input text-fg-muted font-medium hover:bg-input hover:text-fg transition-colors"
-                                    },
-                                    onclick: move |_| {
-                                        local_settings.write().preferred_mcp_source = crate::settings::McpSource::Composio;
-                                    },
-                                    "Composio"
-                                }
-                                button {
-                                    class: if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
-                                        "flex-1 px-4 py-2 rounded-md bg-red-900/50 text-red-200 font-medium shadow-sm ring-2 ring-red-700 border border-red-700"
-                                    } else {
-                                        "flex-1 px-4 py-2 rounded-md bg-input text-fg-muted font-medium hover:bg-input hover:text-fg transition-colors"
-                                    },
-                                    onclick: move |_| {
-                                        local_settings.write().preferred_mcp_source = crate::settings::McpSource::Smithery;
-                                    },
-                                    "Smithery.ai (Deprecated)"
-                                }
-                            }
-
-                            if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
+                                class: "space-y-2",
+                                // Glama — always enabled, nothing to configure
                                 div {
-                                    class: "mt-3 p-3 bg-red-900/30 border border-red-700 rounded-lg",
-                                    p {
-                                        class: "text-red-200 text-sm flex items-center gap-2",
-                                        Icon { width: 16, height: 16, icon: fi_icons::FiAlertTriangle }
-                                        "This integration is deprecated. We recommend using Composio directly."
+                                    class: "flex items-center justify-between px-4 py-3 rounded-md bg-input border border-subtle",
+                                    div {
+                                        span { class: "font-medium text-fg", "Glama" }
+                                        p { class: "text-xs text-fg-muted mt-0.5", "Open MCP server registry — no API key required" }
+                                    }
+                                    span { class: "text-xs font-medium text-green-400", "Enabled" }
+                                }
+                                // Composio — enabled once a profile is configured
+                                div {
+                                    class: "flex items-center justify-between px-4 py-3 rounded-md bg-input border border-subtle",
+                                    div {
+                                        span { class: "font-medium text-fg", "Composio" }
+                                        p { class: "text-xs text-fg-muted mt-0.5", "Shown in the store when a profile below is configured" }
+                                    }
+                                    if local_settings.read().composio_profiles.iter().any(|p| p.is_fully_configured()) {
+                                        span { class: "text-xs font-medium text-green-400", "Enabled" }
+                                    } else {
+                                        span { class: "text-xs font-medium text-fg-muted", "Not configured" }
                                     }
                                 }
                             }
-                                p {
+                            p {
                                 class: "text-xs text-fg-muted mt-2",
-                                "Choose which registry to use when installing new MCP servers. Smithery uses a hosted proxy (requires API key), while Composio runs locally."
+                                "The store search can switch between any enabled registry. Glama servers install locally or connect to remote endpoints; Composio proxies tools through its managed backend."
                             }
 
-                            // Smithery API Key - shown when Smithery is selected
-                            if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Smithery {
-                                div {
-                                    class: "mt-4 pt-4 border-t border-subtle",
-                                    label { class: "block text-sm font-medium text-fg-muted mb-1", "Smithery API Key" }
-                                    input {
-                                        class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                        r#type: "password",
-                                        placeholder: "Enter your Smithery.ai API key",
-                                        value: "{local_settings.read().smithery_api_key.as_deref().unwrap_or(\"\")}",
-                                        oninput: move |event| local_settings.write().smithery_api_key = Some(event.value().trim().to_string())
-                                    }
-                                    p {
-                                        class: "text-xs text-fg-muted mt-1",
-                                        "Required for Smithery.ai marketplace access"
-                                    }
-                                }
-                            }
-
-                            if local_settings.read().preferred_mcp_source == crate::settings::McpSource::Composio {
+                            div {
                                 div {
                                     class: "mt-4 pt-4 border-t border-subtle",
                                     // Instructions
@@ -2240,20 +2202,57 @@ pub fn SettingsPanel() -> Element {
                                             div {
                                                 class: "p-4 border-t border-subtle/30",
                                                 ol {
-                                                    class: "list-decimal list-inside text-sm text-fg-muted space-y-1.5",
+                                                    class: "list-decimal list-inside text-sm text-fg-muted space-y-2",
                                                     li {
-                                                        "Get your API key from "
-                                                        a { class: "text-primary-400 hover:text-primary-300 underline", href: "https://composio.dev/settings", target: "_blank", "composio.dev/settings" }
+                                                        "Create a free account at "
+                                                        a { class: "text-primary-400 hover:text-primary-300 underline", href: "https://dashboard.composio.dev", target: "_blank", "dashboard.composio.dev" }
+                                                        ". Composio organizes everything under a "
+                                                        span { class: "text-fg", "Project" }
+                                                        " — you'll start in a default one."
                                                     }
-                                                    li { "Click \"+ Add Profile\" and paste your API key" }
-                                                    li { "Use the MCP Marketplace to connect your first tool (Gmail, GitHub, etc.)" }
-                                                    li { "Your Server URL will be automatically created - you're done!" }
+                                                    li {
+                                                        "In the dashboard, go to "
+                                                        span { class: "text-fg", "Settings → Project Settings → API Keys" }
+                                                        " and copy your "
+                                                        span { class: "text-fg", "Project API key" }
+                                                        "."
+                                                    }
+                                                    li {
+                                                        "Click \"+ Add Profile\" below and paste the key into the profile's "
+                                                        span { class: "text-fg", "API Key" }
+                                                        " field."
+                                                    }
+                                                    li {
+                                                        "Open the MCP Store, pick a toolkit (Gmail, GitHub, Slack…) and click "
+                                                        span { class: "text-fg", "Connect" }
+                                                        ". Hobbes creates the auth config, MCP server and User ID for you, then opens Composio's login in your browser to link the account."
+                                                    }
+                                                    li {
+                                                        "Approve the OAuth screen. Most toolkits use Composio's "
+                                                        span { class: "text-fg", "managed authentication" }
+                                                        " — nothing else to configure. A few need your "
+                                                        span { class: "text-fg", "own OAuth credentials" }
+                                                        "; for those, Hobbes prompts you to add them under Credentials."
+                                                    }
+                                                    li {
+                                                        "Once the toolkit shows "
+                                                        span { class: "text-fg", "Connected" }
+                                                        ", it's ready — the Server URL is created automatically."
+                                                    }
+                                                }
+                                                div {
+                                                    class: "mt-3 p-2 bg-app/60 rounded border border-subtle/40",
+                                                    p {
+                                                        class: "text-xs text-fg-muted",
+                                                        span { class: "text-fg font-medium", "Note: " }
+                                                        "API keys are project-scoped. Tools you connect live in the project the key belongs to — if you have multiple projects, copy the key from the one you want to use."
+                                                    }
                                                 }
                                                 div {
                                                     class: "mt-3 pt-3 border-t border-subtle/30",
                                                     a {
                                                         class: "text-xs text-primary-400 hover:text-primary-300 flex items-center gap-1",
-                                                        href: "https://docs.composio.dev/docs/welcome",
+                                                        href: "https://docs.composio.dev/docs/quickstart",
                                                         target: "_blank",
                                                         Icon { width: 12, height: 12, icon: fi_icons::FiExternalLink }
                                                         "View Documentation"
@@ -2451,7 +2450,7 @@ pub fn SettingsPanel() -> Element {
                                                     input {
                                                         r#type: "password",
                                                         class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm",
-                                                        placeholder: "Enter your Composio API key from composio.dev/settings",
+                                                        placeholder: "Paste your Project API key from dashboard.composio.dev/settings",
                                                         value: "{local_settings.read().get_active_profile().and_then(|p| p.api_key.clone()).unwrap_or_default()}",
                                                         oninput: {
                                                             let id = active_id.clone();
@@ -2467,8 +2466,9 @@ pub fn SettingsPanel() -> Element {
                                                     }
                                                     p {
                                                         class: "text-xs text-fg-muted mt-1",
-                                                        "Get your API key from "
-                                                        a { class: "text-primary-400 hover:text-primary-300 underline", href: "https://composio.dev/settings", target: "_blank", "composio.dev/settings" }
+                                                        "Project API key from "
+                                                        a { class: "text-primary-400 hover:text-primary-300 underline", href: "https://dashboard.composio.dev", target: "_blank", "dashboard.composio.dev" }
+                                                        " → Settings → Project Settings"
                                                     }
                                                 }
 
@@ -2617,6 +2617,9 @@ pub fn SettingsPanel() -> Element {
                             }
                         }
                     }
+
+                // Installed (non-Composio) servers + advanced JSON editor
+                crate::components::installed_mcps::InstalledMcps {}
 
                    }, // End Mcp
                    crate::settings::SettingsTab::Behavior => rsx! {
@@ -3492,7 +3495,6 @@ pub fn SettingsPanel() -> Element {
                                         // Clear API keys from local settings
                                         let mut ls = local_settings.write();
                                         ls.gemini_config.api_key = None;
-                                        ls.smithery_api_key = None;
                                         for profile in ls.composio_profiles.iter_mut() {
                                             profile.api_key = None;
                                         }
@@ -4135,8 +4137,7 @@ pub fn SettingsPanel() -> Element {
                             *global_settings = local_settings.read().clone();
 
                             // 2. Prepare data for background saving
-                            let mut settings_to_save = global_settings.clone();
-                            let smithery_key_opt = settings_to_save.smithery_api_key.clone();
+                            let settings_to_save = global_settings.clone();
                             let gemini_key_opt = settings_to_save.gemini_config.api_key.clone();
                             let claude_key_opt = settings_to_save.claude_config.api_key.clone();
                             let oai_key_opt = settings_to_save.openai_compat_config.api_key.clone();
@@ -4144,17 +4145,11 @@ pub fn SettingsPanel() -> Element {
                                 .filter_map(|p| p.api_key.as_ref().map(|k| (p.id.clone(), k.clone())))
                                 .collect();
 
-                            let smithery_key_to_save = smithery_key_opt.map(|k| k.trim().to_string());
-                            if let Some(ref trimmed) = smithery_key_to_save {
-                                 settings_to_save.smithery_api_key = Some(trimmed.clone());
-                            }
-
                             let mut secret_updates = Vec::new();
                             if let Some(k) = gemini_key_opt { secret_updates.push(("gemini_api_key".to_string(), k)); }
                             if let Some(k) = claude_key_opt { secret_updates.push(("claude_api_key".to_string(), k)); }
                             if let Some(k) = oai_key_opt { secret_updates.push(("openai_compat_api_key".to_string(), k)); }
-                            if let Some(k) = smithery_key_to_save { secret_updates.push(("smithery_api_key".to_string(), k)); }
-                            tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(n, _)| n).collect::<Vec<_>>());
+                                tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(n, _)| n).collect::<Vec<_>>());
 
                             // Capture the storage mode preference, overriding for Pro builds
                             let effective_mode = if crate::settings::is_sandboxed() {

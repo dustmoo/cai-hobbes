@@ -419,7 +419,6 @@ fn app() -> Element {
 
                     // Phase 1: Read all secrets (immutable borrow) and collect migration tasks
                     let gemini_key;
-                    let smithery_key;
                     let composio_legacy_key;
                     // (profile_index, api_key, needs_migration, profile_id)
                     let mut profile_keys: Vec<(usize, String, bool, String)> = Vec::new();
@@ -427,7 +426,6 @@ fn app() -> Element {
                     {
                         let sm_read = secret_manager.read();
                         gemini_key = sm_read.get("gemini_api_key").cloned();
-                        smithery_key = sm_read.get("smithery_api_key").cloned();
                         composio_legacy_key = sm_read.get("composio_api_key").cloned();
 
                         let current_settings = settings.read();
@@ -468,9 +466,6 @@ fn app() -> Element {
                         if let Some(oai_key) = sm_read.get("openai_compat_api_key").cloned() {
                             current_settings.openai_compat_config.api_key = Some(oai_key);
                         }
-                    }
-                    if let Some(smithery_api_key) = smithery_key {
-                        current_settings.smithery_api_key = Some(smithery_api_key);
                     }
                     if let Some(composio_api_key) = composio_legacy_key {
                         current_settings.composio_api_key = Some(composio_api_key);
@@ -567,7 +562,6 @@ fn app() -> Element {
 
                     // Phase 1: Read all secrets (immutable borrow) and collect migration tasks
                     let gemini_key;
-                    let smithery_key;
                     let composio_legacy_key;
                     // (profile_index, api_key, needs_migration, profile_id)
                     let mut profile_keys: Vec<(usize, String, bool, String)> = Vec::new();
@@ -575,7 +569,6 @@ fn app() -> Element {
                     {
                         let sm_read = secret_manager.read();
                         gemini_key = sm_read.get("gemini_api_key").cloned();
-                        smithery_key = sm_read.get("smithery_api_key").cloned();
                         composio_legacy_key = sm_read.get("composio_api_key").cloned();
 
                         let current_settings = settings.read();
@@ -621,9 +614,6 @@ fn app() -> Element {
                         }
                     } else {
                         tracing::debug!("OpenAI-compat API key already present in settings, skipping keychain hydration");
-                    }
-                    if let Some(smithery_api_key) = smithery_key {
-                        current_settings.smithery_api_key = Some(smithery_api_key);
                     }
                     if let Some(composio_api_key) = composio_legacy_key {
                         current_settings.composio_api_key = Some(composio_api_key);
@@ -1754,6 +1744,7 @@ fn app() -> Element {
                 // SummarizationScheduler component removed; hook called above.
                 if *is_app_initialized.read() {
                     StreamManager {
+                    components::smithery_migration_dialog::SmitheryMigrationDialog {}
                     ConfirmDeleteModal {
                         is_visible: show_confirm_modal,
                         title: "Delete Session".to_string(),

@@ -4,8 +4,9 @@ pub mod composio_client;
 #[cfg(test)]
 mod composio_client_test;
 pub mod core_client;
+pub mod glama_client;
 pub mod manager;
 pub mod oauth_flow;
-pub mod smithery_client;
+pub mod sandbox;
 pub mod tool_selection;
 pub mod image_client;
