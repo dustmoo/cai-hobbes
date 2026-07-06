@@ -276,16 +276,18 @@ mod win {
     /// Resolve a command to its full path the way cmd.exe would: an explicit
     /// path is used as-is, otherwise each PATH directory is searched for the
     /// name plus each PATHEXT extension (and the bare name). Returns the
-    /// containing directory so it can be granted to the container — cmd's own
-    /// PATH search inside the AppContainer silently skips directories the
-    /// container can't read, which reads as "'x' is not recognized".
-    fn resolve_command_dir(command: &str) -> Option<String> {
-        let as_path = std::path::Path::new(command);
+    /// resolved absolute file path.
+    ///
+    /// We pass this absolute path to cmd rather than the bare name because
+    /// cmd's own PATH search *inside* the AppContainer is unreliable —
+    /// directories the container can't enumerate are silently skipped, which
+    /// reads as "'x' is not recognized" even when the tool is on the broker's
+    /// PATH. A `.cmd` shim (npx/uvx) still finds its sibling `node.exe`/`uv.exe`
+    /// via `%~dp0`, so one absolute path chains the whole tool.
+    fn resolve_command_path(command: &str) -> Option<std::path::PathBuf> {
         if command.contains(['\\', '/', ':']) {
-            return as_path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| p.to_string_lossy().to_string());
+            let p = std::path::PathBuf::from(command);
+            return p.is_file().then_some(p);
         }
         let exts: Vec<String> = std::env::var("PATHEXT")
             .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
@@ -295,15 +297,31 @@ mod win {
         let path = std::env::var_os("PATH")?;
         for dir in std::env::split_paths(&path) {
             if dir.join(command).is_file() {
-                return Some(dir.to_string_lossy().to_string());
+                return Some(dir.join(command));
             }
             for ext in &exts {
-                if dir.join(format!("{}{}", command, ext)).is_file() {
-                    return Some(dir.to_string_lossy().to_string());
+                let candidate = dir.join(format!("{}{}", command, ext));
+                if candidate.is_file() {
+                    return Some(candidate);
                 }
             }
         }
         None
+    }
+
+    /// System dirs the AppContainer can already read/execute via the default
+    /// ALL APPLICATION PACKAGES ACE — granting them (a) is redundant and (b)
+    /// fails without elevation, so skip and stay quiet.
+    fn is_preauthorized_dir(dir: &str) -> bool {
+        let lower = dir.to_ascii_lowercase();
+        for var in ["ProgramFiles", "ProgramFiles(x86)", "SystemRoot", "ProgramW6432"] {
+            if let Ok(root) = std::env::var(var) {
+                if !root.is_empty() && lower.starts_with(&root.to_ascii_lowercase()) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn make_inheritable(handle: HANDLE) {
@@ -313,7 +331,15 @@ mod win {
     }
 
     pub fn run() -> Result<i32, String> {
-        let opts = parse_args()?;
+        let mut opts = parse_args()?;
+
+        // Resolve the tool to an absolute path in the broker (see
+        // resolve_command_path) and run that, bypassing cmd's in-container
+        // PATH search. Fall back to the bare name if resolution fails.
+        let resolved_cmd = opts.command.first().and_then(|c| resolve_command_path(c));
+        if let Some(full) = &resolved_cmd {
+            opts.command[0] = full.to_string_lossy().to_string();
+        }
 
         let name = container_name(&opts.name);
         let sid = container_sid(&name)?;
@@ -330,12 +356,18 @@ mod win {
                 grant_access(dir, sid, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0);
             }
         }
-        // The launched tool's own directory must be readable/executable, or
-        // cmd's PATH search inside the container can't find it. For npx/uvx
-        // this is the Node/uv install dir (which also holds node.exe/uv.exe
-        // that the .cmd shim re-invokes from the same directory).
-        if let Some(cmd_dir) = opts.command.first().and_then(|c| resolve_command_dir(c)) {
-            grant_access(&cmd_dir, sid, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0);
+        // The launched tool's own directory must be readable/executable by the
+        // container. Program Files / Windows already grant that to app packages
+        // by default (and aren't grantable without elevation), so only add an
+        // ACE for tools installed elsewhere (e.g. a user-local Node).
+        if let Some(cmd_dir) = resolved_cmd
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_string_lossy().to_string())
+        {
+            if !is_preauthorized_dir(&cmd_dir) {
+                grant_access(&cmd_dir, sid, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0);
+            }
         }
         for dir in &opts.allow {
             grant_access(dir, sid, FILE_ALL_ACCESS.0);
