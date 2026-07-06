@@ -273,6 +273,39 @@ mod win {
         (rw, ro)
     }
 
+    /// Resolve a command to its full path the way cmd.exe would: an explicit
+    /// path is used as-is, otherwise each PATH directory is searched for the
+    /// name plus each PATHEXT extension (and the bare name). Returns the
+    /// containing directory so it can be granted to the container — cmd's own
+    /// PATH search inside the AppContainer silently skips directories the
+    /// container can't read, which reads as "'x' is not recognized".
+    fn resolve_command_dir(command: &str) -> Option<String> {
+        let as_path = std::path::Path::new(command);
+        if command.contains(['\\', '/', ':']) {
+            return as_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_string_lossy().to_string());
+        }
+        let exts: Vec<String> = std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .map(|e| e.to_string())
+            .collect();
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            if dir.join(command).is_file() {
+                return Some(dir.to_string_lossy().to_string());
+            }
+            for ext in &exts {
+                if dir.join(format!("{}{}", command, ext)).is_file() {
+                    return Some(dir.to_string_lossy().to_string());
+                }
+            }
+        }
+        None
+    }
+
     fn make_inheritable(handle: HANDLE) {
         unsafe {
             let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(HANDLE_FLAG_INHERIT.0));
@@ -296,6 +329,13 @@ mod win {
             if std::path::Path::new(dir).exists() {
                 grant_access(dir, sid, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0);
             }
+        }
+        // The launched tool's own directory must be readable/executable, or
+        // cmd's PATH search inside the container can't find it. For npx/uvx
+        // this is the Node/uv install dir (which also holds node.exe/uv.exe
+        // that the .cmd shim re-invokes from the same directory).
+        if let Some(cmd_dir) = opts.command.first().and_then(|c| resolve_command_dir(c)) {
+            grant_access(&cmd_dir, sid, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0);
         }
         for dir in &opts.allow {
             grant_access(dir, sid, FILE_ALL_ACCESS.0);
