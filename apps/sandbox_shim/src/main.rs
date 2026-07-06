@@ -379,6 +379,16 @@ mod win {
             siex.StartupInfo.hStdError = stderr;
             siex.lpAttributeList = attr_list;
 
+            // The child must start in a directory the container can access —
+            // an inherited cwd under the user profile (Hobbes sets $HOME) is
+            // denied to the container SID and makes cmd.exe fail with
+            // "The current directory is invalid." Use the rw-granted temp dir.
+            let workdir = std::env::var("LOCALAPPDATA")
+                .map(|l| format!("{}\\Temp", l))
+                .or_else(|_| std::env::var("SystemRoot"))
+                .unwrap_or_else(|_| "C:\\Windows".to_string());
+            let workdir_w = wide(&workdir);
+
             let mut pi = PROCESS_INFORMATION::default();
             let create_result = CreateProcessW(
                 PCWSTR::null(),
@@ -388,7 +398,7 @@ mod win {
                 true,
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
                 None,
-                PCWSTR::null(),
+                PCWSTR(workdir_w.as_ptr()),
                 &siex.StartupInfo,
                 &mut pi,
             );
