@@ -428,6 +428,22 @@ mod win {
     fn provision_toolchain(command: &str, state_root: &str) -> Option<String> {
         let src_file = resolve_command_path(command)?;
         let src_dir = src_file.parent()?;
+
+        // Never copy a dir that already carries the gate — it's already
+        // reachable, and copying it is at best wasteful and at worst
+        // catastrophic. Everything under %SystemRoot% (System32/SysWOW64, ~GBs)
+        // inherits ALL APPLICATION PACKAGES, so a bare `cmd`/`curl`/`whoami`
+        // resolves there and needs no copy: the outer cmd wrapper already runs
+        // from System32 and finds sibling system tools on the default PATH. Only
+        // tools in non-system dirs whose installer stripped the gate (e.g.
+        // `C:\Program Files\nodejs`) must be provisioned.
+        if let Ok(win) = std::env::var("SystemRoot") {
+            let src_lower = src_dir.to_string_lossy().to_ascii_lowercase();
+            if !win.is_empty() && src_lower.starts_with(&win.to_ascii_lowercase()) {
+                return None;
+            }
+        }
+
         let dir_name = src_dir.file_name()?.to_string_lossy().to_string();
         let dst = format!("{}\\toolchain\\{}", state_root, dir_name);
         let dst_path = std::path::PathBuf::from(&dst);
