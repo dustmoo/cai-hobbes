@@ -994,22 +994,49 @@ impl McpManager {
 
     /// Construct a sane PATH for child processes, including common dev directories
     fn get_sane_path() -> String {
-        let mut paths = vec![
-            "/usr/local/bin".to_string(),
-            "/opt/homebrew/bin".to_string(),
-            "/usr/bin".to_string(),
-            "/bin".to_string(),
-            "/usr/sbin".to_string(),
-            "/sbin".to_string(),
-        ];
-
-        // Add cargo bin and local bin if they exist
-        if let Some(home) = dirs::home_dir() {
-            paths.push(home.join(".cargo/bin").to_string_lossy().to_string());
-            paths.push(home.join(".local/bin").to_string_lossy().to_string());
+        // Windows: the desktop app inherits a full PATH, and the Unix dirs
+        // below are meaningless here. Return the essential system dirs (as a
+        // prefix; the real PATH is appended by `join_paths`). Never emit the
+        // Unix ':' separator — it corrupts drive letters like `C:\`.
+        #[cfg(windows)]
+        {
+            let sysroot =
+                std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+            return format!("{0}\\System32;{0}", sysroot);
         }
 
-        paths.join(":")
+        #[cfg(not(windows))]
+        {
+            let mut paths = vec![
+                "/usr/local/bin".to_string(),
+                "/opt/homebrew/bin".to_string(),
+                "/usr/bin".to_string(),
+                "/bin".to_string(),
+                "/usr/sbin".to_string(),
+                "/sbin".to_string(),
+            ];
+
+            // Add cargo bin and local bin if they exist
+            if let Some(home) = dirs::home_dir() {
+                paths.push(home.join(".cargo/bin").to_string_lossy().to_string());
+                paths.push(home.join(".local/bin").to_string_lossy().to_string());
+            }
+
+            paths.join(":")
+        }
+    }
+
+    /// Join a PATH prefix with the inherited PATH using the platform separator
+    /// (`;` on Windows, `:` elsewhere). Skips a separator when either side is
+    /// empty. Replaces the old hardcoded `format!("{}:{}", …)`, which produced a
+    /// PATH that Windows can't parse (drive-letter colons collide with `:`).
+    fn join_paths(prefix: &str, rest: &str) -> String {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        match (prefix.is_empty(), rest.is_empty()) {
+            (true, _) => rest.to_string(),
+            (_, true) => prefix.to_string(),
+            _ => format!("{}{}{}", prefix, sep, rest),
+        }
     }
 
     /// Get critical environment variables needed for child processes.
@@ -1084,6 +1111,32 @@ impl McpManager {
     fn apply_env_policy(cmd: &mut Command, config: &McpServerConfig) {
         if config.is_registry_install() {
             cmd.env_clear();
+            // On Windows a fully-cleared env breaks cmd.exe, node, and the
+            // AppContainer shim (they need SystemRoot, ComSpec, PATHEXT, …).
+            // Re-add a fixed allowlist of non-secret system vars from the parent
+            // env — never dotenv-loaded secrets, so the hardening intent holds.
+            // (macOS/Linux: no such essentials, so a bare env is fine as before.)
+            #[cfg(windows)]
+            for key in [
+                "SystemRoot",
+                "windir",
+                "ComSpec",
+                "PATHEXT",
+                "SystemDrive",
+                "NUMBER_OF_PROCESSORS",
+                "PROCESSOR_ARCHITECTURE",
+                "PROCESSOR_IDENTIFIER",
+                "ProgramData",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramW6432",
+                "CommonProgramFiles",
+                "CommonProgramFiles(x86)",
+            ] {
+                if let Ok(val) = std::env::var(key) {
+                    cmd.env(key, val);
+                }
+            }
         }
     }
 
@@ -1431,7 +1484,7 @@ impl McpManager {
                             let final_path = if current_path.is_empty() {
                                 sane_path
                             } else {
-                                format!("{}:{}", sane_path, current_path)
+                                Self::join_paths(&sane_path, &current_path)
                             };
                             envs.insert("PATH".to_string(), final_path);
 
@@ -1615,7 +1668,7 @@ impl McpManager {
                     let final_path = if current_path.is_empty() {
                         sane_path
                     } else {
-                        format!("{}:{}", sane_path, current_path)
+                        Self::join_paths(&sane_path, &current_path)
                     };
                     envs.insert("PATH".to_string(), final_path);
 
@@ -4036,7 +4089,7 @@ impl McpManager {
                         let final_path = if current_path.is_empty() {
                             sane_path
                         } else {
-                            format!("{}:{}", sane_path, current_path)
+                            Self::join_paths(&sane_path, &current_path)
                         };
                         envs.insert("PATH".to_string(), final_path);
                         Self::apply_env_policy(&mut cmd, &server_config_clone_for_spawn);
@@ -4197,7 +4250,7 @@ impl McpManager {
                 let final_path = if current_path.is_empty() {
                     sane_path
                 } else {
-                    format!("{}:{}", sane_path, current_path)
+                    Self::join_paths(&sane_path, &current_path)
                 };
                 envs.insert("PATH".to_string(), final_path);
 
@@ -4400,7 +4453,7 @@ impl McpManager {
         let final_path = if current_path.is_empty() {
             sane_path
         } else {
-            format!("{}:{}", sane_path, current_path)
+            Self::join_paths(&sane_path, &current_path)
         };
         envs.insert("PATH".to_string(), final_path);
 
@@ -4553,5 +4606,127 @@ impl McpManager {
                 )
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod win_sandbox_e2e {
+    //! End-to-end validation that the REAL app launch path — `wrap_command` +
+    //! the child environment + the rmcp `TokioChildProcess` transport — can run
+    //! a sandboxed npx MCP server and call its tools on Windows. This is the
+    //! Task 1 gate: it exercises the same code a Glama registry install uses, so
+    //! it catches env-plumbing bugs the shim CLI can't (the shim works from a
+    //! normal console but the app hands it a different environment).
+    //!
+    //! Ignored by default: needs Windows + node/npx + network, spawns a real
+    //! AppContainer, and downloads a package. Run manually:
+    //!
+    //! ```text
+    //! cargo build -p hobbes_sandbox
+    //! cargo test --bin Hobbes -- --ignored win_sandbox_e2e
+    //! ```
+    use super::*;
+
+    /// `sandbox::shim_path()` looks for hobbes-sandbox.exe next to the running
+    /// exe. Under `cargo test` that's the test binary in target/debug/deps, so
+    /// copy the shim there from target/debug.
+    fn ensure_shim_beside_test_exe() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let deps = exe.parent().expect("deps dir");
+        let dst = deps.join("hobbes-sandbox.exe");
+        if dst.exists() {
+            return;
+        }
+        let src = deps
+            .parent()
+            .expect("debug dir")
+            .join("hobbes-sandbox.exe");
+        assert!(
+            src.exists(),
+            "hobbes-sandbox.exe not found at {src:?}; run `cargo build -p hobbes_sandbox` first"
+        );
+        std::fs::copy(&src, &dst).expect("copy shim beside test exe");
+    }
+
+    /// Rebuild the child `Command` exactly as `launch_servers`/reconnect do, so
+    /// this drives the real env plumbing (get_sane_path, join_paths,
+    /// apply_env_policy) end to end.
+    fn build_sandboxed_command(config: &McpServerConfig) -> Command {
+        let command_base = config.command.clone().unwrap();
+        let base_args = config.args.clone().unwrap_or_default();
+        let (final_command, final_args) =
+            crate::mcp::sandbox::wrap_command(config, command_base, base_args)
+                .expect("wrap_command");
+        let mut cmd = Command::new(&final_command);
+        for a in &final_args {
+            cmd.arg(a);
+        }
+        let mut envs = config.env.clone();
+        for (k, v) in McpManager::get_critical_env_vars() {
+            envs.entry(k).or_insert(v);
+        }
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let sane_path = McpManager::get_sane_path();
+        envs.insert(
+            "PATH".to_string(),
+            McpManager::join_paths(&sane_path, &current_path),
+        );
+        McpManager::apply_env_policy(&mut cmd, config);
+        cmd.envs(&envs)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(home) = dirs::home_dir() {
+            cmd.current_dir(home);
+        }
+        cmd
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns a real sandboxed npx MCP server; run with --ignored on Windows"]
+    async fn everything_server_tools_callable_sandboxed() {
+        ensure_shim_beside_test_exe();
+
+        let config = McpServerConfig {
+            name: "everything-e2e".to_string(),
+            command: Some("npx".to_string()),
+            args: Some(vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-everything".to_string(),
+            ]),
+            source: Some("glama".to_string()), // registry install → sandbox on + env_clear
+            sandbox: Some(true),
+            allow_network: true,
+            ..Default::default()
+        };
+
+        let cmd = build_sandboxed_command(&config);
+        let transport = TokioChildProcess::new(cmd).expect("spawn sandbox shim");
+        let service = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            ().serve(transport),
+        )
+        .await
+        .expect("serve timed out")
+        .expect("initialize failed — the sandboxed server never came up");
+
+        // Tools must be discoverable and include the deterministic `get-sum`
+        // (current server-everything renamed the old `add`/`printEnv` tools).
+        let tools = service.list_tools(None).await.expect("list_tools");
+        let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
+        assert!(
+            names.iter().any(|n| n == "get-sum"),
+            "expected a 'get-sum' tool; got {names:?}"
+        );
+
+        // Call get-sum(2,3) and confirm a real result comes back through the transport.
+        let args = serde_json::json!({ "a": 2, "b": 3 });
+        let req = CallToolRequestParam {
+            name: "get-sum".into(),
+            arguments: args.as_object().cloned(),
+        };
+        let result = service.call_tool(req).await.expect("call_tool get-sum");
+        let rendered = format!("{:?}", result.content);
+        assert!(rendered.contains('5'), "get-sum(2,3) did not return 5: {rendered}");
     }
 }
