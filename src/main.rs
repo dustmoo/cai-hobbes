@@ -45,6 +45,7 @@ use secret_manager_generic as secret_manager;
 pub use secret_types::SecretManagerTrait;
 mod services;
 mod session;
+mod session_store;
 mod str_utils;
 mod timers;
 mod usage_log;
@@ -134,10 +135,15 @@ fn main() {
     // Release: INFO+ to stderr only, no file created
     init_logger();
 
-    // Load session state to get window size
-    let initial_state = session::SessionState::load().unwrap_or_default();
-    let initial_width = initial_state.window_width;
-    let initial_height = initial_state.window_height;
+    // Initialize the SQLite session store. On first launch after the JSON→
+    // SQLite migration this also imports sessions.json + sessions-archive.jsonl
+    // (one-time; may take a while for a large archive).
+    if let Err(e) = session_store::init() {
+        tracing::error!("Failed to initialize session store: {e}");
+    }
+
+    // Read persisted window size (meta only — no session hydration)
+    let (initial_width, initial_height) = session::SessionState::load_window_dims();
 
     // Load settings for menu
     let settings_manager = settings::SettingsManager::new(get_settings_path());
@@ -261,10 +267,17 @@ fn RestartRequired() -> Element {
 
 fn app() -> Element {
     let window = use_window();
+    // UI state must load before sessions: its open_tabs list determines which
+    // sessions get hydrated from the store (lazy loading — closed sessions
+    // stay on disk until opened from History).
+    let ui_state_manager =
+        use_context_provider(|| Signal::new(settings::UiStateManager::new(get_ui_state_path())));
+    let mut ui_state = use_context_provider(|| Signal::new(ui_state_manager.read().load()));
     let mut session_state = use_context_provider(|| {
-        let mut state = SessionState::load().unwrap_or_else(|e| {
+        let open_tabs = ui_state.peek().open_tabs.clone();
+        let mut state = SessionState::load(&open_tabs).unwrap_or_else(|e| {
             tracing::error!("Failed to load session state during startup: {}", e);
-            // Create default state with save DISABLED to protect backup
+            // Create default state with save DISABLED to protect stored data
             SessionState {
                 save_disabled: true,
                 ..Default::default()
@@ -278,9 +291,6 @@ fn app() -> Element {
     });
     let settings_manager =
         use_context_provider(|| Signal::new(SettingsManager::new(get_settings_path())));
-    let ui_state_manager =
-        use_context_provider(|| Signal::new(settings::UiStateManager::new(get_ui_state_path())));
-    let mut ui_state = use_context_provider(|| Signal::new(ui_state_manager.read().load()));
 
     // Initialize SecretManager without loading (loading happens async below)
     let mut secret_manager =
@@ -1355,15 +1365,6 @@ fn app() -> Element {
         }
     });
 
-    // Background session GC — runs every 30 minutes
-    use_coroutine(move |_rx: UnboundedReceiver<()>| async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(30 * 60)).await;
-            let tabs = open_tabs.peek().clone();
-            session_state.write().gc_closed_sessions(&tabs, 7);
-        }
-    });
-
     // One-time setup for the menu event loop
     // We use use_hook to ensure the thread is only spawned once.
     use_hook(move || {
@@ -1699,8 +1700,27 @@ fn app() -> Element {
                     close_tab_fn(idx);
                 }
                 ChatCommand::SwitchToSession(session_id) => {
+                    // Lazy hydration: sessions opened from History may not be
+                    // in memory yet — load them from the store first.
+                    let mut hydrated = session_state.peek().sessions.contains_key(&session_id);
+                    if !hydrated {
+                        if let Some(session) = crate::session_store::load_session(&session_id) {
+                            session_state
+                                .write()
+                                .sessions
+                                .insert(session_id.clone(), session);
+                            hydrated = true;
+                        } else {
+                            tracing::error!(
+                                "SwitchToSession: session {} not found in store",
+                                session_id
+                            );
+                        }
+                    }
                     let tabs = open_tabs.read().clone();
-                    if let Some(idx) = tabs.iter().position(|id| id == &session_id) {
+                    if !hydrated {
+                        // Fall through to command clearing without switching.
+                    } else if let Some(idx) = tabs.iter().position(|id| id == &session_id) {
                         active_tab_index.set(idx);
                         current_session_id.set(session_id.clone());
                         session_state.write().active_session_id = session_id.clone();

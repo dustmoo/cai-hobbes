@@ -81,6 +81,7 @@ sha2 = "0.10.9"
 rand = "0.9.2"
 open = "5.3.3"
 tempfile = "3.14"
+rusqlite = { version = "0.32", features = ["bundled"] }
 regex = "1.10"
 serde_norway = "0.9.42"
 sublime_fuzzy = "0.7.0"

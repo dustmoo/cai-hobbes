@@ -2,7 +2,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 
 use crate::mcp::manager::McpContext;
 use serde_json::Value;
@@ -323,6 +322,9 @@ pub fn compute_page_budget(
 /// Existing files without this field default to 0 via `#[serde(default)]`.
 pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 2;
 
+/// Fingerprint-map key for the tool-call-history meta blob (see `collect_meta_kv`).
+const TCH_FP_KEY: &str = "\0meta:tool_call_history";
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionState {
     /// Schema version for forward-compatible migrations.
@@ -351,15 +353,6 @@ pub struct SessionState {
     /// `MAX_PAGE_QUEUE_SIZE` in `handle_page_result`.
     #[serde(skip)]
     pub page_queue: PageQueue,
-}
-
-fn get_sessions_path() -> Option<PathBuf> {
-    dirs::config_dir().and_then(|mut path| {
-        path.push("com.hobbes.app");
-        fs::create_dir_all(&path).ok()?;
-        path.push("sessions.json");
-        Some(path)
-    })
 }
 
 impl SessionState {
@@ -795,79 +788,124 @@ impl SessionState {
         Self::default()
     }
 
-    pub fn load() -> Result<Self, std::io::Error> {
-        let path = get_sessions_path().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find sessions path")
-        })?;
-        let data = fs::read_to_string(&path).map_err(|e| {
+    /// Load session state from the SQLite store, hydrating only the sessions
+    /// that need to be in memory: open tabs, the active session, and any
+    /// session with scheduled timers. Everything else stays on disk and is
+    /// hydrated on demand (history click / timer fire).
+    pub fn load(open_tab_ids: &[String]) -> Result<Self, std::io::Error> {
+        use crate::session_store as store;
+
+        if !store::is_available() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session store not initialized",
+            ));
+        }
+
+        let schema_version = store::meta_get(store::META_SCHEMA_VERSION)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(CURRENT_SESSION_SCHEMA_VERSION);
+        let mut active_session_id =
+            store::meta_get(store::META_ACTIVE_SESSION).unwrap_or_default();
+        let default = SessionState::default();
+        let window_width = store::meta_get(store::META_WINDOW_WIDTH)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default.window_width);
+        let window_height = store::meta_get(store::META_WINDOW_HEIGHT)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default.window_height);
+        let lifetime_cost = store::meta_get(store::META_LIFETIME_COST)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let lifetime_tokens = store::meta_get(store::META_LIFETIME_TOKENS)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let tool_call_history = store::meta_get(store::META_TOOL_CALL_HISTORY)
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+
+        // Hydration set: open tabs, the active session, sessions with timers.
+        let mut ids: Vec<String> = open_tab_ids.to_vec();
+        if !active_session_id.is_empty() && !ids.contains(&active_session_id) {
+            ids.push(active_session_id.clone());
+        }
+        for id in store::session_ids_with_timers() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let mut sessions = store::load_sessions(&ids);
+
+        // Validate active_session_id against the full store, not just memory.
+        if !sessions.contains_key(&active_session_id) {
+            if let Some(recent) = store::most_recent_session_id() {
+                if let Some(session) = store::load_session(&recent) {
+                    sessions.insert(recent.clone(), session);
+                }
+                active_session_id = recent;
+            } else {
+                active_session_id.clear();
+            }
+        }
+
+        tracing::info!(
+            "Loaded session store: {} of {} sessions hydrated (schema_version={}).",
+            sessions.len(),
+            store::session_count(),
+            schema_version
+        );
+
+        Ok(SessionState {
+            schema_version,
+            sessions,
+            active_session_id,
+            window_width,
+            window_height,
+            tool_call_history,
+            lifetime_cost,
+            lifetime_tokens,
+            save_disabled: false,
+            page_queue: PageQueue::default(),
+        })
+    }
+
+    /// Read just the persisted window dimensions (pre-UI startup path).
+    pub fn load_window_dims() -> (f64, f64) {
+        use crate::session_store as store;
+        let default = SessionState::default();
+        let w = store::meta_get(store::META_WINDOW_WIDTH)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default.window_width);
+        let h = store::meta_get(store::META_WINDOW_HEIGHT)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default.window_height);
+        (w, h)
+    }
+
+    /// Parse a legacy `sessions.json` file (including pre-v2 formats) without
+    /// writing anything back. Used only by the one-time JSON→SQLite import.
+    pub(crate) fn load_from_json_file(path: &std::path::Path) -> Result<Self, std::io::Error> {
+        let data = fs::read_to_string(path).map_err(|e| {
             tracing::error!("Failed to read session file at {:?}: {}", path, e);
             e
         })?;
 
-        // Try direct deserialization first
         if let Ok(mut state) = serde_json::from_str::<Self>(&data) {
-            tracing::info!(
-                "Successfully loaded session data (schema_version={}).",
-                state.schema_version
-            );
-
-            // Validate active_session_id
             if !state.sessions.contains_key(&state.active_session_id) {
-                tracing::warn!(
-                    "Loaded active_session_id '{}' not found in sessions. Resetting.",
-                    state.active_session_id
-                );
-                if !state.sessions.is_empty() {
-                    state.active_session_id = state
-                        .sessions
-                        .values()
-                        .max_by_key(|s| s.last_updated)
-                        .map(|s| s.id.clone())
-                        .unwrap_or_default();
-                } else {
-                    state.active_session_id.clear();
-                }
+                state.active_session_id = state
+                    .sessions
+                    .values()
+                    .max_by_key(|s| s.last_updated)
+                    .map(|s| s.id.clone())
+                    .unwrap_or_default();
             }
-
-            // Run forward migrations if schema is behind current version.
-            // Gate future migrations here: `if state.schema_version < 2 { ... }`
-            if state.schema_version < CURRENT_SESSION_SCHEMA_VERSION {
-                tracing::info!(
-                    "Running forward migrations from schema v{} to v{}",
-                    state.schema_version,
-                    CURRENT_SESSION_SCHEMA_VERSION
-                );
-                state.schema_version = CURRENT_SESSION_SCHEMA_VERSION;
-                // Save the upgraded schema version
-                if let Err(e) = state.save() {
-                    tracing::error!("Failed to save schema-upgraded session state: {}", e);
-                }
-            }
-
+            state.schema_version = CURRENT_SESSION_SCHEMA_VERSION;
             return Ok(state);
         }
 
-        // If direct deserialization fails, attempt migration
-        tracing::warn!("Failed to deserialize session state directly, attempting migration...");
-
-        // Backup the old file before attempting to overwrite
-        let backup_path = path.with_extension("json.bak");
-        fs::copy(&path, backup_path)?;
-
+        tracing::warn!("Legacy sessions.json is not in current format, running migrations...");
         let mut state = Self::migrate_from_raw_json(&data)?;
-
-        // Mark as current schema version after successful migration
         state.schema_version = CURRENT_SESSION_SCHEMA_VERSION;
-
-        // Only save the migrated state if we actually recovered sessions
-        if !state.sessions.is_empty() {
-            if let Err(e) = state.save() {
-                tracing::error!("Failed to save migrated session state: {}", e);
-            }
-        } else {
-            tracing::warn!("Migration produced empty sessions - NOT saving to preserve backup");
-        }
-
         Ok(state)
     }
 
@@ -879,7 +917,7 @@ impl SessionState {
     ///
     /// Extracted from `load()` so it can be exercised by unit tests without
     /// touching the filesystem.
-    fn migrate_from_raw_json(data: &str) -> Result<Self, std::io::Error> {
+    pub(crate) fn migrate_from_raw_json(data: &str) -> Result<Self, std::io::Error> {
         let mut state = SessionState::default();
         if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
             // Migrate MessageContent::Text from old tuple format to new struct format
@@ -1039,51 +1077,52 @@ impl SessionState {
         Ok(state)
     }
 
+    /// Synchronously persist dirty sessions + meta to the SQLite store.
+    /// Only sessions whose serialized bytes changed since the last successful
+    /// write are upserted. App code uses `save_async`; this sync variant is
+    /// kept for tests and non-UI callers.
+    #[allow(dead_code)]
     pub fn save(&self) -> Result<(), std::io::Error> {
-        // If save is disabled (due to load failure), protect the backup
+        // If save is disabled (due to load failure), protect the stored data
         if self.save_disabled {
-            tracing::warn!("Save disabled due to prior load failure - protecting backup data");
+            tracing::warn!("Save disabled due to prior load failure - protecting stored data");
             return Ok(());
         }
 
-        use std::io::Write;
-
-        let path = get_sessions_path().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find sessions path")
-        })?;
-        let parent_dir = path.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Could not find parent directory",
-            )
-        })?;
-
-        let data = serde_json::to_string_pretty(self)
+        use crate::session_store as store;
+        let rows = store::collect_dirty_rows(&self.sessions)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        // Create temp file in the same directory (required for atomic rename on same filesystem)
-        let mut temp_file = tempfile::NamedTempFile::new_in(parent_dir)?;
-
-        // Write data to temp file
-        temp_file.write_all(data.as_bytes())?;
-
-        // Sync to disk to ensure data is persisted before rename
-        temp_file.as_file().sync_all()?;
-
-        // Set restrictive permissions on the temp file before persisting
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = fs::Permissions::from_mode(0o600);
-            temp_file.as_file().set_permissions(permissions)?;
+        let (meta, tch_mark) = self.collect_meta_kv();
+        store::write_rows_and_meta(&rows, &meta)
+            .map_err(std::io::Error::other)?;
+        store::mark_rows_saved(&rows);
+        if let Some(tch) = tch_mark {
+            store::mark_blob_saved(TCH_FP_KEY, &tch);
         }
-
-        // Atomically rename temp file to target path
-        // This is the key operation - if it succeeds, the file is fully written
-        // If it fails, the original file remains intact
-        temp_file.persist(&path).map_err(|e| e.error)?;
-
         Ok(())
+    }
+
+    /// Meta key/value pairs to persist alongside session rows. The
+    /// tool-call history blob is fingerprinted and only included when it
+    /// changed; the second return value is the blob to mark saved on success.
+    fn collect_meta_kv(&self) -> (Vec<(String, String)>, Option<String>) {
+        use crate::session_store as store;
+        let mut kv = vec![
+            (store::META_SCHEMA_VERSION.to_string(), self.schema_version.to_string()),
+            (store::META_ACTIVE_SESSION.to_string(), self.active_session_id.clone()),
+            (store::META_WINDOW_WIDTH.to_string(), self.window_width.to_string()),
+            (store::META_WINDOW_HEIGHT.to_string(), self.window_height.to_string()),
+            (store::META_LIFETIME_COST.to_string(), self.lifetime_cost.to_string()),
+            (store::META_LIFETIME_TOKENS.to_string(), self.lifetime_tokens.to_string()),
+        ];
+        let tch = serde_json::to_string(&self.tool_call_history).unwrap_or_else(|_| "[]".into());
+        let mark = if store::blob_changed(TCH_FP_KEY, &tch) {
+            kv.push((store::META_TOOL_CALL_HISTORY.to_string(), tch.clone()));
+            Some(tch)
+        } else {
+            None
+        };
+        (kv, mark)
     }
 
     pub fn create_session_raw(&mut self, initial_profile: Option<String>) -> String {
@@ -1124,17 +1163,33 @@ impl SessionState {
         if let Some(session) = self.sessions.get(id) {
             self.lifetime_cost += session.total_cost();
             self.lifetime_tokens += session.total_tokens() as i64;
+            self.sessions.remove(id);
+            // The in-memory copy was authoritative; ignore the (possibly
+            // stale) stored totals to avoid double counting.
+            crate::session_store::delete_session(id);
+        } else if let Some((cost, tokens)) = crate::session_store::delete_session(id) {
+            // Not hydrated — harvest from the stored row's totals.
+            self.lifetime_cost += cost;
+            self.lifetime_tokens += tokens;
         }
-        self.sessions.remove(id);
 
         if self.active_session_id == id {
-            // The active session was deleted. Find a new one or clear the active id.
-            self.active_session_id = self
+            // The active session was deleted. Prefer the most recent hydrated
+            // session, then fall back to the most recent stored one.
+            let mut next = self
                 .sessions
                 .values()
                 .max_by_key(|s| s.last_updated)
-                .map(|s| s.id.clone())
-                .unwrap_or_default();
+                .map(|s| s.id.clone());
+            if next.is_none() {
+                if let Some(recent) = crate::session_store::most_recent_session_id() {
+                    if let Some(session) = crate::session_store::load_session(&recent) {
+                        self.sessions.insert(recent.clone(), session);
+                    }
+                    next = Some(recent);
+                }
+            }
+            self.active_session_id = next.unwrap_or_default();
         } else if self.sessions.is_empty() {
             self.active_session_id = String::new();
         }
@@ -1143,31 +1198,6 @@ impl SessionState {
     pub fn delete_session(&mut self, id: &str) {
         self.delete_session_raw(id);
         Self::save_async(self, None);
-    }
-
-    /// Remove sessions that are not in any open tab and haven't been
-    /// updated in `max_age` days. Harvests cost/token data before removal.
-    pub fn gc_closed_sessions(&mut self, open_tab_ids: &[String], max_age_days: i64) {
-        let cutoff = Utc::now() - chrono::Duration::days(max_age_days);
-        let open_set: std::collections::HashSet<&str> = open_tab_ids.iter().map(|s| s.as_str()).collect();
-
-        let stale_ids: Vec<String> = self.sessions.iter()
-            .filter(|(id, session)| {
-                !open_set.contains(id.as_str())
-                    && *id != &self.active_session_id
-                    && session.last_updated < cutoff
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for id in &stale_ids {
-            self.delete_session_raw(id); // Harvests cost/tokens into lifetime counters
-        }
-
-        if !stale_ids.is_empty() {
-            tracing::info!("GC: Removed {} stale sessions (older than {} days)", stale_ids.len(), max_age_days);
-            Self::save_async(self, None);
-        }
     }
 
     pub fn get_active_session(&self) -> Option<&Session> {
@@ -1218,43 +1248,17 @@ impl SessionState {
 
     /// Write pre-serialized bytes to the session file using the same atomic
     /// tempfile pattern as `save()`. Used by `save_async` to avoid cloning.
-    fn save_bytes(bytes: Vec<u8>) -> Result<(), std::io::Error> {
-        use std::io::Write;
-
-        let path = get_sessions_path().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "Could not find sessions path")
-        })?;
-        let parent_dir = path.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Could not find parent directory",
-            )
-        })?;
-
-        let mut temp_file = tempfile::NamedTempFile::new_in(parent_dir)?;
-        temp_file.write_all(&bytes)?;
-        temp_file.as_file().sync_all()?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = fs::Permissions::from_mode(0o600);
-            temp_file.as_file().set_permissions(permissions)?;
-        }
-
-        temp_file.persist(&path).map_err(|e| e.error)?;
-        Ok(())
-    }
-
-    /// Saves the session state to disk on a background thread.
-    /// This prevents blocking the main UI thread during file I/O.
+    /// Saves dirty sessions to the SQLite store on a background thread.
+    /// This prevents blocking the main UI thread during DB I/O.
     /// If `error_signal` is provided, save failures will be surfaced to the UI.
     ///
-    /// **Design Note (Serialize-Then-Move):** Serialization happens on the calling
-    /// thread via a borrow of `&SessionState`, producing an owned `Vec<u8>`. Only
-    /// this byte buffer is moved to the background thread for file I/O. This avoids
-    /// the expensive deep clone of the entire state (all sessions + all messages)
-    /// that the previous implementation required.
+    /// **Design Note (Serialize-Then-Move, P-009):** Each hydrated session is
+    /// serialized on the calling thread via a borrow of `&SessionState`;
+    /// sessions whose bytes match the last successful write are skipped
+    /// entirely. Only the owned row buffers move to the background thread —
+    /// the state is never cloned, and a one-message append writes one row.
+    /// Fingerprints commit only after the write succeeds, so a failed write
+    /// is retried on the next save.
     pub fn save_async(
         state: &SessionState,
         error_signal: Option<dioxus::prelude::Signal<Option<String>>>,
@@ -1262,16 +1266,14 @@ impl SessionState {
         // Guard: skip if saves are disabled (backup protection)
         if state.save_disabled {
             tracing::warn!(
-                "save_async: Save disabled due to prior load failure - protecting backup data"
+                "save_async: Save disabled due to prior load failure - protecting stored data"
             );
             return;
         }
 
-        // Serialize on the calling thread — borrows state, no clone needed.
-        // This is the critical optimization: serde serialization is fast (CPU-bound),
-        // but cloning all sessions + messages is expensive and was causing beach-balls.
-        let bytes = match serde_json::to_vec_pretty(state) {
-            Ok(b) => b,
+        use crate::session_store as store;
+        let rows = match store::collect_dirty_rows(&state.sessions) {
+            Ok(r) => r,
             Err(e) => {
                 tracing::error!("Failed to serialize session state: {}", e);
                 if let Some(mut sig) = error_signal {
@@ -1281,17 +1283,23 @@ impl SessionState {
                 return;
             }
         };
+        let (meta, tch_mark) = state.collect_meta_kv();
 
-        // Move only the byte buffer to the background thread for file I/O
+        // Move only the prepared row/meta buffers to the background thread
         dioxus::prelude::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                Self::save_bytes(bytes)
+                store::write_rows_and_meta(&rows, &meta).map(|_| (rows, tch_mark))
             })
             .await;
 
             // Back on the Dioxus runtime — safe to touch Signals
             match result {
-                Ok(Ok(())) => {}
+                Ok(Ok((rows, tch_mark))) => {
+                    store::mark_rows_saved(&rows);
+                    if let Some(tch) = tch_mark {
+                        store::mark_blob_saved(TCH_FP_KEY, &tch);
+                    }
+                }
                 Ok(Err(e)) => {
                     tracing::error!("Failed to save session state: {}", e);
                     if let Some(mut sig) = error_signal {
@@ -1320,6 +1328,9 @@ impl SessionState {
     pub fn update_session_name_raw(&mut self, id: &str, new_name: String) {
         if let Some(session) = self.sessions.get_mut(id) {
             session.name = new_name;
+        } else {
+            // Not hydrated (renamed from History) — update the stored row directly.
+            crate::session_store::rename_session(id, &new_name);
         }
     }
 
@@ -1404,87 +1415,6 @@ impl Default for SessionState {
 mod tests {
     use super::*;
     use std::io::Read;
-
-    /// Test that atomic save creates a valid JSON file with correct permissions
-    #[test]
-    fn test_atomic_save_creates_valid_file() {
-        // Create a temp directory to simulate the config dir
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let test_path = temp_dir.path().join("test_sessions.json");
-
-        // Create a test SessionState
-        let state = SessionState {
-            window_width: 800.0,
-            window_height: 600.0,
-            ..Default::default()
-        };
-
-        // Manually save to our test path (bypassing get_sessions_path)
-        let data = serde_json::to_string_pretty(&state).expect("Failed to serialize");
-
-        // Use the same atomic write pattern
-        {
-            use std::io::Write;
-            let mut temp_file = tempfile::NamedTempFile::new_in(temp_dir.path())
-                .expect("Failed to create temp file");
-            temp_file
-                .write_all(data.as_bytes())
-                .expect("Failed to write");
-            temp_file.as_file().sync_all().expect("Failed to sync");
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let permissions = fs::Permissions::from_mode(0o600);
-                temp_file
-                    .as_file()
-                    .set_permissions(permissions)
-                    .expect("Failed to set permissions");
-            }
-
-            temp_file.persist(&test_path).expect("Failed to persist");
-        }
-
-        // Verify the file exists and is valid JSON
-        let mut file = fs::File::open(&test_path).expect("Failed to open saved file");
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .expect("Failed to read file");
-
-        let loaded: SessionState = serde_json::from_str(&contents).expect("Failed to parse JSON");
-        assert_eq!(loaded.window_width, 800.0);
-        assert_eq!(loaded.window_height, 600.0);
-
-        // Verify permissions on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = fs::metadata(&test_path).expect("Failed to get metadata");
-            let mode = metadata.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "File permissions should be 0600");
-        }
-    }
-
-    /// Test that atomic save doesn't corrupt existing file on serialization error
-    #[test]
-    fn test_atomic_save_preserves_original_on_failure() {
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let test_path = temp_dir.path().join("test_sessions.json");
-
-        // Write an initial file
-        let initial_content = r#"{"sessions":{},"active_session_id":"","window_width":100.0,"window_height":100.0,"tool_call_history":[]}"#;
-        fs::write(&test_path, initial_content).expect("Failed to write initial file");
-
-        // Verify original exists
-        assert!(test_path.exists());
-
-        // The temp file approach means even if we fail mid-write, original is preserved
-        // Since persist() is atomic, we can't really test a mid-write failure easily,
-        // but we can verify the pattern works for normal cases
-
-        let original = fs::read_to_string(&test_path).expect("Failed to read original");
-        assert!(original.contains("100.0"));
-    }
 
     // === Migration Tests ===
 
@@ -2162,34 +2092,142 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_closed_sessions() {
+    fn test_store_upsert_roundtrip() {
+        use crate::session_store::test_support as ts;
         let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        state.sessions.get_mut(&id).unwrap().name = "Roundtrip".to_string();
 
-        let active_id = state.create_session_raw(None);
-        let open_id = state.create_session_raw(None);
-        let stale_id = state.create_session_raw(None);
-        let fresh_id = state.create_session_raw(None);
+        ts::with_test_db(|conn| {
+            ts::upsert(conn, state.sessions.get(&id).unwrap());
+            assert_eq!(ts::get_row_name(conn, &id).as_deref(), Some("Roundtrip"));
+            let data = ts::get_row_data(conn, &id).unwrap();
+            let loaded: Session = serde_json::from_str(&data).unwrap();
+            assert_eq!(loaded.id, id);
+            assert_eq!(loaded.name, "Roundtrip");
+        });
+    }
 
-        state.active_session_id = active_id.clone();
+    /// Out-of-order async saves must not clobber newer rows with older data.
+    #[test]
+    fn test_store_seq_guard_rejects_stale_writes() {
+        use crate::session_store::test_support as ts;
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
 
-        let now = Utc::now();
-        let old_time = now - chrono::Duration::days(10);
-        let fresh_time = now - chrono::Duration::days(2);
+        ts::with_test_db(|conn| {
+            state.sessions.get_mut(&id).unwrap().name = "Newer".to_string();
+            ts::upsert_with_seq(conn, state.sessions.get(&id).unwrap(), 100);
 
-        // Mutate their times
-        state.sessions.get_mut(&active_id).unwrap().last_updated = old_time;
-        state.sessions.get_mut(&open_id).unwrap().last_updated = old_time;
-        state.sessions.get_mut(&stale_id).unwrap().last_updated = old_time;
-        state.sessions.get_mut(&fresh_id).unwrap().last_updated = fresh_time;
+            state.sessions.get_mut(&id).unwrap().name = "Stale".to_string();
+            ts::upsert_with_seq(conn, state.sessions.get(&id).unwrap(), 50);
 
-        state.save_disabled = true; // prevent file saving in test
+            assert_eq!(
+                ts::get_row_name(conn, &id).as_deref(),
+                Some("Newer"),
+                "A write with a lower seq must not overwrite a newer row"
+            );
+        });
+    }
 
-        let open_tabs = vec![open_id.clone()];
-        state.gc_closed_sessions(&open_tabs, 7);
+    /// One-time JSON→SQLite import: live sessions win over archive lines on
+    /// id collision, meta carries over, and a second run is a no-op.
+    #[test]
+    fn test_json_to_sqlite_import() {
+        use crate::session_store::test_support as ts;
+        let dir = tempfile::tempdir().unwrap();
 
-        assert!(state.sessions.contains_key(&active_id), "Active session must survive GC");
-        assert!(state.sessions.contains_key(&open_id), "Open session must survive GC");
-        assert!(state.sessions.contains_key(&fresh_id), "Fresh session must survive GC");
-        assert!(!state.sessions.contains_key(&stale_id), "Stale closed session must be removed by GC");
+        // Live state: two sessions
+        let mut live = SessionState::default();
+        let id_a = live.create_session_raw(None);
+        let id_b = live.create_session_raw(None);
+        live.sessions.get_mut(&id_a).unwrap().name = "Live A".into();
+        live.sessions.get_mut(&id_b).unwrap().name = "Live B".into();
+        live.lifetime_cost = 1.25;
+        live.schema_version = CURRENT_SESSION_SCHEMA_VERSION;
+        let json_path = dir.path().join("sessions.json");
+        fs::write(&json_path, serde_json::to_string(&live).unwrap()).unwrap();
+
+        // Archive: an old copy of session A (must lose) + a unique session C
+        let mut old_a = live.sessions.get(&id_a).unwrap().clone();
+        old_a.name = "Stale A".into();
+        let mut state_c = SessionState::default();
+        let id_c = state_c.create_session_raw(None);
+        state_c.sessions.get_mut(&id_c).unwrap().name = "Archived C".into();
+        let archive_path = dir.path().join("sessions-archive.jsonl");
+        fs::write(
+            &archive_path,
+            format!(
+                "{}\n{}\nnot-json\n",
+                serde_json::to_string(&old_a).unwrap(),
+                serde_json::to_string(state_c.sessions.get(&id_c).unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        ts::with_test_db(|conn| {
+            let (live_n, archive_n) =
+                ts::run_import(conn, Some(json_path.clone()), Some(archive_path.clone())).unwrap();
+            assert_eq!(live_n, 2);
+            assert_eq!(archive_n, 1, "collision + junk line must be skipped");
+            assert_eq!(ts::count(conn), 3);
+            assert_eq!(ts::get_row_name(conn, &id_a).as_deref(), Some("Live A"));
+            assert_eq!(ts::get_row_name(conn, &id_c).as_deref(), Some("Archived C"));
+            assert_eq!(
+                ts::meta(conn, crate::session_store::META_LIFETIME_COST).as_deref(),
+                Some("1.25")
+            );
+
+            // Second run must be a no-op (migration marker set)
+            let (l2, a2) = ts::run_import(conn, Some(json_path), Some(archive_path)).unwrap();
+            assert_eq!((l2, a2), (0, 0));
+            assert_eq!(ts::count(conn), 3);
+        });
+    }
+
+    /// Real-data migration rehearsal. Skipped unless the env vars point at
+    /// copies of a real sessions.json / sessions-archive.jsonl:
+    ///   HOBBES_IMPORT_TEST_JSON=... HOBBES_IMPORT_TEST_ARCHIVE=... \
+    ///     cargo test --release real_data_import -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_data_import() {
+        use crate::session_store::test_support as ts;
+        let json = std::env::var("HOBBES_IMPORT_TEST_JSON").ok().map(std::path::PathBuf::from);
+        let archive = std::env::var("HOBBES_IMPORT_TEST_ARCHIVE").ok().map(std::path::PathBuf::from);
+        if json.is_none() && archive.is_none() {
+            eprintln!("real_data_import: no env vars set, skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::session_store::create_schema(&conn).unwrap();
+        let start = std::time::Instant::now();
+        let (live_n, archive_n) = ts::run_import(&conn, json, archive).unwrap();
+        let db_size = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "real_data_import: {live_n} live + {archive_n} archived sessions in {:.1}s, db size {:.1} MB",
+            start.elapsed().as_secs_f64(),
+            db_size as f64 / 1e6
+        );
+        assert!(ts::count(&conn) as usize >= live_n + archive_n);
+    }
+
+    /// Legacy archive lines (pre-v2 message formats) must import via the
+    /// raw-JSON migration fallback.
+    #[test]
+    fn test_legacy_session_import_fallback() {
+        let old_format = make_old_session_json(r#"{
+            "id": "0b0e9e2e-49e2-4a4d-bd58-9d1b4a55b573",
+            "author": "User",
+            "content": { "Text": "hello from the past" },
+            "attachments": [],
+            "comments": [],
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#);
+        let state = SessionState::migrate_from_raw_json(&old_format).unwrap();
+        let session = state.sessions.get("test-session-1").unwrap();
+        assert_eq!(session.messages.len(), 1);
     }
 }

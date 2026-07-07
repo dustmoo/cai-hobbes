@@ -1,5 +1,5 @@
 #![allow(non_snake_case)]
-use crate::{components::chat_input::ChatCommand, session::SessionState};
+use crate::{components::chat_input::ChatCommand, session::SessionState, session_store};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use sublime_fuzzy::best_match;
@@ -35,70 +35,63 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 
     // Listen for Global Commands (e.g., Delete Session Hotkey) removed - now handled in main.rs
 
+    // Subscribe to session state so renames / new messages / deletions in
+    // hydrated sessions re-render the list. The listing itself comes from the
+    // SQLite store, so closed sessions never need to be loaded into memory.
     let sessions = session_state.read();
     let active_id = sessions.active_session_id.clone();
 
-    let mut sorted_sessions: Vec<_> = sessions.sessions.values().collect();
-    sorted_sessions.sort_by(|a, b| b.last_updated.cmp(&a.last_updated));
-
-    // Filter sessions: exact substring on name + summary, then fuzzy fallback
     let query = debounced_query.read().to_lowercase();
-    let filtered_sessions: Vec<_> = if query.is_empty() {
-        sorted_sessions
+    let limit = *items_per_page.read();
+    let offset = (*current_page.read() * limit) as i64;
+
+    // Phase 1: DB-backed listing — exact substring match on name, summary,
+    // and message text content (search_text column), newest first, paginated
+    // in SQL. Phase 2 (only when exact finds nothing): fuzzy match on
+    // name + summary over lightweight metadata rows.
+    let (mut page_metas, total_items) = if query.is_empty() {
+        let (metas, total) = session_store::list_metadata(None, offset, limit as i64);
+        (metas, total as usize)
     } else {
-        // Phase 1: Exact substring match on name + summary + message text content
-        let exact: Vec<_> = sorted_sessions
-            .iter()
-            .filter(|s| {
-                s.name.to_lowercase().contains(&query)
-                    || s.active_context
-                        .conversation_summary
-                        .summary
-                        .to_lowercase()
-                        .contains(&query)
-                    || s.messages.iter().any(|m| {
-                        m.content
-                            .get_text_content()
-                            .is_some_and(|t| t.to_lowercase().contains(&query))
-                    })
-            })
-            .copied()
-            .collect();
-
-        if !exact.is_empty() {
-            exact
+        let (metas, total) = session_store::list_metadata(Some(&query), offset, limit as i64);
+        if total > 0 {
+            (metas, total as usize)
         } else {
-            // Phase 2: Fuzzy match fallback on name + summary, ranked by score
-            let mut scored: Vec<_> = sorted_sessions
-                .iter()
-                .filter_map(|s| {
-                    let name_score = best_match(&query, &s.name.to_lowercase())
-                        .map(|m| m.score());
-                    let summary_score = best_match(
-                        &query,
-                        &s.active_context.conversation_summary.summary.to_lowercase(),
-                    )
-                    .map(|m| m.score());
-
+            let mut scored: Vec<(String, isize)> = session_store::all_name_summaries()
+                .into_iter()
+                .filter_map(|(id, name, summary)| {
+                    let name_score =
+                        best_match(&query, &name.to_lowercase()).map(|m| m.score());
+                    let summary_score =
+                        best_match(&query, &summary.to_lowercase()).map(|m| m.score());
                     let best = match (name_score, summary_score) {
                         (Some(a), Some(b)) => Some(a.max(b)),
                         (Some(a), None) => Some(a),
                         (None, Some(b)) => Some(b),
                         (None, None) => None,
                     };
-
-                    best.map(|score| (*s, score))
+                    best.map(|score| (id, score))
                 })
                 .collect();
-
-            // Sort by fuzzy score descending (best match first)
             scored.sort_by(|a, b| b.1.cmp(&a.1));
-            scored.into_iter().map(|(s, _)| s).collect()
+            let total = scored.len();
+            let start = (offset as usize).min(total);
+            let end = (start + limit).min(total);
+            let page_ids: Vec<String> =
+                scored[start..end].iter().map(|(id, _)| id.clone()).collect();
+            (session_store::metadata_by_ids(&page_ids), total)
         }
     };
 
-    let total_items = filtered_sessions.len();
-    let limit = *items_per_page.read();
+    // Overlay in-memory data for hydrated sessions: the async DB write can
+    // lag a rename/new message by a beat, and memory is authoritative.
+    for meta in page_metas.iter_mut() {
+        if let Some(live) = sessions.sessions.get(&meta.id) {
+            meta.name = live.name.clone();
+            meta.message_count = live.messages.len() as i64;
+        }
+    }
+
     let total_pages = (total_items as f64 / limit as f64).ceil() as usize;
     let total_pages = if total_pages == 0 { 1 } else { total_pages };
 
@@ -107,14 +100,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
         current_page.set(total_pages.saturating_sub(1));
     }
 
-    let start_index = *current_page.read() * limit;
-    let end_index = (start_index + limit).min(total_items);
-
-    let paginated_sessions = if start_index < total_items {
-        &filtered_sessions[start_index..end_index]
-    } else {
-        &[]
-    };
+    let paginated_sessions = page_metas;
 
     rsx! {
     // Main content of the session manager

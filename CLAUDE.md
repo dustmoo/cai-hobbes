@@ -60,14 +60,14 @@ The `StreamManager` is the central orchestrator. It owns the full turn lifecycle
 
 ### State Model
 
-**`SessionState`** (`src/session.rs`) is the single source of truth for all chat state. It is held in a Dioxus `Signal<SessionState>` and persisted to `sessions.json` on every write.
+**`SessionState`** (`src/session.rs`) is the single source of truth for all *hydrated* chat state. It is held in a Dioxus `Signal<SessionState>` and persisted to a SQLite store (`src/session_store.rs`, `sessions.db`) on every write. Sessions are **lazily hydrated**: only open tabs, the active session, and sessions with pending timers are loaded into memory at startup; everything else stays on disk and hydrates when opened from History (`ChatCommand::SwitchToSession` in `main.rs`). Nothing ever expires — there is no session GC.
 
 Key types within a session:
 - `Session` — one per tab; contains `messages: Vec<Message>`, `active_context: ActiveContext`, `conversation_summary`, `scratchpad`, and per-session provider/model overrides (`llm_provider`, `chat_model`).
 - `ActiveContext` — live in-memory context injected into every prompt: MCP tools, snapshots, skills, scratchpad.
 - `ConversationSummary` — background-generated rolling summary used to seed new prompts after history scrolling.
 
-Persistence uses a **serialize-then-move** pattern (P-009): never clone `SessionState` for async saves — serialize to bytes on the calling thread, move only bytes to the background I/O task. Use `SessionState::save_async(&state, ...)` or `SessionState::save_signal(&session_state, ...)`.
+Persistence uses a **serialize-then-move** pattern (P-009): never clone `SessionState` for async saves — serialize each hydrated session on the calling thread, move only the prepared row buffers to the background write task. Use `SessionState::save_async(&state, ...)` or `SessionState::save_signal(&session_state, ...)`. Saves are incremental: each session row carries a content fingerprint, so only sessions whose bytes changed get upserted, and a monotonic `seq` column prevents out-of-order async writes from clobbering newer rows. Code that must touch non-hydrated sessions (history listing/search, renames from History, deletes, cost sums, import/export) goes through `session_store` queries — never hydrate all sessions to iterate them.
 
 ### LLM Layer (`src/llm/`)
 
@@ -117,7 +117,7 @@ Streaming and summarization state is **per-session**, not global:
 
 ### Memory & Persistence Patterns
 
-- **Sessions**: `~/.config/com.hobbes.app/sessions.json` (macOS: `~/Library/Application Support/...`)
+- **Sessions**: SQLite at `~/.config/com.hobbes.app/sessions.db` (macOS: `~/Library/Application Support/...`), one row per session + a `meta` key/value table (lifetime counters, active session, window size, tool-call history). On first launch, `session_store::init()` runs a one-time import of the legacy `sessions.json` and `sessions-archive.jsonl` (guarded by the `migrated_from_json` meta key); the JSON files are left in place but no longer read or written — don't run pre-SQLite builds afterwards, their writes won't be seen.
 - **Settings**: same config dir, `settings.json`
 - **Credentials**: macOS Keychain via `SecretManager` (biometric-protected). Windows via `keyring` crate. Never call keychain APIs directly from components — use `secret_manager::save_secret_to_keychain()` (P-011).
 - **Logs**: daily rolling log at `~/Library/Application Support/com.hobbes.app/hobbes.log`

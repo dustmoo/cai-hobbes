@@ -1715,12 +1715,11 @@ fn SessionCostIcon() -> Element {
                         }
                     }
 
-                    // All-time totals (lifetime counters from deleted sessions + all live sessions)
+                    // All-time totals (lifetime counters from deleted sessions + all stored sessions)
                     {
-                        let all_time_cost = state.lifetime_cost
-                            + state.sessions.values().map(|s| s.total_cost()).sum::<f64>();
-                        let all_time_tokens = state.lifetime_tokens
-                            + state.sessions.values().map(|s| s.total_tokens() as i64).sum::<i64>();
+                        let (stored_cost, stored_tokens) = crate::session_store::sum_cost_tokens();
+                        let all_time_cost = state.lifetime_cost + stored_cost;
+                        let all_time_tokens = state.lifetime_tokens + stored_tokens;
                         rsx! {
                             div { class: "mt-2 pt-2 border-t border-faint space-y-2 text-xs",
                                 div { class: "text-sm font-semibold text-gray-200 mb-1", "All-Time" }

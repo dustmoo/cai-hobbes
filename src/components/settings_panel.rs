@@ -3396,7 +3396,51 @@ pub fn SettingsPanel() -> Element {
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_history.zip").save_file().await {
-                                                let history_json = serde_json::to_string_pretty(&*session_state.read()).unwrap();
+                                                // Assemble the export incrementally from raw stored
+                                                // blobs — the full history can be hundreds of MB and
+                                                // must not round-trip through a Value tree.
+                                                let history_json = {
+                                                    let state = session_state.read();
+                                                    let mut out = String::from("{\n\"schema_version\": ");
+                                                    out.push_str(&state.schema_version.to_string());
+                                                    out.push_str(",\n\"active_session_id\": ");
+                                                    out.push_str(&serde_json::to_string(&state.active_session_id).unwrap_or_else(|_| "\"\"".into()));
+                                                    out.push_str(&format!(",\n\"window_width\": {},\n\"window_height\": {}", state.window_width, state.window_height));
+                                                    out.push_str(&format!(",\n\"lifetime_cost\": {},\n\"lifetime_tokens\": {}", state.lifetime_cost, state.lifetime_tokens));
+                                                    out.push_str(",\n\"tool_call_history\": ");
+                                                    out.push_str(&serde_json::to_string(&state.tool_call_history).unwrap_or_else(|_| "[]".into()));
+                                                    // Hydrated sessions may be newer than their stored rows
+                                                    let hydrated: std::collections::HashMap<String, String> = state.sessions.iter()
+                                                        .filter_map(|(id, s)| serde_json::to_string(s).ok().map(|j| (id.clone(), j)))
+                                                        .collect();
+                                                    drop(state);
+                                                    out.push_str(",\n\"sessions\": {\n");
+                                                    let mut first = true;
+                                                    let push_entry = |out: &mut String, id: &str, data: &str, first: &mut bool| {
+                                                        if !*first { out.push_str(",\n"); }
+                                                        *first = false;
+                                                        out.push_str(&serde_json::to_string(id).unwrap_or_else(|_| "\"\"".into()));
+                                                        out.push_str(": ");
+                                                        out.push_str(data);
+                                                    };
+                                                    let mut exported_ids = std::collections::HashSet::new();
+                                                    let export_result = crate::session_store::export_all_raw(|id, data| {
+                                                        let blob = hydrated.get(id).map(|s| s.as_str()).unwrap_or(data);
+                                                        exported_ids.insert(id.to_string());
+                                                        push_entry(&mut out, id, blob, &mut first);
+                                                    });
+                                                    if let Err(e) = export_result {
+                                                        tracing::error!("Failed to export stored sessions: {}", e);
+                                                    }
+                                                    // Hydrated sessions whose first save hasn't landed yet
+                                                    for (id, blob) in &hydrated {
+                                                        if !exported_ids.contains(id) {
+                                                            push_entry(&mut out, id, blob, &mut first);
+                                                        }
+                                                    }
+                                                    out.push_str("\n}\n}");
+                                                    out
+                                                };
                                                 let mut zip_buffer = Vec::new();
                                                 {
                                                     let mut zip = ZipWriter::new(std::io::Cursor::new(&mut zip_buffer));
@@ -3445,23 +3489,24 @@ pub fn SettingsPanel() -> Element {
                                                 }
                                                 match serde_json::from_str::<SessionState>(&contents) {
                                                     Ok(imported_state) => {
-                                                        let mut current_state = session_state.write();
-                                                        // Intentional: branches have different side effects (insert vs. push to conflict list).
-                                                        #[allow(clippy::map_entry)]
+                                                        // Imported sessions go straight to the SQLite store —
+                                                        // they don't need to be hydrated into memory.
+                                                        let mut imported = 0usize;
                                                         for (id, session) in imported_state.sessions {
-                                                            if current_state.sessions.contains_key(&id) {
+                                                            let exists = session_state.peek().sessions.contains_key(&id)
+                                                                || crate::session_store::contains(&id);
+                                                            if exists {
                                                                 conflicting_sessions.write().push((id, session));
                                                                 // TODO: Implement conflict resolution modal
-                                                            } else {
-                                                                current_state.sessions.insert(id, session);
+                                                            } else if crate::session_store::insert_if_absent(&session) {
+                                                                imported += 1;
                                                             }
                                                         }
 
                                                         if !conflicting_sessions.read().is_empty() {
                                                             show_conflict_modal.set(true);
                                                         } else {
-                                                            crate::session::SessionState::save_async(&current_state, Some(save_error));
-                                                            tracing::info!("Successfully imported history with no conflicts.");
+                                                            tracing::info!("Successfully imported {} sessions with no conflicts.", imported);
                                                         }
                                                     },
                                                     Err(e) => {
