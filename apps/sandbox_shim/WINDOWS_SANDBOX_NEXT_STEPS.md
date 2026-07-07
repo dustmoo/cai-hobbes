@@ -51,34 +51,53 @@ if ($off -ne '200') { "PASS  network: no --net blocks internet" } else { "FAIL  
 if ($fail -eq 0) { "`nALL GREEN" } else { "`n$fail CHECK(S) FAILED" }
 ```
 
-Commit `verify-sandbox.ps1` so it's the durable regression gate.
+**Status:** committed as `apps/sandbox_shim/verify-sandbox.ps1` and ALL GREEN.
+Note: the original check #1 (a single-line-piped JSON-RPC `initialize`) was
+dropped — it returns no result even UNSANDBOXED (stdin EOF races startup). It's
+replaced by a deterministic node stdin→stdout echo plus an npx "server starts"
+smoke. Full request/response is validated by the Task 1 e2e test instead.
 
 ---
 
 ## Task 1 — In-app end-to-end validation (HIGHEST priority)
 
-Everything so far is the shim CLI. Prove the **real app path** works: the
-manager launches servers through `wrap_command` (`src/mcp/sandbox.rs`, Windows
-branch → the shim), and the AI must be able to *call the server's tools*, not
-just see it start.
+**Core transport risk: RETIRED.** A headless e2e test now drives the REAL app
+path — `wrap_command` + the child env + the rmcp `TokioChildProcess` transport —
+against a sandboxed `npx -y @modelcontextprotocol/server-everything`, and passes:
+`serve`/initialize ✓, `list_tools` ✓ (13 tools), `call_tool(get-sum, 2, 3)` → 5 ✓.
+So the `npx→cmd→node` chain DOES carry a full request/response through the app's
+transport. Test: `src/mcp/manager.rs` mod `win_sandbox_e2e` (Windows-only,
+`#[ignore]`d). Run:
 
-1. Build the app + shim: `.\scripts\build_windows.ps1` (produces both
-   `hobbes.exe` and `hobbes-sandbox.exe` side by side — the shim must sit next
-   to the app exe; `shim_path()` looks there).
-2. Launch Hobbes, install a Glama registry server (an npx-based one), and
-   confirm: it starts sandboxed, and the AI can successfully **invoke one of its
-   tools** and get a result back.
-3. The key risk (findings §"stdin→server response"): the `npx → cmd → node`
-   stdio chain may not cleanly carry a full request/response through the app's
-   child-process transport, even though a manual `initialize` works. If tool
-   calls hang or truncate, that's this issue.
-   - If it fails: the fix direction is to run servers as `node <entry>` directly
-     at the MCP layer instead of via `npx`/`cmd`. **Confirm the failure in-app
-     first** — don't re-architecture on suspicion.
+```text
+cargo build -p hobbes_sandbox
+cargo test --bin Hobbes -- --ignored win_sandbox_e2e
+```
+
+Getting there surfaced (and fixed) a real Windows env bug in the app — NOT the
+shim (commit `c82b0cf`):
+- The child `PATH` was `format!("{}:{}", get_sane_path(), current_path)` — Unix
+  dirs colon-joined, which corrupts Windows drive letters. Now platform-aware
+  (`get_sane_path` Windows branch + a `join_paths` helper; all 5 compose sites).
+- `apply_env_policy` `env_clear()`s registry-install children (so they can't
+  inherit dotenv secrets); on Windows that also stripped `SystemRoot`/`ComSpec`/
+  `PATHEXT`, and node crashed at startup (`Assertion failed: ncrypto::CSPRNG`).
+  It now re-adds a non-secret Windows system-var allowlist after clearing.
+
+**Remaining (needs the GUI — cannot be done headlessly): the human click-through.**
+1. Build: `.\scripts\build_windows.ps1` (builds `hobbes.exe` + `hobbes-sandbox.exe`
+   side by side; the installer `.iss` also ships the shim next to the app exe).
+2. Launch Hobbes → marketplace → search "everything" → install the
+   modelcontextprotocol one (`npx -y @modelcontextprotocol/server-everything`).
+3. Ask the AI to invoke a tool and confirm a result. Current tool names (the
+   server renamed them): **`get-sum`** (adds two numbers → 5), **`echo`**,
+   **`get-env`** (dumps the env the server sees — use it to eyeball that
+   `TEMP`/`HOME`/`USERPROFILE` point into `C:\HobbesSandbox\...` and the real
+   profile is absent).
 
 **Definition of done:** a registry server installed in the real Hobbes app runs
-sandboxed AND its tools are callable by the AI. This is the gate for "Windows
-sandbox done."
+sandboxed AND its tools are callable by the AI. The transport half is proven; the
+GUI click-through is the last confirmation.
 
 ---
 
@@ -161,18 +180,19 @@ background task so the first server launch isn't slow. Not blocking.
 
 ---
 
-## Open design decision (not a task — needs a call)
+## Open design decision — RESOLVED: `--allow` under the profile works
 
-`--allow` paths under `C:\Users\<user>` are **unreachable** by an AppContainer
-(the profile isn't traversable and can't be made so without elevation). So a
-filesystem-type MCP server pointed at a project folder in the user's home dir
-will not work on Windows. Two paths:
-- **Accept it** — registry servers get no user-file access (arguably the safe
-  default for unvetted code), documented as a known platform limitation.
-- **Build a proxy later** — the broker mediates specific allowed paths (copy-in
-  / copy-out or a mapped location under `C:\HobbesSandbox`).
-
-Decide explicitly before shipping so it's not discovered in the field.
+The earlier premise ("`--allow` paths under `C:\Users` are unreachable without
+elevation") was **wrong** — it predated the bypass-traverse-checking finding.
+Verified empirically (`hobbes-sandbox --allow C:\Users\<u>\proj -- node -e read`):
+without `--allow` a profile file is DENIED; with `--allow` it READs. The broker
+runs as the user, so it owns the user's own dirs and the existing
+`grant_access` puts the package-SID gate on the `--allow` leaf; bypass-traverse
+means `C:\Users` itself never needs to be traversable. So filesystem-type MCP
+servers pointed at a home-dir project folder **do** work on Windows, matching
+macOS/Linux. No proxy needed. The only remaining question is posture (should
+unvetted registry servers reach user-granted folders?) — and macOS/Linux already
+allow exactly that via `--allow`, so consistency says yes.
 
 ---
 
