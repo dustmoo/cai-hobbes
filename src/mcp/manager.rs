@@ -374,9 +374,16 @@ pub struct McpServerContext {
     pub tools: Vec<Tool>,
 }
 
+/// Upper bound on a single MCP `call_tool` round-trip. A misbehaving server that
+/// never replies would otherwise leave the tool call (and the Stop button, which
+/// can't abort an in-flight detached call) waiting forever. Generous enough for
+/// legitimately slow tools; the backstop is for hangs, not normal latency.
+const TOOL_CALL_TIMEOUT_SECS: u64 = 180;
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum ServerStatus {
     Loaded,        // Green - fully working
+    Connecting,    // Blue (pulsing) - launching/initializing, not yet ready
     Error,         // Red - configured but failed to load
     Disabled,      // Gray - configured but disabled
     NeedsAuth,     // Yellow - server requires OAuth authentication
@@ -1695,20 +1702,32 @@ impl McpManager {
                             {
                                 Ok(result) => result,
                                 Err(_) => {
+                                    let error_msg =
+                                        "Timed out waiting for the server to initialize"
+                                            .to_string();
                                     tracing::error!(
                                         "Timeout waiting for stdio MCP server '{}' to initialize",
                                         server_name
                                     );
+                                    failed_servers_clone
+                                        .lock()
+                                        .await
+                                        .insert(server_name, (server_config_clone, error_msg));
                                     return;
                                 }
                             }
                         }
                         Err(e) => {
+                            let error_msg = format!("Failed to launch: {}", e);
                             tracing::error!(
                                 "Failed to launch stdio MCP server '{}': {}",
                                 server_name,
                                 e
                             );
+                            failed_servers_clone
+                                .lock()
+                                .await
+                                .insert(server_name, (server_config_clone, error_msg));
                             return;
                         }
                     }
@@ -2319,7 +2338,30 @@ impl McpManager {
                         name: tool.name.clone(),
                         arguments: Some(arguments.clone()),
                     };
-                    match service_arc.call_tool(request).await {
+                    // Bound the call so a hung/unresponsive server can't wedge the
+                    // turn forever (an MCP server that never replies would
+                    // otherwise leave the tool call — and Stop — waiting
+                    // indefinitely). On timeout we surface an error result so the
+                    // turn unwinds and the UI leaves the Running state.
+                    let call_outcome = tokio::time::timeout(
+                        std::time::Duration::from_secs(TOOL_CALL_TIMEOUT_SECS),
+                        service_arc.call_tool(request),
+                    )
+                    .await;
+                    let call_result = match call_outcome {
+                        Ok(r) => r,
+                        Err(_) => {
+                            let msg = format!(
+                                "Tool '{}' timed out after {}s (server may be unresponsive)",
+                                tool.name, TOOL_CALL_TIMEOUT_SECS
+                            );
+                            tracing::error!("{}", msg);
+                            return if tx.send(Err(msg)).is_err() {
+                                tracing::error!("StreamManager receiver dropped");
+                            };
+                        }
+                    };
+                    match call_result {
                         Ok(result) => Ok(result),
                         Err(e) => {
                             let error_str = format!("{}", e);
@@ -3766,11 +3808,15 @@ impl McpManager {
                     ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Error)
                 }
             } else {
-                // Server is still initializing or hasn't been attempted yet
+                // Server is still launching/initializing (not yet connected, not
+                // failed, not auth-blocked). This is a transient state — NOT an
+                // error — so it renders as a pulsing "Connecting…" indicator. A
+                // genuine launch failure lands in `failed_servers` (→ Error);
+                // startup timeouts and spawn errors do too (see launch_servers).
                 McpServerStatus {
-                    error_message: Some("Initializing...".to_string()),
+                    error_message: None,
                     uri: config.uri.clone(),
-                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Error)
+                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Connecting)
                 }
             };
             statuses.push(status);

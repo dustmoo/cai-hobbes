@@ -239,6 +239,7 @@ pub fn InstalledMcps() -> Element {
                                         Some(s) if !s.is_loaded => "h-2.5 w-2.5 rounded-full bg-gray-500",
                                         Some(s) => match s.status {
                                             ServerStatus::Loaded => "h-2.5 w-2.5 rounded-full bg-green-500",
+                                            ServerStatus::Connecting => "h-2.5 w-2.5 rounded-full bg-blue-500 animate-pulse",
                                             ServerStatus::Error => "h-2.5 w-2.5 rounded-full bg-red-500",
                                             ServerStatus::NeedsAuth => "h-2.5 w-2.5 rounded-full bg-yellow-500",
                                             _ => "h-2.5 w-2.5 rounded-full bg-gray-500",
@@ -322,8 +323,10 @@ pub fn InstalledMcps() -> Element {
                                             }
                                         }
                                         Some(s) => {
-                                            // Errored / needs-auth: show a status label instead of the dropdown
+                                            // Connecting / errored / needs-auth: show a status label
+                                            // instead of the load-mode dropdown.
                                             let label = match s.status {
+                                                ServerStatus::Connecting => "Connecting…",
                                                 ServerStatus::Error => "Error",
                                                 ServerStatus::NeedsAuth => "Needs auth",
                                                 _ => "Not loaded",

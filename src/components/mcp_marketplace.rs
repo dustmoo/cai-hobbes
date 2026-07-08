@@ -1201,6 +1201,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
 
     let (status_color, status_text, status_bg) = match status.status {
         ServerStatus::Loaded => ("bg-green-500", "Loaded", "bg-green-900/20"),
+        ServerStatus::Connecting => ("bg-blue-500 animate-pulse", "Connecting…", "bg-blue-900/20"),
         ServerStatus::Error => ("bg-red-500", "Error", "bg-red-900/20"),
         ServerStatus::Disabled => ("bg-gray-500", "Disabled", "bg-app/20"),
         ServerStatus::NeedsAuth => ("bg-yellow-500", "Needs Auth", "bg-yellow-900/20"),
