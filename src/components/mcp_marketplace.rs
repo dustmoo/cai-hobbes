@@ -88,6 +88,11 @@ const GLAMA_TARGET_PER_PAGE: usize = 12;
 const GLAMA_MAX_BATCHES: usize = 2;
 /// Servers requested per underlying registry call (the API's page maximum).
 const GLAMA_FETCH_BATCH: u32 = 100;
+/// When the user is *searching* (vs browsing), we pull the full candidate pool,
+/// re-rank it locally by relevance to the query (see `glama_relevance`), and show
+/// this many best matches. Relevance beats the registry's popularity order for
+/// "find the exact server I typed", so cursor paging is disabled for searches.
+const GLAMA_SEARCH_RESULTS: usize = 24;
 
 impl FeaturedMcp {
     /// Whether this Glama server passes the active marketplace filters.
@@ -105,6 +110,56 @@ impl FeaturedMcp {
         let official_ok = !official_only || self.official;
         let installable_ok = !installable_only || self.installable;
         hosting_ok && official_ok && installable_ok
+    }
+
+    /// Relevance of this result to `query_lower` (already lowercased), literal
+    /// first: exact slug/name match ranks highest, then prefix, then substring,
+    /// then description, then loose token overlap. `official` + `installable`
+    /// break ties. Lets the UI float the server the user actually typed above
+    /// the registry's popularity ordering. Returns 0 for an empty query.
+    fn glama_relevance(&self, query_lower: &str) -> i32 {
+        if query_lower.is_empty() {
+            return 0;
+        }
+        let name = self.name.to_lowercase();
+        let display = self.display_name.to_lowercase();
+        let desc = self.description.to_lowercase();
+        // Slug = the segment after the last '/', e.g.
+        // "@modelcontextprotocol/server-memory" -> "server-memory".
+        let slug = name.rsplit('/').next().unwrap_or(name.as_str());
+
+        let mut score = if slug == query_lower || name == query_lower || display == query_lower {
+            1000
+        } else if slug.starts_with(query_lower)
+            || name.starts_with(query_lower)
+            || display.starts_with(query_lower)
+        {
+            600
+        } else if slug.contains(query_lower)
+            || name.contains(query_lower)
+            || display.contains(query_lower)
+        {
+            300
+        } else if desc.contains(query_lower) {
+            80
+        } else {
+            // Multi-word queries: reward any token that lands somewhere.
+            let hit = query_lower.split_whitespace().any(|t| {
+                !t.is_empty() && (name.contains(t) || display.contains(t) || desc.contains(t))
+            });
+            if hit {
+                20
+            } else {
+                0
+            }
+        };
+        if self.official {
+            score += 30;
+        }
+        if self.installable {
+            score += 10;
+        }
+        score
     }
 
     pub fn resolve_auth(&self, has_local_creds: bool) -> ResolvedAuth {
@@ -543,7 +598,14 @@ pub fn McpMarketplace() -> Element {
                                     }
 
                                     // Enough to render — remember where to resume.
-                                    if accumulated.len() >= GLAMA_TARGET_PER_PAGE {
+                                    // While searching we pull the full pool (up to
+                                    // GLAMA_MAX_BATCHES) so the local relevance
+                                    // re-rank below can surface the exact match even
+                                    // when the registry ranks it low; the early break
+                                    // only applies to browsing.
+                                    if search_param.is_none()
+                                        && accumulated.len() >= GLAMA_TARGET_PER_PAGE
+                                    {
                                         resume_cursor = end_cursor;
                                         break;
                                     }
@@ -569,6 +631,18 @@ pub fn McpMarketplace() -> Element {
                         if let Some(err) = fetch_error {
                             Err(err)
                         } else {
+                            // Searching: re-rank the pool literal-first so the
+                            // server the user typed floats to the top, then show
+                            // the best matches. Cursor paging doesn't apply to a
+                            // relevance-ordered set, so disable Next for searches.
+                            if search_param.is_some() {
+                                let q = query.to_lowercase();
+                                accumulated.sort_by(|a, b| {
+                                    b.glama_relevance(&q).cmp(&a.glama_relevance(&q))
+                                });
+                                accumulated.truncate(GLAMA_SEARCH_RESULTS);
+                                resume_cursor = None;
+                            }
                             next_cursor.set(resume_cursor);
                             // Total is unknown for cursor pagination; the label
                             // renders "Page N" for Glama.
