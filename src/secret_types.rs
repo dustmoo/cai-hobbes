@@ -25,6 +25,18 @@ pub fn composio_key_name(profile_id: &str) -> String {
     format!("{}{}", COMPOSIO_KEY_PREFIX, profile_id)
 }
 
+/// Prefix for per-connector LLM API keys (e.g., "llm_api_key_<uuid>")
+pub const LLM_KEY_PREFIX: &str = "llm_api_key_";
+
+/// Build the full keychain key for an LLM connector instance's API key.
+pub fn llm_key_name(connector_id: &str) -> String {
+    format!("{}{}", LLM_KEY_PREFIX, connector_id)
+}
+
+/// Key name for the CSV index of all per-connector LLM API keys.
+/// Needed so `load_all_from_keychain` can discover dynamically-named keys.
+pub const LLM_KEYS_INDEX_KEY: &str = "llm_connector_keys_index";
+
 /// Prefix for custom tool credentials (e.g., "composio_tool_slack__api_key")
 pub const CUSTOM_TOOL_PREFIX: &str = "composio_tool_";
 
@@ -164,14 +176,22 @@ pub trait SecretManagerTrait {
     /// Load a specific Composio key into the cache from keychain.
     fn load_composio_key(&mut self, profile_id: &str);
 
+    /// Load a specific LLM connector key into the cache from keychain.
+    fn load_llm_key(&mut self, connector_id: &str);
+
     /// Manually update a secret in the cache without keychain write.
     fn update_cache(&mut self, key: String, value: String);
 
     /// Delete all loaded secrets from the platform keychain.
     fn delete_all(&mut self) -> Vec<String>;
 
-    /// Get the current index value directly from keychain (for index updates).
-    fn get_index_from_keychain(&self) -> Option<String>;
+    /// Get a named CSV-index value directly from keychain (for index updates).
+    fn get_named_index_from_keychain(&self, index_key: &str) -> Option<String>;
+
+    /// Get the custom-tool index value directly from keychain.
+    fn get_index_from_keychain(&self) -> Option<String> {
+        self.get_named_index_from_keychain(CUSTOM_KEYS_INDEX_KEY)
+    }
 
     /// Get a reference to the secrets cache for credential extraction.
     fn secrets_ref(&self) -> &std::collections::HashMap<String, String>;
@@ -272,6 +292,44 @@ pub trait SecretManagerTrait {
     fn delete_composio_key(&mut self, profile_id: &str) -> Result<(), String> {
         let key = composio_key_name(profile_id);
         self.delete(&key)
+    }
+
+    /// Get the API key for an LLM connector instance.
+    fn get_llm_key(&self, connector_id: &str) -> Option<&String> {
+        self.get(&llm_key_name(connector_id))
+    }
+
+    /// Set the API key for an LLM connector instance and keep the discovery
+    /// index current so `load_all_from_keychain` finds it on next launch.
+    fn set_llm_key(&mut self, connector_id: &str, value: String) -> Result<(), String> {
+        let key = llm_key_name(connector_id);
+        self.set(&key, value)?;
+
+        let current_index = self
+            .get_named_index_from_keychain(LLM_KEYS_INDEX_KEY)
+            .unwrap_or_default();
+        let new_index = add_to_index_csv(&current_index, &key);
+        if new_index != current_index {
+            self.set(LLM_KEYS_INDEX_KEY, new_index)?;
+            tracing::info!("Updated LLM connector key index with: {}", key);
+        }
+        Ok(())
+    }
+
+    /// Delete the API key for an LLM connector instance and update the index.
+    fn delete_llm_key(&mut self, connector_id: &str) -> Result<(), String> {
+        let key = llm_key_name(connector_id);
+        let _ = self.delete(&key);
+
+        let current_index = self
+            .get_named_index_from_keychain(LLM_KEYS_INDEX_KEY)
+            .unwrap_or_default();
+        if !current_index.is_empty() {
+            let new_index = remove_from_index_csv(&current_index, &key);
+            self.set(LLM_KEYS_INDEX_KEY, new_index)?;
+            tracing::info!("Removed LLM connector key from index: {}", key);
+        }
+        Ok(())
     }
 }
 
@@ -381,6 +439,23 @@ mod tests {
 
         let empty_keys = parse_index_csv("");
         assert!(empty_keys.is_empty());
+    }
+
+    #[test]
+    fn test_llm_key_name_and_index_roundtrip() {
+        let key = llm_key_name("abc-123");
+        assert_eq!(key, "llm_api_key_abc-123");
+        assert!(key.starts_with(LLM_KEY_PREFIX));
+
+        // Index round-trip: add two keys, remove one
+        let idx = add_to_index_csv("", &llm_key_name("a"));
+        let idx = add_to_index_csv(&idx, &llm_key_name("b"));
+        assert_eq!(parse_index_csv(&idx).len(), 2);
+        // Re-adding is a no-op
+        let idx = add_to_index_csv(&idx, &llm_key_name("a"));
+        assert_eq!(parse_index_csv(&idx).len(), 2);
+        let idx = remove_from_index_csv(&idx, &llm_key_name("a"));
+        assert_eq!(parse_index_csv(&idx), vec![llm_key_name("b")]);
     }
 
     #[test]

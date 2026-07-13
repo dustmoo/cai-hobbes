@@ -16,6 +16,12 @@ pub struct GeminiCacheEntry {
     pub cached_message_count: usize,
     /// Hash of the system instruction + tools + cached contents prefix
     pub prefix_hash: u64,
+    /// Fingerprint of the API key the cache was created with. Server-side
+    /// cachedContents are bound to the key's project; with multiple Gemini
+    /// connector instances sharing the process-wide store, an entry created
+    /// under one key must never be reused for a request signed with another.
+    #[serde(default)]
+    pub key_fingerprint: u64,
     /// When this cache expires (UTC)
     pub expires_at: DateTime<Utc>,
     /// Token count of the cached content (from API response)
@@ -67,11 +73,22 @@ impl GeminiCacheStore {
         }
     }
 
-    /// Retrieve a valid cached entry for the given session_id, model, and prefix hash.
-    pub fn get_valid_cache(&self, session_id: &str, model: &str, prefix_hash: u64) -> Option<&GeminiCacheEntry> {
+    /// Retrieve a valid cached entry for the given session_id, model, prefix
+    /// hash, and API-key fingerprint.
+    pub fn get_valid_cache(
+        &self,
+        session_id: &str,
+        model: &str,
+        prefix_hash: u64,
+        key_fingerprint: u64,
+    ) -> Option<&GeminiCacheEntry> {
         if let Some(entry) = self.entries.get(session_id) {
-            // Must match model, prefix hash, and not be expired
-            if entry.model == model && entry.prefix_hash == prefix_hash && entry.expires_at > Utc::now() {
+            // Must match model, prefix hash, creating key, and not be expired
+            if entry.model == model
+                && entry.prefix_hash == prefix_hash
+                && entry.key_fingerprint == key_fingerprint
+                && entry.expires_at > Utc::now()
+            {
                 return Some(entry);
             }
         }
@@ -92,6 +109,15 @@ impl GeminiCacheStore {
     pub fn cleanup_expired(&mut self) {
         self.entries.retain(|_, entry| entry.expires_at > Utc::now());
     }
+}
+
+/// Fingerprint an API key for cache-entry scoping. Not a secret hash — just a
+/// stable discriminator so entries from different keys never cross-match.
+pub fn key_fingerprint(api_key: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    hasher.write(api_key.as_bytes());
+    hasher.finish()
 }
 
 /// Compute a stable hash for system instruction + tools + prefix messages.
@@ -132,6 +158,7 @@ pub async fn api_create_cache(
     contents: Vec<Content>,
     ttl_seconds: u32,
     prefix_hash: u64,
+    key_fp: u64,
 ) -> Result<GeminiCacheEntry, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}/v1beta/cachedContents?key={}", base_url.trim_end_matches('/'), api_key);
     let ttl_str = format!("{}s", ttl_seconds);
@@ -196,6 +223,7 @@ pub async fn api_create_cache(
         model: model_path,
         cached_message_count: contents.len(),
         prefix_hash,
+        key_fingerprint: key_fp,
         expires_at,
         token_count,
     })
@@ -274,6 +302,7 @@ mod tests {
         let session_id = "test-session".to_string();
         let model = "models/gemini-2.5-flash".to_string();
         let prefix_hash = 12345;
+        let key_fp = key_fingerprint("test-api-key");
 
         // Insert non-expired entry
         let entry = GeminiCacheEntry {
@@ -281,17 +310,22 @@ mod tests {
             model: model.clone(),
             cached_message_count: 2,
             prefix_hash,
+            key_fingerprint: key_fp,
             expires_at: Utc::now() + chrono::Duration::seconds(60),
             token_count: Some(500),
         };
         store.insert_entry(session_id.clone(), entry);
 
         // Verify valid lookup
-        assert!(store.get_valid_cache(&session_id, &model, prefix_hash).is_some());
+        assert!(store.get_valid_cache(&session_id, &model, prefix_hash, key_fp).is_some());
         // Verify mismatch model yields None
-        assert!(store.get_valid_cache(&session_id, "models/gemini-2.5-pro", prefix_hash).is_none());
+        assert!(store.get_valid_cache(&session_id, "models/gemini-2.5-pro", prefix_hash, key_fp).is_none());
         // Verify mismatch hash yields None
-        assert!(store.get_valid_cache(&session_id, &model, 9999).is_none());
+        assert!(store.get_valid_cache(&session_id, &model, 9999, key_fp).is_none());
+        // Verify a different API key never reuses another key's cache entry
+        let other_key_fp = key_fingerprint("other-api-key");
+        assert_ne!(key_fp, other_key_fp);
+        assert!(store.get_valid_cache(&session_id, &model, prefix_hash, other_key_fp).is_none());
 
         // Expire the entry
         let expired_entry = GeminiCacheEntry {
@@ -299,13 +333,14 @@ mod tests {
             model: model.clone(),
             cached_message_count: 2,
             prefix_hash,
+            key_fingerprint: key_fp,
             expires_at: Utc::now() - chrono::Duration::seconds(10),
             token_count: Some(500),
         };
         store.insert_entry(session_id.clone(), expired_entry);
 
         // Verify expired entry is not returned
-        assert!(store.get_valid_cache(&session_id, &model, prefix_hash).is_none());
+        assert!(store.get_valid_cache(&session_id, &model, prefix_hash, key_fp).is_none());
 
         // Test cleanup
         store.cleanup_expired();

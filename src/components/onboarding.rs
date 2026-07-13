@@ -132,7 +132,6 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
             LlmProvider::Claude => claude_api_key.read().clone(),
             LlmProvider::OpenAiCompat => oai_api_key.read().clone(), // may be empty (optional)
         };
-        let keychain_key = provider.keychain_key().to_string();
         let use_biometric =
             is_sandboxed() && *keychain_mode.read() == KeychainStorageMode::Biometric;
         let selected_mode = if is_sandboxed() {
@@ -141,7 +140,7 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
             KeychainStorageMode::LocalKeychain
         };
 
-        let endpoint_val = oai_endpoint.read().clone();
+        let endpoint_val = oai_endpoint.read().trim().to_string();
         let model_val = oai_model.read().clone();
         let oai_key_val = oai_api_key.read().clone();
 
@@ -181,13 +180,95 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                 }
             }
 
-            // Save API key to keychain (skip for OpenAI-compat if key is empty)
+            // Build the first connector instance for the chosen provider kind
+            let mut current_settings = settings.read().clone();
+            current_settings.keychain_storage_mode = selected_mode;
+
+            let config = match &provider {
+                LlmProvider::Gemini => crate::settings::ProviderInstanceConfig::Gemini(
+                    crate::settings::GeminiConfig {
+                        api_key: Some(api_key_for_keychain.clone()),
+                        ..Default::default()
+                    },
+                ),
+                LlmProvider::Claude => crate::settings::ProviderInstanceConfig::Claude(
+                    crate::settings::ClaudeConfig {
+                        api_key: Some(api_key_for_keychain.clone()),
+                        ..Default::default()
+                    },
+                ),
+                LlmProvider::OpenAiCompat => crate::settings::ProviderInstanceConfig::OpenAiCompat(
+                    crate::settings::OpenAiCompatConfig {
+                        endpoint: endpoint_val,
+                        model: model_val,
+                        api_key: if api_key_for_keychain.is_empty() {
+                            None
+                        } else {
+                            Some(api_key_for_keychain.clone())
+                        },
+                        ..Default::default()
+                    },
+                ),
+            };
+
+            // Reuse an existing unconfigured connector of this kind (e.g. the
+            // placeholder created by settings migration) instead of adding a
+            // duplicate; otherwise add a fresh instance. Either way it becomes
+            // the globally active connector.
+            let existing_id = current_settings
+                .llm_connectors
+                .iter()
+                .find(|c| {
+                    c.provider() == provider && !current_settings.is_connector_configured(c)
+                })
+                .map(|c| c.id.clone());
+            let connector_id = match existing_id {
+                Some(id) => {
+                    if let Some(instance) = current_settings.connector_by_id_mut(&id) {
+                        instance.config = config;
+                    }
+                    current_settings.active_connector_id = Some(id.clone());
+                    current_settings.active_llm = provider;
+                    id
+                }
+                None => match current_settings.add_connector(provider.display_name(), config) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        error_message.set(format!("Failed to add connector: {}", e));
+                        is_validating.set(false);
+                        return;
+                    }
+                },
+            };
+
+            // Save the API key under the per-connector keychain item and keep
+            // the discovery index current (skip for OpenAI-compat if key is empty)
             if !api_key_for_keychain.is_empty() {
+                let kc_key = crate::secret_types::llm_key_name(&connector_id);
+                let new_index = {
+                    let sm_read = secret_manager.read();
+                    let current_index = sm_read
+                        .get_named_index_from_keychain(crate::secret_types::LLM_KEYS_INDEX_KEY)
+                        .unwrap_or_default();
+                    crate::secret_types::add_to_index_csv(&current_index, &kc_key)
+                };
                 let save_result = tokio::task::spawn_blocking({
                     let api_key = api_key_for_keychain.clone();
-                    let kc_key = keychain_key.clone();
+                    let kc_key = kc_key.clone();
+                    let new_index = new_index.clone();
                     move || {
-                        crate::secret_manager::save_secret_to_keychain(&kc_key, &api_key, use_biometric)
+                        crate::secret_manager::save_secret_to_keychain(
+                            &kc_key,
+                            &api_key,
+                            use_biometric,
+                        )?;
+                        // The index must stay readable without a biometric prompt
+                        // so startup discovery works before authentication.
+                        crate::secret_manager::save_secret_to_keychain(
+                            crate::secret_types::LLM_KEYS_INDEX_KEY,
+                            &new_index,
+                            false,
+                        )
                     }
                 })
                 .await;
@@ -203,34 +284,13 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                 // Update the SecretManager cache so downstream consumers
                 // (e.g. Composio profile hydration) see the key immediately
                 // without requiring an app restart.
-                secret_manager.write().update_cache(
-                    keychain_key.clone(),
-                    api_key_for_keychain.clone(),
-                );
-            }
-
-            let mut current_settings = settings.read().clone();
-            current_settings.active_llm = provider;
-            current_settings.keychain_storage_mode = selected_mode;
-
-            // Apply provider-specific config
-            match &provider {
-                LlmProvider::Gemini => {
-                    current_settings.gemini_config.api_key = Some(api_key_for_keychain);
-                }
-                LlmProvider::Claude => {
-                    current_settings.claude_config.api_key = Some(api_key_for_keychain);
-                    if current_settings.claude_config.model.is_empty() {
-                        current_settings.claude_config.model =
-                            crate::llm::claude_models::ClaudeModel::DEFAULT_CHAT_SLUG.to_string();
-                    }
-                }
-                LlmProvider::OpenAiCompat => {
-                    current_settings.openai_compat_config.endpoint = endpoint_val;
-                    current_settings.openai_compat_config.model = model_val;
-                    if !api_key_for_keychain.is_empty() {
-                        current_settings.openai_compat_config.api_key = Some(api_key_for_keychain);
-                    }
+                {
+                    let mut sm_write = secret_manager.write();
+                    sm_write.update_cache(kc_key, api_key_for_keychain.clone());
+                    sm_write.update_cache(
+                        crate::secret_types::LLM_KEYS_INDEX_KEY.to_string(),
+                        new_index,
+                    );
                 }
             }
 
@@ -488,7 +548,7 @@ pub fn Onboarding(needs_onboarding: Memo<bool>) -> Element {
                                     r#type: "text",
                                     placeholder: "http://localhost:11434",
                                     value: "{oai_endpoint}",
-                                    oninput: move |event| oai_endpoint.set(event.value())
+                                    oninput: move |event| oai_endpoint.set(event.value().trim().to_string())
                                 }
                                 p {
                                     class: "mt-1 text-xs text-fg-muted",

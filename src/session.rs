@@ -118,8 +118,13 @@ pub struct Session {
     /// Acts as the live authority for tool-calling/MCP context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composio_profile: Option<String>,
-    /// Per-session LLM provider override. None → follow global `Settings::active_llm`.
-    /// Set together with `chat_model` by the chat-bar pickers so the pair stays consistent.
+    /// Per-session LLM connector override (stable connector ID).
+    /// None → fall back to `llm_provider` kind match, then the global active connector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_connector_id: Option<String>,
+    /// Per-session LLM provider-kind override. Legacy pin (pre-multi-connector)
+    /// and downgrade-safety mirror of `llm_connector_id`'s kind — the pickers
+    /// set both. None → follow the global active connector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_provider: Option<crate::settings::LlmProvider>,
     /// Per-session chat model override. None → the effective provider's configured model.
@@ -290,15 +295,24 @@ pub fn compute_page_budget(
     settings: &crate::settings::Settings,
     session: Option<&Session>,
 ) -> usize {
-    let (provider, model) = match session {
-        Some(s) => (
-            settings.provider_for_session(s),
-            settings.chat_model_for_session(s),
-        ),
-        None => (settings.active_llm, settings.active_chat_model()),
+    let instance = match session {
+        Some(s) => settings.connector_for_session(s),
+        None => settings.active_connector(),
     };
-    let tuning = settings.effective_context_tuning_for(provider);
-    let provider_context_tokens = settings.resolve_context_window_for(provider, &model);
+    let model = match session {
+        Some(s) => settings.chat_model_for_session(s),
+        None => settings.active_chat_model(),
+    };
+    let (tuning, provider_context_tokens) = match instance {
+        Some(inst) => (
+            settings.effective_context_tuning_for_connector(inst),
+            settings.resolve_context_window_for_connector(inst, &model),
+        ),
+        None => (
+            settings.effective_context_tuning_for(settings.active_llm),
+            settings.resolve_context_window_for(settings.active_llm, &model),
+        ),
+    };
 
     if let Some(max_tokens) = provider_context_tokens {
         let ratio = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(
@@ -487,16 +501,25 @@ impl SessionState {
         // Floor at 4K so small/unconfigured models still get meaningful space.
         // Cap at 32K so even enormous context windows don't allow bloat.
         let session = self.sessions.get(session_id);
-        let (provider, model) = match session {
-            Some(s) => (
-                settings.provider_for_session(s),
-                settings.chat_model_for_session(s),
-            ),
-            None => (settings.active_llm, settings.active_chat_model()),
+        let instance = match session {
+            Some(s) => settings.connector_for_session(s),
+            None => settings.active_connector(),
         };
-        let tuning = settings.effective_context_tuning_for(provider);
-        let max_scratchpad_chars: usize = settings
-            .resolve_context_window_for(provider, &model)
+        let model = match session {
+            Some(s) => settings.chat_model_for_session(s),
+            None => settings.active_chat_model(),
+        };
+        let (tuning, context_tokens) = match instance {
+            Some(inst) => (
+                settings.effective_context_tuning_for_connector(inst),
+                settings.resolve_context_window_for_connector(inst, &model),
+            ),
+            None => (
+                settings.effective_context_tuning_for(settings.active_llm),
+                settings.resolve_context_window_for(settings.active_llm, &model),
+            ),
+        };
+        let max_scratchpad_chars: usize = context_tokens
             .map(|tokens| {
                 let chars = (tokens as f64 * tuning.chars_per_token * 0.02) as usize;
                 chars.clamp(4_000, 32_000)
@@ -1139,6 +1162,7 @@ impl SessionState {
             accumulated_turns: 0,
             memory_optimization_summary: None,
             composio_profile: initial_profile,
+            llm_connector_id: None,
             llm_provider: None,
             chat_model: None,
             loaded_skills: HashMap::new(),
@@ -2036,6 +2060,7 @@ mod tests {
             accumulated_turns: 0,
             memory_optimization_summary: None,
             composio_profile: None,
+            llm_connector_id: None,
             llm_provider: None,
             chat_model: None,
             loaded_skills: HashMap::new(),

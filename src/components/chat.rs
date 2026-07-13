@@ -162,6 +162,8 @@ pub fn ChatWindow(
     let mut delete_message_count = use_signal(|| 0);
     let mut has_new_comments = use_signal(|| false);
     let mut has_pending_approvals = use_signal(|| false);
+    // Dismiss state for the small-context-window warning banner.
+    let mut ctx_window_warning_dismissed = use_signal(|| false);
     use_context_provider(|| has_pending_approvals);
 
     // New Chat with Memory Modal State
@@ -889,12 +891,43 @@ pub fn ChatWindow(
     };
 
     let session_guard = session.read();
+
+    // Context window of the active session's connector, when it's small enough to
+    // degrade tool-calling. Hobbes is a tool harness — with a small window the
+    // system prompt + tool definitions crowd out tool results and the model loops.
+    let small_ctx_window: Option<usize> = session_guard
+        .as_ref()
+        .and_then(|sess| {
+            let s = settings.read();
+            let instance = s.connector_for_session(sess)?;
+            let model = s.chat_model_for_session(sess);
+            s.resolve_context_window_for_connector(instance, &model)
+        })
+        .filter(|&w| w < crate::llm::config::RECOMMENDED_MIN_CONTEXT_TOKENS);
+    let rec_min_ctx = crate::llm::config::RECOMMENDED_MIN_CONTEXT_TOKENS;
+
     if session_guard.is_some() {
         rsx! {
 
             div {
                 class: "{root_classes}",
                 onmounted: move |cx| container_element.set(Some(cx.data())),
+                if let Some(tokens) = small_ctx_window {
+                    if !ctx_window_warning_dismissed() {
+                        div {
+                            class: "flex items-start gap-2 mx-3 mt-2 p-2 rounded border border-yellow-600/40 bg-yellow-500/5",
+                            span { class: "text-yellow-500 shrink-0 text-sm", "⚠️" }
+                            p { class: "flex-grow text-xs text-yellow-200",
+                                "This connector's context window is small ({tokens} tokens). Hobbes relies on tools, and system prompt + tool definitions alone use ~5–7K tokens — under {rec_min_ctx} tokens the model may loop or drop tool results. Consider a connector with a larger context window."
+                            }
+                            button {
+                                class: "shrink-0 text-yellow-500/60 hover:text-yellow-300 text-xs",
+                                onclick: move |_| ctx_window_warning_dismissed.set(true),
+                                "✕"
+                            }
+                        }
+                    }
+                }
                 MessageList {
                     stream_update_trigger: stream_update_trigger,
                     show_scroll_button: show_scroll_button,

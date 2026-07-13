@@ -141,6 +141,7 @@ mod tests {
             accumulated_turns: 0,
             memory_optimization_summary: None,
             composio_profile: None,
+            llm_connector_id: None,
             llm_provider: None,
             chat_model: None,
             loaded_skills: std::collections::HashMap::new(),

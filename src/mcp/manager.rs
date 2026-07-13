@@ -3311,38 +3311,30 @@ impl McpManager {
                         let request =
                             ToolSelectionRequest::new(toolkit_slug.clone(), None, candidates);
 
-                        // Use the actively selected LLM provider for smart selection.
-                        // Fall back to any configured provider so selection still
-                        // works when the active provider has no credentials.
-                        let provider = {
-                            use crate::settings::LlmProvider;
-                            let active = settings_snapshot.active_llm;
-                            if settings_snapshot.is_provider_configured(active) {
-                                Some(active)
-                            } else {
-                                [
-                                    LlmProvider::Gemini,
-                                    LlmProvider::Claude,
-                                    LlmProvider::OpenAiCompat,
-                                ]
-                                .into_iter()
-                                .find(|p| settings_snapshot.is_provider_configured(*p))
-                            }
-                        };
+                        // Use the actively selected LLM connector for smart selection.
+                        // Fall back to any configured connector so selection still
+                        // works when the active one has no credentials.
+                        let instance = settings_snapshot
+                            .active_connector()
+                            .filter(|c| settings_snapshot.is_connector_configured(c))
+                            .or_else(|| {
+                                settings_snapshot
+                                    .llm_connectors
+                                    .iter()
+                                    .find(|c| settings_snapshot.is_connector_configured(c))
+                            })
+                            .cloned();
 
-                        let selection = match provider {
-                            Some(provider) => {
+                        let selection = match instance {
+                            Some(instance) => {
                                 tracing::info!(
-                                    "Tool selection using provider {:?} for toolkit '{}'",
-                                    provider,
+                                    "Tool selection using connector '{}' ({:?}) for toolkit '{}'",
+                                    instance.name,
+                                    instance.provider(),
                                     toolkit_slug
                                 );
-                                let model = settings_snapshot.chat_model_for(provider);
-                                let connector = crate::llm::build_connector_for(
-                                    &settings_snapshot,
-                                    provider,
-                                    &model,
-                                );
+                                let connector =
+                                    crate::llm::build_connector_for_instance(&instance, None);
                                 connector.select_tools_for_toolkit(&request).await
                             }
                             None => {

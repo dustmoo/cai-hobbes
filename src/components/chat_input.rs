@@ -47,9 +47,9 @@ pub enum ChatCommand {
     SwitchProfile(usize),
     /// Switch the current session's model to the model at this index in the available models list.
     SwitchModel(usize),
-    /// Switch the current session's LLM provider to the provider at this index
-    /// in `LlmProvider::all_variants()`.
-    SwitchProvider(usize),
+    /// Switch the current session's LLM connector to the instance with this
+    /// stable ID in `Settings::llm_connectors`.
+    SwitchConnector(String),
     /// Toggle the model selector dropdown in the chat bar.
     #[allow(dead_code)] // Constructed and consumed locally via signal pattern
     ToggleModelSelector,
@@ -181,7 +181,7 @@ pub fn ChatInput(
                 | ChatCommand::DeleteSession(_)
                 | ChatCommand::SwitchProfile(_)
                 | ChatCommand::SwitchModel(_)
-                | ChatCommand::SwitchProvider(_)
+                | ChatCommand::SwitchConnector(_)
                 | ChatCommand::CloseTab => {
                     // Handled globally in main.rs
                 }
@@ -722,50 +722,67 @@ pub fn ChatInput(
                 }
                 SessionCostIcon {}
 
-                // LLM Provider Selector (session-scoped, mirrors the profile picker)
+                // LLM Connector Selector (session-scoped, mirrors the profile picker)
                 { if ui_state.read().show_provider_selector {
                     {
-                        let active_provider = {
+                        // The session's resolved connector (pin → legacy kind → global active)
+                        let active_instance = {
                             let settings_read = settings.read();
                             session_state.read().get_active_session()
-                                .map(|s| settings_read.provider_for_session(s))
-                                .unwrap_or(settings_read.active_llm)
+                                .and_then(|s| settings_read.connector_for_session(s).cloned())
+                                .or_else(|| settings_read.active_connector().cloned())
                         };
-                        let other_providers: Vec<(usize, LlmProvider)> = LlmProvider::all_variants()
+                        let active_id = active_instance.as_ref().map(|c| c.id.clone());
+                        // Every connector, in canonical order — the index drives the
+                        // ⇧⌥⌘{n} hotkey hint. The session's current connector is shown
+                        // highlighted rather than hidden.
+                        let all_connectors: Vec<(usize, crate::settings::ProviderInstance)> = settings
+                            .read()
+                            .llm_connectors
                             .iter()
-                            .copied()
+                            .cloned()
                             .enumerate()
-                            .filter(|(_, p)| *p != active_provider)
                             .collect();
 
-                        if !other_providers.is_empty() {
+                        if let (Some(active), true) = (active_instance, all_connectors.len() > 1) {
+                            let active_provider = active.provider();
                             rsx! {
                                 div {
                                     class: "relative",
                                     button {
                                         class: format!("w-8 h-8 rounded-full {} border border-subtle flex items-center justify-center text-xs font-bold text-fg hover:brightness-110 hover:border-primary-500 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600 shadow-md", active_provider.color_class()),
-                                        title: "Provider: {active_provider.display_name()}",
+                                        title: "Connector: {active.name} ({active_provider.display_name()})",
                                         onclick: move |_| show_provider_selector.set(!show_provider_selector()),
-                                        "{active_provider.initial()}"
+                                        "{active.initial()}"
                                     }
 
                                     if show_provider_selector() {
                                         div {
                                             class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
-                                            for (index, provider) in other_providers.into_iter() {
+                                            for (index, instance) in all_connectors.into_iter() {
                                                 {
-                                                    let configured = settings.read().is_provider_configured(provider);
+                                                    let configured = settings.read().is_connector_configured(&instance);
+                                                    let is_current = Some(&instance.id) == active_id.as_ref();
+                                                    let provider = instance.provider();
+                                                    let connector_id = instance.id.clone();
+                                                    let name = instance.name.clone();
+                                                    let initial = instance.initial();
+                                                    let row_class: &'static str = if is_current {
+                                                        "w-full text-left px-4 py-2 text-sm text-fg bg-primary-900/40 transition-colors flex items-center justify-between"
+                                                    } else if configured {
+                                                        "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between"
+                                                    } else {
+                                                        "w-full text-left px-4 py-2 text-sm text-fg-muted/40 hover:bg-primary-900/50 hover:text-fg-muted transition-colors flex items-center justify-between"
+                                                    };
 
                                                     rsx! {
                                                         button {
-                                                            class: if configured {
-                                                                "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between"
-                                                            } else {
-                                                                "w-full text-left px-4 py-2 text-sm text-fg-muted/40 hover:bg-primary-900/50 hover:text-fg-muted transition-colors flex items-center justify-between"
-                                                            },
+                                                            class: "{row_class}",
                                                             onclick: move |_| {
-                                                                if configured {
-                                                                    chat_command.set(Some(ChatCommand::SwitchProvider(index)));
+                                                                if is_current {
+                                                                    // Already the session's connector — just close
+                                                                } else if configured {
+                                                                    chat_command.set(Some(ChatCommand::SwitchConnector(connector_id.clone())));
                                                                 } else {
                                                                     chat_command.set(Some(ChatCommand::SwitchToSettingsTab(crate::settings::SettingsTab::General, None)));
                                                                 }
@@ -775,9 +792,12 @@ pub fn ChatInput(
                                                                 class: "flex items-center space-x-2",
                                                                 span {
                                                                     class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm shrink-0", provider.color_class()),
-                                                                    "{provider.initial()}"
+                                                                    "{initial}"
                                                                 }
-                                                                span { class: "truncate", "{provider.display_name()}" }
+                                                                span { class: "truncate", "{name}" }
+                                                                if is_current {
+                                                                    span { class: "text-primary-400 text-xs shrink-0", "✓" }
+                                                                }
                                                             }
                                                             if index < 9 {
                                                                 span {
@@ -807,19 +827,27 @@ pub fn ChatInput(
                 } else { rsx!({}) } }
 
                 // Model Selector Dropdown (session-scoped: slots/model follow the
-                // session's effective provider, falling back to global settings)
+                // session's effective connector, falling back to the global active one)
                 { if ui_state.read().show_model_selector {
-                    let (session_provider, current_model) = {
+                    let (session_provider, current_model, slots) = {
                         let settings_read = settings.read();
-                        match session_state.read().get_active_session() {
-                            Some(s) => (
-                                settings_read.provider_for_session(s),
-                                settings_read.chat_model_for_session(s),
-                            ),
-                            None => (settings_read.active_llm, settings_read.active_chat_model()),
-                        }
+                        let state = session_state.read();
+                        let session = state.get_active_session();
+                        let instance = session
+                            .and_then(|s| settings_read.connector_for_session(s))
+                            .or_else(|| settings_read.active_connector());
+                        let provider = instance
+                            .map(|i| i.provider())
+                            .unwrap_or(settings_read.active_llm);
+                        let current_model = match session {
+                            Some(s) => settings_read.chat_model_for_session(s),
+                            None => settings_read.active_chat_model(),
+                        };
+                        let slots = instance
+                            .map(|i| i.config.model_slots().clone())
+                            .unwrap_or_default();
+                        (provider, current_model, slots)
                     };
-                    let slots = settings.read().model_slots_for(session_provider);
                     let user_icons = settings.read().model_icons.clone();
                     // Icon priority: user-set icon > slot position icon > default
                     let current_slot_idx = slots.iter().position(|s| s == &current_model);

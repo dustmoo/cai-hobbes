@@ -16,6 +16,69 @@ use rfd;
 use std::io::Write;
 use zip::write::{FileOptions, ZipWriter};
 
+/// Copy a connector's config into the matching legacy singleton slot so the
+/// per-provider editing blocks (bound to `gemini_config` / `openai_compat_config`
+/// / `claude_config`) edit it in place. Also points `active_llm` at its kind so
+/// the right block renders.
+fn load_instance_into_draft(draft: &mut Settings, connector_id: &str) {
+    use crate::settings::ProviderInstanceConfig;
+    if let Some(instance) = draft.connector_by_id(connector_id).cloned() {
+        match instance.config {
+            ProviderInstanceConfig::Gemini(c) => draft.gemini_config = c,
+            ProviderInstanceConfig::OpenAiCompat(c) => draft.openai_compat_config = c,
+            ProviderInstanceConfig::Claude(c) => draft.claude_config = c,
+        }
+    }
+}
+
+/// The provider kind of the connector currently selected for editing.
+fn selected_kind(
+    draft: &Settings,
+    selected: &Option<String>,
+) -> Option<crate::settings::LlmProvider> {
+    selected
+        .as_deref()
+        .and_then(|id| draft.connector_by_id(id))
+        .map(|c| c.provider())
+}
+
+/// Flush edits from the legacy singleton slot back into the connector instance.
+/// Returns true when the instance actually changed.
+fn flush_draft_into_instance(draft: &mut Settings, connector_id: &str) -> bool {
+    use crate::settings::{LlmProvider, ProviderInstanceConfig};
+    let kind = match draft.connector_by_id(connector_id) {
+        Some(c) => c.provider(),
+        None => return false,
+    };
+    let config = match kind {
+        LlmProvider::Gemini => ProviderInstanceConfig::Gemini(draft.gemini_config.clone()),
+        LlmProvider::OpenAiCompat => {
+            ProviderInstanceConfig::OpenAiCompat(draft.openai_compat_config.clone())
+        }
+        LlmProvider::Claude => ProviderInstanceConfig::Claude(draft.claude_config.clone()),
+    };
+    if let Some(instance) = draft.connector_by_id_mut(connector_id) {
+        if instance.config != config {
+            instance.config = config;
+            return true;
+        }
+    }
+    false
+}
+
+/// Settings view used for change detection. The legacy singleton configs and
+/// `active_llm` are editing mirrors of the selected connector (their edits are
+/// flushed into `llm_connectors` reactively), so they're excluded to avoid
+/// phantom "unsaved changes" when a connector is merely selected for editing.
+fn comparable(s: &Settings) -> Settings {
+    let mut c = s.clone();
+    c.active_llm = Default::default();
+    c.gemini_config = Default::default();
+    c.openai_compat_config = Default::default();
+    c.claude_config = Default::default();
+    c
+}
+
 #[component]
 pub fn SettingsPanel() -> Element {
     let app_name = crate::settings::get_app_name();
@@ -32,8 +95,57 @@ pub fn SettingsPanel() -> Element {
     let mut secret_manager = use_context::<Signal<crate::secret_manager::SecretManager>>();
     let save_error = use_context::<crate::components::shared::SaveErrorContext>().0;
 
-    // Create a local copy of the settings for editing.
-    let mut local_settings = use_signal(|| settings.read().clone());
+    // The connector instance currently selected for editing in the list.
+    let mut selected_connector_id = use_signal(|| {
+        settings
+            .read()
+            .active_connector()
+            .map(|c| c.id.clone())
+    });
+
+    // Create a local copy of the settings for editing. The selected connector's
+    // config is loaded into the legacy singleton slots, which the per-provider
+    // editing blocks bind to.
+    let mut local_settings = use_signal(|| {
+        let mut draft = settings.read().clone();
+        if let Some(id) = draft.active_connector().map(|c| c.id.clone()) {
+            load_instance_into_draft(&mut draft, &id);
+        }
+        draft
+    });
+
+    // Reactively flush singleton-slot edits back into the selected connector
+    // instance. Converges in one extra pass: the write only happens when the
+    // instance's config actually differs from the editing mirror.
+    use_effect(move || {
+        let selected = selected_connector_id.read().clone();
+        let needs_flush = match (&selected, &*local_settings.read()) {
+            (Some(id), draft) => {
+                use crate::settings::{LlmProvider, ProviderInstanceConfig};
+                match draft.connector_by_id(id) {
+                    Some(instance) => match (instance.provider(), &instance.config) {
+                        (LlmProvider::Gemini, ProviderInstanceConfig::Gemini(c)) => {
+                            *c != draft.gemini_config
+                        }
+                        (LlmProvider::OpenAiCompat, ProviderInstanceConfig::OpenAiCompat(c)) => {
+                            *c != draft.openai_compat_config
+                        }
+                        (LlmProvider::Claude, ProviderInstanceConfig::Claude(c)) => {
+                            *c != draft.claude_config
+                        }
+                        _ => false,
+                    },
+                    None => false,
+                }
+            }
+            (None, _) => false,
+        };
+        if needs_flush {
+            if let Some(id) = selected {
+                flush_draft_into_instance(&mut local_settings.write(), &id);
+            }
+        }
+    });
 
     // This signal will track if the local state differs from the global state.
     let mut has_unsaved_changes = use_signal(|| false);
@@ -100,49 +212,80 @@ pub fn SettingsPanel() -> Element {
                 .await
                 {
                     Ok(discovered) => {
-                        // Auto-detect context length from the currently selected model.
-                        // IMPORTANT: Write to global `settings` (not `local_settings`) to avoid
-                        // dirtying the unsaved-changes tracker. The sync-back effect propagates
-                        // global → local cleanly without triggering scroll-resetting re-renders.
+                        // Auto-detect context window + calibrate the tokenizer for the
+                        // selected model, writing results into the SELECTED connector
+                        // instance — the value the prompt builder actually reads per
+                        // session. The old code wrote only the legacy singleton, so
+                        // multi-connector instances kept a null window; the budgeter then
+                        // treated them as unlimited and overran small servers (which
+                        // silently truncate, making tool-calling models loop). The legacy
+                        // singleton is mirrored too so the editing buffer stays in sync.
+                        let selected_id = selected_connector_id.peek().clone();
                         if !current_model.is_empty() {
-                            if let Some(model_info) = discovered.iter().find(|m| m.id == current_model) {
-                                if let Some(ctx_len) = model_info.context_length {
-                                    let existing = settings.peek().openai_compat_config.max_context_tokens;
-                                    if existing != Some(ctx_len) {
+                            // Current instance config is the source of truth for this connector.
+                            let current_cfg = selected_id.as_deref().and_then(|id| {
+                                match settings.peek().connector_by_id(id).map(|c| &c.config) {
+                                    Some(crate::settings::ProviderInstanceConfig::OpenAiCompat(c)) => Some(c.clone()),
+                                    _ => None,
+                                }
+                            });
+
+                            let detected_ctx = discovered
+                                .iter()
+                                .find(|m| m.id == current_model)
+                                .and_then(|m| m.context_length);
+
+                            // Calibrate only when the instance has no manual override.
+                            let need_calibration = current_cfg
+                                .as_ref()
+                                .map(|c| c.context_tuning.chars_per_token.is_none())
+                                .unwrap_or(false);
+                            let calibrated_ratio = if need_calibration {
+                                crate::services::openai_compat_validation::calibrate_tokenizer(
+                                    &endpoint,
+                                    &current_model,
+                                    api_key.as_deref(),
+                                )
+                                .await
+                                // Round to 1 decimal place for cleanliness.
+                                .map(|ratio| (ratio * 10.0).round() / 10.0)
+                            } else {
+                                None
+                            };
+
+                            if let (Some(id), Some(mut cfg)) = (selected_id.as_deref(), current_cfg) {
+                                let mut changed = false;
+                                if let Some(ctx_len) = detected_ctx {
+                                    if cfg.max_context_tokens != Some(ctx_len) {
                                         tracing::info!(
                                             "Auto-detected context window: {} tokens for model '{}'",
                                             ctx_len, current_model
                                         );
-                                        settings.write().openai_compat_config.max_context_tokens = Some(ctx_len);
-                                        // Persist immediately so this value survives the next restart
-                                        // without requiring a manual Settings → Save cycle.
-                                        let sm = settings_manager.peek().clone();
-                                        let s  = settings.peek().clone();
-                                        let _ = sm.save(&s);
+                                        cfg.max_context_tokens = Some(ctx_len);
+                                        changed = true;
                                     }
                                 }
-                            }
-
-                            // Auto-calibrate chars_per_token by probing the tokenizer.
-                            // Only runs if not manually overridden by the user.
-                            // This gives the budget enforcement the real tokenizer ratio
-                            // instead of a heuristic guess.
-                            if settings.peek().openai_compat_config.context_tuning.chars_per_token.is_none() {
-                                if let Some(ratio) = crate::services::openai_compat_validation::calibrate_tokenizer(
-                                    &endpoint,
-                                    &current_model,
-                                    api_key.as_deref(),
-                                ).await {
-                                    // Round to 1 decimal place for cleanliness
-                                    let rounded = (ratio * 10.0).round() / 10.0;
+                                if let Some(ratio) = calibrated_ratio {
                                     tracing::info!(
                                         "Auto-calibrated chars/token: {:.1} for model '{}'",
-                                        rounded, current_model
+                                        ratio, current_model
                                     );
-                                    settings.write().openai_compat_config.context_tuning.chars_per_token = Some(rounded);
-                                    // Persist so the calibrated ratio survives the next restart.
+                                    cfg.context_tuning.chars_per_token = Some(ratio);
+                                    changed = true;
+                                }
+                                if changed {
+                                    {
+                                        let mut sw = settings.write();
+                                        if let Some(instance) = sw.connector_by_id_mut(id) {
+                                            instance.config = crate::settings::ProviderInstanceConfig::OpenAiCompat(cfg.clone());
+                                        }
+                                        // Mirror into the legacy singleton editing buffer.
+                                        sw.openai_compat_config = cfg;
+                                    }
+                                    // Persist immediately so detection survives restart
+                                    // without a manual Settings → Save cycle.
                                     let sm = settings_manager.peek().clone();
-                                    let s  = settings.peek().clone();
+                                    let s = settings.peek().clone();
                                     let _ = sm.save(&s);
                                 }
                             }
@@ -167,7 +310,7 @@ pub fn SettingsPanel() -> Element {
     use_effect(move || {
         let global_settings = settings.read();
         let local = local_settings.read();
-        has_unsaved_changes.set(*global_settings != *local);
+        has_unsaved_changes.set(comparable(&global_settings) != comparable(&local));
     });
 
     // This effect synchronizes local_settings with global settings when the global state changes.
@@ -176,8 +319,21 @@ pub fn SettingsPanel() -> Element {
     // NOTE: This will discard any unsaved changes in the settings panel when external changes occur.
     use_effect(move || {
         let global_settings = settings.read();
-        if *global_settings != *local_settings.peek() {
-            local_settings.set(global_settings.clone());
+        if comparable(&global_settings) != comparable(&local_settings.peek()) {
+            let mut draft = global_settings.clone();
+            // Re-load the selected connector's config into the editing mirrors
+            let selected = selected_connector_id
+                .peek()
+                .clone()
+                .filter(|id| draft.connector_by_id(id).is_some())
+                .or_else(|| draft.active_connector().map(|c| c.id.clone()));
+            if let Some(ref id) = selected {
+                load_instance_into_draft(&mut draft, id);
+            }
+            if *selected_connector_id.peek() != selected {
+                selected_connector_id.set(selected);
+            }
+            local_settings.set(draft);
         }
     });
 
@@ -314,6 +470,11 @@ pub fn SettingsPanel() -> Element {
                                         {
                                             let mut ls = local_settings.write();
                                             ls.gemini_config.api_key = None;
+                                            ls.claude_config.api_key = None;
+                                            ls.openai_compat_config.api_key = None;
+                                            for connector in ls.llm_connectors.iter_mut() {
+                                                connector.config.set_api_key(None);
+                                            }
                                             ls.smithery_api_key = None;
                                             for profile in ls.composio_profiles.iter_mut() {
                                                 profile.api_key = None;
@@ -342,14 +503,32 @@ pub fn SettingsPanel() -> Element {
                         }
                         // 1. Commit the local changes to the global state
                         let mut global_settings = settings.write();
+                        // Connectors removed in this edit session lose their keychain items below
+                        let old_connector_ids: Vec<String> = global_settings
+                            .llm_connectors
+                            .iter()
+                            .map(|c| c.id.clone())
+                            .collect();
                         *global_settings = local_settings.read().clone();
 
                         // 2. Prepare data for background saving (Clone cheap stuff or take ownership)
                         let mut settings_to_save = global_settings.clone();
                         let smithery_key_opt = settings_to_save.smithery_api_key.clone();
-                        let gemini_key_opt = settings_to_save.gemini_config.api_key.clone();
-                        let claude_key_opt = settings_to_save.claude_config.api_key.clone();
-                        let oai_key_opt = settings_to_save.openai_compat_config.api_key.clone();
+                        // Per-connector API keys, keyed by their per-instance keychain item
+                        let llm_key_updates: Vec<(String, String)> = settings_to_save
+                            .llm_connectors
+                            .iter()
+                            .filter_map(|c| {
+                                c.config
+                                    .api_key()
+                                    .filter(|k| !k.trim().is_empty())
+                                    .map(|k| (crate::secret_types::llm_key_name(&c.id), k.clone()))
+                            })
+                            .collect();
+                        let removed_connector_ids: Vec<String> = old_connector_ids
+                            .into_iter()
+                            .filter(|id| settings_to_save.connector_by_id(id).is_none())
+                            .collect();
                         // Extract Composio keys to save (using profile ID as keychain key)
                         let composio_keys: Vec<(String, String)> = settings_to_save.composio_profiles.iter()
                             .filter_map(|p| p.api_key.as_ref().map(|k| (p.id.clone(), k.clone())))
@@ -364,10 +543,7 @@ pub fn SettingsPanel() -> Element {
                         *global_settings = settings_to_save.clone();
                         has_unsaved_changes.set(false);
 
-                        let mut secret_updates = Vec::new();
-                        if let Some(k) = gemini_key_opt { secret_updates.push(("gemini_api_key".to_string(), k)); }
-                        if let Some(k) = claude_key_opt { secret_updates.push(("claude_api_key".to_string(), k)); }
-                        if let Some(k) = oai_key_opt { secret_updates.push(("openai_compat_api_key".to_string(), k)); }
+                        let mut secret_updates = llm_key_updates;
                         if let Some(k) = smithery_key_to_save { secret_updates.push(("smithery_api_key".to_string(), k)); }
                         tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(id, _)| id).collect::<Vec<_>>());
 
@@ -397,6 +573,33 @@ pub fn SettingsPanel() -> Element {
                             }
                             tracing::debug!("Total validated secret updates: {}", final_secret_updates.len());
 
+                            // Delete keychain items of connectors removed in this save
+                            // (also prunes them from the discovery index).
+                            if !removed_connector_ids.is_empty() {
+                                let mut sm = secret_manager.write();
+                                for id in &removed_connector_ids {
+                                    if let Err(e) = sm.delete_llm_key(id) {
+                                        tracing::warn!("Failed to delete key for removed connector {}: {}", id, e);
+                                    }
+                                }
+                            }
+
+                            // Compute the updated LLM key discovery index so newly
+                            // saved per-connector keys are found on next launch.
+                            let new_llm_index = {
+                                let sm = secret_manager.read();
+                                let mut idx = sm
+                                    .get_named_index_from_keychain(crate::secret_types::LLM_KEYS_INDEX_KEY)
+                                    .unwrap_or_default();
+                                for (name, _) in final_secret_updates
+                                    .iter()
+                                    .filter(|(n, _)| n.starts_with(crate::secret_types::LLM_KEY_PREFIX))
+                                {
+                                    idx = crate::secret_types::add_to_index_csv(&idx, name);
+                                }
+                                idx
+                            };
+
                             // Run Keychain operations in blocking task
                             // Capture the storage mode preference, BUT override for Pro builds
                             // Pro builds (no provisioning profile) can't use Biometric keychain access groups
@@ -415,6 +618,22 @@ pub fn SettingsPanel() -> Element {
                                         tracing::error!("Failed to save secret {}: {}", key_name, e);
                                     } else {
                                         saved.push((key_name, key_value));
+                                    }
+                                }
+                                // The index must stay readable without a biometric
+                                // prompt so startup discovery works pre-auth.
+                                if !new_llm_index.is_empty() {
+                                    if let Err(e) = crate::secret_manager::save_secret_to_keychain(
+                                        crate::secret_types::LLM_KEYS_INDEX_KEY,
+                                        &new_llm_index,
+                                        false,
+                                    ) {
+                                        tracing::error!("Failed to save LLM key index: {}", e);
+                                    } else {
+                                        saved.push((
+                                            crate::secret_types::LLM_KEYS_INDEX_KEY.to_string(),
+                                            new_llm_index,
+                                        ));
                                     }
                                 }
                                 saved
@@ -574,23 +793,134 @@ pub fn SettingsPanel() -> Element {
                             class: "p-4",
                             div {
                                 class: "mb-4",
-                                label { class: "block text-sm font-medium text-fg-muted", "LLM Provider" }
-                                select {
-                                    class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
-                                    onchange: move |evt: Event<FormData>| {
-                                        let provider = match evt.value().as_str() {
-                                            "OpenAiCompat" => crate::settings::LlmProvider::OpenAiCompat,
-                                            "Claude" => crate::settings::LlmProvider::Claude,
-                                            _ => crate::settings::LlmProvider::Gemini,
-                                        };
-                                        local_settings.write().active_llm = provider;
-                                    },
-                                    option { value: "Gemini", selected: local_settings.read().active_llm == crate::settings::LlmProvider::Gemini, "Gemini" }
-                                    option { value: "OpenAiCompat", selected: local_settings.read().active_llm == crate::settings::LlmProvider::OpenAiCompat, "OpenAI Compatible" }
-                                    option { value: "Claude", selected: local_settings.read().active_llm == crate::settings::LlmProvider::Claude, "Claude" }
+                                label { class: "block text-sm font-medium text-fg-muted mb-2", "Connectors" }
+                                // Connector list: one row per configured instance
+                                for instance in local_settings.read().llm_connectors.clone() {
+                                    {
+                                        let is_selected = selected_connector_id.read().as_deref() == Some(instance.id.as_str());
+                                        let is_default = local_settings.read().active_connector().map(|c| c.id.clone()) == Some(instance.id.clone());
+                                        let is_last = local_settings.read().llm_connectors.len() <= 1;
+                                        let provider = instance.provider();
+                                        let row_id = instance.id.clone();
+                                        let default_id = instance.id.clone();
+                                        let delete_id = instance.id.clone();
+                                        let rename_id = instance.id.clone();
+
+                                        rsx! {
+                                            div {
+                                                class: if is_selected {
+                                                    "flex items-center gap-2 px-3 py-2 mb-1 rounded-md border border-primary-500 bg-primary-900/30 cursor-pointer"
+                                                } else {
+                                                    "flex items-center gap-2 px-3 py-2 mb-1 rounded-md border border-subtle hover:border-primary-600 cursor-pointer"
+                                                },
+                                                onclick: move |_| {
+                                                    if selected_connector_id.peek().as_deref() != Some(row_id.as_str()) {
+                                                        // Pending edits were already flushed reactively;
+                                                        // load the newly selected instance for editing.
+                                                        load_instance_into_draft(&mut local_settings.write(), &row_id);
+                                                        selected_connector_id.set(Some(row_id.clone()));
+                                                    }
+                                                },
+                                                span {
+                                                    class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm shrink-0", provider.color_class()),
+                                                    "{provider.initial()}"
+                                                }
+                                                if is_selected {
+                                                    input {
+                                                        class: "flex-1 min-w-0 px-2 py-1 bg-input border border-primary-600 rounded text-sm",
+                                                        value: "{instance.name}",
+                                                        onclick: move |e| e.stop_propagation(),
+                                                        oninput: move |event| {
+                                                            local_settings.write().rename_connector(&rename_id, &event.value());
+                                                        }
+                                                    }
+                                                } else {
+                                                    span { class: "flex-1 truncate text-sm", "{instance.name}" }
+                                                }
+                                                span { class: "text-xs text-fg-muted shrink-0", "{provider.display_name()}" }
+                                                button {
+                                                    class: if is_default {
+                                                        "text-yellow-400 text-sm shrink-0"
+                                                    } else {
+                                                        "text-fg-muted/40 hover:text-yellow-400 text-sm shrink-0"
+                                                    },
+                                                    title: if is_default { "Default connector for new sessions" } else { "Make default for new sessions" },
+                                                    onclick: move |e| {
+                                                        e.stop_propagation();
+                                                        let mut draft = local_settings.write();
+                                                        draft.active_connector_id = Some(default_id.clone());
+                                                        if let Some(kind) = draft.connector_by_id(&default_id).map(|c| c.provider()) {
+                                                            draft.active_llm = kind;
+                                                        }
+                                                    },
+                                                    "★"
+                                                }
+                                                button {
+                                                    class: if is_last {
+                                                        "text-fg-muted/30 text-sm shrink-0 cursor-not-allowed"
+                                                    } else {
+                                                        "text-fg-muted hover:text-red-400 text-sm shrink-0"
+                                                    },
+                                                    title: if is_last { "At least one connector is required" } else { "Remove connector" },
+                                                    onclick: move |e| {
+                                                        e.stop_propagation();
+                                                        let mut draft = local_settings.write();
+                                                        if draft.remove_connector(&delete_id) {
+                                                            let new_selected = draft.active_connector().map(|c| c.id.clone());
+                                                            if let Some(ref id) = new_selected {
+                                                                load_instance_into_draft(&mut draft, id);
+                                                            }
+                                                            drop(draft);
+                                                            selected_connector_id.set(new_selected);
+                                                        }
+                                                    },
+                                                    "🗑"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Add-connector buttons, one per provider kind
+                                {
+                                    let at_cap = local_settings.read().llm_connectors.len() >= crate::settings::MAX_LLM_CONNECTORS;
+                                    rsx! {
+                                        div {
+                                            class: "flex gap-2 mt-2",
+                                            for kind in crate::settings::LlmProvider::all_variants().iter().copied() {
+                                                button {
+                                                    class: if at_cap {
+                                                        "px-3 py-1.5 rounded-md text-xs bg-input text-fg-muted/40 cursor-not-allowed"
+                                                    } else {
+                                                        "px-3 py-1.5 rounded-md text-xs bg-input text-fg-muted hover:text-fg hover:border-primary-500 border border-subtle"
+                                                    },
+                                                    title: if at_cap {
+                                                        format!("Connector limit reached ({})", crate::settings::MAX_LLM_CONNECTORS)
+                                                    } else {
+                                                        format!("Add a {} connector", kind.display_name())
+                                                    },
+                                                    onclick: move |_| {
+                                                        if at_cap { return; }
+                                                        let mut draft = local_settings.write();
+                                                        match draft.add_connector(
+                                                            kind.display_name(),
+                                                            crate::settings::ProviderInstanceConfig::default_for(kind),
+                                                        ) {
+                                                            Ok(id) => {
+                                                                load_instance_into_draft(&mut draft, &id);
+                                                                drop(draft);
+                                                                selected_connector_id.set(Some(id));
+                                                            }
+                                                            Err(e) => tracing::warn!("Add connector failed: {}", e),
+                                                        }
+                                                    },
+                                                    "+ {kind.display_name()}"
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                            if local_settings.read().active_llm == crate::settings::LlmProvider::Gemini {
+                            if selected_kind(&local_settings.read(), &selected_connector_id.read()) == Some(crate::settings::LlmProvider::Gemini) {
                                 div {
                                     class: "pl-4 border-l-2 border-subtle",
                                     div {
@@ -990,7 +1320,7 @@ pub fn SettingsPanel() -> Element {
                                                         key: "model-slot-{i}",
                                                         class: "flex items-center gap-3",
                                                         {
-                                                            let slot_model = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                            let slot_model = local_settings.read().model_slots_for(crate::settings::LlmProvider::Gemini).get(i).cloned().unwrap_or_default();
                                                             let effective_icon = if !slot_model.is_empty() {
                                                                 local_settings.read().model_icons.get(&slot_model).cloned()
                                                                     .unwrap_or_else(|| get_slot_icon(i))
@@ -1025,10 +1355,10 @@ pub fn SettingsPanel() -> Element {
                                                             select {
                                                                 class: "block w-full px-2 py-1 bg-input border border-subtle rounded text-xs",
                                                                 onchange: move |evt| {
-                                                                    local_settings.write().update_active_model_slot(i, evt.value());
+                                                                    local_settings.write().update_model_slot_for(crate::settings::LlmProvider::Gemini, i, evt.value());
                                                                 },
                                                                 {
-                                                                    let current_slot_value = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                    let current_slot_value = local_settings.read().model_slots_for(crate::settings::LlmProvider::Gemini).get(i).cloned().unwrap_or_default();
                                                                     let models = available_models.read();
                                                                     let current_in_list = models.iter().any(|m| m.name == current_slot_value);
 
@@ -1054,7 +1384,7 @@ pub fn SettingsPanel() -> Element {
                                                             // Emoji picker popover — only shown when this slot's icon is clicked
                                                             if picker_open_for_slot() == Some(i) {
                                                                 {
-                                                                    let slot_model_for_picker = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                    let slot_model_for_picker = local_settings.read().model_slots_for(crate::settings::LlmProvider::Gemini).get(i).cloned().unwrap_or_default();
                                                                     if !slot_model_for_picker.is_empty() {
                                                                         let current_custom = local_settings.read().model_icons.get(&slot_model_for_picker).cloned().unwrap_or_default();
                                                                         rsx! {
@@ -1105,7 +1435,7 @@ pub fn SettingsPanel() -> Element {
                                 }
                             }
                             // === OpenAI-Compatible Config ===
-                            if local_settings.read().active_llm == crate::settings::LlmProvider::OpenAiCompat {
+                            if selected_kind(&local_settings.read(), &selected_connector_id.read()) == Some(crate::settings::LlmProvider::OpenAiCompat) {
                                 div {
                                     class: "pl-4 border-l-2 border-subtle",
                                     div {
@@ -1116,7 +1446,7 @@ pub fn SettingsPanel() -> Element {
                                             r#type: "text",
                                             placeholder: "http://localhost:11434",
                                             value: "{local_settings.read().openai_compat_config.endpoint}",
-                                            oninput: move |event| local_settings.write().openai_compat_config.endpoint = event.value()
+                                            oninput: move |event| local_settings.write().openai_compat_config.endpoint = event.value().trim().to_string()
                                         }
                                         p {
                                             class: "text-xs text-fg-muted mt-1",
@@ -1465,8 +1795,31 @@ pub fn SettingsPanel() -> Element {
                                         }
                                     }
 
-                                    // Context window is auto-detected from /v1/models (max_model_len)
-                                    // No UI element needed — budget enforcement happens transparently
+                                    // Context window is auto-detected from /v1/models (max_model_len).
+                                    // Surface it, and warn when it's too small for reliable
+                                    // tool-calling — Hobbes is a tool harness and small windows
+                                    // cause the model to loop (see RECOMMENDED_MIN_CONTEXT_TOKENS).
+                                    {
+                                        let cfg_ctx = local_settings.read().openai_compat_config.max_context_tokens;
+                                        let rec_min = crate::llm::config::RECOMMENDED_MIN_CONTEXT_TOKENS;
+                                        match cfg_ctx {
+                                            Some(tokens) if tokens < rec_min => rsx! {
+                                                div {
+                                                    class: "mb-4 flex items-start gap-2 p-2 rounded border border-yellow-600/40 bg-yellow-500/5",
+                                                    span { class: "text-yellow-500 shrink-0 text-sm", "⚠️" }
+                                                    p { class: "text-xs text-yellow-200",
+                                                        "Small context window detected ({tokens} tokens). Hobbes is a tool-calling harness — the system prompt and tool definitions alone use roughly 5–7K tokens, so windows under {rec_min} can make the model loop, re-requesting tool results that were truncated out of its context. Raise the server's max context length (e.g. vLLM "
+                                                        code { class: "px-1 bg-card rounded", "--max-model-len" }
+                                                        ") for reliable tool use."
+                                                    }
+                                                }
+                                            },
+                                            Some(tokens) => rsx! {
+                                                p { class: "text-xs text-fg-muted mb-4", "Context window: {tokens} tokens (auto-detected)." }
+                                            },
+                                            None => rsx! {},
+                                        }
+                                    }
 
                                     // Per-Provider Context Tuning Overrides
                                     div {
@@ -1767,7 +2120,7 @@ pub fn SettingsPanel() -> Element {
                                                         key: "oai-model-slot-{i}",
                                                         class: "flex items-center gap-3",
                                                         {
-                                                            let slot_model = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                            let slot_model = local_settings.read().model_slots_for(crate::settings::LlmProvider::OpenAiCompat).get(i).cloned().unwrap_or_default();
                                                             let effective_icon = if !slot_model.is_empty() {
                                                                 local_settings.read().model_icons.get(&slot_model).cloned()
                                                                     .unwrap_or_else(|| get_slot_icon(i))
@@ -1805,20 +2158,20 @@ pub fn SettingsPanel() -> Element {
                                                                     class: "block w-full px-2 py-1 bg-input border border-subtle rounded text-xs",
                                                                     r#type: "text",
                                                                     placeholder: "Enter model name",
-                                                                    value: "{local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default()}",
+                                                                    value: "{local_settings.read().model_slots_for(crate::settings::LlmProvider::OpenAiCompat).get(i).cloned().unwrap_or_default()}",
                                                                     onchange: move |evt: FormEvent| {
-                                                                        local_settings.write().update_active_model_slot(i, evt.value());
+                                                                        local_settings.write().update_model_slot_for(crate::settings::LlmProvider::OpenAiCompat, i, evt.value());
                                                                     }
                                                                 }
                                                             } else {
                                                                 select {
                                                                     class: "block w-full px-2 py-1 bg-input border border-subtle rounded text-xs",
-                                                                    value: "{local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default()}",
+                                                                    value: "{local_settings.read().model_slots_for(crate::settings::LlmProvider::OpenAiCompat).get(i).cloned().unwrap_or_default()}",
                                                                     onchange: move |evt| {
-                                                                        local_settings.write().update_active_model_slot(i, evt.value());
+                                                                        local_settings.write().update_model_slot_for(crate::settings::LlmProvider::OpenAiCompat, i, evt.value());
                                                                     },
                                                                     {
-                                                                        let current_slot_value = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                        let current_slot_value = local_settings.read().model_slots_for(crate::settings::LlmProvider::OpenAiCompat).get(i).cloned().unwrap_or_default();
                                                                         let models = oai_available_models.read();
                                                                         let current_in_list = models.contains(&current_slot_value);
 
@@ -1845,7 +2198,7 @@ pub fn SettingsPanel() -> Element {
                                                             // Emoji picker popover
                                                             if picker_open_for_slot() == Some(i) {
                                                                 {
-                                                                    let slot_model_for_picker = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                    let slot_model_for_picker = local_settings.read().model_slots_for(crate::settings::LlmProvider::OpenAiCompat).get(i).cloned().unwrap_or_default();
                                                                     if !slot_model_for_picker.is_empty() {
                                                                         let current_custom = local_settings.read().model_icons.get(&slot_model_for_picker).cloned().unwrap_or_default();
                                                                         rsx! {
@@ -1895,7 +2248,7 @@ pub fn SettingsPanel() -> Element {
                                     }
                                 }
                             }
-                            if local_settings.read().active_llm == crate::settings::LlmProvider::Claude {
+                            if selected_kind(&local_settings.read(), &selected_connector_id.read()) == Some(crate::settings::LlmProvider::Claude) {
                                 div {
                                     class: "pl-4 border-l-2 border-subtle",
                                     // API Key
@@ -2049,7 +2402,7 @@ pub fn SettingsPanel() -> Element {
                                                         key: "claude-slot-{i}",
                                                         class: "flex items-center gap-3",
                                                         {
-                                                            let slot_model = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                            let slot_model = local_settings.read().model_slots_for(crate::settings::LlmProvider::Claude).get(i).cloned().unwrap_or_default();
                                                             let effective_icon = if !slot_model.is_empty() {
                                                                 local_settings.read().model_icons.get(&slot_model).cloned()
                                                                     .unwrap_or_else(|| get_slot_icon(i))
@@ -2084,10 +2437,10 @@ pub fn SettingsPanel() -> Element {
                                                             select {
                                                                 class: "block w-full px-2 py-1 bg-input border border-subtle rounded text-xs",
                                                                 onchange: move |evt| {
-                                                                    local_settings.write().update_active_model_slot(i, evt.value());
+                                                                    local_settings.write().update_model_slot_for(crate::settings::LlmProvider::Claude, i, evt.value());
                                                                 },
                                                                 {
-                                                                    let current = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                    let current = local_settings.read().model_slots_for(crate::settings::LlmProvider::Claude).get(i).cloned().unwrap_or_default();
                                                                     let models = crate::llm::claude_models::ClaudeModel::all_models();
                                                                     let in_list = models.iter().any(|m| m.canonical_slug() == current);
                                                                     rsx! {
@@ -2108,7 +2461,7 @@ pub fn SettingsPanel() -> Element {
                                                             }
                                                             if picker_open_for_slot() == Some(i) {
                                                                 {
-                                                                    let slot_model_for_picker = local_settings.read().active_model_slots().get(i).cloned().unwrap_or_default();
+                                                                    let slot_model_for_picker = local_settings.read().model_slots_for(crate::settings::LlmProvider::Claude).get(i).cloned().unwrap_or_default();
                                                                     if !slot_model_for_picker.is_empty() {
                                                                         let current_custom = local_settings.read().model_icons.get(&slot_model_for_picker).cloned().unwrap_or_default();
                                                                         rsx! {
@@ -3381,8 +3734,18 @@ pub fn SettingsPanel() -> Element {
                                                     return;
                                                 }
                                                 match serde_json::from_str::<Settings>(&contents) {
-                                                    Ok(imported_settings) => {
+                                                    Ok(mut imported_settings) => {
+                                                        // Pre-multi-connector exports carry only the
+                                                        // legacy singleton configs — synthesize instances.
+                                                        imported_settings.migrate_legacy_llm_config();
+                                                        let selected = imported_settings
+                                                            .active_connector()
+                                                            .map(|c| c.id.clone());
+                                                        if let Some(ref id) = selected {
+                                                            load_instance_into_draft(&mut imported_settings, id);
+                                                        }
                                                         local_settings.set(imported_settings);
+                                                        selected_connector_id.set(selected);
                                                         tracing::info!("Successfully imported settings. Review and save.");
                                                     },
                                                     Err(e) => {
@@ -3543,6 +3906,11 @@ pub fn SettingsPanel() -> Element {
                                         // Clear API keys from local settings
                                         let mut ls = local_settings.write();
                                         ls.gemini_config.api_key = None;
+                                        ls.claude_config.api_key = None;
+                                        ls.openai_compat_config.api_key = None;
+                                        for connector in ls.llm_connectors.iter_mut() {
+                                            connector.config.set_api_key(None);
+                                        }
                                         ls.smithery_api_key = None;
                                         for profile in ls.composio_profiles.iter_mut() {
                                             profile.api_key = None;
@@ -4305,14 +4673,31 @@ pub fn SettingsPanel() -> Element {
                             // Directly perform the save (same logic as ConfirmSaveModal on_confirm)
                             // 1. Commit the local changes to the global state
                             let mut global_settings = settings.write();
+                            let old_connector_ids: Vec<String> = global_settings
+                                .llm_connectors
+                                .iter()
+                                .map(|c| c.id.clone())
+                                .collect();
                             *global_settings = local_settings.read().clone();
 
                             // 2. Prepare data for background saving
                             let mut settings_to_save = global_settings.clone();
                             let smithery_key_opt = settings_to_save.smithery_api_key.clone();
-                            let gemini_key_opt = settings_to_save.gemini_config.api_key.clone();
-                            let claude_key_opt = settings_to_save.claude_config.api_key.clone();
-                            let oai_key_opt = settings_to_save.openai_compat_config.api_key.clone();
+                            // Per-connector API keys, keyed by their per-instance keychain item
+                            let llm_key_updates: Vec<(String, String)> = settings_to_save
+                                .llm_connectors
+                                .iter()
+                                .filter_map(|c| {
+                                    c.config
+                                        .api_key()
+                                        .filter(|k| !k.trim().is_empty())
+                                        .map(|k| (crate::secret_types::llm_key_name(&c.id), k.clone()))
+                                })
+                                .collect();
+                            let removed_connector_ids: Vec<String> = old_connector_ids
+                                .into_iter()
+                                .filter(|id| settings_to_save.connector_by_id(id).is_none())
+                                .collect();
                             let composio_keys: Vec<(String, String)> = settings_to_save.composio_profiles.iter()
                                 .filter_map(|p| p.api_key.as_ref().map(|k| (p.id.clone(), k.clone())))
                                 .collect();
@@ -4322,10 +4707,7 @@ pub fn SettingsPanel() -> Element {
                                  settings_to_save.smithery_api_key = Some(trimmed.clone());
                             }
 
-                            let mut secret_updates = Vec::new();
-                            if let Some(k) = gemini_key_opt { secret_updates.push(("gemini_api_key".to_string(), k)); }
-                            if let Some(k) = claude_key_opt { secret_updates.push(("claude_api_key".to_string(), k)); }
-                            if let Some(k) = oai_key_opt { secret_updates.push(("openai_compat_api_key".to_string(), k)); }
+                            let mut secret_updates = llm_key_updates;
                             if let Some(k) = smithery_key_to_save { secret_updates.push(("smithery_api_key".to_string(), k)); }
                             tracing::debug!("Composio keys to save: {:?}", composio_keys.iter().map(|(n, _)| n).collect::<Vec<_>>());
 
@@ -4363,6 +4745,31 @@ pub fn SettingsPanel() -> Element {
                                 }
                                 tracing::debug!("Total validated secret updates: {}", final_secret_updates.len());
 
+                                // Delete keychain items of connectors removed in this save
+                                if !removed_connector_ids.is_empty() {
+                                    let mut sm = secret_manager.write();
+                                    for id in &removed_connector_ids {
+                                        if let Err(e) = sm.delete_llm_key(id) {
+                                            tracing::warn!("Failed to delete key for removed connector {}: {}", id, e);
+                                        }
+                                    }
+                                }
+
+                                // Compute the updated LLM key discovery index
+                                let new_llm_index = {
+                                    let sm = secret_manager.read();
+                                    let mut idx = sm
+                                        .get_named_index_from_keychain(crate::secret_types::LLM_KEYS_INDEX_KEY)
+                                        .unwrap_or_default();
+                                    for (name, _) in final_secret_updates
+                                        .iter()
+                                        .filter(|(n, _)| n.starts_with(crate::secret_types::LLM_KEY_PREFIX))
+                                    {
+                                        idx = crate::secret_types::add_to_index_csv(&idx, name);
+                                    }
+                                    idx
+                                };
+
                                 let results = tokio::task::spawn_blocking(move || {
                                     let mut saved = Vec::new();
                                     for (key_name, key_value) in final_secret_updates {
@@ -4370,6 +4777,21 @@ pub fn SettingsPanel() -> Element {
                                             tracing::error!("Failed to save secret {}: {}", key_name, e);
                                         } else {
                                             saved.push((key_name, key_value));
+                                        }
+                                    }
+                                    // Index stays readable without biometric prompt
+                                    if !new_llm_index.is_empty() {
+                                        if let Err(e) = crate::secret_manager::save_secret_to_keychain(
+                                            crate::secret_types::LLM_KEYS_INDEX_KEY,
+                                            &new_llm_index,
+                                            false,
+                                        ) {
+                                            tracing::error!("Failed to save LLM key index: {}", e);
+                                        } else {
+                                            saved.push((
+                                                crate::secret_types::LLM_KEYS_INDEX_KEY.to_string(),
+                                                new_llm_index,
+                                            ));
                                         }
                                     }
                                     saved

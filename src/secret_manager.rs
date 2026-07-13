@@ -128,6 +128,33 @@ impl SecretManager {
             }
         }
 
+        // Load per-connector LLM API keys from their index
+        match keychain_ffi::find_generic_password_with_context(
+            secret_types::LLM_KEYS_INDEX_KEY,
+            context,
+        ) {
+            Ok(index_csv) => {
+                for key in secret_types::parse_index_csv(&index_csv) {
+                    match keychain_ffi::find_generic_password_with_context(key, context) {
+                        Ok(value) => {
+                            self.secrets.insert(key.to_string(), value);
+                            tracing::debug!("Loaded LLM connector key with context: {}", key);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to load indexed LLM key '{}' with context: {}",
+                                key,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::debug!("No LLM connector key index found.");
+            }
+        }
+
         self.migrate_legacy_keys();
 
         tracing::debug!(
@@ -241,6 +268,26 @@ impl SecretManagerTrait for SecretManager {
             }
         }
 
+        // Load per-connector LLM API keys from their index
+        match keychain_ffi::find_generic_password(secret_types::LLM_KEYS_INDEX_KEY) {
+            Ok(index_csv) => {
+                for key in secret_types::parse_index_csv(&index_csv) {
+                    match keychain_ffi::find_generic_password(key) {
+                        Ok(value) => {
+                            self.secrets.insert(key.to_string(), value);
+                            tracing::debug!("Loaded LLM connector key: {}", key);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to load indexed LLM key '{}': {}", key, e);
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::debug!("No LLM connector key index found.");
+            }
+        }
+
         self.migrate_legacy_keys();
 
         tracing::info!(
@@ -321,6 +368,25 @@ impl SecretManagerTrait for SecretManager {
         }
     }
 
+    /// Load an LLM connector key from keychain (for dynamically discovered connectors)
+    fn load_llm_key(&mut self, connector_id: &str) {
+        let key = crate::secret_types::llm_key_name(connector_id);
+        match keychain_ffi::find_generic_password(&key) {
+            Ok(value) => {
+                self.secrets.insert(key, value);
+                tracing::debug!("Loaded LLM key for connector id: {}", connector_id);
+            }
+            Err(keychain_ffi::KeychainError::NotFound) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load LLM key for connector id '{}': {}",
+                    connector_id,
+                    e
+                );
+            }
+        }
+    }
+
     /// Update the internal cache without performing any keychain operations.
     fn update_cache(&mut self, key: String, value: String) {
         self.secrets.insert(key, value);
@@ -355,8 +421,8 @@ impl SecretManagerTrait for SecretManager {
     }
 
     /// Get the current index value directly from keychain (for index updates).
-    fn get_index_from_keychain(&self) -> Option<String> {
-        keychain_ffi::find_generic_password(secret_types::CUSTOM_KEYS_INDEX_KEY).ok()
+    fn get_named_index_from_keychain(&self, index_key: &str) -> Option<String> {
+        keychain_ffi::find_generic_password(index_key).ok()
     }
 
     /// Get a reference to the secrets cache for credential extraction.

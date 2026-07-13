@@ -214,11 +214,60 @@ use crate::{
         shared::{SessionIdContext, SessionToDeleteContext},
         stream_manager::StreamManager,
     },
-    llm::{ClaudeConnector, GeminiConnector, LlmConnector},
+    llm::{GeminiConnector, LlmConnector},
     mcp::manager::McpManager,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Hydrate per-connector API keys from the secret cache into
+/// `settings.llm_connectors`. Connectors without a per-id keychain item claim
+/// the legacy static key for their provider kind (first claimant per kind) and
+/// copy it to `llm_api_key_<id>` + index. The legacy static key is kept for
+/// one release of rollback safety.
+fn hydrate_connector_keys(
+    settings: &mut settings::Settings,
+    sm: &mut secret_manager::SecretManager,
+) {
+    use crate::secret_types::SecretManagerTrait;
+    let mut claimed: std::collections::HashSet<settings::LlmProvider> =
+        std::collections::HashSet::new();
+    let connector_ids: Vec<(String, settings::LlmProvider)> = settings
+        .llm_connectors
+        .iter()
+        .map(|c| (c.id.clone(), c.provider()))
+        .collect();
+    for (id, kind) in connector_ids {
+        if let Some(key) = sm.get_llm_key(&id).cloned() {
+            if let Some(c) = settings.connector_by_id_mut(&id) {
+                c.config.set_api_key(Some(key));
+            }
+            continue;
+        }
+        if claimed.contains(&kind) {
+            continue;
+        }
+        if let Some(key) = sm.get(kind.keychain_key()).cloned() {
+            claimed.insert(kind);
+            if let Some(c) = settings.connector_by_id_mut(&id) {
+                c.config.set_api_key(Some(key.clone()));
+            }
+            if let Err(e) = sm.set_llm_key(&id, key) {
+                tracing::error!(
+                    "Failed to copy legacy {} key to connector {}: {}",
+                    kind.display_name(),
+                    id,
+                    e
+                );
+            } else {
+                tracing::info!(
+                    "Migrated legacy {} API key to per-connector keychain item",
+                    kind.display_name()
+                );
+            }
+        }
+    }
+}
 
 fn get_settings_path() -> PathBuf {
     dirs::config_dir()
@@ -362,6 +411,14 @@ fn app() -> Element {
                 .iter()
                 .map(|p| (p.id.clone(), p.name.clone()))
                 .collect();
+            // Capture connector IDs so their per-instance keys load even if the
+            // discovery index is missing or stale.
+            let connector_ids: Vec<String> = settings
+                .read()
+                .llm_connectors
+                .iter()
+                .map(|c| c.id.clone())
+                .collect();
 
             spawn(async move {
                 // Use spawn_blocking to run keychain operations off the main thread
@@ -412,6 +469,9 @@ fn app() -> Element {
                             sm.load_composio_key_with_context(id, Some(ctx));
                             sm.load_composio_key_with_context(name, Some(ctx));
                         }
+                        for id in &connector_ids {
+                            sm.load_llm_key(id);
+                        }
                     } else {
                         // Fall back to regular keychain access (may prompt multiple times)
                         sm.load_all_from_keychain();
@@ -421,6 +481,9 @@ fn app() -> Element {
                         for (id, name) in &profile_info {
                             sm.load_composio_key(id);
                             sm.load_composio_key(name);
+                        }
+                        for id in &connector_ids {
+                            sm.load_llm_key(id);
                         }
                     }
 
@@ -482,6 +545,11 @@ fn app() -> Element {
                         if let Some(oai_key) = sm_read.get("openai_compat_api_key").cloned() {
                             current_settings.openai_compat_config.api_key = Some(oai_key);
                         }
+                    }
+                    // Hydrate per-connector keys (claims legacy static keys on first run)
+                    {
+                        let mut sm_write = secret_manager.write();
+                        hydrate_connector_keys(&mut current_settings, &mut sm_write);
                     }
                     if let Some(smithery_api_key) = smithery_key {
                         current_settings.smithery_api_key = Some(smithery_api_key);
@@ -562,6 +630,14 @@ fn app() -> Element {
                 .iter()
                 .map(|p| (p.id.clone(), p.name.clone()))
                 .collect();
+            // Capture connector IDs so their per-instance keys load even if the
+            // discovery index is missing or stale.
+            let connector_ids: Vec<String> = settings
+                .read()
+                .llm_connectors
+                .iter()
+                .map(|c| c.id.clone())
+                .collect();
 
             spawn(async move {
                 let loaded_secrets = tokio::task::spawn_blocking(move || {
@@ -571,6 +647,9 @@ fn app() -> Element {
                     for (id, name) in &profile_info {
                         sm.load_composio_key(id);
                         sm.load_composio_key(name);
+                    }
+                    for id in &connector_ids {
+                        sm.load_llm_key(id);
                     }
                     sm
                 })
@@ -635,6 +714,11 @@ fn app() -> Element {
                         }
                     } else {
                         tracing::debug!("OpenAI-compat API key already present in settings, skipping keychain hydration");
+                    }
+                    // Hydrate per-connector keys (claims legacy static keys on first run)
+                    {
+                        let mut sm_write = secret_manager.write();
+                        hydrate_connector_keys(&mut current_settings, &mut sm_write);
                     }
                     if let Some(smithery_api_key) = smithery_key {
                         current_settings.smithery_api_key = Some(smithery_api_key);
@@ -715,53 +799,39 @@ fn app() -> Element {
         };
     }
 
-    let mut llm_connector = use_context_provider(|| {
-        let settings = settings.read();
-        let connector: Arc<dyn LlmConnector> = match settings.active_llm {
-            crate::settings::LlmProvider::Gemini => {
-                Arc::new(GeminiConnector::new_shared(settings.gemini_config.clone()))
+    // Build the global connector from the active connector instance. Fresh
+    // installs have no connectors yet — build a placeholder Gemini connector
+    // and rely on the onboarding gate to prevent use until one is created.
+    fn build_global_connector(settings: &settings::Settings) -> Arc<dyn LlmConnector> {
+        match settings.active_connector() {
+            Some(instance) => {
+                if let crate::settings::ProviderInstanceConfig::OpenAiCompat(c) = &instance.config
+                {
+                    tracing::info!(
+                        "Building OpenAI-compat connector '{}': model='{}', endpoint='{}', api_key={}",
+                        instance.name,
+                        c.model,
+                        c.endpoint,
+                        if c.api_key.is_some() { "present" } else { "MISSING" },
+                    );
+                }
+                crate::llm::build_connector_for_instance(instance, None)
             }
-            crate::settings::LlmProvider::OpenAiCompat => {
-                crate::llm::openai_responses::build_openai_connector(
-                    settings.openai_compat_config.clone(),
-                )
-            }
-            crate::settings::LlmProvider::Claude => {
-                Arc::new(ClaudeConnector::new(settings.claude_config.clone()))
-            }
-        };
-        Signal::new(connector)
-    });
+            None => Arc::new(GeminiConnector::new_shared(
+                crate::settings::GeminiConfig::default(),
+            )),
+        }
+    }
 
-    // Reactively update llm_connector when gemini_config changes
+    let mut llm_connector =
+        use_context_provider(|| Signal::new(build_global_connector(&settings.read())));
+
+    // Reactively rebuild the global connector when settings change (e.g. the
+    // API key is loaded from biometrics, or the active connector is switched).
     use_effect(move || {
-        // Use read() to subscribe to settings changes so this effect re-runs
-        // when the API key is loaded from biometrics
-        let (active_llm, gemini_config, openai_compat_config, claude_config) = {
-            let current_settings = settings.read();
-            (
-                current_settings.active_llm,
-                current_settings.gemini_config.clone(),
-                current_settings.openai_compat_config.clone(),
-                current_settings.claude_config.clone(),
-            )
-        };
-        // Now the read borrow is dropped, safe to set the connector
-        let new_connector: Arc<dyn LlmConnector> = match active_llm {
-            crate::settings::LlmProvider::Gemini => {
-                Arc::new(GeminiConnector::new_shared(gemini_config))
-            }
-            crate::settings::LlmProvider::OpenAiCompat => {
-                tracing::info!(
-                    "Recreating OpenAI-compat connector: model='{}', endpoint='{}', api_key={}",
-                    openai_compat_config.model,
-                    openai_compat_config.endpoint,
-                    if openai_compat_config.api_key.is_some() { "present" } else { "MISSING" },
-                );
-                crate::llm::openai_responses::build_openai_connector(openai_compat_config)
-            }
-            crate::settings::LlmProvider::Claude => Arc::new(ClaudeConnector::new(claude_config)),
-        };
+        // read() subscribes to settings changes; clone what we need, then drop
+        // the borrow before setting the connector signal.
+        let new_connector = build_global_connector(&settings.read());
         llm_connector.set(new_connector);
     });
 
@@ -803,11 +873,15 @@ fn app() -> Element {
             .map(|v| v == crate::settings::CURRENT_TOS_VERSION)
             .unwrap_or(false);
 
-        // Check if the current provider is configured
-        let provider_configured = settings.is_provider_configured(settings.active_llm);
+        // Check if any connector is configured (fresh installs have none;
+        // migrated users keep their existing configured provider)
+        let connector_configured = settings
+            .llm_connectors
+            .iter()
+            .any(|c| settings.is_connector_configured(c));
 
-        // Need onboarding if either TOS not accepted or active provider missing config
-        !tos_accepted || !provider_configured
+        // Need onboarding if either TOS not accepted or no usable connector
+        !tos_accepted || !connector_configured
     });
 
     let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
@@ -872,14 +946,17 @@ fn app() -> Element {
             return;
         }
 
-        let active_llm = settings.peek().active_llm;
-        if active_llm != crate::settings::LlmProvider::OpenAiCompat {
-            return;
-        }
+        let oai_config = {
+            let settings_peek = settings.peek();
+            match settings_peek.active_connector().map(|c| &c.config) {
+                Some(crate::settings::ProviderInstanceConfig::OpenAiCompat(c)) => c.clone(),
+                _ => return,
+            }
+        };
 
-        let endpoint = settings.peek().openai_compat_config.endpoint.clone();
-        let model    = settings.peek().openai_compat_config.model.clone();
-        let api_key  = settings.peek().openai_compat_config.api_key.clone();
+        let endpoint = oai_config.endpoint.clone();
+        let model = oai_config.model.clone();
+        let api_key = oai_config.api_key.clone();
 
         if endpoint.is_empty() || model.is_empty() {
             tracing::debug!("Startup context auto-detect: skipping — endpoint or model not configured");
@@ -895,13 +972,29 @@ fn app() -> Element {
                 Ok(discovered) => {
                     if let Some(info) = discovered.iter().find(|m| m.id == model) {
                         if let Some(ctx_len) = info.context_length {
-                            let existing = settings.peek().openai_compat_config.max_context_tokens;
+                            let existing = match settings.peek().active_connector().map(|c| &c.config) {
+                                Some(crate::settings::ProviderInstanceConfig::OpenAiCompat(c)) => {
+                                    c.max_context_tokens
+                                }
+                                _ => None,
+                            };
                             if existing != Some(ctx_len) {
                                 tracing::info!(
                                     "Startup: auto-detected context window {} tokens for model '{}'",
                                     ctx_len, model
                                 );
-                                settings.write().openai_compat_config.max_context_tokens = Some(ctx_len);
+                                {
+                                    let mut settings_write = settings.write();
+                                    if let Some(instance) = settings_write.active_connector_mut() {
+                                        if let crate::settings::ProviderInstanceConfig::OpenAiCompat(c) =
+                                            &mut instance.config
+                                        {
+                                            c.max_context_tokens = Some(ctx_len);
+                                        }
+                                    }
+                                    // Keep the legacy singleton in sync during the transition
+                                    settings_write.openai_compat_config.max_context_tokens = Some(ctx_len);
+                                }
                                 // Persist immediately so the value survives the next restart
                                 // without requiring a manual Settings → Save cycle.
                                 let sm = settings_manager.peek().clone();
@@ -927,7 +1020,13 @@ fn app() -> Element {
             }
 
             // ── Step 2: Tokenizer calibration (skip if manually overridden) ──
-            if settings.peek().openai_compat_config.context_tuning.chars_per_token.is_none() {
+            let already_calibrated = match settings.peek().active_connector().map(|c| &c.config) {
+                Some(crate::settings::ProviderInstanceConfig::OpenAiCompat(c)) => {
+                    c.context_tuning.chars_per_token.is_some()
+                }
+                _ => true,
+            };
+            if !already_calibrated {
                 if let Some(ratio) = crate::services::openai_compat_validation
                     ::calibrate_tokenizer(&endpoint, &model, api_key.as_deref())
                     .await
@@ -937,7 +1036,19 @@ fn app() -> Element {
                         "Startup: auto-calibrated {:.1} chars/token for model '{}'",
                         rounded, model
                     );
-                    settings.write().openai_compat_config.context_tuning.chars_per_token = Some(rounded);
+                    {
+                        let mut settings_write = settings.write();
+                        if let Some(instance) = settings_write.active_connector_mut() {
+                            if let crate::settings::ProviderInstanceConfig::OpenAiCompat(c) =
+                                &mut instance.config
+                            {
+                                c.context_tuning.chars_per_token = Some(rounded);
+                            }
+                        }
+                        // Keep the legacy singleton in sync during the transition
+                        settings_write.openai_compat_config.context_tuning.chars_per_token =
+                            Some(rounded);
+                    }
                     // Persist calibration ratio alongside the context window value
                     let sm = settings_manager.peek().clone();
                     let s  = settings.peek().clone();
@@ -1577,18 +1688,23 @@ fn app() -> Element {
                     }
                 }
                 ChatCommand::SwitchModel(idx) => {
-                    // Slots come from the session's effective provider so the picker
-                    // works in tabs pinned to a non-global provider.
-                    let (provider, slots) = {
+                    // Slots come from the session's effective connector so the picker
+                    // works in tabs pinned to a non-global connector.
+                    let instance = {
                         let settings_read = settings.peek();
                         let state = session_state.peek();
-                        let provider = state
+                        state
                             .sessions
                             .get(&*current_session_id.read())
-                            .map(|s| settings_read.provider_for_session(s))
-                            .unwrap_or(settings_read.active_llm);
-                        (provider, settings_read.model_slots_for(provider))
+                            .and_then(|s| settings_read.connector_for_session(s))
+                            .or_else(|| settings_read.active_connector())
+                            .cloned()
                     };
+                    if instance.is_none() {
+                        tracing::warn!("SwitchModel: no LLM connector configured, ignoring");
+                    }
+                    if let Some(instance) = instance {
+                    let slots = instance.config.model_slots();
                     if idx < slots.len() {
                         let new_model = slots[idx].clone();
                         if !new_model.is_empty() {
@@ -1596,27 +1712,29 @@ fn app() -> Element {
                                 "SwitchModel: switching to slot {} model '{}' ({})",
                                 idx,
                                 new_model,
-                                provider.display_name()
+                                instance.name
                             );
-                            // Pin the session to the chosen provider+model pair...
+                            // Pin the session to the chosen connector+model pair...
                             let mut session_changed = false;
                             {
                                 let mut state = session_state.write();
                                 if let Some(session) =
                                     state.sessions.get_mut(&*current_session_id.read())
                                 {
-                                    if session.llm_provider != Some(provider)
+                                    if session.llm_connector_id.as_deref()
+                                        != Some(instance.id.as_str())
                                         || session.chat_model.as_deref()
                                             != Some(new_model.as_str())
                                     {
-                                        session.llm_provider = Some(provider);
+                                        session.llm_connector_id = Some(instance.id.clone());
+                                        session.llm_provider = Some(instance.provider());
                                         session.chat_model = Some(new_model.clone());
                                         session_changed = true;
                                     }
                                 }
                             } // write lock dropped here
                             // Session-only pin: do NOT update global settings so other
-                            // tabs keep their current provider/model unaffected.
+                            // tabs keep their current connector/model unaffected.
                             if session_changed {
                                 SessionState::save_async(&session_state.read(), Some(save_error));
                             }
@@ -1626,41 +1744,54 @@ fn app() -> Element {
                     } else {
                         tracing::warn!("SwitchModel: slot {} out of range ({})", idx, slots.len());
                     }
+                    }
                 }
-                ChatCommand::SwitchProvider(idx) => {
-                    let providers = crate::settings::LlmProvider::all_variants();
-                    if let Some(&provider) = providers.get(idx) {
-                        if !settings.peek().is_provider_configured(provider) {
-                            tracing::info!(
-                                "SwitchProvider: {} is not configured, ignoring",
-                                provider.display_name()
-                            );
-                        } else {
-                            // Pin the session to the chosen provider; the model follows
-                            // that provider's configured default.
+                ChatCommand::SwitchConnector(connector_id) => {
+                    let instance = settings.peek().connector_by_id(&connector_id).cloned();
+                    match instance {
+                        Some(instance)
+                            if settings.peek().is_connector_configured(&instance) =>
+                        {
+                            // Pin the session to the chosen connector; the model follows
+                            // that connector's configured default.
                             let mut session_changed = false;
                             {
                                 let mut state = session_state.write();
                                 if let Some(session) =
                                     state.sessions.get_mut(&*current_session_id.read())
                                 {
-                                    if session.llm_provider != Some(provider) {
-                                        session.llm_provider = Some(provider);
+                                    if session.llm_connector_id.as_deref()
+                                        != Some(instance.id.as_str())
+                                    {
+                                        session.llm_connector_id = Some(instance.id.clone());
+                                        session.llm_provider = Some(instance.provider());
                                         session.chat_model = None;
                                         session_changed = true;
                                     }
                                 }
                             } // write lock dropped here
-                            // Session-only pin: do NOT touch settings.active_llm so other
-                            // tabs keep their current provider unaffected. Global provider
+                            // Session-only pin: do NOT touch the global active connector so
+                            // other tabs keep their current connector unaffected. Global
                             // changes belong in the Settings panel, not the per-tab picker.
                             if session_changed {
                                 SessionState::save_async(&session_state.read(), Some(save_error));
                             }
                             tracing::info!(
-                                "SwitchProvider: pinned session to {} (session_changed={})",
-                                provider.display_name(),
+                                "SwitchConnector: pinned session to '{}' (session_changed={})",
+                                instance.name,
                                 session_changed
+                            );
+                        }
+                        Some(instance) => {
+                            tracing::info!(
+                                "SwitchConnector: '{}' is not configured, ignoring",
+                                instance.name
+                            );
+                        }
+                        None => {
+                            tracing::warn!(
+                                "SwitchConnector: unknown connector id '{}', ignoring",
+                                connector_id
                             );
                         }
                     }

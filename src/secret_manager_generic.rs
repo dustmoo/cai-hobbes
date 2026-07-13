@@ -183,6 +183,25 @@ impl SecretManagerTrait for SecretManager {
             }
         }
 
+        // Load per-connector LLM API keys from their index
+        if let Ok(entry) = Entry::new(SERVICE_NAME, secret_types::LLM_KEYS_INDEX_KEY) {
+            if let Ok(index_csv) = entry.get_password() {
+                for key in secret_types::parse_index_csv(&index_csv) {
+                    if let Ok(entry) = Entry::new(SERVICE_NAME, key) {
+                        match entry.get_password() {
+                            Ok(value) => {
+                                self.secrets.insert(key.to_string(), value);
+                                tracing::debug!("Loaded LLM connector key: {}", key);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to load indexed LLM key '{}': {}", key, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         tracing::info!(
             "SecretManager (Generic) loaded {} secrets from keychain",
             self.secrets.len()
@@ -226,6 +245,14 @@ impl SecretManagerTrait for SecretManager {
         }
     }
 
+    fn load_llm_key(&mut self, connector_id: &str) {
+        let key = secret_types::llm_key_name(connector_id);
+        if let Some(value) = self.get_from_keychain_directly(&key) {
+            self.secrets.insert(key, value);
+            tracing::debug!("Loaded LLM key for connector id: {}", connector_id);
+        }
+    }
+
     fn update_cache(&mut self, key: String, value: String) {
         self.secrets.insert(key, value);
     }
@@ -246,9 +273,9 @@ impl SecretManagerTrait for SecretManager {
         deleted
     }
 
-    /// Get the current index value directly from keychain (for index updates).
-    fn get_index_from_keychain(&self) -> Option<String> {
-        self.get_from_keychain_directly(secret_types::CUSTOM_KEYS_INDEX_KEY)
+    /// Get a named CSV-index value directly from keychain (for index updates).
+    fn get_named_index_from_keychain(&self, index_key: &str) -> Option<String> {
+        self.get_from_keychain_directly(index_key)
     }
 
     /// Get a reference to the secrets cache for credential extraction.

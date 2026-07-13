@@ -23,7 +23,10 @@ pub struct OpenAiCompatConnector {
 }
 
 impl OpenAiCompatConnector {
-    pub fn new(config: OpenAiCompatConfig) -> Self {
+    pub fn new(mut config: OpenAiCompatConfig) -> Self {
+        // Stray whitespace from pasted/typed endpoints breaks strict URL
+        // parsing (e.g. raw_tcp_stream's http:// prefix check) — normalize.
+        config.endpoint = config.endpoint.trim().to_string();
         Self { config }
     }
 }

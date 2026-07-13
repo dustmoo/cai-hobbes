@@ -76,9 +76,11 @@ Persistence uses a **serialize-then-move** pattern (P-009): never clone `Session
 - `ClaudeConnector` — Anthropic Messages API; supports extended thinking and transient-failure retry.
 - `OpenAiCompatConnector` — generic OpenAI-compatible endpoint.
 
-**Per-session provider/model overrides**: `Session.llm_provider` and `Session.chat_model` override the global `Settings.active_llm`. Use `settings.provider_for_session(session)` and `settings.chat_model_for_session(session)` to resolve the effective pair. `build_connector_for(settings, provider, model)` in `llm/mod.rs` constructs a connector for a non-global provider. Gemini connectors use a process-wide `OnceLock` cache store via `GeminiConnector::new_shared()` (tests use `new()` for isolation).
+**Multi-connector model**: `Settings.llm_connectors: Vec<ProviderInstance>` holds named connector instances (`{id: uuid, name, config: ProviderInstanceConfig}`) — multiple instances per provider kind, capped at `MAX_LLM_CONNECTORS` (10). `Settings.active_connector_id` is the global default; CRUD via `add_connector` / `remove_connector` (refuses the last) / `rename_connector` / `connector_by_id` / `active_connector`. The legacy singleton fields (`active_llm`, `gemini_config`, `openai_compat_config`, `claude_config`) are deprecated mirrors kept for migration (`migrate_legacy_llm_config` in `SettingsManager::load`) and as the settings-panel editing buffer. Per-instance API keys live in the keychain as `llm_api_key_<id>` (`secret_types::llm_key_name`), discovered at startup via the `llm_connector_keys_index` CSV key plus explicit `load_llm_key` calls; legacy static keys are claimed/copied on first hydration (`hydrate_connector_keys` in `main.rs`).
 
-**Settings API**: provider-aware methods always take an explicit `LlmProvider` argument — `resolve_context_window_for(provider, model)`, `effective_context_tuning_for(provider)`, `model_slots_for(provider)`, `set_chat_model_for(provider, model)`, `is_provider_configured(provider)`.
+**Per-session overrides**: `Session.llm_connector_id` pins a session to a connector instance (`Session.llm_provider`/`chat_model` are kept as legacy fallback/mirror). Resolution chain in `settings.connector_for_session(session)`: pinned id → first connector of the legacy pinned kind → global active connector. Use `chat_model_for_session(session)` for the effective model. `build_connector_for_instance(instance, model_override)` in `llm/mod.rs` constructs a connector for a non-global instance. Gemini connectors use a process-wide `OnceLock` cache store via `GeminiConnector::new_shared()` (tests use `new()` for isolation); cache entries are fingerprinted by API key so two Gemini instances with different keys never cross-reuse server-side `cachedContents`.
+
+**Settings API**: connector-aware methods take an explicit `&ProviderInstance` — `resolve_context_window_for_connector(instance, model)`, `effective_context_tuning_for_connector(instance)`, `is_connector_configured(instance)`. Per-instance feature flags (watch words, thinking, tool use) are read from the resolved instance's config, not global settings.
 
 ### Prompt Construction (`src/context/prompt_builder/`)
 
@@ -88,7 +90,7 @@ Persistence uses a **serialize-then-move** pattern (P-009): never clone `Session
 3. `apply_pass2_budget()` — Pass 2: paginate oversized tool results into `HOBBES_PAGE_RESULT` continuations.
 4. `strip_historical_thinking()` — remove thinking blocks from all but the most recent assistant message.
 
-The prompt builder is **session-aware**: it resolves provider/context window from `session.llm_provider` override, not the global settings.
+The prompt builder is **session-aware**: it resolves the connector/context window from the session's pinned connector (`connector_for_session`), not the global settings.
 
 **Critical (P-001)**: Never call `get_mcp_context().await` inside the prompt build or send-message cycle. MCP context is reactively synced into `session.active_context` via `use_effect` in `ChatWindow` — trust that sync.
 
