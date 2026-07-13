@@ -3405,13 +3405,20 @@ impl McpManager {
         // Step 5: Final Reload
         tracing::info!("[Step 5/5] Finalizing Configuration...");
         {
+            // Authoritative no-auth signal: auth resolution ended without an
+            // auth config (covers both the caller's hint and the 303 self-heal).
+            let effective_no_auth = auth_config_id.is_none();
             let mut s = settings_signal.write();
             if let Some(profile) = s.get_active_profile_mut() {
-                if !profile
+                if let Some(existing) = profile
                     .toolkit_configs
-                    .iter()
-                    .any(|c| c.slug == toolkit_slug)
+                    .iter_mut()
+                    .find(|c| c.slug == toolkit_slug)
                 {
+                    // Keep the no-auth flag current (a no-auth toolkit has no
+                    // connected account, so this flag is what marks it connected).
+                    existing.no_auth = effective_no_auth;
+                } else {
                     profile
                         .toolkit_configs
                         .push(crate::settings::ComposioToolkitConfig {
@@ -3420,6 +3427,7 @@ impl McpManager {
                             tool_count: 0,
                             force_load: false,
                             load_mode: crate::settings::ToolkitLoadMode::OnDemand,
+                            no_auth: effective_no_auth,
                         });
                 }
             }

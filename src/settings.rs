@@ -444,6 +444,11 @@ pub struct ComposioToolkitConfig {
     /// How this toolkit's tools are loaded (replaces `force_load`).
     #[serde(default)]
     pub load_mode: ToolkitLoadMode,
+    /// True if this toolkit requires no authentication (e.g. hackernews).
+    /// No-auth toolkits never have a connected account, so this locally-known
+    /// flag is what marks them as connected in the UI.
+    #[serde(default)]
+    pub no_auth: bool,
 }
 
 impl ComposioToolkitConfig {

@@ -327,7 +327,17 @@ pub fn McpMarketplace() -> Element {
                         );
 
                         match client.get_connected_toolkit_slugs().await {
-                            Ok(slugs) => {
+                            Ok(mut slugs) => {
+                                // No-auth toolkits have no connected account, so the
+                                // network check can't see them. Union in the locally
+                                // persisted no-auth slugs so they stay "Connected".
+                                for cfg in profile
+                                    .toolkit_configs
+                                    .iter()
+                                    .filter(|c| c.no_auth)
+                                {
+                                    slugs.insert(cfg.slug.to_lowercase());
+                                }
                                 tracing::debug!("Fetched {} connected toolkit slugs", slugs.len());
                                 connected_slugs.set(slugs);
                             }
@@ -1530,10 +1540,20 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                         let settings_snapshot = local_settings.read().clone();
 
                                         // Get the current load mode for this toolkit
-                                        let load_mode = settings_snapshot.get_active_profile()
-                                            .and_then(|p| p.toolkit_configs.iter().find(|c| c.slug == toolkit_slug))
+                                        let toolkit_config = settings_snapshot.get_active_profile()
+                                            .and_then(|p| p.toolkit_configs.iter().find(|c| c.slug == toolkit_slug));
+                                        let load_mode = toolkit_config
                                             .map(|c| c.effective_load_mode())
                                             .unwrap_or(crate::settings::ToolkitLoadMode::OnDemand);
+
+                                        // A no-auth toolkit never has a connected account, so trust the
+                                        // persisted no_auth flag to mark it connected. Read it from the
+                                        // global settings signal (the source of truth connect writes to),
+                                        // since local_settings only resyncs on profile change.
+                                        let is_no_auth_connected = settings.read().get_active_profile()
+                                            .map(|p| p.toolkit_configs.iter().any(|c| c.slug == toolkit_slug && c.no_auth))
+                                            .unwrap_or(false);
+                                        let is_connected = toolkit.is_connected || is_no_auth_connected;
 
                                         rsx! {
                                             div {
@@ -1541,8 +1561,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                 div {
                                                     class: "flex items-center gap-2",
                                                     span {
-                                                        class: if toolkit.is_connected { "text-green-400" } else { "text-fg-muted" },
-                                                        if toolkit.is_connected { "✓" } else { "○" }
+                                                        class: if is_connected { "text-green-400" } else { "text-fg-muted" },
+                                                        if is_connected { "✓" } else { "○" }
                                                     }
                                                     span {
                                                         class: "text-sm",
@@ -1553,7 +1573,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                         "({toolkit.tool_count} tools)"
                                                     }
                                                 }
-                                                if toolkit.is_connected {
+                                                if is_connected {
                                                     div {
                                                         class: "flex items-center gap-2",
                                                         button {
@@ -1604,6 +1624,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                             tool_count,
                                                                             force_load: false,
                                                                             load_mode: new_mode,
+                                                                            no_auth: false,
                                                                         });
                                                                     }
                                                                 }
