@@ -15,12 +15,14 @@ pub struct AddToolkitResult {
 }
 
 /// Add a toolkit to the MCP server configuration via PATCH API.
+/// `auth_config_id` is `None` for no-auth toolkits, which are bound to the
+/// server without any auth config (Composio rejects auth configs for them).
 /// Returns an `AddToolkitResult` with the new server URL (if created) and any
 /// pre-existing allowed_tools for this toolkit (for admin curation detection).
 pub async fn add_toolkit_to_server(
     client: &ComposioClient,
     toolkit_slug: &str,
-    auth_config_id: &str,
+    auth_config_id: Option<&str>,
     selected_tools: Option<Vec<String>>,
 ) -> Result<AddToolkitResult, String> {
     // Extract target server ID from base_url/settings for verification
@@ -238,19 +240,27 @@ pub async fn add_toolkit_to_server(
         }
     }
 
-    // 3. Add the NEW authoritative auth config for this toolkit
-    if !auth_config_ids.contains(&auth_config_id.to_string()) {
-        auth_config_ids.push(auth_config_id.to_string());
-        tracing::info!(
-            "Binding new auth_config '{}' for toolkit '{}'",
-            auth_config_id,
-            toolkit_slug
-        );
-        auth_updated = true;
+    // 3. Add the NEW authoritative auth config for this toolkit.
+    // No-auth toolkits have no auth config — they bind by slug alone.
+    if let Some(auth_config_id) = auth_config_id {
+        if !auth_config_ids.contains(&auth_config_id.to_string()) {
+            auth_config_ids.push(auth_config_id.to_string());
+            tracing::info!(
+                "Binding new auth_config '{}' for toolkit '{}'",
+                auth_config_id,
+                toolkit_slug
+            );
+            auth_updated = true;
+        } else {
+            tracing::debug!(
+                "Auth config '{}' already present in reconciled list",
+                auth_config_id
+            );
+        }
     } else {
-        tracing::debug!(
-            "Auth config '{}' already present in reconciled list",
-            auth_config_id
+        tracing::info!(
+            "Toolkit '{}' requires no authentication — binding without an auth config",
+            toolkit_slug
         );
     }
 
@@ -628,7 +638,7 @@ pub async fn set_toolkit_enabled_tools(
 async fn create_mcp_server(
     client: &ComposioClient,
     toolkit_slug: &str,
-    auth_config_id: &str,
+    auth_config_id: Option<&str>,
 ) -> Result<Value, String> {
     let api_base = client.get_api_base_url();
     let url = format!("{}/mcp/servers/custom", api_base);
@@ -642,10 +652,12 @@ async fn create_mcp_server(
     // Build payload with initial toolkit binding
     // CRITICAL: Use String Arrays for toolkits and auth_config_ids
     // Object binding ([{toolkit:..., auth_config:...}]) is FORBIDDEN by API
+    // No-auth toolkits are bound with an empty auth_config_ids array.
+    let auth_config_ids: Vec<&str> = auth_config_id.into_iter().collect();
     let payload = serde_json::json!({
         "name": server_name,
         "toolkits": [toolkit_slug.to_lowercase()],
-        "auth_config_ids": [auth_config_id]
+        "auth_config_ids": auth_config_ids
     });
 
     tracing::info!(

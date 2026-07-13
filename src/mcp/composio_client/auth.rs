@@ -335,6 +335,13 @@ pub async fn prune_connections(
     Ok(())
 }
 
+/// Detect Composio's "toolkit does not require authentication" rejection
+/// (error code 303). Returned when creating an auth config for a no-auth
+/// toolkit — callers should fall back to connecting without auth.
+pub fn is_no_auth_toolkit_error(error: &str) -> bool {
+    error.contains("does not require authentication") || error.contains("\"code\":303")
+}
+
 /// Create an auth config for a toolkit.
 pub(crate) async fn create_auth_config(
     client: &ComposioClient,
@@ -1171,5 +1178,27 @@ pub async fn initiate_connection(
             "Could not find redirectUrl in response: {}",
             response_text
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_no_auth_toolkit_error;
+
+    #[test]
+    fn detects_composio_no_auth_rejection() {
+        // Exact shape returned by POST /auth_configs for a no-auth toolkit,
+        // as wrapped by create_auth_config's error formatting.
+        let err = r#"Failed to create auth config (400 Bad Request): {"error":{"message":"Cannot create an auth config for toolkit \"hackernews\" because it does not require authentication.","code":303,"suggested_fix":"Toolkit \"hackernews\" works without an auth config. You can use its tools directly without creating a connected account."}}"#;
+        assert!(is_no_auth_toolkit_error(err));
+
+        // Code alone is enough if the message ever changes.
+        assert!(is_no_auth_toolkit_error(r#"{"error":{"code":303}}"#));
+
+        // Unrelated failures must not trigger the no-auth path.
+        assert!(!is_no_auth_toolkit_error(
+            "Failed to create auth config (401 Unauthorized): invalid api key"
+        ));
+        assert!(!is_no_auth_toolkit_error("network timeout"));
     }
 }

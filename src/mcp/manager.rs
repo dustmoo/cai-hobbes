@@ -3103,6 +3103,7 @@ impl McpManager {
         toolkit_slug: String,
         auth_scheme: Option<String>,
         use_managed_auth: bool,
+        no_auth: bool,
         mut mcp_context_signal: Signal<McpContext>,
         mut settings_signal: Signal<Settings>,
         settings_manager: SettingsManager,
@@ -3113,10 +3114,11 @@ impl McpManager {
         mut connected_slugs: Signal<HashSet<String>>,
     ) -> Result<(), String> {
         tracing::info!(
-            "Consolidated 6-Point Connection: toolkit_slug={} (auth_scheme: {:?}, managed: {})",
+            "Consolidated 6-Point Connection: toolkit_slug={} (auth_scheme: {:?}, managed: {}, no_auth: {})",
             toolkit_slug,
             auth_scheme,
-            use_managed_auth
+            use_managed_auth,
+            no_auth
         );
 
         is_connecting.set(true);
@@ -3158,45 +3160,71 @@ impl McpManager {
             profile.chrome_profile_directory.clone(),
         );
 
-        // Step 1: Get or create auth config (reuse existing if available)
-        tracing::info!("[Step 1/5] Resolving Auth Config...");
-        let auth_config_id = match client.get_auth_config_id(&toolkit_slug).await {
-            Ok(id) => {
-                tracing::info!(
-                    "Resolved auth config '{}' for toolkit '{}'",
-                    id,
-                    toolkit_slug
-                );
-                id
-            }
-            Err(e) => {
-                let msg = format!("Failed to resolve auth config: {}", e);
-                tracing::error!("{}", msg);
-                connection_error.set(Some(msg.clone()));
-                is_connecting.set(false);
-                return Err(msg);
+        // Step 1: Get or create auth config (reuse existing if available).
+        // No-auth toolkits (e.g. hackernews) skip auth entirely: Composio
+        // rejects auth config creation for them with error code 303, and their
+        // tools work without a connected account.
+        let auth_config_id: Option<String> = if no_auth {
+            tracing::info!(
+                "[Step 1/5] Toolkit '{}' requires no authentication — skipping auth config",
+                toolkit_slug
+            );
+            None
+        } else {
+            tracing::info!("[Step 1/5] Resolving Auth Config...");
+            match client.get_auth_config_id(&toolkit_slug).await {
+                Ok(id) => {
+                    tracing::info!(
+                        "Resolved auth config '{}' for toolkit '{}'",
+                        id,
+                        toolkit_slug
+                    );
+                    Some(id)
+                }
+                // Self-heal: registry listings sometimes omit the no_auth flag;
+                // Composio's 303 rejection is authoritative, so fall back to the
+                // no-auth path instead of failing the connection.
+                Err(e) if crate::mcp::composio_client::auth::is_no_auth_toolkit_error(&e) => {
+                    tracing::info!(
+                        "Toolkit '{}' reported as no-auth by Composio (code 303) — continuing without auth config",
+                        toolkit_slug
+                    );
+                    None
+                }
+                Err(e) => {
+                    let msg = format!("Failed to resolve auth config: {}", e);
+                    tracing::error!("{}", msg);
+                    connection_error.set(Some(msg.clone()));
+                    is_connecting.set(false);
+                    return Err(msg);
+                }
             }
         };
 
         // Step 2: Initiate OAuth (Proxy Link) - AUTH FIRST
-        tracing::info!("[Step 2/5] Initiating OAuth...");
-        connection_status.set("Authenticating...".to_string());
+        // Skipped for no-auth toolkits: there is no account to connect.
+        if auth_config_id.is_some() {
+            tracing::info!("[Step 2/5] Initiating OAuth...");
+            connection_status.set("Authenticating...".to_string());
 
-        match client
-            .initiate_connection(&toolkit_slug, &user_id, false)
-            .await
-        {
-            Ok(result_msg) => {
-                tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
-                // Wait implied by await
+            match client
+                .initiate_connection(&toolkit_slug, &user_id, false)
+                .await
+            {
+                Ok(result_msg) => {
+                    tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
+                    // Wait implied by await
+                }
+                Err(e) => {
+                    let msg = format!("Authentication failed: {}", e);
+                    tracing::error!("{}", msg);
+                    connection_error.set(Some(msg.clone()));
+                    is_connecting.set(false);
+                    return Err(msg);
+                }
             }
-            Err(e) => {
-                let msg = format!("Authentication failed: {}", e);
-                tracing::error!("{}", msg);
-                connection_error.set(Some(msg.clone()));
-                is_connecting.set(false);
-                return Err(msg);
-            }
+        } else {
+            tracing::info!("[Step 2/5] Skipping OAuth — no authentication required");
         }
 
         // Step 3: Add Toolkit to Server (PATCH Registry)
@@ -3207,7 +3235,7 @@ impl McpManager {
         // Step 4 will trigger LLM selection if tools exceed TOOL_SELECTION_THRESHOLD,
         // UNLESS admin has pre-configured allowed_tools (security override).
         let patch_result = client
-            .add_toolkit_to_server(&toolkit_slug, &auth_config_id, None)
+            .add_toolkit_to_server(&toolkit_slug, auth_config_id.as_deref(), None)
             .await;
 
         // Track admin-curated tools detected during PATCH for Step 4 skip logic
@@ -3366,7 +3394,7 @@ impl McpManager {
             if let Some(tools) = selected_tools.clone() {
                 tracing::info!("Applying smart selection of {} tools", tools.len());
                 if let Err(e) = client
-                    .add_toolkit_to_server(&toolkit_slug, &auth_config_id, Some(tools))
+                    .add_toolkit_to_server(&toolkit_slug, auth_config_id.as_deref(), Some(tools))
                     .await
                 {
                     tracing::warn!("Failed to apply smart tool selection: {}", e);

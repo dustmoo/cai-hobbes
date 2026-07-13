@@ -1684,6 +1684,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                                     slug.clone(),
                                                                                     None, // auth_scheme — use default
                                                                                     true, // use_managed_auth
+                                                                                    false, // no_auth — ToolkitInfo lacks the flag; 303 self-heal covers it
                                                                                     mcp_context,
                                                                                     settings,
                                                                                     settings_manager_val,
@@ -2213,6 +2214,7 @@ fn McpServerCard(
                                             let toolkit_slug = mcp.name.clone();
                                             let auth_scheme = mcp.auth_scheme.clone();
                                             let use_managed_auth = mcp.use_managed_auth;
+                                            let no_auth = mcp.no_auth;
                                             move |_| {
                                                 let toolkit_slug = toolkit_slug.clone();
                                                 let auth_scheme = auth_scheme.clone();
@@ -2237,6 +2239,7 @@ fn McpServerCard(
                                                                     toolkit_slug,
                                                                     auth_scheme,
                                                                     use_managed_auth,
+                                                                    no_auth,
                                                                     mcp_context,
                                                                     settings,
                                                                     settings_manager_val,
