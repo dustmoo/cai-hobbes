@@ -66,6 +66,16 @@ fn active_composio_key(
     servers.keys().find(|k| is_composio_native(k)).cloned()
 }
 
+/// Cache key under which a profile's on-demand Composio tools are stored in
+/// `dynamic_composio_tools`. Uses the profile id, falling back to the bare
+/// prefix for the legacy singleton (no profile). Mirrors the profile filter in
+/// `get_mcp_context` so discovery under one profile stays out of another's context.
+fn dyn_composio_key(profile_id: Option<&str>) -> String {
+    profile_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| COMPOSIO_NATIVE_PREFIX.to_string())
+}
+
 /// Gemini's practical tool limit for FunctionDeclarations.
 const GEMINI_TOOL_LIMIT: usize = 128;
 
@@ -487,10 +497,12 @@ pub struct McpManager {
     secret_manager: Signal<crate::secret_manager::SecretManager>,
     /// Shared settings signal for Pattern 30: read image model etc. at call time
     settings: Signal<crate::settings::Settings>,
-    /// Dynamically discovered Composio tools (populated by COMPOSIO_GET_APP_TOOLS).
-    /// Included as a virtual server in get_mcp_context() so the prompt builder
-    /// sends them to Gemini as real FunctionDeclarations.
-    pub dynamic_composio_tools: Arc<Mutex<Vec<rmcp::model::Tool>>>,
+    /// Dynamically discovered Composio tools (populated by COMPOSIO_GET_APP_TOOLS),
+    /// keyed by Composio profile id (see `dyn_composio_key`). Included as a virtual
+    /// server in get_mcp_context() so the prompt builder sends them to Gemini as
+    /// real FunctionDeclarations. Profile-keyed so tools discovered under one
+    /// profile don't bleed into another profile's context across tabs.
+    pub dynamic_composio_tools: Arc<Mutex<HashMap<String, Vec<rmcp::model::Tool>>>>,
     /// Servers whose tools are available on-demand via MCP_LOAD_SERVER_TOOLS meta-tool.
     /// Servers in this set have their process running but tools are NOT included in get_mcp_context()
     /// unless explicitly loaded via the meta-tool into dynamic_local_tools.
@@ -521,7 +533,7 @@ impl McpManager {
             cached_server_statuses: Arc::new(Mutex::new(None)),
             secret_manager,
             settings,
-            dynamic_composio_tools: Arc::new(Mutex::new(Vec::new())),
+            dynamic_composio_tools: Arc::new(Mutex::new(HashMap::new())),
             on_demand_servers: Arc::new(Mutex::new(HashSet::new())),
             dynamic_local_tools: Arc::new(Mutex::new(Vec::new())),
             dynamic_local_tool_sources: Arc::new(Mutex::new(HashMap::new())),
@@ -791,9 +803,10 @@ impl McpManager {
         {
             let mut dynamic = self.dynamic_composio_tools.lock().await;
             if !dynamic.is_empty() {
+                let tool_count: usize = dynamic.values().map(|v| v.len()).sum();
                 tracing::info!(
                     "Clearing {} stale dynamic Composio tools on config reload",
-                    dynamic.len()
+                    tool_count
                 );
                 dynamic.clear();
             }
@@ -875,15 +888,16 @@ impl McpManager {
             tracing::info!("Cleared existing Composio native clients for reinitialization.");
         }
 
-        // Clear dynamic tool caches from the old profile
+        // Clear dynamic tool caches for the profile being reinitialized only —
+        // other profiles' on-demand tools (e.g. in other tabs) must survive.
         {
             let mut dynamic = self.dynamic_composio_tools.lock().await;
-            if !dynamic.is_empty() {
+            if let Some(removed) = dynamic.remove(&dyn_composio_key(Some(&profile.id))) {
                 tracing::info!(
-                    "Clearing {} stale dynamic Composio tools from previous profile",
-                    dynamic.len()
+                    "Clearing {} stale dynamic Composio tools for reinitialized profile '{}'",
+                    removed.len(),
+                    profile.id
                 );
-                dynamic.clear();
             }
         }
         {
@@ -2098,9 +2112,18 @@ impl McpManager {
                 } else {
                     // Fallback 2: check the dynamic Composio tools cache.
                     // Dynamically discovered tools (via COMPOSIO_GET_APP_TOOLS) live here,
-                    // not in any ActiveMcpClient.tools list.
+                    // not in any ActiveMcpClient.tools list. Prefer this client's
+                    // profile bucket; scan the rest only defensively (the Tool is
+                    // metadata — execution still routes through the resolved client).
                     let dynamic_cache = self.dynamic_composio_tools.lock().await;
-                    match dynamic_cache.iter().find(|t| t.name == tool_name) {
+                    // Key by the turn's profile_id — the same key get_mcp_context
+                    // used when it surfaced this tool to the AI.
+                    let key = dyn_composio_key(profile_id.as_deref());
+                    let found = dynamic_cache
+                        .get(&key)
+                        .and_then(|v| v.iter().find(|t| t.name == tool_name))
+                        .or_else(|| dynamic_cache.values().flatten().find(|t| t.name == tool_name));
+                    match found {
                         Some(t) => t.clone(),
                         None => return Err(format!("Tool not found: {}", tool_name)),
                     }
@@ -2133,6 +2156,9 @@ impl McpManager {
         let (tx, rx) = mpsc::unbounded_channel();
         let service = client.service.clone();
         let dynamic_tools_cache = self.dynamic_composio_tools.clone();
+        // Profile bucket for on-demand tools discovered/cleared in this turn.
+        // Keyed by the turn's profile_id so it matches get_mcp_context's lookup.
+        let dyn_profile_key = dyn_composio_key(profile_id.as_deref());
         // Capture the set of tool names currently loaded on this server.
         // Used to filter dynamic injection: only tools the proxy will accept
         // for tools/call should be injected as FunctionDeclarations.
@@ -2373,13 +2399,14 @@ impl McpManager {
                                     let injected_count = rmcp_tools.len();
                                     {
                                         let mut cache = dynamic_tools_cache.lock().await;
+                                        let bucket = cache.entry(dyn_profile_key.clone()).or_default();
                                         let new_names: std::collections::HashSet<String> =
                                             rmcp_tools.iter().map(|t| t.name.to_string()).collect();
-                                        cache.retain(|t| !new_names.contains(&t.name.to_string()));
-                                        cache.extend(rmcp_tools);
+                                        bucket.retain(|t| !new_names.contains(&t.name.to_string()));
+                                        bucket.extend(rmcp_tools);
                                         tracing::info!(
-                                            "Injected {} dynamic tools for '{}' (from {} available, budget: {}, cache: {})",
-                                            injected_count, app_name, total_available, budget, cache.len()
+                                            "Injected {} dynamic tools for '{}' under profile '{}' (from {} available, budget: {}, bucket: {})",
+                                            injected_count, app_name, dyn_profile_key, total_available, budget, bucket.len()
                                         );
                                     }
 
@@ -2465,13 +2492,18 @@ impl McpManager {
                             }
                         }
                     } else if tool.name == "COMPOSIO_CLEAR_TOOLS" {
-                        // Clear all dynamically discovered tools from the cache
+                        // Clear only this profile's dynamically discovered tools,
+                        // so one tab clearing its toolset doesn't wipe another
+                        // profile's discovered tools.
                         let mut cache = dynamic_tools_cache.lock().await;
-                        let cleared_count = cache.len();
-                        cache.clear();
+                        let cleared_count = cache
+                            .remove(&dyn_profile_key)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
                         tracing::info!(
-                            "COMPOSIO_CLEAR_TOOLS: cleared {} dynamic tools",
-                            cleared_count
+                            "COMPOSIO_CLEAR_TOOLS: cleared {} dynamic tools for profile '{}'",
+                            cleared_count,
+                            dyn_profile_key
                         );
 
                         Ok(CallToolResult {
@@ -2863,18 +2895,28 @@ impl McpManager {
 
         // Drop any on-demand tools already discovered for this toolkit — they
         // were resolved against the OLD whitelist and must be re-discovered.
+        // Scoped to the active profile's bucket (the edit is profile-scoped).
         {
             let prefix = format!("{}_", toolkit_slug.to_uppercase().replace('-', "_"));
+            let active_profile_id = self
+                .settings
+                .peek()
+                .get_active_profile()
+                .map(|p| p.id.clone());
+            let key = dyn_composio_key(active_profile_id.as_deref());
             let mut dynamic = self.dynamic_composio_tools.lock().await;
-            let before = dynamic.len();
-            dynamic.retain(|t| !t.name.to_uppercase().starts_with(&prefix));
-            let removed = before - dynamic.len();
-            if removed > 0 {
-                tracing::info!(
-                    "Cleared {} stale dynamic tools for edited toolkit '{}'",
-                    removed,
-                    toolkit_slug
-                );
+            if let Some(bucket) = dynamic.get_mut(&key) {
+                let before = bucket.len();
+                bucket.retain(|t| !t.name.to_uppercase().starts_with(&prefix));
+                let removed = before - bucket.len();
+                if removed > 0 {
+                    tracing::info!(
+                        "Cleared {} stale dynamic tools for edited toolkit '{}' (profile '{}')",
+                        removed,
+                        toolkit_slug,
+                        key
+                    );
+                }
             }
         }
 
@@ -2973,23 +3015,28 @@ impl McpManager {
         // across all server contexts. Dynamic tools that collide with force-loaded
         // tools are excluded to prevent Gemini "Duplicate function declaration" 400 errors.
         let dynamic_tools = self.dynamic_composio_tools.lock().await;
-        if !dynamic_tools.is_empty() {
+        // Only this profile's on-demand tools — never another profile's bucket.
+        let profile_dynamic_tools: &[Tool] = dynamic_tools
+            .get(&dyn_composio_key(profile_id.as_deref()))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        if !profile_dynamic_tools.is_empty() {
             let existing_tool_names: HashSet<String> = server_contexts
                 .iter()
                 .flat_map(|sc| sc.tools.iter().map(|t| t.name.to_string()))
                 .collect();
 
-            let deduped_tools: Vec<Tool> = dynamic_tools
+            let deduped_tools: Vec<Tool> = profile_dynamic_tools
                 .iter()
                 .filter(|t| !existing_tool_names.contains(t.name.as_ref()))
                 .cloned()
                 .collect();
 
-            let skipped = dynamic_tools.len() - deduped_tools.len();
+            let skipped = profile_dynamic_tools.len() - deduped_tools.len();
             if skipped > 0 {
                 tracing::info!(
                     "Dynamic tools: {} total, {} skipped (already in force-loaded set), {} injected",
-                    dynamic_tools.len(), skipped, deduped_tools.len()
+                    profile_dynamic_tools.len(), skipped, deduped_tools.len()
                 );
             }
 
