@@ -36,6 +36,36 @@ fn composio_server_key(profile_id: &str) -> String {
     format!("{}:{}", COMPOSIO_NATIVE_PREFIX, profile_id)
 }
 
+/// Resolve the servers-map key for a specific profile's Composio-native client.
+/// Prefers the profile-scoped key, then a `profile_id` field match, then the
+/// bare prefix, then any Composio client as a last resort.
+///
+/// Profile-scoping is mandatory: each connected profile has its own
+/// `composio-native:{id}` entry, so a bare `find(is_composio_native)` returns an
+/// arbitrary client and can operate on the wrong profile (e.g. reloading tools
+/// for "Clearmirror" but binding them to "Puget").
+fn active_composio_key(
+    servers: &std::collections::HashMap<String, ActiveMcpClient>,
+    profile_id: Option<&str>,
+) -> Option<String> {
+    if let Some(pid) = profile_id {
+        let scoped = composio_server_key(pid);
+        if servers.contains_key(&scoped) {
+            return Some(scoped);
+        }
+        if let Some((k, _)) = servers
+            .iter()
+            .find(|(k, c)| is_composio_native(k) && c.profile_id.as_deref() == Some(pid))
+        {
+            return Some(k.clone());
+        }
+    }
+    if servers.contains_key(COMPOSIO_NATIVE_PREFIX) {
+        return Some(COMPOSIO_NATIVE_PREFIX.to_string());
+    }
+    servers.keys().find(|k| is_composio_native(k)).cloned()
+}
+
 /// Gemini's practical tool limit for FunctionDeclarations.
 const GEMINI_TOOL_LIMIT: usize = 128;
 
@@ -2749,11 +2779,15 @@ impl McpManager {
         &self,
     ) -> Result<Vec<crate::mcp::composio_client::ToolkitInfo>, String> {
         let servers = self.servers.lock().await;
-        // Find any composio-native client (may have profile suffix)
-        let composio_client = servers
-            .iter()
-            .find(|(k, _)| is_composio_native(k))
-            .map(|(_, v)| v);
+        // Select the ACTIVE profile's composio-native client (several accumulate
+        // once multiple profiles connect; a bare find returns an arbitrary one).
+        let active_profile_id = self
+            .settings
+            .peek()
+            .get_active_profile()
+            .map(|p| p.id.clone());
+        let composio_client = active_composio_key(&servers, active_profile_id.as_deref())
+            .and_then(|k| servers.get(&k));
 
         if let Some(client) = composio_client {
             if let McpClientType::NativeComposio(composio_client) = &client.service {
@@ -2773,10 +2807,16 @@ impl McpManager {
         &self,
     ) -> Result<Arc<crate::mcp::composio_client::ComposioClient>, String> {
         let servers = self.servers.lock().await;
-        servers
-            .iter()
-            .find(|(k, _)| is_composio_native(k))
-            .and_then(|(_, v)| match &v.service {
+        // Scope to the active profile's client so operations don't hit a
+        // different profile's Composio account.
+        let active_profile_id = self
+            .settings
+            .peek()
+            .get_active_profile()
+            .map(|p| p.id.clone());
+        active_composio_key(&servers, active_profile_id.as_deref())
+            .and_then(|k| servers.get(&k))
+            .and_then(|v| match &v.service {
                 McpClientType::NativeComposio(c) => Some(c.clone()),
                 _ => None,
             })
@@ -2981,10 +3021,9 @@ impl McpManager {
         // Populate connected toolkit slugs from cached Composio toolkit info (MCP-First, Section 6).
         // This is a pure cache read — no network calls. The cache is hydrated by
         // list_connected_toolkits() which uses the MCP `tools/list` endpoint.
-        let connected_toolkit_slugs = servers
-            .iter()
-            .find(|(k, _)| is_composio_native(k))
-            .and_then(|(_, client)| {
+        let connected_toolkit_slugs = active_composio_key(&servers, profile_id.as_deref())
+            .and_then(|k| servers.get(&k))
+            .and_then(|client| {
                 if let McpClientType::NativeComposio(ref composio_client) = client.service {
                     composio_client.get_cached_toolkit_info()
                 } else {
@@ -3044,8 +3083,11 @@ impl McpManager {
     ) -> Result<(), String> {
         let mut servers = self.servers.lock().await;
 
-        // Find the active composio-native client (may have profile suffix like "composio-native:ProfileName")
-        let composio_key = servers.keys().find(|k| is_composio_native(k)).cloned();
+        // Select the ACTIVE profile's composio-native client. A bare
+        // find(is_composio_native) can return a different profile's client when
+        // several profiles have connected, reloading the wrong profile's tools.
+        let active_profile_id = settings.get_active_profile().map(|p| p.id.clone());
+        let composio_key = active_composio_key(&servers, active_profile_id.as_deref());
 
         if let Some(key) = composio_key {
             if let Some(active_client) = servers.get_mut(&key) {
@@ -3444,8 +3486,9 @@ impl McpManager {
             tracing::warn!("Failed to reload tools: {}", e);
         }
 
-        // Update Context
-        mcp_context_signal.set(self.get_mcp_context(None).await);
+        // Update Context — scope to the active profile so we don't surface a
+        // different profile's Composio tools right after connecting.
+        mcp_context_signal.set(self.get_mcp_context(Some(profile_id.clone())).await);
         self.invalidate_status_cache();
 
         let current_trigger = *trigger_search.peek();
@@ -3601,9 +3644,17 @@ impl McpManager {
         // Special handling for the native Composio client - it's not in configs
         // but could still be active or failed. Now uses "composio-native:{profile}" format.
         {
-            // Find any active composio-native client (may have profile suffix)
+            // Select the ACTIVE profile's composio-native client so the status
+            // card reports the current profile's tools, not an arbitrary
+            // profile's (several accumulate once multiple profiles connect).
+            let active_profile_id = self
+                .settings
+                .peek()
+                .get_active_profile()
+                .map(|p| p.id.clone());
             let active_composio: Option<(&String, &ActiveMcpClient)> =
-                servers.iter().find(|(k, _)| is_composio_native(k));
+                active_composio_key(&servers, active_profile_id.as_deref())
+                    .and_then(|k| servers.get_key_value(&k));
 
             // Find any failed composio-native client
             let failed_composio: Option<(&String, &(McpServerConfig, String))> =
