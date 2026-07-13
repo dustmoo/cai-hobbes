@@ -88,7 +88,9 @@ impl From<ComposioToolkitListing> for FeaturedMcp {
             .unwrap_or_else(|| format!("https://app.composio.dev/app/{}", toolkit.slug));
         let use_managed_auth = toolkit.supports_managed_auth();
         let auth_scheme = toolkit.primary_auth_scheme();
-        let no_auth = toolkit.no_auth.unwrap_or(false);
+        // requires_no_auth() checks both the no_auth flag AND an all-"NO_AUTH"
+        // auth_schemes list — Composio often signals no-auth only via the latter.
+        let no_auth = toolkit.requires_no_auth();
         FeaturedMcp {
             name: toolkit.slug,
             display_name: toolkit.name,

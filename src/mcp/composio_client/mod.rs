@@ -176,6 +176,13 @@ impl ComposioClient {
         discovery::list_toolkit_categories(self).await
     }
 
+    pub async fn get_toolkit_metadata(
+        &self,
+        slug: &str,
+    ) -> Result<ComposioToolkitListing, String> {
+        discovery::get_toolkit_metadata(self, slug).await
+    }
+
     pub async fn get_connected_toolkit_slugs(
         &self,
     ) -> Result<std::collections::HashSet<String>, String> {

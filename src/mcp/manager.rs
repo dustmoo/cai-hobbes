@@ -3249,11 +3249,32 @@ impl McpManager {
             profile.chrome_profile_directory.clone(),
         );
 
+        // Authoritative no-auth check. The UI hint (no_auth param, from the
+        // catalog) is unreliable — Composio often signals no-auth only via
+        // auth_schemes=["NO_AUTH"], and get_auth_config_id can find/create a
+        // config without ever surfacing the 303 rejection. So when the hint is
+        // unset, confirm against the toolkit metadata before touching auth.
+        let requires_no_auth = if no_auth {
+            true
+        } else {
+            match client.get_toolkit_metadata(&toolkit_slug).await {
+                Ok(meta) => meta.requires_no_auth(),
+                Err(e) => {
+                    tracing::debug!(
+                        "Toolkit metadata lookup for '{}' failed ({}); assuming auth required",
+                        toolkit_slug,
+                        e
+                    );
+                    false
+                }
+            }
+        };
+
         // Step 1: Get or create auth config (reuse existing if available).
         // No-auth toolkits (e.g. hackernews) skip auth entirely: Composio
         // rejects auth config creation for them with error code 303, and their
         // tools work without a connected account.
-        let auth_config_id: Option<String> = if no_auth {
+        let auth_config_id: Option<String> = if requires_no_auth {
             tracing::info!(
                 "[Step 1/5] Toolkit '{}' requires no authentication — skipping auth config",
                 toolkit_slug
