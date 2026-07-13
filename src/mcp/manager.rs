@@ -3255,13 +3255,28 @@ impl McpManager {
         // config without ever surfacing the 303 rejection. So when the hint is
         // unset, confirm against the toolkit metadata before touching auth.
         let requires_no_auth = if no_auth {
+            tracing::info!(
+                "[no-auth] '{}': UI hint no_auth=true — treating as no-auth",
+                toolkit_slug
+            );
             true
         } else {
             match client.get_toolkit_metadata(&toolkit_slug).await {
-                Ok(meta) => meta.requires_no_auth(),
+                Ok(meta) => {
+                    let decided = meta.requires_no_auth();
+                    tracing::info!(
+                        "[no-auth] '{}': metadata no_auth={:?} auth_schemes={:?} managed_schemes={:?} -> requires_no_auth={}",
+                        toolkit_slug,
+                        meta.no_auth,
+                        meta.auth_schemes,
+                        meta.composio_managed_auth_schemes,
+                        decided
+                    );
+                    decided
+                }
                 Err(e) => {
-                    tracing::debug!(
-                        "Toolkit metadata lookup for '{}' failed ({}); assuming auth required",
+                    tracing::warn!(
+                        "[no-auth] '{}': metadata lookup FAILED ({}); assuming auth required",
                         toolkit_slug,
                         e
                     );
@@ -3518,6 +3533,12 @@ impl McpManager {
             // Authoritative no-auth signal: auth resolution ended without an
             // auth config (covers both the caller's hint and the 303 self-heal).
             let effective_no_auth = auth_config_id.is_none();
+            tracing::info!(
+                "[no-auth] '{}': persisting no_auth={} (auth_config_id={:?})",
+                toolkit_slug,
+                effective_no_auth,
+                auth_config_id
+            );
             let mut s = settings_signal.write();
             if let Some(profile) = s.get_active_profile_mut() {
                 if let Some(existing) = profile
