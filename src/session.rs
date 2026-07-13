@@ -91,10 +91,6 @@ pub struct ActiveContext {
     pub mcp_tools: Option<McpContext>, // Fixed: Restored field as it is still used in chat.rs/prompt_builder.rs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolWrapper>>,
-    /// Dynamically discovered Composio tools (populated by COMPOSIO_GET_APP_TOOLS).
-    /// These are merged into the Gemini FunctionDeclarations on the next turn.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dynamic_composio_tools: Vec<rmcp::model::Tool>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
