@@ -49,6 +49,22 @@ fn next_seq() -> i64 {
     SEQ.fetch_add(1, Ordering::SeqCst)
 }
 
+/// Seed the seq counter from the store's high-water mark. SEQ is process-local;
+/// without this a fresh process starts below rows written by a longer-lived
+/// earlier process, and the `excluded.seq >= sessions.seq` / `meta.seq` upsert
+/// guards silently reject every update to those rows and meta keys until the
+/// counter catches up — silent data loss that only shows after a restart.
+/// `fetch_max` only ever moves the counter forward (re-init, tests).
+fn seed_seq_from_db(conn: &Connection) {
+    let sessions_max: i64 = conn
+        .query_row("SELECT COALESCE(MAX(seq), 0) FROM sessions", [], |r| r.get(0))
+        .unwrap_or(0);
+    let meta_max: i64 = conn
+        .query_row("SELECT COALESCE(MAX(seq), 0) FROM meta", [], |r| r.get(0))
+        .unwrap_or(0);
+    SEQ.fetch_max(sessions_max.max(meta_max) + 1, Ordering::SeqCst);
+}
+
 pub fn get_db_path() -> Option<PathBuf> {
     dirs::config_dir().and_then(|mut path| {
         path.push("com.hobbes.app");
@@ -127,6 +143,8 @@ pub fn init() -> Result<(), String> {
         // files are left untouched so the import retries next launch.
         tracing::error!("One-time JSON→SQLite import failed (will retry next launch): {e}");
     }
+
+    seed_seq_from_db(&conn);
 
     let _ = CONN.set(Mutex::new(conn));
     Ok(())
@@ -709,6 +727,24 @@ pub mod test_support {
     pub fn upsert_with_seq(conn: &Connection, session: &Session, seq: i64) {
         let row = build_row(session, seq).unwrap();
         upsert_row(conn, &row).unwrap();
+    }
+
+    pub fn seed_seq(conn: &Connection) {
+        seed_seq_from_db(conn);
+    }
+
+    pub fn meta_set(conn: &Connection, key: &str, value: &str) {
+        meta_set_conn(conn, key, value).unwrap();
+    }
+
+    pub fn meta_set_with_seq(conn: &Connection, key: &str, value: &str, seq: i64) {
+        conn.execute(
+            "INSERT INTO meta (key, value, seq) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, seq = excluded.seq
+             WHERE excluded.seq >= meta.seq",
+            params![key, value, seq],
+        )
+        .unwrap();
     }
 
     pub fn get_row_name(conn: &Connection, id: &str) -> Option<String> {

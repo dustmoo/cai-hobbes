@@ -2130,6 +2130,42 @@ mod tests {
         });
     }
 
+    /// The seq counter is process-local. A fresh process must seed it from the
+    /// store's high-water mark, or rows/meta last written by a longer-lived
+    /// earlier process silently reject every update (the July 12 data-loss bug:
+    /// active_session_id and whole sessions frozen at their Friday state).
+    #[test]
+    fn test_store_seq_seeded_from_high_water_mark() {
+        use crate::session_store::test_support as ts;
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+
+        ts::with_test_db(|conn| {
+            // Simulate a previous long-lived process: row + meta at a high seq.
+            state.sessions.get_mut(&id).unwrap().name = "From old process".to_string();
+            ts::upsert_with_seq(conn, state.sessions.get(&id).unwrap(), 50_000);
+            ts::meta_set_with_seq(conn, "active_session_id", &id, 50_001);
+
+            // A fresh process (unseeded counter) must not lose these writes.
+            ts::seed_seq(conn);
+
+            state.sessions.get_mut(&id).unwrap().name = "From new process".to_string();
+            ts::upsert(conn, state.sessions.get(&id).unwrap());
+            assert_eq!(
+                ts::get_row_name(conn, &id).as_deref(),
+                Some("From new process"),
+                "after seeding, a new process's writes must land on high-seq rows"
+            );
+
+            ts::meta_set(conn, "active_session_id", "other-session");
+            assert_eq!(
+                ts::meta(conn, "active_session_id").as_deref(),
+                Some("other-session"),
+                "after seeding, meta writes must land on high-seq keys"
+            );
+        });
+    }
+
     /// One-time JSON→SQLite import: live sessions win over archive lines on
     /// id collision, meta carries over, and a second run is a no-op.
     #[test]

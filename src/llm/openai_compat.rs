@@ -1206,6 +1206,19 @@ impl OpenAiCompatConnector {
     /// we try matching from the first underscore position outward.
     /// This is a last-resort fallback — the tool_name_map lookup should handle most cases.
     fn resolve_tool_call(&self, sanitized_name: &str) -> (String, String) {
+        // Built-in tool names are unambiguous. Local models sometimes emit the
+        // bare name from instruction text (e.g. "HOBBES_INVOKE_SKILL") instead
+        // of the advertised prefixed name ("hobbes-core_HOBBES_INVOKE_SKILL");
+        // the underscore split below would mangle those into server "HOBBES" /
+        // tool "INVOKE_SKILL" and miss the stream-manager interception. Map
+        // them straight to their virtual servers.
+        if sanitized_name.starts_with("HOBBES_") {
+            return ("hobbes-core".to_string(), sanitized_name.to_string());
+        }
+        if sanitized_name.starts_with("MCP_") {
+            return ("hobbes-meta".to_string(), sanitized_name.to_string());
+        }
+
         // Try splitting at each underscore position to find a valid server/tool pair
         if let Some(pos) = sanitized_name.find('_') {
             let server = sanitized_name[..pos].to_string();

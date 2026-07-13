@@ -7,6 +7,44 @@ pub struct SessionIdContext(pub Signal<String>);
 #[derive(Clone, Copy, PartialEq)]
 pub struct DraftContext(pub Signal<String>);
 
+/// Set the chat draft programmatically (clear after send, autocomplete splice,
+/// restore, quick-fix suggestions...).
+///
+/// The chat textarea is UNCONTROLLED (`initial_value`, not `value`) so that
+/// re-renders can never clobber in-flight typing — a controlled binding races
+/// the IPC round-trip and applies a stale value, snapping the caret to the end
+/// and dropping typed-ahead characters. The flip side: every programmatic
+/// draft change must write the DOM value explicitly, which this helper does
+/// (signal + DOM value + auto-resize + optional caret/focus). Never call
+/// `draft.set(...)` directly outside of the textarea's own `oninput`.
+pub fn set_chat_draft(
+    mut draft: Signal<String>,
+    text: String,
+    caret_utf16: Option<usize>,
+    focus: bool,
+) {
+    // JSON-encode for safe embedding as a JS string literal
+    let value_js = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
+    draft.set(text);
+    let caret_js = match caret_utf16 {
+        Some(pos) => format!("el.selectionStart = el.selectionEnd = {};", pos),
+        None => String::new(),
+    };
+    let focus_js = if focus { "el.focus();" } else { "" };
+    let _ = document::eval(&format!(
+        r#"
+        const el = document.getElementById('chat-textarea');
+        if (el) {{
+            el.value = {value_js};
+            {focus_js}
+            el.style.height = 'auto';
+            el.style.height = el.scrollHeight + 'px';
+            {caret_js}
+        }}
+        "#
+    ));
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub struct SessionToDeleteContext(pub Signal<String>);
 

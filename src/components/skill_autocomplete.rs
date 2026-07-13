@@ -93,6 +93,12 @@ pub fn SkillAutocomplete(props: SkillAutocompleteProps) -> Element {
                             },
                             "/{skill.metadata.name}"
                         }
+                        if let Some(hint) = skill.metadata.argument_hint.as_ref() {
+                            span {
+                                class: "font-mono text-[10px] text-fg-muted ml-2 truncate",
+                                "{hint}"
+                            }
+                        }
                     }
                     if !skill.metadata.description.is_empty() {
                          span { class: "text-xs text-fg-muted truncate w-full", "{skill.metadata.description}" }

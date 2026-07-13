@@ -27,6 +27,8 @@ pub struct StreamManagerContext {
     continuation_controller: Signal<ContinuationController>,
     scheduler: Coroutine<SchedulerSignal>,
     permission_manager: Signal<crate::context::permissions::PermissionManager>,
+    skill_registry: Signal<crate::skills::SkillRegistry>,
+    mcp_context: Signal<crate::mcp::manager::McpContext>,
     pub stream_activity: Signal<u64>,
     pub streaming_sessions: Signal<HashSet<String>>,
     stream_session_map: Signal<HashMap<Uuid, String>>,
@@ -538,6 +540,154 @@ impl StreamManagerContext {
                                     session_state.write().handle_scratchpad_update(&args_json, &session_id_inner, &self.settings.read());
 
                                 // Persist so the scratchpad survives app restart
+                                {
+                                    let mut state = session_state.write();
+                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
+                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                                            tc.status = status;
+                                            tc.response = response_str.clone();
+                                        }
+                                    }
+                                    state.touch_session(&session_id_inner);
+                                }
+                                crate::session::SessionState::save_async(&session_state.read(), None);
+
+                                let record = crate::components::shared::ToolCallRecord {
+                                    call: tool_call.clone(),
+                                    result: crate::components::shared::ToolResult {
+                                        status,
+                                        response: response_str,
+                                    },
+                                    profile_color: {
+                                        let settings_read = self.settings.read();
+                                        crate::components::shared::resolve_profile_color(
+                                            profile_id.as_ref(),
+                                            &settings_read,
+                                        )
+                                    },
+                                };
+                                let _ = tool_results_tx_clone.send(record);
+                                completed_tool_tasks_clone
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            }
+
+                            // Intercept HOBBES_INVOKE_SKILL before MCP dispatch — the
+                            // model-invocation path for skills. Executes the skill
+                            // (capability registration only), persists the payload into
+                            // session.loaded_skills, and returns the instruction manual
+                            // as the tool result.
+                            if tool_call.tool_name == "HOBBES_INVOKE_SKILL" {
+                                let skill_name = args_json
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let arguments = args_json
+                                    .get("arguments")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                let skill_opt = self.skill_registry.read().get_skill(&skill_name);
+                                let (status, response_str) = match skill_opt {
+                                    None => (
+                                        ToolCallStatus::Error,
+                                        format!(
+                                            "Skill '{}' not found. Only skills listed under available_skills in your system context can be invoked.",
+                                            skill_name
+                                        ),
+                                    ),
+                                    Some(skill) if skill.metadata.disable_model_invocation => (
+                                        ToolCallStatus::Error,
+                                        format!(
+                                            "Skill '{}' has model invocation disabled. The user must invoke it themselves with /{}.",
+                                            skill_name, skill_name
+                                        ),
+                                    ),
+                                    Some(skill) => {
+                                        let permission = self
+                                            .permission_manager
+                                            .read()
+                                            .check_skill_permission(&skill.metadata.name);
+                                        if permission
+                                            != crate::context::permissions::PermissionStatus::Allowed
+                                        {
+                                            (
+                                                ToolCallStatus::Error,
+                                                format!(
+                                                    "The user has disabled auto-approval for skill '{}'. Ask them to run /{} themselves or enable the skill in Settings → Permissions.",
+                                                    skill_name, skill_name
+                                                ),
+                                            )
+                                        } else {
+                                            let mut skill_call =
+                                                crate::components::shared::SkillCall {
+                                                    execution_id: uuid::Uuid::new_v4().to_string(),
+                                                    skill_name: skill.metadata.name.clone(),
+                                                    arguments,
+                                                    status: crate::components::shared::SkillCallStatus::Running,
+                                                    response: String::new(),
+                                                    instructions: skill.instructions.clone(),
+                                                    path: skill.path.clone(),
+                                                    has_scripts: !skill.scripts.is_empty(),
+                                                    raw_output: None,
+                                                    profile_color: {
+                                                        let settings_read = self.settings.read();
+                                                        crate::components::shared::resolve_profile_color(
+                                                            profile_id.as_ref(),
+                                                            &settings_read,
+                                                        )
+                                                    },
+                                                };
+                                            let mcp_context = {
+                                                // Use the reactively-synced McpContext signal
+                                                // (P-001: never get_mcp_context().await mid-turn)
+                                                let mut ctx = self.mcp_context.read().clone();
+                                                ctx.enrich_from_settings(&self.settings.read());
+                                                ctx
+                                            };
+                                            match crate::skills::execute_skill(
+                                                &mut skill_call,
+                                                Some(&mcp_context),
+                                            )
+                                            .await
+                                            {
+                                                Ok(result) => {
+                                                    let completed = result.status
+                                                        == crate::components::shared::SkillCallStatus::Completed;
+                                                    if completed {
+                                                        // Persist so the skill stays in system
+                                                        // context for all future turns
+                                                        let mut state = session_state.write();
+                                                        if let Some(session) = state
+                                                            .sessions
+                                                            .get_mut(&session_id_inner)
+                                                        {
+                                                            session.loaded_skills.insert(
+                                                                skill_call.skill_name.clone(),
+                                                                result.output.clone(),
+                                                            );
+                                                        }
+                                                        drop(state);
+                                                        tracing::info!(
+                                                            "Model invoked skill '{}' — persisted into session.loaded_skills",
+                                                            skill_call.skill_name
+                                                        );
+                                                        (ToolCallStatus::Completed, result.output)
+                                                    } else {
+                                                        (ToolCallStatus::Error, result.output)
+                                                    }
+                                                }
+                                                Err(e) => (
+                                                    ToolCallStatus::Error,
+                                                    format!("Skill invocation failed: {}", e),
+                                                ),
+                                            }
+                                        }
+                                    }
+                                };
+
                                 {
                                     let mut state = session_state.write();
                                     if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
@@ -1639,6 +1789,8 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         continuation_controller,
         scheduler,
         permission_manager,
+        skill_registry: consume_context::<Signal<crate::skills::SkillRegistry>>(),
+        mcp_context: consume_context::<Signal<crate::mcp::manager::McpContext>>(),
         stream_activity: Signal::new(0),
         streaming_sessions: Signal::new(HashSet::new()),
         stream_session_map: Signal::new(HashMap::new()),
@@ -1698,6 +1850,11 @@ mod tests {
                 continuation_controller,
                 scheduler,
                 permission_manager,
+                skill_registry: Signal::new(crate::skills::SkillRegistry::new()),
+                mcp_context: Signal::new(crate::mcp::manager::McpContext {
+                    servers: Vec::new(),
+                    connected_toolkit_slugs: Vec::new(),
+                }),
                 stream_activity: Signal::new(0),
                 streaming_sessions: Signal::new(HashSet::new()),
                 stream_session_map: Signal::new(HashMap::new()),
@@ -1771,6 +1928,11 @@ mod tests {
                 continuation_controller,
                 scheduler,
                 permission_manager,
+                skill_registry: Signal::new(crate::skills::SkillRegistry::new()),
+                mcp_context: Signal::new(crate::mcp::manager::McpContext {
+                    servers: Vec::new(),
+                    connected_toolkit_slugs: Vec::new(),
+                }),
                 stream_activity: Signal::new(0),
                 streaming_sessions: Signal::new(HashSet::new()),
                 stream_session_map: Signal::new(HashMap::new()),

@@ -1137,7 +1137,7 @@ pub fn MessageBubble(
     let _settings = consume_context::<Signal<Settings>>();
     let stream_manager = consume_context::<StreamManagerContext>();
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let DraftContext(mut chat_input_draft) = consume_context::<DraftContext>();
+    let DraftContext(chat_input_draft) = consume_context::<DraftContext>();
     let save_error = consume_context::<crate::components::shared::SaveErrorContext>().0;
 
     let _is_thinking = false;
@@ -1469,21 +1469,12 @@ pub fn MessageBubble(
                                             "Please continue without tools and answer from your knowledge.".to_string(),
                                         ],
                                         on_select: move |suggestion: String| {
-                                            chat_input_draft.set(suggestion);
-                                            spawn(async move {
-                                                let _ = document::eval(r#"
-                                                    const el = document.getElementById('chat-textarea');
-                                                    if (el) {
-                                                        el.focus();
-                                                        // Don't dispatch input event as it might race with the value update
-                                                        // Just handle the resize explicitly
-                                                        requestAnimationFrame(() => {
-                                                            el.style.height = 'auto';
-                                                            el.style.height = (el.scrollHeight) + 'px';
-                                                        });
-                                                    }
-                                                "#);
-                                            });
+                                            crate::components::shared::set_chat_draft(
+                                                chat_input_draft,
+                                                suggestion,
+                                                None,
+                                                true,
+                                            );
                                         }
                                     }
                                 }
@@ -1831,7 +1822,7 @@ pub fn MessageBubble(
 
 #[component]
 pub fn LinkWithControls(href: String, text: String) -> Element {
-    let DraftContext(mut draft) = use_context::<DraftContext>();
+    let DraftContext(draft) = use_context::<DraftContext>();
     let mut copied = use_signal(|| false);
     let mut is_hovered = use_signal(|| false);
     let mut pop_left = use_signal(|| false);
@@ -1902,15 +1893,7 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                     onclick: move |evt| {
                         evt.stop_propagation();
                         let summary_prompt = format!("Please fetch {} and summarize.", href_clone_for_summarize);
-                        draft.set(summary_prompt);
-                        let _ = document::eval(r#"
-                            const el = document.getElementById('chat-textarea');
-                            if (el) {
-                                el.focus();
-                                el.style.height = 'auto';
-                                el.style.height = (el.scrollHeight) + 'px';
-                            }
-                        "#);
+                        crate::components::shared::set_chat_draft(draft, summary_prompt, None, true);
                     },
                     Icon { width: 14, height: 14, icon: fi_icons::FiFileText }
                 }

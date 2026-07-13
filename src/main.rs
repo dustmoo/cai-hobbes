@@ -336,12 +336,16 @@ fn app() -> Element {
     // Sync theme to DOM (class on <html> element)
     theme::use_theme_sync(settings);
 
-    // Asynchronously load skills from all canonical directories (global + platform)
+    // Asynchronously load skills from all canonical directories (global + platform),
+    // then keep them fresh with a filesystem watcher (debounced auto-reload).
     use_effect(move || {
         if !skills_loaded() {
             spawn(async move {
                 skills::SkillRegistry::reload_into_signal(skill_registry).await;
                 skills_loaded.set(true);
+            });
+            spawn(async move {
+                skills::watcher::watch_skills_directories(skill_registry).await;
             });
         }
     });

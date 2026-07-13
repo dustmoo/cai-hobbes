@@ -4,11 +4,56 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+/// Lightweight skill descriptor for prompt injection (model invocation).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AvailableSkill {
+    pub name: String,
+    pub description: String,
+    pub argument_hint: Option<String>,
+    pub disable_model_invocation: bool,
+}
+
+/// Process-wide mirror of the loaded skills, readable from non-UI code (the
+/// prompt builder) without threading a Signal through every call site. Updated
+/// whenever `reload_into_signal` refreshes the registry — the same OnceLock
+/// pattern used by the shared Gemini cache store.
+static AVAILABLE_SKILLS: std::sync::OnceLock<RwLock<Vec<AvailableSkill>>> =
+    std::sync::OnceLock::new();
+
+fn available_skills_cell() -> &'static RwLock<Vec<AvailableSkill>> {
+    AVAILABLE_SKILLS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Snapshot of all loaded skills' metadata (name, description, hint).
+pub fn available_skills_snapshot() -> Vec<AvailableSkill> {
+    available_skills_cell()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn set_available_skills_for_test(skills: Vec<AvailableSkill>) {
+    *available_skills_cell()
+        .write()
+        .unwrap_or_else(|p| p.into_inner()) = skills;
+}
+
+/// A skill directory that was found on disk but failed to parse (bad YAML,
+/// missing frontmatter, unreadable file). Surfaced in the Settings UI instead
+/// of being silently dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillLoadError {
+    pub path: PathBuf,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SkillRegistry {
     // Map of skill name to Skill
     pub skills: Arc<RwLock<HashMap<String, Skill>>>,
     pub loaded_paths: Arc<RwLock<Vec<PathBuf>>>,
+    pub load_errors: Arc<RwLock<Vec<SkillLoadError>>>,
 }
 
 /// Returns all canonical skill directories (global + platform-specific).
@@ -40,18 +85,182 @@ impl SkillRegistry {
         Self {
             skills: Arc::new(RwLock::new(HashMap::new())),
             loaded_paths: Arc::new(RwLock::new(Vec::new())),
+            load_errors: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
+    /// Directory where in-app-created skills are written: `~/.hobbes/skills`.
+    /// Created on demand.
+    pub fn default_create_dir() -> Result<PathBuf, String> {
+        let dir = get_skills_directories()
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Could not resolve home directory".to_string())?;
+        fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {:?}: {}", dir, e))?;
+        Ok(dir)
+    }
+
+    /// True if `root` is a direct child of one of the managed skills
+    /// directories — the only locations this registry will mutate on disk.
+    fn is_managed_path(root: &Path, managed_dirs: &[PathBuf]) -> bool {
+        root.parent()
+            .map(|parent| managed_dirs.iter().any(|dir| dir.as_path() == parent))
+            .unwrap_or(false)
+    }
+
+    /// Create a new skill on disk under `default_create_dir()/{name}/SKILL.md`
+    /// and insert it into the registry. Rejects duplicate names.
+    pub fn create_skill(&self, skill: &Skill) -> Result<Skill, String> {
+        let base = Self::default_create_dir()?;
+        self.create_skill_in(&base, skill)
+    }
+
+    pub(crate) fn create_skill_in(&self, base_dir: &Path, skill: &Skill) -> Result<Skill, String> {
+        skill.metadata.validate().map_err(|errs| errs.join("; "))?;
+        let name = skill.metadata.name.clone();
+
+        if self.get_skill(&name).is_some() {
+            return Err(format!("A skill named '{}' already exists", name));
+        }
+
+        let root = base_dir.join(&name);
+        if root.exists() {
+            return Err(format!(
+                "A skill directory already exists at {:?}",
+                root
+            ));
+        }
+
+        fs::create_dir_all(&root).map_err(|e| format!("Failed to create {:?}: {}", root, e))?;
+        let file = root.join("SKILL.md");
+        let markdown = skill.to_markdown().map_err(|e| e.to_string())?;
+        fs::write(&file, markdown).map_err(|e| format!("Failed to write {:?}: {}", file, e))?;
+
+        // Re-parse from disk so the registry holds exactly what was written.
+        let parsed = Skill::from_file(&file).map_err(|e| e.to_string())?;
+        self.skills
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(name, parsed.clone());
+        Ok(parsed)
+    }
+
+    /// Save an existing skill in place. If the name changed, the skill's root
+    /// directory is renamed to match (frontmatter `name` is the source of
+    /// truth; `scripts/` and `resources/` move with the directory).
+    pub fn save_skill(&self, original_name: &str, skill: &Skill) -> Result<Skill, String> {
+        self.save_skill_guarded(original_name, skill, &get_skills_directories())
+    }
+
+    pub(crate) fn save_skill_guarded(
+        &self,
+        original_name: &str,
+        skill: &Skill,
+        managed_dirs: &[PathBuf],
+    ) -> Result<Skill, String> {
+        skill.metadata.validate().map_err(|errs| errs.join("; "))?;
+        let new_name = skill.metadata.name.clone();
+
+        let existing = self
+            .get_skill(original_name)
+            .ok_or_else(|| format!("Skill '{}' not found in registry", original_name))?;
+
+        let mut root = existing.root_path.clone();
+        if !Self::is_managed_path(&root, managed_dirs) {
+            return Err(format!(
+                "Refusing to modify skill outside managed skills directories: {:?}",
+                root
+            ));
+        }
+
+        if new_name != original_name {
+            if self.get_skill(&new_name).is_some() {
+                return Err(format!("A skill named '{}' already exists", new_name));
+            }
+            let new_root = root
+                .parent()
+                .ok_or_else(|| "Skill directory has no parent".to_string())?
+                .join(&new_name);
+            if new_root.exists() {
+                return Err(format!(
+                    "A skill directory already exists at {:?}",
+                    new_root
+                ));
+            }
+            fs::rename(&root, &new_root)
+                .map_err(|e| format!("Failed to rename {:?} -> {:?}: {}", root, new_root, e))?;
+            root = new_root;
+        }
+
+        let file = root.join("SKILL.md");
+        let markdown = skill.to_markdown().map_err(|e| e.to_string())?;
+        fs::write(&file, markdown).map_err(|e| format!("Failed to write {:?}: {}", file, e))?;
+
+        let parsed = Skill::from_file(&file).map_err(|e| e.to_string())?;
+        {
+            let mut skills = self.skills.write().unwrap_or_else(|p| p.into_inner());
+            if new_name != original_name {
+                skills.remove(original_name);
+            }
+            skills.insert(new_name, parsed.clone());
+        }
+        Ok(parsed)
+    }
+
+    /// Delete a skill's directory from disk and remove it from the registry.
+    /// Refuses to touch paths outside the canonical skills directories.
+    pub fn delete_skill(&self, name: &str) -> Result<(), String> {
+        self.delete_skill_guarded(name, &get_skills_directories())
+    }
+
+    pub(crate) fn delete_skill_guarded(
+        &self,
+        name: &str,
+        managed_dirs: &[PathBuf],
+    ) -> Result<(), String> {
+        let skill = self
+            .get_skill(name)
+            .ok_or_else(|| format!("Skill '{}' not found in registry", name))?;
+
+        let root = &skill.root_path;
+        if !Self::is_managed_path(root, managed_dirs) {
+            return Err(format!(
+                "Refusing to delete skill outside managed skills directories: {:?}",
+                root
+            ));
+        }
+
+        fs::remove_dir_all(root).map_err(|e| format!("Failed to delete {:?}: {}", root, e))?;
+        self.skills
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(name);
+        Ok(())
+    }
+
     /// Load skills from all canonical directories (global + platform).
-    /// Returns the names of all successfully loaded skills.
+    /// Returns the names of all successfully loaded skills. Per-skill parse
+    /// failures are recorded in `load_errors` (and logged), not dropped.
     pub fn load_all(&self) -> Vec<String> {
+        self.load_errors
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         let mut all_names = Vec::new();
         for dir in get_skills_directories() {
             if dir.exists() {
                 match self.load_from_directory(&dir) {
                     Ok(names) => all_names.extend(names),
-                    Err(e) => tracing::warn!("Failed to load skills from {:?}: {}", dir, e),
+                    Err(e) => {
+                        tracing::warn!("Failed to load skills from {:?}: {}", dir, e);
+                        self.load_errors
+                            .write()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(SkillLoadError {
+                                path: dir.clone(),
+                                error: e,
+                            });
+                    }
                 }
             } else {
                 tracing::debug!("Skills directory not found, skipping: {:?}", dir);
@@ -60,34 +269,59 @@ impl SkillRegistry {
         all_names
     }
 
-    /// Reload all skills from canonical directories and merge into a Dioxus Signal.
-    /// Encapsulates the spawn_blocking + RwLock merge pattern used at startup and
-    /// by the Settings "Reload Skills" button.
+    /// Reload all skills from canonical directories and replace the contents of
+    /// a Dioxus Signal. Encapsulates the spawn_blocking + RwLock swap pattern
+    /// used at startup, by the Settings "Reload Skills" button, and after CRUD
+    /// operations. The fresh load REPLACES the map — an empty result is
+    /// legitimate (e.g. the last skill was deleted); only a join error keeps
+    /// the old state.
     pub async fn reload_into_signal(mut signal: dioxus::prelude::Signal<SkillRegistry>) {
         use dioxus_signals::Writable;
         let loaded = tokio::task::spawn_blocking(move || {
             let temp_registry = SkillRegistry::new();
             let names = temp_registry.load_all();
-            if names.is_empty() {
-                None
-            } else {
-                Some((temp_registry, names))
-            }
+            (temp_registry, names)
         })
         .await;
 
-        if let Ok(Some((loaded_registry, names))) = loaded {
-            let loaded_skills = loaded_registry
-                .skills
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
-            *signal
-                .write()
-                .skills
-                .write()
-                .unwrap_or_else(|p| p.into_inner()) = loaded_skills;
-            tracing::info!("Loaded {} skills: {:?}", names.len(), names);
+        match loaded {
+            Ok((loaded_registry, names)) => {
+                let loaded_skills = loaded_registry
+                    .skills
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                let loaded_errors = loaded_registry
+                    .load_errors
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                // Refresh the process-wide metadata mirror used by the prompt builder
+                let mut available: Vec<AvailableSkill> = loaded_skills
+                    .values()
+                    .map(|s| AvailableSkill {
+                        name: s.metadata.name.clone(),
+                        description: s.metadata.description.clone(),
+                        argument_hint: s.metadata.argument_hint.clone(),
+                        disable_model_invocation: s.metadata.disable_model_invocation,
+                    })
+                    .collect();
+                available.sort_by(|a, b| a.name.cmp(&b.name));
+                *available_skills_cell()
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = available;
+
+                let registry = signal.write();
+                *registry.skills.write().unwrap_or_else(|p| p.into_inner()) = loaded_skills;
+                *registry
+                    .load_errors
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = loaded_errors;
+                tracing::info!("Loaded {} skills: {:?}", names.len(), names);
+            }
+            Err(e) => {
+                tracing::error!("Skill reload task failed; keeping previous registry: {}", e);
+            }
         }
     }
 
@@ -127,6 +361,13 @@ impl SkillRegistry {
                         }
                         Err(e) => {
                             tracing::warn!("Failed to parse skill at {:?}: {}", skill_file, e);
+                            self.load_errors
+                                .write()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .push(SkillLoadError {
+                                    path: skill_file.clone(),
+                                    error: e.to_string(),
+                                });
                         }
                     }
                 }
@@ -324,6 +565,168 @@ This is a test skill.
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    /// Canonicalized TempDir path (macOS TempDir is a /var -> /private/var
+    /// symlink; Skill::from_file canonicalizes, so guards must compare
+    /// canonical parents).
+    fn canonical_temp() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let canonical = temp.path().canonicalize().unwrap();
+        (temp, canonical)
+    }
+
+    #[test]
+    fn test_create_skill_writes_and_registers() {
+        let (_temp, base) = canonical_temp();
+        let registry = SkillRegistry::new();
+        let skill = create_test_skill("new-skill", "Created in-app");
+
+        let created = registry.create_skill_in(&base, &skill).unwrap();
+        assert!(base.join("new-skill").join("SKILL.md").exists());
+        assert_eq!(created.metadata.description, "Created in-app");
+        assert!(registry.get_skill("new-skill").is_some());
+        assert_eq!(created.root_path, base.join("new-skill"));
+    }
+
+    #[test]
+    fn test_create_skill_rejects_duplicates_and_invalid_names() {
+        let (_temp, base) = canonical_temp();
+        let registry = SkillRegistry::new();
+        let skill = create_test_skill("dup", "First");
+        registry.create_skill_in(&base, &skill).unwrap();
+
+        // Duplicate name in registry
+        assert!(registry.create_skill_in(&base, &skill).is_err());
+
+        // Invalid names
+        for bad in ["My Skill", "a/b", ""] {
+            let s = create_test_skill(bad, "desc");
+            assert!(registry.create_skill_in(&base, &s).is_err(), "'{}' accepted", bad);
+        }
+
+        // Directory collision without registry entry
+        std::fs::create_dir_all(base.join("orphan-dir")).unwrap();
+        let s = create_test_skill("orphan-dir", "desc");
+        assert!(registry.create_skill_in(&base, &s).is_err());
+    }
+
+    #[test]
+    fn test_save_skill_in_place_edit() {
+        let (_temp, base) = canonical_temp();
+        let registry = SkillRegistry::new();
+        registry
+            .create_skill_in(&base, &create_test_skill("edit-me", "Before"))
+            .unwrap();
+
+        let mut updated = registry.get_skill("edit-me").unwrap();
+        updated.metadata.description = "After".to_string();
+        updated.instructions = "New instructions".to_string();
+
+        let managed = vec![base.clone()];
+        let saved = registry
+            .save_skill_guarded("edit-me", &updated, &managed)
+            .unwrap();
+        assert_eq!(saved.metadata.description, "After");
+        assert_eq!(saved.instructions, "New instructions");
+        // On-disk content matches
+        let reread = Skill::from_file(&base.join("edit-me").join("SKILL.md")).unwrap();
+        assert_eq!(reread.metadata.description, "After");
+    }
+
+    #[test]
+    fn test_save_skill_rename_moves_directory_and_preserves_assets() {
+        let (_temp, base) = canonical_temp();
+        let registry = SkillRegistry::new();
+        registry
+            .create_skill_in(&base, &create_test_skill("old-name", "desc"))
+            .unwrap();
+        // Add a script that must survive the rename
+        let scripts_dir = base.join("old-name").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::write(scripts_dir.join("run.sh"), "#!/bin/sh").unwrap();
+
+        let mut renamed = registry.get_skill("old-name").unwrap();
+        renamed.metadata.name = "new-name".to_string();
+
+        let managed = vec![base.clone()];
+        let saved = registry
+            .save_skill_guarded("old-name", &renamed, &managed)
+            .unwrap();
+
+        assert!(!base.join("old-name").exists());
+        assert!(base.join("new-name").join("SKILL.md").exists());
+        assert!(base.join("new-name").join("scripts").join("run.sh").exists());
+        assert_eq!(saved.scripts, vec!["run.sh".to_string()]);
+        assert!(registry.get_skill("old-name").is_none());
+        assert!(registry.get_skill("new-name").is_some());
+    }
+
+    #[test]
+    fn test_save_skill_rename_collision_rejected() {
+        let (_temp, base) = canonical_temp();
+        let registry = SkillRegistry::new();
+        registry
+            .create_skill_in(&base, &create_test_skill("skill-a", "A"))
+            .unwrap();
+        registry
+            .create_skill_in(&base, &create_test_skill("skill-b", "B"))
+            .unwrap();
+
+        let mut renamed = registry.get_skill("skill-a").unwrap();
+        renamed.metadata.name = "skill-b".to_string();
+        let managed = vec![base.clone()];
+        assert!(registry
+            .save_skill_guarded("skill-a", &renamed, &managed)
+            .is_err());
+        // Nothing moved
+        assert!(base.join("skill-a").exists());
+        assert!(registry.get_skill("skill-a").is_some());
+    }
+
+    #[test]
+    fn test_delete_skill_removes_dir_and_entry() {
+        let (_temp, base) = canonical_temp();
+        let registry = SkillRegistry::new();
+        registry
+            .create_skill_in(&base, &create_test_skill("doomed", "desc"))
+            .unwrap();
+
+        let managed = vec![base.clone()];
+        registry.delete_skill_guarded("doomed", &managed).unwrap();
+        assert!(!base.join("doomed").exists());
+        assert!(registry.get_skill("doomed").is_none());
+    }
+
+    #[test]
+    fn test_delete_skill_refuses_unmanaged_paths() {
+        let (_temp, base) = canonical_temp();
+        let (_other_temp, other) = canonical_temp();
+        let registry = SkillRegistry::new();
+        registry
+            .create_skill_in(&base, &create_test_skill("guarded", "desc"))
+            .unwrap();
+
+        // Managed dirs list does NOT include `base` — delete must refuse
+        let managed = vec![other];
+        assert!(registry.delete_skill_guarded("guarded", &managed).is_err());
+        assert!(base.join("guarded").exists());
+        assert!(registry.get_skill("guarded").is_some());
+    }
+
+    #[test]
+    fn test_load_records_parse_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let bad_dir = temp_dir.path().join("broken-skill");
+        fs::create_dir(&bad_dir).unwrap();
+        fs::write(bad_dir.join("SKILL.md"), "no frontmatter here").unwrap();
+
+        let registry = SkillRegistry::new();
+        let loaded = registry.load_from_directory(temp_dir.path()).unwrap();
+        assert!(loaded.is_empty());
+        let errors = registry.load_errors.read().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].path.ends_with("broken-skill/SKILL.md"));
     }
 
     #[test]

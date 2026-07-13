@@ -1,6 +1,8 @@
 mod executor;
+pub mod invocation;
 pub mod parser;
 pub mod registry;
+pub mod watcher;
 
 // Re-export common types
 pub use parser::Skill;

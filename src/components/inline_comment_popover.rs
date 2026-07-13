@@ -29,7 +29,9 @@ pub fn InlineCommentPopover(
             textarea {
                 class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm mb-3 text-gray-200 focus:outline-none focus:ring-1 focus:ring-primary-500 min-h-[5rem] resize-none",
                 placeholder: "Add a comment...",
-                value: "{comment_text}",
+                // Uncontrolled: controlled bindings race re-renders and snap the
+                // caret to the end mid-typing (see shared::set_chat_draft).
+                initial_value: "{comment_text}",
                 oninput: move |e| comment_text.set(e.value()),
                 onkeydown: move |evt: KeyboardEvent| {
                     let hotkeys = settings.read().hotkeys.clone();

@@ -136,6 +136,10 @@ pub fn ChatInput(
     let mut skill_autocomplete_index = use_signal(|| 0usize);
     let mut filtered_skills = use_signal(Vec::<Skill>::new);
     let mut autocomplete_mode = use_signal(|| AutocompleteMode::Skill);
+    // Byte range of the in-progress /token in the draft (cursor-aware
+    // autocomplete); selection splices into this range instead of rewriting
+    // the whole draft.
+    let mut autocomplete_token: Signal<Option<(usize, usize)>> = use_signal(|| None);
 
     // Active Focus Management: Reclaim focus when context reverts to ChatInput
     use_effect(move || {
@@ -247,27 +251,12 @@ pub fn ChatInput(
                 }
                 ChatCommand::CopyToDraft(text) => {
                     tracing::info!("ChatCommand::CopyToDraft triggered: {} chars", text.len());
-                    draft.set(text);
+                    crate::components::shared::set_chat_draft(draft, text, None, false);
                 }
                 ChatCommand::RestoreToDraft(text, restore_attachments) => {
                     tracing::info!("ChatCommand::RestoreToDraft triggered: {} chars, {} attachments", text.len(), restore_attachments.len());
-                    draft.set(text);
+                    crate::components::shared::set_chat_draft(draft, text, None, true);
                     attachments.set(restore_attachments);
-                    // Resize the textarea to fit the restored content and focus it.
-                    // requestAnimationFrame ensures the DOM has updated with the new
-                    // value before we measure scrollHeight.
-                    spawn(async move {
-                        let _ = document::eval(r#"
-                            const el = document.getElementById('chat-textarea');
-                            if (el) {
-                                el.focus();
-                                requestAnimationFrame(() => {
-                                    el.style.height = 'auto';
-                                    el.style.height = (el.scrollHeight) + 'px';
-                                });
-                            }
-                        "#);
-                    });
                 }
                 ChatCommand::TriggerAiAnalysis => {
                     tracing::info!("ChatCommand::TriggerAiAnalysis triggered");
@@ -293,8 +282,9 @@ pub fn ChatInput(
     // draft may hold unrelated live text; clearing it is the caller's job.
     let submit = use_callback(move |(user_message, atts): (String, Vec<Attachment>)| {
         // Skill Command Detection
-        if user_message.starts_with('/') {
-            // /unload command — remove a loaded skill from session context
+        {
+            // /unload command — remove a loaded skill from session context.
+            // Stays prefix-only: it is a control command, not a skill.
             let trimmed = user_message.trim();
             if trimmed.starts_with("/unload ") {
                 let skill_name = trimmed.trim_start_matches("/unload ").trim();
@@ -325,16 +315,23 @@ pub fn ChatInput(
                 return;
             }
 
-            let parts: Vec<&str> = user_message.split_whitespace().collect();
-            if !parts.is_empty() {
-                let skill_name = parts[0].trim_start_matches('/');
-                let skill_opt = {
+            // Detect a /skill token anywhere in the message so users can write
+            // explanatory context and invoke a skill in the same message. The
+            // surrounding text reaches the skill turn via normal history.
+            let invocation = {
+                let registry = skill_registry.read();
+                crate::skills::invocation::detect_skill_invocation(&user_message, |name| {
+                    registry.get_skill(name).is_some()
+                })
+            };
+            {
+                let skill_opt = invocation.as_ref().and_then(|inv| {
                     let registry = skill_registry.read();
-                    registry.get_skill(skill_name)
-                };
+                    registry.get_skill(&inv.skill_name)
+                });
 
-                if let Some(skill) = skill_opt {
-                    let arguments = parts[1..].join(" ");
+                if let (Some(skill), Some(inv)) = (skill_opt, invocation) {
+                    let arguments = inv.arguments;
                     let permission_status = permission_manager
                         .read()
                         .check_skill_permission(&skill.metadata.name);
@@ -388,7 +385,7 @@ pub fn ChatInput(
                     if permission_status == crate::context::permissions::PermissionStatus::Allowed {
                         // AUTO-EXECUTE PATH
                         if cfg!(debug_assertions) {
-                            tracing::info!("[Auto-executing: /{}]", skill_name);
+                            tracing::info!("[Auto-executing: /{}]", skill.metadata.name);
                         }
 
                         let skill_message = crate::components::chat::Message {
@@ -529,7 +526,7 @@ pub fn ChatInput(
                     &session_id,
                     QueuedMessage::new(user_message, atts),
                 );
-                draft.set(String::new());
+                crate::components::shared::set_chat_draft(draft, String::new(), None, false);
                 attachments.set(Vec::new());
                 reset_textarea_height();
             }
@@ -539,7 +536,7 @@ pub fn ChatInput(
         }
 
         submit.call((user_message, atts));
-        draft.set(String::new());
+        crate::components::shared::set_chat_draft(draft, String::new(), None, false);
         attachments.set(Vec::new());
         reset_textarea_height();
     };
@@ -1039,7 +1036,11 @@ pub fn ChatInput(
                     style: "max-height: 50vh;",
                     rows: "1",
                     placeholder: "Type your message...",
-                    value: "{draft}",
+                    // UNCONTROLLED on purpose: a controlled `value` binding races
+                    // the IPC round-trip and snaps the caret to the end mid-typing.
+                    // Programmatic writes go through shared::set_chat_draft, which
+                    // updates the DOM explicitly.
+                    initial_value: "{draft}",
                     onmounted: move |evt| {
                         textarea_mounted.set(Some(evt.data()));
                     },
@@ -1094,22 +1095,54 @@ pub fn ChatInput(
                                 skill_autocomplete_index.set(0);
                                 show_skill_autocomplete.set(true);
                             }
-                        } else if let Some(query) = val.strip_prefix('/') {
-                            autocomplete_mode.set(AutocompleteMode::Skill);
-                            let registry = skill_registry.read();
-                            let all_skills = registry.list_skills();
-                            let matches: Vec<Skill> = all_skills
-                                .into_iter()
-                                .filter(|s| {
-                                    query.is_empty() || s.metadata.name.to_lowercase().contains(&query.to_lowercase())
-                                })
-                                .collect();
-                            filtered_skills.set(matches);
-                            skill_autocomplete_index.set(0);
-                            show_skill_autocomplete.set(true);
                         } else {
-                            show_skill_autocomplete.set(false);
-                            filtered_skills.set(Vec::new());
+                            // Cursor-aware skill autocomplete: trigger on a
+                            // /token at the caret, anywhere in the draft. The
+                            // caret position lives only in the DOM, so fetch it
+                            // via eval before running the pure token scan.
+                            spawn(async move {
+                                let mut eval = document::eval(r#"
+                                    const el = document.getElementById('chat-textarea');
+                                    dioxus.send(el ? el.selectionStart : -1);
+                                "#);
+                                let cursor: i64 = eval.recv().await.unwrap_or(-1);
+                                let query_opt = if cursor >= 0 {
+                                    crate::skills::invocation::autocomplete_query_at(
+                                        &val,
+                                        cursor as usize,
+                                    )
+                                } else {
+                                    None
+                                };
+                                match query_opt {
+                                    Some(q) => {
+                                        autocomplete_mode.set(AutocompleteMode::Skill);
+                                        let matches: Vec<Skill> = {
+                                            let registry = skill_registry.read();
+                                            registry
+                                                .list_skills()
+                                                .into_iter()
+                                                .filter(|s| {
+                                                    q.query.is_empty()
+                                                        || s.metadata
+                                                            .name
+                                                            .to_lowercase()
+                                                            .contains(&q.query.to_lowercase())
+                                                })
+                                                .collect()
+                                        };
+                                        autocomplete_token.set(Some(q.token_range));
+                                        filtered_skills.set(matches);
+                                        skill_autocomplete_index.set(0);
+                                        show_skill_autocomplete.set(true);
+                                    }
+                                    None => {
+                                        show_skill_autocomplete.set(false);
+                                        filtered_skills.set(Vec::new());
+                                        autocomplete_token.set(None);
+                                    }
+                                }
+                            });
                         }
                     },
                     onkeydown: move |event| {
@@ -1211,36 +1244,51 @@ pub fn ChatInput(
                                         let selected = skills.get(current_idx).cloned();
                                         drop(skills); // Release borrow before mutating
                                         if let Some(skill) = selected {
-                                            // Preserve existing text as arguments
-                                            // Current draft looks like: "/tim args" or "/timestamp +%s"
-                                            // We want to: replace the "/query" part with "/skillname" but keep args
                                             let current_draft = draft.read().clone();
 
-                                            let skill_command = match *autocomplete_mode.read() {
+                                            match *autocomplete_mode.read() {
                                                 AutocompleteMode::Unload => {
                                                     // For unload, always fill the full command
-                                                    format!("/unload {}", skill.metadata.name)
+                                                    let skill_command = format!("/unload {}", skill.metadata.name);
+                                                    tracing::info!("Populated draft with skill command: {}", skill_command);
+                                                    crate::components::shared::set_chat_draft(draft, skill_command, None, true);
                                                 }
                                                 AutocompleteMode::Skill => {
-                                                    // Preserve existing text as arguments
-                                                    let args = if current_draft.starts_with('/') {
-                                                        current_draft.split_once(' ')
-                                                            .map(|(_, args_part)| args_part.to_string())
-                                                            .unwrap_or_default()
-                                                    } else {
-                                                        String::new()
-                                                    };
-                                                    if args.is_empty() {
-                                                        format!("/{} ", skill.metadata.name)
-                                                    } else {
-                                                        format!("/{} {}", skill.metadata.name, args)
-                                                    }
+                                                    // Splice the completed /name into the in-progress
+                                                    // token's range, preserving surrounding text.
+                                                    let token_range: Option<(usize, usize)> =
+                                                        *autocomplete_token.read();
+                                                    let (start, end) = token_range
+                                                        .filter(|(s, e)| *s <= *e && *e <= current_draft.len())
+                                                        .unwrap_or((0, current_draft.len().min(
+                                                            current_draft.find(' ').unwrap_or(current_draft.len()),
+                                                        )));
+                                                    let completed = format!("/{} ", skill.metadata.name);
+                                                    let mut new_draft = String::with_capacity(
+                                                        current_draft.len() + completed.len(),
+                                                    );
+                                                    new_draft.push_str(&current_draft[..start]);
+                                                    new_draft.push_str(&completed);
+                                                    let cursor_byte = new_draft.len();
+                                                    new_draft.push_str(current_draft[end..].trim_start());
+                                                    // Restore the caret just after the inserted command
+                                                    let cursor_utf16 =
+                                                        crate::skills::invocation::byte_to_utf16_offset(
+                                                            &new_draft,
+                                                            cursor_byte,
+                                                        );
+                                                    tracing::info!("Spliced skill command into draft: {}", new_draft);
+                                                    crate::components::shared::set_chat_draft(
+                                                        draft,
+                                                        new_draft,
+                                                        Some(cursor_utf16),
+                                                        true,
+                                                    );
                                                 }
-                                            };
-                                            draft.set(skill_command.clone());
+                                            }
+                                            autocomplete_token.set(None);
                                             show_skill_autocomplete.set(false);
                                             on_interaction.call(());
-                                            tracing::info!("Populated draft with skill command: {}", skill_command);
                                         }
                                         return;
                                     }
@@ -1287,7 +1335,37 @@ pub fn ChatInput(
                         skills: filtered_skills.read().clone(),
                         selected_index: *skill_autocomplete_index.read(),
                         on_select: move |skill: Skill| {
-                            draft.set(format!("/{} ", skill.metadata.name));
+                            match *autocomplete_mode.read() {
+                                AutocompleteMode::Unload => {
+                                    crate::components::shared::set_chat_draft(
+                                        draft,
+                                        format!("/unload {}", skill.metadata.name),
+                                        None,
+                                        true,
+                                    );
+                                }
+                                AutocompleteMode::Skill => {
+                                    // Splice into the in-progress token, preserving context
+                                    let current_draft = draft.read().clone();
+                                    let token_range: Option<(usize, usize)> = *autocomplete_token.read();
+                                    let (start, end) = token_range
+                                        .filter(|(s, e)| *s <= *e && *e <= current_draft.len())
+                                        .unwrap_or((0, current_draft.len()));
+                                    let completed = format!("/{} ", skill.metadata.name);
+                                    let mut new_draft = String::with_capacity(current_draft.len() + completed.len());
+                                    new_draft.push_str(&current_draft[..start]);
+                                    new_draft.push_str(&completed);
+                                    let cursor_utf16 = crate::skills::invocation::byte_to_utf16_offset(&new_draft, new_draft.len());
+                                    new_draft.push_str(current_draft[end..].trim_start());
+                                    crate::components::shared::set_chat_draft(
+                                        draft,
+                                        new_draft,
+                                        Some(cursor_utf16),
+                                        true,
+                                    );
+                                }
+                            }
+                            autocomplete_token.set(None);
                             show_skill_autocomplete.set(false);
                             on_interaction.call(());
                             tracing::info!("Selected skill from autocomplete: {}", skill.metadata.name);
