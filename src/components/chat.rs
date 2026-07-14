@@ -1198,6 +1198,11 @@ pub fn MessageBubble(
             let mut content = use_signal(|| text_content.clone());
             let mut local_thought_summary = use_signal(|| thought_summary.clone());
             let mut copied = use_signal(|| false);
+            // True when THIS bubble consumed the live stream channel (it was mounted
+            // when the stream started). A bubble re-mounted mid-stream (tab switch away
+            // and back) never owns the channel — `take_stream` is single-consumer — and
+            // instead mirrors accumulated text from session_state (see effects below).
+            let mut owns_channel = use_signal(|| false);
 
             // Token usage display settings - consume BEFORE signal initialization
             let ui_state = consume_context::<Signal<crate::settings::UiState>>();
@@ -1348,6 +1353,10 @@ pub fn MessageBubble(
             use_effect(move || {
                 let _stream_activity = stream_manager.stream_activity;
                 if !is_user && stream_manager.is_streaming(&message.id) {
+                    // We mounted while the live channel is still available, so we're the
+                    // consumer. Claim ownership synchronously (before the async take) so the
+                    // session_state-mirror effect never fights this channel loop.
+                    owns_channel.set(true);
                     spawn(async move {
                         if let Some(mut rx) = stream_manager.take_stream(&message.id) {
                             while let Some(stream_msg) = rx.recv().await {
@@ -1374,6 +1383,49 @@ pub fn MessageBubble(
                             }
                         }
                     });
+                }
+            });
+
+            // Live mirror for a bubble re-mounted mid-stream (tab switched away and
+            // back). The single-consumer channel was already taken by the original
+            // mount, so this bubble can't reattach to it — but the stream task writes
+            // the full accumulated text into session_state on every chunk. Reading
+            // session_state here subscribes this effect to those per-chunk writes, so
+            // the output keeps painting live instead of freezing at the mount snapshot.
+            use_effect(move || {
+                let _ = stream_manager.stream_activity.read();
+                let state = session_state.read();
+                // Skip when we own the live channel (owner drives content directly) or
+                // the turn is no longer generating (nothing left to mirror).
+                if is_user || *owns_channel.peek() || !stream_manager.is_generating(&message.id) {
+                    return;
+                }
+                if let Some((latest, latest_summary)) = state
+                    .sessions
+                    .values()
+                    .flat_map(|s| s.messages.iter())
+                    .find(|m| m.id == message.id)
+                    .and_then(|m| match &m.content {
+                        MessageContent::Text {
+                            content,
+                            thought_summary,
+                            ..
+                        } => Some((content.clone(), thought_summary.clone())),
+                        _ => None,
+                    })
+                {
+                    let mut changed = false;
+                    if *content.peek() != latest {
+                        content.set(latest);
+                        changed = true;
+                    }
+                    if *local_thought_summary.peek() != latest_summary {
+                        local_thought_summary.set(latest_summary);
+                        changed = true;
+                    }
+                    if changed {
+                        on_content_update.call(());
+                    }
                 }
             });
 
