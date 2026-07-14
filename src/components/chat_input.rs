@@ -1714,6 +1714,7 @@ fn PendingTimersBar() -> Element {
 fn SessionCostIcon() -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
     let ui_state = consume_context::<Signal<UiState>>();
+    let stream_manager = consume_context::<StreamManagerContext>();
     // Consume SessionIdContext to ensure this component re-renders on every tab switch
     let SessionIdContext(current_target_id) = use_context::<SessionIdContext>();
     let mut show_popover = use_signal(|| false);
@@ -1721,6 +1722,15 @@ fn SessionCostIcon() -> Element {
     let mut prev_session_id = use_signal(String::new);
     let mut animation_target = use_signal(|| 0.0_f64);
     let mut cost_animating = use_signal(|| false);
+
+    // Subscribe to the stream lifecycle so the cost/token counters refresh at every
+    // turn start/end/continuation. As a memoized no-props component, the background
+    // usage write into `session_state` doesn't reliably re-render this icon on its own
+    // (the value only surfaced after a tab switch flushed the scheduler); `stream_activity`
+    // is the app's canonical "stream state changed" signal and is bumped after the final
+    // usage is recorded, so reading it here guarantees a refresh without leaving the tab.
+    // Read unconditionally, before any early return, so the subscription can't be dropped.
+    let _ = stream_manager.stream_activity.read();
 
     // Check if we should show the icon
     if !ui_state.read().show_session_cost_icon {
