@@ -2926,6 +2926,250 @@ impl McpManager {
         Ok(())
     }
 
+    /// Fully remove a toolkit from the active profile's Composio server: unbind
+    /// it (PATCH), delete its connected account(s) and auth config(s), drop its
+    /// on-demand tools, then reload. Settings (`toolkit_configs`) and
+    /// `connected_slugs` are updated UI-side, mirroring how connect splits work.
+    ///
+    /// Step 1 (the PATCH) is the fail point: on an already-wedged server it will
+    /// error, which is expected — recovery is `recreate_composio_server`.
+    pub async fn remove_toolkit(
+        &self,
+        toolkit_slug: &str,
+        settings: &Settings,
+    ) -> Result<(), String> {
+        let composio_client = self.find_composio_client().await?;
+
+        // 1. Unbind from the MCP server (PATCH + generate); returns the auth
+        //    config id(s) that were dropped from the server's array.
+        let dropped_auth_ids = composio_client
+            .remove_toolkit_from_server(toolkit_slug)
+            .await?;
+
+        // 2. Delete the toolkit's connected account(s) (best-effort).
+        if let Err(e) = composio_client
+            .delete_toolkit_connections(toolkit_slug)
+            .await
+        {
+            tracing::warn!(
+                "[REMOVE] delete_toolkit_connections('{}') failed: {}",
+                toolkit_slug,
+                e
+            );
+        }
+
+        // 3. Delete the dropped auth config(s) so they can't accumulate
+        //    (best-effort — only runs after the PATCH already removed the
+        //    references, so a failure here never leaves a dangling reference).
+        for id in &dropped_auth_ids {
+            if let Err(e) = composio_client.delete_auth_config(id).await {
+                tracing::warn!("[REMOVE] delete_auth_config('{}') failed: {}", id, e);
+            }
+        }
+
+        // 4. Bust caches + drop this profile's on-demand tools for the toolkit.
+        composio_client.clear_cached_toolkit_info();
+        {
+            let prefix = format!("{}_", toolkit_slug.to_uppercase().replace('-', "_"));
+            let active_profile_id = self
+                .settings
+                .peek()
+                .get_active_profile()
+                .map(|p| p.id.clone());
+            let key = dyn_composio_key(active_profile_id.as_deref());
+            let mut dynamic = self.dynamic_composio_tools.lock().await;
+            if let Some(bucket) = dynamic.get_mut(&key) {
+                let before = bucket.len();
+                bucket.retain(|t| !t.name.to_uppercase().starts_with(&prefix));
+                let removed = before - bucket.len();
+                if removed > 0 {
+                    tracing::info!(
+                        "[REMOVE] Cleared {} dynamic tools for removed toolkit '{}' (profile '{}')",
+                        removed,
+                        toolkit_slug,
+                        key
+                    );
+                }
+            }
+        }
+
+        // 5. Reload the active client's tool set and refresh status.
+        self.reload_composio_tools(settings).await?;
+        self.invalidate_status_cache();
+        tracing::info!("[REMOVE] Toolkit '{}' fully removed", toolkit_slug);
+        Ok(())
+    }
+
+    /// Recovery for an already-wedged Composio server: its poisoned
+    /// `auth_config_ids` reject every PATCH, so removal can't help. Provisions a
+    /// FRESH empty server, repoints the active profile at it, and best-effort
+    /// re-binds the toolkits the user already had (existing accounts/configs
+    /// survive, so most rebind without new OAuth). The old server is abandoned
+    /// (Composio has no delete-server endpoint). Returns
+    /// `(rebound, needs_reconnect)` slug lists for a UI summary.
+    pub async fn recreate_composio_server(
+        &self,
+        mut settings_signal: Signal<Settings>,
+        settings_manager: SettingsManager,
+        mut mcp_context_signal: Signal<McpContext>,
+    ) -> Result<(Vec<String>, Vec<String>), String> {
+        let settings_snapshot = settings_signal.peek().clone();
+        let Some(profile) = settings_snapshot.get_active_profile() else {
+            return Err("No active Composio profile found".to_string());
+        };
+        let Some(api_key) = profile.api_key.clone() else {
+            return Err("No Composio API key configured".to_string());
+        };
+        let profile_id = profile.id.clone();
+        let base_url = profile
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
+        let user_id = profile
+            .user_id
+            .clone()
+            .or(profile.entity_id.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let entity_id = profile.entity_id.clone();
+        let chrome_dir = profile.chrome_profile_directory.clone();
+        let kept: Vec<(String, bool)> = profile
+            .toolkit_configs
+            .iter()
+            .map(|c| (c.slug.clone(), c.no_auth))
+            .collect();
+
+        // Owned, mutable client (mirrors connect_toolkit) so we can repoint its
+        // base_url and clone it into the servers map.
+        let mut client = ComposioClient::new(
+            api_key,
+            base_url,
+            entity_id,
+            Some(user_id),
+            profile_id.clone(),
+            chrome_dir,
+        );
+
+        // 1. Resolve auth configs for all kept toolkits FIRST. This only hits
+        //    /auth_configs, so it works even while the old server is wedged.
+        let mut resolved: Vec<(String, Option<String>)> = Vec::new();
+        let mut needs_reconnect: Vec<String> = Vec::new();
+        for (slug, no_auth) in kept {
+            if no_auth {
+                resolved.push((slug, None));
+                continue;
+            }
+            match client.get_auth_config_id(&slug).await {
+                Ok(id) => resolved.push((slug, Some(id))),
+                Err(e) if crate::mcp::composio_client::auth::is_no_auth_toolkit_error(&e) => {
+                    resolved.push((slug, None));
+                }
+                Err(e) => {
+                    tracing::warn!("[RECREATE] '{}' auth resolve failed: {}", slug, e);
+                    needs_reconnect.push(slug);
+                }
+            }
+        }
+
+        // Composio rejects a server with no applications (error 1153
+        // MCP_MissingAuthConfigsOrToolkits), so the fresh server must be seeded
+        // with at least one toolkit.
+        let Some((seed_slug, seed_auth)) = resolved.first().cloned() else {
+            return Err(
+                "No toolkits available to provision a fresh server — connect a toolkit first."
+                    .to_string(),
+            );
+        };
+
+        // 2. Provision the fresh server, seeded with the first toolkit.
+        let (_new_id, new_url) = client
+            .create_fresh_mcp_server(&seed_slug, seed_auth.as_deref())
+            .await?;
+
+        // 3. Repoint client + servers map + persisted base_url (mirror connect Step 3).
+        client.base_url = new_url.clone();
+        {
+            let server_key = composio_server_key(&profile_id);
+            let mut s = self.servers.lock().await;
+            if let Some(existing) = s.get_mut(&server_key) {
+                existing.service =
+                    McpClientType::NativeComposio(std::sync::Arc::new(client.clone()));
+                existing.tools = Vec::new();
+            } else {
+                let active_client = ActiveMcpClient {
+                    config: McpServerConfig::composio_stub(composio_server_key(&profile_id)),
+                    service: McpClientType::NativeComposio(std::sync::Arc::new(client.clone())),
+                    tools: Vec::new(),
+                    warning_message: None,
+                    profile_id: Some(profile_id.clone()),
+                };
+                s.insert(server_key, active_client);
+            }
+        }
+        {
+            let mut s = settings_signal.write();
+            if let Some(p) = s.composio_profiles.iter_mut().find(|p| p.id == profile_id) {
+                p.base_url = Some(new_url.clone());
+            }
+        }
+        let updated = settings_signal.peek().clone();
+        {
+            let sm = settings_manager.clone();
+            let updated_for_save = updated.clone();
+            spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || sm.save(&updated_for_save)).await;
+            });
+        }
+
+        // 4. Bind the remaining toolkits (the seed is already bound by creation).
+        let mut rebound = vec![seed_slug.clone()];
+        tracing::info!(
+            "[RECREATE] Seeded new server with '{}' (auth={:?}); binding {} more",
+            seed_slug,
+            seed_auth,
+            resolved.len().saturating_sub(1)
+        );
+        for (slug, auth) in resolved.into_iter().skip(1) {
+            match client
+                .add_toolkit_to_server(&slug, auth.as_deref(), None)
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!("[RECREATE] Bound '{}' (auth={:?})", slug, auth);
+                    rebound.push(slug);
+                }
+                Err(e) => {
+                    tracing::warn!("[RECREATE] Failed to re-bind '{}': {}", slug, e);
+                    needs_reconnect.push(slug);
+                }
+            }
+        }
+
+        // Verify what actually persisted on the new server (config-level state,
+        // independent of what the MCP proxy exposes via tools/list).
+        match client.server_config_summary().await {
+            Ok((sid, toolkits, auth_ids)) => tracing::info!(
+                "[RECREATE] New server {} now has toolkits={:?} auth_config_ids={:?}",
+                sid,
+                toolkits,
+                auth_ids
+            ),
+            Err(e) => tracing::warn!("[RECREATE] Could not read new server config: {}", e),
+        }
+
+        // 5. Reload tools + refresh context/status.
+        let _ = self.reload_composio_tools(&updated).await;
+        mcp_context_signal.set(self.get_mcp_context(Some(profile_id)).await);
+        self.invalidate_status_cache();
+
+        tracing::info!(
+            "[RECREATE] Done: {} bound to server, {} could not resolve auth. NOTE: auth toolkits \
+             may still need a reconnect (OAuth) before their tools appear.",
+            rebound.len(),
+            needs_reconnect.len()
+        );
+        Ok((rebound, needs_reconnect))
+    }
+
     pub async fn get_mcp_context(&self, profile_id: Option<String>) -> McpContext {
         let servers = self.servers.lock().await;
         let unloaded = self.unloaded_servers.lock().await;
@@ -3182,6 +3426,30 @@ impl McpManager {
         }
     }
 
+    /// Undo the auth config / connected account created by a failed connect
+    /// attempt — but only when the toolkit had **no** pre-existing auth config,
+    /// so we never delete state an already-connected toolkit depends on.
+    /// Best-effort; deletes the account first (it references the config).
+    async fn rollback_partial_connect(
+        client: &crate::mcp::composio_client::ComposioClient,
+        toolkit_slug: &str,
+        auth_config_id: Option<&str>,
+        had_auth_config_before: bool,
+    ) {
+        if had_auth_config_before {
+            return;
+        }
+        let Some(acid) = auth_config_id else {
+            return;
+        };
+        tracing::warn!(
+            "[ROLLBACK] '{}' connect failed; removing the auth config/account created this attempt",
+            toolkit_slug
+        );
+        let _ = client.delete_toolkit_connections(toolkit_slug).await;
+        let _ = client.delete_auth_config(acid).await;
+    }
+
     /// Connect a toolkit to the natively managed Composio server.
     /// Encapsulates the 5-step lifecycle: AuthConfig, Registry (PATCH/Create),
     /// OAuth, and User Binding.
@@ -3285,6 +3553,15 @@ impl McpManager {
             }
         };
 
+        // For rollback scoping: did an auth config already exist before this
+        // attempt? If not and we fail mid-connect, we delete the config/account
+        // this attempt created so a failed connect leaves no orphan behind.
+        let had_auth_config_before = if requires_no_auth {
+            true // nothing to roll back for no-auth toolkits
+        } else {
+            client.has_existing_auth_config(&toolkit_slug).await
+        };
+
         // Step 1: Get or create auth config (reuse existing if available).
         // No-auth toolkits (e.g. hackernews) skip auth entirely: Composio
         // rejects auth config creation for them with error code 303, and their
@@ -3343,6 +3620,13 @@ impl McpManager {
                 Err(e) => {
                     let msg = format!("Authentication failed: {}", e);
                     tracing::error!("{}", msg);
+                    Self::rollback_partial_connect(
+                        &client,
+                        &toolkit_slug,
+                        auth_config_id.as_deref(),
+                        had_auth_config_before,
+                    )
+                    .await;
                     connection_error.set(Some(msg.clone()));
                     is_connecting.set(false);
                     return Err(msg);
@@ -3430,6 +3714,13 @@ impl McpManager {
             Err(e) => {
                 let msg = format!("Failed to configure server: {}", e);
                 tracing::error!("{}", msg);
+                Self::rollback_partial_connect(
+                    &client,
+                    &toolkit_slug,
+                    auth_config_id.as_deref(),
+                    had_auth_config_before,
+                )
+                .await;
                 connection_error.set(Some(msg.clone()));
                 is_connecting.set(false);
                 return Err(msg);

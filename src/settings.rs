@@ -560,6 +560,13 @@ impl ComposioProfile {
         self.user_id.as_ref().is_some_and(|s| !s.is_empty())
             && self.api_key.as_ref().is_some_and(|s| !s.is_empty())
     }
+
+    /// Remove a toolkit's config entry (used when a toolkit is fully removed
+    /// from the Composio server). Mirrors `Settings::remove_profile`.
+    pub fn remove_toolkit_config(&mut self, slug: &str) {
+        self.toolkit_configs
+            .retain(|c| !c.slug.eq_ignore_ascii_case(slug));
+    }
 }
 
 impl Default for Settings {
@@ -1911,6 +1918,28 @@ pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_toolkit_config_drops_matching_slug_case_insensitively() {
+        let mut profile = ComposioProfile::default();
+        for slug in ["gmail", "github", "slack"] {
+            profile.toolkit_configs.push(ComposioToolkitConfig {
+                slug: slug.to_string(),
+                display_name: slug.to_string(),
+                ..Default::default()
+            });
+        }
+        profile.remove_toolkit_config("GMAIL"); // case-insensitive
+        let remaining: Vec<&str> = profile
+            .toolkit_configs
+            .iter()
+            .map(|c| c.slug.as_str())
+            .collect();
+        assert_eq!(remaining, vec!["github", "slack"]);
+        // Removing a non-existent slug is a no-op.
+        profile.remove_toolkit_config("notthere");
+        assert_eq!(profile.toolkit_configs.len(), 2);
+    }
 
     #[test]
     fn seed_fills_empty_claude_slots() {

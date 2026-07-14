@@ -189,6 +189,44 @@ impl ComposioClient {
         discovery::get_connected_toolkit_slugs(self).await
     }
 
+    pub async fn delete_auth_config(&self, auth_config_id: &str) -> Result<(), String> {
+        auth::delete_auth_config(self, auth_config_id).await
+    }
+
+    pub async fn has_existing_auth_config(&self, toolkit_slug: &str) -> bool {
+        auth::has_existing_auth_config(self, toolkit_slug).await
+    }
+
+    pub async fn delete_toolkit_connections(&self, toolkit_slug: &str) -> Result<(), String> {
+        auth::delete_toolkit_connections(self, toolkit_slug).await
+    }
+
+    /// Remove a toolkit from the MCP server (unbind + strip auth config +
+    /// allowed_tools). Returns the auth_config_id(s) that were dropped.
+    pub async fn remove_toolkit_from_server(
+        &self,
+        toolkit_slug: &str,
+    ) -> Result<Vec<String>, String> {
+        execution::remove_toolkit_from_server(self, toolkit_slug).await
+    }
+
+    /// Provision a fresh MCP server (recovery), seeded with one toolkit (Composio
+    /// rejects empty servers). Returns (server_id, url).
+    pub async fn create_fresh_mcp_server(
+        &self,
+        seed_toolkit: &str,
+        seed_auth_config_id: Option<&str>,
+    ) -> Result<(String, String), String> {
+        execution::create_fresh_mcp_server(self, seed_toolkit, seed_auth_config_id).await
+    }
+
+    /// Diagnostic: (server_id, bound toolkits, auth_config_ids) for the current server.
+    pub async fn server_config_summary(
+        &self,
+    ) -> Result<(String, Vec<String>, Vec<String>), String> {
+        execution::server_config_summary(self).await
+    }
+
     pub async fn get_toolkit_tools_detailed(
         &self,
         toolkit_slug: &str,

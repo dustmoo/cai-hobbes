@@ -366,3 +366,42 @@ against the official pricing pages.
 
 **If broken**: the in-app cost counter and `usage_log` totals quietly diverge
 from the real bill.
+
+---
+
+### 14. Composio Toolkit Removal & Auth-Config Hygiene
+
+> **Pattern ID**: P-014
+> **Anti-Pattern**: Create-or-find auth configs with no deletion → wedged servers
+
+All Composio toolkits for a profile bind to **one shared MCP server**. Its
+`toolkits` + `auth_config_ids` arrays are the choke point: a PATCH is fail-fast,
+so a single stale/duplicate/invalid `auth_config_id` makes **every** future
+connect (and even a removal PATCH) reject — the server is "wedged". The historical
+fix was to hand-create a fresh server in the Composio dashboard.
+
+**Removal** (`McpManager::remove_toolkit`) mirrors the connect lifecycle in
+reverse: `remove_toolkit_from_server` PATCH (drop the slug from `toolkits`,
+`auth_config_ids`, `allowed_tools`; Mandate 5 + regenerate per Mandate 6) →
+`delete_connected_account` for the toolkit's accounts → `delete_auth_config` for
+the dropped ids → drop its on-demand tools (profile-keyed bucket) + settings
+`toolkit_configs` entry (UI-side). Pure array planning lives in
+`compute_toolkit_removal` (unit-tested).
+
+**Hygiene rules** (all reuse `delete_auth_config`):
+- **Dedupe on connect** — `get_auth_config_id` keeps one config per slug and
+  deletes the rest; the reconciliation in `add_toolkit_to_server` re-points the
+  server at the survivor.
+- **Rollback on failed connect** — `connect_toolkit` deletes the auth
+  config/account it created **only when the toolkit had none before**
+  (`has_existing_auth_config`), so a failed attempt leaves no orphan and never
+  touches an already-connected toolkit's state.
+- **Recreate to recover** — `recreate_composio_server` resolves auth for the kept
+  toolkits, provisions a fresh server **seeded with the first** toolkit
+  (`create_fresh_mcp_server` — Composio rejects an empty server, error 1153), then
+  binds the rest, repoints `base_url` + the servers map. This is the **only**
+  recovery for an already-wedged server. There is **no delete-server endpoint**;
+  the old server is abandoned.
+
+**If broken**: connects fail with 400s on the shared server; removals also fail;
+the only escape is Recreate.

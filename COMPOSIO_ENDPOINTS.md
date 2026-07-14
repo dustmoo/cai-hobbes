@@ -82,6 +82,24 @@ These calls use the `x-api-key` header for authentication and are used for admin
 | `list_mcp_servers()` | GET | `/api/v3/mcp/servers` | List available servers (Dynamic Lookup) |
 | `generate_mcp_user()` | POST | `/api/v3/mcp/servers/generate` | Bind user_id to server (Mandatory User Generation) |
 | `initiate_connection()` | POST | `/api/v3/connected_accounts/link` | Generate OAuth link URL for user authentication |
+| `remove_toolkit_from_server()` | PATCH | `/api/v3/mcp/{server_id}` | Unbind a toolkit: drop it from `toolkits`/`auth_config_ids`/`allowed_tools`. Returns dropped auth_config ids |
+| `delete_auth_config()` | DELETE | `/api/v3/auth_configs/{id}` | Delete a toolkit's auth config (full removal + dedupe) |
+| `delete_connected_account()` | DELETE | `/api/v3/connected_accounts/{id}` | Delete a connected account (prune / full removal) |
+| `create_fresh_mcp_server()` | POST | `/api/v3/mcp/servers/custom` | Provision a **fresh** server seeded with one toolkit (Recreate recovery). Composio rejects an empty server — error 1153 `MCP_MissingAuthConfigsOrToolkits` — so it must have ≥1 toolkit/auth_config |
+
+### Removal / cleanup lifecycle (mirrors the connect lifecycle)
+
+`McpManager::remove_toolkit` fully removes a toolkit: PATCH the server with the
+toolkit dropped (obey Mandate 5 + regenerate per Mandate 6) → `delete_connected_account`
+for each of its accounts → `delete_auth_config` for the dropped ids → drop its
+on-demand tools + settings `toolkit_configs` entry.
+
+**Auth-config hygiene (prevents wedged servers):** auth configs are create-or-find; if
+duplicates/orphans accumulate on the single shared server, one invalid `auth_config_id`
+makes every fail-fast PATCH reject, wedging the server. Mitigations: `get_auth_config_id`
+dedupes (keep one, `delete_auth_config` the rest); failed connects roll back the config/account
+they created; and `create_empty_mcp_server` + `recreate_composio_server` rebuild a server
+that is already wedged (the old server is abandoned — there is **no** delete-server endpoint).
 
 ---
 
