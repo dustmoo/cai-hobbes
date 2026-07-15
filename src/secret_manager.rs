@@ -329,6 +329,22 @@ impl SecretManagerTrait for SecretManager {
         }
     }
 
+    /// Set a secret honoring an explicit protection level. Non-biometric
+    /// writes use a plain keychain item (same as
+    /// `save_secret_to_keychain(.., false)`) so the value stays readable
+    /// without an authentication prompt — required for the discovery
+    /// index keys read at startup before any biometric context exists.
+    fn set_with_protection(&mut self, key: &str, value: String, biometric: bool) -> Result<(), String> {
+        if biometric {
+            return self.set(key, value);
+        }
+        keychain_ffi::set_generic_password(key, &value)
+            .map_err(|e| format!("Failed to save secret to Keychain: {}", e))?;
+        self.secrets.insert(key.to_string(), value);
+        tracing::debug!("Saved secret (without biometric protection): {}", key);
+        Ok(())
+    }
+
     /// Delete a secret (removes from cache and keychain)
     fn delete(&mut self, key: &str) -> Result<(), String> {
         // Use our FFI to delete (includes access group)

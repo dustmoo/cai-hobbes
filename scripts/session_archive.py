@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Manage the Hobbes session archive (sessions-archive.jsonl).
 
-The archive is append-only JSONL: one Session object per line. The app's
-session GC appends stale sessions here instead of deleting them. Duplicate
+The archive is append-only JSONL: one Session object per line. It holds
+sessions recovered from old sessions.json snapshots/backups. Duplicate
 session ids are resolved last-line-wins.
+
+Since the SQLite migration, live sessions are stored in sessions.db —
+sessions.json is a legacy file the app imported once and no longer reads.
 
 Subcommands:
   list                       List archived sessions (newest first).
@@ -12,10 +15,9 @@ Subcommands:
                              archive. Inputs are processed in the order given,
                              so pass oldest first — a newer copy of the same
                              session id wins. Sessions already live in
-                             sessions.json are skipped.
+                             sessions.db are skipped.
   restore <session-id>       Copy a session from the archive back into the
-                             live sessions.json. Quit Hobbes first! A backup
-                             of sessions.json is written alongside it.
+                             live sessions.db. Quit Hobbes first!
 
 Run with the app's config dir auto-detected, or override with --config-dir.
 """
@@ -23,7 +25,7 @@ Run with the app's config dir auto-detected, or override with --config-dir.
 import argparse
 import json
 import os
-import shutil
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +37,20 @@ def default_config_dir() -> Path:
     if sys.platform == "win32":
         return Path(os.environ["APPDATA"]) / "com.hobbes.app"
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "com.hobbes.app"
+
+
+def open_db(config_dir: Path) -> sqlite3.Connection:
+    db_path = config_dir / "sessions.db"
+    if not db_path.exists():
+        print(f"Live session store not found at {db_path}.", file=sys.stderr)
+        print("Launch Hobbes once so it creates sessions.db, then retry.", file=sys.stderr)
+        sys.exit(1)
+    return sqlite3.connect(db_path)
+
+
+def live_session_ids(config_dir: Path) -> set:
+    with open_db(config_dir) as conn:
+        return {row[0] for row in conn.execute("SELECT id FROM sessions")}
 
 
 def read_archive(archive_path: Path) -> dict:
@@ -72,6 +88,58 @@ def parse_ts(session: dict) -> str:
     return session.get("last_updated") or ""
 
 
+def fixed_width_ts(raw: str) -> str:
+    """Normalize a timestamp to the store's fixed-width UTC micros format
+    (lexicographic order == time order). Falls back to the raw string."""
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except (ValueError, AttributeError):
+        return raw
+
+
+def message_text(message: dict) -> str:
+    content = message.get("content")
+    if isinstance(content, dict):
+        text = content.get("Text")
+        if isinstance(text, dict):
+            return text.get("content") or ""
+        if isinstance(text, str):  # pre-migration tuple format
+            return text
+    return ""
+
+
+def build_row(session: dict, seq: int) -> tuple:
+    """Mirror src/session_store.rs build_row for a raw session dict."""
+    messages = session.get("messages", [])
+    usages = [m.get("usage") or {} for m in messages]
+    total_cost = (session.get("accumulated_cost") or 0.0) + sum(
+        u.get("cost") or 0.0 for u in usages
+    )
+    total_tokens = (session.get("accumulated_tokens") or 0) + sum(
+        u.get("total_tokens") or 0 for u in usages
+    )
+    name = session.get("name", "")
+    summary = (
+        (session.get("active_context") or {}).get("conversation_summary") or {}
+    ).get("summary") or ""
+    search_parts = [name.lower(), summary.lower()]
+    search_parts.extend(t.lower() for t in (message_text(m) for m in messages) if t)
+    return (
+        session["id"],
+        name,
+        fixed_width_ts(parse_ts(session)),
+        len(messages),
+        total_cost,
+        total_tokens,
+        1 if session.get("scheduled_timers") else 0,
+        summary,
+        "\n".join(search_parts),
+        seq,
+        json.dumps(session, separators=(",", ":"), ensure_ascii=False),
+    )
+
+
 def cmd_list(args) -> int:
     archive = read_archive(args.config_dir / "sessions-archive.jsonl")
     if not archive:
@@ -89,12 +157,7 @@ def cmd_list(args) -> int:
 def cmd_merge(args) -> int:
     archive_path = args.config_dir / "sessions-archive.jsonl"
     archive = read_archive(archive_path)
-
-    live_ids = set()
-    live_path = args.config_dir / "sessions.json"
-    if live_path.exists():
-        with open(live_path, encoding="utf-8") as f:
-            live_ids = set(json.load(f).get("sessions", {}).keys())
+    live_ids = live_session_ids(args.config_dir)
 
     to_append = []
     for input_file in args.files:
@@ -143,27 +206,24 @@ def cmd_restore(args) -> int:
         print(f"Session {args.session_id} not found in archive.", file=sys.stderr)
         return 1
 
-    live_path = args.config_dir / "sessions.json"
-    with open(live_path, encoding="utf-8") as f:
-        state = json.load(f)
-    if args.session_id in state["sessions"]:
-        print("Session already present in live sessions.json — nothing to do.")
-        return 0
+    with open_db(args.config_dir) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM sessions WHERE id = ?", (args.session_id,)
+        ).fetchone()
+        if exists:
+            print("Session already present in live sessions.db — nothing to do.")
+            return 0
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = live_path.with_name(f"sessions.json.pre-restore-{stamp}")
-    shutil.copy2(live_path, backup)
-    print(f"Backed up live state to {backup.name}")
+        (max_seq,) = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM sessions").fetchone()
+        conn.execute(
+            "INSERT INTO sessions (id, name, last_updated, message_count, total_cost,"
+            " total_tokens, has_timers, summary, search_text, seq, data)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            build_row(session, max_seq + 1),
+        )
+        conn.commit()
 
-    state["sessions"][args.session_id] = session
-    tmp = live_path.with_name("sessions.json.restore-tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, live_path)
-    print(f"Restored '{session.get('name', args.session_id)}' into sessions.json.")
+    print(f"Restored '{session.get('name', args.session_id)}' into sessions.db.")
     print("Restart Hobbes (make sure it was not running during the restore).")
     return 0
 

@@ -230,6 +230,9 @@ fn hydrate_connector_keys(
     sm: &mut secret_manager::SecretManager,
 ) {
     use crate::secret_types::SecretManagerTrait;
+    // Match the user's chosen storage mode for the migrated key itself; the
+    // index is always written non-biometric (set_llm_key handles that).
+    let use_biometric = settings.use_biometric_storage();
     let mut claimed: std::collections::HashSet<settings::LlmProvider> =
         std::collections::HashSet::new();
     let connector_ids: Vec<(String, settings::LlmProvider)> = settings
@@ -252,7 +255,7 @@ fn hydrate_connector_keys(
             if let Some(c) = settings.connector_by_id_mut(&id) {
                 c.config.set_api_key(Some(key.clone()));
             }
-            if let Err(e) = sm.set_llm_key(&id, key) {
+            if let Err(e) = sm.set_llm_key(&id, key, use_biometric) {
                 tracing::error!(
                     "Failed to copy legacy {} key to connector {}: {}",
                     kind.display_name(),
@@ -605,6 +608,7 @@ fn app() -> Element {
                                             &slug,
                                             &field,
                                             val,
+                                            current_settings.use_biometric_storage(),
                                         );
                                     }
                                 }
@@ -772,6 +776,7 @@ fn app() -> Element {
                                             &slug,
                                             &field,
                                             val,
+                                            current_settings.use_biometric_storage(),
                                         );
                                     }
                                 }
@@ -873,12 +878,15 @@ fn app() -> Element {
             .map(|v| v == crate::settings::CURRENT_TOS_VERSION)
             .unwrap_or(false);
 
-        // Check if any connector is configured (fresh installs have none;
-        // migrated users keep their existing configured provider)
+        // Check that the ACTIVE connector is configured — it is what
+        // build_global_connector serves to every new session, so an
+        // unconfigured active connector must route to setup even when some
+        // other connector is configured (fresh installs have none;
+        // migrated users keep their existing configured provider).
         let connector_configured = settings
-            .llm_connectors
-            .iter()
-            .any(|c| settings.is_connector_configured(c));
+            .active_connector()
+            .map(|c| settings.is_connector_configured(c))
+            .unwrap_or(false);
 
         // Need onboarding if either TOS not accepted or no usable connector
         !tos_accepted || !connector_configured

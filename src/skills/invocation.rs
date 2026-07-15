@@ -1,5 +1,5 @@
-// Pure skill-invocation detection: finds `/name` command tokens anywhere in a
-// message (not just at the start), and powers cursor-aware autocomplete.
+// Pure skill-invocation detection: finds `/name` command tokens at the start
+// of any line in a message, and powers cursor-aware autocomplete.
 // Kept free of Dioxus/UI types so it's testable headlessly.
 
 /// A skill invocation detected inside a message.
@@ -19,7 +19,10 @@ const TRAILING_PUNCT: &[char] = &['.', ',', '!', '?', ':', ';'];
 
 /// Scan `message` for the first whitespace-delimited token of the form
 /// `/name` where `name` matches a known skill. Rules that kill false
-/// positives on paths (`/usr/bin`), URLs, and fractions:
+/// positives on paths (`/usr/bin`), URLs, fractions, and prose mentions:
+/// - the token must sit at the START of a line (only whitespace before it on
+///   that line) — prose that merely mentions "/name" mid-sentence must reach
+///   the model as text, not hijack the message into skill execution
 /// - the token must START with `/` (so `https://x.co/foo` and `a/b` never match)
 /// - the remainder must be non-empty and contain no further `/` (so `/usr/bin` never matches)
 /// - after stripping at most one trailing punctuation char, the remainder must
@@ -31,6 +34,10 @@ pub fn detect_skill_invocation(
     is_known: impl Fn(&str) -> bool,
 ) -> Option<SkillInvocation> {
     for (start, token) in tokens_with_offsets(message) {
+        let line_start = message[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if !message[line_start..start].chars().all(char::is_whitespace) {
+            continue;
+        }
         let Some(rest) = token.strip_prefix('/') else {
             continue;
         };
@@ -155,8 +162,8 @@ mod tests {
     }
 
     #[test]
-    fn detects_mid_message() {
-        let msg = "Here is some context about the task. Now /research rust runtimes";
+    fn detects_at_line_start_after_context() {
+        let msg = "Here is some context about the task.\n/research rust runtimes";
         let inv = detect_skill_invocation(msg, known(&["research"])).unwrap();
         assert_eq!(inv.skill_name, "research");
         assert_eq!(inv.arguments, "rust runtimes");
@@ -164,11 +171,26 @@ mod tests {
     }
 
     #[test]
-    fn detects_at_end_of_message_with_empty_args() {
+    fn detects_indented_line_start_with_empty_args() {
         let inv =
-            detect_skill_invocation("please summarize then /digest", known(&["digest"])).unwrap();
+            detect_skill_invocation("please summarize\n  /digest", known(&["digest"])).unwrap();
         assert_eq!(inv.skill_name, "digest");
         assert_eq!(inv.arguments, "");
+    }
+
+    #[test]
+    fn rejects_mid_sentence_mentions() {
+        // Prose that merely mentions a skill must not hijack the message.
+        let is_known = known(&["deploy", "research"]);
+        assert!(detect_skill_invocation(
+            "I already ran /deploy earlier today, please don't run it again",
+            &is_known
+        )
+        .is_none());
+        assert!(detect_skill_invocation("please summarize then /digest", known(&["digest"])).is_none());
+        assert!(
+            detect_skill_invocation("context. Now /research rust runtimes", &is_known).is_none()
+        );
     }
 
     #[test]
@@ -201,11 +223,11 @@ mod tests {
 
     #[test]
     fn strips_one_trailing_punctuation() {
-        let inv = detect_skill_invocation("you could try /research.", known(&["research"])).unwrap();
+        let inv = detect_skill_invocation("/research.", known(&["research"])).unwrap();
         assert_eq!(inv.skill_name, "research");
         assert_eq!(inv.arguments, "");
         // Only ONE trailing punct is stripped — "/research.." stays unknown
-        assert!(detect_skill_invocation("try /research..", known(&["research"])).is_none());
+        assert!(detect_skill_invocation("/research..", known(&["research"])).is_none());
     }
 
     #[test]
@@ -221,7 +243,7 @@ mod tests {
 
     #[test]
     fn unicode_context_offsets_are_correct() {
-        let msg = "résumé context 🚀 then /research crème brûlée";
+        let msg = "résumé context 🚀\n/research crème brûlée";
         let inv = detect_skill_invocation(msg, known(&["research"])).unwrap();
         assert_eq!(&msg[inv.token_range.0..inv.token_range.1], "/research");
         assert_eq!(inv.arguments, "crème brûlée");

@@ -82,6 +82,23 @@ impl StreamManagerContext {
         }
     }
 
+    /// The session's resolved OpenAI-compat config when watch-word recovery
+    /// is enabled on it. Watch words are a per-instance OpenAI-compat
+    /// feature: gate on the session's resolved connector config, not the
+    /// global one.
+    fn watch_word_config(&self, session_id: &str) -> Option<crate::settings::OpenAiCompatConfig> {
+        self.effective_connector(session_id).and_then(|inst| {
+            match inst.config {
+                crate::settings::ProviderInstanceConfig::OpenAiCompat(c)
+                    if c.watch_words_enabled =>
+                {
+                    Some(c)
+                }
+                _ => None,
+            }
+        })
+    }
+
     /// The chat model a session resolves to (session override → provider default).
     fn effective_model(&self, session_id: &str) -> String {
         let settings = self.settings.read();
@@ -1188,20 +1205,9 @@ impl StreamManagerContext {
                         let model = session
                             .map(|s| settings_guard.chat_model_for_session(s))
                             .unwrap_or_else(|| settings_guard.active_chat_model());
-                        match instance {
-                            Some(inst) => (
-                                settings_guard.effective_context_tuning_for_connector(inst),
-                                settings_guard.resolve_context_window_for_connector(inst, &model),
-                                settings_guard.enable_summarization,
-                            ),
-                            None => (
-                                settings_guard
-                                    .effective_context_tuning_for(settings_guard.active_llm),
-                                settings_guard
-                                    .resolve_context_window_for(settings_guard.active_llm, &model),
-                                settings_guard.enable_summarization,
-                            ),
-                        }
+                        let (tuning, context_tokens) =
+                            settings_guard.tuning_and_window(instance, &model);
+                        (tuning, context_tokens, settings_guard.enable_summarization)
                     };
                     // Compute a dynamic threshold: how many messages actually fit
                     // in this model's context budget, then trigger summarization
@@ -1352,19 +1358,7 @@ impl StreamManagerContext {
             // (e.g., "error decoding response body") and auto-recovery is enabled,
             // retry the continuation instead of leaving the user stranded.
             if stream_error_occurred {
-                // Recovery is a per-instance OpenAI-compat feature: gate on the
-                // session's resolved connector config, not the global one.
-                let recovery_config = self.effective_connector(&session_id).and_then(|inst| {
-                    match inst.config {
-                        crate::settings::ProviderInstanceConfig::OpenAiCompat(c)
-                            if c.watch_words_enabled =>
-                        {
-                            Some(c)
-                        }
-                        _ => None,
-                    }
-                });
-                if let Some(recovery_config) = recovery_config {
+                if let Some(recovery_config) = self.watch_word_config(&session_id) {
                     let max_recoveries = recovery_config.max_watch_word_recoveries;
 
                     let recovery_count = self.session_state.read().sessions.get(&session_id)
@@ -1517,16 +1511,8 @@ impl StreamManagerContext {
                 return;
             };
             let model = settings.chat_model_for_session(session);
-            let (tuning, context_tokens) = match settings.connector_for_session(session) {
-                Some(inst) => (
-                    settings.effective_context_tuning_for_connector(inst),
-                    settings.resolve_context_window_for_connector(inst, &model),
-                ),
-                None => (
-                    settings.effective_context_tuning_for(settings.active_llm),
-                    settings.resolve_context_window_for(settings.active_llm, &model),
-                ),
-            };
+            let (tuning, context_tokens) =
+                settings.tuning_and_window(settings.connector_for_session(session), &model);
             // A result smaller than its eventual historical budget will always
             // fit and never needs a summary; only summarize ones that would be
             // compressed later.
@@ -1605,19 +1591,7 @@ impl StreamManagerContext {
         final_text: &str,
         message_id: &Uuid,
     ) -> bool {
-        // Watch words are a per-instance OpenAI-compat feature: gate on the
-        // session's resolved connector config, not the global one.
-        let watch_config = self.effective_connector(session_id).and_then(|inst| {
-            match inst.config {
-                crate::settings::ProviderInstanceConfig::OpenAiCompat(c)
-                    if c.watch_words_enabled =>
-                {
-                    Some(c)
-                }
-                _ => None,
-            }
-        });
-        let watch_config = match watch_config {
+        let watch_config = match self.watch_word_config(session_id) {
             Some(c) if !final_text.is_empty() => c,
             _ => return false,
         };

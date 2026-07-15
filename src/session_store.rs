@@ -24,6 +24,12 @@ use crate::session::Session;
 
 static CONN: OnceLock<Mutex<Connection>> = OnceLock::new();
 static FINGERPRINTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+/// Deleted session ids → the seq at which the delete happened. Background
+/// saves carry rows collected *before* a delete; without this, such a write
+/// would re-insert the deleted row (the seq upsert guard only protects
+/// updates, and no save path deletes rows). Rows whose seq predates the
+/// tombstone are dropped at write time.
+static TOMBSTONES: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 static SEQ: AtomicI64 = AtomicI64::new(1);
 
 pub const META_SCHEMA_VERSION: &str = "schema_version";
@@ -39,13 +45,17 @@ fn fingerprints() -> &'static Mutex<HashMap<String, u64>> {
     FINGERPRINTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn tombstones() -> &'static Mutex<HashMap<String, i64>> {
+    TOMBSTONES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn hash_bytes(data: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     data.hash(&mut h);
     h.finish()
 }
 
-fn next_seq() -> i64 {
+pub(crate) fn next_seq() -> i64 {
     SEQ.fetch_add(1, Ordering::SeqCst)
 }
 
@@ -180,6 +190,12 @@ fn import_json_files(
     let mut imported_live = 0usize;
     let mut imported_archive = 0usize;
 
+    // The whole import — rows, meta, and the migrated marker — commits
+    // atomically: a crash mid-import leaves the marker unset, so the import
+    // retries next launch instead of persisting a partial history.
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let conn = &*tx;
+
     // 1. Live sessions.json — parse through the existing load/migration logic.
     if let Some(json_path) = json_path {
         if json_path.exists() {
@@ -192,14 +208,14 @@ fn import_json_files(
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                     upsert_row(conn, &row)?;
                 }
-                meta_set_conn(conn, META_SCHEMA_VERSION, &state.schema_version.to_string())?;
-                meta_set_conn(conn, META_ACTIVE_SESSION, &state.active_session_id)?;
-                meta_set_conn(conn, META_WINDOW_WIDTH, &state.window_width.to_string())?;
-                meta_set_conn(conn, META_WINDOW_HEIGHT, &state.window_height.to_string())?;
-                meta_set_conn(conn, META_LIFETIME_COST, &state.lifetime_cost.to_string())?;
-                meta_set_conn(conn, META_LIFETIME_TOKENS, &state.lifetime_tokens.to_string())?;
+                meta_set_conn(conn, META_SCHEMA_VERSION, &state.schema_version.to_string(), next_seq())?;
+                meta_set_conn(conn, META_ACTIVE_SESSION, &state.active_session_id, next_seq())?;
+                meta_set_conn(conn, META_WINDOW_WIDTH, &state.window_width.to_string(), next_seq())?;
+                meta_set_conn(conn, META_WINDOW_HEIGHT, &state.window_height.to_string(), next_seq())?;
+                meta_set_conn(conn, META_LIFETIME_COST, &state.lifetime_cost.to_string(), next_seq())?;
+                meta_set_conn(conn, META_LIFETIME_TOKENS, &state.lifetime_tokens.to_string(), next_seq())?;
                 let tch = serde_json::to_string(&state.tool_call_history).unwrap_or_else(|_| "[]".into());
-                meta_set_conn(conn, META_TOOL_CALL_HISTORY, &tch)?;
+                meta_set_conn(conn, META_TOOL_CALL_HISTORY, &tch, next_seq())?;
                 Ok(())
             })();
             tx_result.map_err(|e| format!("import sessions.json rows: {e}"))?;
@@ -241,8 +257,9 @@ fn import_json_files(
         }
     }
 
-    meta_set_conn(conn, META_JSON_MIGRATED, &chrono::Utc::now().to_rfc3339())
+    meta_set_conn(conn, META_JSON_MIGRATED, &chrono::Utc::now().to_rfc3339(), next_seq())
         .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     tracing::info!(
         "JSON→SQLite import complete: {imported_live} live sessions, {imported_archive} archived sessions. \
          The original JSON files were left in place and are no longer read."
@@ -383,8 +400,14 @@ pub fn collect_dirty_rows(
 }
 
 pub fn mark_rows_saved(rows: &[SessionRow]) {
+    let tombs = tombstones().lock().unwrap();
     let mut fps = fingerprints().lock().unwrap();
     for row in rows {
+        // A tombstoned row was dropped by write_rows_and_meta, not saved —
+        // recording its fingerprint would mask a future re-import.
+        if tombs.get(&row.id).is_some_and(|del_seq| row.seq < *del_seq) {
+            continue;
+        }
         fps.insert(row.id.clone(), row.data_hash);
     }
 }
@@ -406,27 +429,44 @@ pub fn mark_blob_saved(key: &str, data: &str) {
     fingerprints().lock().unwrap().insert(key.to_string(), hash_bytes(data));
 }
 
-/// Write rows + meta entries. Called on a blocking thread.
-pub fn write_rows_and_meta(rows: &[SessionRow], meta: &[(String, String)]) -> Result<(), String> {
+/// Write rows + meta entries atomically. Called on a blocking thread.
+/// Meta seqs are assigned at collect time (see `collect_meta_kv`) so an older
+/// snapshot whose write lands later cannot overwrite newer meta. Rows whose
+/// seq predates a delete tombstone are dropped — they were collected before
+/// the session was deleted and must not resurrect it.
+pub fn write_rows_and_meta(rows: &[SessionRow], meta: &[(String, String, i64)]) -> Result<(), String> {
     with_conn(|conn| {
-        for row in rows {
-            upsert_row(conn, row)?;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut tombs = tombstones().lock().unwrap();
+            for row in rows {
+                match tombs.get(&row.id) {
+                    Some(del_seq) if row.seq < *del_seq => continue,
+                    Some(_) => {
+                        // Row collected after the delete — the id was
+                        // re-created, so the tombstone no longer applies.
+                        tombs.remove(&row.id);
+                    }
+                    None => {}
+                }
+                upsert_row(&tx, row)?;
+            }
         }
-        for (key, value) in meta {
-            meta_set_conn(conn, key, value)?;
+        for (key, value, seq) in meta {
+            meta_set_conn(&tx, key, value, *seq)?;
         }
-        Ok(())
+        tx.commit()
     })
 }
 
 // ── Meta ────────────────────────────────────────────────────────────────────
 
-fn meta_set_conn(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+fn meta_set_conn(conn: &Connection, key: &str, value: &str, seq: i64) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO meta (key, value, seq) VALUES (?1, ?2, ?3)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, seq = excluded.seq
          WHERE excluded.seq >= meta.seq",
-        params![key, value, next_seq()],
+        params![key, value, seq],
     )?;
     Ok(())
 }
@@ -520,6 +560,7 @@ pub fn most_recent_session_id() -> Option<String> {
 /// harvesting into the lifetime counters.
 pub fn delete_session(id: &str) -> Option<(f64, i64)> {
     forget_fingerprint(id);
+    tombstones().lock().unwrap().insert(id.to_string(), next_seq());
     with_conn(|conn| {
         use rusqlite::OptionalExtension;
         let harvest: Option<(f64, i64)> = conn
@@ -734,7 +775,7 @@ pub mod test_support {
     }
 
     pub fn meta_set(conn: &Connection, key: &str, value: &str) {
-        meta_set_conn(conn, key, value).unwrap();
+        meta_set_conn(conn, key, value, next_seq()).unwrap();
     }
 
     pub fn meta_set_with_seq(conn: &Connection, key: &str, value: &str, seq: i64) {

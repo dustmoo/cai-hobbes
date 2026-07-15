@@ -170,6 +170,19 @@ pub trait SecretManagerTrait {
     /// Set a secret (updates cache and saves to keychain).
     fn set(&mut self, key: &str, value: String) -> Result<(), String>;
 
+    /// Set a secret with an explicit protection level. Platforms without
+    /// biometric ACLs ignore the flag; the macOS implementation overrides
+    /// this so `biometric: false` writes a plain keychain item that stays
+    /// readable without an authentication prompt.
+    fn set_with_protection(
+        &mut self,
+        key: &str,
+        value: String,
+        _biometric: bool,
+    ) -> Result<(), String> {
+        self.set(key, value)
+    }
+
     /// Delete a secret (removes from cache and keychain).
     fn delete(&mut self, key: &str) -> Result<(), String>;
 
@@ -227,25 +240,29 @@ pub trait SecretManagerTrait {
             .any(|k| key_belongs_to_toolkit(k, slug))
     }
 
-    /// Set a custom tool credential and update the index.
+    /// Set a custom tool credential and update the index. `biometric`
+    /// controls the protection of the credential itself; the index is always
+    /// written unprotected — it must stay readable without a biometric
+    /// prompt so startup discovery works before authentication.
     fn set_custom_tool_credential(
         &mut self,
         profile_name: Option<&str>,
         slug: &str,
         field: &str,
         value: String,
+        biometric: bool,
     ) -> Result<(), String> {
         let key = format_custom_tool_key(profile_name, slug, field);
 
         // 1. Save the actual secret
-        self.set(&key, value)?;
+        self.set_with_protection(&key, value, biometric)?;
 
         // 2. Update Index
         let current_index = self.get_index_from_keychain().unwrap_or_default();
         let new_index = add_to_index_csv(&current_index, &key);
 
         if new_index != current_index {
-            self.set(CUSTOM_KEYS_INDEX_KEY, new_index)?;
+            self.set_with_protection(CUSTOM_KEYS_INDEX_KEY, new_index, false)?;
             tracing::info!("Updated custom tool index with new key: {}", key);
         }
 
@@ -269,7 +286,8 @@ pub trait SecretManagerTrait {
 
         if !current_index.is_empty() {
             let new_index = remove_from_index_csv(&current_index, &key);
-            self.set(CUSTOM_KEYS_INDEX_KEY, new_index)?;
+            // Same as set_custom_tool_credential: never biometric-protect the index.
+            self.set_with_protection(CUSTOM_KEYS_INDEX_KEY, new_index, false)?;
             tracing::info!("Removed custom tool key from index: {}", key);
         }
 
@@ -301,16 +319,24 @@ pub trait SecretManagerTrait {
 
     /// Set the API key for an LLM connector instance and keep the discovery
     /// index current so `load_all_from_keychain` finds it on next launch.
-    fn set_llm_key(&mut self, connector_id: &str, value: String) -> Result<(), String> {
+    /// `biometric` controls the protection of the key itself; the index is
+    /// always written unprotected — it must stay readable without a
+    /// biometric prompt so startup discovery works before authentication.
+    fn set_llm_key(
+        &mut self,
+        connector_id: &str,
+        value: String,
+        biometric: bool,
+    ) -> Result<(), String> {
         let key = llm_key_name(connector_id);
-        self.set(&key, value)?;
+        self.set_with_protection(&key, value, biometric)?;
 
         let current_index = self
             .get_named_index_from_keychain(LLM_KEYS_INDEX_KEY)
             .unwrap_or_default();
         let new_index = add_to_index_csv(&current_index, &key);
         if new_index != current_index {
-            self.set(LLM_KEYS_INDEX_KEY, new_index)?;
+            self.set_with_protection(LLM_KEYS_INDEX_KEY, new_index, false)?;
             tracing::info!("Updated LLM connector key index with: {}", key);
         }
         Ok(())
@@ -326,7 +352,8 @@ pub trait SecretManagerTrait {
             .unwrap_or_default();
         if !current_index.is_empty() {
             let new_index = remove_from_index_csv(&current_index, &key);
-            self.set(LLM_KEYS_INDEX_KEY, new_index)?;
+            // Same as set_llm_key: the index must never carry a biometric ACL.
+            self.set_with_protection(LLM_KEYS_INDEX_KEY, new_index, false)?;
             tracing::info!("Removed LLM connector key from index: {}", key);
         }
         Ok(())

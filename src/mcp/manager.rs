@@ -2877,6 +2877,35 @@ impl McpManager {
     ///
     /// Cache busting is thorough because the edited whitelist affects tools in
     /// several places: the client's cached toolkit-info counts, any on-demand
+    /// Drop the active profile's on-demand dynamic tools for a toolkit
+    /// (matched by `TOOLKIT_` name prefix). Used whenever a toolkit's
+    /// whitelist changes or the toolkit is removed — already-discovered
+    /// tools were resolved against stale state.
+    /// P-010: takes only the `dynamic_composio_tools` lock.
+    async fn clear_dynamic_tools_for_toolkit(&self, toolkit_slug: &str) {
+        let prefix = format!("{}_", toolkit_slug.to_uppercase().replace('-', "_"));
+        let active_profile_id = self
+            .settings
+            .peek()
+            .get_active_profile()
+            .map(|p| p.id.clone());
+        let key = dyn_composio_key(active_profile_id.as_deref());
+        let mut dynamic = self.dynamic_composio_tools.lock().await;
+        if let Some(bucket) = dynamic.get_mut(&key) {
+            let before = bucket.len();
+            bucket.retain(|t| !t.name.to_uppercase().starts_with(&prefix));
+            let removed = before - bucket.len();
+            if removed > 0 {
+                tracing::info!(
+                    "Cleared {} stale dynamic tools for toolkit '{}' (profile '{}')",
+                    removed,
+                    toolkit_slug,
+                    key
+                );
+            }
+        }
+    }
+
     /// tools already discovered into `dynamic_composio_tools`, and the loaded
     /// tool set on the active client.
     pub async fn set_composio_toolkit_tools(
@@ -2896,29 +2925,7 @@ impl McpManager {
         // Drop any on-demand tools already discovered for this toolkit — they
         // were resolved against the OLD whitelist and must be re-discovered.
         // Scoped to the active profile's bucket (the edit is profile-scoped).
-        {
-            let prefix = format!("{}_", toolkit_slug.to_uppercase().replace('-', "_"));
-            let active_profile_id = self
-                .settings
-                .peek()
-                .get_active_profile()
-                .map(|p| p.id.clone());
-            let key = dyn_composio_key(active_profile_id.as_deref());
-            let mut dynamic = self.dynamic_composio_tools.lock().await;
-            if let Some(bucket) = dynamic.get_mut(&key) {
-                let before = bucket.len();
-                bucket.retain(|t| !t.name.to_uppercase().starts_with(&prefix));
-                let removed = before - bucket.len();
-                if removed > 0 {
-                    tracing::info!(
-                        "Cleared {} stale dynamic tools for edited toolkit '{}' (profile '{}')",
-                        removed,
-                        toolkit_slug,
-                        key
-                    );
-                }
-            }
-        }
+        self.clear_dynamic_tools_for_toolkit(toolkit_slug).await;
 
         // Reload the loaded/force-loaded tool set from the server.
         self.reload_composio_tools(settings).await?;
@@ -2969,29 +2976,7 @@ impl McpManager {
 
         // 4. Bust caches + drop this profile's on-demand tools for the toolkit.
         composio_client.clear_cached_toolkit_info();
-        {
-            let prefix = format!("{}_", toolkit_slug.to_uppercase().replace('-', "_"));
-            let active_profile_id = self
-                .settings
-                .peek()
-                .get_active_profile()
-                .map(|p| p.id.clone());
-            let key = dyn_composio_key(active_profile_id.as_deref());
-            let mut dynamic = self.dynamic_composio_tools.lock().await;
-            if let Some(bucket) = dynamic.get_mut(&key) {
-                let before = bucket.len();
-                bucket.retain(|t| !t.name.to_uppercase().starts_with(&prefix));
-                let removed = before - bucket.len();
-                if removed > 0 {
-                    tracing::info!(
-                        "[REMOVE] Cleared {} dynamic tools for removed toolkit '{}' (profile '{}')",
-                        removed,
-                        toolkit_slug,
-                        key
-                    );
-                }
-            }
-        }
+        self.clear_dynamic_tools_for_toolkit(toolkit_slug).await;
 
         // 5. Reload the active client's tool set and refresh status.
         self.reload_composio_tools(settings).await?;

@@ -299,16 +299,7 @@ pub fn compute_page_budget(
         Some(s) => settings.chat_model_for_session(s),
         None => settings.active_chat_model(),
     };
-    let (tuning, provider_context_tokens) = match instance {
-        Some(inst) => (
-            settings.effective_context_tuning_for_connector(inst),
-            settings.resolve_context_window_for_connector(inst, &model),
-        ),
-        None => (
-            settings.effective_context_tuning_for(settings.active_llm),
-            settings.resolve_context_window_for(settings.active_llm, &model),
-        ),
-    };
+    let (tuning, provider_context_tokens) = settings.tuning_and_window(instance, &model);
 
     if let Some(max_tokens) = provider_context_tokens {
         let ratio = crate::llm::config::ContextTuningPreset::clamp_budget_ratio(
@@ -505,16 +496,7 @@ impl SessionState {
             Some(s) => settings.chat_model_for_session(s),
             None => settings.active_chat_model(),
         };
-        let (tuning, context_tokens) = match instance {
-            Some(inst) => (
-                settings.effective_context_tuning_for_connector(inst),
-                settings.resolve_context_window_for_connector(inst, &model),
-            ),
-            None => (
-                settings.effective_context_tuning_for(settings.active_llm),
-                settings.resolve_context_window_for(settings.active_llm, &model),
-            ),
-        };
+        let (tuning, context_tokens) = settings.tuning_and_window(instance, &model);
         let max_scratchpad_chars: usize = context_tokens
             .map(|tokens| {
                 let chars = (tokens as f64 * tuning.chars_per_token * 0.02) as usize;
@@ -938,7 +920,20 @@ impl SessionState {
     /// touching the filesystem.
     pub(crate) fn migrate_from_raw_json(data: &str) -> Result<Self, std::io::Error> {
         let mut state = SessionState::default();
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
+        // Unparseable data must be an error, not an empty state: the caller
+        // (the one-time JSON→SQLite import) treats Ok as a successful import
+        // and permanently stamps the migrated marker.
+        let parsed = serde_json::from_str::<serde_json::Value>(data).map_err(|e| {
+            tracing::error!(
+                "Migration could not parse sessions.json as JSON: {e}. NOT treating as empty state."
+            );
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("sessions.json is unparseable: {e}"),
+            )
+        })?;
+        {
+            let mut value = parsed;
             // Migrate MessageContent::Text from old tuple format to new struct format
             if let Some(sessions_obj) = value.get_mut("sessions").and_then(|v| v.as_object_mut()) {
                 for (_session_id, session_val) in sessions_obj.iter_mut() {
@@ -1124,19 +1119,22 @@ impl SessionState {
     /// Meta key/value pairs to persist alongside session rows. The
     /// tool-call history blob is fingerprinted and only included when it
     /// changed; the second return value is the blob to mark saved on success.
-    fn collect_meta_kv(&self) -> (Vec<(String, String)>, Option<String>) {
+    /// Seqs are drawn here, at collect time on the calling thread — not at
+    /// write time on the blocking pool — so overlapping saves whose writes
+    /// land out of order cannot overwrite newer meta with an older snapshot.
+    fn collect_meta_kv(&self) -> (Vec<(String, String, i64)>, Option<String>) {
         use crate::session_store as store;
         let mut kv = vec![
-            (store::META_SCHEMA_VERSION.to_string(), self.schema_version.to_string()),
-            (store::META_ACTIVE_SESSION.to_string(), self.active_session_id.clone()),
-            (store::META_WINDOW_WIDTH.to_string(), self.window_width.to_string()),
-            (store::META_WINDOW_HEIGHT.to_string(), self.window_height.to_string()),
-            (store::META_LIFETIME_COST.to_string(), self.lifetime_cost.to_string()),
-            (store::META_LIFETIME_TOKENS.to_string(), self.lifetime_tokens.to_string()),
+            (store::META_SCHEMA_VERSION.to_string(), self.schema_version.to_string(), store::next_seq()),
+            (store::META_ACTIVE_SESSION.to_string(), self.active_session_id.clone(), store::next_seq()),
+            (store::META_WINDOW_WIDTH.to_string(), self.window_width.to_string(), store::next_seq()),
+            (store::META_WINDOW_HEIGHT.to_string(), self.window_height.to_string(), store::next_seq()),
+            (store::META_LIFETIME_COST.to_string(), self.lifetime_cost.to_string(), store::next_seq()),
+            (store::META_LIFETIME_TOKENS.to_string(), self.lifetime_tokens.to_string(), store::next_seq()),
         ];
         let tch = serde_json::to_string(&self.tool_call_history).unwrap_or_else(|_| "[]".into());
         let mark = if store::blob_changed(TCH_FP_KEY, &tch) {
-            kv.push((store::META_TOOL_CALL_HISTORY.to_string(), tch.clone()));
+            kv.push((store::META_TOOL_CALL_HISTORY.to_string(), tch.clone(), store::next_seq()));
             Some(tch)
         } else {
             None

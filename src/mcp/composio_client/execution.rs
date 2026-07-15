@@ -404,50 +404,9 @@ pub async fn add_toolkit_to_server(
         );
     }
 
-    // Step 4: Generate/register user with the MCP server
-    // This is required for the user to see the tools
-    // API: POST /api/v3/mcp/servers/generate
-    // NOTE: This might be the one place that still uses v3? Docs are unclear, but standard practice says stick to v1 for registry if possible.
-    // However, 'generate' implies runtime credential creation. Let's keep it as is unless it fails.
-    if let Some(ref user_id) = client.user_id {
-        let generate_url = format!("{}/mcp/servers/generate", client.get_api_base_url());
-        // CRITICAL: API requires user_ids (plural, array) NOT user_id (singular)
-        // SDK pattern: user_ids=[user_id], managed_auth_by_composio=True
-        // Pattern 110: Ensure managed_auth_by_composio is explicitly true
-        let generate_payload = serde_json::json!({
-            "user_ids": [user_id],
-            "mcp_server_id": server_id,
-            "managed_auth_by_composio": true
-        });
-
-        tracing::debug!(
-            "Registering user '{}' with MCP server '{}'",
-            user_id,
-            server_id
-        );
-
-        let generate_response = client
-            .client
-            .post(&generate_url)
-            .header("x-api-key", &client.api_key)
-            .header("Content-Type", "application/json")
-            .json(&generate_payload)
-            .send()
-            .await;
-
-        match generate_response {
-            Ok(resp) if resp.status().is_success() => {
-                tracing::info!("User '{}' registered with MCP server", user_id);
-            }
-            Ok(resp) => {
-                let text = resp.text().await.unwrap_or_default();
-                tracing::warn!("Failed to register user with MCP server: {}", text);
-            }
-            Err(e) => {
-                tracing::warn!("Error registering user with MCP server: {}", e);
-            }
-        }
-    }
+    // Step 4: Generate/register user with the MCP server — required for the
+    // user to see the tools (Mandate 6 / Pattern 110).
+    generate_mcp_user(client, &server_id).await;
 
     tracing::info!(
         "Successfully added toolkit '{}' with {} tools to MCP server",

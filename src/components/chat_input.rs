@@ -315,8 +315,9 @@ pub fn ChatInput(
                 return;
             }
 
-            // Detect a /skill token anywhere in the message so users can write
-            // explanatory context and invoke a skill in the same message. The
+            // Detect a /skill token at the start of any line so users can
+            // write explanatory context and invoke a skill in the same
+            // message; mid-sentence mentions of a skill stay plain text. The
             // surrounding text reaches the skill turn via normal history.
             let invocation = {
                 let registry = skill_registry.read();
@@ -1286,8 +1287,16 @@ pub fn ChatInput(
                                                     // token's range, preserving surrounding text.
                                                     let token_range: Option<(usize, usize)> =
                                                         *autocomplete_token.read();
+                                                    // The stored range comes from an async cursor eval and can be
+                                                    // stale against the current draft — a non-boundary index would
+                                                    // panic on slicing, so validate char boundaries too.
                                                     let (start, end) = token_range
-                                                        .filter(|(s, e)| *s <= *e && *e <= current_draft.len())
+                                                        .filter(|(s, e)| {
+                                                            *s <= *e
+                                                                && *e <= current_draft.len()
+                                                                && current_draft.is_char_boundary(*s)
+                                                                && current_draft.is_char_boundary(*e)
+                                                        })
                                                         .unwrap_or((0, current_draft.len().min(
                                                             current_draft.find(' ').unwrap_or(current_draft.len()),
                                                         )));
@@ -1376,8 +1385,15 @@ pub fn ChatInput(
                                     // Splice into the in-progress token, preserving context
                                     let current_draft = draft.read().clone();
                                     let token_range: Option<(usize, usize)> = *autocomplete_token.read();
+                                    // Same as the keyboard path: the range may be stale against the
+                                    // current draft, so reject non-char-boundary indices before slicing.
                                     let (start, end) = token_range
-                                        .filter(|(s, e)| *s <= *e && *e <= current_draft.len())
+                                        .filter(|(s, e)| {
+                                            *s <= *e
+                                                && *e <= current_draft.len()
+                                                && current_draft.is_char_boundary(*s)
+                                                && current_draft.is_char_boundary(*e)
+                                        })
                                         .unwrap_or((0, current_draft.len()));
                                     let completed = format!("/{} ", skill.metadata.name);
                                     let mut new_draft = String::with_capacity(current_draft.len() + completed.len());

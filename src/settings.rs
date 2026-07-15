@@ -731,17 +731,25 @@ impl Settings {
     }
 
     /// The chat model a session should use: its override (when set), else the
-    /// configured model of the session's connector.
+    /// configured model of the session's connector. The override is ignored
+    /// when connector resolution fell back to a different provider kind than
+    /// the one the model was pinned for (e.g. the pinned connector was
+    /// deleted) — sending another provider's model string would fail every
+    /// request in the session.
     pub fn chat_model_for_session(&self, session: &crate::session::Session) -> String {
-        session
-            .chat_model
-            .clone()
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| {
-                self.connector_for_session(session)
-                    .map(|c| c.config.chat_model())
-                    .unwrap_or_else(|| self.chat_model_for(self.active_llm))
-            })
+        let connector = self.connector_for_session(session);
+        let pin_matches_connector = match (session.llm_provider, connector.map(|c| c.provider())) {
+            (Some(pinned), Some(resolved)) => pinned == resolved,
+            _ => true,
+        };
+        if pin_matches_connector {
+            if let Some(model) = session.chat_model.clone().filter(|m| !m.is_empty()) {
+                return model;
+            }
+        }
+        connector
+            .map(|c| c.config.chat_model())
+            .unwrap_or_else(|| self.chat_model_for(self.active_llm))
     }
 
     /// Resolve the effective context window for a specific provider + model.
@@ -1051,6 +1059,34 @@ impl Settings {
         instance: &ProviderInstance,
     ) -> ResolvedContextTuning {
         self.resolve_context_tuning(instance.config.context_tuning())
+    }
+
+    /// Whether keychain items should be written with biometric protection:
+    /// only in a sandboxed (signed) build with Biometric mode selected.
+    /// Discovery-index keys are always written plain regardless — they must
+    /// be readable at startup before any authentication.
+    pub fn use_biometric_storage(&self) -> bool {
+        is_sandboxed() && self.keychain_storage_mode == KeychainStorageMode::Biometric
+    }
+
+    /// Context tuning + resolved context window for an optional connector
+    /// instance, falling back to the globally-active provider when none
+    /// resolved. Shared by every "how big is the context" call site.
+    pub fn tuning_and_window(
+        &self,
+        instance: Option<&ProviderInstance>,
+        model: &str,
+    ) -> (ResolvedContextTuning, Option<usize>) {
+        match instance {
+            Some(inst) => (
+                self.effective_context_tuning_for_connector(inst),
+                self.resolve_context_window_for_connector(inst, model),
+            ),
+            None => (
+                self.effective_context_tuning_for(self.active_llm),
+                self.resolve_context_window_for(self.active_llm, model),
+            ),
+        }
     }
 
     /// One-time migration: synthesize named connector instances from the legacy
