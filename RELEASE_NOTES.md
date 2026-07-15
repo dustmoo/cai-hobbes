@@ -1,3 +1,35 @@
+# Hobbes v0.11.3 — Multiple Connectors, Skills & SQLite Sessions
+
+## ✨ New Features
+
+### Multiple LLM connectors
+- **Add several connectors per provider.** You can now configure up to 10 named connector instances — e.g. two OpenAI-compatible endpoints (a local model and a cloud one), or separate Gemini keys for work and personal — each with its own API key, model slots, and tuning.
+- **Pin a conversation to a connector.** The provider/model switcher pins the *current tab* to a connector instance; other tabs and new sessions keep using your global default. Per-connector API keys are stored individually in the keychain.
+- **Per-instance feature flags.** Watch-word recovery, thinking, and tool-use settings now follow the connector a session actually resolves to, not the global settings.
+
+### Skill management
+- **In-app skill editor.** Create and edit skills (instructions, metadata, scripts) directly from Hobbes — no more hand-editing files.
+- **`/command` invocation with autocomplete.** Type `/` at the start of a line to invoke a skill by name, with a searchable autocomplete popover. You can put context on the lines above the command; mentioning a skill mid-sentence stays plain text.
+- **Live reload.** A file watcher picks up external changes to your skills folder immediately.
+
+### SQLite session storage
+- **Chat history moved from `sessions.json` to a database.** Sessions load lazily (open tabs and the active session hydrate at startup; everything else loads on demand), saves write only what changed, and nothing ever expires. Your existing history is imported automatically on first launch — the old JSON files are left in place as a backup.
+- **Faster history search.** Search runs in the database across all sessions — including ones never opened this run — matching names, summaries, and message text.
+
+### Composio
+- **No-auth toolkits connect cleanly** (e.g. tools that need no account link).
+- **Remove toolkits and recover wedged servers** from MCP → Status.
+- **Profile isolation.** Clients and on-demand tools are scoped to the active profile, so tools no longer bleed across tabs using different profiles.
+
+## 🛡️ Reliability & Security
+- **Session-store hardening:** saves are atomic (a crash can't persist a half-written state), overlapping background saves can't revert newer data, deleted conversations stay deleted, and a corrupt legacy `sessions.json` is preserved for recovery instead of being treated as empty history.
+- **Keychain fixes:** key-discovery indexes are always readable before authentication, and keys migrated from older versions honor your chosen storage mode — no more surprise Touch ID prompts at startup or being bounced back into onboarding despite a valid key.
+- **Model pinning safety:** deleting a connector no longer sends its pinned model name to a different provider.
+- **UI stability:** fixed a potential crash when autocompleting skills in text containing emoji/CJK, streaming stays live when returning to a tab mid-stream, and the session cost icon refreshes on stream lifecycle.
+- **Dependency audit refresh:** dependencies bumped and the RUSTSEC ignore list pruned from 10 entries to 3, each with a documented justification.
+
+---
+
 # Hobbes v0.11.0 — Provider-Aware Tool Selection & Composio Tool Editor
 
 ## ✨ New Features
