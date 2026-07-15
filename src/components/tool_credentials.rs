@@ -228,12 +228,18 @@ pub fn ToolCredentials() -> Element {
             return;
         }
 
-        let p_name = settings.peek().get_active_profile().map(|p| p.name.clone());
+        let (p_name, use_biometric) = {
+            let settings_read = settings.peek();
+            (
+                settings_read.get_active_profile().map(|p| p.name.clone()),
+                settings_read.use_biometric_storage(),
+            )
+        };
 
         spawn(async move {
             let result = {
                 let mut sm = secret_manager.write();
-                sm.set_custom_tool_credential(p_name.as_deref(), &slug, &field, value)
+                sm.set_custom_tool_credential(p_name.as_deref(), &slug, &field, value, use_biometric)
             };
 
             match result {

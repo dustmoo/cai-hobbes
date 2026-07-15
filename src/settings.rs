@@ -1,5 +1,6 @@
 use crate::context::permissions::{PermissionSettings, ToolCategory};
 pub use crate::llm::{ClaudeConfig, GeminiConfig, OpenAiCompatConfig};
+pub use crate::llm::config::ProviderInstanceConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -211,12 +212,26 @@ default_switch_tab! {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Settings {
+    /// DEPRECATED: global default provider kind. Kept for migration and for
+    /// resolving legacy sessions that only pinned a provider kind. New code
+    /// should use `active_connector_id` / `active_connector()`.
     pub active_llm: LlmProvider,
+    /// DEPRECATED: legacy singleton per-provider configs. Read once by
+    /// `migrate_legacy_llm_config` to synthesize `llm_connectors`; kept
+    /// serialized for one release of downgrade safety.
     pub gemini_config: GeminiConfig,
     #[serde(default)]
     pub openai_compat_config: OpenAiCompatConfig,
     #[serde(default)]
     pub claude_config: ClaudeConfig,
+    /// Named LLM connector instances ("flavors"). Multiple instances per
+    /// provider kind are allowed, capped at MAX_LLM_CONNECTORS total.
+    #[serde(default)]
+    pub llm_connectors: Vec<ProviderInstance>,
+    /// The globally active connector (default for new sessions). Sessions can
+    /// pin their own via `Session.llm_connector_id`.
+    #[serde(default)]
+    pub active_connector_id: Option<String>,
     pub persona: String,
     pub user_name: Option<String>,
     pub force_tool_use_instruction: Option<String>,
@@ -429,6 +444,11 @@ pub struct ComposioToolkitConfig {
     /// How this toolkit's tools are loaded (replaces `force_load`).
     #[serde(default)]
     pub load_mode: ToolkitLoadMode,
+    /// True if this toolkit requires no authentication (e.g. hackernews).
+    /// No-auth toolkits never have a connected account, so this locally-known
+    /// flag is what marks them as connected in the UI.
+    #[serde(default)]
+    pub no_auth: bool,
 }
 
 impl ComposioToolkitConfig {
@@ -440,6 +460,40 @@ impl ComposioToolkitConfig {
         } else {
             self.load_mode
         }
+    }
+}
+
+/// Maximum number of LLM connector instances across all provider kinds.
+/// Matches the 10-model-slot / digit-hotkey idiom used elsewhere.
+pub const MAX_LLM_CONNECTORS: usize = 10;
+
+/// A named LLM connector instance ("flavor") — one configured endpoint/key
+/// combination of a given provider kind. Mirrors the ComposioProfile pattern.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ProviderInstance {
+    #[serde(default = "default_uuid")]
+    pub id: String,
+    /// Unique display name shown in the chat-bar selector and settings list.
+    pub name: String,
+    pub config: ProviderInstanceConfig,
+}
+
+impl ProviderInstance {
+    /// The provider kind of this connector.
+    pub fn provider(&self) -> LlmProvider {
+        self.config.provider()
+    }
+
+    /// Single-letter badge for pickers, derived from the connector's display
+    /// name so same-kind instances are distinguishable (falls back to the
+    /// provider kind's initial for blank names).
+    pub fn initial(&self) -> String {
+        self.name
+            .trim()
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| self.provider().initial().to_string())
     }
 }
 
@@ -506,6 +560,13 @@ impl ComposioProfile {
         self.user_id.as_ref().is_some_and(|s| !s.is_empty())
             && self.api_key.as_ref().is_some_and(|s| !s.is_empty())
     }
+
+    /// Remove a toolkit's config entry (used when a toolkit is fully removed
+    /// from the Composio server). Mirrors `Settings::remove_profile`.
+    pub fn remove_toolkit_config(&mut self, slug: &str) {
+        self.toolkit_configs
+            .retain(|c| !c.slug.eq_ignore_ascii_case(slug));
+    }
 }
 
 impl Default for Settings {
@@ -521,6 +582,8 @@ impl Default for Settings {
             gemini_config: GeminiConfig::default(),
             openai_compat_config: OpenAiCompatConfig::default(),
             claude_config: ClaudeConfig::default(),
+            llm_connectors: Vec::new(),
+            active_connector_id: None,
             persona: "You are Hobbes. Be a direct, clear, and radically candid partner. Function as an exocortex, matching the user's communication style. Your default tone is that of a professional friend.".to_string(),
             user_name: None,
             force_tool_use_instruction: Some("You must always use the provided tools to answer the user's request, even if you think you know the answer. Do not answer from your own knowledge base when tools are available. When using the fetch tool, you MUST provide markdown links as sources. When you use tools you MUST use the information from the tool, if you don't have it, look up fresh information instead of guessing.".to_string()),
@@ -659,33 +722,34 @@ impl Settings {
         }
     }
 
-    /// The provider a session should use: its override, else the global default.
+    /// The provider kind a session should use, resolved through its connector.
     pub fn provider_for_session(&self, session: &crate::session::Session) -> LlmProvider {
-        session.llm_provider.unwrap_or(self.active_llm)
+        self.connector_for_session(session)
+            .map(|c| c.provider())
+            .or(session.llm_provider)
+            .unwrap_or(self.active_llm)
     }
 
-    /// The chat model a session should use: its override (when set for the
-    /// effective provider), else that provider's configured model.
+    /// The chat model a session should use: its override (when set), else the
+    /// configured model of the session's connector. The override is ignored
+    /// when connector resolution fell back to a different provider kind than
+    /// the one the model was pinned for (e.g. the pinned connector was
+    /// deleted) — sending another provider's model string would fail every
+    /// request in the session.
     pub fn chat_model_for_session(&self, session: &crate::session::Session) -> String {
-        let provider = self.provider_for_session(session);
-        session
-            .chat_model
-            .clone()
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| self.chat_model_for(provider))
-    }
-
-    /// Whether a provider has the minimum configuration needed to serve requests.
-    pub fn is_provider_configured(&self, provider: LlmProvider) -> bool {
-        match provider {
-            LlmProvider::Gemini => {
-                self.gemini_config.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok()
-            }
-            LlmProvider::OpenAiCompat => !self.openai_compat_config.endpoint.is_empty(),
-            LlmProvider::Claude => {
-                self.claude_config.api_key.is_some() || std::env::var("ANTHROPIC_API_KEY").is_ok()
+        let connector = self.connector_for_session(session);
+        let pin_matches_connector = match (session.llm_provider, connector.map(|c| c.provider())) {
+            (Some(pinned), Some(resolved)) => pinned == resolved,
+            _ => true,
+        };
+        if pin_matches_connector {
+            if let Some(model) = session.chat_model.clone().filter(|m| !m.is_empty()) {
+                return model;
             }
         }
+        connector
+            .map(|c| c.config.chat_model())
+            .unwrap_or_else(|| self.chat_model_for(self.active_llm))
     }
 
     /// Resolve the effective context window for a specific provider + model.
@@ -739,7 +803,14 @@ impl Settings {
             LlmProvider::OpenAiCompat => &self.openai_compat_config.context_tuning,
             LlmProvider::Claude => &self.claude_config.context_tuning,
         };
+        self.resolve_context_tuning(preset)
+    }
 
+    /// Cascade a context-tuning preset over global settings and compiled defaults.
+    fn resolve_context_tuning(
+        &self,
+        preset: &crate::llm::config::ContextTuningPreset,
+    ) -> ResolvedContextTuning {
         ResolvedContextTuning {
             chat_history_length: preset.chat_history_length
                 .unwrap_or(self.chat_history_length),
@@ -790,27 +861,298 @@ impl Settings {
         }
     }
 
-    pub fn update_active_model_slot(&mut self, index: usize, model: String) {
-        match self.active_llm {
-            LlmProvider::Gemini => {
-                while self.gemini_config.model_slots.len() <= index {
-                    self.gemini_config.model_slots.push("".to_string());
-                }
-                self.gemini_config.model_slots[index] = model;
-            }
-            LlmProvider::OpenAiCompat => {
-                while self.openai_compat_config.model_slots.len() <= index {
-                    self.openai_compat_config.model_slots.push("".to_string());
-                }
-                self.openai_compat_config.model_slots[index] = model;
-            }
-            LlmProvider::Claude => {
-                while self.claude_config.model_slots.len() <= index {
-                    self.claude_config.model_slots.push("".to_string());
-                }
-                self.claude_config.model_slots[index] = model;
+    /// Set a quick-switch model slot on a specific provider kind's editing
+    /// mirror (the settings panel flushes mirrors into the selected connector).
+    pub fn update_model_slot_for(&mut self, provider: LlmProvider, index: usize, model: String) {
+        let slots = match provider {
+            LlmProvider::Gemini => &mut self.gemini_config.model_slots,
+            LlmProvider::OpenAiCompat => &mut self.openai_compat_config.model_slots,
+            LlmProvider::Claude => &mut self.claude_config.model_slots,
+        };
+        while slots.len() <= index {
+            slots.push(String::new());
+        }
+        slots[index] = model;
+    }
+
+    // ========================================================================
+    // LLM connector instances ("flavors")
+    // ========================================================================
+
+    /// Look up a connector by its stable ID.
+    pub fn connector_by_id(&self, id: &str) -> Option<&ProviderInstance> {
+        self.llm_connectors.iter().find(|c| c.id == id)
+    }
+
+    /// Mutable lookup of a connector by its stable ID.
+    pub fn connector_by_id_mut(&mut self, id: &str) -> Option<&mut ProviderInstance> {
+        self.llm_connectors.iter_mut().find(|c| c.id == id)
+    }
+
+    /// The globally active connector: `active_connector_id` when it resolves,
+    /// else the first connector (stale-id fallback, mirrors get_active_profile_mut).
+    pub fn active_connector(&self) -> Option<&ProviderInstance> {
+        self.active_connector_id
+            .as_deref()
+            .and_then(|id| self.connector_by_id(id))
+            .or_else(|| self.llm_connectors.first())
+    }
+
+    /// Mutable access to the globally active connector (same fallback rules).
+    pub fn active_connector_mut(&mut self) -> Option<&mut ProviderInstance> {
+        let id = self
+            .active_connector()
+            .map(|c| c.id.clone())?;
+        self.connector_by_id_mut(&id)
+    }
+
+    /// Add a new connector. Enforces the MAX_LLM_CONNECTORS cap and unique
+    /// display names (auto-suffixed like Composio's add_profile). The new
+    /// connector becomes the globally active one. Returns its ID.
+    pub fn add_connector(
+        &mut self,
+        name: &str,
+        config: ProviderInstanceConfig,
+    ) -> Result<String, String> {
+        if self.llm_connectors.len() >= MAX_LLM_CONNECTORS {
+            return Err(format!(
+                "Connector limit reached ({MAX_LLM_CONNECTORS}). Remove one to add another."
+            ));
+        }
+        let base_name = if name.trim().is_empty() {
+            config.provider().display_name().to_string()
+        } else {
+            name.trim().to_string()
+        };
+        let mut unique_name = base_name.clone();
+        let mut counter = 1;
+        while self.llm_connectors.iter().any(|c| c.name == unique_name) {
+            counter += 1;
+            unique_name = format!("{base_name} {counter}");
+        }
+        let instance = ProviderInstance {
+            id: Uuid::new_v4().to_string(),
+            name: unique_name,
+            config,
+        };
+        let id = instance.id.clone();
+        self.llm_connectors.push(instance);
+        self.active_connector_id = Some(id.clone());
+        self.active_llm = self
+            .connector_by_id(&id)
+            .map(|c| c.provider())
+            .unwrap_or(self.active_llm);
+        Ok(id)
+    }
+
+    /// Remove a connector by ID. Refuses to remove the last one (returns false).
+    /// Reassigns the active connector to the first remaining when needed.
+    pub fn remove_connector(&mut self, id: &str) -> bool {
+        if self.llm_connectors.len() <= 1 {
+            return false;
+        }
+        let before = self.llm_connectors.len();
+        self.llm_connectors.retain(|c| c.id != id);
+        if self.llm_connectors.len() == before {
+            return false;
+        }
+        if self.active_connector_id.as_deref() == Some(id) {
+            self.active_connector_id = self.llm_connectors.first().map(|c| c.id.clone());
+            if let Some(active) = self.active_connector() {
+                self.active_llm = active.provider();
             }
         }
+        true
+    }
+
+    /// Rename a connector, keeping display names unique.
+    pub fn rename_connector(&mut self, id: &str, name: &str) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let taken = self
+            .llm_connectors
+            .iter()
+            .any(|c| c.id != id && c.name == trimmed);
+        if taken {
+            return;
+        }
+        if let Some(c) = self.connector_by_id_mut(id) {
+            c.name = trimmed.to_string();
+        }
+    }
+
+    /// The connector a session should use.
+    /// Resolution: session's pinned connector ID → first connector matching the
+    /// session's legacy pinned provider kind → globally active connector.
+    pub fn connector_for_session(
+        &self,
+        session: &crate::session::Session,
+    ) -> Option<&ProviderInstance> {
+        if let Some(inst) = session
+            .llm_connector_id
+            .as_deref()
+            .and_then(|id| self.connector_by_id(id))
+        {
+            return Some(inst);
+        }
+        if let Some(kind) = session.llm_provider {
+            if let Some(inst) = self.llm_connectors.iter().find(|c| c.provider() == kind) {
+                return Some(inst);
+            }
+        }
+        self.active_connector()
+    }
+
+    /// Whether a connector has the minimum configuration needed to serve requests.
+    pub fn is_connector_configured(&self, instance: &ProviderInstance) -> bool {
+        match &instance.config {
+            ProviderInstanceConfig::Gemini(c) => {
+                c.api_key.is_some() || std::env::var("GEMINI_API_KEY").is_ok()
+            }
+            ProviderInstanceConfig::OpenAiCompat(c) => !c.endpoint.trim().is_empty(),
+            ProviderInstanceConfig::Claude(c) => {
+                c.api_key.is_some() || std::env::var("ANTHROPIC_API_KEY").is_ok()
+            }
+        }
+    }
+
+    /// Resolve the effective context window for a connector + model.
+    /// Same resolution rules as `resolve_context_window_for`, but reads the
+    /// instance's own config (per-instance endpoint / max_context_tokens).
+    pub fn resolve_context_window_for_connector(
+        &self,
+        instance: &ProviderInstance,
+        model: &str,
+    ) -> Option<usize> {
+        match &instance.config {
+            ProviderInstanceConfig::OpenAiCompat(c) => {
+                let base = c
+                    .max_context_tokens
+                    .or_else(|| crate::llm::openai_models::known_context_window(model));
+                crate::llm::context_cache::clamp_to_learned(&c.endpoint, model, base)
+            }
+            ProviderInstanceConfig::Claude(_) => {
+                let claude_model = crate::llm::claude_models::ClaudeModel::from_slug(model);
+                crate::llm::context_cache::clamp_to_learned(
+                    "claude",
+                    model,
+                    Some(claude_model.context_window_tokens()),
+                )
+            }
+            ProviderInstanceConfig::Gemini(_) => {
+                let gemini_model = crate::llm::gemini::GeminiModel::from_slug(model);
+                crate::llm::context_cache::clamp_to_learned(
+                    "gemini",
+                    model,
+                    Some(gemini_model.context_window_tokens()),
+                )
+            }
+        }
+    }
+
+    /// Resolve the effective context tuning for a connector instance.
+    /// Instance preset overrides → Global settings → Compiled defaults.
+    pub fn effective_context_tuning_for_connector(
+        &self,
+        instance: &ProviderInstance,
+    ) -> ResolvedContextTuning {
+        self.resolve_context_tuning(instance.config.context_tuning())
+    }
+
+    /// Whether keychain items should be written with biometric protection:
+    /// only in a sandboxed (signed) build with Biometric mode selected.
+    /// Discovery-index keys are always written plain regardless — they must
+    /// be readable at startup before any authentication.
+    pub fn use_biometric_storage(&self) -> bool {
+        is_sandboxed() && self.keychain_storage_mode == KeychainStorageMode::Biometric
+    }
+
+    /// Context tuning + resolved context window for an optional connector
+    /// instance, falling back to the globally-active provider when none
+    /// resolved. Shared by every "how big is the context" call site.
+    pub fn tuning_and_window(
+        &self,
+        instance: Option<&ProviderInstance>,
+        model: &str,
+    ) -> (ResolvedContextTuning, Option<usize>) {
+        match instance {
+            Some(inst) => (
+                self.effective_context_tuning_for_connector(inst),
+                self.resolve_context_window_for_connector(inst, model),
+            ),
+            None => (
+                self.effective_context_tuning_for(self.active_llm),
+                self.resolve_context_window_for(self.active_llm, model),
+            ),
+        }
+    }
+
+    /// One-time migration: synthesize named connector instances from the legacy
+    /// singleton per-provider configs. No-op once `llm_connectors` is populated.
+    /// Returns true when it changed anything (caller persists).
+    pub fn migrate_legacy_llm_config(&mut self) -> bool {
+        if !self.llm_connectors.is_empty() {
+            return false;
+        }
+
+        let mut migrated = false;
+        // A provider is worth migrating when it's configured beyond defaults
+        // (keys aren't hydrated at settings-load time, so we can't check them
+        // here) or it is the active provider — the active one always migrates
+        // so the user's selection and onboarding gating survive.
+        let gemini_worth = self.gemini_config != GeminiConfig::default()
+            || self.active_llm == LlmProvider::Gemini;
+        let oai_worth = !self.openai_compat_config.endpoint.is_empty()
+            || self.active_llm == LlmProvider::OpenAiCompat;
+        let claude_worth = self.claude_config != ClaudeConfig::default()
+            || self.active_llm == LlmProvider::Claude;
+
+        let push = |connectors: &mut Vec<ProviderInstance>, config: ProviderInstanceConfig| {
+            let name = config.provider().display_name().to_string();
+            connectors.push(ProviderInstance {
+                id: Uuid::new_v4().to_string(),
+                name,
+                config,
+            });
+        };
+
+        if gemini_worth {
+            push(
+                &mut self.llm_connectors,
+                ProviderInstanceConfig::Gemini(self.gemini_config.clone()),
+            );
+            migrated = true;
+        }
+        if oai_worth {
+            push(
+                &mut self.llm_connectors,
+                ProviderInstanceConfig::OpenAiCompat(self.openai_compat_config.clone()),
+            );
+            migrated = true;
+        }
+        if claude_worth {
+            push(
+                &mut self.llm_connectors,
+                ProviderInstanceConfig::Claude(self.claude_config.clone()),
+            );
+            migrated = true;
+        }
+
+        if migrated {
+            self.active_connector_id = self
+                .llm_connectors
+                .iter()
+                .find(|c| c.provider() == self.active_llm)
+                .map(|c| c.id.clone());
+            tracing::info!(
+                "Migrated legacy LLM configs to {} connector instance(s); active: {:?}",
+                self.llm_connectors.len(),
+                self.active_connector_id
+            );
+        }
+        migrated
     }
 
     /// Get the currently active Composio profile (matched by stable ID)
@@ -1155,6 +1497,9 @@ impl SettingsManager {
             settings.migrate_active_profile_name_to_id();
             settings.sync_chat_model_to_slots();
             settings.seed_default_claude_slots_if_empty();
+            if settings.migrate_legacy_llm_config() && self.save(&settings).is_err() {
+                tracing::error!("Failed to persist migrated LLM connector settings.");
+            }
             return settings;
         }
 
@@ -1275,6 +1620,7 @@ impl SettingsManager {
         // active_composio_profile as a legacy name. Defensively convert to ID here too.
         // (Mirrors the happy-path call at L793.)
         settings.migrate_active_profile_name_to_id();
+        settings.migrate_legacy_llm_config();
 
         // After migrating, save the repaired settings file for the next run.
         if self.save(&settings).is_err() {
@@ -1610,6 +1956,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remove_toolkit_config_drops_matching_slug_case_insensitively() {
+        let mut profile = ComposioProfile::default();
+        for slug in ["gmail", "github", "slack"] {
+            profile.toolkit_configs.push(ComposioToolkitConfig {
+                slug: slug.to_string(),
+                display_name: slug.to_string(),
+                ..Default::default()
+            });
+        }
+        profile.remove_toolkit_config("GMAIL"); // case-insensitive
+        let remaining: Vec<&str> = profile
+            .toolkit_configs
+            .iter()
+            .map(|c| c.slug.as_str())
+            .collect();
+        assert_eq!(remaining, vec!["github", "slack"]);
+        // Removing a non-existent slug is a no-op.
+        profile.remove_toolkit_config("notthere");
+        assert_eq!(profile.toolkit_configs.len(), 2);
+    }
+
+    #[test]
     fn seed_fills_empty_claude_slots() {
         let mut s = Settings::default();
         s.claude_config.model_slots = vec![]; // simulate a persisted empty vec
@@ -1670,5 +2038,284 @@ mod tests {
         mgr.save(&settings).unwrap();
 
         assert_eq!(mgr.load().user_name.as_deref(), Some("Grace"));
+    }
+
+    // ========================================================================
+    // Multi-connector ("flavors") tests
+    // ========================================================================
+
+    fn test_session() -> crate::session::Session {
+        crate::session::Session {
+            id: "test-session".to_string(),
+            name: "test".to_string(),
+            messages: vec![],
+            active_context: Default::default(),
+            last_updated: chrono::Utc::now(),
+            accumulated_cost: 0.0,
+            accumulated_tokens: 0,
+            accumulated_turns: 0,
+            memory_optimization_summary: None,
+            composio_profile: None,
+            llm_connector_id: None,
+            llm_provider: None,
+            chat_model: None,
+            loaded_skills: HashMap::new(),
+            scratchpad: String::new(),
+            current_ai_turn_count: 0,
+            watch_word_recovery_count: 0,
+            scheduled_timers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn migrate_creates_instance_for_active_provider() {
+        let mut s = Settings::default(); // active_llm = Gemini, all configs default
+        assert!(s.migrate_legacy_llm_config());
+        assert_eq!(s.llm_connectors.len(), 1);
+        assert_eq!(s.llm_connectors[0].provider(), LlmProvider::Gemini);
+        assert_eq!(
+            s.active_connector_id.as_deref(),
+            Some(s.llm_connectors[0].id.as_str())
+        );
+    }
+
+    #[test]
+    fn migrate_includes_configured_legacy_providers() {
+        let mut s = Settings::default();
+        s.openai_compat_config.endpoint = "http://localhost:11434/v1".to_string();
+        s.claude_config.model = "claude-sonnet-4-6".to_string(); // non-default
+        assert!(s.migrate_legacy_llm_config());
+        let kinds: Vec<LlmProvider> = s.llm_connectors.iter().map(|c| c.provider()).collect();
+        assert!(kinds.contains(&LlmProvider::Gemini)); // active provider always migrates
+        assert!(kinds.contains(&LlmProvider::OpenAiCompat));
+        assert!(kinds.contains(&LlmProvider::Claude));
+        // Config payloads carried over
+        let oai = s
+            .llm_connectors
+            .iter()
+            .find(|c| c.provider() == LlmProvider::OpenAiCompat)
+            .unwrap();
+        match &oai.config {
+            ProviderInstanceConfig::OpenAiCompat(c) => {
+                assert_eq!(c.endpoint, "http://localhost:11434/v1")
+            }
+            _ => panic!("wrong config variant"),
+        }
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let mut s = Settings::default();
+        assert!(s.migrate_legacy_llm_config());
+        let count = s.llm_connectors.len();
+        let active = s.active_connector_id.clone();
+        assert!(!s.migrate_legacy_llm_config());
+        assert_eq!(s.llm_connectors.len(), count);
+        assert_eq!(s.active_connector_id, active);
+    }
+
+    #[test]
+    fn add_connector_enforces_cap_and_unique_names() {
+        let mut s = Settings::default();
+        for _ in 0..MAX_LLM_CONNECTORS {
+            s.add_connector(
+                "Local",
+                ProviderInstanceConfig::OpenAiCompat(OpenAiCompatConfig::default()),
+            )
+            .unwrap();
+        }
+        assert_eq!(s.llm_connectors.len(), MAX_LLM_CONNECTORS);
+        assert!(s
+            .add_connector(
+                "Local",
+                ProviderInstanceConfig::OpenAiCompat(OpenAiCompatConfig::default()),
+            )
+            .is_err());
+        // Unique display names auto-suffixed
+        let names: std::collections::HashSet<&str> =
+            s.llm_connectors.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names.len(), MAX_LLM_CONNECTORS);
+        assert!(names.contains("Local"));
+        assert!(names.contains("Local 2"));
+    }
+
+    #[test]
+    fn add_connector_activates_new_instance() {
+        let mut s = Settings::default();
+        let first = s
+            .add_connector("A", ProviderInstanceConfig::Gemini(GeminiConfig::default()))
+            .unwrap();
+        assert_eq!(s.active_connector_id.as_deref(), Some(first.as_str()));
+        let second = s
+            .add_connector("B", ProviderInstanceConfig::Claude(ClaudeConfig::default()))
+            .unwrap();
+        assert_eq!(s.active_connector_id.as_deref(), Some(second.as_str()));
+        assert_eq!(s.active_llm, LlmProvider::Claude);
+    }
+
+    #[test]
+    fn remove_connector_refuses_last_and_reassigns_active() {
+        let mut s = Settings::default();
+        let a = s
+            .add_connector("A", ProviderInstanceConfig::Gemini(GeminiConfig::default()))
+            .unwrap();
+        assert!(!s.remove_connector(&a), "must refuse removing the last connector");
+
+        let b = s
+            .add_connector("B", ProviderInstanceConfig::Claude(ClaudeConfig::default()))
+            .unwrap();
+        // b is active; removing it reassigns to the first remaining (a)
+        assert!(s.remove_connector(&b));
+        assert_eq!(s.active_connector_id.as_deref(), Some(a.as_str()));
+        assert_eq!(s.active_llm, LlmProvider::Gemini);
+        // Unknown id is a no-op... but with one left it refuses anyway
+        assert!(!s.remove_connector("nonexistent"));
+    }
+
+    #[test]
+    fn rename_connector_keeps_names_unique() {
+        let mut s = Settings::default();
+        let a = s
+            .add_connector("A", ProviderInstanceConfig::Gemini(GeminiConfig::default()))
+            .unwrap();
+        let b = s
+            .add_connector("B", ProviderInstanceConfig::Gemini(GeminiConfig::default()))
+            .unwrap();
+        s.rename_connector(&b, "A"); // collides — ignored
+        assert_eq!(s.connector_by_id(&b).unwrap().name, "B");
+        s.rename_connector(&a, "Primary");
+        assert_eq!(s.connector_by_id(&a).unwrap().name, "Primary");
+        s.rename_connector(&b, "   "); // blank — ignored
+        assert_eq!(s.connector_by_id(&b).unwrap().name, "B");
+    }
+
+    #[test]
+    fn connector_for_session_fallback_chain() {
+        let mut s = Settings::default();
+        let gemini_id = s
+            .add_connector("G", ProviderInstanceConfig::Gemini(GeminiConfig::default()))
+            .unwrap();
+        let claude_id = s
+            .add_connector("C", ProviderInstanceConfig::Claude(ClaudeConfig::default()))
+            .unwrap();
+        // active is claude_id (last added)
+
+        // 1. Pinned connector id wins
+        let mut session = test_session();
+        session.llm_connector_id = Some(gemini_id.clone());
+        session.llm_provider = Some(LlmProvider::Gemini);
+        assert_eq!(s.connector_for_session(&session).unwrap().id, gemini_id);
+
+        // 2. Legacy session (kind only) → first connector of that kind
+        let mut legacy = test_session();
+        legacy.llm_provider = Some(LlmProvider::Gemini);
+        assert_eq!(s.connector_for_session(&legacy).unwrap().id, gemini_id);
+
+        // 3. Stale pinned id → kind match fallback
+        let mut stale = test_session();
+        stale.llm_connector_id = Some("deleted-id".to_string());
+        stale.llm_provider = Some(LlmProvider::Claude);
+        assert_eq!(s.connector_for_session(&stale).unwrap().id, claude_id);
+
+        // 4. No pins at all → global active connector
+        let unpinned = test_session();
+        assert_eq!(s.connector_for_session(&unpinned).unwrap().id, claude_id);
+
+        // 5. No connectors configured → None
+        let empty = Settings::default();
+        assert!(empty.connector_for_session(&unpinned).is_none());
+    }
+
+    #[test]
+    fn chat_model_for_session_resolves_through_connector() {
+        let mut s = Settings::default();
+        let mut oai = OpenAiCompatConfig::default();
+        oai.endpoint = "http://a:8000/v1".to_string();
+        oai.model = "qwen-3.6".to_string();
+        let oai_id = s
+            .add_connector("Local A", ProviderInstanceConfig::OpenAiCompat(oai))
+            .unwrap();
+
+        let mut session = test_session();
+        session.llm_connector_id = Some(oai_id);
+        // No session model override → connector's configured model
+        assert_eq!(s.chat_model_for_session(&session), "qwen-3.6");
+        // Session override wins
+        session.chat_model = Some("other-model".to_string());
+        assert_eq!(s.chat_model_for_session(&session), "other-model");
+    }
+
+    #[test]
+    fn two_instances_of_same_kind_keep_separate_configs() {
+        let mut s = Settings::default();
+        let mut a = OpenAiCompatConfig::default();
+        a.endpoint = "http://a:8000/v1".to_string();
+        a.max_context_tokens = Some(32_000);
+        a.watch_words_enabled = true;
+        let mut b = OpenAiCompatConfig::default();
+        b.endpoint = "http://b:8000/v1".to_string();
+        b.max_context_tokens = Some(8_000);
+        let a_id = s
+            .add_connector("A", ProviderInstanceConfig::OpenAiCompat(a))
+            .unwrap();
+        let b_id = s
+            .add_connector("B", ProviderInstanceConfig::OpenAiCompat(b))
+            .unwrap();
+
+        let inst_a = s.connector_by_id(&a_id).unwrap();
+        let inst_b = s.connector_by_id(&b_id).unwrap();
+        assert_eq!(
+            s.resolve_context_window_for_connector(inst_a, "some-model"),
+            Some(32_000)
+        );
+        assert_eq!(
+            s.resolve_context_window_for_connector(inst_b, "some-model"),
+            Some(8_000)
+        );
+        match (&inst_a.config, &inst_b.config) {
+            (
+                ProviderInstanceConfig::OpenAiCompat(ca),
+                ProviderInstanceConfig::OpenAiCompat(cb),
+            ) => {
+                assert!(ca.watch_words_enabled);
+                assert!(!cb.watch_words_enabled);
+            }
+            _ => panic!("wrong config variants"),
+        }
+    }
+
+    #[test]
+    fn settings_json_roundtrip_preserves_connectors_but_not_keys() {
+        let mut s = Settings::default();
+        let mut cfg = GeminiConfig::default();
+        cfg.api_key = Some("secret".to_string());
+        let id = s
+            .add_connector("My Gemini", ProviderInstanceConfig::Gemini(cfg))
+            .unwrap();
+
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("secret"),
+            "api keys must never serialize into settings.json"
+        );
+        let restored: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.llm_connectors.len(), 1);
+        let inst = restored.connector_by_id(&id).unwrap();
+        assert_eq!(inst.name, "My Gemini");
+        assert_eq!(inst.provider(), LlmProvider::Gemini);
+        assert!(inst.config.api_key().is_none());
+        assert_eq!(restored.active_connector_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn session_deserializes_without_connector_id() {
+        // Old sessions.db rows have llm_provider but no llm_connector_id
+        let mut session = test_session();
+        session.llm_provider = Some(LlmProvider::Claude);
+        let mut value = serde_json::to_value(&session).unwrap();
+        value.as_object_mut().unwrap().remove("llm_connector_id");
+        let restored: crate::session::Session = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.llm_connector_id, None);
+        assert_eq!(restored.llm_provider, Some(LlmProvider::Claude));
     }
 }

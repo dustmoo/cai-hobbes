@@ -162,6 +162,8 @@ pub fn ChatWindow(
     let mut delete_message_count = use_signal(|| 0);
     let mut has_new_comments = use_signal(|| false);
     let mut has_pending_approvals = use_signal(|| false);
+    // Dismiss state for the small-context-window warning banner.
+    let mut ctx_window_warning_dismissed = use_signal(|| false);
     use_context_provider(|| has_pending_approvals);
 
     // New Chat with Memory Modal State
@@ -889,12 +891,43 @@ pub fn ChatWindow(
     };
 
     let session_guard = session.read();
+
+    // Context window of the active session's connector, when it's small enough to
+    // degrade tool-calling. Hobbes is a tool harness — with a small window the
+    // system prompt + tool definitions crowd out tool results and the model loops.
+    let small_ctx_window: Option<usize> = session_guard
+        .as_ref()
+        .and_then(|sess| {
+            let s = settings.read();
+            let instance = s.connector_for_session(sess)?;
+            let model = s.chat_model_for_session(sess);
+            s.resolve_context_window_for_connector(instance, &model)
+        })
+        .filter(|&w| w < crate::llm::config::RECOMMENDED_MIN_CONTEXT_TOKENS);
+    let rec_min_ctx = crate::llm::config::RECOMMENDED_MIN_CONTEXT_TOKENS;
+
     if session_guard.is_some() {
         rsx! {
 
             div {
                 class: "{root_classes}",
                 onmounted: move |cx| container_element.set(Some(cx.data())),
+                if let Some(tokens) = small_ctx_window {
+                    if !ctx_window_warning_dismissed() {
+                        div {
+                            class: "flex items-start gap-2 mx-3 mt-2 p-2 rounded border border-yellow-600/40 bg-yellow-500/5",
+                            span { class: "text-yellow-500 shrink-0 text-sm", "⚠️" }
+                            p { class: "flex-grow text-xs text-yellow-200",
+                                "This connector's context window is small ({tokens} tokens). Hobbes relies on tools, and system prompt + tool definitions alone use ~5–7K tokens — under {rec_min_ctx} tokens the model may loop or drop tool results. Consider a connector with a larger context window."
+                            }
+                            button {
+                                class: "shrink-0 text-yellow-500/60 hover:text-yellow-300 text-xs",
+                                onclick: move |_| ctx_window_warning_dismissed.set(true),
+                                "✕"
+                            }
+                        }
+                    }
+                }
                 MessageList {
                     stream_update_trigger: stream_update_trigger,
                     show_scroll_button: show_scroll_button,
@@ -1137,7 +1170,7 @@ pub fn MessageBubble(
     let _settings = consume_context::<Signal<Settings>>();
     let stream_manager = consume_context::<StreamManagerContext>();
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let DraftContext(mut chat_input_draft) = consume_context::<DraftContext>();
+    let DraftContext(chat_input_draft) = consume_context::<DraftContext>();
     let save_error = consume_context::<crate::components::shared::SaveErrorContext>().0;
 
     let _is_thinking = false;
@@ -1165,6 +1198,11 @@ pub fn MessageBubble(
             let mut content = use_signal(|| text_content.clone());
             let mut local_thought_summary = use_signal(|| thought_summary.clone());
             let mut copied = use_signal(|| false);
+            // True when THIS bubble consumed the live stream channel (it was mounted
+            // when the stream started). A bubble re-mounted mid-stream (tab switch away
+            // and back) never owns the channel — `take_stream` is single-consumer — and
+            // instead mirrors accumulated text from session_state (see effects below).
+            let mut owns_channel = use_signal(|| false);
 
             // Token usage display settings - consume BEFORE signal initialization
             let ui_state = consume_context::<Signal<crate::settings::UiState>>();
@@ -1315,6 +1353,10 @@ pub fn MessageBubble(
             use_effect(move || {
                 let _stream_activity = stream_manager.stream_activity;
                 if !is_user && stream_manager.is_streaming(&message.id) {
+                    // We mounted while the live channel is still available, so we're the
+                    // consumer. Claim ownership synchronously (before the async take) so the
+                    // session_state-mirror effect never fights this channel loop.
+                    owns_channel.set(true);
                     spawn(async move {
                         if let Some(mut rx) = stream_manager.take_stream(&message.id) {
                             while let Some(stream_msg) = rx.recv().await {
@@ -1341,6 +1383,49 @@ pub fn MessageBubble(
                             }
                         }
                     });
+                }
+            });
+
+            // Live mirror for a bubble re-mounted mid-stream (tab switched away and
+            // back). The single-consumer channel was already taken by the original
+            // mount, so this bubble can't reattach to it — but the stream task writes
+            // the full accumulated text into session_state on every chunk. Reading
+            // session_state here subscribes this effect to those per-chunk writes, so
+            // the output keeps painting live instead of freezing at the mount snapshot.
+            use_effect(move || {
+                let _ = stream_manager.stream_activity.read();
+                let state = session_state.read();
+                // Skip when we own the live channel (owner drives content directly) or
+                // the turn is no longer generating (nothing left to mirror).
+                if is_user || *owns_channel.peek() || !stream_manager.is_generating(&message.id) {
+                    return;
+                }
+                if let Some((latest, latest_summary)) = state
+                    .sessions
+                    .values()
+                    .flat_map(|s| s.messages.iter())
+                    .find(|m| m.id == message.id)
+                    .and_then(|m| match &m.content {
+                        MessageContent::Text {
+                            content,
+                            thought_summary,
+                            ..
+                        } => Some((content.clone(), thought_summary.clone())),
+                        _ => None,
+                    })
+                {
+                    let mut changed = false;
+                    if *content.peek() != latest {
+                        content.set(latest);
+                        changed = true;
+                    }
+                    if *local_thought_summary.peek() != latest_summary {
+                        local_thought_summary.set(latest_summary);
+                        changed = true;
+                    }
+                    if changed {
+                        on_content_update.call(());
+                    }
                 }
             });
 
@@ -1469,21 +1554,12 @@ pub fn MessageBubble(
                                             "Please continue without tools and answer from your knowledge.".to_string(),
                                         ],
                                         on_select: move |suggestion: String| {
-                                            chat_input_draft.set(suggestion);
-                                            spawn(async move {
-                                                let _ = document::eval(r#"
-                                                    const el = document.getElementById('chat-textarea');
-                                                    if (el) {
-                                                        el.focus();
-                                                        // Don't dispatch input event as it might race with the value update
-                                                        // Just handle the resize explicitly
-                                                        requestAnimationFrame(() => {
-                                                            el.style.height = 'auto';
-                                                            el.style.height = (el.scrollHeight) + 'px';
-                                                        });
-                                                    }
-                                                "#);
-                                            });
+                                            crate::components::shared::set_chat_draft(
+                                                chat_input_draft,
+                                                suggestion,
+                                                None,
+                                                true,
+                                            );
                                         }
                                     }
                                 }
@@ -1831,7 +1907,7 @@ pub fn MessageBubble(
 
 #[component]
 pub fn LinkWithControls(href: String, text: String) -> Element {
-    let DraftContext(mut draft) = use_context::<DraftContext>();
+    let DraftContext(draft) = use_context::<DraftContext>();
     let mut copied = use_signal(|| false);
     let mut is_hovered = use_signal(|| false);
     let mut pop_left = use_signal(|| false);
@@ -1902,15 +1978,7 @@ pub fn LinkWithControls(href: String, text: String) -> Element {
                     onclick: move |evt| {
                         evt.stop_propagation();
                         let summary_prompt = format!("Please fetch {} and summarize.", href_clone_for_summarize);
-                        draft.set(summary_prompt);
-                        let _ = document::eval(r#"
-                            const el = document.getElementById('chat-textarea');
-                            if (el) {
-                                el.focus();
-                                el.style.height = 'auto';
-                                el.style.height = (el.scrollHeight) + 'px';
-                            }
-                        "#);
+                        crate::components::shared::set_chat_draft(draft, summary_prompt, None, true);
                     },
                     Icon { width: 14, height: 14, icon: fi_icons::FiFileText }
                 }

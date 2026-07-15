@@ -23,4 +23,6 @@ pub enum FocusContext {
     ConflictModal,
     /// Settings panel is focused
     SettingsPanel,
+    /// Skill editor overlay is open
+    SkillEditorModal,
 }

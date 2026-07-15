@@ -25,6 +25,18 @@ pub fn composio_key_name(profile_id: &str) -> String {
     format!("{}{}", COMPOSIO_KEY_PREFIX, profile_id)
 }
 
+/// Prefix for per-connector LLM API keys (e.g., "llm_api_key_<uuid>")
+pub const LLM_KEY_PREFIX: &str = "llm_api_key_";
+
+/// Build the full keychain key for an LLM connector instance's API key.
+pub fn llm_key_name(connector_id: &str) -> String {
+    format!("{}{}", LLM_KEY_PREFIX, connector_id)
+}
+
+/// Key name for the CSV index of all per-connector LLM API keys.
+/// Needed so `load_all_from_keychain` can discover dynamically-named keys.
+pub const LLM_KEYS_INDEX_KEY: &str = "llm_connector_keys_index";
+
 /// Prefix for custom tool credentials (e.g., "composio_tool_slack__api_key")
 pub const CUSTOM_TOOL_PREFIX: &str = "composio_tool_";
 
@@ -158,11 +170,27 @@ pub trait SecretManagerTrait {
     /// Set a secret (updates cache and saves to keychain).
     fn set(&mut self, key: &str, value: String) -> Result<(), String>;
 
+    /// Set a secret with an explicit protection level. Platforms without
+    /// biometric ACLs ignore the flag; the macOS implementation overrides
+    /// this so `biometric: false` writes a plain keychain item that stays
+    /// readable without an authentication prompt.
+    fn set_with_protection(
+        &mut self,
+        key: &str,
+        value: String,
+        _biometric: bool,
+    ) -> Result<(), String> {
+        self.set(key, value)
+    }
+
     /// Delete a secret (removes from cache and keychain).
     fn delete(&mut self, key: &str) -> Result<(), String>;
 
     /// Load a specific Composio key into the cache from keychain.
     fn load_composio_key(&mut self, profile_id: &str);
+
+    /// Load a specific LLM connector key into the cache from keychain.
+    fn load_llm_key(&mut self, connector_id: &str);
 
     /// Manually update a secret in the cache without keychain write.
     fn update_cache(&mut self, key: String, value: String);
@@ -170,8 +198,13 @@ pub trait SecretManagerTrait {
     /// Delete all loaded secrets from the platform keychain.
     fn delete_all(&mut self) -> Vec<String>;
 
-    /// Get the current index value directly from keychain (for index updates).
-    fn get_index_from_keychain(&self) -> Option<String>;
+    /// Get a named CSV-index value directly from keychain (for index updates).
+    fn get_named_index_from_keychain(&self, index_key: &str) -> Option<String>;
+
+    /// Get the custom-tool index value directly from keychain.
+    fn get_index_from_keychain(&self) -> Option<String> {
+        self.get_named_index_from_keychain(CUSTOM_KEYS_INDEX_KEY)
+    }
 
     /// Get a reference to the secrets cache for credential extraction.
     fn secrets_ref(&self) -> &std::collections::HashMap<String, String>;
@@ -207,25 +240,29 @@ pub trait SecretManagerTrait {
             .any(|k| key_belongs_to_toolkit(k, slug))
     }
 
-    /// Set a custom tool credential and update the index.
+    /// Set a custom tool credential and update the index. `biometric`
+    /// controls the protection of the credential itself; the index is always
+    /// written unprotected — it must stay readable without a biometric
+    /// prompt so startup discovery works before authentication.
     fn set_custom_tool_credential(
         &mut self,
         profile_name: Option<&str>,
         slug: &str,
         field: &str,
         value: String,
+        biometric: bool,
     ) -> Result<(), String> {
         let key = format_custom_tool_key(profile_name, slug, field);
 
         // 1. Save the actual secret
-        self.set(&key, value)?;
+        self.set_with_protection(&key, value, biometric)?;
 
         // 2. Update Index
         let current_index = self.get_index_from_keychain().unwrap_or_default();
         let new_index = add_to_index_csv(&current_index, &key);
 
         if new_index != current_index {
-            self.set(CUSTOM_KEYS_INDEX_KEY, new_index)?;
+            self.set_with_protection(CUSTOM_KEYS_INDEX_KEY, new_index, false)?;
             tracing::info!("Updated custom tool index with new key: {}", key);
         }
 
@@ -249,7 +286,8 @@ pub trait SecretManagerTrait {
 
         if !current_index.is_empty() {
             let new_index = remove_from_index_csv(&current_index, &key);
-            self.set(CUSTOM_KEYS_INDEX_KEY, new_index)?;
+            // Same as set_custom_tool_credential: never biometric-protect the index.
+            self.set_with_protection(CUSTOM_KEYS_INDEX_KEY, new_index, false)?;
             tracing::info!("Removed custom tool key from index: {}", key);
         }
 
@@ -272,6 +310,53 @@ pub trait SecretManagerTrait {
     fn delete_composio_key(&mut self, profile_id: &str) -> Result<(), String> {
         let key = composio_key_name(profile_id);
         self.delete(&key)
+    }
+
+    /// Get the API key for an LLM connector instance.
+    fn get_llm_key(&self, connector_id: &str) -> Option<&String> {
+        self.get(&llm_key_name(connector_id))
+    }
+
+    /// Set the API key for an LLM connector instance and keep the discovery
+    /// index current so `load_all_from_keychain` finds it on next launch.
+    /// `biometric` controls the protection of the key itself; the index is
+    /// always written unprotected — it must stay readable without a
+    /// biometric prompt so startup discovery works before authentication.
+    fn set_llm_key(
+        &mut self,
+        connector_id: &str,
+        value: String,
+        biometric: bool,
+    ) -> Result<(), String> {
+        let key = llm_key_name(connector_id);
+        self.set_with_protection(&key, value, biometric)?;
+
+        let current_index = self
+            .get_named_index_from_keychain(LLM_KEYS_INDEX_KEY)
+            .unwrap_or_default();
+        let new_index = add_to_index_csv(&current_index, &key);
+        if new_index != current_index {
+            self.set_with_protection(LLM_KEYS_INDEX_KEY, new_index, false)?;
+            tracing::info!("Updated LLM connector key index with: {}", key);
+        }
+        Ok(())
+    }
+
+    /// Delete the API key for an LLM connector instance and update the index.
+    fn delete_llm_key(&mut self, connector_id: &str) -> Result<(), String> {
+        let key = llm_key_name(connector_id);
+        let _ = self.delete(&key);
+
+        let current_index = self
+            .get_named_index_from_keychain(LLM_KEYS_INDEX_KEY)
+            .unwrap_or_default();
+        if !current_index.is_empty() {
+            let new_index = remove_from_index_csv(&current_index, &key);
+            // Same as set_llm_key: the index must never carry a biometric ACL.
+            self.set_with_protection(LLM_KEYS_INDEX_KEY, new_index, false)?;
+            tracing::info!("Removed LLM connector key from index: {}", key);
+        }
+        Ok(())
     }
 }
 
@@ -381,6 +466,23 @@ mod tests {
 
         let empty_keys = parse_index_csv("");
         assert!(empty_keys.is_empty());
+    }
+
+    #[test]
+    fn test_llm_key_name_and_index_roundtrip() {
+        let key = llm_key_name("abc-123");
+        assert_eq!(key, "llm_api_key_abc-123");
+        assert!(key.starts_with(LLM_KEY_PREFIX));
+
+        // Index round-trip: add two keys, remove one
+        let idx = add_to_index_csv("", &llm_key_name("a"));
+        let idx = add_to_index_csv(&idx, &llm_key_name("b"));
+        assert_eq!(parse_index_csv(&idx).len(), 2);
+        // Re-adding is a no-op
+        let idx = add_to_index_csv(&idx, &llm_key_name("a"));
+        assert_eq!(parse_index_csv(&idx).len(), 2);
+        let idx = remove_from_index_csv(&idx, &llm_key_name("a"));
+        assert_eq!(parse_index_csv(&idx), vec![llm_key_name("b")]);
     }
 
     #[test]

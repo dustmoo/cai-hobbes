@@ -1223,9 +1223,11 @@ impl LlmConnector for GeminiConnector {
                         prefix_contents,
                     );
 
+                    let key_fp = crate::llm::gemini_cache::key_fingerprint(&api_key);
                     let mut store = self.cache_store.lock().await;
                     store.cleanup_expired();
-                    if let Some(entry) = store.get_valid_cache(sess_id, &model, prefix_hash) {
+                    if let Some(entry) = store.get_valid_cache(sess_id, &model, prefix_hash, key_fp)
+                    {
                         cache_entry_opt = Some(entry.clone());
                     } else {
                         let chars_per_token = self.config.context_tuning.chars_per_token
@@ -1256,6 +1258,7 @@ impl LlmConnector for GeminiConnector {
                                 contents_prefix,
                                 self.config.cache_ttl_seconds,
                                 prefix_hash,
+                                key_fp,
                             ).await {
                                 Ok(new_entry) => {
                                     let mut store_lock = self.cache_store.lock().await;

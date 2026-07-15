@@ -1,6 +1,7 @@
 // Dioxus Signal types are held across .await — not real locks, just Dioxus marker types.
 #![allow(clippy::await_holding_invalid_type)]
 
+use crate::components::confirm_delete_modal::ConfirmDeleteModal;
 use crate::components::mcp_search_form::McpSearchForm;
 use crate::components::shared::SessionIdContext;
 use crate::components::smithery_registry::{SmitheryClient, SmitheryServer};
@@ -88,7 +89,9 @@ impl From<ComposioToolkitListing> for FeaturedMcp {
             .unwrap_or_else(|| format!("https://app.composio.dev/app/{}", toolkit.slug));
         let use_managed_auth = toolkit.supports_managed_auth();
         let auth_scheme = toolkit.primary_auth_scheme();
-        let no_auth = toolkit.no_auth.unwrap_or(false);
+        // requires_no_auth() checks both the no_auth flag AND an all-"NO_AUTH"
+        // auth_schemes list — Composio often signals no-auth only via the latter.
+        let no_auth = toolkit.requires_no_auth();
         FeaturedMcp {
             name: toolkit.slug,
             display_name: toolkit.name,
@@ -327,7 +330,17 @@ pub fn McpMarketplace() -> Element {
                         );
 
                         match client.get_connected_toolkit_slugs().await {
-                            Ok(slugs) => {
+                            Ok(mut slugs) => {
+                                // No-auth toolkits have no connected account, so the
+                                // network check can't see them. Union in the locally
+                                // persisted no-auth slugs so they stay "Connected".
+                                for cfg in profile
+                                    .toolkit_configs
+                                    .iter()
+                                    .filter(|c| c.no_auth)
+                                {
+                                    slugs.insert(cfg.slug.to_lowercase());
+                                }
                                 tracing::debug!("Fetched {} connected toolkit slugs", slugs.len());
                                 connected_slugs.set(slugs);
                             }
@@ -1095,6 +1108,15 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
     // Toolkit whose tool whitelist is being edited: (slug, display_name)
     let mut editing_toolkit: Signal<Option<(String, String)>> = use_signal(|| None);
 
+    // Toolkit removal confirm state: (slug, display_name) + modal visibility.
+    let mut remove_target: Signal<Option<(String, String)>> = use_signal(|| None);
+    let mut remove_confirm_visible = use_signal(|| false);
+    let mut removing_slug: Signal<Option<String>> = use_signal(|| None);
+    // Recreate-server confirm + result summary.
+    let mut recreate_confirm_visible = use_signal(|| false);
+    let mut recreating = use_signal(|| false);
+    let mut recreate_result: Signal<Option<String>> = use_signal(|| None);
+
     // Connection state for inline "Connect" button on disconnected toolkits
     let mut tk_is_connecting = use_signal(|| false);
     let mut tk_connection_status = use_signal(String::new);
@@ -1530,10 +1552,20 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                         let settings_snapshot = local_settings.read().clone();
 
                                         // Get the current load mode for this toolkit
-                                        let load_mode = settings_snapshot.get_active_profile()
-                                            .and_then(|p| p.toolkit_configs.iter().find(|c| c.slug == toolkit_slug))
+                                        let toolkit_config = settings_snapshot.get_active_profile()
+                                            .and_then(|p| p.toolkit_configs.iter().find(|c| c.slug == toolkit_slug));
+                                        let load_mode = toolkit_config
                                             .map(|c| c.effective_load_mode())
                                             .unwrap_or(crate::settings::ToolkitLoadMode::OnDemand);
+
+                                        // A no-auth toolkit never has a connected account, so trust the
+                                        // persisted no_auth flag to mark it connected. Read it from the
+                                        // global settings signal (the source of truth connect writes to),
+                                        // since local_settings only resyncs on profile change.
+                                        let is_no_auth_connected = settings.read().get_active_profile()
+                                            .map(|p| p.toolkit_configs.iter().any(|c| c.slug == toolkit_slug && c.no_auth))
+                                            .unwrap_or(false);
+                                        let is_connected = toolkit.is_connected || is_no_auth_connected;
 
                                         rsx! {
                                             div {
@@ -1541,8 +1573,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                 div {
                                                     class: "flex items-center gap-2",
                                                     span {
-                                                        class: if toolkit.is_connected { "text-green-400" } else { "text-fg-muted" },
-                                                        if toolkit.is_connected { "✓" } else { "○" }
+                                                        class: if is_connected { "text-green-400" } else { "text-fg-muted" },
+                                                        if is_connected { "✓" } else { "○" }
                                                     }
                                                     span {
                                                         class: "text-sm",
@@ -1553,7 +1585,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                         "({toolkit.tool_count} tools)"
                                                     }
                                                 }
-                                                if toolkit.is_connected {
+                                                if is_connected {
                                                     div {
                                                         class: "flex items-center gap-2",
                                                         button {
@@ -1566,6 +1598,21 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                 move |_| editing_toolkit.set(Some((slug.clone(), name.clone())))
                                                             },
                                                             Icon { width: 14, height: 14, icon: fi_icons::FiEdit2 }
+                                                        }
+                                                        button {
+                                                            class: "p-1.5 bg-section hover:bg-red-600 border border-faint rounded transition-colors shrink-0",
+                                                            title: "Remove toolkit — deletes its Composio connection, auth config, and tools",
+                                                            "aria-label": "Remove toolkit",
+                                                            disabled: removing_slug.read().as_deref() == Some(toolkit_slug.as_str()),
+                                                            onclick: {
+                                                                let slug = toolkit_slug.clone();
+                                                                let name = toolkit.display_name.clone();
+                                                                move |_| {
+                                                                    remove_target.set(Some((slug.clone(), name.clone())));
+                                                                    remove_confirm_visible.set(true);
+                                                                }
+                                                            },
+                                                            Icon { width: 14, height: 14, icon: fi_icons::FiTrash2 }
                                                         }
                                                     select {
                                                         class: "px-2 py-1 bg-section border border-faint rounded text-xs shrink-0",
@@ -1604,6 +1651,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                             tool_count,
                                                                             force_load: false,
                                                                             load_mode: new_mode,
+                                                                            no_auth: false,
                                                                         });
                                                                     }
                                                                 }
@@ -1684,6 +1732,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                                     slug.clone(),
                                                                                     None, // auth_scheme — use default
                                                                                     true, // use_managed_auth
+                                                                                    false, // no_auth — ToolkitInfo lacks the flag; 303 self-heal covers it
                                                                                     mcp_context,
                                                                                     settings,
                                                                                     settings_manager_val,
@@ -1721,6 +1770,25 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     class: "text-xs text-fg-muted mt-2",
                                     "Loaded: all tools available upfront. On-demand: discover then use dynamically. Excluded: hidden from AI."
                                 }
+
+                                // Recovery: recreate the Composio server if it stops
+                                // accepting connections (poisoned auth_config_ids).
+                                div {
+                                    class: "mt-3 pt-2 border-t border-faint",
+                                    button {
+                                        class: "text-xs text-fg-muted hover:text-red-400 underline",
+                                        disabled: *recreating.read(),
+                                        onclick: move |_| recreate_confirm_visible.set(true),
+                                        if *recreating.read() {
+                                            "Recreating server…"
+                                        } else {
+                                            "Connections failing? Recreate Composio server"
+                                        }
+                                    }
+                                    if let Some(msg) = recreate_result.read().as_ref() {
+                                        p { class: "text-xs text-fg-muted mt-1", "{msg}" }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1732,6 +1800,102 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                     editing_toolkit,
                     refresh_trigger,
                 }
+            }
+
+            // Confirm: remove a toolkit (deletes its Composio connection + auth config).
+            ConfirmDeleteModal {
+                is_visible: remove_confirm_visible,
+                title: remove_target.read().as_ref().map(|(_, n)| format!("Remove {n}?")).unwrap_or_default(),
+                message: remove_target.read().as_ref().map(|(_, n)| format!("This removes {n} from your Composio server and deletes its connection, auth config, and tools. This can't be undone.")).unwrap_or_default(),
+                confirm_button_text: "Remove".to_string(),
+                show_dont_ask_again: false,
+                on_cancel: move |_| {
+                    remove_confirm_visible.set(false);
+                    remove_target.set(None);
+                },
+                on_confirm: move |_remember: bool| {
+                    let Some((slug, _name)) = remove_target.peek().clone() else { return; };
+                    let mut connected_slugs = connected_slugs;
+                    let mut mcp_context = mcp_context;
+                    remove_confirm_visible.set(false);
+                    removing_slug.set(Some(slug.clone()));
+                    spawn(async move {
+                        let manager = mcp_manager.read().clone();
+                        let settings_snapshot = settings.peek().clone();
+                        match manager.remove_toolkit(&slug, &settings_snapshot).await {
+                            Ok(()) => {
+                                {
+                                    let mut s = local_settings.write();
+                                    if let Some(p) = s.get_active_profile_mut() {
+                                        p.remove_toolkit_config(&slug);
+                                    }
+                                }
+                                let updated = local_settings.peek().clone();
+                                settings.set(updated.clone());
+                                if let Err(e) = settings_manager.read().save(&updated) {
+                                    tracing::error!("Failed to save settings after remove: {}", e);
+                                }
+                                connected_slugs.write().remove(&slug.to_lowercase());
+                                let profile_id = updated.get_active_profile().map(|p| p.id.clone());
+                                mcp_context.set(manager.get_mcp_context(profile_id).await);
+                                match manager.get_composio_toolkits().await {
+                                    Ok(kits) => toolkits.set(kits),
+                                    Err(e) => tracing::error!("Failed to refresh toolkits: {}", e),
+                                }
+                                let cur = *refresh_trigger.peek();
+                                refresh_trigger.set(cur + 1);
+                            }
+                            Err(e) => {
+                                tracing::error!("Remove toolkit '{}' failed: {}", slug, e);
+                                tk_connection_error.set(Some(format!("Remove failed: {e}")));
+                            }
+                        }
+                        removing_slug.set(None);
+                        remove_target.set(None);
+                    });
+                },
+            }
+
+            // Confirm: recreate the Composio server (recovery).
+            ConfirmDeleteModal {
+                is_visible: recreate_confirm_visible,
+                title: "Recreate Composio server?".to_string(),
+                message: "Provisions a fresh Composio server and re-binds your toolkits. Fixes a server that stopped accepting connections. Some toolkits may need to be reconnected.".to_string(),
+                confirm_button_text: "Recreate".to_string(),
+                show_dont_ask_again: false,
+                on_cancel: move |_| recreate_confirm_visible.set(false),
+                on_confirm: move |_remember: bool| {
+                    recreate_confirm_visible.set(false);
+                    recreating.set(true);
+                    recreate_result.set(None);
+                    spawn(async move {
+                        let manager = mcp_manager.read().clone();
+                        let sm = settings_manager.peek().clone();
+                        match manager.recreate_composio_server(settings, sm, mcp_context).await {
+                            Ok((rebound, needs)) => {
+                                let extra = if needs.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" ({} couldn't resolve: {})", needs.len(), needs.join(", "))
+                                };
+                                recreate_result.set(Some(format!(
+                                    "Fresh server ready — {} toolkit(s) bound. Click Connect on any still shown as disconnected to restore their tools (auth toolkits need a quick re-auth).{}",
+                                    rebound.len(), extra
+                                )));
+                                if let Ok(kits) = manager.get_composio_toolkits().await {
+                                    toolkits.set(kits);
+                                }
+                                let cur = *refresh_trigger.peek();
+                                refresh_trigger.set(cur + 1);
+                            }
+                            Err(e) => {
+                                tracing::error!("Recreate server failed: {}", e);
+                                recreate_result.set(Some(format!("Recreate failed: {e}")));
+                            }
+                        }
+                        recreating.set(false);
+                    });
+                },
             }
         }
     }
@@ -2213,6 +2377,7 @@ fn McpServerCard(
                                             let toolkit_slug = mcp.name.clone();
                                             let auth_scheme = mcp.auth_scheme.clone();
                                             let use_managed_auth = mcp.use_managed_auth;
+                                            let no_auth = mcp.no_auth;
                                             move |_| {
                                                 let toolkit_slug = toolkit_slug.clone();
                                                 let auth_scheme = auth_scheme.clone();
@@ -2237,6 +2402,7 @@ fn McpServerCard(
                                                                     toolkit_slug,
                                                                     auth_scheme,
                                                                     use_managed_auth,
+                                                                    no_auth,
                                                                     mcp_context,
                                                                     settings,
                                                                     settings_manager_val,

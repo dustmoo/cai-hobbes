@@ -86,3 +86,4 @@ credentials/
 *.pdf
 out.txt
 test_actual.py
+__pycache__/

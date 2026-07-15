@@ -76,7 +76,9 @@ pub struct OpenAiResponsesConnector {
 }
 
 impl OpenAiResponsesConnector {
-    pub fn new(config: OpenAiCompatConfig) -> Self {
+    pub fn new(mut config: OpenAiCompatConfig) -> Self {
+        // Normalize stray whitespace from pasted/typed endpoints.
+        config.endpoint = config.endpoint.trim().to_string();
         Self { config }
     }
 

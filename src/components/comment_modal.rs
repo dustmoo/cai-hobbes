@@ -109,10 +109,13 @@ pub fn CommentModal(
                         "Quoted Text (copy from above)"
                     }
                     input {
+                        id: "comment-modal-quote",
                         class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm",
                         r#type: "text",
                         placeholder: "Paste the text you want to comment on...",
-                        value: "{selected_text}",
+                        // Uncontrolled: controlled bindings race re-renders and snap
+                        // the caret to the end mid-typing (see shared::set_chat_draft).
+                        initial_value: "{selected_text}",
                         oninput: move |e| selected_text.set(e.value())
                     }
                 }
@@ -125,10 +128,11 @@ pub fn CommentModal(
                         "Your Comment"
                     }
                     textarea {
+                        id: "comment-modal-text",
                         class: "w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm",
                         rows: "3",
                         placeholder: "Add your comment...",
-                        value: "{new_comment_text}",
+                        initial_value: "{new_comment_text}",
                         autofocus: true,
                         onmounted: move |evt| {
                             let mounted = evt.data();
@@ -168,6 +172,13 @@ pub fn CommentModal(
                             comments.write().push(new_comment);
                             selected_text.set(String::new());
                             new_comment_text.set(String::new());
+                            // Uncontrolled inputs: clear the DOM values explicitly
+                            let _ = document::eval(r#"
+                                const quote = document.getElementById('comment-modal-quote');
+                                if (quote) { quote.value = ''; }
+                                const text = document.getElementById('comment-modal-text');
+                                if (text) { text.value = ''; }
+                            "#);
                         }
                     },
                     disabled: selected_text().is_empty() || new_comment_text().is_empty(),

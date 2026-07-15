@@ -11,8 +11,9 @@ use super::LlmConnector;
 use crate::components::shared::{StreamMessage, ToolCall, UsageData};
 use crate::mcp::manager::McpContext;
 
+// The OpenAI tool-call `id` is intentionally not kept: calls are matched
+// positionally during streaming and ToolCall carries no provider id.
 struct PendingToolCall {
-    id: String,
     name: String,
     server_name: String,
     arguments: String,
@@ -23,7 +24,10 @@ pub struct OpenAiCompatConnector {
 }
 
 impl OpenAiCompatConnector {
-    pub fn new(config: OpenAiCompatConfig) -> Self {
+    pub fn new(mut config: OpenAiCompatConfig) -> Self {
+        // Stray whitespace from pasted/typed endpoints breaks strict URL
+        // parsing (e.g. raw_tcp_stream's http:// prefix check) — normalize.
+        config.endpoint = config.endpoint.trim().to_string();
         Self { config }
     }
 }
@@ -426,7 +430,6 @@ impl LlmConnector for OpenAiCompatConnector {
                                     }
                                 }
                                 StreamEvent::ToolCall {
-                                    id,
                                     name,
                                     arguments,
                                     ..
@@ -457,7 +460,6 @@ impl LlmConnector for OpenAiCompatConnector {
                                             self.resolve_tool_call(&name)
                                         };
                                         pending_tool_calls.push(PendingToolCall {
-                                            id,
                                             name: resolved_tool,
                                             server_name: resolved_server,
                                             // CRITICAL: Use .as_str() not .to_string()!
@@ -1206,6 +1208,19 @@ impl OpenAiCompatConnector {
     /// we try matching from the first underscore position outward.
     /// This is a last-resort fallback — the tool_name_map lookup should handle most cases.
     fn resolve_tool_call(&self, sanitized_name: &str) -> (String, String) {
+        // Built-in tool names are unambiguous. Local models sometimes emit the
+        // bare name from instruction text (e.g. "HOBBES_INVOKE_SKILL") instead
+        // of the advertised prefixed name ("hobbes-core_HOBBES_INVOKE_SKILL");
+        // the underscore split below would mangle those into server "HOBBES" /
+        // tool "INVOKE_SKILL" and miss the stream-manager interception. Map
+        // them straight to their virtual servers.
+        if sanitized_name.starts_with("HOBBES_") {
+            return ("hobbes-core".to_string(), sanitized_name.to_string());
+        }
+        if sanitized_name.starts_with("MCP_") {
+            return ("hobbes-meta".to_string(), sanitized_name.to_string());
+        }
+
         // Try splitting at each underscore position to find a valid server/tool pair
         if let Some(pos) = sanitized_name.find('_') {
             let server = sanitized_name[..pos].to_string();

@@ -23,6 +23,7 @@ fn create_test_session() -> Session {
         accumulated_turns: 0,
         memory_optimization_summary: None,
         composio_profile: None,
+        llm_connector_id: None,
         llm_provider: None,
         chat_model: None,
         loaded_skills: std::collections::HashMap::new(),
@@ -453,5 +454,134 @@ fn historical_tool_result_uses_summary_when_available() {
     assert!(
         tool_text.contains("HOBBES_PAGE_RESULT"),
         "full data should remain retrievable via pagination id"
+    );
+}
+
+// =========================================================================
+// available_skills / HOBBES_INVOKE_SKILL gating (on-demand mechanic)
+// =========================================================================
+
+fn invoke_skill_tool() -> rmcp::model::Tool {
+    rmcp::model::Tool {
+        name: "HOBBES_INVOKE_SKILL".into(),
+        description: Some("Load a skill".into()),
+        input_schema: std::sync::Arc::new(serde_json::Map::new()),
+        title: None,
+        output_schema: None,
+        annotations: None,
+        icons: None,
+        meta: None,
+    }
+}
+
+fn session_with_core_tools() -> Session {
+    let mut session = create_test_session();
+    session.active_context.mcp_tools = Some(crate::mcp::manager::McpContext {
+        servers: vec![crate::mcp::manager::McpServerContext {
+            name: "hobbes-core".to_string(),
+            description: "built-in".to_string(),
+            tools: vec![invoke_skill_tool()],
+        }],
+        connected_toolkit_slugs: vec![],
+    });
+    session
+}
+
+fn loaded_skill_payload(skill: &str, resolved_tool: &str) -> String {
+    serde_json::to_string(&crate::components::shared::CapabilityContextPayload {
+        skill: skill.to_string(),
+        instruction_manual: "Do the thing.".to_string(),
+        environment: crate::components::shared::SkillEnvironment {
+            root_path: std::path::PathBuf::new(),
+            scripts: vec![],
+            resources: vec![],
+            user_args: String::new(),
+        },
+        resolved_tools: std::collections::HashMap::from([(
+            "search".to_string(),
+            resolved_tool.to_string(),
+        )]),
+        warnings: vec![],
+    })
+    .unwrap()
+}
+
+/// Single test covering all gate states: the skill-metadata mirror is a
+/// process-wide OnceLock, so the states are exercised sequentially in one
+/// test to avoid cross-test races, and the mirror is cleared at the end.
+#[test]
+fn test_available_skills_gated_by_running_skill() {
+    use crate::skills::registry::{set_available_skills_for_test, AvailableSkill};
+
+    set_available_skills_for_test(vec![AvailableSkill {
+        name: "research".to_string(),
+        description: "Deep research".to_string(),
+        argument_hint: Some("<topic>".to_string()),
+        disable_model_invocation: false,
+    }]);
+    let settings = Settings::default();
+    let state = create_test_session_state();
+
+    // 1. Idle session → skills advertised, loader tool present
+    let session = session_with_core_tools();
+    let prompt = PromptBuilder::new(&session, &settings, &state).build_prompt("Hi".to_string());
+    let system = prompt.prompt.system.clone().unwrap();
+    assert!(system.contains("available_skills"), "idle: skills advertised");
+    assert!(
+        prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_INVOKE_SKILL"),
+        "idle: loader tool advertised"
+    );
+
+    // 2. Loaded skill turn-active (its tools used in recent messages) → gated
+    let mut session = session_with_core_tools();
+    session.loaded_skills.insert(
+        "news".to_string(),
+        loaded_skill_payload("news", "test-server_search"),
+    );
+    session.messages = vec![
+        user_text_msg("/news"),
+        tool_call_msg("search", "results".to_string(), None),
+    ];
+    let prompt = PromptBuilder::new(&session, &settings, &state).build_prompt(String::new());
+    let system = prompt.prompt.system.clone().unwrap();
+    assert!(
+        !system.contains("available_skills"),
+        "running: no other skills advertised"
+    );
+    assert!(
+        !prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_INVOKE_SKILL"),
+        "running: loader tool withheld"
+    );
+
+    // 3. Model just loaded a skill (last message is the loader tool call) → gated
+    let mut session = session_with_core_tools();
+    session
+        .loaded_skills
+        .insert("news".to_string(), loaded_skill_payload("news", "unrelated"));
+    session.messages = vec![
+        user_text_msg("check the news"),
+        tool_call_msg("HOBBES_INVOKE_SKILL", "manual...".to_string(), None),
+    ];
+    let prompt = PromptBuilder::new(&session, &settings, &state).build_prompt(String::new());
+    assert!(
+        !prompt.prompt.system.clone().unwrap().contains("available_skills"),
+        "just-loaded: no other skills advertised"
+    );
+    assert!(
+        !prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_INVOKE_SKILL"),
+        "just-loaded: loader tool withheld"
+    );
+
+    // 4. No skills on disk → loader tool withheld even when idle
+    set_available_skills_for_test(vec![]);
+    let session = session_with_core_tools();
+    let prompt = PromptBuilder::new(&session, &settings, &state).build_prompt("Hi".to_string());
+    assert!(
+        !prompt.prompt.system.clone().unwrap().contains("available_skills"),
+        "no skills: nothing advertised"
+    );
+    assert!(
+        !prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_INVOKE_SKILL"),
+        "no skills: loader tool withheld"
     );
 }

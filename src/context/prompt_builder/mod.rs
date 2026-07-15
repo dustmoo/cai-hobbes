@@ -40,18 +40,33 @@ impl<'a> PromptBuilder<'a> {
         self.settings.provider_for_session(self.session)
     }
 
-    /// Per-provider context tuning resolved against the session's provider.
-    pub(crate) fn effective_tuning(&self) -> crate::settings::ResolvedContextTuning {
-        self.settings
-            .effective_context_tuning_for(self.effective_provider())
+    /// The connector instance this prompt resolves to (session pin → legacy
+    /// kind match → global active connector).
+    pub(crate) fn effective_connector(&self) -> Option<&crate::settings::ProviderInstance> {
+        self.settings.connector_for_session(self.session)
     }
 
-    /// Context window resolved against the session's provider + model.
+    /// Per-connector context tuning resolved against the session's connector.
+    pub(crate) fn effective_tuning(&self) -> crate::settings::ResolvedContextTuning {
+        match self.effective_connector() {
+            Some(instance) => self.settings.effective_context_tuning_for_connector(instance),
+            None => self
+                .settings
+                .effective_context_tuning_for(self.effective_provider()),
+        }
+    }
+
+    /// Context window resolved against the session's connector + model.
     pub(crate) fn effective_context_window(&self) -> Option<usize> {
-        self.settings.resolve_context_window_for(
-            self.effective_provider(),
-            &self.settings.chat_model_for_session(self.session),
-        )
+        let model = self.settings.chat_model_for_session(self.session);
+        match self.effective_connector() {
+            Some(instance) => self
+                .settings
+                .resolve_context_window_for_connector(instance, &model),
+            None => self
+                .settings
+                .resolve_context_window_for(self.effective_provider(), &model),
+        }
     }
 
     /// Builds the structured `LlmPrompt` with system instructions, tools, and conversation history.

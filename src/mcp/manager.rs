@@ -36,6 +36,46 @@ fn composio_server_key(profile_id: &str) -> String {
     format!("{}:{}", COMPOSIO_NATIVE_PREFIX, profile_id)
 }
 
+/// Resolve the servers-map key for a specific profile's Composio-native client.
+/// Prefers the profile-scoped key, then a `profile_id` field match, then the
+/// bare prefix, then any Composio client as a last resort.
+///
+/// Profile-scoping is mandatory: each connected profile has its own
+/// `composio-native:{id}` entry, so a bare `find(is_composio_native)` returns an
+/// arbitrary client and can operate on the wrong profile (e.g. reloading tools
+/// for "Clearmirror" but binding them to "Puget").
+fn active_composio_key(
+    servers: &std::collections::HashMap<String, ActiveMcpClient>,
+    profile_id: Option<&str>,
+) -> Option<String> {
+    if let Some(pid) = profile_id {
+        let scoped = composio_server_key(pid);
+        if servers.contains_key(&scoped) {
+            return Some(scoped);
+        }
+        if let Some((k, _)) = servers
+            .iter()
+            .find(|(k, c)| is_composio_native(k) && c.profile_id.as_deref() == Some(pid))
+        {
+            return Some(k.clone());
+        }
+    }
+    if servers.contains_key(COMPOSIO_NATIVE_PREFIX) {
+        return Some(COMPOSIO_NATIVE_PREFIX.to_string());
+    }
+    servers.keys().find(|k| is_composio_native(k)).cloned()
+}
+
+/// Cache key under which a profile's on-demand Composio tools are stored in
+/// `dynamic_composio_tools`. Uses the profile id, falling back to the bare
+/// prefix for the legacy singleton (no profile). Mirrors the profile filter in
+/// `get_mcp_context` so discovery under one profile stays out of another's context.
+fn dyn_composio_key(profile_id: Option<&str>) -> String {
+    profile_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| COMPOSIO_NATIVE_PREFIX.to_string())
+}
+
 /// Gemini's practical tool limit for FunctionDeclarations.
 const GEMINI_TOOL_LIMIT: usize = 128;
 
@@ -457,10 +497,12 @@ pub struct McpManager {
     secret_manager: Signal<crate::secret_manager::SecretManager>,
     /// Shared settings signal for Pattern 30: read image model etc. at call time
     settings: Signal<crate::settings::Settings>,
-    /// Dynamically discovered Composio tools (populated by COMPOSIO_GET_APP_TOOLS).
-    /// Included as a virtual server in get_mcp_context() so the prompt builder
-    /// sends them to Gemini as real FunctionDeclarations.
-    pub dynamic_composio_tools: Arc<Mutex<Vec<rmcp::model::Tool>>>,
+    /// Dynamically discovered Composio tools (populated by COMPOSIO_GET_APP_TOOLS),
+    /// keyed by Composio profile id (see `dyn_composio_key`). Included as a virtual
+    /// server in get_mcp_context() so the prompt builder sends them to Gemini as
+    /// real FunctionDeclarations. Profile-keyed so tools discovered under one
+    /// profile don't bleed into another profile's context across tabs.
+    pub dynamic_composio_tools: Arc<Mutex<HashMap<String, Vec<rmcp::model::Tool>>>>,
     /// Servers whose tools are available on-demand via MCP_LOAD_SERVER_TOOLS meta-tool.
     /// Servers in this set have their process running but tools are NOT included in get_mcp_context()
     /// unless explicitly loaded via the meta-tool into dynamic_local_tools.
@@ -491,7 +533,7 @@ impl McpManager {
             cached_server_statuses: Arc::new(Mutex::new(None)),
             secret_manager,
             settings,
-            dynamic_composio_tools: Arc::new(Mutex::new(Vec::new())),
+            dynamic_composio_tools: Arc::new(Mutex::new(HashMap::new())),
             on_demand_servers: Arc::new(Mutex::new(HashSet::new())),
             dynamic_local_tools: Arc::new(Mutex::new(Vec::new())),
             dynamic_local_tool_sources: Arc::new(Mutex::new(HashMap::new())),
@@ -761,9 +803,10 @@ impl McpManager {
         {
             let mut dynamic = self.dynamic_composio_tools.lock().await;
             if !dynamic.is_empty() {
+                let tool_count: usize = dynamic.values().map(|v| v.len()).sum();
                 tracing::info!(
                     "Clearing {} stale dynamic Composio tools on config reload",
-                    dynamic.len()
+                    tool_count
                 );
                 dynamic.clear();
             }
@@ -845,15 +888,16 @@ impl McpManager {
             tracing::info!("Cleared existing Composio native clients for reinitialization.");
         }
 
-        // Clear dynamic tool caches from the old profile
+        // Clear dynamic tool caches for the profile being reinitialized only —
+        // other profiles' on-demand tools (e.g. in other tabs) must survive.
         {
             let mut dynamic = self.dynamic_composio_tools.lock().await;
-            if !dynamic.is_empty() {
+            if let Some(removed) = dynamic.remove(&dyn_composio_key(Some(&profile.id))) {
                 tracing::info!(
-                    "Clearing {} stale dynamic Composio tools from previous profile",
-                    dynamic.len()
+                    "Clearing {} stale dynamic Composio tools for reinitialized profile '{}'",
+                    removed.len(),
+                    profile.id
                 );
-                dynamic.clear();
             }
         }
         {
@@ -2068,9 +2112,18 @@ impl McpManager {
                 } else {
                     // Fallback 2: check the dynamic Composio tools cache.
                     // Dynamically discovered tools (via COMPOSIO_GET_APP_TOOLS) live here,
-                    // not in any ActiveMcpClient.tools list.
+                    // not in any ActiveMcpClient.tools list. Prefer this client's
+                    // profile bucket; scan the rest only defensively (the Tool is
+                    // metadata — execution still routes through the resolved client).
                     let dynamic_cache = self.dynamic_composio_tools.lock().await;
-                    match dynamic_cache.iter().find(|t| t.name == tool_name) {
+                    // Key by the turn's profile_id — the same key get_mcp_context
+                    // used when it surfaced this tool to the AI.
+                    let key = dyn_composio_key(profile_id.as_deref());
+                    let found = dynamic_cache
+                        .get(&key)
+                        .and_then(|v| v.iter().find(|t| t.name == tool_name))
+                        .or_else(|| dynamic_cache.values().flatten().find(|t| t.name == tool_name));
+                    match found {
                         Some(t) => t.clone(),
                         None => return Err(format!("Tool not found: {}", tool_name)),
                     }
@@ -2103,6 +2156,9 @@ impl McpManager {
         let (tx, rx) = mpsc::unbounded_channel();
         let service = client.service.clone();
         let dynamic_tools_cache = self.dynamic_composio_tools.clone();
+        // Profile bucket for on-demand tools discovered/cleared in this turn.
+        // Keyed by the turn's profile_id so it matches get_mcp_context's lookup.
+        let dyn_profile_key = dyn_composio_key(profile_id.as_deref());
         // Capture the set of tool names currently loaded on this server.
         // Used to filter dynamic injection: only tools the proxy will accept
         // for tools/call should be injected as FunctionDeclarations.
@@ -2343,13 +2399,14 @@ impl McpManager {
                                     let injected_count = rmcp_tools.len();
                                     {
                                         let mut cache = dynamic_tools_cache.lock().await;
+                                        let bucket = cache.entry(dyn_profile_key.clone()).or_default();
                                         let new_names: std::collections::HashSet<String> =
                                             rmcp_tools.iter().map(|t| t.name.to_string()).collect();
-                                        cache.retain(|t| !new_names.contains(&t.name.to_string()));
-                                        cache.extend(rmcp_tools);
+                                        bucket.retain(|t| !new_names.contains(&t.name.to_string()));
+                                        bucket.extend(rmcp_tools);
                                         tracing::info!(
-                                            "Injected {} dynamic tools for '{}' (from {} available, budget: {}, cache: {})",
-                                            injected_count, app_name, total_available, budget, cache.len()
+                                            "Injected {} dynamic tools for '{}' under profile '{}' (from {} available, budget: {}, bucket: {})",
+                                            injected_count, app_name, dyn_profile_key, total_available, budget, bucket.len()
                                         );
                                     }
 
@@ -2435,13 +2492,18 @@ impl McpManager {
                             }
                         }
                     } else if tool.name == "COMPOSIO_CLEAR_TOOLS" {
-                        // Clear all dynamically discovered tools from the cache
+                        // Clear only this profile's dynamically discovered tools,
+                        // so one tab clearing its toolset doesn't wipe another
+                        // profile's discovered tools.
                         let mut cache = dynamic_tools_cache.lock().await;
-                        let cleared_count = cache.len();
-                        cache.clear();
+                        let cleared_count = cache
+                            .remove(&dyn_profile_key)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
                         tracing::info!(
-                            "COMPOSIO_CLEAR_TOOLS: cleared {} dynamic tools",
-                            cleared_count
+                            "COMPOSIO_CLEAR_TOOLS: cleared {} dynamic tools for profile '{}'",
+                            cleared_count,
+                            dyn_profile_key
                         );
 
                         Ok(CallToolResult {
@@ -2749,11 +2811,15 @@ impl McpManager {
         &self,
     ) -> Result<Vec<crate::mcp::composio_client::ToolkitInfo>, String> {
         let servers = self.servers.lock().await;
-        // Find any composio-native client (may have profile suffix)
-        let composio_client = servers
-            .iter()
-            .find(|(k, _)| is_composio_native(k))
-            .map(|(_, v)| v);
+        // Select the ACTIVE profile's composio-native client (several accumulate
+        // once multiple profiles connect; a bare find returns an arbitrary one).
+        let active_profile_id = self
+            .settings
+            .peek()
+            .get_active_profile()
+            .map(|p| p.id.clone());
+        let composio_client = active_composio_key(&servers, active_profile_id.as_deref())
+            .and_then(|k| servers.get(&k));
 
         if let Some(client) = composio_client {
             if let McpClientType::NativeComposio(composio_client) = &client.service {
@@ -2773,10 +2839,16 @@ impl McpManager {
         &self,
     ) -> Result<Arc<crate::mcp::composio_client::ComposioClient>, String> {
         let servers = self.servers.lock().await;
-        servers
-            .iter()
-            .find(|(k, _)| is_composio_native(k))
-            .and_then(|(_, v)| match &v.service {
+        // Scope to the active profile's client so operations don't hit a
+        // different profile's Composio account.
+        let active_profile_id = self
+            .settings
+            .peek()
+            .get_active_profile()
+            .map(|p| p.id.clone());
+        active_composio_key(&servers, active_profile_id.as_deref())
+            .and_then(|k| servers.get(&k))
+            .and_then(|v| match &v.service {
                 McpClientType::NativeComposio(c) => Some(c.clone()),
                 _ => None,
             })
@@ -2805,6 +2877,35 @@ impl McpManager {
     ///
     /// Cache busting is thorough because the edited whitelist affects tools in
     /// several places: the client's cached toolkit-info counts, any on-demand
+    /// Drop the active profile's on-demand dynamic tools for a toolkit
+    /// (matched by `TOOLKIT_` name prefix). Used whenever a toolkit's
+    /// whitelist changes or the toolkit is removed — already-discovered
+    /// tools were resolved against stale state.
+    /// P-010: takes only the `dynamic_composio_tools` lock.
+    async fn clear_dynamic_tools_for_toolkit(&self, toolkit_slug: &str) {
+        let prefix = format!("{}_", toolkit_slug.to_uppercase().replace('-', "_"));
+        let active_profile_id = self
+            .settings
+            .peek()
+            .get_active_profile()
+            .map(|p| p.id.clone());
+        let key = dyn_composio_key(active_profile_id.as_deref());
+        let mut dynamic = self.dynamic_composio_tools.lock().await;
+        if let Some(bucket) = dynamic.get_mut(&key) {
+            let before = bucket.len();
+            bucket.retain(|t| !t.name.to_uppercase().starts_with(&prefix));
+            let removed = before - bucket.len();
+            if removed > 0 {
+                tracing::info!(
+                    "Cleared {} stale dynamic tools for toolkit '{}' (profile '{}')",
+                    removed,
+                    toolkit_slug,
+                    key
+                );
+            }
+        }
+    }
+
     /// tools already discovered into `dynamic_composio_tools`, and the loaded
     /// tool set on the active client.
     pub async fn set_composio_toolkit_tools(
@@ -2823,25 +2924,235 @@ impl McpManager {
 
         // Drop any on-demand tools already discovered for this toolkit — they
         // were resolved against the OLD whitelist and must be re-discovered.
-        {
-            let prefix = format!("{}_", toolkit_slug.to_uppercase().replace('-', "_"));
-            let mut dynamic = self.dynamic_composio_tools.lock().await;
-            let before = dynamic.len();
-            dynamic.retain(|t| !t.name.to_uppercase().starts_with(&prefix));
-            let removed = before - dynamic.len();
-            if removed > 0 {
-                tracing::info!(
-                    "Cleared {} stale dynamic tools for edited toolkit '{}'",
-                    removed,
-                    toolkit_slug
-                );
-            }
-        }
+        // Scoped to the active profile's bucket (the edit is profile-scoped).
+        self.clear_dynamic_tools_for_toolkit(toolkit_slug).await;
 
         // Reload the loaded/force-loaded tool set from the server.
         self.reload_composio_tools(settings).await?;
         self.invalidate_status_cache();
         Ok(())
+    }
+
+    /// Fully remove a toolkit from the active profile's Composio server: unbind
+    /// it (PATCH), delete its connected account(s) and auth config(s), drop its
+    /// on-demand tools, then reload. Settings (`toolkit_configs`) and
+    /// `connected_slugs` are updated UI-side, mirroring how connect splits work.
+    ///
+    /// Step 1 (the PATCH) is the fail point: on an already-wedged server it will
+    /// error, which is expected — recovery is `recreate_composio_server`.
+    pub async fn remove_toolkit(
+        &self,
+        toolkit_slug: &str,
+        settings: &Settings,
+    ) -> Result<(), String> {
+        let composio_client = self.find_composio_client().await?;
+
+        // 1. Unbind from the MCP server (PATCH + generate); returns the auth
+        //    config id(s) that were dropped from the server's array.
+        let dropped_auth_ids = composio_client
+            .remove_toolkit_from_server(toolkit_slug)
+            .await?;
+
+        // 2. Delete the toolkit's connected account(s) (best-effort).
+        if let Err(e) = composio_client
+            .delete_toolkit_connections(toolkit_slug)
+            .await
+        {
+            tracing::warn!(
+                "[REMOVE] delete_toolkit_connections('{}') failed: {}",
+                toolkit_slug,
+                e
+            );
+        }
+
+        // 3. Delete the dropped auth config(s) so they can't accumulate
+        //    (best-effort — only runs after the PATCH already removed the
+        //    references, so a failure here never leaves a dangling reference).
+        for id in &dropped_auth_ids {
+            if let Err(e) = composio_client.delete_auth_config(id).await {
+                tracing::warn!("[REMOVE] delete_auth_config('{}') failed: {}", id, e);
+            }
+        }
+
+        // 4. Bust caches + drop this profile's on-demand tools for the toolkit.
+        composio_client.clear_cached_toolkit_info();
+        self.clear_dynamic_tools_for_toolkit(toolkit_slug).await;
+
+        // 5. Reload the active client's tool set and refresh status.
+        self.reload_composio_tools(settings).await?;
+        self.invalidate_status_cache();
+        tracing::info!("[REMOVE] Toolkit '{}' fully removed", toolkit_slug);
+        Ok(())
+    }
+
+    /// Recovery for an already-wedged Composio server: its poisoned
+    /// `auth_config_ids` reject every PATCH, so removal can't help. Provisions a
+    /// FRESH empty server, repoints the active profile at it, and best-effort
+    /// re-binds the toolkits the user already had (existing accounts/configs
+    /// survive, so most rebind without new OAuth). The old server is abandoned
+    /// (Composio has no delete-server endpoint). Returns
+    /// `(rebound, needs_reconnect)` slug lists for a UI summary.
+    pub async fn recreate_composio_server(
+        &self,
+        mut settings_signal: Signal<Settings>,
+        settings_manager: SettingsManager,
+        mut mcp_context_signal: Signal<McpContext>,
+    ) -> Result<(Vec<String>, Vec<String>), String> {
+        let settings_snapshot = settings_signal.peek().clone();
+        let Some(profile) = settings_snapshot.get_active_profile() else {
+            return Err("No active Composio profile found".to_string());
+        };
+        let Some(api_key) = profile.api_key.clone() else {
+            return Err("No Composio API key configured".to_string());
+        };
+        let profile_id = profile.id.clone();
+        let base_url = profile
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
+        let user_id = profile
+            .user_id
+            .clone()
+            .or(profile.entity_id.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let entity_id = profile.entity_id.clone();
+        let chrome_dir = profile.chrome_profile_directory.clone();
+        let kept: Vec<(String, bool)> = profile
+            .toolkit_configs
+            .iter()
+            .map(|c| (c.slug.clone(), c.no_auth))
+            .collect();
+
+        // Owned, mutable client (mirrors connect_toolkit) so we can repoint its
+        // base_url and clone it into the servers map.
+        let mut client = ComposioClient::new(
+            api_key,
+            base_url,
+            entity_id,
+            Some(user_id),
+            profile_id.clone(),
+            chrome_dir,
+        );
+
+        // 1. Resolve auth configs for all kept toolkits FIRST. This only hits
+        //    /auth_configs, so it works even while the old server is wedged.
+        let mut resolved: Vec<(String, Option<String>)> = Vec::new();
+        let mut needs_reconnect: Vec<String> = Vec::new();
+        for (slug, no_auth) in kept {
+            if no_auth {
+                resolved.push((slug, None));
+                continue;
+            }
+            match client.get_auth_config_id(&slug).await {
+                Ok(id) => resolved.push((slug, Some(id))),
+                Err(e) if crate::mcp::composio_client::auth::is_no_auth_toolkit_error(&e) => {
+                    resolved.push((slug, None));
+                }
+                Err(e) => {
+                    tracing::warn!("[RECREATE] '{}' auth resolve failed: {}", slug, e);
+                    needs_reconnect.push(slug);
+                }
+            }
+        }
+
+        // Composio rejects a server with no applications (error 1153
+        // MCP_MissingAuthConfigsOrToolkits), so the fresh server must be seeded
+        // with at least one toolkit.
+        let Some((seed_slug, seed_auth)) = resolved.first().cloned() else {
+            return Err(
+                "No toolkits available to provision a fresh server — connect a toolkit first."
+                    .to_string(),
+            );
+        };
+
+        // 2. Provision the fresh server, seeded with the first toolkit.
+        let (_new_id, new_url) = client
+            .create_fresh_mcp_server(&seed_slug, seed_auth.as_deref())
+            .await?;
+
+        // 3. Repoint client + servers map + persisted base_url (mirror connect Step 3).
+        client.base_url = new_url.clone();
+        {
+            let server_key = composio_server_key(&profile_id);
+            let mut s = self.servers.lock().await;
+            if let Some(existing) = s.get_mut(&server_key) {
+                existing.service =
+                    McpClientType::NativeComposio(std::sync::Arc::new(client.clone()));
+                existing.tools = Vec::new();
+            } else {
+                let active_client = ActiveMcpClient {
+                    config: McpServerConfig::composio_stub(composio_server_key(&profile_id)),
+                    service: McpClientType::NativeComposio(std::sync::Arc::new(client.clone())),
+                    tools: Vec::new(),
+                    warning_message: None,
+                    profile_id: Some(profile_id.clone()),
+                };
+                s.insert(server_key, active_client);
+            }
+        }
+        {
+            let mut s = settings_signal.write();
+            if let Some(p) = s.composio_profiles.iter_mut().find(|p| p.id == profile_id) {
+                p.base_url = Some(new_url.clone());
+            }
+        }
+        let updated = settings_signal.peek().clone();
+        {
+            let sm = settings_manager.clone();
+            let updated_for_save = updated.clone();
+            spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || sm.save(&updated_for_save)).await;
+            });
+        }
+
+        // 4. Bind the remaining toolkits (the seed is already bound by creation).
+        let mut rebound = vec![seed_slug.clone()];
+        tracing::info!(
+            "[RECREATE] Seeded new server with '{}' (auth={:?}); binding {} more",
+            seed_slug,
+            seed_auth,
+            resolved.len().saturating_sub(1)
+        );
+        for (slug, auth) in resolved.into_iter().skip(1) {
+            match client
+                .add_toolkit_to_server(&slug, auth.as_deref(), None)
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!("[RECREATE] Bound '{}' (auth={:?})", slug, auth);
+                    rebound.push(slug);
+                }
+                Err(e) => {
+                    tracing::warn!("[RECREATE] Failed to re-bind '{}': {}", slug, e);
+                    needs_reconnect.push(slug);
+                }
+            }
+        }
+
+        // Verify what actually persisted on the new server (config-level state,
+        // independent of what the MCP proxy exposes via tools/list).
+        match client.server_config_summary().await {
+            Ok((sid, toolkits, auth_ids)) => tracing::info!(
+                "[RECREATE] New server {} now has toolkits={:?} auth_config_ids={:?}",
+                sid,
+                toolkits,
+                auth_ids
+            ),
+            Err(e) => tracing::warn!("[RECREATE] Could not read new server config: {}", e),
+        }
+
+        // 5. Reload tools + refresh context/status.
+        let _ = self.reload_composio_tools(&updated).await;
+        mcp_context_signal.set(self.get_mcp_context(Some(profile_id)).await);
+        self.invalidate_status_cache();
+
+        tracing::info!(
+            "[RECREATE] Done: {} bound to server, {} could not resolve auth. NOTE: auth toolkits \
+             may still need a reconnect (OAuth) before their tools appear.",
+            rebound.len(),
+            needs_reconnect.len()
+        );
+        Ok((rebound, needs_reconnect))
     }
 
     pub async fn get_mcp_context(&self, profile_id: Option<String>) -> McpContext {
@@ -2933,23 +3244,28 @@ impl McpManager {
         // across all server contexts. Dynamic tools that collide with force-loaded
         // tools are excluded to prevent Gemini "Duplicate function declaration" 400 errors.
         let dynamic_tools = self.dynamic_composio_tools.lock().await;
-        if !dynamic_tools.is_empty() {
+        // Only this profile's on-demand tools — never another profile's bucket.
+        let profile_dynamic_tools: &[Tool] = dynamic_tools
+            .get(&dyn_composio_key(profile_id.as_deref()))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        if !profile_dynamic_tools.is_empty() {
             let existing_tool_names: HashSet<String> = server_contexts
                 .iter()
                 .flat_map(|sc| sc.tools.iter().map(|t| t.name.to_string()))
                 .collect();
 
-            let deduped_tools: Vec<Tool> = dynamic_tools
+            let deduped_tools: Vec<Tool> = profile_dynamic_tools
                 .iter()
                 .filter(|t| !existing_tool_names.contains(t.name.as_ref()))
                 .cloned()
                 .collect();
 
-            let skipped = dynamic_tools.len() - deduped_tools.len();
+            let skipped = profile_dynamic_tools.len() - deduped_tools.len();
             if skipped > 0 {
                 tracing::info!(
                     "Dynamic tools: {} total, {} skipped (already in force-loaded set), {} injected",
-                    dynamic_tools.len(), skipped, deduped_tools.len()
+                    profile_dynamic_tools.len(), skipped, deduped_tools.len()
                 );
             }
 
@@ -2981,10 +3297,9 @@ impl McpManager {
         // Populate connected toolkit slugs from cached Composio toolkit info (MCP-First, Section 6).
         // This is a pure cache read — no network calls. The cache is hydrated by
         // list_connected_toolkits() which uses the MCP `tools/list` endpoint.
-        let connected_toolkit_slugs = servers
-            .iter()
-            .find(|(k, _)| is_composio_native(k))
-            .and_then(|(_, client)| {
+        let connected_toolkit_slugs = active_composio_key(&servers, profile_id.as_deref())
+            .and_then(|k| servers.get(&k))
+            .and_then(|client| {
                 if let McpClientType::NativeComposio(ref composio_client) = client.service {
                     composio_client.get_cached_toolkit_info()
                 } else {
@@ -3044,8 +3359,11 @@ impl McpManager {
     ) -> Result<(), String> {
         let mut servers = self.servers.lock().await;
 
-        // Find the active composio-native client (may have profile suffix like "composio-native:ProfileName")
-        let composio_key = servers.keys().find(|k| is_composio_native(k)).cloned();
+        // Select the ACTIVE profile's composio-native client. A bare
+        // find(is_composio_native) can return a different profile's client when
+        // several profiles have connected, reloading the wrong profile's tools.
+        let active_profile_id = settings.get_active_profile().map(|p| p.id.clone());
+        let composio_key = active_composio_key(&servers, active_profile_id.as_deref());
 
         if let Some(key) = composio_key {
             if let Some(active_client) = servers.get_mut(&key) {
@@ -3093,6 +3411,30 @@ impl McpManager {
         }
     }
 
+    /// Undo the auth config / connected account created by a failed connect
+    /// attempt — but only when the toolkit had **no** pre-existing auth config,
+    /// so we never delete state an already-connected toolkit depends on.
+    /// Best-effort; deletes the account first (it references the config).
+    async fn rollback_partial_connect(
+        client: &crate::mcp::composio_client::ComposioClient,
+        toolkit_slug: &str,
+        auth_config_id: Option<&str>,
+        had_auth_config_before: bool,
+    ) {
+        if had_auth_config_before {
+            return;
+        }
+        let Some(acid) = auth_config_id else {
+            return;
+        };
+        tracing::warn!(
+            "[ROLLBACK] '{}' connect failed; removing the auth config/account created this attempt",
+            toolkit_slug
+        );
+        let _ = client.delete_toolkit_connections(toolkit_slug).await;
+        let _ = client.delete_auth_config(acid).await;
+    }
+
     /// Connect a toolkit to the natively managed Composio server.
     /// Encapsulates the 5-step lifecycle: AuthConfig, Registry (PATCH/Create),
     /// OAuth, and User Binding.
@@ -3103,6 +3445,7 @@ impl McpManager {
         toolkit_slug: String,
         auth_scheme: Option<String>,
         use_managed_auth: bool,
+        no_auth: bool,
         mut mcp_context_signal: Signal<McpContext>,
         mut settings_signal: Signal<Settings>,
         settings_manager: SettingsManager,
@@ -3113,10 +3456,11 @@ impl McpManager {
         mut connected_slugs: Signal<HashSet<String>>,
     ) -> Result<(), String> {
         tracing::info!(
-            "Consolidated 6-Point Connection: toolkit_slug={} (auth_scheme: {:?}, managed: {})",
+            "Consolidated 6-Point Connection: toolkit_slug={} (auth_scheme: {:?}, managed: {}, no_auth: {})",
             toolkit_slug,
             auth_scheme,
-            use_managed_auth
+            use_managed_auth,
+            no_auth
         );
 
         is_connecting.set(true);
@@ -3158,45 +3502,123 @@ impl McpManager {
             profile.chrome_profile_directory.clone(),
         );
 
-        // Step 1: Get or create auth config (reuse existing if available)
-        tracing::info!("[Step 1/5] Resolving Auth Config...");
-        let auth_config_id = match client.get_auth_config_id(&toolkit_slug).await {
-            Ok(id) => {
-                tracing::info!(
-                    "Resolved auth config '{}' for toolkit '{}'",
-                    id,
-                    toolkit_slug
-                );
-                id
+        // Authoritative no-auth check. The UI hint (no_auth param, from the
+        // catalog) is unreliable — Composio often signals no-auth only via
+        // auth_schemes=["NO_AUTH"], and get_auth_config_id can find/create a
+        // config without ever surfacing the 303 rejection. So when the hint is
+        // unset, confirm against the toolkit metadata before touching auth.
+        let requires_no_auth = if no_auth {
+            tracing::info!(
+                "[no-auth] '{}': UI hint no_auth=true — treating as no-auth",
+                toolkit_slug
+            );
+            true
+        } else {
+            match client.get_toolkit_metadata(&toolkit_slug).await {
+                Ok(meta) => {
+                    let decided = meta.requires_no_auth();
+                    tracing::info!(
+                        "[no-auth] '{}': metadata no_auth={:?} auth_schemes={:?} managed_schemes={:?} -> requires_no_auth={}",
+                        toolkit_slug,
+                        meta.no_auth,
+                        meta.auth_schemes,
+                        meta.composio_managed_auth_schemes,
+                        decided
+                    );
+                    decided
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[no-auth] '{}': metadata lookup FAILED ({}); assuming auth required",
+                        toolkit_slug,
+                        e
+                    );
+                    false
+                }
             }
-            Err(e) => {
-                let msg = format!("Failed to resolve auth config: {}", e);
-                tracing::error!("{}", msg);
-                connection_error.set(Some(msg.clone()));
-                is_connecting.set(false);
-                return Err(msg);
+        };
+
+        // For rollback scoping: did an auth config already exist before this
+        // attempt? If not and we fail mid-connect, we delete the config/account
+        // this attempt created so a failed connect leaves no orphan behind.
+        let had_auth_config_before = if requires_no_auth {
+            true // nothing to roll back for no-auth toolkits
+        } else {
+            client.has_existing_auth_config(&toolkit_slug).await
+        };
+
+        // Step 1: Get or create auth config (reuse existing if available).
+        // No-auth toolkits (e.g. hackernews) skip auth entirely: Composio
+        // rejects auth config creation for them with error code 303, and their
+        // tools work without a connected account.
+        let auth_config_id: Option<String> = if requires_no_auth {
+            tracing::info!(
+                "[Step 1/5] Toolkit '{}' requires no authentication — skipping auth config",
+                toolkit_slug
+            );
+            None
+        } else {
+            tracing::info!("[Step 1/5] Resolving Auth Config...");
+            match client.get_auth_config_id(&toolkit_slug).await {
+                Ok(id) => {
+                    tracing::info!(
+                        "Resolved auth config '{}' for toolkit '{}'",
+                        id,
+                        toolkit_slug
+                    );
+                    Some(id)
+                }
+                // Self-heal: registry listings sometimes omit the no_auth flag;
+                // Composio's 303 rejection is authoritative, so fall back to the
+                // no-auth path instead of failing the connection.
+                Err(e) if crate::mcp::composio_client::auth::is_no_auth_toolkit_error(&e) => {
+                    tracing::info!(
+                        "Toolkit '{}' reported as no-auth by Composio (code 303) — continuing without auth config",
+                        toolkit_slug
+                    );
+                    None
+                }
+                Err(e) => {
+                    let msg = format!("Failed to resolve auth config: {}", e);
+                    tracing::error!("{}", msg);
+                    connection_error.set(Some(msg.clone()));
+                    is_connecting.set(false);
+                    return Err(msg);
+                }
             }
         };
 
         // Step 2: Initiate OAuth (Proxy Link) - AUTH FIRST
-        tracing::info!("[Step 2/5] Initiating OAuth...");
-        connection_status.set("Authenticating...".to_string());
+        // Skipped for no-auth toolkits: there is no account to connect.
+        if auth_config_id.is_some() {
+            tracing::info!("[Step 2/5] Initiating OAuth...");
+            connection_status.set("Authenticating...".to_string());
 
-        match client
-            .initiate_connection(&toolkit_slug, &user_id, false)
-            .await
-        {
-            Ok(result_msg) => {
-                tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
-                // Wait implied by await
+            match client
+                .initiate_connection(&toolkit_slug, &user_id, false)
+                .await
+            {
+                Ok(result_msg) => {
+                    tracing::info!("Connection result for {}: {}", toolkit_slug, result_msg);
+                    // Wait implied by await
+                }
+                Err(e) => {
+                    let msg = format!("Authentication failed: {}", e);
+                    tracing::error!("{}", msg);
+                    Self::rollback_partial_connect(
+                        &client,
+                        &toolkit_slug,
+                        auth_config_id.as_deref(),
+                        had_auth_config_before,
+                    )
+                    .await;
+                    connection_error.set(Some(msg.clone()));
+                    is_connecting.set(false);
+                    return Err(msg);
+                }
             }
-            Err(e) => {
-                let msg = format!("Authentication failed: {}", e);
-                tracing::error!("{}", msg);
-                connection_error.set(Some(msg.clone()));
-                is_connecting.set(false);
-                return Err(msg);
-            }
+        } else {
+            tracing::info!("[Step 2/5] Skipping OAuth — no authentication required");
         }
 
         // Step 3: Add Toolkit to Server (PATCH Registry)
@@ -3207,7 +3629,7 @@ impl McpManager {
         // Step 4 will trigger LLM selection if tools exceed TOOL_SELECTION_THRESHOLD,
         // UNLESS admin has pre-configured allowed_tools (security override).
         let patch_result = client
-            .add_toolkit_to_server(&toolkit_slug, &auth_config_id, None)
+            .add_toolkit_to_server(&toolkit_slug, auth_config_id.as_deref(), None)
             .await;
 
         // Track admin-curated tools detected during PATCH for Step 4 skip logic
@@ -3277,6 +3699,13 @@ impl McpManager {
             Err(e) => {
                 let msg = format!("Failed to configure server: {}", e);
                 tracing::error!("{}", msg);
+                Self::rollback_partial_connect(
+                    &client,
+                    &toolkit_slug,
+                    auth_config_id.as_deref(),
+                    had_auth_config_before,
+                )
+                .await;
                 connection_error.set(Some(msg.clone()));
                 is_connecting.set(false);
                 return Err(msg);
@@ -3311,38 +3740,30 @@ impl McpManager {
                         let request =
                             ToolSelectionRequest::new(toolkit_slug.clone(), None, candidates);
 
-                        // Use the actively selected LLM provider for smart selection.
-                        // Fall back to any configured provider so selection still
-                        // works when the active provider has no credentials.
-                        let provider = {
-                            use crate::settings::LlmProvider;
-                            let active = settings_snapshot.active_llm;
-                            if settings_snapshot.is_provider_configured(active) {
-                                Some(active)
-                            } else {
-                                [
-                                    LlmProvider::Gemini,
-                                    LlmProvider::Claude,
-                                    LlmProvider::OpenAiCompat,
-                                ]
-                                .into_iter()
-                                .find(|p| settings_snapshot.is_provider_configured(*p))
-                            }
-                        };
+                        // Use the actively selected LLM connector for smart selection.
+                        // Fall back to any configured connector so selection still
+                        // works when the active one has no credentials.
+                        let instance = settings_snapshot
+                            .active_connector()
+                            .filter(|c| settings_snapshot.is_connector_configured(c))
+                            .or_else(|| {
+                                settings_snapshot
+                                    .llm_connectors
+                                    .iter()
+                                    .find(|c| settings_snapshot.is_connector_configured(c))
+                            })
+                            .cloned();
 
-                        let selection = match provider {
-                            Some(provider) => {
+                        let selection = match instance {
+                            Some(instance) => {
                                 tracing::info!(
-                                    "Tool selection using provider {:?} for toolkit '{}'",
-                                    provider,
+                                    "Tool selection using connector '{}' ({:?}) for toolkit '{}'",
+                                    instance.name,
+                                    instance.provider(),
                                     toolkit_slug
                                 );
-                                let model = settings_snapshot.chat_model_for(provider);
-                                let connector = crate::llm::build_connector_for(
-                                    &settings_snapshot,
-                                    provider,
-                                    &model,
-                                );
+                                let connector =
+                                    crate::llm::build_connector_for_instance(&instance, None);
                                 connector.select_tools_for_toolkit(&request).await
                             }
                             None => {
@@ -3374,7 +3795,7 @@ impl McpManager {
             if let Some(tools) = selected_tools.clone() {
                 tracing::info!("Applying smart selection of {} tools", tools.len());
                 if let Err(e) = client
-                    .add_toolkit_to_server(&toolkit_slug, &auth_config_id, Some(tools))
+                    .add_toolkit_to_server(&toolkit_slug, auth_config_id.as_deref(), Some(tools))
                     .await
                 {
                     tracing::warn!("Failed to apply smart tool selection: {}", e);
@@ -3385,13 +3806,26 @@ impl McpManager {
         // Step 5: Final Reload
         tracing::info!("[Step 5/5] Finalizing Configuration...");
         {
+            // Authoritative no-auth signal: auth resolution ended without an
+            // auth config (covers both the caller's hint and the 303 self-heal).
+            let effective_no_auth = auth_config_id.is_none();
+            tracing::info!(
+                "[no-auth] '{}': persisting no_auth={} (auth_config_id={:?})",
+                toolkit_slug,
+                effective_no_auth,
+                auth_config_id
+            );
             let mut s = settings_signal.write();
             if let Some(profile) = s.get_active_profile_mut() {
-                if !profile
+                if let Some(existing) = profile
                     .toolkit_configs
-                    .iter()
-                    .any(|c| c.slug == toolkit_slug)
+                    .iter_mut()
+                    .find(|c| c.slug == toolkit_slug)
                 {
+                    // Keep the no-auth flag current (a no-auth toolkit has no
+                    // connected account, so this flag is what marks it connected).
+                    existing.no_auth = effective_no_auth;
+                } else {
                     profile
                         .toolkit_configs
                         .push(crate::settings::ComposioToolkitConfig {
@@ -3400,6 +3834,7 @@ impl McpManager {
                             tool_count: 0,
                             force_load: false,
                             load_mode: crate::settings::ToolkitLoadMode::OnDemand,
+                            no_auth: effective_no_auth,
                         });
                 }
             }
@@ -3416,8 +3851,9 @@ impl McpManager {
             tracing::warn!("Failed to reload tools: {}", e);
         }
 
-        // Update Context
-        mcp_context_signal.set(self.get_mcp_context(None).await);
+        // Update Context — scope to the active profile so we don't surface a
+        // different profile's Composio tools right after connecting.
+        mcp_context_signal.set(self.get_mcp_context(Some(profile_id.clone())).await);
         self.invalidate_status_cache();
 
         let current_trigger = *trigger_search.peek();
@@ -3573,9 +4009,17 @@ impl McpManager {
         // Special handling for the native Composio client - it's not in configs
         // but could still be active or failed. Now uses "composio-native:{profile}" format.
         {
-            // Find any active composio-native client (may have profile suffix)
+            // Select the ACTIVE profile's composio-native client so the status
+            // card reports the current profile's tools, not an arbitrary
+            // profile's (several accumulate once multiple profiles connect).
+            let active_profile_id = self
+                .settings
+                .peek()
+                .get_active_profile()
+                .map(|p| p.id.clone());
             let active_composio: Option<(&String, &ActiveMcpClient)> =
-                servers.iter().find(|(k, _)| is_composio_native(k));
+                active_composio_key(&servers, active_profile_id.as_deref())
+                    .and_then(|k| servers.get_key_value(&k));
 
             // Find any failed composio-native client
             let failed_composio: Option<(&String, &(McpServerConfig, String))> =

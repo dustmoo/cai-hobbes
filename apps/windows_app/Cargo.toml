@@ -65,6 +65,8 @@ serde_norway = "0.9.42"
 regex = "1.10"
 sublime_fuzzy = "0.7.0"
 json2markdown = "0.2.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+notify = "8.2.0"
 
 # macOS-specific dependencies (needed when checking on macOS dev machines)
 [target.'cfg(target_os = "macos")'.dependencies]

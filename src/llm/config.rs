@@ -2,6 +2,14 @@ use super::claude_models::ClaudeModel;
 use super::gemini::GeminiModel;
 use serde::{Deserialize, Serialize};
 
+/// Minimum context window (in tokens) below which Hobbes — a tool-calling
+/// harness — is prone to degraded behavior. The system prompt plus MCP tool
+/// definitions alone routinely consume ~5–7K tokens, so a smaller window
+/// leaves little room for tool results; the model then loops, re-requesting
+/// data that has been truncated out of its context. Surfaced as a warning at
+/// connector set-time (Settings) and as a banner in chat.
+pub const RECOMMENDED_MIN_CONTEXT_TOKENS: usize = 16_384;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GeminiConfig {
     #[serde(skip)]
@@ -314,6 +322,79 @@ impl Default for ClaudeConfig {
             extended_thinking: false,
             model_slots: default_claude_model_slots(),
             context_tuning: ContextTuningPreset::default(),
+        }
+    }
+}
+
+/// Provider-kind-tagged config payload for a named connector instance.
+/// Wraps the existing per-provider config structs; their `#[serde(skip)]`
+/// api_key fields carry through, so keys never land in settings.json.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderInstanceConfig {
+    Gemini(GeminiConfig),
+    OpenAiCompat(OpenAiCompatConfig),
+    Claude(ClaudeConfig),
+}
+
+impl ProviderInstanceConfig {
+    /// The provider kind of this config.
+    pub fn provider(&self) -> crate::settings::LlmProvider {
+        match self {
+            Self::Gemini(_) => crate::settings::LlmProvider::Gemini,
+            Self::OpenAiCompat(_) => crate::settings::LlmProvider::OpenAiCompat,
+            Self::Claude(_) => crate::settings::LlmProvider::Claude,
+        }
+    }
+
+    /// A default config of the given kind (used when adding a new connector).
+    pub fn default_for(provider: crate::settings::LlmProvider) -> Self {
+        match provider {
+            crate::settings::LlmProvider::Gemini => Self::Gemini(GeminiConfig::default()),
+            crate::settings::LlmProvider::OpenAiCompat => {
+                Self::OpenAiCompat(OpenAiCompatConfig::default())
+            }
+            crate::settings::LlmProvider::Claude => Self::Claude(ClaudeConfig::default()),
+        }
+    }
+
+    pub fn chat_model(&self) -> String {
+        match self {
+            Self::Gemini(c) => c.chat_model.clone(),
+            Self::OpenAiCompat(c) => c.model.clone(),
+            Self::Claude(c) => c.model.clone(),
+        }
+    }
+
+    pub fn model_slots(&self) -> &Vec<String> {
+        match self {
+            Self::Gemini(c) => &c.model_slots,
+            Self::OpenAiCompat(c) => &c.model_slots,
+            Self::Claude(c) => &c.model_slots,
+        }
+    }
+
+    pub fn context_tuning(&self) -> &ContextTuningPreset {
+        match self {
+            Self::Gemini(c) => &c.context_tuning,
+            Self::OpenAiCompat(c) => &c.context_tuning,
+            Self::Claude(c) => &c.context_tuning,
+        }
+    }
+
+    pub fn api_key(&self) -> Option<&String> {
+        match self {
+            Self::Gemini(c) => c.api_key.as_ref(),
+            Self::OpenAiCompat(c) => c.api_key.as_ref(),
+            Self::Claude(c) => c.api_key.as_ref(),
+        }
+    }
+
+    pub fn set_api_key(&mut self, key: Option<String>) {
+        match self {
+            Self::Gemini(c) => c.api_key = key,
+            Self::OpenAiCompat(c) => c.api_key = key,
+            Self::Claude(c) => c.api_key = key,
         }
     }
 }

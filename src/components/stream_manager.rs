@@ -27,6 +27,8 @@ pub struct StreamManagerContext {
     continuation_controller: Signal<ContinuationController>,
     scheduler: Coroutine<SchedulerSignal>,
     permission_manager: Signal<crate::context::permissions::PermissionManager>,
+    skill_registry: Signal<crate::skills::SkillRegistry>,
+    mcp_context: Signal<crate::mcp::manager::McpContext>,
     pub stream_activity: Signal<u64>,
     pub streaming_sessions: Signal<HashSet<String>>,
     stream_session_map: Signal<HashMap<Uuid, String>>,
@@ -69,15 +71,32 @@ impl StreamManagerContext {
             .map(|(mid, _)| *mid)
     }
 
-    /// The provider a session resolves to (session override → global settings).
-    fn effective_provider(&self, session_id: &str) -> crate::settings::LlmProvider {
+    /// The connector instance a session resolves to (session pin → legacy kind
+    /// match → global active connector). Cloned so no locks are held.
+    fn effective_connector(&self, session_id: &str) -> Option<crate::settings::ProviderInstance> {
         let settings = self.settings.read();
-        self.session_state
-            .read()
-            .sessions
-            .get(session_id)
-            .map(|s| settings.provider_for_session(s))
-            .unwrap_or(settings.active_llm)
+        let state = self.session_state.read();
+        match state.sessions.get(session_id) {
+            Some(s) => settings.connector_for_session(s).cloned(),
+            None => settings.active_connector().cloned(),
+        }
+    }
+
+    /// The session's resolved OpenAI-compat config when watch-word recovery
+    /// is enabled on it. Watch words are a per-instance OpenAI-compat
+    /// feature: gate on the session's resolved connector config, not the
+    /// global one.
+    fn watch_word_config(&self, session_id: &str) -> Option<crate::settings::OpenAiCompatConfig> {
+        self.effective_connector(session_id).and_then(|inst| {
+            match inst.config {
+                crate::settings::ProviderInstanceConfig::OpenAiCompat(c)
+                    if c.watch_words_enabled =>
+                {
+                    Some(c)
+                }
+                _ => None,
+            }
+        })
     }
 
     /// The chat model a session resolves to (session override → provider default).
@@ -93,31 +112,40 @@ impl StreamManagerContext {
     /// overrides match the global selection) use the shared global connector;
     /// otherwise a connector is built for the session's provider + model.
     fn connector_for_session(&self, session_id: &str) -> Arc<dyn crate::llm::LlmConnector> {
-        let (provider, model, matches_global) = {
+        let (instance, model, matches_global) = {
             let settings = self.settings.read();
             let state = self.session_state.read();
-            let (provider, model) = match state.sessions.get(session_id) {
-                Some(s) => (
-                    settings.provider_for_session(s),
-                    settings.chat_model_for_session(s),
-                ),
-                None => (settings.active_llm, settings.active_chat_model()),
+            let instance = match state.sessions.get(session_id) {
+                Some(s) => settings.connector_for_session(s).cloned(),
+                None => settings.active_connector().cloned(),
             };
-            let matches_global =
-                provider == settings.active_llm && model == settings.active_chat_model();
-            (provider, model, matches_global)
+            let model = match state.sessions.get(session_id) {
+                Some(s) => settings.chat_model_for_session(s),
+                None => settings.active_chat_model(),
+            };
+            // Reuse the shared global connector only when the session resolves
+            // to the same connector INSTANCE (by id) and the same model.
+            let matches_global = match (&instance, settings.active_connector()) {
+                (Some(inst), Some(active)) => {
+                    inst.id == active.id && model == active.config.chat_model()
+                }
+                _ => true, // no connectors configured — only the global one exists
+            };
+            (instance, model, matches_global)
         };
 
-        if matches_global {
-            self.llm_connector.read().clone()
-        } else {
-            tracing::info!(
-                session_id,
-                provider = provider.display_name(),
-                model,
-                "Session overrides global LLM selection — building session connector"
-            );
-            crate::llm::build_connector_for(&self.settings.read(), provider, &model)
+        match (matches_global, instance) {
+            (false, Some(inst)) => {
+                tracing::info!(
+                    session_id,
+                    connector = %inst.name,
+                    provider = inst.provider().display_name(),
+                    model,
+                    "Session overrides global LLM selection — building session connector"
+                );
+                crate::llm::build_connector_for_instance(&inst, Some(&model))
+            }
+            _ => self.llm_connector.read().clone(),
         }
     }
 
@@ -278,36 +306,52 @@ impl StreamManagerContext {
                             && crate::llm::context_cache::is_context_overflow(&error_msg)
                         {
                             context_retry_count += 1;
-                            let (provider, model, scope, chars_per_token) = {
+                            let (instance, model, scope, chars_per_token) = {
                                 let settings = self.settings.read();
                                 let state = self.session_state.read();
                                 let session = state.sessions.get(&session_id);
-                                let provider = session
-                                    .map(|s| settings.provider_for_session(s))
-                                    .unwrap_or(settings.active_llm);
+                                let instance = session
+                                    .and_then(|s| settings.connector_for_session(s))
+                                    .or_else(|| settings.active_connector())
+                                    .cloned();
                                 let model = session
                                     .map(|s| settings.chat_model_for_session(s))
                                     .unwrap_or_else(|| settings.active_chat_model());
-                                let scope = match provider {
-                                    crate::settings::LlmProvider::OpenAiCompat => {
-                                        settings.openai_compat_config.endpoint.clone()
+                                let scope = match instance.as_ref().map(|i| &i.config) {
+                                    Some(crate::settings::ProviderInstanceConfig::OpenAiCompat(
+                                        c,
+                                    )) => c.endpoint.clone(),
+                                    Some(crate::settings::ProviderInstanceConfig::Claude(_)) => {
+                                        "claude".to_string()
                                     }
-                                    crate::settings::LlmProvider::Claude => "claude".to_string(),
-                                    crate::settings::LlmProvider::Gemini => "gemini".to_string(),
+                                    _ => "gemini".to_string(),
                                 };
-                                let cpt =
-                                    settings.effective_context_tuning_for(provider).chars_per_token;
-                                (provider, model, scope, cpt)
+                                let cpt = instance
+                                    .as_ref()
+                                    .map(|i| {
+                                        settings
+                                            .effective_context_tuning_for_connector(i)
+                                            .chars_per_token
+                                    })
+                                    .unwrap_or_else(|| {
+                                        settings
+                                            .effective_context_tuning_for(settings.active_llm)
+                                            .chars_per_token
+                                    });
+                                (instance, model, scope, cpt)
                             };
 
                             // The connector may already have recorded an explicit
-                            // limit parsed from the raw body; resolve_context_window_for
-                            // reflects it. Shrink to 80% of the best estimate (8k floor)
-                            // so we make progress even when no exact number was given.
-                            let current = self
-                                .settings
-                                .read()
-                                .resolve_context_window_for(provider, &model)
+                            // limit parsed from the raw body; the resolver reflects it.
+                            // Shrink to 80% of the best estimate (8k floor) so we make
+                            // progress even when no exact number was given.
+                            let current = instance
+                                .as_ref()
+                                .and_then(|i| {
+                                    self.settings
+                                        .read()
+                                        .resolve_context_window_for_connector(i, &model)
+                                })
                                 .unwrap_or(128_000);
                             let new_window = current.saturating_sub(current / 5).max(8_000);
                             crate::llm::context_cache::record_window(&scope, &model, new_window);
@@ -538,6 +582,154 @@ impl StreamManagerContext {
                                     session_state.write().handle_scratchpad_update(&args_json, &session_id_inner, &self.settings.read());
 
                                 // Persist so the scratchpad survives app restart
+                                {
+                                    let mut state = session_state.write();
+                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
+                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                                            tc.status = status;
+                                            tc.response = response_str.clone();
+                                        }
+                                    }
+                                    state.touch_session(&session_id_inner);
+                                }
+                                crate::session::SessionState::save_async(&session_state.read(), None);
+
+                                let record = crate::components::shared::ToolCallRecord {
+                                    call: tool_call.clone(),
+                                    result: crate::components::shared::ToolResult {
+                                        status,
+                                        response: response_str,
+                                    },
+                                    profile_color: {
+                                        let settings_read = self.settings.read();
+                                        crate::components::shared::resolve_profile_color(
+                                            profile_id.as_ref(),
+                                            &settings_read,
+                                        )
+                                    },
+                                };
+                                let _ = tool_results_tx_clone.send(record);
+                                completed_tool_tasks_clone
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            }
+
+                            // Intercept HOBBES_INVOKE_SKILL before MCP dispatch — the
+                            // model-invocation path for skills. Executes the skill
+                            // (capability registration only), persists the payload into
+                            // session.loaded_skills, and returns the instruction manual
+                            // as the tool result.
+                            if tool_call.tool_name == "HOBBES_INVOKE_SKILL" {
+                                let skill_name = args_json
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let arguments = args_json
+                                    .get("arguments")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                let skill_opt = self.skill_registry.read().get_skill(&skill_name);
+                                let (status, response_str) = match skill_opt {
+                                    None => (
+                                        ToolCallStatus::Error,
+                                        format!(
+                                            "Skill '{}' not found. Only skills listed under available_skills in your system context can be invoked.",
+                                            skill_name
+                                        ),
+                                    ),
+                                    Some(skill) if skill.metadata.disable_model_invocation => (
+                                        ToolCallStatus::Error,
+                                        format!(
+                                            "Skill '{}' has model invocation disabled. The user must invoke it themselves with /{}.",
+                                            skill_name, skill_name
+                                        ),
+                                    ),
+                                    Some(skill) => {
+                                        let permission = self
+                                            .permission_manager
+                                            .read()
+                                            .check_skill_permission(&skill.metadata.name);
+                                        if permission
+                                            != crate::context::permissions::PermissionStatus::Allowed
+                                        {
+                                            (
+                                                ToolCallStatus::Error,
+                                                format!(
+                                                    "The user has disabled auto-approval for skill '{}'. Ask them to run /{} themselves or enable the skill in Settings → Permissions.",
+                                                    skill_name, skill_name
+                                                ),
+                                            )
+                                        } else {
+                                            let mut skill_call =
+                                                crate::components::shared::SkillCall {
+                                                    execution_id: uuid::Uuid::new_v4().to_string(),
+                                                    skill_name: skill.metadata.name.clone(),
+                                                    arguments,
+                                                    status: crate::components::shared::SkillCallStatus::Running,
+                                                    response: String::new(),
+                                                    instructions: skill.instructions.clone(),
+                                                    path: skill.path.clone(),
+                                                    has_scripts: !skill.scripts.is_empty(),
+                                                    raw_output: None,
+                                                    profile_color: {
+                                                        let settings_read = self.settings.read();
+                                                        crate::components::shared::resolve_profile_color(
+                                                            profile_id.as_ref(),
+                                                            &settings_read,
+                                                        )
+                                                    },
+                                                };
+                                            let mcp_context = {
+                                                // Use the reactively-synced McpContext signal
+                                                // (P-001: never get_mcp_context().await mid-turn)
+                                                let mut ctx = self.mcp_context.read().clone();
+                                                ctx.enrich_from_settings(&self.settings.read());
+                                                ctx
+                                            };
+                                            match crate::skills::execute_skill(
+                                                &mut skill_call,
+                                                Some(&mcp_context),
+                                            )
+                                            .await
+                                            {
+                                                Ok(result) => {
+                                                    let completed = result.status
+                                                        == crate::components::shared::SkillCallStatus::Completed;
+                                                    if completed {
+                                                        // Persist so the skill stays in system
+                                                        // context for all future turns
+                                                        let mut state = session_state.write();
+                                                        if let Some(session) = state
+                                                            .sessions
+                                                            .get_mut(&session_id_inner)
+                                                        {
+                                                            session.loaded_skills.insert(
+                                                                skill_call.skill_name.clone(),
+                                                                result.output.clone(),
+                                                            );
+                                                        }
+                                                        drop(state);
+                                                        tracing::info!(
+                                                            "Model invoked skill '{}' — persisted into session.loaded_skills",
+                                                            skill_call.skill_name
+                                                        );
+                                                        (ToolCallStatus::Completed, result.output)
+                                                    } else {
+                                                        (ToolCallStatus::Error, result.output)
+                                                    }
+                                                }
+                                                Err(e) => (
+                                                    ToolCallStatus::Error,
+                                                    format!("Skill invocation failed: {}", e),
+                                                ),
+                                            }
+                                        }
+                                    }
+                                };
+
                                 {
                                     let mut state = session_state.write();
                                     if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
@@ -1006,18 +1198,16 @@ impl StreamManagerContext {
                     let (tuning, context_tokens, enable_summarization) = {
                         let settings_guard = self.settings.read();
                         let state_guard = self.session_state.read();
-                        let (provider, model) = match state_guard.sessions.get(&session_id) {
-                            Some(s) => (
-                                settings_guard.provider_for_session(s),
-                                settings_guard.chat_model_for_session(s),
-                            ),
-                            None => (settings_guard.active_llm, settings_guard.active_chat_model()),
-                        };
-                        (
-                            settings_guard.effective_context_tuning_for(provider),
-                            settings_guard.resolve_context_window_for(provider, &model),
-                            settings_guard.enable_summarization,
-                        )
+                        let session = state_guard.sessions.get(&session_id);
+                        let instance = session
+                            .and_then(|s| settings_guard.connector_for_session(s))
+                            .or_else(|| settings_guard.active_connector());
+                        let model = session
+                            .map(|s| settings_guard.chat_model_for_session(s))
+                            .unwrap_or_else(|| settings_guard.active_chat_model());
+                        let (tuning, context_tokens) =
+                            settings_guard.tuning_and_window(instance, &model);
+                        (tuning, context_tokens, settings_guard.enable_summarization)
                     };
                     // Compute a dynamic threshold: how many messages actually fit
                     // in this model's context budget, then trigger summarization
@@ -1168,13 +1358,8 @@ impl StreamManagerContext {
             // (e.g., "error decoding response body") and auto-recovery is enabled,
             // retry the continuation instead of leaving the user stranded.
             if stream_error_occurred {
-                let session_provider = self.effective_provider(&session_id);
-                let settings = self.settings.read();
-                if session_provider == crate::settings::LlmProvider::OpenAiCompat
-                    && settings.openai_compat_config.watch_words_enabled
-                {
-                    let max_recoveries = settings.openai_compat_config.max_watch_word_recoveries;
-                    drop(settings);
+                if let Some(recovery_config) = self.watch_word_config(&session_id) {
+                    let max_recoveries = recovery_config.max_watch_word_recoveries;
 
                     let recovery_count = self.session_state.read().sessions.get(&session_id)
                         .map(|s| s.watch_word_recovery_count).unwrap_or(0);
@@ -1325,13 +1510,13 @@ impl StreamManagerContext {
             let Some(session) = state.sessions.get(session_id) else {
                 return;
             };
-            let provider = settings.provider_for_session(session);
             let model = settings.chat_model_for_session(session);
-            let tuning = settings.effective_context_tuning_for(provider);
+            let (tuning, context_tokens) =
+                settings.tuning_and_window(settings.connector_for_session(session), &model);
             // A result smaller than its eventual historical budget will always
             // fit and never needs a summary; only summarize ones that would be
             // compressed later.
-            let threshold = match settings.resolve_context_window_for(provider, &model) {
+            let threshold = match context_tokens {
                 Some(tokens) => {
                     let total = tokens as f64
                         * tuning.chars_per_token
@@ -1406,19 +1591,14 @@ impl StreamManagerContext {
         final_text: &str,
         message_id: &Uuid,
     ) -> bool {
-        let session_provider = self.effective_provider(session_id);
-        let settings = self.settings.read();
-        if session_provider != crate::settings::LlmProvider::OpenAiCompat
-            || !settings.openai_compat_config.watch_words_enabled
-            || final_text.is_empty()
-        {
-            return false;
-        }
+        let watch_config = match self.watch_word_config(session_id) {
+            Some(c) if !final_text.is_empty() => c,
+            _ => return false,
+        };
 
-        let max_recoveries = settings.openai_compat_config.max_watch_word_recoveries;
-        let max_response_chars = settings.openai_compat_config.watch_word_max_response_chars;
-        let watch_words = settings.openai_compat_config.watch_words.clone();
-        drop(settings); // Release before accessing session_state
+        let max_recoveries = watch_config.max_watch_word_recoveries;
+        let max_response_chars = watch_config.watch_word_max_response_chars;
+        let watch_words = watch_config.watch_words;
 
         // Skip watch word detection on long responses — they're almost
         // certainly complete even if they contain a watch word pattern.
@@ -1639,6 +1819,8 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         continuation_controller,
         scheduler,
         permission_manager,
+        skill_registry: consume_context::<Signal<crate::skills::SkillRegistry>>(),
+        mcp_context: consume_context::<Signal<crate::mcp::manager::McpContext>>(),
         stream_activity: Signal::new(0),
         streaming_sessions: Signal::new(HashSet::new()),
         stream_session_map: Signal::new(HashMap::new()),
@@ -1698,6 +1880,11 @@ mod tests {
                 continuation_controller,
                 scheduler,
                 permission_manager,
+                skill_registry: Signal::new(crate::skills::SkillRegistry::new()),
+                mcp_context: Signal::new(crate::mcp::manager::McpContext {
+                    servers: Vec::new(),
+                    connected_toolkit_slugs: Vec::new(),
+                }),
                 stream_activity: Signal::new(0),
                 streaming_sessions: Signal::new(HashSet::new()),
                 stream_session_map: Signal::new(HashMap::new()),
@@ -1771,6 +1958,11 @@ mod tests {
                 continuation_controller,
                 scheduler,
                 permission_manager,
+                skill_registry: Signal::new(crate::skills::SkillRegistry::new()),
+                mcp_context: Signal::new(crate::mcp::manager::McpContext {
+                    servers: Vec::new(),
+                    connected_toolkit_slugs: Vec::new(),
+                }),
                 stream_activity: Signal::new(0),
                 streaming_sessions: Signal::new(HashSet::new()),
                 stream_session_map: Signal::new(HashMap::new()),

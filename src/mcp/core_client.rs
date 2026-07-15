@@ -78,6 +78,39 @@ impl CoreClient {
                 meta: None,
             },
             Tool {
+                name: "HOBBES_INVOKE_SKILL".into(),
+                description: Some(
+                    "Load one of the available skills (listed in your system context under \
+                    'available_skills') into this session. Returns the skill's full instruction \
+                    manual and resolved tool capabilities; the skill then stays loaded for the \
+                    rest of the session. Only invoke a skill that clearly matches the user's \
+                    current request."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Exact name of the skill to load (from available_skills)."
+                            },
+                            "arguments": {
+                                "type": "string",
+                                "description": "Optional arguments for the skill, like the text after /name when a user invokes it."
+                            }
+                        },
+                        "required": ["name"]
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("Invoke Skill".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            Tool {
                 name: "HOBBES_SET_TIMER".into(),
                 description: Some(
                     "Schedule a timer/reminder. When it fires, Hobbes brings its window to the \

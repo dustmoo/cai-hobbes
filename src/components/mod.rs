@@ -12,6 +12,7 @@ pub mod session_manager;
 pub mod settings_panel;
 pub mod skill_autocomplete;
 pub mod skill_call_display;
+pub mod skill_editor;
 pub mod stream_manager;
 pub mod syntax_highlighter;
 pub mod tab_bar;

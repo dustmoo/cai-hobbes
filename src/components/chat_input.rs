@@ -47,9 +47,9 @@ pub enum ChatCommand {
     SwitchProfile(usize),
     /// Switch the current session's model to the model at this index in the available models list.
     SwitchModel(usize),
-    /// Switch the current session's LLM provider to the provider at this index
-    /// in `LlmProvider::all_variants()`.
-    SwitchProvider(usize),
+    /// Switch the current session's LLM connector to the instance with this
+    /// stable ID in `Settings::llm_connectors`.
+    SwitchConnector(String),
     /// Toggle the model selector dropdown in the chat bar.
     #[allow(dead_code)] // Constructed and consumed locally via signal pattern
     ToggleModelSelector,
@@ -136,6 +136,10 @@ pub fn ChatInput(
     let mut skill_autocomplete_index = use_signal(|| 0usize);
     let mut filtered_skills = use_signal(Vec::<Skill>::new);
     let mut autocomplete_mode = use_signal(|| AutocompleteMode::Skill);
+    // Byte range of the in-progress /token in the draft (cursor-aware
+    // autocomplete); selection splices into this range instead of rewriting
+    // the whole draft.
+    let mut autocomplete_token: Signal<Option<(usize, usize)>> = use_signal(|| None);
 
     // Active Focus Management: Reclaim focus when context reverts to ChatInput
     use_effect(move || {
@@ -177,7 +181,7 @@ pub fn ChatInput(
                 | ChatCommand::DeleteSession(_)
                 | ChatCommand::SwitchProfile(_)
                 | ChatCommand::SwitchModel(_)
-                | ChatCommand::SwitchProvider(_)
+                | ChatCommand::SwitchConnector(_)
                 | ChatCommand::CloseTab => {
                     // Handled globally in main.rs
                 }
@@ -247,27 +251,12 @@ pub fn ChatInput(
                 }
                 ChatCommand::CopyToDraft(text) => {
                     tracing::info!("ChatCommand::CopyToDraft triggered: {} chars", text.len());
-                    draft.set(text);
+                    crate::components::shared::set_chat_draft(draft, text, None, false);
                 }
                 ChatCommand::RestoreToDraft(text, restore_attachments) => {
                     tracing::info!("ChatCommand::RestoreToDraft triggered: {} chars, {} attachments", text.len(), restore_attachments.len());
-                    draft.set(text);
+                    crate::components::shared::set_chat_draft(draft, text, None, true);
                     attachments.set(restore_attachments);
-                    // Resize the textarea to fit the restored content and focus it.
-                    // requestAnimationFrame ensures the DOM has updated with the new
-                    // value before we measure scrollHeight.
-                    spawn(async move {
-                        let _ = document::eval(r#"
-                            const el = document.getElementById('chat-textarea');
-                            if (el) {
-                                el.focus();
-                                requestAnimationFrame(() => {
-                                    el.style.height = 'auto';
-                                    el.style.height = (el.scrollHeight) + 'px';
-                                });
-                            }
-                        "#);
-                    });
                 }
                 ChatCommand::TriggerAiAnalysis => {
                     tracing::info!("ChatCommand::TriggerAiAnalysis triggered");
@@ -293,8 +282,9 @@ pub fn ChatInput(
     // draft may hold unrelated live text; clearing it is the caller's job.
     let submit = use_callback(move |(user_message, atts): (String, Vec<Attachment>)| {
         // Skill Command Detection
-        if user_message.starts_with('/') {
-            // /unload command — remove a loaded skill from session context
+        {
+            // /unload command — remove a loaded skill from session context.
+            // Stays prefix-only: it is a control command, not a skill.
             let trimmed = user_message.trim();
             if trimmed.starts_with("/unload ") {
                 let skill_name = trimmed.trim_start_matches("/unload ").trim();
@@ -325,16 +315,24 @@ pub fn ChatInput(
                 return;
             }
 
-            let parts: Vec<&str> = user_message.split_whitespace().collect();
-            if !parts.is_empty() {
-                let skill_name = parts[0].trim_start_matches('/');
-                let skill_opt = {
+            // Detect a /skill token at the start of any line so users can
+            // write explanatory context and invoke a skill in the same
+            // message; mid-sentence mentions of a skill stay plain text. The
+            // surrounding text reaches the skill turn via normal history.
+            let invocation = {
+                let registry = skill_registry.read();
+                crate::skills::invocation::detect_skill_invocation(&user_message, |name| {
+                    registry.get_skill(name).is_some()
+                })
+            };
+            {
+                let skill_opt = invocation.as_ref().and_then(|inv| {
                     let registry = skill_registry.read();
-                    registry.get_skill(skill_name)
-                };
+                    registry.get_skill(&inv.skill_name)
+                });
 
-                if let Some(skill) = skill_opt {
-                    let arguments = parts[1..].join(" ");
+                if let (Some(skill), Some(inv)) = (skill_opt, invocation) {
+                    let arguments = inv.arguments;
                     let permission_status = permission_manager
                         .read()
                         .check_skill_permission(&skill.metadata.name);
@@ -388,7 +386,7 @@ pub fn ChatInput(
                     if permission_status == crate::context::permissions::PermissionStatus::Allowed {
                         // AUTO-EXECUTE PATH
                         if cfg!(debug_assertions) {
-                            tracing::info!("[Auto-executing: /{}]", skill_name);
+                            tracing::info!("[Auto-executing: /{}]", skill.metadata.name);
                         }
 
                         let skill_message = crate::components::chat::Message {
@@ -529,7 +527,7 @@ pub fn ChatInput(
                     &session_id,
                     QueuedMessage::new(user_message, atts),
                 );
-                draft.set(String::new());
+                crate::components::shared::set_chat_draft(draft, String::new(), None, false);
                 attachments.set(Vec::new());
                 reset_textarea_height();
             }
@@ -539,7 +537,7 @@ pub fn ChatInput(
         }
 
         submit.call((user_message, atts));
-        draft.set(String::new());
+        crate::components::shared::set_chat_draft(draft, String::new(), None, false);
         attachments.set(Vec::new());
         reset_textarea_height();
     };
@@ -725,50 +723,67 @@ pub fn ChatInput(
                 }
                 SessionCostIcon {}
 
-                // LLM Provider Selector (session-scoped, mirrors the profile picker)
+                // LLM Connector Selector (session-scoped, mirrors the profile picker)
                 { if ui_state.read().show_provider_selector {
                     {
-                        let active_provider = {
+                        // The session's resolved connector (pin → legacy kind → global active)
+                        let active_instance = {
                             let settings_read = settings.read();
                             session_state.read().get_active_session()
-                                .map(|s| settings_read.provider_for_session(s))
-                                .unwrap_or(settings_read.active_llm)
+                                .and_then(|s| settings_read.connector_for_session(s).cloned())
+                                .or_else(|| settings_read.active_connector().cloned())
                         };
-                        let other_providers: Vec<(usize, LlmProvider)> = LlmProvider::all_variants()
+                        let active_id = active_instance.as_ref().map(|c| c.id.clone());
+                        // Every connector, in canonical order — the index drives the
+                        // ⇧⌥⌘{n} hotkey hint. The session's current connector is shown
+                        // highlighted rather than hidden.
+                        let all_connectors: Vec<(usize, crate::settings::ProviderInstance)> = settings
+                            .read()
+                            .llm_connectors
                             .iter()
-                            .copied()
+                            .cloned()
                             .enumerate()
-                            .filter(|(_, p)| *p != active_provider)
                             .collect();
 
-                        if !other_providers.is_empty() {
+                        if let (Some(active), true) = (active_instance, all_connectors.len() > 1) {
+                            let active_provider = active.provider();
                             rsx! {
                                 div {
                                     class: "relative",
                                     button {
                                         class: format!("w-8 h-8 rounded-full {} border border-subtle flex items-center justify-center text-xs font-bold text-fg hover:brightness-110 hover:border-primary-500 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600 shadow-md", active_provider.color_class()),
-                                        title: "Provider: {active_provider.display_name()}",
+                                        title: "Connector: {active.name} ({active_provider.display_name()})",
                                         onclick: move |_| show_provider_selector.set(!show_provider_selector()),
-                                        "{active_provider.initial()}"
+                                        "{active.initial()}"
                                     }
 
                                     if show_provider_selector() {
                                         div {
                                             class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
-                                            for (index, provider) in other_providers.into_iter() {
+                                            for (index, instance) in all_connectors.into_iter() {
                                                 {
-                                                    let configured = settings.read().is_provider_configured(provider);
+                                                    let configured = settings.read().is_connector_configured(&instance);
+                                                    let is_current = Some(&instance.id) == active_id.as_ref();
+                                                    let provider = instance.provider();
+                                                    let connector_id = instance.id.clone();
+                                                    let name = instance.name.clone();
+                                                    let initial = instance.initial();
+                                                    let row_class: &'static str = if is_current {
+                                                        "w-full text-left px-4 py-2 text-sm text-fg bg-primary-900/40 transition-colors flex items-center justify-between"
+                                                    } else if configured {
+                                                        "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between"
+                                                    } else {
+                                                        "w-full text-left px-4 py-2 text-sm text-fg-muted/40 hover:bg-primary-900/50 hover:text-fg-muted transition-colors flex items-center justify-between"
+                                                    };
 
                                                     rsx! {
                                                         button {
-                                                            class: if configured {
-                                                                "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between"
-                                                            } else {
-                                                                "w-full text-left px-4 py-2 text-sm text-fg-muted/40 hover:bg-primary-900/50 hover:text-fg-muted transition-colors flex items-center justify-between"
-                                                            },
+                                                            class: "{row_class}",
                                                             onclick: move |_| {
-                                                                if configured {
-                                                                    chat_command.set(Some(ChatCommand::SwitchProvider(index)));
+                                                                if is_current {
+                                                                    // Already the session's connector — just close
+                                                                } else if configured {
+                                                                    chat_command.set(Some(ChatCommand::SwitchConnector(connector_id.clone())));
                                                                 } else {
                                                                     chat_command.set(Some(ChatCommand::SwitchToSettingsTab(crate::settings::SettingsTab::General, None)));
                                                                 }
@@ -778,9 +793,12 @@ pub fn ChatInput(
                                                                 class: "flex items-center space-x-2",
                                                                 span {
                                                                     class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm shrink-0", provider.color_class()),
-                                                                    "{provider.initial()}"
+                                                                    "{initial}"
                                                                 }
-                                                                span { class: "truncate", "{provider.display_name()}" }
+                                                                span { class: "truncate", "{name}" }
+                                                                if is_current {
+                                                                    span { class: "text-primary-400 text-xs shrink-0", "✓" }
+                                                                }
                                                             }
                                                             if index < 9 {
                                                                 span {
@@ -810,19 +828,27 @@ pub fn ChatInput(
                 } else { rsx!({}) } }
 
                 // Model Selector Dropdown (session-scoped: slots/model follow the
-                // session's effective provider, falling back to global settings)
+                // session's effective connector, falling back to the global active one)
                 { if ui_state.read().show_model_selector {
-                    let (session_provider, current_model) = {
+                    let (session_provider, current_model, slots) = {
                         let settings_read = settings.read();
-                        match session_state.read().get_active_session() {
-                            Some(s) => (
-                                settings_read.provider_for_session(s),
-                                settings_read.chat_model_for_session(s),
-                            ),
-                            None => (settings_read.active_llm, settings_read.active_chat_model()),
-                        }
+                        let state = session_state.read();
+                        let session = state.get_active_session();
+                        let instance = session
+                            .and_then(|s| settings_read.connector_for_session(s))
+                            .or_else(|| settings_read.active_connector());
+                        let provider = instance
+                            .map(|i| i.provider())
+                            .unwrap_or(settings_read.active_llm);
+                        let current_model = match session {
+                            Some(s) => settings_read.chat_model_for_session(s),
+                            None => settings_read.active_chat_model(),
+                        };
+                        let slots = instance
+                            .map(|i| i.config.model_slots().clone())
+                            .unwrap_or_default();
+                        (provider, current_model, slots)
                     };
-                    let slots = settings.read().model_slots_for(session_provider);
                     let user_icons = settings.read().model_icons.clone();
                     // Icon priority: user-set icon > slot position icon > default
                     let current_slot_idx = slots.iter().position(|s| s == &current_model);
@@ -1039,7 +1065,11 @@ pub fn ChatInput(
                     style: "max-height: 50vh;",
                     rows: "1",
                     placeholder: "Type your message...",
-                    value: "{draft}",
+                    // UNCONTROLLED on purpose: a controlled `value` binding races
+                    // the IPC round-trip and snaps the caret to the end mid-typing.
+                    // Programmatic writes go through shared::set_chat_draft, which
+                    // updates the DOM explicitly.
+                    initial_value: "{draft}",
                     onmounted: move |evt| {
                         textarea_mounted.set(Some(evt.data()));
                     },
@@ -1094,22 +1124,54 @@ pub fn ChatInput(
                                 skill_autocomplete_index.set(0);
                                 show_skill_autocomplete.set(true);
                             }
-                        } else if let Some(query) = val.strip_prefix('/') {
-                            autocomplete_mode.set(AutocompleteMode::Skill);
-                            let registry = skill_registry.read();
-                            let all_skills = registry.list_skills();
-                            let matches: Vec<Skill> = all_skills
-                                .into_iter()
-                                .filter(|s| {
-                                    query.is_empty() || s.metadata.name.to_lowercase().contains(&query.to_lowercase())
-                                })
-                                .collect();
-                            filtered_skills.set(matches);
-                            skill_autocomplete_index.set(0);
-                            show_skill_autocomplete.set(true);
                         } else {
-                            show_skill_autocomplete.set(false);
-                            filtered_skills.set(Vec::new());
+                            // Cursor-aware skill autocomplete: trigger on a
+                            // /token at the caret, anywhere in the draft. The
+                            // caret position lives only in the DOM, so fetch it
+                            // via eval before running the pure token scan.
+                            spawn(async move {
+                                let mut eval = document::eval(r#"
+                                    const el = document.getElementById('chat-textarea');
+                                    dioxus.send(el ? el.selectionStart : -1);
+                                "#);
+                                let cursor: i64 = eval.recv().await.unwrap_or(-1);
+                                let query_opt = if cursor >= 0 {
+                                    crate::skills::invocation::autocomplete_query_at(
+                                        &val,
+                                        cursor as usize,
+                                    )
+                                } else {
+                                    None
+                                };
+                                match query_opt {
+                                    Some(q) => {
+                                        autocomplete_mode.set(AutocompleteMode::Skill);
+                                        let matches: Vec<Skill> = {
+                                            let registry = skill_registry.read();
+                                            registry
+                                                .list_skills()
+                                                .into_iter()
+                                                .filter(|s| {
+                                                    q.query.is_empty()
+                                                        || s.metadata
+                                                            .name
+                                                            .to_lowercase()
+                                                            .contains(&q.query.to_lowercase())
+                                                })
+                                                .collect()
+                                        };
+                                        autocomplete_token.set(Some(q.token_range));
+                                        filtered_skills.set(matches);
+                                        skill_autocomplete_index.set(0);
+                                        show_skill_autocomplete.set(true);
+                                    }
+                                    None => {
+                                        show_skill_autocomplete.set(false);
+                                        filtered_skills.set(Vec::new());
+                                        autocomplete_token.set(None);
+                                    }
+                                }
+                            });
                         }
                     },
                     onkeydown: move |event| {
@@ -1211,36 +1273,59 @@ pub fn ChatInput(
                                         let selected = skills.get(current_idx).cloned();
                                         drop(skills); // Release borrow before mutating
                                         if let Some(skill) = selected {
-                                            // Preserve existing text as arguments
-                                            // Current draft looks like: "/tim args" or "/timestamp +%s"
-                                            // We want to: replace the "/query" part with "/skillname" but keep args
                                             let current_draft = draft.read().clone();
 
-                                            let skill_command = match *autocomplete_mode.read() {
+                                            match *autocomplete_mode.read() {
                                                 AutocompleteMode::Unload => {
                                                     // For unload, always fill the full command
-                                                    format!("/unload {}", skill.metadata.name)
+                                                    let skill_command = format!("/unload {}", skill.metadata.name);
+                                                    tracing::info!("Populated draft with skill command: {}", skill_command);
+                                                    crate::components::shared::set_chat_draft(draft, skill_command, None, true);
                                                 }
                                                 AutocompleteMode::Skill => {
-                                                    // Preserve existing text as arguments
-                                                    let args = if current_draft.starts_with('/') {
-                                                        current_draft.split_once(' ')
-                                                            .map(|(_, args_part)| args_part.to_string())
-                                                            .unwrap_or_default()
-                                                    } else {
-                                                        String::new()
-                                                    };
-                                                    if args.is_empty() {
-                                                        format!("/{} ", skill.metadata.name)
-                                                    } else {
-                                                        format!("/{} {}", skill.metadata.name, args)
-                                                    }
+                                                    // Splice the completed /name into the in-progress
+                                                    // token's range, preserving surrounding text.
+                                                    let token_range: Option<(usize, usize)> =
+                                                        *autocomplete_token.read();
+                                                    // The stored range comes from an async cursor eval and can be
+                                                    // stale against the current draft — a non-boundary index would
+                                                    // panic on slicing, so validate char boundaries too.
+                                                    let (start, end) = token_range
+                                                        .filter(|(s, e)| {
+                                                            *s <= *e
+                                                                && *e <= current_draft.len()
+                                                                && current_draft.is_char_boundary(*s)
+                                                                && current_draft.is_char_boundary(*e)
+                                                        })
+                                                        .unwrap_or((0, current_draft.len().min(
+                                                            current_draft.find(' ').unwrap_or(current_draft.len()),
+                                                        )));
+                                                    let completed = format!("/{} ", skill.metadata.name);
+                                                    let mut new_draft = String::with_capacity(
+                                                        current_draft.len() + completed.len(),
+                                                    );
+                                                    new_draft.push_str(&current_draft[..start]);
+                                                    new_draft.push_str(&completed);
+                                                    let cursor_byte = new_draft.len();
+                                                    new_draft.push_str(current_draft[end..].trim_start());
+                                                    // Restore the caret just after the inserted command
+                                                    let cursor_utf16 =
+                                                        crate::skills::invocation::byte_to_utf16_offset(
+                                                            &new_draft,
+                                                            cursor_byte,
+                                                        );
+                                                    tracing::info!("Spliced skill command into draft: {}", new_draft);
+                                                    crate::components::shared::set_chat_draft(
+                                                        draft,
+                                                        new_draft,
+                                                        Some(cursor_utf16),
+                                                        true,
+                                                    );
                                                 }
-                                            };
-                                            draft.set(skill_command.clone());
+                                            }
+                                            autocomplete_token.set(None);
                                             show_skill_autocomplete.set(false);
                                             on_interaction.call(());
-                                            tracing::info!("Populated draft with skill command: {}", skill_command);
                                         }
                                         return;
                                     }
@@ -1287,7 +1372,44 @@ pub fn ChatInput(
                         skills: filtered_skills.read().clone(),
                         selected_index: *skill_autocomplete_index.read(),
                         on_select: move |skill: Skill| {
-                            draft.set(format!("/{} ", skill.metadata.name));
+                            match *autocomplete_mode.read() {
+                                AutocompleteMode::Unload => {
+                                    crate::components::shared::set_chat_draft(
+                                        draft,
+                                        format!("/unload {}", skill.metadata.name),
+                                        None,
+                                        true,
+                                    );
+                                }
+                                AutocompleteMode::Skill => {
+                                    // Splice into the in-progress token, preserving context
+                                    let current_draft = draft.read().clone();
+                                    let token_range: Option<(usize, usize)> = *autocomplete_token.read();
+                                    // Same as the keyboard path: the range may be stale against the
+                                    // current draft, so reject non-char-boundary indices before slicing.
+                                    let (start, end) = token_range
+                                        .filter(|(s, e)| {
+                                            *s <= *e
+                                                && *e <= current_draft.len()
+                                                && current_draft.is_char_boundary(*s)
+                                                && current_draft.is_char_boundary(*e)
+                                        })
+                                        .unwrap_or((0, current_draft.len()));
+                                    let completed = format!("/{} ", skill.metadata.name);
+                                    let mut new_draft = String::with_capacity(current_draft.len() + completed.len());
+                                    new_draft.push_str(&current_draft[..start]);
+                                    new_draft.push_str(&completed);
+                                    let cursor_utf16 = crate::skills::invocation::byte_to_utf16_offset(&new_draft, new_draft.len());
+                                    new_draft.push_str(current_draft[end..].trim_start());
+                                    crate::components::shared::set_chat_draft(
+                                        draft,
+                                        new_draft,
+                                        Some(cursor_utf16),
+                                        true,
+                                    );
+                                }
+                            }
+                            autocomplete_token.set(None);
                             show_skill_autocomplete.set(false);
                             on_interaction.call(());
                             tracing::info!("Selected skill from autocomplete: {}", skill.metadata.name);
@@ -1608,6 +1730,7 @@ fn PendingTimersBar() -> Element {
 fn SessionCostIcon() -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
     let ui_state = consume_context::<Signal<UiState>>();
+    let stream_manager = consume_context::<StreamManagerContext>();
     // Consume SessionIdContext to ensure this component re-renders on every tab switch
     let SessionIdContext(current_target_id) = use_context::<SessionIdContext>();
     let mut show_popover = use_signal(|| false);
@@ -1615,6 +1738,15 @@ fn SessionCostIcon() -> Element {
     let mut prev_session_id = use_signal(String::new);
     let mut animation_target = use_signal(|| 0.0_f64);
     let mut cost_animating = use_signal(|| false);
+
+    // Subscribe to the stream lifecycle so the cost/token counters refresh at every
+    // turn start/end/continuation. As a memoized no-props component, the background
+    // usage write into `session_state` doesn't reliably re-render this icon on its own
+    // (the value only surfaced after a tab switch flushed the scheduler); `stream_activity`
+    // is the app's canonical "stream state changed" signal and is bumped after the final
+    // usage is recorded, so reading it here guarantees a refresh without leaving the tab.
+    // Read unconditionally, before any early return, so the subscription can't be dropped.
+    let _ = stream_manager.stream_activity.read();
 
     // Check if we should show the icon
     if !ui_state.read().show_session_cost_icon {
@@ -1715,12 +1847,11 @@ fn SessionCostIcon() -> Element {
                         }
                     }
 
-                    // All-time totals (lifetime counters from deleted sessions + all live sessions)
+                    // All-time totals (lifetime counters from deleted sessions + all stored sessions)
                     {
-                        let all_time_cost = state.lifetime_cost
-                            + state.sessions.values().map(|s| s.total_cost()).sum::<f64>();
-                        let all_time_tokens = state.lifetime_tokens
-                            + state.sessions.values().map(|s| s.total_tokens() as i64).sum::<i64>();
+                        let (stored_cost, stored_tokens) = crate::session_store::sum_cost_tokens();
+                        let all_time_cost = state.lifetime_cost + stored_cost;
+                        let all_time_tokens = state.lifetime_tokens + stored_tokens;
                         rsx! {
                             div { class: "mt-2 pt-2 border-t border-faint space-y-2 text-xs",
                                 div { class: "text-sm font-semibold text-gray-200 mb-1", "All-Time" }

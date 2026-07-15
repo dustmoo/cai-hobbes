@@ -50,6 +50,12 @@ pub fn record_window(scope: &str, model: &str, tokens: usize) {
 
 /// Clamp a base context window by any learned ceiling for `(scope, model)`.
 /// `base` may be `None` (unknown window); a learned value then becomes the window.
+///
+/// Scoping across connector instances is deliberate: OpenAI-compat uses the
+/// endpoint URL as scope (limits are per-server, so multiple instances are
+/// naturally isolated), while Claude/Gemini use static "claude"/"gemini"
+/// scopes — context windows there are model-intrinsic, not key-specific, so
+/// sharing learned values between instances of the same kind is correct.
 pub fn clamp_to_learned(scope: &str, model: &str, base: Option<usize>) -> Option<usize> {
     match (base, learned_window(scope, model)) {
         (Some(b), Some(l)) => Some(b.min(l)),

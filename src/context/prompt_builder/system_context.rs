@@ -247,6 +247,11 @@ impl<'a> PromptBuilder<'a> {
         //
         // Fallback: If no active skill is detected via tool matching, ALL loaded skills
         // get their full manuals (current behavior) — we never silently degrade context.
+        //
+        // The turn-active set is also reused further down to gate `available_skills`:
+        // while a skill is mid-execution, no other skills are advertised.
+        let mut turn_active_skill_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         if !self.session.loaded_skills.is_empty() {
             // Step 1: Collect tool server prefixes used in the last 5 messages.
             let recently_used_servers: std::collections::HashSet<String> = self
@@ -267,7 +272,7 @@ impl<'a> PromptBuilder<'a> {
             // Step 2: Identify which loaded skills have tools on those servers.
             // A skill is "turn-active" if any of its resolved_tools match a recently
             // used server prefix.
-            let active_skill_names: std::collections::HashSet<String> = self
+            turn_active_skill_names = self
                 .session
                 .loaded_skills
                 .iter()
@@ -288,7 +293,7 @@ impl<'a> PromptBuilder<'a> {
             // Step 3: Build the loaded_skills array for the system context map.
             // Full manual → turn-active skills; stub only → inactive skills.
             // If no active skills were detected, fall back to injecting all skills fully.
-            let use_lazy = !active_skill_names.is_empty();
+            let use_lazy = !turn_active_skill_names.is_empty();
             let skills_array: Vec<serde_json::Value> = self
                 .session
                 .loaded_skills
@@ -304,7 +309,7 @@ impl<'a> PromptBuilder<'a> {
                         .map(|(cap, tool)| json!({"capability": cap, "use_tool": tool}))
                         .collect();
 
-                    let is_active = !use_lazy || active_skill_names.contains(skill_name);
+                    let is_active = !use_lazy || turn_active_skill_names.contains(skill_name);
                     if is_active {
                         tracing::debug!(
                             "Loaded skill '{}': full instruction_manual injected ({} chars)",
@@ -338,7 +343,7 @@ impl<'a> PromptBuilder<'a> {
                 tracing::info!(
                     "Loaded skills injected: {} total, {} active (lazy={})",
                     self.session.loaded_skills.len(),
-                    active_skill_names.len(),
+                    turn_active_skill_names.len(),
                     use_lazy
                 );
             }
@@ -407,6 +412,65 @@ impl<'a> PromptBuilder<'a> {
                     before,
                     tools.len(),
                     skill_tools
+                );
+            }
+        }
+
+        // Advertise invocable skills so the model can load one on its own —
+        // the same on-demand mechanic as MCP_LOAD_SERVER_TOOLS: compact metadata
+        // in the system context plus a loader tool; the full instruction manual
+        // is only injected once a skill is actually loaded.
+        //
+        // Gated on skill execution: while a skill is running this turn (a skill
+        // call is the current turn, a loaded skill's tools were used recently,
+        // or the model just loaded one), no other skills are advertised and the
+        // loader tool is withheld entirely. The only skill in context is the one
+        // being run — advertising alternatives mid-skill derails small local
+        // models into re-execution loops.
+        {
+            let skill_running = skill_tool_names.is_some()
+                || !turn_active_skill_names.is_empty()
+                || last_meaningful_msg.is_some_and(|m| {
+                    matches!(
+                        &m.content,
+                        MessageContent::ToolCall(tc) if tc.tool_name == "HOBBES_INVOKE_SKILL"
+                    )
+                });
+            let available: Vec<serde_json::Value> = if skill_running {
+                Vec::new()
+            } else {
+                crate::skills::registry::available_skills_snapshot()
+                    .into_iter()
+                    .filter(|s| !s.disable_model_invocation)
+                    .filter(|s| !self.session.loaded_skills.contains_key(&s.name))
+                    .map(|s| {
+                        let mut entry = json!({
+                            "name": s.name,
+                            "description": s.description,
+                        });
+                        if let Some(hint) = s.argument_hint {
+                            entry["argument_hint"] = json!(hint);
+                        }
+                        entry
+                    })
+                    .collect()
+            };
+            if available.is_empty() {
+                // Nothing to advertise this turn — withhold the loader tool the
+                // same way an on-demand server withholds its tools until loaded.
+                tools.retain(|t| t.name != "HOBBES_INVOKE_SKILL");
+                if skill_running {
+                    tracing::debug!(
+                        "Skill running this turn — available_skills and HOBBES_INVOKE_SKILL withheld"
+                    );
+                }
+            } else {
+                system_context_map.insert(
+                    "available_skills".to_string(),
+                    json!({
+                        "skills": available,
+                        "instruction": "On-demand skills. Load one by calling the HOBBES_INVOKE_SKILL tool with {\"name\": \"<skill name>\", \"arguments\": \"<optional args>\"}; it returns the skill's full instruction manual. Only load a skill that clearly matches the user's current request."
+                    }),
                 );
             }
         }

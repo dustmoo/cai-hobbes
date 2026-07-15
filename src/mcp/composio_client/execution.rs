@@ -15,12 +15,14 @@ pub struct AddToolkitResult {
 }
 
 /// Add a toolkit to the MCP server configuration via PATCH API.
+/// `auth_config_id` is `None` for no-auth toolkits, which are bound to the
+/// server without any auth config (Composio rejects auth configs for them).
 /// Returns an `AddToolkitResult` with the new server URL (if created) and any
 /// pre-existing allowed_tools for this toolkit (for admin curation detection).
 pub async fn add_toolkit_to_server(
     client: &ComposioClient,
     toolkit_slug: &str,
-    auth_config_id: &str,
+    auth_config_id: Option<&str>,
     selected_tools: Option<Vec<String>>,
 ) -> Result<AddToolkitResult, String> {
     // Extract target server ID from base_url/settings for verification
@@ -233,24 +235,38 @@ pub async fn add_toolkit_to_server(
             }
         }
         Err(e) => {
-            tracing::warn!("Failed to fetch active auth configs for reconciliation: {}. Falling back to append-only (risky).", e);
-            auth_config_ids = existing_auth_ids;
+            tracing::warn!("Failed to fetch active auth configs for reconciliation: {}. Falling back to dedup-only.", e);
+            // Can't map ids->slug without the list, but at least don't let the
+            // array grow with duplicates (a contributor to wedged servers).
+            let mut seen = std::collections::HashSet::new();
+            auth_config_ids = existing_auth_ids
+                .into_iter()
+                .filter(|id| seen.insert(id.clone()))
+                .collect();
         }
     }
 
-    // 3. Add the NEW authoritative auth config for this toolkit
-    if !auth_config_ids.contains(&auth_config_id.to_string()) {
-        auth_config_ids.push(auth_config_id.to_string());
-        tracing::info!(
-            "Binding new auth_config '{}' for toolkit '{}'",
-            auth_config_id,
-            toolkit_slug
-        );
-        auth_updated = true;
+    // 3. Add the NEW authoritative auth config for this toolkit.
+    // No-auth toolkits have no auth config — they bind by slug alone.
+    if let Some(auth_config_id) = auth_config_id {
+        if !auth_config_ids.contains(&auth_config_id.to_string()) {
+            auth_config_ids.push(auth_config_id.to_string());
+            tracing::info!(
+                "Binding new auth_config '{}' for toolkit '{}'",
+                auth_config_id,
+                toolkit_slug
+            );
+            auth_updated = true;
+        } else {
+            tracing::debug!(
+                "Auth config '{}' already present in reconciled list",
+                auth_config_id
+            );
+        }
     } else {
-        tracing::debug!(
-            "Auth config '{}' already present in reconciled list",
-            auth_config_id
+        tracing::info!(
+            "Toolkit '{}' requires no authentication — binding without an auth config",
+            toolkit_slug
         );
     }
 
@@ -388,50 +404,9 @@ pub async fn add_toolkit_to_server(
         );
     }
 
-    // Step 4: Generate/register user with the MCP server
-    // This is required for the user to see the tools
-    // API: POST /api/v3/mcp/servers/generate
-    // NOTE: This might be the one place that still uses v3? Docs are unclear, but standard practice says stick to v1 for registry if possible.
-    // However, 'generate' implies runtime credential creation. Let's keep it as is unless it fails.
-    if let Some(ref user_id) = client.user_id {
-        let generate_url = format!("{}/mcp/servers/generate", client.get_api_base_url());
-        // CRITICAL: API requires user_ids (plural, array) NOT user_id (singular)
-        // SDK pattern: user_ids=[user_id], managed_auth_by_composio=True
-        // Pattern 110: Ensure managed_auth_by_composio is explicitly true
-        let generate_payload = serde_json::json!({
-            "user_ids": [user_id],
-            "mcp_server_id": server_id,
-            "managed_auth_by_composio": true
-        });
-
-        tracing::debug!(
-            "Registering user '{}' with MCP server '{}'",
-            user_id,
-            server_id
-        );
-
-        let generate_response = client
-            .client
-            .post(&generate_url)
-            .header("x-api-key", &client.api_key)
-            .header("Content-Type", "application/json")
-            .json(&generate_payload)
-            .send()
-            .await;
-
-        match generate_response {
-            Ok(resp) if resp.status().is_success() => {
-                tracing::info!("User '{}' registered with MCP server", user_id);
-            }
-            Ok(resp) => {
-                let text = resp.text().await.unwrap_or_default();
-                tracing::warn!("Failed to register user with MCP server: {}", text);
-            }
-            Err(e) => {
-                tracing::warn!("Error registering user with MCP server: {}", e);
-            }
-        }
-    }
+    // Step 4: Generate/register user with the MCP server — required for the
+    // user to see the tools (Mandate 6 / Pattern 110).
+    generate_mcp_user(client, &server_id).await;
 
     tracing::info!(
         "Successfully added toolkit '{}' with {} tools to MCP server",
@@ -498,6 +473,40 @@ async fn fetch_server_config(client: &ComposioClient) -> Result<(String, Value),
         .to_string();
 
     Ok((id, found.clone()))
+}
+
+/// Diagnostic: the current server's id + its bound `toolkits` and
+/// `auth_config_ids` (config-level state, independent of what the MCP proxy
+/// actually exposes via tools/list). Used to verify a recreate/rebind.
+pub async fn server_config_summary(
+    client: &ComposioClient,
+) -> Result<(String, Vec<String>, Vec<String>), String> {
+    let (server_id, server_obj) = fetch_server_config(client).await?;
+    let toolkits: Vec<String> = server_obj
+        .get("toolkits")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    t.as_str().map(|s| s.to_string()).or_else(|| {
+                        t.get("toolkit")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let auth_config_ids: Vec<String> = server_obj
+        .get("auth_config_ids")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((server_id, toolkits, auth_config_ids))
 }
 
 /// Extract the `allowed_tools` whitelist from a server config object.
@@ -622,13 +631,261 @@ pub async fn set_toolkit_enabled_tools(
     Ok(())
 }
 
+/// (Re)bind the user to the MCP server after any config change (Mandate 6 /
+/// Pattern 110: `POST /mcp/servers/generate`). Best-effort — warns, never fails.
+async fn generate_mcp_user(client: &ComposioClient, server_id: &str) {
+    let Some(ref user_id) = client.user_id else {
+        return;
+    };
+    let generate_url = format!("{}/mcp/servers/generate", client.get_api_base_url());
+    let generate_payload = serde_json::json!({
+        "user_ids": [user_id],
+        "mcp_server_id": server_id,
+        "managed_auth_by_composio": true
+    });
+    match client
+        .client
+        .post(&generate_url)
+        .header("x-api-key", &client.api_key)
+        .header("Content-Type", "application/json")
+        .json(&generate_payload)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!("User '{}' registered with MCP server '{}'", user_id, server_id);
+        }
+        Ok(resp) => {
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!("Failed to register user with MCP server: {}", text);
+        }
+        Err(e) => tracing::warn!("Error registering user with MCP server: {}", e),
+    }
+}
+
+/// Remove a toolkit from the MCP server config: drop it from `toolkits`, drop
+/// its auth_config_id(s) from `auth_config_ids`, and strip its `allowed_tools`
+/// entries, then regenerate the user binding. Returns the auth_config_id(s)
+/// that were dropped so the caller can delete them. Inverse of
+/// `add_toolkit_to_server`; structurally modeled on `set_toolkit_enabled_tools`
+/// (Mandate 5: string arrays; Mandate 6: generate after PATCH).
+pub async fn remove_toolkit_from_server(
+    client: &ComposioClient,
+    toolkit_slug: &str,
+) -> Result<Vec<String>, String> {
+    let (server_id, server_obj) = fetch_server_config(client).await?;
+
+    // Map auth_config_id -> slug so we can identify the ones for this toolkit.
+    let (valid_id_map, list_ok): (std::collections::HashMap<String, String>, bool) =
+        match list_auth_configs(client).await {
+            Ok(active) => (
+                active
+                    .iter()
+                    .filter_map(|ac| {
+                        ac.toolkit
+                            .as_ref()
+                            .map(|t| (ac.id.clone(), t.slug.to_lowercase()))
+                    })
+                    .collect(),
+                true,
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    "[REMOVE] list_auth_configs failed ({}); keeping unmapped auth configs",
+                    e
+                );
+                (std::collections::HashMap::new(), false)
+            }
+        };
+
+    let plan = compute_toolkit_removal(&server_obj, toolkit_slug, &valid_id_map, list_ok);
+
+    let mut patch_payload = serde_json::json!({
+        "toolkits": plan.toolkits,
+        "auth_config_ids": plan.auth_config_ids,
+    });
+    if !plan.allowed_tools.is_empty() {
+        patch_payload["allowed_tools"] = serde_json::json!(plan.allowed_tools);
+    }
+
+    let config_url = format!("{}/mcp/{}", client.get_api_base_url(), server_id);
+    tracing::info!(
+        "Removing toolkit '{}' from server {} (dropping {} auth config(s))",
+        toolkit_slug,
+        server_id,
+        plan.dropped_ids.len()
+    );
+
+    let patch_response = client
+        .client
+        .patch(&config_url)
+        .header("x-api-key", &client.api_key)
+        .header("Content-Type", "application/json")
+        .json(&patch_payload)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to update MCP server: {}", e))?;
+
+    if !patch_response.status().is_success() {
+        let status = patch_response.status();
+        let text = patch_response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Failed to remove toolkit ({}): {}",
+            status, text
+        ));
+    }
+
+    generate_mcp_user(client, &server_id).await;
+    Ok(plan.dropped_ids)
+}
+
+/// Pure result of planning a toolkit removal from a server config object.
+struct ToolkitRemovalPlan {
+    toolkits: Vec<String>,
+    auth_config_ids: Vec<String>,
+    dropped_ids: Vec<String>,
+    allowed_tools: Vec<String>,
+}
+
+/// Pure computation of the PATCH arrays for removing `toolkit_slug` from a
+/// server config: filter the slug out of `toolkits`, split `auth_config_ids`
+/// into kept vs dropped (via `valid_id_map`; when `list_ok` is false, unmapped
+/// ids are kept conservatively), and strip the toolkit's `allowed_tools`.
+/// Extracted from `remove_toolkit_from_server` so it can be unit-tested.
+fn compute_toolkit_removal(
+    server_obj: &Value,
+    toolkit_slug: &str,
+    valid_id_map: &std::collections::HashMap<String, String>,
+    list_ok: bool,
+) -> ToolkitRemovalPlan {
+    let target_slug_lower = toolkit_slug.to_lowercase();
+    let prefix = toolkit_tool_prefix(toolkit_slug);
+
+    // toolkits minus the target (handle string + { toolkit } object forms).
+    let toolkits: Vec<String> = server_obj
+        .get("toolkits")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    t.as_str().map(|s| s.to_string()).or_else(|| {
+                        t.get("toolkit")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                })
+                .filter(|s| !s.eq_ignore_ascii_case(toolkit_slug))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let existing_auth_ids: Vec<String> = server_obj
+        .get("auth_config_ids")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut dropped_ids = Vec::new();
+    let mut auth_config_ids = Vec::new();
+    for id in existing_auth_ids {
+        match valid_id_map.get(&id) {
+            Some(slug) if slug == &target_slug_lower => dropped_ids.push(id), // ours — delete
+            Some(_) => auth_config_ids.push(id),                              // other toolkit — keep
+            None => {
+                if list_ok {
+                    // Not in the active list -> stale/deleted. Drop from the
+                    // array (also helps un-wedge a poisoned server) but don't
+                    // try to delete it.
+                    tracing::warn!("[REMOVE] Dropping stale auth config id '{}'", id);
+                } else {
+                    auth_config_ids.push(id); // can't reason -> keep
+                }
+            }
+        }
+    }
+
+    // allowed_tools minus this toolkit's entries.
+    let allowed_tools: Vec<String> = extract_allowed_tools(server_obj)
+        .into_iter()
+        .filter(|t| !t.to_uppercase().starts_with(&prefix))
+        .collect();
+
+    ToolkitRemovalPlan {
+        toolkits,
+        auth_config_ids,
+        dropped_ids,
+        allowed_tools,
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::compute_toolkit_removal;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn server() -> serde_json::Value {
+        json!({
+            "toolkits": ["gmail", "github", {"toolkit": "slack"}],
+            "auth_config_ids": ["ac_gmail", "ac_github", "ac_slack", "ac_stale"],
+            "allowed_tools": ["GMAIL_SEND", "GITHUB_CREATE_ISSUE", "SLACK_POST"]
+        })
+    }
+
+    fn id_map() -> HashMap<String, String> {
+        // ac_stale intentionally absent (not in active configs).
+        HashMap::from([
+            ("ac_gmail".into(), "gmail".into()),
+            ("ac_github".into(), "github".into()),
+            ("ac_slack".into(), "slack".into()),
+        ])
+    }
+
+    #[test]
+    fn removes_target_toolkit_auth_and_tools() {
+        let plan = compute_toolkit_removal(&server(), "gmail", &id_map(), true);
+        // gmail dropped from toolkits; github + slack (object form) kept.
+        assert_eq!(plan.toolkits, vec!["github".to_string(), "slack".to_string()]);
+        // gmail's auth config dropped and reported; stale ac dropped (list_ok).
+        assert_eq!(plan.dropped_ids, vec!["ac_gmail".to_string()]);
+        assert_eq!(
+            plan.auth_config_ids,
+            vec!["ac_github".to_string(), "ac_slack".to_string()]
+        );
+        // gmail's allowed_tools entry stripped, others kept.
+        assert_eq!(
+            plan.allowed_tools,
+            vec!["GITHUB_CREATE_ISSUE".to_string(), "SLACK_POST".to_string()]
+        );
+    }
+
+    #[test]
+    fn keeps_unmapped_ids_when_list_failed() {
+        // list_ok = false: can't map, so the stale id is kept (conservative).
+        let plan = compute_toolkit_removal(&server(), "gmail", &HashMap::new(), false);
+        assert!(plan.dropped_ids.is_empty());
+        assert_eq!(plan.auth_config_ids.len(), 4); // nothing dropped
+        assert_eq!(plan.toolkits, vec!["github".to_string(), "slack".to_string()]);
+    }
+
+    #[test]
+    fn slug_match_is_case_insensitive() {
+        let plan = compute_toolkit_removal(&server(), "GMAIL", &id_map(), true);
+        assert!(!plan.toolkits.iter().any(|t| t.eq_ignore_ascii_case("gmail")));
+    }
+}
+
 /// Create a new MCP server for the user's first toolkit.
 /// Called when no servers exist for the account.
 /// Endpoint: POST /api/v3/mcp/servers/custom
 async fn create_mcp_server(
     client: &ComposioClient,
     toolkit_slug: &str,
-    auth_config_id: &str,
+    auth_config_id: Option<&str>,
 ) -> Result<Value, String> {
     let api_base = client.get_api_base_url();
     let url = format!("{}/mcp/servers/custom", api_base);
@@ -642,10 +899,12 @@ async fn create_mcp_server(
     // Build payload with initial toolkit binding
     // CRITICAL: Use String Arrays for toolkits and auth_config_ids
     // Object binding ([{toolkit:..., auth_config:...}]) is FORBIDDEN by API
+    // No-auth toolkits are bound with an empty auth_config_ids array.
+    let auth_config_ids: Vec<&str> = auth_config_id.into_iter().collect();
     let payload = serde_json::json!({
         "name": server_name,
         "toolkits": [toolkit_slug.to_lowercase()],
-        "auth_config_ids": [auth_config_id]
+        "auth_config_ids": auth_config_ids
     });
 
     tracing::info!(
@@ -686,6 +945,45 @@ async fn create_mcp_server(
 
     tracing::info!("Created new MCP server with ID: {}", server_id);
     Ok(server)
+}
+
+/// Provision a brand-new MCP server for the Recreate recovery, seeded with a
+/// single toolkit. Composio rejects a server with empty `toolkits` AND empty
+/// `auth_config_ids` (error 1153 `MCP_MissingAuthConfigsOrToolkits`), so a fresh
+/// server must be created with at least one application — the caller then binds
+/// the rest. This gives clean arrays, the fix for an already-wedged server whose
+/// poisoned `auth_config_ids` reject every PATCH. Binds the user and returns
+/// `(server_id, new_mcp_url)`.
+pub async fn create_fresh_mcp_server(
+    client: &ComposioClient,
+    seed_toolkit: &str,
+    seed_auth_config_id: Option<&str>,
+) -> Result<(String, String), String> {
+    // Reuse create_mcp_server's seeded POST (toolkits:[slug], auth_config_ids:[..]).
+    let server = create_mcp_server(client, seed_toolkit, seed_auth_config_id).await?;
+    let server_id = server
+        .get("id")
+        .and_then(|s| s.as_str())
+        .ok_or("Created server missing ID")?
+        .to_string();
+
+    let base_domain = client.get_api_base_url().replace("/api/v3", "");
+    let new_url = format!("{}/v3/mcp/{}/mcp", base_domain, server_id);
+
+    if let Some(ref user_id) = client.user_id {
+        if let Err(e) = create_mcp_instance(client, &server_id, user_id).await {
+            tracing::warn!("[RECREATE] Failed to create instance: {}", e);
+        }
+    }
+    generate_mcp_user(client, &server_id).await;
+
+    tracing::info!(
+        "[RECREATE] Fresh server {} (seeded with '{}') at {}",
+        server_id,
+        seed_toolkit,
+        new_url
+    );
+    Ok((server_id, new_url))
 }
 
 /// Create an MCP instance to bind a user to a server.

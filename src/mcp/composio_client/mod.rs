@@ -176,10 +176,55 @@ impl ComposioClient {
         discovery::list_toolkit_categories(self).await
     }
 
+    pub async fn get_toolkit_metadata(
+        &self,
+        slug: &str,
+    ) -> Result<ComposioToolkitListing, String> {
+        discovery::get_toolkit_metadata(self, slug).await
+    }
+
     pub async fn get_connected_toolkit_slugs(
         &self,
     ) -> Result<std::collections::HashSet<String>, String> {
         discovery::get_connected_toolkit_slugs(self).await
+    }
+
+    pub async fn delete_auth_config(&self, auth_config_id: &str) -> Result<(), String> {
+        auth::delete_auth_config(self, auth_config_id).await
+    }
+
+    pub async fn has_existing_auth_config(&self, toolkit_slug: &str) -> bool {
+        auth::has_existing_auth_config(self, toolkit_slug).await
+    }
+
+    pub async fn delete_toolkit_connections(&self, toolkit_slug: &str) -> Result<(), String> {
+        auth::delete_toolkit_connections(self, toolkit_slug).await
+    }
+
+    /// Remove a toolkit from the MCP server (unbind + strip auth config +
+    /// allowed_tools). Returns the auth_config_id(s) that were dropped.
+    pub async fn remove_toolkit_from_server(
+        &self,
+        toolkit_slug: &str,
+    ) -> Result<Vec<String>, String> {
+        execution::remove_toolkit_from_server(self, toolkit_slug).await
+    }
+
+    /// Provision a fresh MCP server (recovery), seeded with one toolkit (Composio
+    /// rejects empty servers). Returns (server_id, url).
+    pub async fn create_fresh_mcp_server(
+        &self,
+        seed_toolkit: &str,
+        seed_auth_config_id: Option<&str>,
+    ) -> Result<(String, String), String> {
+        execution::create_fresh_mcp_server(self, seed_toolkit, seed_auth_config_id).await
+    }
+
+    /// Diagnostic: (server_id, bound toolkits, auth_config_ids) for the current server.
+    pub async fn server_config_summary(
+        &self,
+    ) -> Result<(String, Vec<String>, Vec<String>), String> {
+        execution::server_config_summary(self).await
     }
 
     pub async fn get_toolkit_tools_detailed(
@@ -213,10 +258,11 @@ impl ComposioClient {
         execution::execute_tool(self, name, args).await
     }
 
+    /// `auth_config_id` is `None` for no-auth toolkits (bound without auth).
     pub async fn add_toolkit_to_server(
         &self,
         toolkit_slug: &str,
-        auth_config_id: &str,
+        auth_config_id: Option<&str>,
         selected_tools: Option<Vec<String>>,
     ) -> Result<execution::AddToolkitResult, String> {
         execution::add_toolkit_to_server(self, toolkit_slug, auth_config_id, selected_tools).await
@@ -407,7 +453,7 @@ impl ComposioClient {
         // SECURITY: Passing None preserves admin-configured allowed_tools (no re-selection)
         tracing::info!("[RECONNECT 5/5] Re-patching MCP server...");
         match self
-            .add_toolkit_to_server(toolkit_slug, &auth_config_id, None)
+            .add_toolkit_to_server(toolkit_slug, Some(&auth_config_id), None)
             .await
         {
             Ok(result) => {

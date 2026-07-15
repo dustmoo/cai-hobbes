@@ -24,31 +24,36 @@ use crate::mcp::manager::McpContext;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-/// Build a connector for a specific provider + chat model from the current
-/// settings. Used for per-session provider/model overrides, where the global
-/// connector (built from `Settings::active_llm`) does not match the session.
-/// Gemini connectors share a process-wide cache store, so per-request
-/// construction does not orphan server-side cachedContents entries.
-pub fn build_connector_for(
-    settings: &crate::settings::Settings,
-    provider: crate::settings::LlmProvider,
-    model: &str,
+/// Build a connector for a specific connector instance, optionally overriding
+/// the chat model (per-session model pins). Gemini connectors share a
+/// process-wide cache store, so per-request construction does not orphan
+/// server-side cachedContents entries; cache entries are fingerprinted by API
+/// key so instances with different keys never cross-reuse them.
+pub fn build_connector_for_instance(
+    instance: &crate::settings::ProviderInstance,
+    model_override: Option<&str>,
 ) -> std::sync::Arc<dyn LlmConnector> {
-    use crate::settings::LlmProvider;
-    match provider {
-        LlmProvider::Gemini => {
-            let mut config = settings.gemini_config.clone();
-            config.chat_model = model.to_string();
+    use crate::llm::config::ProviderInstanceConfig;
+    match &instance.config {
+        ProviderInstanceConfig::Gemini(config) => {
+            let mut config = config.clone();
+            if let Some(model) = model_override {
+                config.chat_model = model.to_string();
+            }
             std::sync::Arc::new(GeminiConnector::new_shared(config))
         }
-        LlmProvider::OpenAiCompat => {
-            let mut config = settings.openai_compat_config.clone();
-            config.model = model.to_string();
+        ProviderInstanceConfig::OpenAiCompat(config) => {
+            let mut config = config.clone();
+            if let Some(model) = model_override {
+                config.model = model.to_string();
+            }
             openai_responses::build_openai_connector(config)
         }
-        LlmProvider::Claude => {
-            let mut config = settings.claude_config.clone();
-            config.model = model.to_string();
+        ProviderInstanceConfig::Claude(config) => {
+            let mut config = config.clone();
+            if let Some(model) = model_override {
+                config.model = model.to_string();
+            }
             std::sync::Arc::new(ClaudeConnector::new(config))
         }
     }

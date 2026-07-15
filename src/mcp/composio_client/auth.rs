@@ -335,6 +335,113 @@ pub async fn prune_connections(
     Ok(())
 }
 
+/// Delete an auth config by ID. Models `delete_connected_account`.
+/// Also evicts it from the slug→id `auth_config_cache` so a deleted config is
+/// never re-served on a later connect. Endpoint: `DELETE /api/v3/auth_configs/{id}`.
+pub async fn delete_auth_config(
+    client: &ComposioClient,
+    auth_config_id: &str,
+) -> Result<(), String> {
+    let url = format!(
+        "{}/auth_configs/{}",
+        client.get_api_base_url(),
+        auth_config_id
+    );
+    tracing::info!("Deleting auth config: {}", auth_config_id);
+
+    let response = client
+        .client
+        .delete(&url)
+        .header("x-api-key", &client.api_key)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to delete auth config: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Failed to delete auth config ({}): {}",
+            status, text
+        ));
+    }
+
+    // Evict any cache entry pointing at this id (cache is keyed by slug).
+    if let Ok(mut cache) = client.auth_config_cache.write() {
+        cache.retain(|_, v| v != auth_config_id);
+    }
+
+    tracing::info!("Successfully deleted auth config: {}", auth_config_id);
+    Ok(())
+}
+
+/// Delete ALL connected accounts for a toolkit (used on full toolkit removal).
+/// Unlike `prune_connections`, this keeps nothing — every account for the
+/// toolkit is deleted. Best-effort: individual delete failures are logged, not
+/// propagated. Also busts the account/context caches for the slug so the
+/// toolkit stops reporting as connected.
+pub async fn delete_toolkit_connections(
+    client: &ComposioClient,
+    toolkit_slug: &str,
+) -> Result<(), String> {
+    // list_connected_accounts is already user-scoped (P-004), so filter by toolkit only.
+    let accounts = list_connected_accounts(client).await?;
+    let targets: Vec<&ConnectedAccount> = accounts
+        .iter()
+        .filter(|acc| {
+            acc.toolkit
+                .as_ref()
+                .map(|t| t.slug.eq_ignore_ascii_case(toolkit_slug))
+                .unwrap_or(false)
+                || acc
+                    .app_name
+                    .as_ref()
+                    .map(|n| n.eq_ignore_ascii_case(toolkit_slug))
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    tracing::info!(
+        "[REMOVE] Deleting {} connected account(s) for toolkit '{}'",
+        targets.len(),
+        toolkit_slug
+    );
+    for acc in targets {
+        if let Err(e) = delete_connected_account(client, &acc.id).await {
+            tracing::warn!(
+                "[REMOVE] Failed to delete account {} for '{}': {}",
+                acc.id,
+                toolkit_slug,
+                e
+            );
+        }
+    }
+
+    // Bust caches (mirror reconnect_toolkit teardown) so removal is reflected.
+    if let Ok(mut map) = client.toolkit_account_map.write() {
+        map.remove(&toolkit_slug.to_lowercase());
+    }
+    let bust_user = client
+        .user_id
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    client
+        .context_store
+        .remove_param(toolkit_slug, &bust_user, "connected_account_id");
+    client
+        .context_store
+        .remove_param(toolkit_slug, &bust_user, "connectedAccountId");
+
+    Ok(())
+}
+
+/// Detect Composio's "toolkit does not require authentication" rejection
+/// (error code 303). Returned when creating an auth config for a no-auth
+/// toolkit — callers should fall back to connecting without auth.
+pub fn is_no_auth_toolkit_error(error: &str) -> bool {
+    error.contains("does not require authentication") || error.contains("\"code\":303")
+}
+
 /// Create an auth config for a toolkit.
 pub(crate) async fn create_auth_config(
     client: &ComposioClient,
@@ -497,6 +604,29 @@ pub(crate) async fn create_auth_config(
     Ok(auth_config_id.to_string())
 }
 
+/// Whether an auth config already exists for this toolkit (before a connect
+/// attempt creates one). Used to scope connect rollback to only what the
+/// current attempt created. On error, assumes one exists (conservative: never
+/// deletes a config we're unsure about).
+pub async fn has_existing_auth_config(client: &ComposioClient, toolkit_slug: &str) -> bool {
+    match list_auth_configs(client).await {
+        Ok(configs) => configs.iter().any(|ac| {
+            ac.toolkit
+                .as_ref()
+                .map(|t| t.slug.eq_ignore_ascii_case(toolkit_slug))
+                .unwrap_or(false)
+        }),
+        Err(e) => {
+            tracing::warn!(
+                "has_existing_auth_config('{}') lookup failed ({}); assuming it exists",
+                toolkit_slug,
+                e
+            );
+            true
+        }
+    }
+}
+
 /// Fetch the auth_config_id for a given toolkit, prioritizing local custom credentials.
 pub(crate) async fn get_auth_config_id(
     client: &ComposioClient,
@@ -614,7 +744,10 @@ pub(crate) async fn get_auth_config_id(
 
     let url = format!("{}/auth_configs", client.get_api_base_url());
     let mut current_cursor: Option<String> = None;
-    let mut found_id: Option<String> = None;
+    // Collect ALL configs matching the slug (across pages) so we can dedupe:
+    // keep one, delete the rest. The list is server-side filtered by
+    // toolkit_slug, so this is normally a single page.
+    let mut matching_ids: Vec<String> = Vec::new();
 
     // Pagination Loop
     loop {
@@ -688,16 +821,11 @@ pub(crate) async fn get_auth_config_id(
                                 id,
                                 toolkit_slug
                             );
-                            found_id = Some(id.to_string());
-                            break;
+                            matching_ids.push(id.to_string());
                         }
                     }
                 }
             }
-        }
-
-        if found_id.is_some() {
-            break;
         }
 
         // Check for next_cursor
@@ -712,10 +840,28 @@ pub(crate) async fn get_auth_config_id(
         }
     }
 
-    if let Some(ref id) = found_id {
+    if let Some((keep, dupes)) = matching_ids.split_first() {
+        let keep = keep.clone();
+        // Dedupe: delete every extra config for this toolkit so the shared
+        // server's auth_config_ids can't accumulate duplicates/orphans (the
+        // root cause of wedged servers). Best-effort. The subsequent
+        // add_toolkit_to_server reconciliation re-points the server at `keep`.
+        if !dupes.is_empty() {
+            tracing::warn!(
+                "Found {} duplicate auth configs for toolkit '{}'; keeping '{}', deleting the rest",
+                dupes.len(),
+                toolkit_slug,
+                keep
+            );
+            for id in dupes {
+                if let Err(e) = delete_auth_config(client, id).await {
+                    tracing::warn!("Failed to delete duplicate auth config '{}': {}", id, e);
+                }
+            }
+        }
         match client.auth_config_cache.write() {
             Ok(mut cache) => {
-                cache.insert(toolkit_slug.to_string(), id.clone());
+                cache.insert(toolkit_slug.to_string(), keep.clone());
             }
             Err(e) => {
                 tracing::error!(
@@ -724,7 +870,7 @@ pub(crate) async fn get_auth_config_id(
                 );
             }
         }
-        return Ok(id.clone());
+        return Ok(keep);
     }
 
     // No auth config found - create one programmatically
@@ -1171,5 +1317,27 @@ pub async fn initiate_connection(
             "Could not find redirectUrl in response: {}",
             response_text
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_no_auth_toolkit_error;
+
+    #[test]
+    fn detects_composio_no_auth_rejection() {
+        // Exact shape returned by POST /auth_configs for a no-auth toolkit,
+        // as wrapped by create_auth_config's error formatting.
+        let err = r#"Failed to create auth config (400 Bad Request): {"error":{"message":"Cannot create an auth config for toolkit \"hackernews\" because it does not require authentication.","code":303,"suggested_fix":"Toolkit \"hackernews\" works without an auth config. You can use its tools directly without creating a connected account."}}"#;
+        assert!(is_no_auth_toolkit_error(err));
+
+        // Code alone is enough if the message ever changes.
+        assert!(is_no_auth_toolkit_error(r#"{"error":{"code":303}}"#));
+
+        // Unrelated failures must not trigger the no-auth path.
+        assert!(!is_no_auth_toolkit_error(
+            "Failed to create auth config (401 Unauthorized): invalid api key"
+        ));
+        assert!(!is_no_auth_toolkit_error("network timeout"));
     }
 }

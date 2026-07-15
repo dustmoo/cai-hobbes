@@ -135,7 +135,17 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 }
                 s if s.starts_with("switch_provider_") => {
                     if let Ok(idx) = s.replace("switch_provider_", "").parse::<usize>() {
-                        chat_command.set(Some(ChatCommand::SwitchProvider(idx)));
+                        // Hotkey index maps to position in the canonical connector list
+                        let connector_id = settings
+                            .peek()
+                            .llm_connectors
+                            .get(idx)
+                            .map(|c| c.id.clone());
+                        if let Some(id) = connector_id {
+                            chat_command.set(Some(ChatCommand::SwitchConnector(id)));
+                        } else {
+                            tracing::debug!("switch_provider_{}: no connector at index", idx);
+                        }
                     }
                 }
                 _ => tracing::warn!("Unknown JS hotkey action: {}", msg),
