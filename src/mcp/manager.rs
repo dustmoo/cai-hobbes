@@ -91,7 +91,13 @@ pub const HOBBES_CORE_SERVER: &str = "hobbes-core";
 /// all built-in tools and their origins.
 pub const HOBBES_META_SERVER: &str = "hobbes-meta";
 
-
+/// Built-in virtual servers must always stay fully loaded. `hobbes-meta`
+/// provides `MCP_LOAD_SERVER_TOOLS` itself — putting it on-demand (or
+/// unloading it) locks the loader behind the loader and makes every
+/// on-demand server unreachable.
+pub fn is_builtin_virtual_server(name: &str) -> bool {
+    name == HOBBES_CORE_SERVER || name == HOBBES_META_SERVER
+}
 
 /// Get meta-tools for local MCP server on-demand loading.
 /// These allow the AI to load/unload tools from servers set to "On-demand" mode.
@@ -697,6 +703,13 @@ impl McpManager {
     pub async fn set_initial_unloaded_servers(&self, servers: Vec<String>) {
         let mut unloaded = self.unloaded_servers.lock().await;
         for server in servers {
+            if is_builtin_virtual_server(&server) {
+                tracing::warn!(
+                    "Ignoring persisted unloaded state for built-in server '{}'",
+                    server
+                );
+                continue;
+            }
             unloaded.insert(server);
         }
         tracing::debug!(
@@ -709,6 +722,13 @@ impl McpManager {
     pub async fn set_initial_on_demand_servers(&self, servers: Vec<String>) {
         let mut on_demand = self.on_demand_servers.lock().await;
         for server in servers {
+            if is_builtin_virtual_server(&server) {
+                tracing::warn!(
+                    "Ignoring persisted on-demand state for built-in server '{}'",
+                    server
+                );
+                continue;
+            }
             on_demand.insert(server);
         }
         tracing::debug!(
@@ -719,6 +739,13 @@ impl McpManager {
 
     /// Set a server to on-demand mode (tools hidden, discoverable via meta-tool)
     pub async fn set_server_on_demand(&self, server_name: &str) {
+        if is_builtin_virtual_server(server_name) {
+            tracing::warn!(
+                "Refusing to set built-in server '{}' to on-demand mode",
+                server_name
+            );
+            return;
+        }
         // Remove from unloaded if present
         {
             let mut unloaded = self.unloaded_servers.lock().await;
@@ -3317,6 +3344,10 @@ impl McpManager {
 
     /// Unload a server's tools from the AI context (runtime only)
     pub async fn unload_server(&self, server_name: &str) {
+        if is_builtin_virtual_server(server_name) {
+            tracing::warn!("Refusing to unload built-in server '{}'", server_name);
+            return;
+        }
         let mut unloaded = self.unloaded_servers.lock().await;
         unloaded.insert(server_name.to_string());
         drop(unloaded); // Release lock before sync try_lock in invalidate

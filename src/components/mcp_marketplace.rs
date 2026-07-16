@@ -9,7 +9,9 @@ use crate::components::syntax_highlighter::highlight_json;
 use crate::mcp::composio_client::{
     ComposioCategory, ComposioClient, ComposioToolkitListing, ResolvedAuth,
 };
-use crate::mcp::manager::{McpManager, McpServerStatus, ServerStatus, COMPOSIO_NATIVE_PREFIX};
+use crate::mcp::manager::{
+    is_builtin_virtual_server, McpManager, McpServerStatus, ServerStatus, COMPOSIO_NATIVE_PREFIX,
+};
 use crate::settings::{McpSource, Settings, SettingsManager};
 use crate::SecretManagerTrait;
 use dioxus::prelude::*;
@@ -1290,9 +1292,10 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     "{status.tools} tools"
                                 }
                             }
-                            // Load mode selector for local MCPs (not Composio)
-                            // Shows a dropdown: Loaded (always) / On-demand / Disabled
-                            if !is_composio && (status.status == ServerStatus::Loaded || status.status == ServerStatus::Disabled) {
+                            // Load mode selector for local MCPs (not Composio, not built-in
+                            // virtual servers — hobbes-meta provides the loader tool itself,
+                            // so it must never be set to on-demand or disabled)
+                            if !is_composio && !is_builtin_virtual_server(&status.name) && (status.status == ServerStatus::Loaded || status.status == ServerStatus::Disabled) {
                                 {
                                     let server_name = status.name.clone();
                                     let current_mode = if !status.is_loaded {

@@ -1520,6 +1520,26 @@ impl LlmConnector for GeminiConnector {
                                             matched_tool = t;
                                         }
 
+                                        // Built-in tool names are unambiguous. Models sometimes
+                                        // emit the bare name from instruction text (e.g.
+                                        // "MCP_LOAD_SERVER_TOOLS") instead of the advertised
+                                        // prefixed name ("hobbes-meta_MCP_LOAD_SERVER_TOOLS").
+                                        // Route them straight to their virtual servers, same as
+                                        // the OpenAI-compat connector does.
+                                        if !found_tool {
+                                            if fc_name.starts_with("HOBBES_") {
+                                                matched_server =
+                                                    crate::mcp::manager::HOBBES_CORE_SERVER.into();
+                                                matched_tool = fc_name.clone();
+                                                found_tool = true;
+                                            } else if fc_name.starts_with("MCP_") {
+                                                matched_server =
+                                                    crate::mcp::manager::HOBBES_META_SERVER.into();
+                                                matched_tool = fc_name.clone();
+                                                found_tool = true;
+                                            }
+                                        }
+
                                         if found_tool {
                                             // Dedup: hash the arguments to create a fingerprint
                                             use std::hash::{Hash, Hasher};
