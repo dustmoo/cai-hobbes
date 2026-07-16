@@ -1,3 +1,12 @@
+# Hobbes v0.11.4 — On-Demand MCP Loading Fix
+
+## 🐛 Fixes
+
+- **On-demand local MCP servers are loadable again.** The built-in `hobbes-meta` server (which provides `MCP_LOAD_SERVER_TOOLS`) could itself be switched to on-demand mode in MCP settings — locking the loader behind the loader, so servers marked [ON-DEMAND] (Playwright, iTerm, etc.) could never be loaded and the AI hit "Tool Not Available" errors. Built-in servers now always stay fully loaded: the mode dropdown no longer appears for them, and any previously saved on-demand/disabled state for them is ignored at startup.
+- **Gemini recognizes bare built-in tool names.** If the model calls a built-in tool by its bare name (e.g. `MCP_LOAD_SERVER_TOOLS` instead of the prefixed `hobbes-meta_MCP_LOAD_SERVER_TOOLS`), Gemini sessions now route it to the right server instead of failing — matching the existing behavior for OpenAI-compatible models.
+
+---
+
 # Hobbes v0.11.3 — Multiple Connectors, Skills & SQLite Sessions
 
 ## ✨ New Features
