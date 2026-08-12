@@ -75,6 +75,8 @@ pub struct HotkeySettings {
     pub toggle_history: String,
     #[serde(default = "default_toggle_mcp")]
     pub toggle_mcp: String,
+    #[serde(default = "default_toggle_planner")]
+    pub toggle_planner: String,
     #[serde(default = "default_toggle_profile")]
     pub toggle_profile: String,
     #[serde(default = "default_toggle_provider")]
@@ -121,6 +123,7 @@ impl Default for HotkeySettings {
             toggle_settings: default_toggle_settings(),
             toggle_history: default_toggle_history(),
             toggle_mcp: default_toggle_mcp(),
+            toggle_planner: default_toggle_planner(),
             toggle_profile: default_toggle_profile(),
             toggle_provider: default_toggle_provider(),
             toggle_attachments: default_toggle_attachments(),
@@ -152,6 +155,10 @@ fn default_toggle_history() -> String {
 }
 fn default_toggle_mcp() -> String {
     "CmdOrCtrl+Shift+M".to_string()
+}
+// Shift+P is taken by the profile selector; T ("tasks") is free.
+fn default_toggle_planner() -> String {
+    "CmdOrCtrl+Shift+T".to_string()
 }
 fn default_toggle_profile() -> String {
     "CmdOrCtrl+Shift+P".to_string()

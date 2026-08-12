@@ -300,6 +300,7 @@ pub enum MenuAction {
     Settings,
     History,
     Mcp,
+    Planner,
     Profile,
     Attachments,
 }
@@ -1128,6 +1129,9 @@ fn app() -> Element {
     let mut show_session_manager = use_signal(|| false);
     let mut show_settings_panel = use_signal(|| false);
     let mut show_mcp_manager = use_signal(|| false);
+    // The planner replaces the chat column (not a sidebar), so it is
+    // independent of the three panel signals above.
+    let mut show_planner = use_signal(|| false);
     let mut settings_panel_width = use_signal(|| ui_state.read().settings_panel_width);
     let mut is_dragging = use_signal(|| false);
     let mut drag_start_info = use_signal(|| (0.0, 0.0)); // (start_x, start_width)
@@ -1482,6 +1486,10 @@ fn app() -> Element {
                     tracing::info!("MenuAction::Mcp triggered");
                     chat_command.set(Some(ChatCommand::ToggleMcp));
                 }
+                MenuAction::Planner => {
+                    tracing::info!("MenuAction::Planner triggered");
+                    chat_command.set(Some(ChatCommand::TogglePlanner));
+                }
                 MenuAction::Profile => {
                     tracing::info!("MenuAction::Profile triggered");
                     chat_command.set(Some(ChatCommand::ToggleProfile));
@@ -1509,6 +1517,7 @@ fn app() -> Element {
                         "settings" => Some(MenuAction::Settings),
                         "view_history" => Some(MenuAction::History),
                         "view_mcp" => Some(MenuAction::Mcp),
+                        "view_planner" => Some(MenuAction::Planner),
                         "view_profile" => Some(MenuAction::Profile),
                         "view_attachments" => Some(MenuAction::Attachments),
                         _ => None,
@@ -1834,6 +1843,12 @@ fn app() -> Element {
                         show_session_manager.set(false);
                     }
                 }
+                ChatCommand::TogglePlanner => {
+                    // Replaces the chat column, not the sidebars — those may
+                    // stay open beside the planner, so don't close them.
+                    let new_state = !*show_planner.peek();
+                    show_planner.set(new_state);
+                }
                 ChatCommand::DeleteSession(target_id) => {
                     if !target_id.is_empty() {
                         if settings.peek().confirm_on_delete {
@@ -2100,9 +2115,21 @@ fn app() -> Element {
                                     }
                                 }
 
-                                components::chat::ChatWindow {
-                                    on_content_resize: move |_| {},
-                                    on_interaction: move |_| {},
+                                // ChatWindow stays mounted while the planner is shown —
+                                // unmounting it mid-stream would drop live streaming
+                                // updates, so visibility is toggled with CSS instead.
+                                div {
+                                    class: if *show_planner.read() { "hidden" } else { "flex-1 flex flex-col min-h-0 min-w-0" },
+                                    components::chat::ChatWindow {
+                                        on_content_resize: move |_| {},
+                                        on_interaction: move |_| {},
+                                    }
+                                }
+                                if *show_planner.read() {
+                                    div {
+                                        class: "flex-1 min-h-0 min-w-0",
+                                        components::planner_view::PlannerView {}
+                                    }
                                 }
                             }
                         }

@@ -56,12 +56,20 @@ pub fn build_menu(_settings: &Settings) -> Menu {
 
     let mcp_item = MenuItem::with_id("view_mcp", "MCP Config", true, None);
 
+    let planner_item = MenuItem::with_id("view_planner", "Planner", true, None);
+
     let profile_item = MenuItem::with_id("view_profile", "Profile Selector", true, None);
 
     let attachments_item = MenuItem::with_id("view_attachments", "Add Attachments", true, None);
 
     view_menu
-        .append_items(&[&history_item, &mcp_item, &profile_item, &attachments_item])
+        .append_items(&[
+            &history_item,
+            &mcp_item,
+            &planner_item,
+            &profile_item,
+            &attachments_item,
+        ])
         .unwrap();
 
     // A standard Window menu.

@@ -31,6 +31,8 @@ pub enum ChatCommand {
     ToggleSettings,
     ToggleHistory,
     ToggleMcp,
+    /// Show/hide the full-width Planner view in place of the chat column.
+    TogglePlanner,
     NewChat,
     NewChatWithMemory,
     ScrollToBottom,
@@ -175,6 +177,7 @@ pub fn ChatInput(
                 ChatCommand::ToggleSettings
                 | ChatCommand::ToggleHistory
                 | ChatCommand::ToggleMcp
+                | ChatCommand::TogglePlanner
                 | ChatCommand::SwitchToSettingsTab(_, _)
                 | ChatCommand::SwitchTab(_)
                 | ChatCommand::SwitchToSession(_)
@@ -721,6 +724,11 @@ pub fn ChatInput(
                     onclick: move |_| chat_command.set(Some(ChatCommand::ToggleMcp)),
                     visible: ui_state.read().show_mcp_icon,
                     title: "MCP Tools"
+                }
+                ChatBarIconButton {
+                    icon: fi_icons::FiCheckSquare,
+                    onclick: move |_| chat_command.set(Some(ChatCommand::TogglePlanner)),
+                    title: "Planner"
                 }
                 SessionCostIcon {}
 
