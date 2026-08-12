@@ -11,12 +11,6 @@
 //!
 //! See `PLANNER_DESIGN.md` for the full specification.
 //!
-//! P0 lays the model, the store and the state container. Their consumers arrive
-//! with the planner's AI tools (P1) and its view (P2) — until then most of this
-//! surface is exercised only by tests, hence the module-wide allow below.
-//! Remove it once P2 lands so genuinely dead code starts showing up again.
-#![allow(dead_code)]
-
 pub mod handlers;
 pub mod model;
 pub mod store;
@@ -91,12 +85,19 @@ impl PlannerState {
         Some(self.todos.remove(idx))
     }
 
-    /// Time blocks intersecting a day, earliest first.
+    /// Time blocks starting on a day, earliest first.
+    ///
+    /// `date` is a **local** calendar day — planner days are user-local
+    /// everywhere (handlers and the timeline both pass
+    /// `chrono::Local::now().date_naive()`). Blocks are stored in UTC, so the
+    /// start must be converted back to local time before comparing; comparing
+    /// `start.date_naive()` (the UTC date) makes any late-evening local block
+    /// fall on the next UTC day and vanish from today's timeline.
     pub fn blocks_on(&self, date: chrono::NaiveDate) -> Vec<&TimeBlock> {
         let mut out: Vec<&TimeBlock> = self
             .blocks
             .iter()
-            .filter(|b| b.start.date_naive() == date)
+            .filter(|b| b.start.with_timezone(&chrono::Local).date_naive() == date)
             .collect();
         out.sort_by_key(|b| b.start);
         out
@@ -181,31 +182,45 @@ mod tests {
         assert_eq!(state.capacity_for(date("2026-08-13"), 360), 360);
     }
 
+    /// Build a UTC instant from a *local* date and hour, the way blocks are
+    /// created by the timeline and the HOBBES_TIME_BLOCK handler. Keeps these
+    /// tests independent of the machine's timezone.
+    fn local_instant(date: chrono::NaiveDate, hour: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Local
+            .from_local_datetime(&date.and_hms_opt(hour, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
     #[test]
-    fn blocks_on_filters_by_day_and_sorts_by_start() {
+    fn blocks_on_filters_by_local_day_and_sorts_by_start() {
         let mut state = PlannerState::default();
-        let base = "2026-08-12T09:00:00Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap();
-        let mut push = |id: &str, offset_h: i64| {
+        let day = date("2026-08-12");
+        let next = date("2026-08-13");
+        let mut push = |id: &str, on: chrono::NaiveDate, hour: u32| {
             state.blocks.push(TimeBlock {
                 id: id.into(),
                 todo_id: None,
                 title: id.into(),
-                start: base + chrono::Duration::hours(offset_h),
-                end: base + chrono::Duration::hours(offset_h + 1),
+                start: local_instant(on, hour),
+                end: local_instant(on, hour) + chrono::Duration::hours(1),
                 source: BlockSource::Manual,
             });
         };
-        push("later", 3);
-        push("earlier", 0);
-        push("next-day", 25);
+        push("later", day, 12);
+        push("earlier", day, 9);
+        // 22:00 local is the case the UTC-date comparison got wrong: in any
+        // timezone at or west of UTC-2 it lands on the next *UTC* day.
+        push("late-evening", day, 22);
+        push("next-day", next, 10);
 
         let ids: Vec<&str> = state
-            .blocks_on(date("2026-08-12"))
+            .blocks_on(day)
             .iter()
             .map(|b| b.id.as_str())
             .collect();
-        assert_eq!(ids, vec!["earlier", "later"]);
+        assert_eq!(ids, vec!["earlier", "later", "late-evening"]);
     }
 }

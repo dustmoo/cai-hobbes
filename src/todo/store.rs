@@ -354,10 +354,12 @@ pub fn delete_todo(id: &str) -> Result<(), String> {
     with_conn(|conn| delete_by_id_conn(conn, "todos", id))
 }
 
+#[allow(dead_code)] // consumer is project management UI, not yet built
 pub fn delete_project(id: &str) -> Result<(), String> {
     with_conn(|conn| delete_by_id_conn(conn, "todo_projects", id))
 }
 
+#[allow(dead_code)] // consumer is project management UI, not yet built
 pub fn delete_area(id: &str) -> Result<(), String> {
     with_conn(|conn| delete_by_id_conn(conn, "todo_areas", id))
 }

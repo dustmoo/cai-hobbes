@@ -277,6 +277,8 @@ pub struct TimeBlock {
 }
 
 impl TimeBlock {
+    // Consumed by P4's inline cards (elapsed-vs-estimate display).
+    #[allow(dead_code)]
     pub fn duration_minutes(&self) -> u32 {
         (self.end - self.start).num_minutes().max(0) as u32
     }
@@ -388,12 +390,14 @@ pub const SORT_STEP: f64 = 1024.0;
 
 /// Below this gap, `sort_between` can no longer split cleanly and the list
 /// should be renormalised.
+#[allow(dead_code)] // consumer is drag-and-drop reordering, deferred from P2
 pub const SORT_MIN_GAP: f64 = 1e-6;
 
 /// A sort key placing an item between two neighbours.
 ///
 /// `None` means "no neighbour on that side". Writing one row instead of
 /// renumbering the whole list is what keeps drag-and-drop responsive.
+#[allow(dead_code)] // consumer is drag-and-drop reordering, deferred from P2
 pub fn sort_between(before: Option<f64>, after: Option<f64>) -> f64 {
     match (before, after) {
         (None, None) => 0.0,
@@ -405,6 +409,7 @@ pub fn sort_between(before: Option<f64>, after: Option<f64>) -> f64 {
 
 /// Whether the neighbours have collapsed too close together to split again.
 /// The caller should renormalise the list and retry.
+#[allow(dead_code)] // consumer is drag-and-drop reordering, deferred from P2
 pub fn needs_renormalise(before: Option<f64>, after: Option<f64>) -> bool {
     match (before, after) {
         (Some(b), Some(a)) => (a - b).abs() < SORT_MIN_GAP,
@@ -413,6 +418,7 @@ pub fn needs_renormalise(before: Option<f64>, after: Option<f64>) -> bool {
 }
 
 /// Rewrite an ordered slice's sort keys onto a fresh evenly-spaced ladder.
+#[allow(dead_code)] // consumer is drag-and-drop reordering, deferred from P2
 pub fn renormalise(todos: &mut [Todo]) {
     for (i, todo) in todos.iter_mut().enumerate() {
         todo.sort_order = i as f64 * SORT_STEP;
