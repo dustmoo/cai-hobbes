@@ -585,3 +585,78 @@ fn test_available_skills_gated_by_running_skill() {
         "no skills: loader tool withheld"
     );
 }
+
+// =========================================================================
+// Planner: planner_today injection and tool gating
+// =========================================================================
+
+/// A session whose MCP context advertises the hobbes-planner tools, as the
+/// reactive sync in ChatWindow would populate it.
+fn session_with_planner_tools() -> Session {
+    let mut session = create_test_session();
+    session.active_context.mcp_tools = Some(crate::mcp::manager::McpContext {
+        servers: vec![crate::mcp::manager::McpServerContext {
+            name: crate::mcp::manager::HOBBES_PLANNER_SERVER.to_string(),
+            description: "Built-in planner".to_string(),
+            tools: crate::mcp::planner_client::PlannerClient::new().list_tools(),
+        }],
+        connected_toolkit_slugs: vec![],
+    });
+    session
+}
+
+#[test]
+fn planner_today_block_is_injected_when_attached() {
+    let session = create_test_session();
+    let state = create_test_session_state();
+    let settings = Settings::default();
+
+    let planner = crate::todo::PlannerState::default();
+    let today = chrono::Local::now().date_naive();
+    let block = crate::todo::handlers::planner_today_context(&planner, &settings, today);
+    assert!(block.is_some(), "enabled by default");
+
+    let prompt = PromptBuilder::new(&session, &settings, &state)
+        .with_planner_today(block)
+        .build_prompt("Hi".to_string());
+    let system = prompt.prompt.system.unwrap();
+    assert!(system.contains("planner_today"));
+    assert!(system.contains("HOBBES_PLAN_DAY"), "instruction names the tools");
+
+    // Without the attachment (the default) nothing is injected.
+    let prompt = PromptBuilder::new(&session, &settings, &state).build_prompt("Hi".to_string());
+    assert!(!prompt.prompt.system.unwrap().contains("planner_today"));
+}
+
+#[test]
+fn planner_tools_are_withheld_when_the_planner_is_disabled() {
+    let state = create_test_session_state();
+    let session = session_with_planner_tools();
+
+    let enabled = Settings::default();
+    let prompt = PromptBuilder::new(&session, &enabled, &state).build_prompt("Hi".to_string());
+    assert!(
+        prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_TODO_CREATE"),
+        "enabled: planner tools advertised"
+    );
+
+    let disabled = Settings {
+        planner_enabled: false,
+        ..Default::default()
+    };
+    let prompt = PromptBuilder::new(&session, &disabled, &state).build_prompt("Hi".to_string());
+    for tool in [
+        "HOBBES_TODO_CREATE",
+        "HOBBES_TODO_UPDATE",
+        "HOBBES_TODO_LIST",
+        "HOBBES_PLAN_DAY",
+        "HOBBES_TIME_BLOCK",
+        "HOBBES_PROJECT_UPSERT",
+    ] {
+        assert!(
+            !prompt.prompt.tools.iter().any(|t| t.name == tool),
+            "disabled: '{}' must disappear from the advertised tools",
+            tool
+        );
+    }
+}

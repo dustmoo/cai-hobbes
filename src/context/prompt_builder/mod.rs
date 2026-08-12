@@ -20,6 +20,11 @@ pub struct PromptBuilder<'a> {
     pub(crate) session: &'a Session,
     pub(crate) settings: &'a Settings,
     pub(crate) session_state: &'a crate::session::SessionState,
+    /// Prebuilt `planner_today` system-context block
+    /// (`todo::handlers::planner_today_context`). Computed at the call site so
+    /// the builder stays free of planner state; `None` (the default) when the
+    /// planner or its context injection is disabled.
+    pub(crate) planner_today: Option<serde_json::Value>,
 }
 
 impl<'a> PromptBuilder<'a> {
@@ -32,7 +37,15 @@ impl<'a> PromptBuilder<'a> {
             session,
             settings,
             session_state,
+            planner_today: None,
         }
+    }
+
+    /// Attach the `planner_today` block built by
+    /// `todo::handlers::planner_today_context`.
+    pub fn with_planner_today(mut self, planner_today: Option<serde_json::Value>) -> Self {
+        self.planner_today = planner_today;
+        self
     }
 
     /// Effective LLM provider for this prompt: session override → global settings.

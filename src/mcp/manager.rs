@@ -91,12 +91,18 @@ pub const HOBBES_CORE_SERVER: &str = "hobbes-core";
 /// all built-in tools and their origins.
 pub const HOBBES_META_SERVER: &str = "hobbes-meta";
 
+/// Canonical server name for the built-in planner tools
+/// (`HOBBES_TODO_*`, `HOBBES_PLAN_DAY`, `HOBBES_TIME_BLOCK`,
+/// `HOBBES_PROJECT_UPSERT`). Registered in `McpManager::servers` so the AI can
+/// accurately introspect all built-in tools and their origins.
+pub const HOBBES_PLANNER_SERVER: &str = "hobbes-planner";
+
 /// Built-in virtual servers must always stay fully loaded. `hobbes-meta`
 /// provides `MCP_LOAD_SERVER_TOOLS` itself — putting it on-demand (or
 /// unloading it) locks the loader behind the loader and makes every
 /// on-demand server unreachable.
 pub fn is_builtin_virtual_server(name: &str) -> bool {
-    name == HOBBES_CORE_SERVER || name == HOBBES_META_SERVER
+    name == HOBBES_CORE_SERVER || name == HOBBES_META_SERVER || name == HOBBES_PLANNER_SERVER
 }
 
 /// Get meta-tools for local MCP server on-demand loading.
@@ -450,6 +456,11 @@ pub enum McpClientType {
     /// Dispatch is intercepted in use_mcp_tool() before the match arm runs.
     /// This variant exists so the server is visible / introspectable in McpManager.
     NativeMeta,
+    /// Built-in planner tools (HOBBES_TODO_*, HOBBES_PLAN_DAY, HOBBES_TIME_BLOCK,
+    /// HOBBES_PROJECT_UPSERT). Dispatch is intercepted upstream in
+    /// components::builtin_tools (requires the PlannerState signal).
+    /// This variant exists so the server is visible / introspectable in McpManager.
+    NativePlanner,
 }
 
 impl McpClientType {
@@ -461,7 +472,8 @@ impl McpClientType {
             McpClientType::NativeComposio(_)
             | McpClientType::NativeImage(_)
             | McpClientType::NativeCore
-            | McpClientType::NativeMeta => true,
+            | McpClientType::NativeMeta
+            | McpClientType::NativePlanner => true,
         }
     }
 }
@@ -1212,6 +1224,30 @@ impl McpManager {
                 };
                 if tx_clone.send(active_client).is_err() {
                     tracing::error!("Failed to send initialized Hobbes Core client");
+                }
+            });
+        }
+
+        // Initialize Native Planner Client (HOBBES_TODO_*, HOBBES_PLAN_DAY, …)
+        {
+            let tx_clone = tx.clone();
+            spawn(async move {
+                tracing::info!("Initializing Hobbes Planner built-in tools server");
+                let planner_client = crate::mcp::planner_client::PlannerClient::new();
+                let tools = planner_client.list_tools();
+                let config = McpServerConfig::native_stub(
+                    HOBBES_PLANNER_SERVER.to_string(),
+                    "Built-in planner: to-dos, daily planning, time blocks.".to_string(),
+                );
+                let active_client = ActiveMcpClient {
+                    config,
+                    service: McpClientType::NativePlanner,
+                    tools,
+                    warning_message: None,
+                    profile_id: None,
+                };
+                if tx_clone.send(active_client).is_err() {
+                    tracing::error!("Failed to send initialized Hobbes Planner client");
                 }
             });
         }
@@ -2306,6 +2342,16 @@ impl McpManager {
                     // If we land here it means a dispatch path was missed.
                     Err(format!(
                         "Built-in core tool '{}' was not intercepted before MCP dispatch. \
+                        This is a Hobbes bug — please report it.",
+                        tool.name
+                    ))
+                }
+                McpClientType::NativePlanner => {
+                    // Planner tools are intercepted upstream in
+                    // components::builtin_tools before use_mcp_tool() is called.
+                    // If we land here it means a dispatch path was missed.
+                    Err(format!(
+                        "Built-in planner tool '{}' was not intercepted before MCP dispatch. \
                         This is a Hobbes bug — please report it.",
                         tool.name
                     ))
@@ -4092,6 +4138,7 @@ impl McpManager {
             ("hobbes-native-image", "Image Generation"),
             (HOBBES_CORE_SERVER, "Hobbes Core Tools"),
             (HOBBES_META_SERVER, "Hobbes Meta Tools"),
+            (HOBBES_PLANNER_SERVER, "Hobbes Planner"),
         ] {
             if let Some((_k, client)) = servers.iter().find(|(k, _)| k.as_str() == server_key) {
                 statuses.push(McpServerStatus {

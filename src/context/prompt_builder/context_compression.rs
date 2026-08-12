@@ -8,7 +8,7 @@ impl<'a> PromptBuilder<'a> {
     /// 1. Core (never omit): system_persona, user_name, current_time, scratchpad
     /// 2. Skill (compress before omit): loaded_skills instruction_manuals
     /// 3. Context (trim): conversation_summary, entities
-    /// 4. Enrichment (omit first): composio_context, mcp_servers, user_instruction
+    /// 4. Enrichment (omit first): composio_context, mcp_servers, user_instruction, planner_today
     pub(crate) fn compose_system_for_budget(
         system_context_map: &mut serde_json::Map<String, serde_json::Value>,
         persona: &str,
@@ -56,8 +56,10 @@ impl<'a> PromptBuilder<'a> {
         // These keys are NEVER removed or modified by any compression tier.
         // scratchpad is the AI's persistent session memory — immune to all compression.
 
-        // Tier 4: Drop enrichment sections
-        for key in ["composio_context", "mcp_servers", "user_instruction"] {
+        // Tier 4: Drop enrichment sections.
+        // planner_today is deliberately last: it is the freshest enrichment
+        // (today's plan) and should outlive the other three under pressure.
+        for key in ["composio_context", "mcp_servers", "user_instruction", "planner_today"] {
             if running_size <= system_budget_chars { return; }
             if let Some(removed) = system_context_map.remove(key) {
                 // Account for key + value + quotes/colon/comma overhead

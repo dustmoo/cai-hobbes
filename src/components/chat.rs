@@ -92,6 +92,7 @@ pub fn ChatWindow(
     let mcp_context_signal = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let permission_manager = use_context::<Signal<PermissionManager>>();
     let skill_registry = use_context::<Signal<crate::skills::SkillRegistry>>();
+    let planner_state = use_context::<Signal<crate::todo::PlannerState>>();
     let mut chat_command = use_context::<Signal<Option<super::chat_input::ChatCommand>>>();
 
     // Shared expansion state for <details> blocks in MarkdownRenderer.
@@ -361,6 +362,7 @@ pub fn ChatWindow(
                             skill_registry,
                             permission_manager,
                             mcp_context: mcp_context_signal,
+                            planner: planner_state,
                         },
                         &tool_call,
                         &args_json,
@@ -559,7 +561,14 @@ pub fn ChatWindow(
                                 let state = session_state.read();
                                 if let Some(session) = state.sessions.get(&target_id) {
                                     let builder =
-                                        PromptBuilder::new(session, &settings_read, &state);
+                                        PromptBuilder::new(session, &settings_read, &state)
+                                            .with_planner_today(
+                                                crate::todo::handlers::planner_today_context(
+                                                    &planner_state.read(),
+                                                    &settings_read,
+                                                    chrono::Local::now().date_naive(),
+                                                ),
+                                            );
                                     let result = builder.build_prompt("".to_string());
                                     (result.prompt, result.pages_to_store)
                                 } else {
@@ -677,7 +686,12 @@ pub fn ChatWindow(
                         let user_prompt = user_message.clone();
                         let state = session_state.read();
                         if let Some(session) = state.sessions.get(&target_id) {
-                            let builder = PromptBuilder::new(session, &settings_read, &state);
+                            let builder = PromptBuilder::new(session, &settings_read, &state)
+                                .with_planner_today(crate::todo::handlers::planner_today_context(
+                                    &planner_state.read(),
+                                    &settings_read,
+                                    chrono::Local::now().date_naive(),
+                                ));
                             let result = builder.build_prompt(user_prompt);
                             (result.prompt, result.pages_to_store)
                         } else {
@@ -751,7 +765,12 @@ pub fn ChatWindow(
                 let (prompt_data, pages) = {
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&target_id) {
-                        let builder = PromptBuilder::new(session, &settings, &state);
+                        let builder = PromptBuilder::new(session, &settings, &state)
+                            .with_planner_today(crate::todo::handlers::planner_today_context(
+                                &planner_state.read(),
+                                &settings,
+                                chrono::Local::now().date_naive(),
+                            ));
                         let result = builder.build_prompt("".to_string());
                         (result.prompt, result.pages_to_store)
                     } else {

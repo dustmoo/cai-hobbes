@@ -110,6 +110,7 @@ pub fn ChatInput(
     let _settings_manager = use_context::<Signal<SettingsManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let _planner_state = use_context::<Signal<crate::todo::PlannerState>>();
     let ui_state = use_context::<Signal<UiState>>();
     let DraftContext(mut draft) = use_context::<DraftContext>();
     let mut is_dragging = use_signal(|| false);
@@ -1441,7 +1442,12 @@ pub fn ChatInput(
                                                         }
 
                                                         let settings_reader = settings.read();
-                                                        let builder = PromptBuilder::new(&session_for_debug, &settings_reader, &state);
+                                                        let builder = PromptBuilder::new(&session_for_debug, &settings_reader, &state)
+                                                            .with_planner_today(crate::todo::handlers::planner_today_context(
+                                                                &_planner_state.read(),
+                                                                &settings_reader,
+                                                                chrono::Local::now().date_naive(),
+                                                            ));
                                                         let result = builder.build_prompt("[DEBUG USER MESSAGE]".to_string());
                                                         let prompt_data = result.prompt;
                                                         format!("{:#?}", prompt_data)

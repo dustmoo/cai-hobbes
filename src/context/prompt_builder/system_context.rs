@@ -363,6 +363,22 @@ impl<'a> PromptBuilder<'a> {
             );
         }
 
+        // Inject today's plan so the model sees the day without calling a tool
+        // for it. Prebuilt at the call site (todo::handlers::planner_today_context)
+        // and already hard-capped there; None when the planner or the injection
+        // is disabled. Tier 4 in context_compression — the last enrichment
+        // dropped under budget pressure.
+        if let Some(planner_today) = &self.planner_today {
+            system_context_map.insert("planner_today".to_string(), planner_today.clone());
+        }
+
+        // When the planner is disabled its tools must disappear from the prompt
+        // entirely, not just fail on call — same precedent as the
+        // HOBBES_INVOKE_SKILL withholding below.
+        if !self.settings.planner_enabled {
+            tools.retain(|t| !crate::components::builtin_tools::is_planner_tool(&t.name));
+        }
+
         // Skill-scoped tool filtering: when a skill has resolved specific tools,
         // only include those tool definitions instead of ALL tools from ALL servers.
         // IMPORTANT: Only apply this filter when the skill call is the LAST meaningful

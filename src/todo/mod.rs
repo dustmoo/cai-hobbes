@@ -17,6 +17,7 @@
 //! Remove it once P2 lands so genuinely dead code starts showing up again.
 #![allow(dead_code)]
 
+pub mod handlers;
 pub mod model;
 pub mod store;
 pub mod views;

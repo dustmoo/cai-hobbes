@@ -48,11 +48,28 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_SET_TIMER",
     "HOBBES_LIST_TIMERS",
     "HOBBES_CANCEL_TIMER",
+    "HOBBES_TODO_CREATE",
+    "HOBBES_TODO_UPDATE",
+    "HOBBES_TODO_LIST",
+    "HOBBES_PLAN_DAY",
+    "HOBBES_TIME_BLOCK",
+    "HOBBES_PROJECT_UPSERT",
 ];
 
 #[allow(dead_code)]
 pub fn is_builtin_tool(name: &str) -> bool {
     BUILTIN_TOOLS.contains(&name)
+}
+
+/// Whether a tool belongs to the `hobbes-planner` virtual server. Used both to
+/// gate dispatch on `settings.planner_enabled` and to withhold the tool
+/// definitions from the prompt when the planner is off (system_context.rs).
+pub fn is_planner_tool(name: &str) -> bool {
+    name.starts_with("HOBBES_TODO_")
+        || matches!(
+            name,
+            "HOBBES_PLAN_DAY" | "HOBBES_TIME_BLOCK" | "HOBBES_PROJECT_UPSERT"
+        )
 }
 
 /// The app-state signals a built-in handler may need.
@@ -63,6 +80,9 @@ pub struct BuiltinToolCtx {
     pub skill_registry: Signal<SkillRegistry>,
     pub permission_manager: Signal<PermissionManager>,
     pub mcp_context: Signal<McpContext>,
+    /// The global planner (to-dos, day plans, time blocks) — shared across all
+    /// chat tabs, unlike the per-session state above.
+    pub planner: Signal<crate::todo::PlannerState>,
 }
 
 pub struct BuiltinOutcome {
@@ -159,7 +179,75 @@ pub async fn dispatch_builtin_tool(
             })
         }
 
+        name if is_planner_tool(name) => {
+            let (status, response) = run_planner_tool(deps, name, args_json, session_id);
+            // Planner mutations persist through todo::store inside the handler;
+            // this flag persists the *session* so the tool response written into
+            // the message survives a restart.
+            Some(BuiltinOutcome {
+                status,
+                response,
+                persist: true,
+            })
+        }
+
         _ => None,
+    }
+}
+
+/// Execute one of the `hobbes-planner` tools against the global planner state.
+///
+/// Planner days are user-local, so "today" is `Local::now()`, not UTC. The
+/// handlers write through to `todo::store` themselves (`persist: true`).
+fn run_planner_tool(
+    deps: BuiltinToolCtx,
+    tool_name: &str,
+    args_json: &serde_json::Value,
+    session_id: &str,
+) -> (ToolCallStatus, String) {
+    if !deps.settings.read().planner_enabled {
+        return (
+            ToolCallStatus::Error,
+            "The planner is disabled in Settings.".to_string(),
+        );
+    }
+
+    use crate::todo::handlers;
+    let mut planner = deps.planner;
+    let today = chrono::Local::now().date_naive();
+
+    match tool_name {
+        "HOBBES_TODO_CREATE" => {
+            handlers::handle_todo_create(&mut planner.write(), args_json, session_id, today, true)
+        }
+        "HOBBES_TODO_UPDATE" => {
+            handlers::handle_todo_update(&mut planner.write(), args_json, today, true)
+        }
+        "HOBBES_TODO_LIST" => handlers::handle_todo_list(&planner.read(), args_json, today),
+        "HOBBES_PLAN_DAY" => {
+            let default_capacity = deps.settings.read().planner_daily_capacity_minutes;
+            handlers::handle_plan_day(
+                &mut planner.write(),
+                args_json,
+                default_capacity,
+                today,
+                true,
+            )
+        }
+        "HOBBES_TIME_BLOCK" => {
+            handlers::handle_time_block(&mut planner.write(), args_json, today, true)
+        }
+        "HOBBES_PROJECT_UPSERT" => {
+            handlers::handle_project_upsert(&mut planner.write(), args_json, today, true)
+        }
+        other => (
+            ToolCallStatus::Error,
+            format!(
+                "Planner tool '{}' matched is_planner_tool but has no handler. \
+                This is a Hobbes bug — please report it.",
+                other
+            ),
+        ),
     }
 }
 
@@ -293,9 +381,31 @@ mod tests {
         }
     }
 
+    /// Same drift guard for the planner: a tool advertised by `PlannerClient`
+    /// but not dispatchable here reaches `NativePlanner` and fails.
+    #[test]
+    fn every_planner_client_tool_is_dispatchable() {
+        for tool in crate::mcp::planner_client::PlannerClient::new().list_tools() {
+            assert!(
+                is_builtin_tool(&tool.name),
+                "PlannerClient advertises '{}' but BUILTIN_TOOLS does not list it — \
+                 it would fail as an unintercepted NativePlanner call",
+                tool.name
+            );
+            assert!(
+                is_planner_tool(&tool.name),
+                "'{}' is advertised by PlannerClient but is_planner_tool() misses it — \
+                 it would dodge the planner_enabled gate and the disabled-tool filter",
+                tool.name
+            );
+        }
+    }
+
     #[test]
     fn unknown_tools_are_not_builtin() {
         assert!(!is_builtin_tool("some_mcp_server_tool"));
         assert!(!is_builtin_tool("MCP_LOAD_SERVER_TOOLS"));
+        assert!(!is_planner_tool("HOBBES_UPDATE_SCRATCHPAD"));
+        assert!(!is_planner_tool("MCP_LOAD_SERVER_TOOLS"));
     }
 }
