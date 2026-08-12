@@ -18,6 +18,7 @@ pub mod syntax_highlighter;
 pub mod tab_bar;
 pub mod tool_call_display;
 
+pub mod builtin_tools;
 pub mod confirm_delete_modal;
 pub mod confirm_save_modal;
 pub mod continuation_controller;

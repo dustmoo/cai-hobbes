@@ -99,7 +99,7 @@ The prompt builder is **session-aware**: it resolves the connector/context windo
 `McpManager` manages all tool servers as an `Arc<McpManager>`. Lock ordering is **mandatory** (P-010): always acquire `servers` before `dynamic_local_tools` before `dynamic_composio_tools`. Violations cause ABBA deadlocks.
 
 Two virtual built-in servers are registered for AI introspection:
-- `hobbes-core` (via `CoreClient`) — `HOBBES_UPDATE_SCRATCHPAD`, `HOBBES_PAGE_RESULT`. Dispatched in `stream_manager.rs` before MCP dispatch (requires `SessionState`).
+- `hobbes-core` (via `CoreClient`) — `HOBBES_UPDATE_SCRATCHPAD`, `HOBBES_PAGE_RESULT`, `HOBBES_INVOKE_SKILL`, `HOBBES_SET_TIMER`, `HOBBES_LIST_TIMERS`, `HOBBES_CANCEL_TIMER`. All dispatch through `components::builtin_tools::dispatch_builtin_tool` before MCP dispatch (they need `SessionState` and the skill/permission registries). Both the streaming path and the approval-resume path call it — add new built-ins there, never at a call site (P-015).
 - `hobbes-meta` — `MCP_LOAD_SERVER_TOOLS`, `MCP_UNLOAD_SERVER_TOOLS`.
 
 Composio integration uses explicit per-user OAuth (P-002 through P-007) — see `SYSTEM_PATTERNS.md` for the full 6-point reconnect lifecycle.

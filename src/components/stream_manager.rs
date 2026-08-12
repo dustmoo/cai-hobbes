@@ -533,269 +533,52 @@ impl StreamManagerContext {
                                     .unwrap_or(serde_json::Value::Null);
                             let profile_id = profile_id_inner;
 
-                            // Intercept HOBBES_PAGE_RESULT before MCP dispatch —
-                            // requires SessionState.page_queue which McpManager doesn't have.
-                            if tool_call.tool_name == "HOBBES_PAGE_RESULT" {
-                                let page_budget = crate::session::compute_page_budget(
-                                    &self.settings.read(),
-                                    session_state.read().sessions.get(&session_id_inner),
-                                );
-                                let (status, response_str) =
-                                    session_state.write().handle_page_result(&args_json, "", page_budget);
-
-
-                                // Update message with result
-                                {
-                                    let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
-                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
-                                            tc.status = status;
-                                            tc.response = response_str.clone();
-                                        }
-                                    }
-                                    state.touch_session(&session_id_inner);
-                                }
-
-                                let record = crate::components::shared::ToolCallRecord {
-                                    call: tool_call.clone(),
-                                    result: crate::components::shared::ToolResult {
-                                        status,
-                                        response: response_str,
+                            // Built-in tools run here, before MCP dispatch — they
+                            // need SessionState and the skill/permission registries
+                            // that McpManager doesn't own. The same dispatcher backs
+                            // the approval-resume path in chat.rs; see
+                            // components::builtin_tools.
+                            if let Some(outcome) =
+                                crate::components::builtin_tools::dispatch_builtin_tool(
+                                    crate::components::builtin_tools::BuiltinToolCtx {
+                                        session_state,
+                                        settings: self.settings,
+                                        skill_registry: self.skill_registry,
+                                        permission_manager: self.permission_manager,
+                                        mcp_context: self.mcp_context,
                                     },
-                                    profile_color: {
-                                        let settings_read = self.settings.read();
-                                        crate::components::shared::resolve_profile_color(
-                                            profile_id.as_ref(),
-                                            &settings_read,
-                                        )
-                                    },
-                                };
-                                let _ = tool_results_tx_clone.send(record);
-                                completed_tool_tasks_clone
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                return;
-                            }
-
-                            // Intercept HOBBES_UPDATE_SCRATCHPAD before MCP dispatch.
-                            if tool_call.tool_name == "HOBBES_UPDATE_SCRATCHPAD" {
-                                let (status, response_str) =
-                                    session_state.write().handle_scratchpad_update(&args_json, &session_id_inner, &self.settings.read());
-
-                                // Persist so the scratchpad survives app restart
-                                {
-                                    let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
-                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
-                                            tc.status = status;
-                                            tc.response = response_str.clone();
-                                        }
-                                    }
-                                    state.touch_session(&session_id_inner);
-                                }
-                                crate::session::SessionState::save_async(&session_state.read(), None);
-
-                                let record = crate::components::shared::ToolCallRecord {
-                                    call: tool_call.clone(),
-                                    result: crate::components::shared::ToolResult {
-                                        status,
-                                        response: response_str,
-                                    },
-                                    profile_color: {
-                                        let settings_read = self.settings.read();
-                                        crate::components::shared::resolve_profile_color(
-                                            profile_id.as_ref(),
-                                            &settings_read,
-                                        )
-                                    },
-                                };
-                                let _ = tool_results_tx_clone.send(record);
-                                completed_tool_tasks_clone
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                return;
-                            }
-
-                            // Intercept HOBBES_INVOKE_SKILL before MCP dispatch — the
-                            // model-invocation path for skills. Executes the skill
-                            // (capability registration only), persists the payload into
-                            // session.loaded_skills, and returns the instruction manual
-                            // as the tool result.
-                            if tool_call.tool_name == "HOBBES_INVOKE_SKILL" {
-                                let skill_name = args_json
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let arguments = args_json
-                                    .get("arguments")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-
-                                let skill_opt = self.skill_registry.read().get_skill(&skill_name);
-                                let (status, response_str) = match skill_opt {
-                                    None => (
-                                        ToolCallStatus::Error,
-                                        format!(
-                                            "Skill '{}' not found. Only skills listed under available_skills in your system context can be invoked.",
-                                            skill_name
-                                        ),
-                                    ),
-                                    Some(skill) if skill.metadata.disable_model_invocation => (
-                                        ToolCallStatus::Error,
-                                        format!(
-                                            "Skill '{}' has model invocation disabled. The user must invoke it themselves with /{}.",
-                                            skill_name, skill_name
-                                        ),
-                                    ),
-                                    Some(skill) => {
-                                        let permission = self
-                                            .permission_manager
-                                            .read()
-                                            .check_skill_permission(&skill.metadata.name);
-                                        if permission
-                                            != crate::context::permissions::PermissionStatus::Allowed
-                                        {
-                                            (
-                                                ToolCallStatus::Error,
-                                                format!(
-                                                    "The user has disabled auto-approval for skill '{}'. Ask them to run /{} themselves or enable the skill in Settings → Permissions.",
-                                                    skill_name, skill_name
-                                                ),
-                                            )
-                                        } else {
-                                            let mut skill_call =
-                                                crate::components::shared::SkillCall {
-                                                    execution_id: uuid::Uuid::new_v4().to_string(),
-                                                    skill_name: skill.metadata.name.clone(),
-                                                    arguments,
-                                                    status: crate::components::shared::SkillCallStatus::Running,
-                                                    response: String::new(),
-                                                    instructions: skill.instructions.clone(),
-                                                    path: skill.path.clone(),
-                                                    has_scripts: !skill.scripts.is_empty(),
-                                                    raw_output: None,
-                                                    profile_color: {
-                                                        let settings_read = self.settings.read();
-                                                        crate::components::shared::resolve_profile_color(
-                                                            profile_id.as_ref(),
-                                                            &settings_read,
-                                                        )
-                                                    },
-                                                };
-                                            let mcp_context = {
-                                                // Use the reactively-synced McpContext signal
-                                                // (P-001: never get_mcp_context().await mid-turn)
-                                                let mut ctx = self.mcp_context.read().clone();
-                                                ctx.enrich_from_settings(&self.settings.read());
-                                                ctx
-                                            };
-                                            match crate::skills::execute_skill(
-                                                &mut skill_call,
-                                                Some(&mcp_context),
-                                            )
-                                            .await
-                                            {
-                                                Ok(result) => {
-                                                    let completed = result.status
-                                                        == crate::components::shared::SkillCallStatus::Completed;
-                                                    if completed {
-                                                        // Persist so the skill stays in system
-                                                        // context for all future turns
-                                                        let mut state = session_state.write();
-                                                        if let Some(session) = state
-                                                            .sessions
-                                                            .get_mut(&session_id_inner)
-                                                        {
-                                                            session.loaded_skills.insert(
-                                                                skill_call.skill_name.clone(),
-                                                                result.output.clone(),
-                                                            );
-                                                        }
-                                                        drop(state);
-                                                        tracing::info!(
-                                                            "Model invoked skill '{}' — persisted into session.loaded_skills",
-                                                            skill_call.skill_name
-                                                        );
-                                                        (ToolCallStatus::Completed, result.output)
-                                                    } else {
-                                                        (ToolCallStatus::Error, result.output)
-                                                    }
-                                                }
-                                                Err(e) => (
-                                                    ToolCallStatus::Error,
-                                                    format!("Skill invocation failed: {}", e),
-                                                ),
-                                            }
-                                        }
-                                    }
-                                };
+                                    &tool_call,
+                                    &args_json,
+                                    &session_id_inner,
+                                    profile_id.as_ref(),
+                                )
+                                .await
+                            {
+                                let crate::components::builtin_tools::BuiltinOutcome {
+                                    status,
+                                    response,
+                                    persist,
+                                } = outcome;
 
                                 {
                                     let mut state = session_state.write();
                                     if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
                                         if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
                                             tc.status = status;
-                                            tc.response = response_str.clone();
+                                            tc.response = response.clone();
                                         }
                                     }
                                     state.touch_session(&session_id_inner);
                                 }
-                                crate::session::SessionState::save_async(&session_state.read(), None);
+                                if persist {
+                                    crate::session::SessionState::save_async(&session_state.read(), None);
+                                }
 
                                 let record = crate::components::shared::ToolCallRecord {
                                     call: tool_call.clone(),
                                     result: crate::components::shared::ToolResult {
                                         status,
-                                        response: response_str,
-                                    },
-                                    profile_color: {
-                                        let settings_read = self.settings.read();
-                                        crate::components::shared::resolve_profile_color(
-                                            profile_id.as_ref(),
-                                            &settings_read,
-                                        )
-                                    },
-                                };
-                                let _ = tool_results_tx_clone.send(record);
-                                completed_tool_tasks_clone
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                return;
-                            }
-
-                            // Intercept HOBBES timer tools before MCP dispatch.
-                            if matches!(
-                                tool_call.tool_name.as_str(),
-                                "HOBBES_SET_TIMER" | "HOBBES_LIST_TIMERS" | "HOBBES_CANCEL_TIMER"
-                            ) {
-                                let (status, response_str) = match tool_call.tool_name.as_str() {
-                                    "HOBBES_SET_TIMER" => session_state
-                                        .write()
-                                        .handle_set_timer(&args_json, &session_id_inner),
-                                    "HOBBES_LIST_TIMERS" => {
-                                        session_state.read().handle_list_timers(&session_id_inner)
-                                    }
-                                    _ => session_state
-                                        .write()
-                                        .handle_cancel_timer(&args_json, &session_id_inner),
-                                };
-
-                                {
-                                    let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
-                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
-                                            tc.status = status;
-                                            tc.response = response_str.clone();
-                                        }
-                                    }
-                                    state.touch_session(&session_id_inner);
-                                }
-                                crate::session::SessionState::save_async(&session_state.read(), None);
-
-                                let record = crate::components::shared::ToolCallRecord {
-                                    call: tool_call.clone(),
-                                    result: crate::components::shared::ToolResult {
-                                        status,
-                                        response: response_str,
+                                        response,
                                     },
                                     profile_color: {
                                         let settings_read = self.settings.read();

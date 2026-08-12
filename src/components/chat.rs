@@ -89,8 +89,9 @@ pub fn ChatWindow(
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let mut settings = use_context::<Signal<Settings>>();
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
-    let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let mcp_context_signal = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let permission_manager = use_context::<Signal<PermissionManager>>();
+    let skill_registry = use_context::<Signal<crate::skills::SkillRegistry>>();
     let mut chat_command = use_context::<Signal<Option<super::chat_input::ChatCommand>>>();
 
     // Shared expansion state for <details> blocks in MarkdownRenderer.
@@ -184,7 +185,7 @@ pub fn ChatWindow(
     // This ensures the UI updates immediately when tools are loaded/unloaded
     // We filter tools by the session's active profile to ensure isolation.
     use_effect(move || {
-        let mut current_context = _mcp_context.read().clone();
+        let mut current_context = mcp_context_signal.read().clone();
         let mut state = session_state.write();
         if let Some(session) = state.sessions.get_mut(&*current_target_id.read()) {
             let profile_id = session.composio_profile.clone();
@@ -350,36 +351,47 @@ pub fn ChatWindow(
                     let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                         .unwrap_or(serde_json::Value::Null);
 
-                    // Intercept HOBBES_PAGE_RESULT and HOBBES_UPDATE_SCRATCHPAD before MCP
-                    // dispatch — these tools require SessionState which McpManager doesn't own.
-                    let (status, response_str) = if tool_call.tool_name == "HOBBES_PAGE_RESULT" {
-                        let page_budget = crate::session::compute_page_budget(
-                            &settings.read(),
-                            session_state.read().sessions.get(&active_session_id),
-                        );
-                        session_state.write().handle_page_result(&args_json, "", page_budget)
-                    } else if tool_call.tool_name == "HOBBES_UPDATE_SCRATCHPAD" {
-                        session_state.write().handle_scratchpad_update(&args_json, &active_session_id, &settings.read())
-                    } else {
-                        // Normal MCP tool dispatch
-                        let manager = mcp_manager.read().clone();
-                        let result_receiver = manager
-                            .use_mcp_tool(
-                                &tool_call.server_name,
-                                &tool_call.tool_name,
-                                args_json,
-                                true,
-                                composio_profile.clone(),
-                            )
-                            .await;
+                    // Built-in tools run before MCP dispatch, through the same
+                    // dispatcher the streaming path uses so the two can't drift
+                    // apart (see components::builtin_tools).
+                    let builtin = crate::components::builtin_tools::dispatch_builtin_tool(
+                        crate::components::builtin_tools::BuiltinToolCtx {
+                            session_state,
+                            settings,
+                            skill_registry,
+                            permission_manager,
+                            mcp_context: mcp_context_signal,
+                        },
+                        &tool_call,
+                        &args_json,
+                        &active_session_id,
+                        composio_profile.as_ref(),
+                    )
+                    .await;
 
-                        let (s, r, _) = match result_receiver {
-                            Ok(receiver) => {
-                                crate::mcp::manager::McpManager::process_tool_output(receiver).await
-                            }
-                            Err(e) => (crate::components::shared::ToolCallStatus::Error, e, false),
-                        };
-                        (s, r)
+                    let (status, response_str, persist) = match builtin {
+                        Some(outcome) => (outcome.status, outcome.response, outcome.persist),
+                        None => {
+                            // Normal MCP tool dispatch
+                            let manager = mcp_manager.read().clone();
+                            let result_receiver = manager
+                                .use_mcp_tool(
+                                    &tool_call.server_name,
+                                    &tool_call.tool_name,
+                                    args_json,
+                                    true,
+                                    composio_profile.clone(),
+                                )
+                                .await;
+
+                            let (s, r, _) = match result_receiver {
+                                Ok(receiver) => {
+                                    crate::mcp::manager::McpManager::process_tool_output(receiver).await
+                                }
+                                Err(e) => (crate::components::shared::ToolCallStatus::Error, e, false),
+                            };
+                            (s, r, false)
+                        }
                     };
 
 
@@ -414,6 +426,13 @@ pub fn ChatWindow(
                                     )
                                 },
                             });
+                    }
+
+                    // Built-ins that mutate durable session state (scratchpad,
+                    // skills, timers) must survive a restart; pagination is
+                    // turn-local and skips the write.
+                    if persist {
+                        crate::session::SessionState::save_async(&session_state.read(), None);
                     }
                 }
 

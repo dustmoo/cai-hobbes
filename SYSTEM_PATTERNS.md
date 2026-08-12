@@ -165,6 +165,7 @@ mod secret_manager_generic; // keyring crate
 | AP-006 | Direct Keychain Save Bypass | Duplicated fallback logic, inconsistent behavior | Use `save_secret_to_keychain()` or `SecretManager::set()` |
 | AP-007 | Reversed MCP Lock Order | App deadlock (hangs forever) | Always lock `servers` before `dynamic_local_tools` |
 | AP-008 | `use_memo` Over a Prop | Streaming code/markdown freezes at first chunk | Compute inline; reserve `use_memo` for Signals (P-012) |
+| AP-009 | Built-in Tool Intercepted at One Call Site | Tool works normally, fails only after a permission approval | Add it to `dispatch_builtin_tool`, never to a call site (P-015) |
 
 ---
 
@@ -405,3 +406,53 @@ the dropped ids → drop its on-demand tools (profile-keyed bucket) + settings
 
 **If broken**: connects fail with 400s on the shared server; removals also fail;
 the only escape is Recreate.
+
+---
+
+### 15. Built-in Tools Have Exactly One Dispatch Point
+
+> **Pattern ID**: P-015
+> **Anti-Pattern**: Intercepting a `HOBBES_*` tool at one call site but not the other (AP-009)
+
+Built-in ("virtual server") tools are intercepted **before** MCP dispatch because
+they operate on `SessionState`, the skill registry, and the permission manager —
+state `McpManager` does not own. `McpClientType::NativeCore` therefore has no
+executor: reaching it means interception was missed, and it returns an explicit
+*"was not intercepted before MCP dispatch. This is a Hobbes bug"* error.
+
+There are **two** paths that execute tool calls:
+
+| Path | Location | When |
+|------|----------|------|
+| Streaming | `src/components/stream_manager.rs` | Normal turn |
+| Approval resume | `src/components/chat.rs` | Re-runs calls left `Running` after the user approves them |
+
+Both route through `dispatch_builtin_tool` in
+`src/components/builtin_tools.rs`, which returns `Some(BuiltinOutcome)` for a
+built-in and `None` to fall through to MCP.
+
+**Rules**:
+- **Add new built-ins to `dispatch_builtin_tool` only** — never inline at a call
+  site. That is how the two paths drifted before: `HOBBES_SET_TIMER` and
+  `HOBBES_INVOKE_SKILL` were handled only on the streaming path, so they worked
+  normally and hit the NativeCore bug error whenever the turn happened to resume
+  from an approval. Intermittent by nature, and invisible in any test that
+  doesn't involve a permission prompt.
+- **`BuiltinOutcome.persist`** carries whether the caller must
+  `SessionState::save_async` afterwards. Pagination is turn-local (`false`); the
+  scratchpad, skills, and timers must survive a restart (`true`).
+- **The dispatcher only computes the result.** Writing it back into the message,
+  persisting, and recording tool-call history stay with each caller, because the
+  two sites genuinely differ there.
+- `BUILTIN_TOOLS` is documentation plus a test fixture — it is deliberately
+  **not** consulted as an early-out in the dispatcher. A guard would mean a new
+  match arm whose name was omitted from the list silently fell through to MCP,
+  trading a loud failure for a quiet one.
+
+**Test**: `every_core_client_tool_is_dispatchable` asserts every tool advertised
+by `CoreClient::list_tools` is listed in `BUILTIN_TOOLS`, so a tool added to the
+schema but not the dispatcher fails the build rather than the user's next
+approval.
+
+**If broken**: the tool works in most turns and errors only after a permission
+prompt — the hardest possible failure to reproduce from a bug report.
