@@ -617,15 +617,17 @@ fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
 #[component]
 fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
+    let settings = use_context::<Signal<Settings>>();
     let mut draft = use_signal(String::new);
 
     let mut submit = move |_| {
-        let title = draft.peek().trim().to_string();
-        if title.is_empty() {
-            return;
-        }
         let day = today();
-        let mut todo = Todo::new(title, planner.peek().next_sort_order());
+        let parsed = crate::todo::quick_add::parse_quick_add(&draft.peek(), day);
+        if parsed.title.is_empty() {
+            return; // tokens without a title aren't a todo yet
+        }
+
+        let mut todo = Todo::new(parsed.title, planner.peek().next_sort_order());
         // New todos land in the context being looked at, so quick-add never
         // makes work vanish into a different list.
         match selection.peek().clone() {
@@ -647,13 +649,67 @@ fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
             }
             _ => {} // Inbox (and Logbook, which hides quick-add)
         }
+
+        // Tokens beat defaults; defaults beat nothing.
+        let default_estimate = settings.peek().planner_default_estimate_minutes;
+        todo.estimate_minutes = parsed
+            .estimate_minutes
+            .or((default_estimate > 0).then_some(default_estimate));
+        todo.tags = parsed.tags;
+        todo.deadline = parsed.deadline;
+        todo.time_of_day = parsed.time_of_day;
+
+        // An @clock token means "this happens at that time": it implies a
+        // scheduled day (today unless the view already picked one) and puts a
+        // linked block on that day's timeline.
+        let block_date = parsed.block_start.map(|_| {
+            let d = todo.scheduled_for.unwrap_or(day);
+            todo.scheduled_for = Some(d);
+            if todo.bucket == TodoBucket::Inbox {
+                todo.bucket = TodoBucket::Anytime;
+            }
+            d
+        });
+
         if let Err(e) = store::save_todo(&todo) {
             tracing::error!("planner: failed to save new todo: {}", e);
         }
-        planner.write().upsert_todo(todo);
+
+        let block = match (block_date, parsed.block_start) {
+            (Some(d), Some(start)) => {
+                let duration = todo
+                    .estimate_minutes
+                    .unwrap_or(settings.peek().planner_default_block_minutes)
+                    .max(15);
+                let block = TimeBlock {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    todo_id: Some(todo.id.clone()),
+                    title: todo.title.clone(),
+                    start: local_minutes_to_utc(d, start),
+                    end: local_minutes_to_utc(d, start + duration),
+                    source: BlockSource::Manual,
+                };
+                persist_block(&block);
+                Some(block)
+            }
+            _ => None,
+        };
+
+        {
+            let mut state = planner.write();
+            state.upsert_todo(todo);
+            if let Some(b) = block {
+                state.blocks.push(b);
+            }
+        }
         draft.set(String::new());
         // The input stays mounted, so focus is retained across submits.
     };
+
+    // Parsed inline on every keystroke (P-012: draft is a Signal, so this
+    // tracks). The chips show what Enter will actually do — the premium tell
+    // of Things/Todoist quick entry is that tokens are confirmed before commit.
+    let preview = crate::todo::quick_add::parse_quick_add(&draft.read(), today());
 
     rsx! {
         div {
@@ -661,7 +717,7 @@ fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
             input {
                 class: "w-full rounded border border-subtle bg-input px-3 py-2 text-sm text-fg placeholder:text-fg-muted focus:outline-none focus:border-faint",
                 r#type: "text",
-                placeholder: "Add a to-do — press Enter",
+                placeholder: "Add a to-do — ~30m · #tag · @2pm · !fri — press Enter",
                 value: "{draft}",
                 oninput: move |evt| draft.set(evt.value()),
                 onkeydown: move |evt| {
@@ -670,6 +726,35 @@ fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
                         submit(());
                     }
                 },
+            }
+            if preview.has_tokens() {
+                div {
+                    class: "mt-1.5 flex flex-wrap items-center gap-1.5",
+                    if let Some(m) = preview.estimate_minutes {
+                        span { class: "rounded bg-input px-1.5 py-0.5 text-[10px] text-fg", "{model::format_minutes(m)}" }
+                    }
+                    if let Some(start) = preview.block_start {
+                        span { class: "rounded bg-btn-primary px-1.5 py-0.5 text-[10px] text-fg", "on timeline @{fmt_hhmm(start)}" }
+                    }
+                    if let Some(tod) = preview.time_of_day {
+                        span { class: "rounded bg-input px-1.5 py-0.5 text-[10px] text-fg",
+                            match tod {
+                                TimeOfDay::Morning => "morning",
+                                TimeOfDay::Afternoon => "afternoon",
+                                TimeOfDay::Evening => "this evening",
+                            }
+                        }
+                    }
+                    if let Some(d) = preview.deadline {
+                        span { class: "rounded bg-red-500/20 px-1.5 py-0.5 text-[10px] text-fg", "due {d.format(\"%-d %b\")}" }
+                    }
+                    for tag in preview.tags.iter() {
+                        span { class: "rounded bg-input px-1.5 py-0.5 text-[10px] text-fg-muted", "#{tag}" }
+                    }
+                    if preview.title.is_empty() {
+                        span { class: "text-[10px] text-fg-muted", "…needs a title" }
+                    }
+                }
             }
         }
     }
@@ -1037,6 +1122,7 @@ fn TodayRail() -> Element {
     // scheduled for the day (estimate = block length) plus the linked block.
     // A bare, todo-less block would be invisible to the Today list and the
     // capacity math — the timeline and the list must stay one model.
+    let block_minutes = settings.peek().planner_default_block_minutes.max(15);
     let mut create_block_at = move |minutes: u32| {
         let start_min = snap_to_quarter(minutes.clamp(day_start, day_end.saturating_sub(15)));
 
@@ -1045,14 +1131,14 @@ fn TodayRail() -> Element {
         // later should not dump it back into the capture queue.
         todo.bucket = TodoBucket::Anytime;
         todo.scheduled_for = Some(day);
-        todo.estimate_minutes = Some(30);
+        todo.estimate_minutes = Some(block_minutes);
 
         let block = TimeBlock {
             id: uuid::Uuid::new_v4().to_string(),
             todo_id: Some(todo.id.clone()),
             title: todo.title.clone(),
             start: local_minutes_to_utc(day, start_min),
-            end: local_minutes_to_utc(day, start_min + 30),
+            end: local_minutes_to_utc(day, start_min + block_minutes),
             source: BlockSource::Manual,
         };
 

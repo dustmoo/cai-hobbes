@@ -13,6 +13,7 @@
 //!
 pub mod handlers;
 pub mod model;
+pub mod quick_add;
 pub mod store;
 pub mod views;
 

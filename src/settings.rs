@@ -345,6 +345,18 @@ pub struct Settings {
     /// calendar overlay.
     #[serde(default)]
     pub planner_calendar_profile: Option<String>,
+    /// Estimate auto-filled onto quick-added todos when the input carries no
+    /// `~duration` token. 0 disables the auto-fill.
+    #[serde(default)]
+    pub planner_default_estimate_minutes: u32,
+    /// Length of blocks created by clicking an empty timeline slot or by a
+    /// quick-add `@time` token on a todo without an estimate.
+    #[serde(default = "default_planner_block_minutes")]
+    pub planner_default_block_minutes: u32,
+}
+
+fn default_planner_block_minutes() -> u32 {
+    30
 }
 
 fn default_workday_start() -> String {
@@ -677,6 +689,8 @@ impl Default for Settings {
             planner_daily_capacity_minutes: default_daily_capacity_minutes(),
             planner_auto_rollover: true,
             planner_calendar_profile: None,
+            planner_default_estimate_minutes: 0,
+            planner_default_block_minutes: default_planner_block_minutes(),
         }
     }
 }
@@ -1725,6 +1739,7 @@ pub enum SettingsTab {
     General,
     Mcp,
     Behavior,
+    Planner,
     Data,
     Permissions,
     Hotkeys,
