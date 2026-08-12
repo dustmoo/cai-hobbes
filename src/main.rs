@@ -48,6 +48,7 @@ mod session;
 mod session_store;
 mod str_utils;
 mod timers;
+mod todo;
 mod usage_log;
 mod settings;
 mod skills;
@@ -377,6 +378,11 @@ fn app() -> Element {
 
     let skill_registry = use_context_provider(|| Signal::new(skills::SkillRegistry::new()));
     let mut skills_loaded = use_signal(|| false);
+
+    // The planner is hydrated in full at startup — its rows are small and
+    // bounded by human effort, so there is no lazy-loading path to justify.
+    // Safe here: session_store::init() ran in main() before the app launched.
+    use_context_provider(|| Signal::new(todo::PlannerState::load()));
 
     // Pattern: Grounded App Initialization
     // Masks transient desyncs during the first render tick

@@ -72,7 +72,10 @@ fn seed_seq_from_db(conn: &Connection) {
     let meta_max: i64 = conn
         .query_row("SELECT COALESCE(MAX(seq), 0) FROM meta", [], |r| r.get(0))
         .unwrap_or(0);
-    SEQ.fetch_max(sessions_max.max(meta_max) + 1, Ordering::SeqCst);
+    // The planner's tables share this counter — omitting them would restart the
+    // seq below existing planner rows and silently reject every planner write.
+    let todo_max = crate::todo::store::max_seq(conn);
+    SEQ.fetch_max(sessions_max.max(meta_max).max(todo_max) + 1, Ordering::SeqCst);
 }
 
 pub fn get_db_path() -> Option<PathBuf> {
@@ -115,7 +118,11 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
              value TEXT NOT NULL,
              seq   INTEGER NOT NULL
          );",
-    )
+    )?;
+
+    // The planner shares this database and connection. Creating its schema here
+    // means test databases get the planner tables too.
+    crate::todo::store::create_schema(conn)
 }
 
 /// Open the global connection, create the schema, and run the one-time
@@ -164,7 +171,10 @@ pub fn is_available() -> bool {
     CONN.get().is_some()
 }
 
-fn with_conn<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
+/// Borrow the shared connection. `pub(crate)` so sibling domains (the planner,
+/// `todo::store`) persist through this one connection rather than opening a
+/// second writer on the same file.
+pub(crate) fn with_conn<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
     let conn = CONN.get().ok_or("session store not initialized")?;
     let guard = conn.lock().map_err(|_| "session store lock poisoned")?;
     f(&guard).map_err(|e| e.to_string())

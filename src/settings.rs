@@ -313,6 +313,45 @@ pub struct Settings {
     /// Can be overridden per-provider in Context Tuning config.
     #[serde(default = "default_true")]
     pub compact_tool_results: bool,
+
+    // ── Planner ─────────────────────────────────────────────────────────────
+    /// Master switch for the built-in planner. When off, its tools are withheld
+    /// from the prompt and its view is hidden.
+    #[serde(default = "default_true")]
+    pub planner_enabled: bool,
+    /// Include today's plan in the system context so the assistant sees the day
+    /// without having to call a tool for it. Costs tokens on every turn.
+    #[serde(default = "default_true")]
+    pub planner_inject_today_context: bool,
+    /// Timeline bounds, "HH:MM" local time.
+    #[serde(default = "default_workday_start")]
+    pub planner_workday_start: String,
+    #[serde(default = "default_workday_end")]
+    pub planner_workday_end: String,
+    /// Default minutes of focused work a day is planned against.
+    #[serde(default = "default_daily_capacity_minutes")]
+    pub planner_daily_capacity_minutes: u32,
+    /// Roll unfinished todos scheduled for a past day forward onto today.
+    #[serde(default = "default_true")]
+    pub planner_auto_rollover: bool,
+    /// Composio profile to read calendar events from. `None` disables the
+    /// calendar overlay.
+    #[serde(default)]
+    pub planner_calendar_profile: Option<String>,
+}
+
+fn default_workday_start() -> String {
+    "09:00".to_string()
+}
+
+fn default_workday_end() -> String {
+    "17:00".to_string()
+}
+
+/// Six hours — a realistic amount of focused work in a day, not eight. Planning
+/// against an honest number is the whole point of showing capacity.
+fn default_daily_capacity_minutes() -> u32 {
+    360
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -624,6 +663,13 @@ impl Default for Settings {
             model_icons: HashMap::new(),
             enable_summarization: true,
             compact_tool_results: true,
+            planner_enabled: true,
+            planner_inject_today_context: true,
+            planner_workday_start: default_workday_start(),
+            planner_workday_end: default_workday_end(),
+            planner_daily_capacity_minutes: default_daily_capacity_minutes(),
+            planner_auto_rollover: true,
+            planner_calendar_profile: None,
         }
     }
 }

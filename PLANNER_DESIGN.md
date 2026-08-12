@@ -132,7 +132,6 @@ CREATE TABLE IF NOT EXISTS todos (
 CREATE INDEX IF NOT EXISTS idx_todos_scheduled ON todos(scheduled_for, status);
 CREATE INDEX IF NOT EXISTS idx_todos_project   ON todos(project_id, status);
 
-CREATE TABLE IF NOT EXISTS todo_tags (todo_id TEXT, tag TEXT, PRIMARY KEY (todo_id, tag));
 CREATE TABLE IF NOT EXISTS todo_projects  (…, seq INTEGER NOT NULL, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS todo_areas     (…, seq INTEGER NOT NULL, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS todo_blocks    (id TEXT PRIMARY KEY, todo_id TEXT, start TEXT,
@@ -140,6 +139,11 @@ CREATE TABLE IF NOT EXISTS todo_blocks    (id TEXT PRIMARY KEY, todo_id TEXT, st
 CREATE TABLE IF NOT EXISTS todo_day_plans (date TEXT PRIMARY KEY, seq INTEGER NOT NULL,
                                            data TEXT NOT NULL);
 ```
+
+A `todo_tags` join table was specced for tag filtering but **not built**: the whole
+planner is held in memory, so tag filtering happens in Rust and the table would be an
+unused write-amplification path. If tag queries ever need to run in SQL, that becomes
+migration v2 — which is exactly what the runner is for.
 
 Three non-negotiables inherited from the session store:
 
@@ -154,10 +158,15 @@ Three non-negotiables inherited from the session store:
 
 **Schema versioning.** The session store has no migration runner; it relies on
 `CREATE TABLE IF NOT EXISTS` plus Rust-side migration of a JSON blob. Todos will need
-real column additions over time, so `todo::store` should introduce a small
-`PRAGMA user_version` migration runner (`fn migrate(conn) -> Result<()>` applying
-numbered steps). Keeping it scoped to the todo tables means it can be retrofitted to
-sessions later without a risky rewrite now.
+real column additions over time, so `todo::store` owns a small numbered migration
+runner.
+
+> **Implemented differently to this spec.** The original plan called for
+> `PRAGMA user_version`. That pragma is a *single* value for the whole database file,
+> and `sessions.db` is shared — claiming it for the planner would block sessions from
+> ever getting a migration path of their own. P0 instead uses a
+> `schema_migrations(domain TEXT PRIMARY KEY, version INTEGER)` table, so each domain
+> versions independently and sessions can adopt the same runner later.
 
 **Write strategy.** Unlike sessions, todos are small and few. Hydrate *all* of them at
 startup into a `Signal<PlannerState>`, and write through on each mutation
