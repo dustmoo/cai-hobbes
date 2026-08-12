@@ -1009,6 +1009,17 @@ fn TodayRail() -> Element {
             .cloned()
             .collect()
     };
+    // Linked blocks render their todo's *current* title (the copy stored on
+    // the block goes stale the moment the todo is renamed) and show a done
+    // treatment once the todo is closed.
+    let linked_info: std::collections::HashMap<String, (String, bool)> = blocks
+        .iter()
+        .filter_map(|b| {
+            let tid = b.todo_id.as_ref()?;
+            let t = state.todo(tid)?;
+            Some((b.id.clone(), (t.title.clone(), t.status.is_closed())))
+        })
+        .collect();
     drop(state);
 
     let timeline_height = (day_end - day_start) as f64 / 60.0 * PX_PER_HOUR;
@@ -1016,19 +1027,39 @@ fn TodayRail() -> Element {
         .filter(|h| h * 60 >= day_start && h * 60 <= day_end)
         .collect();
 
+    // A block dropped on the calendar IS planned work: it creates a todo
+    // scheduled for the day (estimate = block length) plus the linked block.
+    // A bare, todo-less block would be invisible to the Today list and the
+    // capacity math — the timeline and the list must stay one model.
     let mut create_block_at = move |minutes: u32| {
         let start_min = snap_to_quarter(minutes.clamp(day_start, day_end.saturating_sub(15)));
+
+        let mut todo = Todo::new("Focus", planner.peek().next_sort_order());
+        // Anytime, not Inbox: this todo is born triaged — clearing its date
+        // later should not dump it back into the capture queue.
+        todo.bucket = TodoBucket::Anytime;
+        todo.scheduled_for = Some(day);
+        todo.estimate_minutes = Some(30);
+
         let block = TimeBlock {
             id: uuid::Uuid::new_v4().to_string(),
-            todo_id: None,
-            title: "Focus".to_string(),
+            todo_id: Some(todo.id.clone()),
+            title: todo.title.clone(),
             start: local_minutes_to_utc(day, start_min),
             end: local_minutes_to_utc(day, start_min + 30),
             source: BlockSource::Manual,
         };
+
+        if let Err(e) = store::save_todo(&todo) {
+            tracing::error!("planner: failed to save block todo {}: {}", todo.id, e);
+        }
         persist_block(&block);
         selected_block.set(Some(block.id.clone()));
-        planner.write().blocks.push(block);
+        {
+            let mut state = planner.write();
+            state.upsert_todo(todo);
+            state.blocks.push(block);
+        }
     };
 
     let busy: Vec<(u32, u32)> = blocks
@@ -1072,15 +1103,25 @@ fn TodayRail() -> Element {
             }
             Some((s, e)) if (s, e) == (orig_s, orig_e) => {}
             Some((s, e)) => {
+                let mut linked_todo: Option<String> = None;
                 {
                     let mut state = planner.write();
                     if let Some(b) = state.blocks.iter_mut().find(|b| b.id == id) {
                         b.start = local_minutes_to_utc(day, s);
                         b.end = local_minutes_to_utc(day, e);
+                        if mode == BlockDragMode::ResizeEnd {
+                            linked_todo = b.todo_id.clone();
+                        }
                     }
                 }
                 if let Some(b) = planner.peek().blocks.iter().find(|b| b.id == id) {
                     persist_block(b);
+                }
+                // Resizing the block IS re-estimating the work: the capacity
+                // bar follows the calendar, not a stale estimate.
+                if let Some(tid) = linked_todo {
+                    let minutes = e.saturating_sub(s).max(15);
+                    mutate_todo(planner, &tid, |t| t.estimate_minutes = Some(minutes));
                 }
                 selected_block.set(Some(id));
             }
@@ -1144,6 +1185,10 @@ fn TodayRail() -> Element {
                         let is_external = matches!(block.source, BlockSource::External { .. });
                         let is_selected = selected_block.read().as_deref() == Some(block.id.as_str());
                         let is_dragging_this = preview_for.as_ref().is_some_and(|(pid, _, _)| *pid == block.id);
+                        let (display_title, is_done) = linked_info
+                            .get(&block.id)
+                            .map(|(t, c)| (t.clone(), *c))
+                            .unwrap_or_else(|| (block.title.clone(), false));
                         let delete_id = block.id.clone();
                         let drag_id = block.id.clone();
                         let resize_id = block.id.clone();
@@ -1186,7 +1231,11 @@ fn TodayRail() -> Element {
                                     },
                                     div {
                                         class: "flex items-start justify-between gap-1",
-                                        p { class: "truncate text-xs font-medium leading-4", "{block.title}" }
+                                        p {
+                                            class: "truncate text-xs font-medium leading-4",
+                                            class: if is_done { "line-through opacity-60" },
+                                            "{display_title}"
+                                        }
                                         if is_selected && !is_external {
                                             button {
                                                 class: "shrink-0 text-red-400 hover:text-red-300",
