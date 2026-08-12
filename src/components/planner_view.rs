@@ -31,6 +31,15 @@ enum PlannerSelection {
     Project(String),
 }
 
+/// What a timeline drag is doing to a block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BlockDragMode {
+    /// Reposition the whole block, duration preserved.
+    Move,
+    /// Drag the bottom edge to change the end time.
+    ResizeEnd,
+}
+
 fn today() -> NaiveDate {
     Local::now().date_naive()
 }
@@ -113,6 +122,38 @@ fn block_geometry(
 /// Round down to the nearest quarter hour, so clicked blocks land on tidy edges.
 fn snap_to_quarter(minutes: u32) -> u32 {
     minutes - minutes % 15
+}
+
+/// Where a moved block lands: the original span shifted by `delta_min`,
+/// snapped to the quarter grid and clamped inside the workday, duration
+/// preserved. Returns `(start, end)` in minutes since local midnight.
+fn dragged_move(
+    orig_start: u32,
+    orig_end: u32,
+    delta_min: i64,
+    day_start: u32,
+    day_end: u32,
+) -> (u32, u32) {
+    let duration = orig_end.saturating_sub(orig_start).max(15);
+    let max_start = day_end.saturating_sub(duration).max(day_start);
+    let raw = (orig_start as i64 + delta_min).clamp(day_start as i64, max_start as i64) as u32;
+    let start = snap_to_quarter(raw).max(day_start);
+    (start, start + duration)
+}
+
+/// Where a resized block's end lands: at least 15 minutes past the start, at
+/// most the end of the workday, snapped to the quarter grid.
+fn dragged_resize(orig_start: u32, orig_end: u32, delta_min: i64, day_end: u32) -> (u32, u32) {
+    let min_end = orig_start + 15;
+    let raw = (orig_end as i64 + delta_min).clamp(min_end as i64, day_end.max(min_end) as i64);
+    let end = snap_to_quarter(raw as u32).max(min_end).min(day_end.max(min_end));
+    (orig_start, end)
+}
+
+/// `570` → `"09:30"` — labels for previewed positions, where no DateTime
+/// exists yet.
+fn fmt_hhmm(minutes: u32) -> String {
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 /// Naive first-fit: the earliest quarter-hour slot at or after `day_start`
@@ -1000,6 +1041,58 @@ fn TodayRail() -> Element {
         })
         .collect();
 
+    // Timeline drag: (block id, mode, anchor screen-y, orig start, orig end).
+    // The preview holds the snapped (start, end) under the cursor; because it
+    // only changes when the drag crosses a quarter-hour boundary, re-renders
+    // are throttled to grid crossings for free.
+    let mut block_drag =
+        use_signal(|| Option::<(String, BlockDragMode, f64, u32, u32)>::None);
+    let mut drag_preview = use_signal(|| Option::<(u32, u32)>::None);
+
+    let mut commit_block_drag = move || {
+        let Some((id, mode, _, orig_s, orig_e)) = block_drag.peek().clone() else {
+            return;
+        };
+        let preview = *drag_preview.peek();
+        block_drag.set(None);
+        drag_preview.set(None);
+
+        match preview {
+            // The mouse never left the starting quarter: that's a click, and a
+            // click on a block means select/deselect (the pre-drag behaviour).
+            None => {
+                if mode == BlockDragMode::Move {
+                    let current = selected_block.peek().clone();
+                    selected_block.set(if current.as_deref() == Some(id.as_str()) {
+                        None
+                    } else {
+                        Some(id)
+                    });
+                }
+            }
+            Some((s, e)) if (s, e) == (orig_s, orig_e) => {}
+            Some((s, e)) => {
+                {
+                    let mut state = planner.write();
+                    if let Some(b) = state.blocks.iter_mut().find(|b| b.id == id) {
+                        b.start = local_minutes_to_utc(day, s);
+                        b.end = local_minutes_to_utc(day, e);
+                    }
+                }
+                if let Some(b) = planner.peek().blocks.iter().find(|b| b.id == id) {
+                    persist_block(b);
+                }
+                selected_block.set(Some(id));
+            }
+        }
+    };
+
+    // Snapshot for the render pass: which block is previewing where.
+    let preview_for: Option<(String, u32, u32)> = block_drag
+        .read()
+        .as_ref()
+        .and_then(|(id, _, _, _, _)| (*drag_preview.read()).map(|(s, e)| (id.clone(), s, e)));
+
     rsx! {
         div {
             class: "h-full w-full flex flex-col gap-4 overflow-y-auto border-l border-subtle bg-section p-4",
@@ -1037,49 +1130,59 @@ fn TodayRail() -> Element {
                 }
                 // Blocks fully outside the workday window are filtered before
                 // rsx so the loop body positions unconditionally.
-                for (block, top, height) in blocks.iter().filter_map(|b| {
-                    block_geometry(
-                        minutes_in_local_day(&b.start),
-                        minutes_in_local_day(&b.end),
-                        day_start,
-                        day_end,
-                    )
-                    .map(|(top, height)| (b, top, height))
+                for (block, s_min, e_min, top, height) in blocks.iter().filter_map(|b| {
+                    // A block mid-drag renders at its previewed position, not
+                    // its stored one.
+                    let (s_min, e_min) = match &preview_for {
+                        Some((pid, ps, pe)) if *pid == b.id => (*ps as i64, *pe as i64),
+                        _ => (minutes_in_local_day(&b.start), minutes_in_local_day(&b.end)),
+                    };
+                    block_geometry(s_min, e_min, day_start, day_end)
+                        .map(|(top, height)| (b, s_min, e_min, top, height))
                 }) {
                     {
                         let is_external = matches!(block.source, BlockSource::External { .. });
                         let is_selected = selected_block.read().as_deref() == Some(block.id.as_str());
-                        let block_id = block.id.clone();
+                        let is_dragging_this = preview_for.as_ref().is_some_and(|(pid, _, _)| *pid == block.id);
                         let delete_id = block.id.clone();
-                        let start_label = block.start.with_timezone(&Local).format("%H:%M");
-                        let end_label = block.end.with_timezone(&Local).format("%H:%M");
+                        let drag_id = block.id.clone();
+                        let resize_id = block.id.clone();
+                        // Original minutes anchor the drag math; labels follow
+                        // the (possibly previewed) rendered position.
+                        let orig_s = minutes_in_local_day(&block.start).max(0) as u32;
+                        let orig_e = minutes_in_local_day(&block.end).max(0) as u32;
+                        let start_label = fmt_hhmm(s_min.max(0) as u32);
+                        let end_label = fmt_hhmm(e_min.max(0) as u32);
                         // Three-way conditional lives outside rsx: the macro's
                         // conditional-attribute form only supports if/else.
                         let block_class = if is_external {
                             "absolute left-11 right-1 overflow-hidden rounded border border-faint bg-input px-1.5 py-0.5 text-fg-muted"
                         } else if is_selected {
-                            "absolute left-11 right-1 overflow-hidden rounded border border-subtle bg-btn-primary-hover px-1.5 py-0.5 text-fg cursor-pointer"
+                            "absolute left-11 right-1 overflow-hidden rounded border border-subtle bg-btn-primary-hover px-1.5 py-0.5 text-fg cursor-grab"
                         } else {
-                            "absolute left-11 right-1 overflow-hidden rounded border border-subtle bg-btn-primary px-1.5 py-0.5 text-fg cursor-pointer"
+                            "absolute left-11 right-1 overflow-hidden rounded border border-subtle bg-btn-primary px-1.5 py-0.5 text-fg cursor-grab"
                         };
                         rsx! {
                                 div {
                                     key: "{block.id}",
-                                    class: block_class,
+                                    class: "{block_class}",
+                                    class: if is_dragging_this { "z-10 ring-1 ring-primary-400" },
                                     style: "top: {top}px; height: {height}px;",
-                                    onclick: move |evt| {
-                                        evt.stop_propagation();
+                                    // Selection also runs through the drag: a
+                                    // press that never leaves its quarter-hour
+                                    // commits as a click in commit_block_drag.
+                                    onmousedown: move |evt| {
                                         if is_external {
                                             return; // mirrored calendar events are read-only
                                         }
-                                        let current = selected_block.peek().clone();
-                                        selected_block.set(
-                                            if current.as_deref() == Some(block_id.as_str()) {
-                                                None
-                                            } else {
-                                                Some(block_id.clone())
-                                            },
-                                        );
+                                        evt.stop_propagation();
+                                        block_drag.set(Some((
+                                            drag_id.clone(),
+                                            BlockDragMode::Move,
+                                            evt.data.screen_coordinates().y,
+                                            orig_s,
+                                            orig_e,
+                                        )));
                                     },
                                     div {
                                         class: "flex items-start justify-between gap-1",
@@ -1088,6 +1191,7 @@ fn TodayRail() -> Element {
                                             button {
                                                 class: "shrink-0 text-red-400 hover:text-red-300",
                                                 title: "Delete block",
+                                                onmousedown: move |evt| evt.stop_propagation(),
                                                 onclick: move |evt| {
                                                     evt.stop_propagation();
                                                     if let Err(e) = store::delete_block(&delete_id) {
@@ -1106,12 +1210,68 @@ fn TodayRail() -> Element {
                                     if height >= 30.0 {
                                         p { class: "text-[10px] opacity-80", "{start_label}–{end_label}" }
                                     }
+                                    if !is_external {
+                                        div {
+                                            class: "absolute inset-x-0 bottom-0 h-1.5 cursor-ns-resize",
+                                            onmousedown: move |evt| {
+                                                evt.stop_propagation();
+                                                block_drag.set(Some((
+                                                    resize_id.clone(),
+                                                    BlockDragMode::ResizeEnd,
+                                                    evt.data.screen_coordinates().y,
+                                                    orig_s,
+                                                    orig_e,
+                                                )));
+                                            },
+                                        }
+                                    }
                                 }
                         }
                     }
                 }
+
+                // Fullscreen capture surface while a block drag is live — the
+                // same convention as the column resizers. Snapping happens in
+                // the pure helpers; commit persists exactly once on release.
+                if block_drag.read().is_some() {
+                    div {
+                        class: if block_drag.read().as_ref().is_some_and(|(_, m, _, _, _)| *m == BlockDragMode::ResizeEnd) {
+                            "fixed inset-0 z-50 cursor-ns-resize"
+                        } else {
+                            "fixed inset-0 z-50 cursor-grabbing"
+                        },
+                        onmousemove: move |evt| {
+                            let Some((_, mode, anchor_y, orig_s, orig_e)) = block_drag.peek().clone() else {
+                                return;
+                            };
+                            let dy = evt.data.screen_coordinates().y - anchor_y;
+                            let delta_min = (dy / PX_PER_HOUR * 60.0).round() as i64;
+                            let next = match mode {
+                                BlockDragMode::Move => {
+                                    dragged_move(orig_s, orig_e, delta_min, day_start, day_end)
+                                }
+                                BlockDragMode::ResizeEnd => {
+                                    dragged_resize(orig_s, orig_e, delta_min, day_end)
+                                }
+                            };
+                            // Don't promote an unmoved press into a drag: the
+                            // first preview is only set once the position
+                            // actually differs, so commit can tell click from
+                            // drag by preview presence.
+                            let current = *drag_preview.peek();
+                            if current.is_none() && next == (orig_s, orig_e) {
+                                return;
+                            }
+                            if current != Some(next) {
+                                drag_preview.set(Some(next));
+                            }
+                        },
+                        onmouseup: move |_| commit_block_drag(),
+                        onmouseleave: move |_| commit_block_drag(),
+                    }
+                }
             }
-            p { class: "text-[11px] text-fg-muted", "Click an empty slot to add a 30-minute block." }
+            p { class: "text-[11px] text-fg-muted", "Click an empty slot for a new block · drag a block to move it · drag its bottom edge to resize." }
 
             if !unblocked.is_empty() {
                 div {
@@ -1196,6 +1356,39 @@ mod tests {
         // Very short blocks keep a height that fits a one-line title.
         let (_, h) = block_geometry(540, 545, 540, 1020).unwrap();
         assert_eq!(h, 20.0);
+    }
+
+    #[test]
+    fn dragged_move_snaps_and_clamps() {
+        // 09:30–10:15 dragged down 40min lands on the 10:00 grid line, 45m kept.
+        assert_eq!(dragged_move(570, 615, 40, 540, 1020), (600, 645));
+        // Dragging above the workday pins to its start.
+        assert_eq!(dragged_move(570, 615, -600, 540, 1020), (540, 585));
+        // Dragging below pins so the block still ends inside the day.
+        assert_eq!(dragged_move(570, 615, 600, 540, 1020), (975, 1020));
+        // Zero delta is the identity — a click must not look like a drag.
+        assert_eq!(dragged_move(570, 615, 0, 540, 1020), (570, 615));
+        // A zero-length block is treated as the 15m minimum, not a panic.
+        assert_eq!(dragged_move(600, 600, 0, 540, 1020), (600, 615));
+    }
+
+    #[test]
+    fn dragged_resize_keeps_a_minimum_and_stays_in_day() {
+        // 09:30–10:15 pulled 30min longer.
+        assert_eq!(dragged_resize(570, 615, 30, 1020), (570, 645));
+        // Shrinking below 15 minutes stops at 15.
+        assert_eq!(dragged_resize(570, 615, -600, 1020), (570, 585));
+        // Growing past the workday stops at its end.
+        assert_eq!(dragged_resize(570, 615, 600, 1020), (570, 1020));
+        // Snap floors to the quarter grid.
+        assert_eq!(dragged_resize(570, 615, 10, 1020), (570, 615));
+    }
+
+    #[test]
+    fn fmt_hhmm_pads() {
+        assert_eq!(fmt_hhmm(570), "09:30");
+        assert_eq!(fmt_hhmm(0), "00:00");
+        assert_eq!(fmt_hhmm(1020), "17:00");
     }
 
     #[test]

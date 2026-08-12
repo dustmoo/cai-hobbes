@@ -1399,6 +1399,11 @@ video {
   inset: 0px;
 }
 
+.inset-x-0 {
+  left: 0px;
+  right: 0px;
+}
+
 .-top-0\.5 {
   top: -0.125rem;
 }
@@ -2098,8 +2103,20 @@ video {
   cursor: default;
 }
 
+.cursor-grab {
+  cursor: grab;
+}
+
+.cursor-grabbing {
+  cursor: grabbing;
+}
+
 .cursor-not-allowed {
   cursor: not-allowed;
+}
+
+.cursor-ns-resize {
+  cursor: ns-resize;
 }
 
 .cursor-pointer {
