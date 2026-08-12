@@ -104,8 +104,9 @@ fn block_geometry(
         return None;
     }
     let top = (start - day_start as i64) as f64 / 60.0 * PX_PER_HOUR;
-    // A floor keeps very short blocks clickable.
-    let height = ((end - start) as f64 / 60.0 * PX_PER_HOUR).max(10.0);
+    // The floor keeps a one-line title readable: a 15-minute block is only
+    // 12px at 48px/h, which clips its own label.
+    let height = ((end - start) as f64 / 60.0 * PX_PER_HOUR).max(20.0);
     Some((top, height))
 }
 
@@ -259,13 +260,99 @@ pub fn PlannerView() -> Element {
 
     let show_today_rail = *selection.read() == PlannerSelection::View(TodoView::Today);
 
+    // Column resizing follows the main view's sidebar convention: a divider
+    // strip arms a fullscreen overlay, mousemove writes the width straight to
+    // the DOM via document::eval (no re-render churn), and mouseup commits the
+    // final width to the signal and persists it in UiState.
+    let mut ui_state = use_context::<Signal<crate::settings::UiState>>();
+    let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
+    let mut left_width = use_signal(|| ui_state.peek().planner_left_width);
+    let mut today_width = use_signal(|| ui_state.peek().planner_today_width);
+    // (is_left_divider, drag start x, width at drag start)
+    let mut drag: Signal<Option<(bool, f64, f64)>> = use_signal(|| None);
+    let mut drag_last_width = use_signal(|| 0.0f64);
+
+    let mut commit_drag = move || {
+        let Some((is_left, _, _)) = *drag.peek() else {
+            return;
+        };
+        let w = *drag_last_width.peek();
+        drag.set(None);
+        if w <= 0.0 {
+            return;
+        }
+        if is_left {
+            left_width.set(w);
+            ui_state.write().planner_left_width = w;
+        } else {
+            today_width.set(w);
+            ui_state.write().planner_today_width = w;
+        }
+        let state = (*ui_state.read()).clone();
+        let manager = (*ui_state_manager.read()).clone();
+        spawn(async move {
+            let _ = manager.save(&state);
+        });
+    };
+
     rsx! {
         div {
-            class: "flex flex-row h-full min-h-0 bg-app text-fg",
-            LeftRail { selection }
+            class: "relative flex flex-row h-full min-h-0 bg-app text-fg",
+            div {
+                id: "planner-left-rail",
+                class: "shrink-0 h-full min-h-0",
+                style: "width: {left_width}px;",
+                LeftRail { selection }
+            }
+            div {
+                class: "w-1 shrink-0 cursor-col-resize bg-primary-700/40 hover:bg-primary-500 transition-colors",
+                onmousedown: move |evt| {
+                    drag_last_width.set(*left_width.peek());
+                    drag.set(Some((true, evt.data.screen_coordinates().x, *left_width.peek())));
+                },
+            }
             CentreColumn { selection }
             if show_today_rail {
-                TodayRail {}
+                div {
+                    class: "w-1 shrink-0 cursor-col-resize bg-primary-700/40 hover:bg-primary-500 transition-colors",
+                    onmousedown: move |evt| {
+                        drag_last_width.set(*today_width.peek());
+                        drag.set(Some((false, evt.data.screen_coordinates().x, *today_width.peek())));
+                    },
+                }
+                div {
+                    id: "planner-today-rail",
+                    class: "shrink-0 h-full min-h-0",
+                    style: "width: {today_width}px;",
+                    TodayRail {}
+                }
+            }
+
+            if drag.read().is_some() {
+                div {
+                    class: "fixed inset-0 z-50 cursor-col-resize",
+                    onmousemove: move |evt| {
+                        let Some((is_left, start_x, start_w)) = *drag.peek() else {
+                            return;
+                        };
+                        let dx = evt.data.screen_coordinates().x - start_x;
+                        // The right divider sits on the rail's left edge, so
+                        // dragging left grows the rail.
+                        let (id, new_w) = if is_left {
+                            ("planner-left-rail", (start_w + dx).clamp(160.0, 340.0))
+                        } else {
+                            ("planner-today-rail", (start_w - dx).clamp(240.0, 560.0))
+                        };
+                        let js = format!(
+                            "document.getElementById('{}').style.width = '{}px';",
+                            id, new_w
+                        );
+                        let _ = document::eval(&js);
+                        drag_last_width.set(new_w);
+                    },
+                    onmouseup: move |_| commit_drag(),
+                    onmouseleave: move |_| commit_drag(),
+                }
             }
         }
     }
@@ -353,7 +440,7 @@ fn LeftRail(mut selection: Signal<PlannerSelection>) -> Element {
 
     rsx! {
         div {
-            class: "w-52 shrink-0 flex flex-col gap-0.5 overflow-y-auto border-r border-subtle bg-section p-2",
+            class: "h-full w-full flex flex-col gap-0.5 overflow-y-auto border-r border-subtle bg-section p-2",
             RailItem {
                 icon: fi_icons::FiInbox,
                 label: "Inbox",
@@ -832,7 +919,7 @@ fn CapacityBar(planned: u32, capacity: u32, summary: String) -> Element {
         div {
             class: "flex flex-col gap-1.5",
             div {
-                class: "h-2 w-full overflow-hidden rounded-full bg-input flex",
+                class: "h-2 w-full overflow-hidden rounded-full bg-input border border-faint flex",
                 div {
                     class: "h-full bg-btn-primary",
                     style: "width: {within_pct}%;",
@@ -915,7 +1002,7 @@ fn TodayRail() -> Element {
 
     rsx! {
         div {
-            class: "w-80 shrink-0 flex flex-col gap-4 overflow-y-auto border-l border-subtle bg-section p-4",
+            class: "h-full w-full flex flex-col gap-4 overflow-y-auto border-l border-subtle bg-section p-4",
             CapacityBar {
                 planned: capacity.planned_minutes,
                 capacity: capacity.capacity_minutes,
@@ -969,11 +1056,11 @@ fn TodayRail() -> Element {
                         // Three-way conditional lives outside rsx: the macro's
                         // conditional-attribute form only supports if/else.
                         let block_class = if is_external {
-                            "absolute left-8 right-1 overflow-hidden rounded border border-faint bg-input px-1.5 py-0.5 text-fg-muted"
+                            "absolute left-11 right-1 overflow-hidden rounded border border-faint bg-input px-1.5 py-0.5 text-fg-muted"
                         } else if is_selected {
-                            "absolute left-8 right-1 overflow-hidden rounded border border-subtle bg-btn-primary-hover px-1.5 py-0.5 text-fg cursor-pointer"
+                            "absolute left-11 right-1 overflow-hidden rounded border border-subtle bg-btn-primary-hover px-1.5 py-0.5 text-fg cursor-pointer"
                         } else {
-                            "absolute left-8 right-1 overflow-hidden rounded border border-subtle bg-btn-primary px-1.5 py-0.5 text-fg cursor-pointer"
+                            "absolute left-11 right-1 overflow-hidden rounded border border-subtle bg-btn-primary px-1.5 py-0.5 text-fg cursor-pointer"
                         };
                         rsx! {
                                 div {
@@ -996,7 +1083,7 @@ fn TodayRail() -> Element {
                                     },
                                     div {
                                         class: "flex items-start justify-between gap-1",
-                                        p { class: "truncate text-xs font-medium", "{block.title}" }
+                                        p { class: "truncate text-xs font-medium leading-4", "{block.title}" }
                                         if is_selected && !is_external {
                                             button {
                                                 class: "shrink-0 text-red-400 hover:text-red-300",
@@ -1016,7 +1103,9 @@ fn TodayRail() -> Element {
                                             }
                                         }
                                     }
-                                    p { class: "text-[10px] opacity-80", "{start_label}–{end_label}" }
+                                    if height >= 30.0 {
+                                        p { class: "text-[10px] opacity-80", "{start_label}–{end_label}" }
+                                    }
                                 }
                         }
                     }
@@ -1104,9 +1193,9 @@ mod tests {
         // Fully outside the window renders nothing.
         assert_eq!(block_geometry(300, 480, 540, 1020), None);
         assert_eq!(block_geometry(1080, 1140, 540, 1020), None);
-        // Very short blocks keep a clickable minimum height.
+        // Very short blocks keep a height that fits a one-line title.
         let (_, h) = block_geometry(540, 545, 540, 1020).unwrap();
-        assert_eq!(h, 10.0);
+        assert_eq!(h, 20.0);
     }
 
     #[test]

@@ -1129,9 +1129,12 @@ fn app() -> Element {
     let mut show_session_manager = use_signal(|| false);
     let mut show_settings_panel = use_signal(|| false);
     let mut show_mcp_manager = use_signal(|| false);
-    // The planner replaces the chat column (not a sidebar), so it is
-    // independent of the three panel signals above.
-    let mut show_planner = use_signal(|| false);
+    // The planner is its own tab in the tab bar, not a sidebar: `open` is
+    // whether the tab exists, `active` whether it (vs. the selected session's
+    // chat) fills the main column. Selecting any session tab deactivates the
+    // planner without closing its tab.
+    let mut planner_tab_open = use_signal(|| false);
+    let mut planner_active = use_signal(|| false);
     let mut settings_panel_width = use_signal(|| ui_state.read().settings_panel_width);
     let mut is_dragging = use_signal(|| false);
     let mut drag_start_info = use_signal(|| (0.0, 0.0)); // (start_x, start_width)
@@ -1342,6 +1345,9 @@ fn app() -> Element {
 
     // Tab switching - use signal copies directly in closures
     let mut switch_tab_fn = move |idx: usize| {
+        // Selecting a chat tab brings its chat forward; the planner tab (if
+        // open) stays in the bar, just no longer active.
+        planner_active.set(false);
         let tabs = open_tabs.read();
         if idx < tabs.len() {
             let session_id = tabs[idx].clone();
@@ -1441,6 +1447,7 @@ fn app() -> Element {
     };
 
     let mut new_tab_fn = move || {
+        planner_active.set(false);
         let new_id = session_state.write().create_session(active_profile_id());
         let mut tabs = open_tabs.read().clone();
         tabs.push(new_id.clone());
@@ -1844,10 +1851,17 @@ fn app() -> Element {
                     }
                 }
                 ChatCommand::TogglePlanner => {
-                    // Replaces the chat column, not the sidebars — those may
-                    // stay open beside the planner, so don't close them.
-                    let new_state = !*show_planner.peek();
-                    show_planner.set(new_state);
+                    // First invocation opens the tab and focuses it; afterwards
+                    // it toggles focus between planner and chat. Closing the
+                    // tab is only ever done from its ✕ — a toggle that silently
+                    // removed the tab would make the icon feel destructive.
+                    if !*planner_tab_open.peek() {
+                        planner_tab_open.set(true);
+                        planner_active.set(true);
+                    } else {
+                        let now_active = !*planner_active.peek();
+                        planner_active.set(now_active);
+                    }
                 }
                 ChatCommand::DeleteSession(target_id) => {
                     if !target_id.is_empty() {
@@ -2111,6 +2125,13 @@ fn app() -> Element {
                                             on_select_tab: switch_tab_fn,
                                             on_close_tab: close_tab_fn,
                                             on_new_tab: move |_| new_tab_fn(),
+                                            planner_tab_open: *planner_tab_open.read(),
+                                            planner_active: *planner_active.read(),
+                                            on_select_planner: move |_| planner_active.set(true),
+                                            on_close_planner: move |_| {
+                                                planner_active.set(false);
+                                                planner_tab_open.set(false);
+                                            },
                                         }
                                     }
                                 }
@@ -2119,13 +2140,13 @@ fn app() -> Element {
                                 // unmounting it mid-stream would drop live streaming
                                 // updates, so visibility is toggled with CSS instead.
                                 div {
-                                    class: if *show_planner.read() { "hidden" } else { "flex-1 flex flex-col min-h-0 min-w-0" },
+                                    class: if *planner_active.read() { "hidden" } else { "flex-1 flex flex-col min-h-0 min-w-0" },
                                     components::chat::ChatWindow {
                                         on_content_resize: move |_| {},
                                         on_interaction: move |_| {},
                                     }
                                 }
-                                if *show_planner.read() {
+                                if *planner_active.read() {
                                     div {
                                         class: "flex-1 min-h-0 min-w-0",
                                         components::planner_view::PlannerView {}

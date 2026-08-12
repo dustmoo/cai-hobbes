@@ -1743,6 +1743,11 @@ impl Default for SettingsTab {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UiState {
     pub settings_panel_width: f64,
+    /// Planner view column widths (px), user-resizable like the sidebars.
+    #[serde(default = "default_planner_left_width")]
+    pub planner_left_width: f64,
+    #[serde(default = "default_planner_today_width")]
+    pub planner_today_width: f64,
     /// Default state for tool call Arguments section (expanded or collapsed)
     #[serde(default = "default_true", alias = "show_tool_arguments")]
     pub default_tool_arguments_open: bool,
@@ -1818,10 +1823,20 @@ fn default_token_display_mode() -> String {
     "all".to_string()
 }
 
+fn default_planner_left_width() -> f64 {
+    208.0
+}
+
+fn default_planner_today_width() -> f64 {
+    320.0
+}
+
 impl Default for UiState {
     fn default() -> Self {
         Self {
             settings_panel_width: 420.0, // Comfortable width for 1440px window
+            planner_left_width: default_planner_left_width(),
+            planner_today_width: default_planner_today_width(),
             default_tool_arguments_open: true,
             default_tool_response_open: false,
             default_tool_thought_open: false,
