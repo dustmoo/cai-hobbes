@@ -1229,46 +1229,54 @@ fn TodayRail() -> Element {
                         }
                     }
                 }
+            }
 
-                // Fullscreen capture surface while a block drag is live — the
-                // same convention as the column resizers. Snapping happens in
-                // the pure helpers; commit persists exactly once on release.
-                if block_drag.read().is_some() {
-                    div {
-                        class: if block_drag.read().as_ref().is_some_and(|(_, m, _, _, _)| *m == BlockDragMode::ResizeEnd) {
-                            "fixed inset-0 z-50 cursor-ns-resize"
-                        } else {
-                            "fixed inset-0 z-50 cursor-grabbing"
-                        },
-                        onmousemove: move |evt| {
-                            let Some((_, mode, anchor_y, orig_s, orig_e)) = block_drag.peek().clone() else {
-                                return;
-                            };
-                            let dy = evt.data.screen_coordinates().y - anchor_y;
-                            let delta_min = (dy / PX_PER_HOUR * 60.0).round() as i64;
-                            let next = match mode {
-                                BlockDragMode::Move => {
-                                    dragged_move(orig_s, orig_e, delta_min, day_start, day_end)
-                                }
-                                BlockDragMode::ResizeEnd => {
-                                    dragged_resize(orig_s, orig_e, delta_min, day_end)
-                                }
-                            };
-                            // Don't promote an unmoved press into a drag: the
-                            // first preview is only set once the position
-                            // actually differs, so commit can tell click from
-                            // drag by preview presence.
-                            let current = *drag_preview.peek();
-                            if current.is_none() && next == (orig_s, orig_e) {
-                                return;
+            // Fullscreen capture surface while a block drag is live — the same
+            // convention as the column resizers. Snapping happens in the pure
+            // helpers; commit persists exactly once on release.
+            //
+            // This MUST be a sibling of the timeline container, never a child:
+            // after mousedown-on-block + mouseup-on-overlay the browser
+            // synthesizes a click on their nearest common ancestor. As a child,
+            // that ancestor was the container itself, whose onclick is
+            // create_block_at — every drag also spawned a phantom "Focus"
+            // block at the release point. As a sibling, the common ancestor is
+            // this rail's root, which has no click handler.
+            if block_drag.read().is_some() {
+                div {
+                    class: if block_drag.read().as_ref().is_some_and(|(_, m, _, _, _)| *m == BlockDragMode::ResizeEnd) {
+                        "fixed inset-0 z-50 cursor-ns-resize"
+                    } else {
+                        "fixed inset-0 z-50 cursor-grabbing"
+                    },
+                    onmousemove: move |evt| {
+                        let Some((_, mode, anchor_y, orig_s, orig_e)) = block_drag.peek().clone() else {
+                            return;
+                        };
+                        let dy = evt.data.screen_coordinates().y - anchor_y;
+                        let delta_min = (dy / PX_PER_HOUR * 60.0).round() as i64;
+                        let next = match mode {
+                            BlockDragMode::Move => {
+                                dragged_move(orig_s, orig_e, delta_min, day_start, day_end)
                             }
-                            if current != Some(next) {
-                                drag_preview.set(Some(next));
+                            BlockDragMode::ResizeEnd => {
+                                dragged_resize(orig_s, orig_e, delta_min, day_end)
                             }
-                        },
-                        onmouseup: move |_| commit_block_drag(),
-                        onmouseleave: move |_| commit_block_drag(),
-                    }
+                        };
+                        // Don't promote an unmoved press into a drag: the
+                        // first preview is only set once the position
+                        // actually differs, so commit can tell click from
+                        // drag by preview presence.
+                        let current = *drag_preview.peek();
+                        if current.is_none() && next == (orig_s, orig_e) {
+                            return;
+                        }
+                        if current != Some(next) {
+                            drag_preview.set(Some(next));
+                        }
+                    },
+                    onmouseup: move |_| commit_block_drag(),
+                    onmouseleave: move |_| commit_block_drag(),
                 }
             }
             p { class: "text-[11px] text-fg-muted", "Click an empty slot for a new block · drag a block to move it · drag its bottom edge to resize." }
