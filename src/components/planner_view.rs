@@ -629,9 +629,15 @@ fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
         // New todos land in the context being looked at, so quick-add never
         // makes work vanish into a different list.
         match selection.peek().clone() {
-            PlannerSelection::View(TodoView::Today) => todo.scheduled_for = Some(day),
+            // Scheduled todos are born triaged (Anytime, like block-created
+            // ones): clearing the date later must not dump them into Inbox.
+            PlannerSelection::View(TodoView::Today) => {
+                todo.scheduled_for = Some(day);
+                todo.bucket = TodoBucket::Anytime;
+            }
             PlannerSelection::View(TodoView::Upcoming) => {
                 todo.scheduled_for = day.succ_opt();
+                todo.bucket = TodoBucket::Anytime;
             }
             PlannerSelection::View(TodoView::Anytime) => todo.bucket = TodoBucket::Anytime,
             PlannerSelection::View(TodoView::Someday) => todo.bucket = TodoBucket::Someday,
@@ -759,28 +765,28 @@ fn TodoRow(todo: Todo, in_logbook: bool) -> Element {
 
     let schedule = |patch: fn(&mut Todo, NaiveDate)| {
         let id = id.clone();
-        move |_| mutate_todo(planner, &id, |t| patch(t, today()))
+        move |_| {
+            mutate_todo(planner, &id, |t| patch(t, today()));
+            // The timebox follows the schedule: blocks left on days that no
+            // longer match the new date are removed everywhere (same rule as
+            // the AI's update and plan-day handlers).
+            let keep = planner.peek().todo(&id).and_then(|t| t.scheduled_for);
+            let pruned = planner.write().prune_blocks_for_todo(&id, keep);
+            for b in &pruned {
+                if let Err(e) = store::delete_block(&b.id) {
+                    tracing::error!("planner: failed to delete rescheduled block {}: {}", b.id, e);
+                }
+            }
+        }
     };
 
     let delete = {
         let id = id.clone();
         move |_| {
+            // store::delete_todo cascades to the todo's block rows;
+            // remove_todo mirrors that in memory.
             if let Err(e) = store::delete_todo(&id) {
                 tracing::error!("planner: failed to delete todo {}: {}", id, e);
-            }
-            // Orphaned timeline blocks are removed by remove_todo; drop their
-            // rows too so the store doesn't resurrect them at next launch.
-            let block_ids: Vec<String> = planner
-                .peek()
-                .blocks
-                .iter()
-                .filter(|b| b.todo_id.as_deref() == Some(id.as_str()))
-                .map(|b| b.id.clone())
-                .collect();
-            for bid in block_ids {
-                if let Err(e) = store::delete_block(&bid) {
-                    tracing::error!("planner: failed to delete block {}: {}", bid, e);
-                }
             }
             planner.write().remove_todo(&id);
         }

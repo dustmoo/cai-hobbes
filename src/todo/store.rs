@@ -350,8 +350,16 @@ pub fn save_day_plan(plan: &DayPlan) -> Result<(), String> {
     with_conn(|conn| upsert_day_plan_conn(conn, plan, seq))
 }
 
+/// Deleting a todo also deletes its time blocks. The cascade lives here, not
+/// in each caller: a caller that forgets it leaves orphaned block rows that
+/// resurrect on the calendar at next launch.
 pub fn delete_todo(id: &str) -> Result<(), String> {
-    with_conn(|conn| delete_by_id_conn(conn, "todos", id))
+    with_conn(|conn| delete_todo_conn(conn, id))
+}
+
+fn delete_todo_conn(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM todo_blocks WHERE todo_id = ?1", params![id])?;
+    delete_by_id_conn(conn, "todos", id)
 }
 
 #[allow(dead_code)] // consumer is project management UI, not yet built
@@ -536,6 +544,38 @@ mod tests {
                 })
                 .unwrap();
             assert!(completed_at.is_some());
+        });
+    }
+
+    #[test]
+    fn deleting_a_todo_cascades_to_its_blocks() {
+        with_db(|conn| {
+            upsert_todo_conn(conn, &sample(), 1).unwrap();
+            let mine = TimeBlock {
+                id: "blk_mine".into(),
+                todo_id: Some("td_1".into()),
+                title: "Draft".into(),
+                start: Utc::now(),
+                end: Utc::now(),
+                source: BlockSource::Manual,
+            };
+            let other = TimeBlock {
+                id: "blk_other".into(),
+                todo_id: None,
+                title: "Standup".into(),
+                start: Utc::now(),
+                end: Utc::now(),
+                source: BlockSource::Manual,
+            };
+            upsert_block_conn(conn, &mine, 2).unwrap();
+            upsert_block_conn(conn, &other, 3).unwrap();
+
+            delete_todo_conn(conn, "td_1").unwrap();
+
+            let loaded = load_all_conn(conn).unwrap();
+            assert!(loaded.todos.is_empty());
+            assert_eq!(loaded.blocks.len(), 1, "unlinked block must survive");
+            assert_eq!(loaded.blocks[0].id, "blk_other");
         });
     }
 

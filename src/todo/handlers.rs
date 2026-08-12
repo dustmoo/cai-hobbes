@@ -295,6 +295,7 @@ pub fn handle_todo_update(
     let mut updated: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
+    let mut pruned_blocks = 0usize;
     for (i, item) in items.iter().enumerate() {
         match apply_todo_update(state, item, today, now) {
             Ok(summary) => {
@@ -305,13 +306,25 @@ pub fn handle_todo_update(
                     if let Some(todo) = state.todo(id) {
                         persist_todo(todo, persist);
                     }
+                    // Rescheduling moves the work's timebox with it.
+                    if item.get("scheduled_for").is_some() {
+                        pruned_blocks += prune_rescheduled_blocks(state, id, persist);
+                    }
                 }
             }
             Err(e) => errors.push(format!("updates[{}]: {}", i, e)),
         }
     }
 
-    compose_batch_response("Updated", &updated, &errors)
+    let (status, mut out) = compose_batch_response("Updated", &updated, &errors);
+    if pruned_blocks > 0 {
+        out.push_str(&format!(
+            "
+Removed {} timeline block(s) that no longer matched the schedule.",
+            pruned_blocks
+        ));
+    }
+    (status, out)
 }
 
 fn apply_todo_update(
@@ -404,6 +417,22 @@ fn apply_todo_update(
     }
     todo.updated_at = now;
     Ok(todo.summary())
+}
+
+/// The timebox follows the schedule: after a todo's `scheduled_for` changes,
+/// drop its blocks on days that no longer match, everywhere. Returns how many
+/// were removed so responses can say so.
+fn prune_rescheduled_blocks(state: &mut PlannerState, todo_id: &str, persist: bool) -> usize {
+    let keep = state.todo(todo_id).and_then(|t| t.scheduled_for);
+    let removed = state.prune_blocks_for_todo(todo_id, keep);
+    if persist {
+        for b in &removed {
+            if let Err(e) = store::delete_block(&b.id) {
+                tracing::error!("Failed to delete rescheduled block {}: {}", b.id, e);
+            }
+        }
+    }
+    removed.len()
 }
 
 /// Shared partial-success shape for the batch tools: valid items are applied
@@ -571,6 +600,7 @@ pub fn handle_plan_day(
     let now = Utc::now();
     let mut scheduled: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut pruned_blocks = 0usize;
 
     for (i, item) in items.iter().enumerate() {
         let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
@@ -617,6 +647,8 @@ pub fn handle_plan_day(
         scheduled.push(todo.summary());
         let snapshot = todo.clone();
         persist_todo(&snapshot, persist);
+        // Planning a todo onto `date` moves its timebox with it.
+        pruned_blocks += prune_rescheduled_blocks(state, id, persist);
     }
 
     // Upsert the DayPlan: planning is an event worth recording even when the
@@ -657,6 +689,12 @@ pub fn handle_plan_day(
         date,
         scheduled.join("\n")
     ));
+    if pruned_blocks > 0 {
+        out.push_str(&format!(
+            "\nRemoved {} timeline block(s) left on other days.",
+            pruned_blocks
+        ));
+    }
     if errors.is_empty() {
         (ToolCallStatus::Completed, out)
     } else {
@@ -710,7 +748,7 @@ fn parse_block_times(
     Ok((local_to_utc(date, start_t)?, local_to_utc(date, end_t)?))
 }
 
-fn block_line(block: &TimeBlock) -> String {
+fn block_line(state: &PlannerState, block: &TimeBlock) -> String {
     let local_start = block.start.with_timezone(&chrono::Local);
     let local_end = block.end.with_timezone(&chrono::Local);
     format!(
@@ -718,7 +756,7 @@ fn block_line(block: &TimeBlock) -> String {
         block.id,
         local_start.format("%H:%M"),
         local_end.format("%H:%M"),
-        block.title,
+        state.block_display_title(block),
         local_start.format("%Y-%m-%d"),
     )
 }
@@ -731,7 +769,7 @@ fn overlap_warning(state: &PlannerState, block: &TimeBlock) -> Option<String> {
         .blocks
         .iter()
         .filter(|b| b.id != block.id && b.overlaps(block))
-        .map(block_line)
+        .map(|b| block_line(state, b))
         .collect();
     if clashes.is_empty() {
         None
@@ -802,7 +840,7 @@ fn time_block_create(
     };
     let warning = overlap_warning(state, &block);
     persist_block(&block, persist);
-    let mut out = format!("Created {}", block_line(&block));
+    let mut out = format!("Created {}", block_line(state, &block));
     state.blocks.push(block);
     if let Some(w) = warning {
         out.push('\n');
@@ -866,6 +904,7 @@ fn time_block_move(
         (Err(e), _) | (_, Err(e)) => return (ToolCallStatus::Error, e),
     };
 
+    let old_duration = existing.duration_minutes();
     let mut updated = existing;
     updated.start = start;
     updated.end = end;
@@ -875,9 +914,27 @@ fn time_block_move(
 
     let warning = overlap_warning(state, &updated);
     persist_block(&updated, persist);
-    let mut out = format!("Moved {}", block_line(&updated));
+    let mut out = format!("Moved {}", block_line(state, &updated));
+    let new_duration = updated.duration_minutes();
+    let linked = updated.todo_id.clone();
     if let Some(slot) = state.blocks.iter_mut().find(|b| b.id == id) {
         *slot = updated;
+    }
+    // Changing a linked block's length IS re-estimating the work — the same
+    // rule the UI's resize drag applies. A pure move leaves the estimate alone.
+    if new_duration != old_duration {
+        if let Some(tid) = linked {
+            if let Some(todo) = state.todo_mut(&tid) {
+                todo.estimate_minutes = Some(new_duration.max(15));
+                todo.updated_at = Utc::now();
+                let snapshot = todo.clone();
+                persist_todo(&snapshot, persist);
+                out.push_str(&format!(
+                    "\nEstimate updated to {}.",
+                    model::format_minutes(new_duration.max(15))
+                ));
+            }
+        }
     }
     if let Some(w) = warning {
         out.push('\n');
@@ -911,7 +968,7 @@ fn time_block_delete(
     }
     (
         ToolCallStatus::Completed,
-        format!("Deleted {}", block_line(&removed)),
+        format!("Deleted {}", block_line(state, &removed)),
     )
 }
 
@@ -1180,7 +1237,7 @@ pub fn planner_today_context(
                 "{}–{} {}",
                 b.start.with_timezone(&chrono::Local).format("%H:%M"),
                 b.end.with_timezone(&chrono::Local).format("%H:%M"),
-                truncate_title(&b.title)
+                truncate_title(&planner.block_display_title(b))
             )
         })
         .collect();
@@ -1241,6 +1298,149 @@ mod tests {
 
     fn upsert(state: &mut PlannerState, args: Value) -> (ToolCallStatus, String) {
         handle_project_upsert(state, &args, today(), false)
+    }
+
+    /// Create one todo and return its id.
+    fn seed_todo(state: &mut PlannerState, title: &str, scheduled: &str) -> String {
+        let (status, _) = create(
+            state,
+            json!({"todos": [{"title": title, "scheduled_for": scheduled}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        state.todos.last().unwrap().id.clone()
+    }
+
+    /// Create a block linked to `todo_id` on `TODAY` and return its id.
+    fn seed_linked_block(state: &mut PlannerState, todo_id: &str) -> String {
+        let (status, _) = block(
+            state,
+            json!({"action": "create", "todo_id": todo_id, "date": "today",
+                   "start": "09:00", "end": "10:00"}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        state.blocks.last().unwrap().id.clone()
+    }
+
+    // ── schedule / timebox consistency ──────────────────────────────────────
+
+    #[test]
+    fn rescheduling_a_todo_prunes_its_stale_blocks() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Draft", "today");
+        seed_linked_block(&mut state, &id);
+        assert_eq!(state.blocks.len(), 1);
+
+        let (status, out) = update(
+            &mut state,
+            json!({"updates": [{"id": id, "scheduled_for": "tomorrow"}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(
+            state.blocks.is_empty(),
+            "a block on the old day must move off the calendar with the work"
+        );
+        assert!(out.contains("Removed 1 timeline block"), "response says so: {}", out);
+    }
+
+    #[test]
+    fn unscheduling_clears_the_timebox_too() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Draft", "today");
+        seed_linked_block(&mut state, &id);
+
+        let (status, _) = update(
+            &mut state,
+            json!({"updates": [{"id": id, "scheduled_for": null}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(state.blocks.is_empty());
+    }
+
+    #[test]
+    fn update_without_touching_schedule_keeps_blocks() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Draft", "today");
+        seed_linked_block(&mut state, &id);
+
+        let (status, out) = update(
+            &mut state,
+            json!({"updates": [{"id": id, "title": "Renamed", "status": "completed"}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert_eq!(state.blocks.len(), 1, "completing is history, not rescheduling");
+        assert!(!out.contains("Removed"), "no prune note: {}", out);
+    }
+
+    #[test]
+    fn plan_day_moves_timeboxes_with_the_work() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Draft", "today");
+        seed_linked_block(&mut state, &id);
+
+        let (status, out) = plan(
+            &mut state,
+            json!({"date": "tomorrow", "items": [{"id": id, "estimate_minutes": 60}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(state.blocks.is_empty(), "yesterday's block must not squat on the calendar");
+        assert!(out.contains("Removed 1 timeline block"), "{}", out);
+    }
+
+    #[test]
+    fn resizing_a_linked_block_reestimates_the_todo() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Draft", "today");
+        let block_id = seed_linked_block(&mut state, &id); // 09:00–10:00
+
+        let (status, out) = block(
+            &mut state,
+            json!({"action": "move", "id": block_id, "end": "10:30"}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert_eq!(
+            state.todos[0].estimate_minutes,
+            Some(90),
+            "the capacity math must follow the calendar"
+        );
+        assert!(out.contains("Estimate updated to 1h 30m"), "{}", out);
+
+        // A pure move (same duration) leaves the estimate alone.
+        let (status, out) = block(
+            &mut state,
+            json!({"action": "move", "id": block_id, "start": "13:00", "end": "14:30"}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert_eq!(state.todos[0].estimate_minutes, Some(90));
+        assert!(!out.contains("Estimate updated"), "{}", out);
+    }
+
+    #[test]
+    fn tool_responses_and_context_use_the_live_todo_title() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Draft", "today");
+        let block_id = seed_linked_block(&mut state, &id);
+
+        let (status, _) = update(
+            &mut state,
+            json!({"updates": [{"id": id, "title": "Renamed"}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+
+        // Tool response path (block_line).
+        let (_, out) = block(
+            &mut state,
+            json!({"action": "move", "id": block_id, "start": "11:00", "end": "12:00"}),
+        );
+        assert!(out.contains("Renamed"), "block_line must resolve live: {}", out);
+        assert!(!out.contains("Draft"), "{}", out);
+
+        // Context path (planner_today_context).
+        let settings = crate::settings::Settings::default();
+        // The fixture pins TODAY; using the real clock here would make this
+        // test expire at midnight.
+        let ctx = planner_today_context(&state, &settings, today()).expect("planner context on");
+        let blocks_json = ctx.get("blocks").unwrap().to_string();
+        assert!(blocks_json.contains("Renamed"), "{}", blocks_json);
     }
 
     // ── create ──────────────────────────────────────────────────────────────

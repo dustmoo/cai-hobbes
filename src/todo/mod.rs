@@ -85,6 +85,46 @@ impl PlannerState {
         Some(self.todos.remove(idx))
     }
 
+    /// A block's display title: the linked todo's *current* title when there
+    /// is one, else the title stored on the block. The stored copy goes stale
+    /// the moment the todo is renamed — every surface (timeline, tool
+    /// responses, planner_today context) must resolve through this.
+    pub fn block_display_title(&self, block: &TimeBlock) -> String {
+        block
+            .todo_id
+            .as_deref()
+            .and_then(|id| self.todo(id))
+            .map(|t| t.title.clone())
+            .unwrap_or_else(|| block.title.clone())
+    }
+
+    /// Remove a todo's time blocks that sit on any local day other than
+    /// `keep_day` (`None` keeps nothing). Returns the removed blocks so the
+    /// caller can delete their store rows and report the count.
+    ///
+    /// The timebox follows the schedule: rescheduling or unscheduling a todo
+    /// without this leaves its old blocks squatting on the calendar, counting
+    /// for nothing.
+    pub fn prune_blocks_for_todo(
+        &mut self,
+        todo_id: &str,
+        keep_day: Option<chrono::NaiveDate>,
+    ) -> Vec<TimeBlock> {
+        let mut removed = Vec::new();
+        self.blocks.retain(|b| {
+            let is_linked = b.todo_id.as_deref() == Some(todo_id);
+            let keeps = keep_day
+                .is_some_and(|d| b.start.with_timezone(&chrono::Local).date_naive() == d);
+            if is_linked && !keeps {
+                removed.push(b.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
     /// Time blocks starting on a day, earliest first.
     ///
     /// `date` is a **local** calendar day — planner days are user-local
@@ -192,6 +232,70 @@ mod tests {
             .earliest()
             .unwrap()
             .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn block_display_title_follows_the_linked_todo() {
+        let mut state = PlannerState::default();
+        let mut todo = Todo::new("Original", 0.0);
+        todo.id = "td_1".into();
+        state.upsert_todo(todo);
+
+        let linked = TimeBlock {
+            id: "blk_1".into(),
+            todo_id: Some("td_1".into()),
+            title: "Original".into(),
+            start: chrono::Utc::now(),
+            end: chrono::Utc::now(),
+            source: BlockSource::Manual,
+        };
+        let bare = TimeBlock {
+            id: "blk_2".into(),
+            todo_id: None,
+            title: "Standup".into(),
+            start: chrono::Utc::now(),
+            end: chrono::Utc::now(),
+            source: BlockSource::Manual,
+        };
+
+        state.todo_mut("td_1").unwrap().title = "Renamed".into();
+        assert_eq!(state.block_display_title(&linked), "Renamed");
+        assert_eq!(state.block_display_title(&bare), "Standup");
+    }
+
+    #[test]
+    fn prune_blocks_follows_the_schedule() {
+        let mut state = PlannerState::default();
+        let day = date("2026-08-12");
+        let other = date("2026-08-13");
+        let mut push = |id: &str, todo_id: Option<&str>, on: chrono::NaiveDate| {
+            state.blocks.push(TimeBlock {
+                id: id.into(),
+                todo_id: todo_id.map(String::from),
+                title: id.into(),
+                start: local_instant(on, 9),
+                end: local_instant(on, 10),
+                source: BlockSource::Manual,
+            });
+        };
+        push("keep-day", Some("td_1"), day);
+        push("wrong-day", Some("td_1"), other);
+        push("other-todo", Some("td_2"), other);
+        push("bare", None, other);
+
+        // Rescheduled onto `day`: only the block on another day goes.
+        let removed = state.prune_blocks_for_todo("td_1", Some(day));
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].id, "wrong-day");
+        assert_eq!(state.blocks.len(), 3);
+
+        // Unscheduled entirely: its remaining block goes too; unrelated and
+        // bare blocks are never touched.
+        let removed = state.prune_blocks_for_todo("td_1", None);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].id, "keep-day");
+        let ids: Vec<&str> = state.blocks.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["other-todo", "bare"]);
     }
 
     #[test]

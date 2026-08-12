@@ -190,7 +190,10 @@ impl PlannerClient {
                 description: Some(format!(
                     "Create, move, or delete a block on the day timeline. Times are local \
                     'HH:MM'; the response warns (without failing) when the block overlaps \
-                    an existing one. {}",
+                    an existing one. Link 'todo_id' when the block is time for a to-do — \
+                    a block without todo_id is a calendar-only event (e.g. a meeting) that \
+                    does NOT appear in the to-do lists or count toward the day's capacity. \
+                    Resizing a linked block re-estimates its to-do. {}",
                     SHARED_NOTE
                 ).into()),
                 input_schema: Arc::new(
