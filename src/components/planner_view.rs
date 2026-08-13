@@ -1025,7 +1025,16 @@ fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
 
     let cycle = {
         let id = id.clone();
-        move |_| mutate_todo(planner, &id, |t| t.estimate_minutes = cycle_estimate(t.estimate_minutes))
+        move |_| {
+            mutate_todo(planner, &id, |t| {
+                t.estimate_minutes = cycle_estimate(t.estimate_minutes)
+            });
+            // The estimate IS the timebox's length: a re-estimate resizes the
+            // block on the ruler from its anchored start.
+            for b in planner.write().resize_blocks_to_estimate(&id) {
+                persist_block(&b);
+            }
+        }
     };
 
     let completed_line = in_logbook.then(|| {

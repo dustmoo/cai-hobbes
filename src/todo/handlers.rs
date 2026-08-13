@@ -297,6 +297,7 @@ pub fn handle_todo_update(
     let mut errors: Vec<String> = Vec::new();
 
     let mut pruned_blocks = 0usize;
+    let mut resized_blocks = 0usize;
     for (i, item) in items.iter().enumerate() {
         match apply_todo_update(state, item, today, now) {
             Ok((summary, wants_focus)) => {
@@ -324,6 +325,10 @@ pub fn handle_todo_update(
                     if item.get("scheduled_for").is_some() {
                         pruned_blocks += prune_rescheduled_blocks(state, id, persist);
                     }
+                    // Re-estimating resizes it from its anchored start.
+                    if item.get("estimate_minutes").is_some() {
+                        resized_blocks += resize_blocks_after_estimate(state, id, persist);
+                    }
                 }
                 updated.push(summary);
             }
@@ -334,9 +339,14 @@ pub fn handle_todo_update(
     let (status, mut out) = compose_batch_response("Updated", &updated, &errors);
     if pruned_blocks > 0 {
         out.push_str(&format!(
-            "
-Removed {} timeline block(s) that no longer matched the schedule.",
+            "\nRemoved {} timeline block(s) that no longer matched the schedule.",
             pruned_blocks
+        ));
+    }
+    if resized_blocks > 0 {
+        out.push_str(&format!(
+            "\nResized {} timeline block(s) to the new estimate.",
+            resized_blocks
         ));
     }
     (status, out)
@@ -475,6 +485,19 @@ fn sync_schedule_to_block(
             pruned.len()
         ));
     }
+}
+
+/// Estimate → timebox: after a re-estimate, resize the todo's (single) block
+/// on its scheduled day from the anchored start, persisting the change.
+/// Returns how many blocks were resized.
+fn resize_blocks_after_estimate(state: &mut PlannerState, todo_id: &str, persist: bool) -> usize {
+    let changed = state.resize_blocks_to_estimate(todo_id);
+    if persist {
+        for b in &changed {
+            persist_block(b, true);
+        }
+    }
+    changed.len()
 }
 
 /// The timebox follows the schedule: after a todo's `scheduled_for` changes,
@@ -705,8 +728,12 @@ pub fn handle_plan_day(
         scheduled.push(todo.summary());
         let snapshot = todo.clone();
         persist_todo(&snapshot, persist);
-        // Planning a todo onto `date` moves its timebox with it.
+        // Planning a todo onto `date` moves its timebox with it; an estimate
+        // override resizes whatever block survives.
         pruned_blocks += prune_rescheduled_blocks(state, id, persist);
+        if estimate.is_some() {
+            resize_blocks_after_estimate(state, id, persist);
+        }
     }
 
     // Upsert the DayPlan: planning is an event worth recording even when the
@@ -1631,6 +1658,39 @@ mod tests {
         let (_, _) = update(&mut state, json!({"updates": [{"id": id, "status": "open"}]}));
         let ctx = planner_today_context(&state, &settings, today()).expect("context on");
         assert!(ctx.get("in_focus").unwrap().is_null());
+    }
+
+    #[test]
+    fn reestimating_resizes_the_timebox_from_its_start() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Case study", "today");
+        let block_id = seed_linked_block(&mut state, &id); // 09:00–10:00
+
+        let (status, out) = update(
+            &mut state,
+            json!({"updates": [{"id": id, "estimate_minutes": 30}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        let b = state.blocks.iter().find(|b| b.id == block_id).unwrap();
+        let start_local = b.start.with_timezone(&chrono::Local);
+        let end_local = b.end.with_timezone(&chrono::Local);
+        assert_eq!(
+            (end_local - start_local).num_minutes(),
+            30,
+            "the block must shrink from its anchored start"
+        );
+        assert_eq!(start_local.format("%H:%M").to_string(), "09:00");
+        assert!(out.contains("Resized 1 timeline block"), "{}", out);
+
+        // Clearing the estimate leaves the block untouched.
+        let (status, out) = update(
+            &mut state,
+            json!({"updates": [{"id": id, "estimate_minutes": null}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        let b = state.blocks.iter().find(|b| b.id == block_id).unwrap();
+        assert_eq!((b.end - b.start).num_minutes(), 30);
+        assert!(!out.contains("Resized"), "{}", out);
     }
 
     // ── create ──────────────────────────────────────────────────────────────

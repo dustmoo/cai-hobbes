@@ -163,6 +163,45 @@ impl PlannerState {
         changed
     }
 
+    /// Estimate → timebox sync: after a todo's estimate changes, resize its
+    /// block on the scheduled day so the start stays anchored and the end
+    /// lands at start + estimate. Only applies when exactly ONE block holds
+    /// the todo that day — a task deliberately split across several sittings
+    /// is ambiguous, and resizing each to the full estimate would double the
+    /// plan. Returns the changed blocks for persistence.
+    pub fn resize_blocks_to_estimate(&mut self, todo_id: &str) -> Vec<TimeBlock> {
+        let Some(todo) = self.todo(todo_id) else {
+            return Vec::new();
+        };
+        let (Some(day), Some(estimate)) = (todo.scheduled_for, todo.estimate_minutes) else {
+            return Vec::new();
+        };
+        let estimate = estimate.max(15) as i64;
+
+        let mut on_day: Vec<usize> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                b.todo_id.as_deref() == Some(todo_id)
+                    && b.start.with_timezone(&chrono::Local).date_naive() == day
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if on_day.len() != 1 {
+            return Vec::new();
+        }
+        let idx = on_day.pop().expect("len checked");
+
+        let block = &mut self.blocks[idx];
+        let new_end = block.start + chrono::Duration::minutes(estimate);
+        if block.end == new_end {
+            return Vec::new(); // already in sync (e.g. the resize-drag path)
+        }
+        block.end = new_end;
+        vec![block.clone()]
+    }
+
     /// A block's display title: the linked todo's *current* title when there
     /// is one, else the title stored on the block. The stored copy goes stale
     /// the moment the todo is renamed — every surface (timeline, tool
@@ -448,6 +487,69 @@ mod tests {
         assert_eq!(t.status, model::TodoStatus::Open);
         assert_eq!(t.actual_minutes, 120, "overnight sessions cap at 2h");
         assert!(t.started_at.is_none());
+    }
+
+    #[test]
+    fn estimate_change_resizes_the_single_timebox_from_its_start() {
+        let mut state = PlannerState::default();
+        let day = date("2026-08-13");
+        let mut todo = Todo::new("Case study", 0.0);
+        todo.id = "td_1".into();
+        todo.scheduled_for = Some(day);
+        todo.estimate_minutes = Some(120);
+        state.upsert_todo(todo);
+        state.blocks.push(TimeBlock {
+            id: "blk_1".into(),
+            todo_id: Some("td_1".into()),
+            title: "Case study".into(),
+            start: local_instant(day, 12) + chrono::Duration::minutes(30),
+            end: local_instant(day, 14) + chrono::Duration::minutes(30),
+            source: BlockSource::Manual,
+        });
+
+        // 2h -> 30m: the block keeps its 12:30 start and shrinks to 13:00.
+        state.todo_mut("td_1").unwrap().estimate_minutes = Some(30);
+        let changed = state.resize_blocks_to_estimate("td_1");
+        assert_eq!(changed.len(), 1);
+        let b = &state.blocks[0];
+        assert_eq!(b.start, local_instant(day, 12) + chrono::Duration::minutes(30));
+        assert_eq!(b.end, b.start + chrono::Duration::minutes(30));
+
+        // Same estimate again: no-op, nothing to persist.
+        assert!(state.resize_blocks_to_estimate("td_1").is_empty());
+
+        // No estimate: the block is left alone rather than deleted or zeroed.
+        state.todo_mut("td_1").unwrap().estimate_minutes = None;
+        assert!(state.resize_blocks_to_estimate("td_1").is_empty());
+        assert_eq!(state.blocks[0].end, state.blocks[0].start + chrono::Duration::minutes(30));
+    }
+
+    #[test]
+    fn split_timeboxes_are_never_resized() {
+        let mut state = PlannerState::default();
+        let day = date("2026-08-13");
+        let mut todo = Todo::new("split", 0.0);
+        todo.id = "td_1".into();
+        todo.scheduled_for = Some(day);
+        todo.estimate_minutes = Some(60);
+        state.upsert_todo(todo);
+        for (id, h) in [("a", 9), ("b", 15)] {
+            state.blocks.push(TimeBlock {
+                id: id.into(),
+                todo_id: Some("td_1".into()),
+                title: "split".into(),
+                start: local_instant(day, h),
+                end: local_instant(day, h) + chrono::Duration::minutes(30),
+                source: BlockSource::Manual,
+            });
+        }
+
+        // Two sittings for one estimate is ambiguous — resizing both to the
+        // full hour would double the planned time. Leave them.
+        assert!(state.resize_blocks_to_estimate("td_1").is_empty());
+        for b in &state.blocks {
+            assert_eq!(b.end, b.start + chrono::Duration::minutes(30));
+        }
     }
 
     #[test]
