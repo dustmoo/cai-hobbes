@@ -1015,11 +1015,14 @@ pub fn ChatInput(
                                                                     }
                                                                     span { class: "truncate", "{profile_name}" }
                                                                 }
-                                                                // Hotkey hint (1-indexed)
+                                                                // Hotkey hint (1-indexed). Profile switching is
+                                                                // the RESERVED Cmd+Option+N combo (hotkey.rs) —
+                                                                // plain Cmd+N is tab switching, so a bare ⌘ hint
+                                                                // advertised a binding this popup doesn't own.
                                                                 if index < 9 {
                                                                     span {
                                                                         class: "text-xs text-fg-muted font-mono",
-                                                                        "⌘{index + 1}"
+                                                                        "⌥⌘{index + 1}"
                                                                     }
                                                                 }
                                                             }
