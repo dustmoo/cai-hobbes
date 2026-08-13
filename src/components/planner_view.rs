@@ -202,6 +202,17 @@ fn cycle_estimate(current: Option<u32>) -> Option<u32> {
     }
 }
 
+/// Human scheduled-date label: "Today", "Tomorrow", then "Fri 15 Aug".
+fn scheduled_label(d: NaiveDate, today: NaiveDate) -> String {
+    if d == today {
+        "Today".to_string()
+    } else if Some(d) == today.succ_opt() {
+        "Tomorrow".to_string()
+    } else {
+        d.format("%a %-d %b").to_string()
+    }
+}
+
 fn view_title(view: TodoView) -> &'static str {
     match view {
         TodoView::Inbox => "Inbox",
@@ -779,6 +790,13 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
 
     let in_logbook = sel == PlannerSelection::View(TodoView::Logbook);
     let is_today = sel == PlannerSelection::View(TodoView::Today);
+    // Views whose membership doesn't already answer "when?" show the
+    // scheduled date on each row: Upcoming spans arbitrary future days and a
+    // project mixes scheduled with unscheduled work.
+    let show_scheduled = matches!(
+        sel,
+        PlannerSelection::View(TodoView::Upcoming) | PlannerSelection::Project(_)
+    );
 
     // Today gets its "This Evening" split; every other selection is one flat list.
     let (main_rows, evening_rows): (Vec<Todo>, Vec<Todo>) = if is_today {
@@ -801,7 +819,7 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
             for todo in main_rows {
                 // Cloned because the generated key borrows `todo.id` after the
                 // prop takes ownership.
-                TodoRow { key: "{todo.id}", todo: todo.clone(), in_logbook }
+                TodoRow { key: "{todo.id}", todo: todo.clone(), in_logbook, show_scheduled }
             }
             if !evening_rows.is_empty() {
                 h2 {
@@ -809,7 +827,7 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
                     "This Evening"
                 }
                 for todo in evening_rows {
-                    TodoRow { key: "{todo.id}", todo: todo.clone(), in_logbook: false }
+                    TodoRow { key: "{todo.id}", todo: todo.clone(), in_logbook: false, show_scheduled: false }
                 }
             }
         }
@@ -817,7 +835,7 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
 }
 
 #[component]
-fn TodoRow(todo: Todo, in_logbook: bool) -> Element {
+fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let mut editing = use_signal(|| false);
     let mut edit_buffer = use_signal(String::new);
@@ -826,6 +844,23 @@ fn TodoRow(todo: Todo, in_logbook: bool) -> Element {
     let day = today();
     let is_done = todo.status.is_closed();
     let is_overdue = todo.is_overdue(day);
+
+    // The row mirrors the timeline: if this todo is timeboxed on its
+    // scheduled day, its start time appears as a chip. Scheduling metadata
+    // must be legible from every visual state, not just the ruler.
+    let block_time: Option<String> = todo.scheduled_for.and_then(|d| {
+        let state = planner.read();
+        state
+            .blocks
+            .iter()
+            .filter(|b| {
+                b.todo_id.as_deref() == Some(todo.id.as_str())
+                    && b.start.with_timezone(&Local).date_naive() == d
+            })
+            .map(|b| b.start)
+            .min()
+            .map(|start| start.with_timezone(&Local).format("%H:%M").to_string())
+    });
 
     let commit_title = {
         let id = id.clone();
@@ -957,6 +992,24 @@ fn TodoRow(todo: Todo, in_logbook: bool) -> Element {
                 span { class: "shrink-0 text-xs text-fg-muted", "{date_line}" }
             }
             // Chips
+            if show_scheduled {
+                if let Some(d) = todo.scheduled_for {
+                    span {
+                        class: "shrink-0 flex items-center gap-1 rounded-full border border-subtle px-2 py-0.5 text-xs text-fg-muted",
+                        Icon { width: 10, height: 10, icon: fi_icons::FiCalendar }
+                        "{scheduled_label(d, day)}"
+                    }
+                }
+            }
+            if !in_logbook {
+                if let Some(t) = block_time {
+                    span {
+                        class: "shrink-0 rounded-full bg-primary-700/50 border border-subtle px-2 py-0.5 text-xs text-fg",
+                        title: "On the timeline",
+                        "@ {t}"
+                    }
+                }
+            }
             if !in_logbook {
                 button {
                     class: if todo.estimate_minutes.is_some() {
@@ -1566,6 +1619,14 @@ mod tests {
         assert_eq!(fmt_hhmm(570), "09:30");
         assert_eq!(fmt_hhmm(0), "00:00");
         assert_eq!(fmt_hhmm(1020), "17:00");
+    }
+
+    #[test]
+    fn scheduled_labels_read_naturally() {
+        let today: NaiveDate = "2026-08-13".parse().unwrap();
+        assert_eq!(scheduled_label(today, today), "Today");
+        assert_eq!(scheduled_label("2026-08-14".parse().unwrap(), today), "Tomorrow");
+        assert_eq!(scheduled_label("2026-08-21".parse().unwrap(), today), "Fri 21 Aug");
     }
 
     #[test]
