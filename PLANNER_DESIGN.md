@@ -425,6 +425,12 @@ list persisted across sessions, with no UI work at all. P2 is where it earns the
 
 ---
 
+## 8b. UX hardening
+
+Post-P3 manual testing surfaced coherence gaps between the views, hidden model
+data, and misleading affordances. Their remediation plan lives in
+`PLANNER_UX_PLAN.md` (batches U1–U4).
+
 ## 9. Risks
 
 - **Silent write rejection.** Forgetting to extend `seed_seq_from_db` with the new
