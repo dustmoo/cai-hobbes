@@ -16,7 +16,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
 use crate::settings::Settings;
-use crate::todo::model::{self, BlockSource, TimeBlock, TimeOfDay, Todo, TodoBucket};
+use crate::todo::model::{self, BlockSource, TimeBlock, TimeOfDay, Todo, TodoBucket, TodoStatus};
 use crate::todo::store;
 use crate::todo::views::{self, TodoView};
 use crate::todo::PlannerState;
@@ -287,6 +287,74 @@ fn todos_for_selection(state: &PlannerState, selection: &PlannerSelection, day: 
     }
 }
 
+// ── Focus bar ───────────────────────────────────────────────────────────────
+
+/// Sunsama-style focus strip: visible whenever one todo is in progress, with
+/// a live elapsed-vs-estimate readout and the two exits (done / stop).
+#[component]
+fn FocusBar() -> Element {
+    let mut planner = use_context::<Signal<PlannerState>>();
+
+    // Elapsed is wall-clock; a ~20s ticker keeps the readout honest without
+    // meaningful re-render cost (the bar is a single strip).
+    let mut tick = use_signal(|| 0u64);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            tick += 1;
+        }
+    });
+    let _subscribe = *tick.read();
+
+    let Some(focus) = planner.read().focused().cloned() else {
+        return rsx! {};
+    };
+    let now = Utc::now();
+    let elapsed = focus.elapsed_minutes(now);
+    let readout = match focus.estimate_minutes {
+        Some(est) => format!(
+            "{} of {}",
+            model::format_minutes(elapsed),
+            model::format_minutes(est)
+        ),
+        None => model::format_minutes(elapsed),
+    };
+    let over = focus.estimate_minutes.is_some_and(|est| elapsed > est);
+    let focus_id = focus.id.clone();
+    let done_id = focus.id.clone();
+
+    rsx! {
+        div {
+            class: "flex items-center gap-3 border-b border-subtle bg-primary-700/30 px-4 py-2",
+            span { class: "h-2 w-2 shrink-0 rounded-full bg-primary-400 animate-pulse" }
+            span { class: "min-w-0 truncate text-sm font-medium text-fg", "{focus.title}" }
+            span {
+                class: if over { "shrink-0 text-xs text-red-400" } else { "shrink-0 text-xs text-fg-muted" },
+                "{readout}"
+            }
+            div { class: "flex-1" }
+            button {
+                class: "shrink-0 rounded bg-btn-primary px-2 py-1 text-xs font-medium text-fg hover:bg-btn-primary-hover",
+                onclick: move |_| {
+                    mutate_todo(planner, &done_id, |t| t.mark_completed(Utc::now()));
+                },
+                "Done"
+            }
+            button {
+                class: "shrink-0 rounded px-2 py-1 text-xs text-fg-muted hover:bg-input hover:text-fg",
+                title: "Pause — elapsed time is kept",
+                onclick: move |_| {
+                    let _ = &focus_id;
+                    if planner.write().stop_focus(Utc::now()).is_some() {
+                        persist_todo(&planner, &focus_id);
+                    }
+                },
+                "Stop"
+            }
+        }
+    }
+}
+
 // ── Root ────────────────────────────────────────────────────────────────────
 
 #[component]
@@ -375,7 +443,10 @@ pub fn PlannerView() -> Element {
 
     rsx! {
         div {
-            class: "relative flex flex-row h-full min-h-0 bg-app text-fg",
+            class: "flex h-full min-h-0 flex-col bg-app text-fg",
+            FocusBar {}
+            div {
+            class: "relative flex flex-row flex-1 min-h-0",
             div {
                 id: "planner-left-rail",
                 class: "shrink-0 h-full min-h-0",
@@ -431,6 +502,7 @@ pub fn PlannerView() -> Element {
                     onmouseup: move |_| commit_drag(),
                     onmouseleave: move |_| commit_drag(),
                 }
+            }
             }
         }
     }
@@ -871,6 +943,7 @@ fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
     let id = todo.id.clone();
     let day = today();
     let is_done = todo.status.is_closed();
+    let in_focus = todo.status == TodoStatus::InProgress;
     let is_overdue = todo.is_overdue(day);
 
     // The row mirrors the timeline: if this todo is timeboxed on its
@@ -964,13 +1037,19 @@ fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
     rsx! {
         div {
             class: "group flex items-center gap-2 rounded px-2 py-1.5 hover:bg-section",
-            // Checkbox
+            // Checkbox — a pulsing play glyph while the todo is in focus.
             button {
-                class: "shrink-0 text-fg-muted hover:text-fg transition-colors",
+                class: if in_focus {
+                    "shrink-0 text-primary-400 animate-pulse hover:text-fg transition-colors"
+                } else {
+                    "shrink-0 text-fg-muted hover:text-fg transition-colors"
+                },
                 title: if is_done { "Reopen" } else { "Complete" },
                 onclick: toggle_done,
                 if is_done {
                     Icon { width: 16, height: 16, icon: fi_icons::FiCheckCircle }
+                } else if in_focus {
+                    Icon { width: 16, height: 16, icon: fi_icons::FiPlayCircle }
                 } else {
                     Icon { width: 16, height: 16, icon: fi_icons::FiCircle }
                 }
@@ -1074,13 +1153,45 @@ fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
             if !in_logbook {
                 div {
                     class: "hidden shrink-0 items-center gap-1 group-hover:flex",
-                    // Activate: open a fresh chat seeded with this task.
+                    // Start / stop focus on this todo.
+                    button {
+                        class: "rounded p-1 text-primary-300 hover:bg-input hover:text-primary-200",
+                        title: if in_focus { "Stop focus — elapsed time is kept" } else { "Start focus (pauses any other)" },
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                let now = Utc::now();
+                                if in_focus {
+                                    if planner.write().stop_focus(now).is_some() {
+                                        persist_todo(&planner, &id);
+                                    }
+                                } else {
+                                    let changed = planner.write().start_focus(&id, now);
+                                    for cid in &changed {
+                                        persist_todo(&planner, cid);
+                                    }
+                                }
+                            }
+                        },
+                        if in_focus {
+                            Icon { width: 14, height: 14, icon: fi_icons::FiPauseCircle }
+                        } else {
+                            Icon { width: 14, height: 14, icon: fi_icons::FiPlayCircle }
+                        }
+                    }
+                    // Activate: focus the task AND open a fresh chat seeded
+                    // with it — activating means working on it now.
                     button {
                         class: "rounded p-1 text-primary-300 hover:bg-input hover:text-primary-200",
                         title: "Work on this in a new chat",
                         onclick: {
                             let todo = todo.clone();
+                            let id = id.clone();
                             move |_| {
+                                let changed = planner.write().start_focus(&id, Utc::now());
+                                for cid in &changed {
+                                    persist_todo(&planner, cid);
+                                }
                                 chat_command.set(Some(
                                     crate::components::chat_input::ChatCommand::StartTodoInChat(
                                         activation_seed(&todo),
@@ -1210,12 +1321,19 @@ fn TodayRail() -> Element {
     // Linked blocks render their todo's *current* title (the copy stored on
     // the block goes stale the moment the todo is renamed) and show a done
     // treatment once the todo is closed.
-    let linked_info: std::collections::HashMap<String, (String, bool)> = blocks
+    let linked_info: std::collections::HashMap<String, (String, bool, bool)> = blocks
         .iter()
         .filter_map(|b| {
             let tid = b.todo_id.as_ref()?;
             let t = state.todo(tid)?;
-            Some((b.id.clone(), (t.title.clone(), t.status.is_closed())))
+            Some((
+                b.id.clone(),
+                (
+                    t.title.clone(),
+                    t.status.is_closed(),
+                    t.status == TodoStatus::InProgress,
+                ),
+            ))
         })
         .collect();
     drop(state);
@@ -1384,10 +1502,10 @@ fn TodayRail() -> Element {
                         let is_external = matches!(block.source, BlockSource::External { .. });
                         let is_selected = selected_block.read().as_deref() == Some(block.id.as_str());
                         let is_dragging_this = preview_for.as_ref().is_some_and(|(pid, _, _)| *pid == block.id);
-                        let (display_title, is_done) = linked_info
+                        let (display_title, is_done, is_focus_block) = linked_info
                             .get(&block.id)
-                            .map(|(t, c)| (t.clone(), *c))
-                            .unwrap_or_else(|| (block.title.clone(), false));
+                            .map(|(t, c, f)| (t.clone(), *c, *f))
+                            .unwrap_or_else(|| (block.title.clone(), false, false));
                         let delete_id = block.id.clone();
                         let drag_id = block.id.clone();
                         let resize_id = block.id.clone();
@@ -1411,6 +1529,7 @@ fn TodayRail() -> Element {
                                     key: "{block.id}",
                                     class: "{block_class}",
                                     class: if is_dragging_this { "z-10 ring-1 ring-primary-400" },
+                                    class: if is_focus_block { "ring-1 ring-primary-300" },
                                     style: "top: {top}px; height: {height}px;",
                                     // Selection also runs through the drag: a
                                     // press that never leaves its quarter-hour

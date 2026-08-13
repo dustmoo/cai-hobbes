@@ -70,10 +70,11 @@ fn parse_time_of_day(raw: &str) -> Result<TimeOfDay, String> {
 fn parse_status(raw: &str) -> Result<TodoStatus, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "open" => Ok(TodoStatus::Open),
+        "in_progress" | "in-progress" | "started" => Ok(TodoStatus::InProgress),
         "completed" => Ok(TodoStatus::Completed),
         "cancelled" => Ok(TodoStatus::Cancelled),
         _ => Err(format!(
-            "invalid status '{}' — expected open, completed, or cancelled",
+            "invalid status '{}' — expected open, in_progress, completed, or cancelled",
             raw
         )),
     }
@@ -298,11 +299,24 @@ pub fn handle_todo_update(
     let mut pruned_blocks = 0usize;
     for (i, item) in items.iter().enumerate() {
         match apply_todo_update(state, item, today, now) {
-            Ok(summary) => {
-                updated.push(summary);
+            Ok((summary, wants_focus)) => {
+                let mut summary = summary;
                 // The borrow of the patched todo has ended; re-fetch by id for
                 // the store write.
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                    if wants_focus {
+                        // Single-focus: starting this one pauses any other.
+                        for changed in state.start_focus(id, now) {
+                            if let Some(t) = state.todo(&changed) {
+                                persist_todo(t, persist);
+                            }
+                        }
+                        // Re-summarise so the response shows ▶, not the
+                        // pre-focus state.
+                        if let Some(t) = state.todo(id) {
+                            summary = t.summary();
+                        }
+                    }
                     if let Some(todo) = state.todo(id) {
                         persist_todo(todo, persist);
                     }
@@ -311,6 +325,7 @@ pub fn handle_todo_update(
                         pruned_blocks += prune_rescheduled_blocks(state, id, persist);
                     }
                 }
+                updated.push(summary);
             }
             Err(e) => errors.push(format!("updates[{}]: {}", i, e)),
         }
@@ -327,12 +342,15 @@ Removed {} timeline block(s) that no longer matched the schedule.",
     (status, out)
 }
 
+/// Returns the patched todo's summary plus whether the item asked for focus
+/// (`status: in_progress`), which the caller applies via `start_focus` once
+/// this borrow has ended.
 fn apply_todo_update(
     state: &mut PlannerState,
     item: &Value,
     today: NaiveDate,
     now: DateTime<Utc>,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let obj = item.as_object().ok_or("expected an object")?;
     let id = obj
         .get("id")
@@ -404,19 +422,26 @@ fn apply_todo_update(
             .map(new_checklist_item)
             .collect();
     }
+    let mut wants_focus = false;
     match status {
         Some(TodoStatus::Completed) => todo.mark_completed(now),
         Some(TodoStatus::Open) => todo.reopen(now),
         Some(TodoStatus::Cancelled) => {
+            // Cancelling mid-focus still banks the session time.
+            todo.fold_elapsed(now);
             todo.status = TodoStatus::Cancelled;
             // The logbook orders by completed_at; a cancelled todo's "closed
             // moment" is when it was abandoned.
             todo.completed_at = Some(now);
         }
+        // Focus is a whole-state operation (it pauses the previous focus), so
+        // it can't run inside this single-todo borrow — the caller applies it
+        // through PlannerState::start_focus.
+        Some(TodoStatus::InProgress) => wants_focus = true,
         None => {}
     }
     todo.updated_at = now;
-    Ok(todo.summary())
+    Ok((todo.summary(), wants_focus))
 }
 
 /// The inverse rule: placing a linked block on a day schedules the todo there
@@ -1299,13 +1324,27 @@ pub fn planner_today_context(
         })
         .collect();
 
+    let now = Utc::now();
+    let focus = planner.focused().map(|t| {
+        format!(
+            "[{}] {} — {} elapsed{}",
+            t.id,
+            truncate_title(&t.title),
+            model::format_minutes(t.elapsed_minutes(now)),
+            t.estimate_minutes
+                .map(|m| format!(" of {} estimated", model::format_minutes(m)))
+                .unwrap_or_default()
+        )
+    });
+
     Some(serde_json::json!({
         "date": today.to_string(),
         "capacity": cap.summary(),
+        "in_focus": focus,
         "todos": todos,
         "blocks": blocks,
         "overdue": overdue,
-        "instruction": "The user's shared to-do list for today. Manage it with the HOBBES_TODO_* / HOBBES_PLAN_DAY / HOBBES_TIME_BLOCK tools.",
+        "instruction": "The user's shared to-do list for today. Manage it with the HOBBES_TODO_* / HOBBES_PLAN_DAY / HOBBES_TIME_BLOCK tools. Setting a todo's status to in_progress starts focus mode on it (only one at a time); completing or reopening it ends the session.",
     }))
 }
 
@@ -1532,6 +1571,66 @@ mod tests {
         assert_eq!(status, ToolCallStatus::Completed);
         assert_eq!(state.todos[0].scheduled_for, Some(tomorrow));
         assert!(!out.contains("Scheduled"), "{}", out);
+    }
+
+    // ── focus mode ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn setting_in_progress_starts_singular_focus() {
+        let mut state = PlannerState::default();
+        let a = seed_todo(&mut state, "First", "today");
+        let b = seed_todo(&mut state, "Second", "today");
+
+        let (status, out) = update(
+            &mut state,
+            json!({"updates": [{"id": a, "status": "in_progress"}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(out.contains('▶'), "response shows the focus mark: {}", out);
+        assert_eq!(state.focused().unwrap().id, a);
+
+        // Focusing the second pauses the first.
+        let (status, _) = update(
+            &mut state,
+            json!({"updates": [{"id": b, "status": "in_progress"}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert_eq!(state.focused().unwrap().id, b);
+        assert_eq!(
+            state.todo(&a).unwrap().status,
+            TodoStatus::Open,
+            "single focus: the previous task is paused"
+        );
+
+        // Completing ends the session.
+        let (status, _) = update(
+            &mut state,
+            json!({"updates": [{"id": b, "status": "completed"}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(state.focused().is_none());
+        assert!(state.todo(&b).unwrap().started_at.is_none());
+    }
+
+    #[test]
+    fn context_reports_the_focused_task() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Deep work", "today");
+        let (_, _) = update(
+            &mut state,
+            json!({"updates": [{"id": id, "estimate_minutes": 60, "status": "in_progress"}]}),
+        );
+
+        let settings = crate::settings::Settings::default();
+        let ctx = planner_today_context(&state, &settings, today()).expect("context on");
+        let focus = ctx.get("in_focus").unwrap().as_str().unwrap();
+        assert!(focus.contains("Deep work"), "{}", focus);
+        assert!(focus.contains("of 1h estimated"), "{}", focus);
+
+        // No focus → explicit null, not a stale string.
+        let (_, _) = update(&mut state, json!({"updates": [{"id": id, "status": "open"}]}));
+        let ctx = planner_today_context(&state, &settings, today()).expect("context on");
+        assert!(ctx.get("in_focus").unwrap().is_null());
     }
 
     // ── create ──────────────────────────────────────────────────────────────

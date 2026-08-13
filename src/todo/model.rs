@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 pub enum TodoStatus {
     #[default]
     Open,
+    /// Being actively worked right now — focus mode. At most one todo holds
+    /// this at a time; `PlannerState::start_focus` enforces it.
+    InProgress,
     Completed,
     /// Explicitly abandoned. Distinct from completed so the logbook can tell
     /// "I did this" from "I decided not to".
@@ -23,6 +26,7 @@ impl TodoStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             TodoStatus::Open => "open",
+            TodoStatus::InProgress => "in_progress",
             TodoStatus::Completed => "completed",
             TodoStatus::Cancelled => "cancelled",
         }
@@ -128,6 +132,10 @@ pub struct Todo {
     #[serde(default)]
     pub checklist: Vec<ChecklistItem>,
 
+    /// When the current focus session began. `Some` only while status is
+    /// `InProgress`; folding into `actual_minutes` happens on pause/close.
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
     /// Fractional index — see [`sort_between`].
     #[serde(default)]
     pub sort_order: f64,
@@ -159,6 +167,7 @@ impl Todo {
             actual_minutes: 0,
             tags: Vec::new(),
             checklist: Vec::new(),
+            started_at: None,
             sort_order,
             origin: TodoOrigin::User,
             created_at: now,
@@ -173,15 +182,44 @@ impl Todo {
         !self.status.is_closed() && self.deadline.is_some_and(|d| d < today)
     }
 
+    /// Fold the running focus session (if any) into `actual_minutes` and clear
+    /// the start marker. Safe to call in any state.
+    pub fn fold_elapsed(&mut self, now: DateTime<Utc>) {
+        if let Some(started) = self.started_at.take() {
+            let mins = (now - started).num_minutes().max(0) as u32;
+            self.actual_minutes = self.actual_minutes.saturating_add(mins);
+        }
+    }
+
+    /// Minutes actually spent, including the live session when focused.
+    pub fn elapsed_minutes(&self, now: DateTime<Utc>) -> u32 {
+        let live = self
+            .started_at
+            .map(|s| (now - s).num_minutes().max(0) as u32)
+            .unwrap_or(0);
+        self.actual_minutes.saturating_add(live)
+    }
+
     pub fn mark_completed(&mut self, now: DateTime<Utc>) {
+        self.fold_elapsed(now);
         self.status = TodoStatus::Completed;
         self.completed_at = Some(now);
         self.updated_at = now;
     }
 
     pub fn reopen(&mut self, now: DateTime<Utc>) {
+        self.fold_elapsed(now);
         self.status = TodoStatus::Open;
         self.completed_at = None;
+        self.updated_at = now;
+    }
+
+    /// Leave focus without closing: back to Open with the session banked.
+    pub fn pause(&mut self, now: DateTime<Utc>) {
+        self.fold_elapsed(now);
+        if self.status == TodoStatus::InProgress {
+            self.status = TodoStatus::Open;
+        }
         self.updated_at = now;
     }
 
@@ -190,6 +228,7 @@ impl Todo {
     pub fn summary(&self) -> String {
         let mark = match self.status {
             TodoStatus::Open => "○",
+            TodoStatus::InProgress => "▶",
             TodoStatus::Completed => "✓",
             TodoStatus::Cancelled => "✗",
         };
@@ -527,6 +566,37 @@ mod tests {
         // A day that "fits" while hiding unestimated work is the exact lie the
         // planner exists to prevent.
         assert!(cap.summary().contains("1 unestimated"));
+    }
+
+    #[test]
+    fn focus_time_accrues_and_folds() {
+        let start: DateTime<Utc> = "2026-08-13T10:00:00Z".parse().unwrap();
+        let later: DateTime<Utc> = "2026-08-13T10:25:00Z".parse().unwrap();
+
+        let mut t = Todo::new("deep work", 0.0);
+        t.status = TodoStatus::InProgress;
+        t.started_at = Some(start);
+
+        // Live elapsed counts the running session.
+        assert_eq!(t.elapsed_minutes(later), 25);
+
+        // Pausing banks it and returns to Open.
+        t.pause(later);
+        assert_eq!(t.status, TodoStatus::Open);
+        assert_eq!(t.actual_minutes, 25);
+        assert!(t.started_at.is_none());
+        assert_eq!(t.elapsed_minutes(later), 25);
+
+        // A second session stacks on top, and completing folds it.
+        t.status = TodoStatus::InProgress;
+        t.started_at = Some(later);
+        let end: DateTime<Utc> = "2026-08-13T10:40:00Z".parse().unwrap();
+        t.mark_completed(end);
+        assert_eq!(t.actual_minutes, 40);
+        assert_eq!(t.status, TodoStatus::Completed);
+
+        // In-progress is active, not closed: it stays in Today and capacity.
+        assert!(!TodoStatus::InProgress.is_closed());
     }
 
     #[test]

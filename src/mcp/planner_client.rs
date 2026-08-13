@@ -74,7 +74,7 @@ impl PlannerClient {
                 name: "HOBBES_TODO_UPDATE".into(),
                 description: Some(format!(
                     "Update one or more todos: patch any mutable field, or set 'status' to \
-                    complete, cancel, or reopen them. Pass an explicit JSON null to CLEAR an \
+                    complete, cancel, or reopen them. Setting status to in_progress starts focus mode: only one todo is ever in focus, the previous one is paused automatically with its elapsed time banked. Pass an explicit JSON null to CLEAR an \
                     optional field (scheduled_for, time_of_day, deadline, estimate_minutes, \
                     project_id) — omitted fields are left untouched. Replacing 'checklist' \
                     resets item completion. {}",
@@ -93,7 +93,7 @@ impl PlannerClient {
                                         "id": { "type": "string", "description": "Id of the todo to update (from HOBBES_TODO_LIST or a previous create)." },
                                         "title": { "type": "string" },
                                         "notes": { "type": "string" },
-                                        "status": { "type": "string", "enum": ["open", "completed", "cancelled"], "description": "'completed' finishes it, 'cancelled' abandons it, 'open' reopens it." },
+                                        "status": { "type": "string", "enum": ["open", "in_progress", "completed", "cancelled"], "description": "'completed' finishes it, 'cancelled' abandons it, 'open' reopens it." },
                                         "bucket": { "type": "string", "enum": ["inbox", "anytime", "someday"] },
                                         "scheduled_for": { "type": ["string", "null"], "description": "YYYY-MM-DD, 'today' or 'tomorrow'; null clears it." },
                                         "time_of_day": { "type": ["string", "null"], "enum": ["morning", "afternoon", "evening", null], "description": "null clears it." },
@@ -239,7 +239,7 @@ impl PlannerClient {
                                         "notes": { "type": "string" },
                                         "area_id": { "type": "string", "description": "Area to file the project under." },
                                         "deadline": { "type": "string", "description": "YYYY-MM-DD, 'today' or 'tomorrow'." },
-                                        "status": { "type": "string", "enum": ["open", "completed", "cancelled"] }
+                                        "status": { "type": "string", "enum": ["open", "in_progress", "completed", "cancelled"] }
                                     }
                                 }
                             },

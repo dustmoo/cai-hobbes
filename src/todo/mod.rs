@@ -37,7 +37,17 @@ impl PlannerState {
     /// Load everything from the store. Returns an empty planner if the database
     /// is unavailable, so a storage failure degrades rather than blocking launch.
     pub fn load() -> Self {
-        store::load_all()
+        let mut state = store::load_all();
+        let stale = state.sanitize_stale_focus(chrono::Utc::now());
+        for id in &stale {
+            if let Some(t) = state.todo(id) {
+                if let Err(e) = store::save_todo(t) {
+                    tracing::error!("Failed to persist stale-focus pause for {}: {}", id, e);
+                }
+            }
+            tracing::info!("Paused stale focus session on todo {}", id);
+        }
+        state
     }
 
     pub fn todo(&self, id: &str) -> Option<&Todo> {
@@ -84,6 +94,73 @@ impl PlannerState {
         // pointing at nothing.
         self.blocks.retain(|b| b.todo_id.as_deref() != Some(id));
         Some(self.todos.remove(idx))
+    }
+
+    /// The todo currently in focus, if any. The single-focus invariant makes
+    /// `find` correct: `start_focus` never leaves two in progress.
+    pub fn focused(&self) -> Option<&Todo> {
+        self.todos
+            .iter()
+            .find(|t| t.status == model::TodoStatus::InProgress)
+    }
+
+    /// Enter focus on one todo, pausing whichever held it before — at most one
+    /// task is ever in progress (the Sunsama model: focus is singular).
+    /// Returns the ids of every todo whose state changed, for persistence.
+    pub fn start_focus(
+        &mut self,
+        todo_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<String> {
+        if self.todo(todo_id).is_none() {
+            return Vec::new();
+        }
+        let mut changed = Vec::new();
+        for t in &mut self.todos {
+            if t.status == model::TodoStatus::InProgress && t.id != todo_id {
+                t.pause(now);
+                changed.push(t.id.clone());
+            }
+        }
+        if let Some(t) = self.todo_mut(todo_id) {
+            if t.status != model::TodoStatus::InProgress {
+                t.fold_elapsed(now); // defensive: a stray marker never double-counts
+                t.status = model::TodoStatus::InProgress;
+                t.started_at = Some(now);
+                t.updated_at = now;
+                changed.push(t.id.clone());
+            }
+        }
+        changed
+    }
+
+    /// Leave focus mode, banking the session. Returns the paused todo's id.
+    pub fn stop_focus(&mut self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+        let id = self.focused().map(|t| t.id.clone())?;
+        if let Some(t) = self.todo_mut(&id) {
+            t.pause(now);
+        }
+        Some(id)
+    }
+
+    /// A focus session that survived an app quit is almost certainly abandoned
+    /// — pause it on load, capping the banked time at two hours so a forgotten
+    /// overnight session can't pollute the actuals. Returns the affected ids.
+    pub fn sanitize_stale_focus(&mut self, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+        let mut changed = Vec::new();
+        for t in &mut self.todos {
+            if t.status == model::TodoStatus::InProgress {
+                if let Some(started) = t.started_at {
+                    let mins = (now - started).num_minutes().clamp(0, 120) as u32;
+                    t.actual_minutes = t.actual_minutes.saturating_add(mins);
+                    t.started_at = None;
+                }
+                t.status = model::TodoStatus::Open;
+                t.updated_at = now;
+                changed.push(t.id.clone());
+            }
+        }
+        changed
     }
 
     /// A block's display title: the linked todo's *current* title when there
@@ -320,6 +397,57 @@ mod tests {
         assert_eq!(removed[0].id, "keep-day");
         let ids: Vec<&str> = state.blocks.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, vec!["other-todo", "bare"]);
+    }
+
+    #[test]
+    fn focus_is_singular() {
+        let now = chrono::Utc::now();
+        let mut state = PlannerState::default();
+        let (a, b) = (Todo::new("a", 0.0), Todo::new("b", 0.0));
+        let (id_a, id_b) = (a.id.clone(), b.id.clone());
+        state.upsert_todo(a);
+        state.upsert_todo(b);
+
+        let changed = state.start_focus(&id_a, now);
+        assert_eq!(changed, vec![id_a.clone()]);
+        assert_eq!(state.focused().unwrap().id, id_a);
+
+        // Focusing b pauses a — both report as changed.
+        let changed = state.start_focus(&id_b, now);
+        assert_eq!(changed.len(), 2);
+        assert_eq!(state.focused().unwrap().id, id_b);
+        assert_eq!(
+            state.todo(&id_a).unwrap().status,
+            model::TodoStatus::Open,
+            "the previous focus must be paused, not left dangling"
+        );
+
+        // Re-focusing the focused todo is a no-op (no double-start).
+        assert!(state.start_focus(&id_b, now).is_empty());
+        // Unknown ids change nothing.
+        assert!(state.start_focus("nope", now).is_empty());
+
+        assert_eq!(state.stop_focus(now), Some(id_b.clone()));
+        assert!(state.focused().is_none());
+        assert_eq!(state.stop_focus(now), None);
+    }
+
+    #[test]
+    fn stale_focus_is_paused_on_load_with_capped_accrual() {
+        let now: chrono::DateTime<chrono::Utc> = "2026-08-13T09:00:00Z".parse().unwrap();
+        let mut state = PlannerState::default();
+        let mut t = Todo::new("forgotten overnight", 0.0);
+        t.status = model::TodoStatus::InProgress;
+        t.started_at = Some(now - chrono::Duration::hours(14));
+        let id = t.id.clone();
+        state.upsert_todo(t);
+
+        let changed = state.sanitize_stale_focus(now);
+        assert_eq!(changed, vec![id.clone()]);
+        let t = state.todo(&id).unwrap();
+        assert_eq!(t.status, model::TodoStatus::Open);
+        assert_eq!(t.actual_minutes, 120, "overnight sessions cap at 2h");
+        assert!(t.started_at.is_none());
     }
 
     #[test]
