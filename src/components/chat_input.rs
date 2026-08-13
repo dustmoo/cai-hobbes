@@ -163,6 +163,29 @@ pub fn ChatInput(
         }
     });
 
+    // Event-driven caret landing for StartTodoInChat: the arm bumps this
+    // nonce, and this effect runs after the render that committed the tab
+    // switch and unhid the chat — so one plain focus() suffices. The rAF hop
+    // orders the eval after the webview has painted the applied mutations.
+    let mut caret_focus_nonce = use_signal(|| 0u64);
+    use_effect(move || {
+        if *caret_focus_nonce.read() == 0 {
+            return; // initial render, no request pending
+        }
+        let _ = document::eval(
+            r#"
+            requestAnimationFrame(() => {
+                const el = document.getElementById('chat-textarea');
+                if (el) {
+                    el.focus();
+                    el.selectionStart = el.selectionEnd = el.value.length;
+                    el.scrollTop = el.scrollHeight;
+                }
+            });
+            "#,
+        );
+    });
+
     // Listen for global chat commands (from menu hotkeys)
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     use_effect(move || {
@@ -263,23 +286,14 @@ pub fn ChatInput(
                 }
                 ChatCommand::StartTodoInChat(text) => {
                     tracing::info!("ChatCommand::StartTodoInChat triggered: {} chars", text.len());
-                    // No focus here: the planner is still covering the chat at
-                    // this instant, and focusing a display:none textarea is a
-                    // silent no-op. Fill the draft now, then focus + caret-to-
-                    // end once main.rs's tab switch has unhidden the chat.
+                    // The planner still covers the chat at this instant, and
+                    // focusing a display:none textarea is a silent no-op. Fill
+                    // the draft now and bump the focus nonce — its use_effect
+                    // above runs after the render that applied main.rs's tab
+                    // switch (effects run post-DOM-commit), so focus lands on
+                    // a visible element. Event-driven; no timers, no polling.
                     crate::components::shared::set_chat_draft(draft, text, None, false);
-                    spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                        let _ = document::eval(
-                            r#"
-                            const el = document.getElementById('chat-textarea');
-                            if (el) {
-                                el.focus();
-                                el.selectionStart = el.selectionEnd = el.value.length;
-                            }
-                            "#,
-                        );
-                    });
+                    caret_focus_nonce += 1;
                 }
                 ChatCommand::RestoreToDraft(text, restore_attachments) => {
                     tracing::info!("ChatCommand::RestoreToDraft triggered: {} chars, {} attachments", text.len(), restore_attachments.len());
