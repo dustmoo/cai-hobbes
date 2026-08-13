@@ -1148,6 +1148,10 @@ fn app() -> Element {
         use_context_provider(|| crate::components::shared::SaveErrorContext(Signal::new(None))).0;
 
     let mut chat_command = use_context_provider(|| Signal::new(None::<ChatCommand>));
+    let mut pending_chat_seed = use_context_provider(|| {
+        crate::components::shared::PendingChatSeedContext(Signal::new(None))
+    })
+    .0;
 
     // Tab state - initialized from UiState or with current active session
     let mut open_tabs = use_signal(|| {
@@ -1850,11 +1854,15 @@ fn app() -> Element {
                         show_session_manager.set(false);
                     }
                 }
-                ChatCommand::StartTodoInChat(_) => {
-                    // ChatInput consumes the same command to seed the draft;
-                    // this side only provides the fresh tab (which also brings
-                    // the chat forward — new_tab_fn deactivates the planner).
+                ChatCommand::StartTodoInChat(text) => {
+                    // Sequenced in ONE effect: open the tab (which deactivates
+                    // the planner), then park the seed. ChatInput's consuming
+                    // effect fires after this render commits — textarea
+                    // visible, seed applied exactly once. Racing two consumers
+                    // on chat_command lost the seed whenever the async command
+                    // clear ran first.
                     new_tab_fn();
+                    pending_chat_seed.set(Some(text));
                 }
                 ChatCommand::TogglePlanner => {
                     // First invocation opens the tab and focuses it; afterwards

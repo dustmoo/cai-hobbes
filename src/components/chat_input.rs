@@ -41,9 +41,10 @@ pub enum ChatCommand {
     CancelGeneration,
     CopyToDraft(String),
     RestoreToDraft(String, Vec<hobbes_core::models::Attachment>),
-    /// "Activate" a planner todo: main.rs opens a fresh chat tab, ChatInput
-    /// seeds the draft with the task and parks the caret at the end so the
-    /// user types details immediately. Both handlers observe the same command.
+    /// "Activate" a planner todo. Handled entirely in main.rs: it opens a
+    /// fresh chat tab and parks the text in PendingChatSeedContext in the same
+    /// effect; ChatInput's pending-seed consumer then fills the draft and
+    /// lands the caret after the render that unhid the chat.
     StartTodoInChat(String),
     TriggerAiAnalysis,
     SwitchToSettingsTab(crate::settings::SettingsTab, Option<String>),
@@ -163,27 +164,21 @@ pub fn ChatInput(
         }
     });
 
-    // Event-driven caret landing for StartTodoInChat: the arm bumps this
-    // nonce, and this effect runs after the render that committed the tab
-    // switch and unhid the chat — so one plain focus() suffices. The rAF hop
-    // orders the eval after the webview has painted the applied mutations.
-    let mut caret_focus_nonce = use_signal(|| 0u64);
+    // Deterministic seed hand-off for StartTodoInChat: main.rs opens the tab
+    // and parks the text here in the SAME effect, so this consumer's first run
+    // for the new value happens after the render that unhid the chat — the
+    // uncontrolled textarea is visible and set_chat_draft's focus sticks.
+    let crate::components::shared::PendingChatSeedContext(mut pending_seed) =
+        use_context::<crate::components::shared::PendingChatSeedContext>();
     use_effect(move || {
-        if *caret_focus_nonce.read() == 0 {
-            return; // initial render, no request pending
-        }
-        let _ = document::eval(
-            r#"
-            requestAnimationFrame(() => {
-                const el = document.getElementById('chat-textarea');
-                if (el) {
-                    el.focus();
-                    el.selectionStart = el.selectionEnd = el.value.length;
-                    el.scrollTop = el.scrollHeight;
-                }
-            });
-            "#,
-        );
+        let Some(text) = pending_seed.read().clone() else {
+            return;
+        };
+        // Consume before applying: the write re-runs this effect, which then
+        // sees None and stops — one application per activation.
+        pending_seed.set(None);
+        let caret = text.encode_utf16().count();
+        crate::components::shared::set_chat_draft(draft, text, Some(caret), true);
     });
 
     // Listen for global chat commands (from menu hotkeys)
@@ -205,6 +200,7 @@ pub fn ChatInput(
                 | ChatCommand::ToggleHistory
                 | ChatCommand::ToggleMcp
                 | ChatCommand::TogglePlanner
+                | ChatCommand::StartTodoInChat(_)
                 | ChatCommand::SwitchToSettingsTab(_, _)
                 | ChatCommand::SwitchTab(_)
                 | ChatCommand::SwitchToSession(_)
@@ -283,17 +279,6 @@ pub fn ChatInput(
                 ChatCommand::CopyToDraft(text) => {
                     tracing::info!("ChatCommand::CopyToDraft triggered: {} chars", text.len());
                     crate::components::shared::set_chat_draft(draft, text, None, false);
-                }
-                ChatCommand::StartTodoInChat(text) => {
-                    tracing::info!("ChatCommand::StartTodoInChat triggered: {} chars", text.len());
-                    // The planner still covers the chat at this instant, and
-                    // focusing a display:none textarea is a silent no-op. Fill
-                    // the draft now and bump the focus nonce — its use_effect
-                    // above runs after the render that applied main.rs's tab
-                    // switch (effects run post-DOM-commit), so focus lands on
-                    // a visible element. Event-driven; no timers, no polling.
-                    crate::components::shared::set_chat_draft(draft, text, None, false);
-                    caret_focus_nonce += 1;
                 }
                 ChatCommand::RestoreToDraft(text, restore_attachments) => {
                     tracing::info!("ChatCommand::RestoreToDraft triggered: {} chars, {} attachments", text.len(), restore_attachments.len());

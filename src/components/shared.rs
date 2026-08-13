@@ -48,6 +48,13 @@ pub fn set_chat_draft(
 #[derive(Clone, Copy, PartialEq)]
 pub struct SessionToDeleteContext(pub Signal<String>);
 
+/// Seed text awaiting the chat input after a planner todo is activated.
+/// main.rs writes it in the same effect that opens the new tab, so ChatInput's
+/// consuming effect necessarily runs after the render that unhid the chat —
+/// deterministic hand-off, no racing on the command signal.
+#[derive(Clone, Copy)]
+pub struct PendingChatSeedContext(pub Signal<Option<String>>);
+
 /// Context for surfacing async save errors to the UI via a dismissible toast.
 /// When `Some(msg)`, the toast is visible with the given error message.
 #[derive(Clone, Copy, PartialEq)]
