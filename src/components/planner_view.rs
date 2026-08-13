@@ -202,6 +202,32 @@ fn cycle_estimate(current: Option<u32>) -> Option<u32> {
     }
 }
 
+/// The draft seeded into a fresh chat when a todo is activated. Speaks in the
+/// user's voice (it is their message to edit), carries the id so the AI can
+/// drive HOBBES_TODO_UPDATE, and ends mid-sentence so the caret invites the
+/// details.
+fn activation_seed(todo: &Todo) -> String {
+    let mut meta: Vec<String> = Vec::new();
+    if let Some(m) = todo.estimate_minutes {
+        meta.push(model::format_minutes(m));
+    }
+    if let Some(d) = todo.deadline {
+        meta.push(format!("due {}", d.format("%-d %b")));
+    }
+    for tag in &todo.tags {
+        meta.push(format!("#{}", tag));
+    }
+    let meta = if meta.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", meta.join(", "))
+    };
+    format!(
+        "Let's work on my to-do \"{}\"{} — todo id {}.\n\nDetails: ",
+        todo.title, meta, todo.id
+    )
+}
+
 /// Human scheduled-date label: "Today", "Tomorrow", then "Fri 15 Aug".
 fn scheduled_label(d: NaiveDate, today: NaiveDate) -> String {
     if d == today {
@@ -837,6 +863,8 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
 #[component]
 fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
+    let mut chat_command =
+        use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
     let mut editing = use_signal(|| false);
     let mut edit_buffer = use_signal(String::new);
 
@@ -1046,6 +1074,22 @@ fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
             if !in_logbook {
                 div {
                     class: "hidden shrink-0 items-center gap-1 group-hover:flex",
+                    // Activate: open a fresh chat seeded with this task.
+                    button {
+                        class: "rounded p-1 text-primary-300 hover:bg-input hover:text-primary-200",
+                        title: "Work on this in a new chat",
+                        onclick: {
+                            let todo = todo.clone();
+                            move |_| {
+                                chat_command.set(Some(
+                                    crate::components::chat_input::ChatCommand::StartTodoInChat(
+                                        activation_seed(&todo),
+                                    ),
+                                ));
+                            }
+                        },
+                        Icon { width: 14, height: 14, icon: fi_icons::FiMessageCircle }
+                    }
                     button {
                         class: "rounded px-1.5 py-0.5 text-xs text-fg-muted hover:bg-input hover:text-fg",
                         onclick: schedule(|t, day| {
@@ -1619,6 +1663,27 @@ mod tests {
         assert_eq!(fmt_hhmm(570), "09:30");
         assert_eq!(fmt_hhmm(0), "00:00");
         assert_eq!(fmt_hhmm(1020), "17:00");
+    }
+
+    #[test]
+    fn activation_seed_carries_the_task_and_invites_details() {
+        let mut t = Todo::new("Finalize Case Study", 0.0);
+        t.id = "td_1a2b".into();
+        t.estimate_minutes = Some(60);
+        t.deadline = Some("2026-08-13".parse().unwrap());
+        t.tags = vec!["writing".into()];
+
+        let seed = activation_seed(&t);
+        assert_eq!(
+            seed,
+            "Let's work on my to-do \"Finalize Case Study\" (1h, due 13 Aug, #writing) — todo id td_1a2b.\n\nDetails: "
+        );
+
+        // Bare todos skip the empty parenthetical.
+        let bare = Todo::new("Email", 0.0);
+        let seed = activation_seed(&bare);
+        assert!(seed.starts_with("Let's work on my to-do \"Email\" — todo id"));
+        assert!(seed.ends_with("Details: "), "caret parks after the prompt");
     }
 
     #[test]

@@ -4003,6 +4003,11 @@ video {
   color: rgb(74 222 128 / var(--tw-text-opacity, 1));
 }
 
+.hover\:text-primary-200:hover {
+  --tw-text-opacity: 1;
+  color: rgb(173 194 224 / var(--tw-text-opacity, 1));
+}
+
 .hover\:text-primary-300:hover {
   --tw-text-opacity: 1;
   color: rgb(132 164 209 / var(--tw-text-opacity, 1));

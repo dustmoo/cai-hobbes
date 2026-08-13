@@ -41,6 +41,10 @@ pub enum ChatCommand {
     CancelGeneration,
     CopyToDraft(String),
     RestoreToDraft(String, Vec<hobbes_core::models::Attachment>),
+    /// "Activate" a planner todo: main.rs opens a fresh chat tab, ChatInput
+    /// seeds the draft with the task and parks the caret at the end so the
+    /// user types details immediately. Both handlers observe the same command.
+    StartTodoInChat(String),
     TriggerAiAnalysis,
     SwitchToSettingsTab(crate::settings::SettingsTab, Option<String>),
     SwitchTab(usize),
@@ -256,6 +260,26 @@ pub fn ChatInput(
                 ChatCommand::CopyToDraft(text) => {
                     tracing::info!("ChatCommand::CopyToDraft triggered: {} chars", text.len());
                     crate::components::shared::set_chat_draft(draft, text, None, false);
+                }
+                ChatCommand::StartTodoInChat(text) => {
+                    tracing::info!("ChatCommand::StartTodoInChat triggered: {} chars", text.len());
+                    // No focus here: the planner is still covering the chat at
+                    // this instant, and focusing a display:none textarea is a
+                    // silent no-op. Fill the draft now, then focus + caret-to-
+                    // end once main.rs's tab switch has unhidden the chat.
+                    crate::components::shared::set_chat_draft(draft, text, None, false);
+                    spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                        let _ = document::eval(
+                            r#"
+                            const el = document.getElementById('chat-textarea');
+                            if (el) {
+                                el.focus();
+                                el.selectionStart = el.selectionEnd = el.value.length;
+                            }
+                            "#,
+                        );
+                    });
                 }
                 ChatCommand::RestoreToDraft(text, restore_attachments) => {
                     tracing::info!("ChatCommand::RestoreToDraft triggered: {} chars, {} attachments", text.len(), restore_attachments.len());

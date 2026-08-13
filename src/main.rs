@@ -1850,6 +1850,12 @@ fn app() -> Element {
                         show_session_manager.set(false);
                     }
                 }
+                ChatCommand::StartTodoInChat(_) => {
+                    // ChatInput consumes the same command to seed the draft;
+                    // this side only provides the fresh tab (which also brings
+                    // the chat forward — new_tab_fn deactivates the planner).
+                    new_tab_fn();
+                }
                 ChatCommand::TogglePlanner => {
                     // First invocation opens the tab and focuses it; afterwards
                     // it toggles focus between planner and chat. Closing the
