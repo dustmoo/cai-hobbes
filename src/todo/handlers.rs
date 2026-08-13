@@ -419,6 +419,39 @@ fn apply_todo_update(
     Ok(todo.summary())
 }
 
+/// The inverse rule: placing a linked block on a day schedules the todo there
+/// (see `PlannerState::schedule_todo_on`). Persists the todo and deletes any
+/// pruned stale blocks; appends what happened to the response so the model
+/// knows the schedule moved.
+fn sync_schedule_to_block(
+    state: &mut PlannerState,
+    todo_id: &str,
+    date: NaiveDate,
+    persist: bool,
+    out: &mut String,
+) {
+    let (changed, pruned) = state.schedule_todo_on(todo_id, date, Utc::now());
+    if changed {
+        if let Some(todo) = state.todo(todo_id) {
+            persist_todo(todo, persist);
+            out.push_str(&format!("\nScheduled '{}' onto {}.", todo.title, date));
+        }
+    }
+    if !pruned.is_empty() {
+        if persist {
+            for b in &pruned {
+                if let Err(e) = store::delete_block(&b.id) {
+                    tracing::error!("Failed to delete stale block {}: {}", b.id, e);
+                }
+            }
+        }
+        out.push_str(&format!(
+            "\nRemoved {} of its timeline block(s) left on other days.",
+            pruned.len()
+        ));
+    }
+}
+
 /// The timebox follows the schedule: after a todo's `scheduled_for` changes,
 /// drop its blocks on days that no longer match, everywhere. Returns how many
 /// were removed so responses can say so.
@@ -841,7 +874,12 @@ fn time_block_create(
     let warning = overlap_warning(state, &block);
     persist_block(&block, persist);
     let mut out = format!("Created {}", block_line(state, &block));
+    let linked = block.todo_id.clone();
     state.blocks.push(block);
+    // Timeboxing work on a day IS scheduling it there.
+    if let Some(tid) = linked {
+        sync_schedule_to_block(state, &tid, date, persist, &mut out);
+    }
     if let Some(w) = warning {
         out.push('\n');
         out.push_str(&w);
@@ -923,7 +961,7 @@ fn time_block_move(
     // Changing a linked block's length IS re-estimating the work — the same
     // rule the UI's resize drag applies. A pure move leaves the estimate alone.
     if new_duration != old_duration {
-        if let Some(tid) = linked {
+        if let Some(tid) = linked.clone() {
             if let Some(todo) = state.todo_mut(&tid) {
                 todo.estimate_minutes = Some(new_duration.max(15));
                 todo.updated_at = Utc::now();
@@ -934,6 +972,12 @@ fn time_block_move(
                     model::format_minutes(new_duration.max(15))
                 ));
             }
+        }
+    }
+    // Moving a linked block to another day drags the schedule along with it.
+    if date != cur_start.date_naive() {
+        if let Some(tid) = linked {
+            sync_schedule_to_block(state, &tid, date, persist, &mut out);
         }
     }
     if let Some(w) = warning {
@@ -1441,6 +1485,53 @@ mod tests {
         let ctx = planner_today_context(&state, &settings, today()).expect("planner context on");
         let blocks_json = ctx.get("blocks").unwrap().to_string();
         assert!(blocks_json.contains("Renamed"), "{}", blocks_json);
+    }
+
+    #[test]
+    fn creating_a_block_schedules_its_todo_onto_that_day() {
+        let mut state = PlannerState::default();
+        // Scheduled yesterday — the exact "dropped it into today but the line
+        // item kept the old date" report.
+        let id = seed_todo(&mut state, "Email", "2026-08-11");
+
+        let (status, out) = block(
+            &mut state,
+            json!({"action": "create", "todo_id": id, "date": "today",
+                   "start": "10:45", "end": "11:45"}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert_eq!(
+            state.todos[0].scheduled_for,
+            Some(today()),
+            "the timebox is the schedule — the line item must follow the block"
+        );
+        assert!(out.contains("Scheduled 'Email' onto"), "{}", out);
+    }
+
+    #[test]
+    fn moving_a_block_across_days_drags_the_schedule_and_prunes() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Email", "today");
+        let block_id = seed_linked_block(&mut state, &id); // today 09:00–10:00
+
+        let (status, out) = block(
+            &mut state,
+            json!({"action": "move", "id": block_id, "date": "tomorrow"}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        let tomorrow = today().succ_opt().unwrap();
+        assert_eq!(state.todos[0].scheduled_for, Some(tomorrow));
+        assert_eq!(state.blocks.len(), 1, "the moved block itself must survive the prune");
+        assert!(out.contains("Scheduled 'Email' onto"), "{}", out);
+
+        // Same-day move: schedule untouched, no note.
+        let (status, out) = block(
+            &mut state,
+            json!({"action": "move", "id": block_id, "start": "13:00", "end": "14:00"}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert_eq!(state.todos[0].scheduled_for, Some(tomorrow));
+        assert!(!out.contains("Scheduled"), "{}", out);
     }
 
     // ── create ──────────────────────────────────────────────────────────────

@@ -659,6 +659,16 @@ fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
         todo.deadline = parsed.deadline;
         todo.time_of_day = parsed.time_of_day;
 
+        // An @clock token also implies a time-of-day group when none was given
+        // explicitly, so "@7pm" lands in This Evening without a second token.
+        if todo.time_of_day.is_none() {
+            todo.time_of_day = parsed.block_start.map(|m| match m / 60 {
+                0..=11 => TimeOfDay::Morning,
+                12..=16 => TimeOfDay::Afternoon,
+                _ => TimeOfDay::Evening,
+            });
+        }
+
         // An @clock token means "this happens at that time": it implies a
         // scheduled day (today unless the view already picked one) and puts a
         // linked block on that day's timeline.
@@ -1452,7 +1462,25 @@ fn TodayRail() -> Element {
                                                 source: BlockSource::Auto,
                                             };
                                             persist_block(&block);
-                                            planner.write().blocks.push(block);
+                                            // Timeboxing the work today IS scheduling it
+                                            // today: a todo rolled in from an earlier day
+                                            // must not keep its stale date once placed.
+                                            let (changed, pruned) = {
+                                                let mut state = planner.write();
+                                                state.blocks.push(block);
+                                                state.schedule_todo_on(&todo_id, day, Utc::now())
+                                            };
+                                            if changed {
+                                                persist_todo(&planner, &todo_id);
+                                            }
+                                            for b in &pruned {
+                                                if let Err(e) = store::delete_block(&b.id) {
+                                                    tracing::error!(
+                                                        "planner: failed to delete stale block {}: {}",
+                                                        b.id, e
+                                                    );
+                                                }
+                                            }
                                         },
                                         Icon { width: 14, height: 14, icon: fi_icons::FiPlus }
                                     }

@@ -126,6 +126,29 @@ impl PlannerState {
         removed
     }
 
+    /// Placing (or moving) a linked block onto a day IS scheduling the work
+    /// there — the inverse of [`prune_blocks_for_todo`]: the schedule and the
+    /// timebox must never disagree. Sets `scheduled_for`, stamps `updated_at`,
+    /// and prunes the todo's blocks left on other days. Returns whether the
+    /// schedule actually changed and the pruned blocks (for store deletion).
+    pub fn schedule_todo_on(
+        &mut self,
+        todo_id: &str,
+        date: chrono::NaiveDate,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (bool, Vec<TimeBlock>) {
+        let Some(todo) = self.todo_mut(todo_id) else {
+            return (false, Vec::new());
+        };
+        let changed = todo.scheduled_for != Some(date);
+        if changed {
+            todo.scheduled_for = Some(date);
+            todo.updated_at = now;
+        }
+        let pruned = self.prune_blocks_for_todo(todo_id, Some(date));
+        (changed, pruned)
+    }
+
     /// Time blocks starting on a day, earliest first.
     ///
     /// `date` is a **local** calendar day — planner days are user-local
@@ -297,6 +320,43 @@ mod tests {
         assert_eq!(removed[0].id, "keep-day");
         let ids: Vec<&str> = state.blocks.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, vec!["other-todo", "bare"]);
+    }
+
+    #[test]
+    fn scheduling_via_block_placement_syncs_the_todo() {
+        let mut state = PlannerState::default();
+        let day = date("2026-08-13");
+        let yesterday = date("2026-08-12");
+        let mut todo = Todo::new("Email", 0.0);
+        todo.id = "td_1".into();
+        todo.scheduled_for = Some(yesterday);
+        state.upsert_todo(todo);
+        // A stale block from yesterday, and today's fresh one.
+        for (id, on) in [("old", yesterday), ("new", day)] {
+            state.blocks.push(TimeBlock {
+                id: id.into(),
+                todo_id: Some("td_1".into()),
+                title: "Email".into(),
+                start: local_instant(on, 10),
+                end: local_instant(on, 11),
+                source: BlockSource::Manual,
+            });
+        }
+
+        let (changed, pruned) = state.schedule_todo_on("td_1", day, chrono::Utc::now());
+        assert!(changed, "the line item must move to the block's day");
+        assert_eq!(state.todo("td_1").unwrap().scheduled_for, Some(day));
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].id, "old");
+        assert_eq!(state.blocks.len(), 1, "today's block survives the prune");
+
+        // Same day again: no-op, nothing pruned.
+        let (changed, pruned) = state.schedule_todo_on("td_1", day, chrono::Utc::now());
+        assert!(!changed);
+        assert!(pruned.is_empty());
+        // Unknown id: harmless.
+        let (changed, pruned) = state.schedule_todo_on("nope", day, chrono::Utc::now());
+        assert!(!changed && pruned.is_empty());
     }
 
     #[test]
