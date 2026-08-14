@@ -31,6 +31,12 @@ enum PlannerSelection {
     Project(String),
 }
 
+/// Which timeline block is selected on the Today rail. Provided at the
+/// PlannerView root (same pattern as TodoDetailContext) so a row's timebox
+/// chip can jump to Today with its block already highlighted.
+#[derive(Clone, Copy)]
+struct SelectedBlockContext(Signal<Option<String>>);
+
 /// What a timeline drag is doing to a block.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum BlockDragMode {
@@ -215,13 +221,24 @@ fn minutes_in_local_day(dt: &chrono::DateTime<Utc>) -> i64 {
 }
 
 /// Estimate chip click-cycle: none → 15m → 30m → 1h → 2h → none.
+///
+/// Off-ladder values (AI- or free-entry-set, e.g. 45m) snap to the NEAREST
+/// ladder step — ties round up, so 45 → 60 — and the next click walks the
+/// ladder normally from there. Only an exact 2h advances to none: a click on
+/// an off-ladder chip must never throw the estimate away.
 fn cycle_estimate(current: Option<u32>) -> Option<u32> {
+    const LADDER: [u32; 4] = [15, 30, 60, 120];
     match current {
         None => Some(15),
-        Some(15) => Some(30),
-        Some(30) => Some(60),
-        Some(60) => Some(120),
-        _ => None,
+        Some(m) => match LADDER.iter().position(|&step| step == m) {
+            Some(pos) => LADDER.get(pos + 1).copied(),
+            // min_by_key breaks distance ties on Reverse(step): the larger
+            // step wins, which is the ties-round-up rule.
+            None => LADDER
+                .iter()
+                .min_by_key(|&&step| (m.abs_diff(step), std::cmp::Reverse(step)))
+                .copied(),
+        },
     }
 }
 
@@ -249,17 +266,6 @@ fn activation_seed(todo: &Todo) -> String {
         "Let's work on my to-do \"{}\"{} — todo id {}.\n\nDetails: ",
         todo.title, meta, todo.id
     )
-}
-
-/// Human scheduled-date label: "Today", "Tomorrow", then "Fri 15 Aug".
-fn scheduled_label(d: NaiveDate, today: NaiveDate) -> String {
-    if d == today {
-        "Today".to_string()
-    } else if Some(d) == today.succ_opt() {
-        "Tomorrow".to_string()
-    } else {
-        d.format("%a %-d %b").to_string()
-    }
 }
 
 fn view_title(view: TodoView) -> &'static str {
@@ -390,6 +396,11 @@ pub fn PlannerView() -> Element {
     // button and by the card rendered at this root.
     let detail_open = use_signal(|| Option::<String>::None);
     use_context_provider(|| crate::components::todo_detail::TodoDetailContext(detail_open));
+
+    // Timeline block selection lives at the root (not in TodayRail) so the
+    // timebox chip on a row can select the block it navigates to.
+    let selected_block = use_signal(|| Option::<String>::None);
+    use_context_provider(|| SelectedBlockContext(selected_block));
 
     // Auto-rollover, once per mount: yesterday's unfinished work reappears on
     // today's plate. Guarded by a signal so re-renders never repeat it.
@@ -788,6 +799,14 @@ fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
             _ => {} // Inbox (and Logbook, which hides quick-add)
         }
 
+        // A *day token overrides the view-context date — the user said when.
+        // Born triaged (Anytime) like every other scheduled birth, so clearing
+        // the date later never dumps it into Inbox.
+        if let Some(d) = parsed.scheduled {
+            todo.scheduled_for = Some(d);
+            todo.bucket = TodoBucket::Anytime;
+        }
+
         // Tokens beat defaults; defaults beat nothing.
         let default_estimate = settings.peek().planner_default_estimate_minutes;
         todo.estimate_minutes = parsed
@@ -857,7 +876,8 @@ fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
     // Parsed inline on every keystroke (P-012: draft is a Signal, so this
     // tracks). The chips show what Enter will actually do — the premium tell
     // of Things/Todoist quick entry is that tokens are confirmed before commit.
-    let preview = crate::todo::quick_add::parse_quick_add(&draft.read(), today());
+    let day = today();
+    let preview = crate::todo::quick_add::parse_quick_add(&draft.read(), day);
 
     rsx! {
         div {
@@ -865,7 +885,7 @@ fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
             input {
                 class: "w-full rounded border border-subtle bg-input px-3 py-2 text-sm text-fg placeholder:text-fg-muted focus:outline-none focus:border-faint",
                 r#type: "text",
-                placeholder: "Add a to-do — ~30m · #tag · @2pm · !fri — press Enter",
+                placeholder: "Add a to-do — ~30m · #tag · @2pm · *mon · !fri — press Enter",
                 value: "{draft}",
                 oninput: move |evt| draft.set(evt.value()),
                 onkeydown: move |evt| {
@@ -893,8 +913,15 @@ fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
                             }
                         }
                     }
+                    if let Some(d) = preview.scheduled {
+                        span {
+                            class: "flex items-center gap-1 rounded bg-input px-1.5 py-0.5 text-[10px] text-fg",
+                            Icon { width: 10, height: 10, icon: fi_icons::FiCalendar }
+                            "→ {views::friendly_date(d, day)}"
+                        }
+                    }
                     if let Some(d) = preview.deadline {
-                        span { class: "rounded bg-red-500/20 px-1.5 py-0.5 text-[10px] text-fg", "due {d.format(\"%-d %b\")}" }
+                        span { class: "rounded bg-red-500/20 px-1.5 py-0.5 text-[10px] text-fg", "due {views::friendly_date(d, day)}" }
                     }
                     for tag in preview.tags.iter() {
                         span { class: "rounded bg-input px-1.5 py-0.5 text-[10px] text-fg-muted", "#{tag}" }
@@ -916,6 +943,18 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
     let state = planner.read();
 
     let is_today = sel == PlannerSelection::View(TodoView::Today);
+    let is_upcoming = sel == PlannerSelection::View(TodoView::Upcoming);
+
+    // Upcoming renders under day headers — the same grouped query the AI's
+    // list tool flattens, so the two orderings can't drift.
+    let upcoming_groups: Vec<(NaiveDate, Vec<Todo>)> = if is_upcoming {
+        views::upcoming_grouped(&state.todos, day)
+            .into_iter()
+            .map(|(d, ts)| (d, ts.into_iter().cloned().collect()))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Today gets its "This Evening" split; every other selection is one flat
     // list. Completing a todo must keep its row visible for the rest of the
@@ -943,10 +982,12 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
                 .cloned()
                 .collect(),
         )
+    } else if is_upcoming {
+        (Vec::new(), Vec::new())
     } else {
         (todos_for_selection(&state, &sel, day), Vec::new())
     };
-    let is_empty = main_rows.is_empty() && evening_rows.is_empty();
+    let is_empty = main_rows.is_empty() && evening_rows.is_empty() && upcoming_groups.is_empty();
 
     rsx! {
         div {
@@ -957,7 +998,19 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
             for todo in main_rows {
                 // Cloned because the generated key borrows `todo.id` after the
                 // prop takes ownership.
-                TodoRow { key: "{todo.id}", todo: todo.clone(), selection: sel.clone() }
+                TodoRow { key: "{todo.id}", todo: todo.clone(), selection }
+            }
+            for (date, rows) in upcoming_groups {
+                div {
+                    key: "day-{date}",
+                    h2 {
+                        class: "px-2 pt-5 pb-1 text-sm font-medium text-fg-muted",
+                        "{views::friendly_date(date, day)}"
+                    }
+                    for todo in rows {
+                        TodoRow { key: "{todo.id}", todo: todo.clone(), selection }
+                    }
+                }
             }
             if !evening_rows.is_empty() {
                 h2 {
@@ -965,7 +1018,7 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
                     "This Evening"
                 }
                 for todo in evening_rows {
-                    TodoRow { key: "{todo.id}", todo: todo.clone(), selection: sel.clone() }
+                    TodoRow { key: "{todo.id}", todo: todo.clone(), selection }
                 }
             }
         }
@@ -973,7 +1026,7 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
 }
 
 #[component]
-fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
+fn TodoRow(todo: Todo, mut selection: Signal<PlannerSelection>) -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let settings = use_context::<Signal<Settings>>();
     let mut chat_command =
@@ -983,38 +1036,38 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
     // U1.5: first click arms, second click deletes; leaving the row disarms.
     let mut delete_armed = use_signal(|| false);
     let mut detail_open = use_context::<crate::components::todo_detail::TodoDetailContext>().0;
+    let mut selected_block = use_context::<SelectedBlockContext>().0;
 
+    let sel = selection.read().clone();
     let id = todo.id.clone();
     let day = today();
     let is_done = todo.status.is_closed();
     let in_focus = todo.status == TodoStatus::InProgress;
     let is_overdue = todo.is_overdue(day);
 
-    let in_logbook = selection == PlannerSelection::View(TodoView::Logbook);
-    // Views whose membership doesn't already answer "when?" show the
-    // scheduled date on each row: Upcoming spans arbitrary future days and a
-    // project mixes scheduled with unscheduled work.
-    let show_scheduled = matches!(
-        selection,
-        PlannerSelection::View(TodoView::Upcoming) | PlannerSelection::Project(_)
-    );
+    let in_logbook = sel == PlannerSelection::View(TodoView::Logbook);
+    // A project mixes scheduled with unscheduled work, so its rows answer
+    // "when?" inline. Upcoming no longer needs the chip: its day headers
+    // (U3.3) already say the date, and repeating it per row is noise.
+    let show_scheduled = matches!(sel, PlannerSelection::Project(_));
 
     // The hover cluster never offers the state the row is already in.
     // "Today" stays visible for an Evening row scheduled today — there it
     // means "back to the daytime list", not a no-op.
-    let offer_today = !(selection == PlannerSelection::View(TodoView::Today)
+    let offer_today = !(sel == PlannerSelection::View(TodoView::Today)
         && todo.scheduled_for == Some(day)
         && todo.time_of_day.is_none());
     let offer_tomorrow = todo.scheduled_for != day.succ_opt();
     let offer_evening =
         !(todo.time_of_day == Some(TimeOfDay::Evening) && todo.scheduled_for.is_some());
     let offer_clear_date = todo.scheduled_for.is_some() || todo.time_of_day.is_some();
-    let offer_someday = selection != PlannerSelection::View(TodoView::Someday);
+    let offer_someday = sel != PlannerSelection::View(TodoView::Someday);
 
     // The row mirrors the timeline: if this todo is timeboxed on its
-    // scheduled day, its start time appears as a chip. Scheduling metadata
+    // scheduled day, its start time appears as a chip (with the block id so
+    // clicking the chip can highlight it on arrival). Scheduling metadata
     // must be legible from every visual state, not just the ruler.
-    let block_time: Option<String> = todo.scheduled_for.and_then(|d| {
+    let block_info: Option<(String, String)> = todo.scheduled_for.and_then(|d| {
         let state = planner.read();
         state
             .blocks
@@ -1023,9 +1076,13 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
                 b.todo_id.as_deref() == Some(todo.id.as_str())
                     && b.start.with_timezone(&Local).date_naive() == d
             })
-            .map(|b| b.start)
-            .min()
-            .map(|start| start.with_timezone(&Local).format("%H:%M").to_string())
+            .min_by_key(|b| b.start)
+            .map(|b| {
+                (
+                    b.start.with_timezone(&Local).format("%H:%M").to_string(),
+                    b.id.clone(),
+                )
+            })
     });
 
     let commit_title = {
@@ -1110,7 +1167,7 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
 
     let completed_line = in_logbook.then(|| {
         todo.completed_at
-            .map(|d| d.with_timezone(&Local).format("%-d %b %Y").to_string())
+            .map(|d| views::friendly_date(d.with_timezone(&Local).date_naive(), day))
             .unwrap_or_default()
     });
     // U2.2: the logbook surfaces estimate accuracy — "52m of 1h", or just the
@@ -1203,15 +1260,22 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
                     span {
                         class: "shrink-0 flex items-center gap-1 rounded-full border border-subtle px-2 py-0.5 text-xs text-fg-muted",
                         Icon { width: 10, height: 10, icon: fi_icons::FiCalendar }
-                        "{scheduled_label(d, day)}"
+                        "{views::friendly_date(d, day)}"
                     }
                 }
             }
             if !in_logbook {
-                if let Some(t) = block_time {
-                    span {
-                        class: "shrink-0 rounded-full bg-primary-700/50 border border-subtle px-2 py-0.5 text-xs text-fg",
-                        title: "On the timeline",
+                if let Some((t, block_id)) = block_info {
+                    // A live affordance, not a dead label: the chip jumps to
+                    // Today with its block selected, so "@ 09:00" is always
+                    // one click from the timebox it names.
+                    button {
+                        class: "shrink-0 rounded-full bg-primary-700/50 border border-subtle px-2 py-0.5 text-xs text-fg hover:bg-primary-700",
+                        title: "On the timeline — click to show it in Today",
+                        onclick: move |_| {
+                            selected_block.set(Some(block_id.clone()));
+                            selection.set(PlannerSelection::View(TodoView::Today));
+                        },
                         "@ {t}"
                     }
                 }
@@ -1239,7 +1303,7 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
                     } else {
                         "shrink-0 rounded-full border border-subtle px-2 py-0.5 text-xs text-fg-muted"
                     },
-                    "due {deadline.format(\"%-d %b\")}"
+                    "due {views::friendly_date(deadline, day)}"
                 }
             }
             for tag in todo.tags.iter() {
@@ -1248,20 +1312,22 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
                     "#{tag}"
                 }
             }
-            // Hover schedule menu
-            if !in_logbook {
-                div {
-                    class: "hidden shrink-0 items-center gap-1 group-hover:flex",
-                    // Detail card (U2.1): the full editor for this todo.
-                    button {
-                        class: "rounded p-1 text-fg-muted hover:bg-input hover:text-fg",
-                        title: "Details",
-                        onclick: {
-                            let id = id.clone();
-                            move |_| detail_open.set(Some(id.clone()))
-                        },
-                        Icon { width: 14, height: 14, icon: fi_icons::FiInfo }
-                    }
+            // Hover cluster. Logbook rows get a reduced one (U3.5): Details
+            // and Delete only — closed work can be inspected and pruned, but
+            // scheduling or focusing it would mean reopening it first.
+            div {
+                class: "hidden shrink-0 items-center gap-1 group-hover:flex",
+                // Detail card (U2.1): the full editor for this todo.
+                button {
+                    class: "rounded p-1 text-fg-muted hover:bg-input hover:text-fg",
+                    title: "Details",
+                    onclick: {
+                        let id = id.clone();
+                        move |_| detail_open.set(Some(id.clone()))
+                    },
+                    Icon { width: 14, height: 14, icon: fi_icons::FiInfo }
+                }
+                if !in_logbook {
                     // Start / stop focus on this todo.
                     button {
                         class: "rounded p-1 text-primary-300 hover:bg-input hover:text-primary-200",
@@ -1389,7 +1455,8 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
                             "Someday"
                         }
                     }
-                    if *delete_armed.read() {
+                }
+                if *delete_armed.read() {
                         button {
                             class: "rounded border border-red-700 bg-red-900/30 px-1.5 py-0.5 text-xs font-medium text-red-400 hover:bg-input",
                             title: "Click again to delete",
@@ -1403,7 +1470,6 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
                             onclick: delete,
                             Icon { width: 14, height: 14, icon: fi_icons::FiTrash2 }
                         }
-                    }
                 }
             }
         }
@@ -1456,7 +1522,7 @@ fn CapacityBar(planned: u32, done: u32, capacity: u32, summary: String) -> Eleme
 fn TodayRail() -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let settings = use_context::<Signal<Settings>>();
-    let mut selected_block = use_signal(|| Option::<String>::None);
+    let mut selected_block = use_context::<SelectedBlockContext>().0;
 
     let day = today();
     let settings_read = settings.read();
@@ -2113,13 +2179,8 @@ mod tests {
         assert!(seed.ends_with("Details: "), "caret parks after the prompt");
     }
 
-    #[test]
-    fn scheduled_labels_read_naturally() {
-        let today: NaiveDate = "2026-08-13".parse().unwrap();
-        assert_eq!(scheduled_label(today, today), "Today");
-        assert_eq!(scheduled_label("2026-08-14".parse().unwrap(), today), "Tomorrow");
-        assert_eq!(scheduled_label("2026-08-21".parse().unwrap(), today), "Fri 21 Aug");
-    }
+    // Date labels are covered by views::friendly_date's tests (U3.6): one
+    // formatter, one test home.
 
     #[test]
     fn snap_to_quarter_rounds_down() {
@@ -2151,9 +2212,23 @@ mod tests {
         assert_eq!(cycle_estimate(Some(15)), Some(30));
         assert_eq!(cycle_estimate(Some(30)), Some(60));
         assert_eq!(cycle_estimate(Some(60)), Some(120));
+        // Only an exact 2h cycles to none.
         assert_eq!(cycle_estimate(Some(120)), None);
-        // An off-ladder estimate (e.g. AI-set 45m) cycles back to none.
-        assert_eq!(cycle_estimate(Some(45)), None);
+    }
+
+    #[test]
+    fn cycle_estimate_snaps_off_ladder_values_to_the_nearest_step() {
+        // 45 is equidistant from 30 and 60 — ties round up.
+        assert_eq!(cycle_estimate(Some(45)), Some(60));
+        // 90 is equidistant from 60 and 120 — same rule.
+        assert_eq!(cycle_estimate(Some(90)), Some(120));
+        // Plain nearest when there's no tie.
+        assert_eq!(cycle_estimate(Some(20)), Some(15));
+        assert_eq!(cycle_estimate(Some(50)), Some(60));
+        // Past the top of the ladder snaps back to 2h, never to none.
+        assert_eq!(cycle_estimate(Some(300)), Some(120));
+        // ...and the next click continues the ladder normally.
+        assert_eq!(cycle_estimate(cycle_estimate(Some(45))), Some(120));
     }
 
     #[test]

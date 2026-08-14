@@ -944,6 +944,7 @@ pub fn SettingsPanel() -> Element {
                                         p { "#tag                  tag (repeatable)" }
                                         p { "@2pm  @14:30  @9      place on today's timeline" }
                                         p { "@morning  @evening    time-of-day group" }
+                                        p { "*mon  *tomorrow       scheduled day" }
                                         p { "!fri  !tomorrow       deadline" }
                                     }
                                 }

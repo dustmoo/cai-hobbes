@@ -11,6 +11,7 @@
 //! | `#tag`                | tag (repeatable) |
 //! | `@2pm` `@14:30` `@9`  | place on the timeline at that local time |
 //! | `@morning` `@afternoon` `@evening` | time of day group |
+//! | `*fri` `*tomorrow` `*today` | scheduled day (same day words as `!`) |
 //! | `!fri` `!tomorrow` `!today` | deadline (weekday = next occurrence, today counts) |
 //!
 //! Shared by the quick-add input; the AI goes through its structured tools and
@@ -26,6 +27,8 @@ pub struct QuickAddParse {
     pub estimate_minutes: Option<u32>,
     pub tags: Vec<String>,
     pub deadline: Option<NaiveDate>,
+    /// Scheduled day (`*fri`): overrides the view-context default date.
+    pub scheduled: Option<NaiveDate>,
     pub time_of_day: Option<TimeOfDay>,
     /// Local minutes since midnight where the todo should be time-blocked.
     pub block_start: Option<u32>,
@@ -37,6 +40,7 @@ impl QuickAddParse {
         self.estimate_minutes.is_some()
             || !self.tags.is_empty()
             || self.deadline.is_some()
+            || self.scheduled.is_some()
             || self.time_of_day.is_some()
             || self.block_start.is_some()
     }
@@ -82,6 +86,15 @@ pub fn parse_quick_add(input: &str, today: NaiveDate) -> QuickAddParse {
             ("!", rest) => match parse_day_word(rest, today) {
                 Some(d) => {
                     out.deadline = Some(d);
+                    true
+                }
+                None => false,
+            },
+            // Same day-word grammar as `!`, but for the *scheduled* day —
+            // mirroring the deadline token so Upcoming stops misleading.
+            ("*", rest) => match parse_day_word(rest, today) {
+                Some(d) => {
+                    out.scheduled = Some(d);
                     true
                 }
                 None => false,
@@ -295,11 +308,34 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_token_resolves_day_words_like_the_deadline_token() {
+        // Today is Wednesday.
+        assert_eq!(parse_quick_add("x *fri", today()).scheduled, Some(date("2026-08-14")));
+        assert_eq!(parse_quick_add("x *tomorrow", today()).scheduled, Some(date("2026-08-13")));
+        assert_eq!(parse_quick_add("x *today", today()).scheduled, Some(date("2026-08-12")));
+        // Scheduled and deadline are independent axes.
+        let p = parse_quick_add("x *mon !fri", today());
+        assert_eq!(p.scheduled, Some(date("2026-08-17")));
+        assert_eq!(p.deadline, Some(date("2026-08-14")));
+        assert!(p.has_tokens());
+    }
+
+    #[test]
+    fn scheduled_token_composes_with_a_clock() {
+        // The submit path anchors the @clock block on the *day.
+        let p = parse_quick_add("standup @9 *mon", today());
+        assert_eq!(p.title, "standup");
+        assert_eq!(p.block_start, Some(9 * 60));
+        assert_eq!(p.scheduled, Some(date("2026-08-17")));
+    }
+
+    #[test]
     fn unrecognised_tokens_stay_in_the_title() {
-        let p = parse_quick_add("email @john about #q3 !soon ~later", today());
-        assert_eq!(p.title, "email @john about !soon ~later");
+        let p = parse_quick_add("email @john about #q3 !soon *soon ~later", today());
+        assert_eq!(p.title, "email @john about !soon *soon ~later");
         assert_eq!(p.tags, vec!["q3"]);
         assert_eq!(p.deadline, None);
+        assert_eq!(p.scheduled, None);
         assert_eq!(p.estimate_minutes, None);
         assert_eq!(p.block_start, None);
     }

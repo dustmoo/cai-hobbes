@@ -641,7 +641,16 @@ pub fn handle_todo_list(
             },
             None => TodoView::Today,
         };
-        let matches = views::in_view(&state.todos, view, today);
+        // Upcoming flattens the same grouped query the UI's day headers use —
+        // date ascending, then sort order — so the two surfaces can't drift.
+        let matches: Vec<&Todo> = if view == TodoView::Upcoming {
+            views::upcoming_grouped(&state.todos, today)
+                .into_iter()
+                .flat_map(|(_, ts)| ts)
+                .collect()
+        } else {
+            views::in_view(&state.todos, view, today)
+        };
         (
             format!("{} — {} todo(s)", view.as_str(), matches.len()),
             matches,
@@ -2014,6 +2023,28 @@ mod tests {
             assert_eq!(status, ToolCallStatus::Completed, "view {view}");
             assert!(resp.contains(expect), "view {view} should list '{expect}': {resp}");
         }
+    }
+
+    #[test]
+    fn list_upcoming_orders_by_date_then_sort() {
+        // today() is 2026-08-12; creation order deliberately scrambles dates.
+        let mut state = PlannerState::default();
+        create(
+            &mut state,
+            json!({"todos": [
+                {"title": "late month", "scheduled_for": "2026-08-25"},
+                {"title": "tomorrow item", "scheduled_for": "2026-08-13"},
+                {"title": "late month too", "scheduled_for": "2026-08-25"}
+            ]}),
+        );
+        let (status, resp) = list(&state, json!({"view": "upcoming"}));
+        assert_eq!(status, ToolCallStatus::Completed);
+        let pos = |needle: &str| resp.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        assert!(pos("tomorrow item") < pos("late month"), "dates ascend: {resp}");
+        assert!(
+            pos("late month") < pos("late month too"),
+            "within a date, creation/sort order holds: {resp}"
+        );
     }
 
     #[test]

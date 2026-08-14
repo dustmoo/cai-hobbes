@@ -5,7 +5,7 @@
 //! human effort), so filtering here rather than in SQL keeps one definition of
 //! each view for both the UI and the AI's `HOBBES_TODO_LIST`.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::model::{TimeOfDay, Todo, TodoBucket};
@@ -114,6 +114,38 @@ pub fn completed_today(todos: &[Todo], today: NaiveDate) -> Vec<&Todo> {
         .collect();
     out.sort_by_key(|t| t.completed_at);
     out
+}
+
+/// The one date formatter (U3.6): every user-facing date — scheduled chips,
+/// deadline chips, logbook completion lines, the detail card — goes through
+/// here so "the same day" never reads two different ways. "Today" /
+/// "Tomorrow", otherwise "Fri 15 Aug", with the year appended only when it
+/// differs from today's.
+pub fn friendly_date(d: NaiveDate, today: NaiveDate) -> String {
+    if d == today {
+        "Today".to_string()
+    } else if Some(d) == today.succ_opt() {
+        "Tomorrow".to_string()
+    } else if d.year() == today.year() {
+        d.format("%a %-d %b").to_string()
+    } else {
+        d.format("%a %-d %b %Y").to_string()
+    }
+}
+
+/// Upcoming grouped by scheduled date, dates ascending, within each date in
+/// `in_view`'s order (sort_order, then created_at). Shared by the UI's day
+/// headers and (flattened) by `HOBBES_TODO_LIST`'s "upcoming" view so the two
+/// surfaces can't drift.
+pub fn upcoming_grouped(todos: &[Todo], today: NaiveDate) -> Vec<(NaiveDate, Vec<&Todo>)> {
+    // in_view already applies the comparator; a stable grouping keeps it.
+    let mut by_date: std::collections::BTreeMap<NaiveDate, Vec<&Todo>> =
+        std::collections::BTreeMap::new();
+    for t in in_view(todos, TodoView::Upcoming, today) {
+        let Some(d) = t.scheduled_for else { continue };
+        by_date.entry(d).or_default().push(t);
+    }
+    by_date.into_iter().collect()
 }
 
 /// Today split into the main list and Things' "This Evening" group.
@@ -356,6 +388,49 @@ mod tests {
 
         let todos = vec![b, fine, a];
         assert_eq!(titles(overdue(&todos, today)), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn friendly_date_reads_naturally_and_shows_foreign_years() {
+        let today = date("2026-08-13");
+        assert_eq!(friendly_date(today, today), "Today");
+        assert_eq!(friendly_date(date("2026-08-14"), today), "Tomorrow");
+        assert_eq!(friendly_date(date("2026-08-21"), today), "Fri 21 Aug");
+        // Same-year past dates stay short; a different year must say so.
+        assert_eq!(friendly_date(date("2026-01-05"), today), "Mon 5 Jan");
+        assert_eq!(friendly_date(date("2027-01-04"), today), "Mon 4 Jan 2027");
+        assert_eq!(friendly_date(date("2025-12-31"), today), "Wed 31 Dec 2025");
+    }
+
+    #[test]
+    fn upcoming_grouped_orders_dates_then_rows() {
+        let today = date("2026-08-12");
+        let mut far_first = todo("far first", TodoBucket::Anytime, Some("2026-08-20"));
+        far_first.sort_order = 1.0;
+        let mut far_second = todo("far second", TodoBucket::Anytime, Some("2026-08-20"));
+        far_second.sort_order = 2.0;
+        let near = todo("near", TodoBucket::Anytime, Some("2026-08-13"));
+        // Listed out of order on purpose: grouping must sort, not preserve.
+        let todos = vec![far_second.clone(), near.clone(), far_first.clone()];
+
+        let grouped = upcoming_grouped(&todos, today);
+        assert_eq!(
+            grouped
+                .iter()
+                .map(|(d, ts)| (*d, titles(ts.clone())))
+                .collect::<Vec<_>>(),
+            vec![
+                (date("2026-08-13"), vec!["near".to_string()]),
+                (
+                    date("2026-08-20"),
+                    vec!["far first".to_string(), "far second".to_string()]
+                ),
+            ]
+        );
+
+        // Today and past days never leak in — Upcoming is strictly future.
+        let only_today = [todo("now", TodoBucket::Anytime, Some("2026-08-12"))];
+        assert!(upcoming_grouped(&only_today, today).is_empty());
     }
 
     #[test]

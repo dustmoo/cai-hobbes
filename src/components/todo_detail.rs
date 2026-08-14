@@ -14,6 +14,7 @@ use dioxus_free_icons::{icons::fi_icons, Icon};
 use crate::components::planner_view::{mutate_todo, persist_block};
 use crate::todo::model::{self, ChecklistItem, TimeOfDay, TodoOrigin, TodoStatus};
 use crate::todo::store;
+use crate::todo::views;
 use crate::todo::PlannerState;
 
 /// Which todo's detail card is open. Provided at the PlannerView root,
@@ -210,9 +211,11 @@ fn DetailCardInner(todo_id: String) -> Element {
         TodoStatus::Completed => "Completed",
         TodoStatus::Cancelled => "Cancelled",
     };
+    // One date formatter across the planner (U3.6).
+    let today = Local::now().date_naive();
     let completed_label = todo.status.is_closed().then(|| {
         todo.completed_at
-            .map(|d| d.with_timezone(&Local).format("%-d %b %Y").to_string())
+            .map(|d| views::friendly_date(d.with_timezone(&Local).date_naive(), today))
             .unwrap_or_default()
     });
     let scheduled_value = todo.scheduled_for.map(|d| d.to_string()).unwrap_or_default();
@@ -223,7 +226,8 @@ fn DetailCardInner(todo_id: String) -> Element {
             format!("AI · session {}", session_id.chars().take(8).collect::<String>())
         }
     };
-    let created_label = todo.created_at.with_timezone(&Local).format("%-d %b %Y").to_string();
+    let created_label =
+        views::friendly_date(todo.created_at.with_timezone(&Local).date_naive(), today);
 
     let label_class = "pb-1 text-xs font-medium text-fg-muted";
     let input_class = "w-full rounded border border-subtle bg-input px-2 py-1.5 text-sm text-fg placeholder:text-fg-muted focus:outline-none focus:border-faint";
