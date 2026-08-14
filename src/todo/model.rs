@@ -356,11 +356,16 @@ impl DayPlan {
 /// The result of measuring a day's planned work against its capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capacity {
+    /// The day's total: open work still owed PLUS work already finished.
+    /// Counting only open todos makes a fully executed day read "0m planned"
+    /// — finishing work must never shrink the plan.
     pub planned_minutes: u32,
+    /// The finished share of `planned_minutes`: todos completed on this day.
+    pub done_minutes: u32,
     pub capacity_minutes: u32,
-    /// Todos scheduled for the day with no estimate — they make `planned`
-    /// an undercount, so the UI and the AI should say so rather than imply
-    /// the day fits.
+    /// Open todos scheduled for the day with no estimate — they make
+    /// `planned` an undercount, so the UI and the AI should say so rather
+    /// than imply the day fits.
     pub unestimated: usize,
 }
 
@@ -379,16 +384,16 @@ impl Capacity {
 
     /// Human summary for tool responses and the capacity bar's tooltip.
     pub fn summary(&self) -> String {
-        let base = format!(
-            "{} planned of {} capacity",
-            format_minutes(self.planned_minutes),
-            format_minutes(self.capacity_minutes)
-        );
-        let mut out = if self.is_overcommitted() {
-            format!("{} — over by {}", base, format_minutes(self.over_by()))
+        let mut out = format!("{} planned", format_minutes(self.planned_minutes));
+        // Zero-state stays clean: an untouched day shouldn't advertise "0m done".
+        if self.done_minutes > 0 {
+            out.push_str(&format!(" · {} done", format_minutes(self.done_minutes)));
+        }
+        if self.is_overcommitted() {
+            out.push_str(&format!(" — over by {}", format_minutes(self.over_by())));
         } else {
-            format!("{} — {} free", base, format_minutes(self.remaining()))
-        };
+            out.push_str(&format!(" · {} free", format_minutes(self.remaining())));
+        }
         if self.unestimated > 0 {
             out.push_str(&format!(
                 " ({} unestimated, so the real total is higher)",
@@ -399,23 +404,37 @@ impl Capacity {
     }
 }
 
-/// Measure the open todos scheduled for a day against its capacity.
+/// Measure the todos scheduled for a day against its capacity.
+///
+/// `date` is a **local** calendar day (planner days are user-local
+/// everywhere). Open todos contribute their estimates; todos completed on
+/// that local day contribute `max(estimate, actual_minutes)` — the actual
+/// wins when the work overran, and unestimated finished work still counts
+/// for the time it took.
 pub fn measure_capacity(todos: &[Todo], date: NaiveDate, capacity_minutes: u32) -> Capacity {
-    let scheduled = todos
-        .iter()
-        .filter(|t| t.scheduled_for == Some(date) && !t.status.is_closed());
-
-    let mut planned = 0u32;
+    let mut open = 0u32;
+    let mut done = 0u32;
     let mut unestimated = 0usize;
-    for todo in scheduled {
-        match todo.estimate_minutes {
-            Some(m) => planned = planned.saturating_add(m),
-            None => unestimated += 1,
+    for todo in todos.iter().filter(|t| t.scheduled_for == Some(date)) {
+        if todo.status.is_closed() {
+            let completed_on_day = todo
+                .completed_at
+                .is_some_and(|c| c.with_timezone(&chrono::Local).date_naive() == date);
+            if completed_on_day {
+                let spent = todo.estimate_minutes.unwrap_or(0).max(todo.actual_minutes);
+                done = done.saturating_add(spent);
+            }
+        } else {
+            match todo.estimate_minutes {
+                Some(m) => open = open.saturating_add(m),
+                None => unestimated += 1,
+            }
         }
     }
 
     Capacity {
-        planned_minutes: planned,
+        planned_minutes: open.saturating_add(done),
+        done_minutes: done,
         capacity_minutes,
         unestimated,
     }
@@ -522,27 +541,68 @@ mod tests {
         assert!(!t.is_overdue(today));
     }
 
+    /// A UTC instant whose *local* date is `date`, matching how completion
+    /// stamps are compared. Keeps these tests independent of the machine's
+    /// timezone.
+    fn local_noon(date: NaiveDate) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        chrono::Local
+            .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     #[test]
-    fn capacity_counts_only_open_todos_scheduled_that_day() {
+    fn capacity_counts_open_and_done_work_scheduled_that_day() {
         let today = date("2026-08-12");
         let other = date("2026-08-13");
         let mut done = todo_with(Some(60), Some(today));
-        done.mark_completed(Utc::now());
+        done.mark_completed(local_noon(today));
 
         let todos = vec![
             todo_with(Some(45), Some(today)),
             todo_with(Some(30), Some(today)),
             todo_with(Some(600), Some(other)), // different day
             todo_with(None, Some(today)),      // unestimated
-            done,                              // already finished
+            done,                              // finished today — still planned work
             todo_with(Some(90), None),         // unscheduled
         ];
 
         let cap = measure_capacity(&todos, today, 360);
-        assert_eq!(cap.planned_minutes, 75);
+        assert_eq!(
+            cap.planned_minutes, 135,
+            "finishing work must not shrink the plan: open (75) + done (60)"
+        );
+        assert_eq!(cap.done_minutes, 60);
         assert_eq!(cap.unestimated, 1);
-        assert_eq!(cap.remaining(), 285);
+        assert_eq!(cap.remaining(), 225);
         assert!(!cap.is_overcommitted());
+        assert_eq!(cap.summary(), "2h 15m planned · 1h done · 3h 45m free (1 unestimated, so the real total is higher)");
+    }
+
+    #[test]
+    fn capacity_done_uses_the_larger_of_estimate_and_actual() {
+        let today = date("2026-08-12");
+        let yesterday = date("2026-08-11");
+
+        // Overran its estimate: the actual wins.
+        let mut overran = todo_with(Some(30), Some(today));
+        overran.actual_minutes = 50;
+        overran.mark_completed(local_noon(today));
+        // No estimate: the actual is all we know.
+        let mut unestimated_done = todo_with(None, Some(today));
+        unestimated_done.actual_minutes = 20;
+        unestimated_done.mark_completed(local_noon(today));
+        // Completed on a *different* local day than it was scheduled: it
+        // wasn't this day's work, so it contributes nothing here.
+        let mut stale = todo_with(Some(90), Some(today));
+        stale.mark_completed(local_noon(yesterday));
+
+        let cap = measure_capacity(&[overran, unestimated_done, stale], today, 360);
+        assert_eq!(cap.done_minutes, 70);
+        assert_eq!(cap.planned_minutes, 70);
+        assert_eq!(cap.unestimated, 0, "unestimated counts OPEN todos only");
     }
 
     #[test]
@@ -554,7 +614,7 @@ mod tests {
         assert!(cap.is_overcommitted());
         assert_eq!(cap.over_by(), 40);
         assert_eq!(cap.remaining(), 0);
-        assert!(cap.summary().contains("over by 40m"));
+        assert_eq!(cap.summary(), "6h 40m planned — over by 40m");
     }
 
     #[test]

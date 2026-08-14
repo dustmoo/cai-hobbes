@@ -97,6 +97,25 @@ pub fn in_view(todos: &[Todo], view: TodoView, today: NaiveDate) -> Vec<&Todo> {
     out
 }
 
+/// Todos finished (or abandoned) on the local day `today`, oldest first.
+///
+/// A deliberately separate query from `matches_view(Today)`: Today means
+/// "open work owed" — the AI's list tool and the rollover both depend on
+/// that — while this feeds the UI's struck-through "done today" rows so
+/// checking a todo off doesn't delete it from sight.
+pub fn completed_today(todos: &[Todo], today: NaiveDate) -> Vec<&Todo> {
+    let mut out: Vec<&Todo> = todos
+        .iter()
+        .filter(|t| {
+            t.status.is_closed()
+                && t.completed_at
+                    .is_some_and(|c| c.with_timezone(&chrono::Local).date_naive() == today)
+        })
+        .collect();
+    out.sort_by_key(|t| t.completed_at);
+    out
+}
+
 /// Today split into the main list and Things' "This Evening" group.
 pub struct TodaySections<'a> {
     pub daytime: Vec<&'a Todo>,
@@ -239,6 +258,47 @@ mod tests {
         let sections = today_sections(&todos, today);
         assert_eq!(titles(sections.daytime), vec!["work"]);
         assert_eq!(titles(sections.evening), vec!["read the spec"]);
+    }
+
+    /// A UTC instant on the *local* day `d`, the way completion stamps are
+    /// compared. Keeps these tests independent of the machine's timezone.
+    fn local_instant(d: NaiveDate, hour: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        chrono::Local
+            .from_local_datetime(&d.and_hms_opt(hour, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn completed_today_holds_the_day_s_closures_oldest_first() {
+        let today = date("2026-08-12");
+        let yesterday = date("2026-08-11");
+
+        let mut evening = todo("evening", TodoBucket::Anytime, Some("2026-08-12"));
+        evening.mark_completed(local_instant(today, 18));
+        let mut morning = todo("morning", TodoBucket::Anytime, None);
+        morning.mark_completed(local_instant(today, 9));
+        // Cancelled still counts: it was decided today, and the row should
+        // stay visible for the undo moment either way.
+        let mut dropped = todo("dropped", TodoBucket::Anytime, Some("2026-08-12"));
+        dropped.status = TodoStatus::Cancelled;
+        dropped.completed_at = Some(local_instant(today, 12));
+        let mut stale = todo("stale", TodoBucket::Anytime, Some("2026-08-12"));
+        stale.mark_completed(local_instant(yesterday, 15));
+        let open = todo("open", TodoBucket::Anytime, Some("2026-08-12"));
+
+        let todos = vec![evening, morning, dropped, stale, open];
+        assert_eq!(
+            titles(completed_today(&todos, today)),
+            vec!["morning", "dropped", "evening"],
+            "yesterday's completions and open work don't belong here"
+        );
+
+        // The open-work views are untouched: completed rows never leak into
+        // the AI's "today" list.
+        assert_eq!(titles(in_view(&todos, TodoView::Today, today)), vec!["open"]);
     }
 
     #[test]

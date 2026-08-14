@@ -306,16 +306,41 @@ pub fn handle_todo_update(
                 // the store write.
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
                     if wants_focus {
+                        let scheduled_before = state.todo(id).and_then(|t| t.scheduled_for);
                         // Single-focus: starting this one pauses any other.
-                        for changed in state.start_focus(id, now) {
+                        // Focus also implies today (see start_focus), so the
+                        // pruned off-day blocks need their store rows deleted.
+                        let (changed, pruned) = state.start_focus(id, now);
+                        for changed in changed {
                             if let Some(t) = state.todo(&changed) {
                                 persist_todo(t, persist);
                             }
                         }
+                        if persist {
+                            for b in &pruned {
+                                if let Err(e) = store::delete_block(&b.id) {
+                                    tracing::error!(
+                                        "Failed to delete stale block {}: {}",
+                                        b.id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        pruned_blocks += pruned.len();
                         // Re-summarise so the response shows ▶, not the
-                        // pre-focus state.
+                        // pre-focus state — and say so when focus pulled the
+                        // todo onto today, so the model knows the date moved.
                         if let Some(t) = state.todo(id) {
                             summary = t.summary();
+                            if t.scheduled_for != scheduled_before {
+                                if let Some(d) = t.scheduled_for {
+                                    summary.push_str(&format!(
+                                        "\nScheduled '{}' onto {}.",
+                                        t.title, d
+                                    ));
+                                }
+                            }
                         }
                     }
                     if let Some(todo) = state.todo(id) {
@@ -1640,6 +1665,33 @@ mod tests {
     }
 
     #[test]
+    fn setting_in_progress_pulls_unscheduled_work_onto_today() {
+        let mut state = PlannerState::default();
+        let (_, _) = create(&mut state, json!({"todos": [{"title": "Surprise task"}]}));
+        let id = state.todos[0].id.clone();
+        assert_eq!(state.todos[0].scheduled_for, None);
+
+        let (status, out) = update(
+            &mut state,
+            json!({"updates": [{"id": id, "status": "in_progress"}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        // start_focus derives "today" from the real clock (focus is a live
+        // act), so assert against the actual local day, not the fixture date.
+        let real_today = chrono::Local::now().date_naive();
+        assert_eq!(
+            state.todo(&id).unwrap().scheduled_for,
+            Some(real_today),
+            "focus means working on it now, so it belongs on today's plan"
+        );
+        assert!(
+            out.contains("Scheduled 'Surprise task' onto"),
+            "the response must say the date moved: {}",
+            out
+        );
+    }
+
+    #[test]
     fn context_reports_the_focused_task() {
         let mut state = PlannerState::default();
         let id = seed_todo(&mut state, "Deep work", "today");
@@ -2060,8 +2112,9 @@ mod tests {
             ]}),
         );
         assert_eq!(status, ToolCallStatus::Completed, "{resp}");
-        assert!(resp.contains("3h 15m planned of 6h capacity"), "{resp}");
+        assert!(resp.contains("3h 15m planned"), "{resp}");
         assert!(resp.contains("2h 45m free"), "{resp}");
+        assert!(!resp.contains("done"), "a freshly planned day has no done segment: {resp}");
 
         for t in &state.todos {
             assert_eq!(t.scheduled_for, Some(today()));
@@ -2367,7 +2420,7 @@ mod tests {
         );
         let ctx = planner_today_context(&state, &ctx_settings(true, true), today()).unwrap();
         assert_eq!(ctx["date"], TODAY);
-        assert_eq!(ctx["capacity"], "3h 25m planned of 6h capacity — 2h 35m free");
+        assert_eq!(ctx["capacity"], "3h 25m planned · 2h 35m free");
         let todos = ctx["todos"].as_array().unwrap();
         assert_eq!(todos.len(), 1);
         assert!(todos[0].as_str().unwrap().contains("planned"));

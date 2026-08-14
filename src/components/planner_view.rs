@@ -119,6 +119,29 @@ fn block_geometry(
     Some((top, height))
 }
 
+/// Which side of the workday window a fully-off-window block sits on.
+///
+/// The exact complement of [`block_geometry`]'s culling rule: every block on
+/// the day is either drawn on the ruler or classified here for the off-window
+/// strip — the store must never hold a block the Today rail doesn't show.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum OffWindow {
+    /// Ends at or before the workday starts.
+    Early,
+    /// Starts at or after the workday ends.
+    After,
+}
+
+fn off_window(start_min: i64, end_min: i64, day_start: u32, day_end: u32) -> Option<OffWindow> {
+    if end_min <= day_start as i64 {
+        Some(OffWindow::Early)
+    } else if start_min >= day_end as i64 {
+        Some(OffWindow::After)
+    } else {
+        None
+    }
+}
+
 /// Round down to the nearest quarter hour, so clicked blocks land on tidy edges.
 fn snap_to_quarter(minutes: u32) -> u32 {
     minutes - minutes % 15
@@ -886,22 +909,33 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
     let day = today();
     let state = planner.read();
 
-    let in_logbook = sel == PlannerSelection::View(TodoView::Logbook);
     let is_today = sel == PlannerSelection::View(TodoView::Today);
-    // Views whose membership doesn't already answer "when?" show the
-    // scheduled date on each row: Upcoming spans arbitrary future days and a
-    // project mixes scheduled with unscheduled work.
-    let show_scheduled = matches!(
-        sel,
-        PlannerSelection::View(TodoView::Upcoming) | PlannerSelection::Project(_)
-    );
 
-    // Today gets its "This Evening" split; every other selection is one flat list.
+    // Today gets its "This Evening" split; every other selection is one flat
+    // list. Completing a todo must keep its row visible for the rest of the
+    // day (struck through, reopenable in place), so Today appends the day's
+    // completions after the open rows in each section — a separate query from
+    // the view membership, which the AI's list tool needs to stay "open work
+    // owed".
     let (main_rows, evening_rows): (Vec<Todo>, Vec<Todo>) = if is_today {
         let sections = views::today_sections(&state.todos, day);
+        let (done_evening, done_daytime): (Vec<&Todo>, Vec<&Todo>) =
+            views::completed_today(&state.todos, day)
+                .into_iter()
+                .partition(|t| t.time_of_day == Some(TimeOfDay::Evening));
         (
-            sections.daytime.into_iter().cloned().collect(),
-            sections.evening.into_iter().cloned().collect(),
+            sections
+                .daytime
+                .into_iter()
+                .chain(done_daytime)
+                .cloned()
+                .collect(),
+            sections
+                .evening
+                .into_iter()
+                .chain(done_evening)
+                .cloned()
+                .collect(),
         )
     } else {
         (todos_for_selection(&state, &sel, day), Vec::new())
@@ -917,7 +951,7 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
             for todo in main_rows {
                 // Cloned because the generated key borrows `todo.id` after the
                 // prop takes ownership.
-                TodoRow { key: "{todo.id}", todo: todo.clone(), in_logbook, show_scheduled }
+                TodoRow { key: "{todo.id}", todo: todo.clone(), selection: sel.clone() }
             }
             if !evening_rows.is_empty() {
                 h2 {
@@ -925,7 +959,7 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
                     "This Evening"
                 }
                 for todo in evening_rows {
-                    TodoRow { key: "{todo.id}", todo: todo.clone(), in_logbook: false, show_scheduled: false }
+                    TodoRow { key: "{todo.id}", todo: todo.clone(), selection: sel.clone() }
                 }
             }
         }
@@ -933,18 +967,42 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
 }
 
 #[component]
-fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
+fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
+    let settings = use_context::<Signal<Settings>>();
     let mut chat_command =
         use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
     let mut editing = use_signal(|| false);
     let mut edit_buffer = use_signal(String::new);
+    // U1.5: first click arms, second click deletes; leaving the row disarms.
+    let mut delete_armed = use_signal(|| false);
 
     let id = todo.id.clone();
     let day = today();
     let is_done = todo.status.is_closed();
     let in_focus = todo.status == TodoStatus::InProgress;
     let is_overdue = todo.is_overdue(day);
+
+    let in_logbook = selection == PlannerSelection::View(TodoView::Logbook);
+    // Views whose membership doesn't already answer "when?" show the
+    // scheduled date on each row: Upcoming spans arbitrary future days and a
+    // project mixes scheduled with unscheduled work.
+    let show_scheduled = matches!(
+        selection,
+        PlannerSelection::View(TodoView::Upcoming) | PlannerSelection::Project(_)
+    );
+
+    // The hover cluster never offers the state the row is already in.
+    // "Today" stays visible for an Evening row scheduled today — there it
+    // means "back to the daytime list", not a no-op.
+    let offer_today = !(selection == PlannerSelection::View(TodoView::Today)
+        && todo.scheduled_for == Some(day)
+        && todo.time_of_day.is_none());
+    let offer_tomorrow = todo.scheduled_for != day.succ_opt();
+    let offer_evening =
+        !(todo.time_of_day == Some(TimeOfDay::Evening) && todo.scheduled_for.is_some());
+    let offer_clear_date = todo.scheduled_for.is_some() || todo.time_of_day.is_some();
+    let offer_someday = selection != PlannerSelection::View(TodoView::Someday);
 
     // The row mirrors the timeline: if this todo is timeboxed on its
     // scheduled day, its start time appears as a chip. Scheduling metadata
@@ -1014,6 +1072,12 @@ fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
     let delete = {
         let id = id.clone();
         move |_| {
+            // Honour confirm-on-delete without a modal: the first click only
+            // arms the button, the second (while still on the row) deletes.
+            if settings.peek().confirm_on_delete && !*delete_armed.peek() {
+                delete_armed.set(true);
+                return;
+            }
             // store::delete_todo cascades to the todo's block rows;
             // remove_todo mirrors that in memory.
             if let Err(e) = store::delete_todo(&id) {
@@ -1046,6 +1110,12 @@ fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
     rsx! {
         div {
             class: "group flex items-center gap-2 rounded px-2 py-1.5 hover:bg-section",
+            // A wandering pointer disarms the delete confirmation.
+            onmouseleave: move |_| {
+                if *delete_armed.peek() {
+                    delete_armed.set(false);
+                }
+            },
             // Checkbox — a pulsing play glyph while the todo is in focus.
             button {
                 class: if in_focus {
@@ -1175,9 +1245,21 @@ fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
                                         persist_todo(&planner, &id);
                                     }
                                 } else {
-                                    let changed = planner.write().start_focus(&id, now);
+                                    // Focus implies today: start_focus may
+                                    // reschedule the todo and prune off-day
+                                    // blocks, whose rows we must delete.
+                                    let (changed, pruned) =
+                                        planner.write().start_focus(&id, now);
                                     for cid in &changed {
                                         persist_todo(&planner, cid);
+                                    }
+                                    for b in &pruned {
+                                        if let Err(e) = store::delete_block(&b.id) {
+                                            tracing::error!(
+                                                "planner: failed to delete stale block {}: {}",
+                                                b.id, e
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1197,9 +1279,18 @@ fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
                             let todo = todo.clone();
                             let id = id.clone();
                             move |_| {
-                                let changed = planner.write().start_focus(&id, Utc::now());
+                                let (changed, pruned) =
+                                    planner.write().start_focus(&id, Utc::now());
                                 for cid in &changed {
                                     persist_todo(&planner, cid);
+                                }
+                                for b in &pruned {
+                                    if let Err(e) = store::delete_block(&b.id) {
+                                        tracing::error!(
+                                            "planner: failed to delete stale block {}: {}",
+                                            b.id, e
+                                        );
+                                    }
                                 }
                                 chat_command.set(Some(
                                     crate::components::chat_input::ChatCommand::StartTodoInChat(
@@ -1210,53 +1301,78 @@ fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
                         },
                         Icon { width: 14, height: 14, icon: fi_icons::FiMessageCircle }
                     }
-                    button {
-                        class: "rounded px-1.5 py-0.5 text-xs text-fg-muted hover:bg-input hover:text-fg",
-                        onclick: schedule(|t, day| {
-                            t.scheduled_for = Some(day);
-                            t.time_of_day = None;
-                        }),
-                        "Today"
+                    if offer_today {
+                        button {
+                            class: "rounded px-1.5 py-0.5 text-xs text-fg-muted hover:bg-input hover:text-fg",
+                            onclick: schedule(|t, day| {
+                                t.scheduled_for = Some(day);
+                                t.time_of_day = None;
+                            }),
+                            "Today"
+                        }
                     }
-                    button {
-                        class: "rounded px-1.5 py-0.5 text-xs text-fg-muted hover:bg-input hover:text-fg",
-                        onclick: schedule(|t, day| {
-                            t.scheduled_for = day.succ_opt();
-                            t.time_of_day = None;
-                        }),
-                        "Tomorrow"
+                    if offer_tomorrow {
+                        button {
+                            class: "rounded px-1.5 py-0.5 text-xs text-fg-muted hover:bg-input hover:text-fg",
+                            onclick: schedule(|t, day| {
+                                t.scheduled_for = day.succ_opt();
+                                t.time_of_day = None;
+                            }),
+                            "Tomorrow"
+                        }
                     }
-                    button {
-                        class: "rounded px-1.5 py-0.5 text-xs text-fg-muted hover:bg-input hover:text-fg",
-                        title: "Move to today's This Evening group",
-                        onclick: schedule(|t, day| {
-                            t.scheduled_for = Some(day);
-                            t.time_of_day = Some(TimeOfDay::Evening);
-                        }),
-                        "Evening"
+                    if offer_evening {
+                        button {
+                            class: "rounded px-1.5 py-0.5 text-xs text-fg-muted hover:bg-input hover:text-fg",
+                            title: "Move to the This Evening group",
+                            // Evening is a time-of-day, not a reschedule: a
+                            // dated todo keeps its day (yanking an Upcoming
+                            // todo onto today was the U1.4 bug); only an
+                            // undated one gets scheduled today.
+                            onclick: schedule(|t, day| {
+                                t.time_of_day = Some(TimeOfDay::Evening);
+                                if t.scheduled_for.is_none() {
+                                    t.scheduled_for = Some(day);
+                                }
+                            }),
+                            "Evening"
+                        }
                     }
-                    button {
-                        class: "rounded px-1.5 py-0.5 text-xs text-fg-muted hover:bg-input hover:text-fg",
-                        onclick: schedule(|t, _| {
-                            t.scheduled_for = None;
-                            t.time_of_day = None;
-                        }),
-                        "Clear date"
+                    if offer_clear_date {
+                        button {
+                            class: "rounded px-1.5 py-0.5 text-xs text-fg-muted hover:bg-input hover:text-fg",
+                            onclick: schedule(|t, _| {
+                                t.scheduled_for = None;
+                                t.time_of_day = None;
+                            }),
+                            "Clear date"
+                        }
                     }
-                    button {
-                        class: "rounded px-1.5 py-0.5 text-xs text-fg-muted hover:bg-input hover:text-fg",
-                        onclick: schedule(|t, _| {
-                            t.scheduled_for = None;
-                            t.time_of_day = None;
-                            t.bucket = TodoBucket::Someday;
-                        }),
-                        "Someday"
+                    if offer_someday {
+                        button {
+                            class: "rounded px-1.5 py-0.5 text-xs text-fg-muted hover:bg-input hover:text-fg",
+                            onclick: schedule(|t, _| {
+                                t.scheduled_for = None;
+                                t.time_of_day = None;
+                                t.bucket = TodoBucket::Someday;
+                            }),
+                            "Someday"
+                        }
                     }
-                    button {
-                        class: "rounded px-1.5 py-0.5 text-xs text-red-400 hover:bg-input",
-                        title: "Delete",
-                        onclick: delete,
-                        Icon { width: 14, height: 14, icon: fi_icons::FiTrash2 }
+                    if *delete_armed.read() {
+                        button {
+                            class: "rounded border border-red-700 bg-red-900/30 px-1.5 py-0.5 text-xs font-medium text-red-400 hover:bg-input",
+                            title: "Click again to delete",
+                            onclick: delete.clone(),
+                            "Sure?"
+                        }
+                    } else {
+                        button {
+                            class: "rounded px-1.5 py-0.5 text-xs text-red-400 hover:bg-input",
+                            title: "Delete",
+                            onclick: delete,
+                            Icon { width: 14, height: 14, icon: fi_icons::FiTrash2 }
+                        }
                     }
                 }
             }
@@ -1267,11 +1383,16 @@ fn TodoRow(todo: Todo, in_logbook: bool, show_scheduled: bool) -> Element {
 // ── Right rail: capacity + timeline (Today only) ────────────────────────────
 
 #[component]
-fn CapacityBar(planned: u32, capacity: u32, summary: String) -> Element {
+fn CapacityBar(planned: u32, done: u32, capacity: u32, summary: String) -> Element {
     // The bar's full width represents whichever is larger, so overcommitment
-    // shows as a red tail instead of silently clipping at 100%.
+    // shows as a red tail instead of silently clipping at 100%. `planned`
+    // includes `done`: finished work fills from the left with its own tint so
+    // completing a todo moves time between segments instead of shrinking the
+    // bar.
     let denom = planned.max(capacity).max(1) as f64;
-    let within_pct = (planned.min(capacity) as f64 / denom) * 100.0;
+    let within = planned.min(capacity);
+    let done_pct = (done.min(within) as f64 / denom) * 100.0;
+    let open_pct = (within.saturating_sub(done) as f64 / denom) * 100.0;
     let over_pct = (planned.saturating_sub(capacity) as f64 / denom) * 100.0;
 
     rsx! {
@@ -1279,9 +1400,15 @@ fn CapacityBar(planned: u32, capacity: u32, summary: String) -> Element {
             class: "flex flex-col gap-1.5",
             div {
                 class: "h-2 w-full overflow-hidden rounded-full bg-input border border-faint flex",
+                if done_pct > 0.0 {
+                    div {
+                        class: "h-full bg-primary-400",
+                        style: "width: {done_pct}%;",
+                    }
+                }
                 div {
                     class: "h-full bg-btn-primary",
-                    style: "width: {within_pct}%;",
+                    style: "width: {open_pct}%;",
                 }
                 if over_pct > 0.0 {
                     div {
@@ -1346,6 +1473,22 @@ fn TodayRail() -> Element {
         })
         .collect();
     drop(state);
+
+    // Blocks the ruler culls (fully outside the workday window) still exist
+    // and still count — first-fit overflow is deliberately honest — so they
+    // get a strip of their own instead of rendering nowhere.
+    let off_window_blocks: Vec<(TimeBlock, OffWindow)> = blocks
+        .iter()
+        .filter_map(|b| {
+            off_window(
+                minutes_in_local_day(&b.start),
+                minutes_in_local_day(&b.end),
+                day_start,
+                day_end,
+            )
+            .map(|side| (b.clone(), side))
+        })
+        .collect();
 
     let timeline_height = (day_end - day_start) as f64 / 60.0 * PX_PER_HOUR;
     let hours: Vec<u32> = (day_start / 60..=day_end / 60)
@@ -1465,6 +1608,7 @@ fn TodayRail() -> Element {
             class: "h-full w-full flex flex-col gap-4 overflow-y-auto border-l border-subtle bg-section p-4",
             CapacityBar {
                 planned: capacity.planned_minutes,
+                done: capacity.done_minutes,
                 capacity: capacity.capacity_minutes,
                 summary: capacity.summary(),
             }
@@ -1602,6 +1746,82 @@ fn TodayRail() -> Element {
                                         }
                                     }
                                 }
+                        }
+                    }
+                }
+            }
+
+            // Off-window strip: the visible home for blocks the ruler culls.
+            // Same select/delete affordances as ruler blocks, minus dragging.
+            if !off_window_blocks.is_empty() {
+                div {
+                    class: "flex flex-col gap-1",
+                    for (block, side) in off_window_blocks {
+                        {
+                            let is_selected =
+                                selected_block.read().as_deref() == Some(block.id.as_str());
+                            let display_title = linked_info
+                                .get(&block.id)
+                                .map(|(t, _, _)| t.clone())
+                                .unwrap_or_else(|| block.title.clone());
+                            let start_label =
+                                fmt_hhmm(minutes_in_local_day(&block.start).max(0) as u32);
+                            let end_label =
+                                fmt_hhmm(minutes_in_local_day(&block.end).max(0) as u32);
+                            let side_label = match side {
+                                OffWindow::Early => "Early",
+                                OffWindow::After => "After hours",
+                            };
+                            let select_id = block.id.clone();
+                            let delete_id = block.id.clone();
+                            rsx! {
+                                div {
+                                    key: "{block.id}",
+                                    class: if is_selected {
+                                        "flex items-center gap-2 rounded bg-card px-2 py-1.5 ring-1 ring-primary-400 cursor-pointer"
+                                    } else {
+                                        "flex items-center gap-2 rounded bg-card px-2 py-1.5 cursor-pointer"
+                                    },
+                                    onclick: move |evt| {
+                                        evt.stop_propagation();
+                                        let current = selected_block.peek().clone();
+                                        selected_block.set(
+                                            if current.as_deref() == Some(select_id.as_str()) {
+                                                None
+                                            } else {
+                                                Some(select_id.clone())
+                                            },
+                                        );
+                                    },
+                                    span {
+                                        class: "shrink-0 rounded-full bg-input px-2 py-0.5 text-[10px] text-fg-muted",
+                                        "{side_label}"
+                                    }
+                                    span {
+                                        class: "shrink-0 text-[10px] text-fg-muted",
+                                        "{start_label}–{end_label}"
+                                    }
+                                    span { class: "flex-1 min-w-0 truncate text-xs text-fg", "{display_title}" }
+                                    if is_selected {
+                                        button {
+                                            class: "shrink-0 text-red-400 hover:text-red-300",
+                                            title: "Delete block",
+                                            onclick: move |evt| {
+                                                evt.stop_propagation();
+                                                if let Err(e) = store::delete_block(&delete_id) {
+                                                    tracing::error!(
+                                                        "planner: failed to delete block {}: {}",
+                                                        delete_id, e
+                                                    );
+                                                }
+                                                planner.write().blocks.retain(|b| b.id != delete_id);
+                                                selected_block.set(None);
+                                            },
+                                            Icon { width: 12, height: 12, icon: fi_icons::FiTrash2 }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1758,6 +1978,33 @@ mod tests {
         // Very short blocks keep a height that fits a one-line title.
         let (_, h) = block_geometry(540, 545, 540, 1020).unwrap();
         assert_eq!(h, 20.0);
+    }
+
+    #[test]
+    fn off_window_classifies_exactly_what_the_ruler_culls() {
+        let (ds, de) = (540, 1020); // 09:00–17:00
+
+        // Fully before / fully after the window, edges touching included.
+        assert_eq!(off_window(300, 480, ds, de), Some(OffWindow::Early));
+        assert_eq!(off_window(480, 540, ds, de), Some(OffWindow::Early));
+        assert_eq!(off_window(1020, 1080, ds, de), Some(OffWindow::After));
+        assert_eq!(off_window(1080, 1140, ds, de), Some(OffWindow::After));
+
+        // Anything the ruler draws (even partially) is not off-window.
+        assert_eq!(off_window(570, 615, ds, de), None);
+        assert_eq!(off_window(480, 600, ds, de), None);
+        assert_eq!(off_window(1000, 1080, ds, de), None);
+
+        // The complement of block_geometry: every block is drawn or stripped.
+        for (s, e) in [(300, 480), (480, 600), (570, 615), (1000, 1080), (1020, 1080)] {
+            assert_eq!(
+                block_geometry(s, e, ds, de).is_none(),
+                off_window(s, e, ds, de).is_some(),
+                "({}, {}) must render in exactly one place",
+                s,
+                e
+            );
+        }
     }
 
     #[test]

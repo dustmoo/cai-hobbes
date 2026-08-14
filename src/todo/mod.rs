@@ -106,14 +106,20 @@ impl PlannerState {
 
     /// Enter focus on one todo, pausing whichever held it before — at most one
     /// task is ever in progress (the Sunsama model: focus is singular).
-    /// Returns the ids of every todo whose state changed, for persistence.
+    ///
+    /// Focus means "working on it now", so a focused todo that isn't on
+    /// today's plan contradicts itself: any todo not already scheduled today
+    /// is pulled onto today, pruning its off-day blocks per the
+    /// schedule↔timebox rule. Returns the ids of every todo whose state
+    /// changed (for persistence) and the pruned blocks (the caller must
+    /// delete their store rows).
     pub fn start_focus(
         &mut self,
         todo_id: &str,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<TimeBlock>) {
         if self.todo(todo_id).is_none() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let mut changed = Vec::new();
         for t in &mut self.todos {
@@ -131,7 +137,19 @@ impl PlannerState {
                 changed.push(t.id.clone());
             }
         }
-        changed
+        let today = now.with_timezone(&chrono::Local).date_naive();
+        let mut pruned = Vec::new();
+        if self
+            .todo(todo_id)
+            .is_some_and(|t| t.scheduled_for != Some(today))
+        {
+            let (rescheduled, p) = self.schedule_todo_on(todo_id, today, now);
+            pruned = p;
+            if rescheduled && !changed.iter().any(|c| c == todo_id) {
+                changed.push(todo_id.to_string());
+            }
+        }
+        (changed, pruned)
     }
 
     /// Leave focus mode, banking the session. Returns the paused todo's id.
@@ -447,12 +465,16 @@ mod tests {
         state.upsert_todo(a);
         state.upsert_todo(b);
 
-        let changed = state.start_focus(&id_a, now);
+        let today = now.with_timezone(&chrono::Local).date_naive();
+        let (changed, pruned) = state.start_focus(&id_a, now);
         assert_eq!(changed, vec![id_a.clone()]);
+        assert!(pruned.is_empty());
         assert_eq!(state.focused().unwrap().id, id_a);
+        // Focus implies today: the undated todo lands on today's plan.
+        assert_eq!(state.todo(&id_a).unwrap().scheduled_for, Some(today));
 
         // Focusing b pauses a — both report as changed.
-        let changed = state.start_focus(&id_b, now);
+        let (changed, _) = state.start_focus(&id_b, now);
         assert_eq!(changed.len(), 2);
         assert_eq!(state.focused().unwrap().id, id_b);
         assert_eq!(
@@ -462,13 +484,51 @@ mod tests {
         );
 
         // Re-focusing the focused todo is a no-op (no double-start).
-        assert!(state.start_focus(&id_b, now).is_empty());
+        assert!(state.start_focus(&id_b, now).0.is_empty());
         // Unknown ids change nothing.
-        assert!(state.start_focus("nope", now).is_empty());
+        assert!(state.start_focus("nope", now).0.is_empty());
 
         assert_eq!(state.stop_focus(now), Some(id_b.clone()));
         assert!(state.focused().is_none());
         assert_eq!(state.stop_focus(now), None);
+    }
+
+    #[test]
+    fn focusing_a_future_todo_pulls_it_onto_today_and_prunes_its_block() {
+        let now = chrono::Utc::now();
+        let today = now.with_timezone(&chrono::Local).date_naive();
+        let tomorrow = today.succ_opt().unwrap();
+
+        let mut state = PlannerState::default();
+        let mut todo = Todo::new("planned ahead", 0.0);
+        todo.id = "td_1".into();
+        todo.scheduled_for = Some(tomorrow);
+        state.upsert_todo(todo);
+        state.blocks.push(TimeBlock {
+            id: "blk_tomorrow".into(),
+            todo_id: Some("td_1".into()),
+            title: "planned ahead".into(),
+            start: local_instant(tomorrow, 9),
+            end: local_instant(tomorrow, 10),
+            source: BlockSource::Manual,
+        });
+
+        let (changed, pruned) = state.start_focus("td_1", now);
+        assert_eq!(changed, vec!["td_1".to_string()]);
+        assert_eq!(
+            state.todo("td_1").unwrap().scheduled_for,
+            Some(today),
+            "working on it now means it belongs on today's plan"
+        );
+        assert_eq!(pruned.len(), 1, "tomorrow's block follows the schedule off the calendar");
+        assert_eq!(pruned[0].id, "blk_tomorrow");
+        assert!(state.blocks.is_empty());
+
+        // A todo already scheduled today keeps its date and blocks.
+        state.stop_focus(now);
+        let (_, pruned) = state.start_focus("td_1", now);
+        assert!(pruned.is_empty());
+        assert_eq!(state.todo("td_1").unwrap().scheduled_for, Some(today));
     }
 
     #[test]
