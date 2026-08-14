@@ -29,6 +29,7 @@ pub mod mcp_marketplace;
 pub mod mcp_search_form;
 pub mod onboarding;
 pub mod planner_view;
+pub mod todo_detail;
 pub mod quick_fix;
 pub mod shared;
 pub mod smithery_registry;

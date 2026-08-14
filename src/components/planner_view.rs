@@ -50,7 +50,7 @@ fn today() -> NaiveDate {
 // human-driven cadence. A failed write is logged, not surfaced — the in-memory
 // state stays authoritative for the session either way.
 
-fn persist_todo(planner: &Signal<PlannerState>, id: &str) {
+pub(crate) fn persist_todo(planner: &Signal<PlannerState>, id: &str) {
     if let Some(t) = planner.peek().todo(id) {
         if let Err(e) = store::save_todo(t) {
             tracing::error!("planner: failed to save todo {}: {}", id, e);
@@ -58,14 +58,14 @@ fn persist_todo(planner: &Signal<PlannerState>, id: &str) {
     }
 }
 
-fn persist_block(block: &TimeBlock) {
+pub(crate) fn persist_block(block: &TimeBlock) {
     if let Err(e) = store::save_block(block) {
         tracing::error!("planner: failed to save block {}: {}", block.id, e);
     }
 }
 
 /// Patch one todo in state, stamp `updated_at`, and persist it.
-fn mutate_todo(mut planner: Signal<PlannerState>, id: &str, f: impl FnOnce(&mut Todo)) {
+pub(crate) fn mutate_todo(mut planner: Signal<PlannerState>, id: &str, f: impl FnOnce(&mut Todo)) {
     let now = Utc::now();
     {
         let mut state = planner.write();
@@ -386,6 +386,11 @@ pub fn PlannerView() -> Element {
     let settings = use_context::<Signal<Settings>>();
     let selection = use_signal(|| PlannerSelection::View(TodoView::Today));
 
+    // Which todo's detail card is open (U2.1) — consumed by TodoRow's info
+    // button and by the card rendered at this root.
+    let detail_open = use_signal(|| Option::<String>::None);
+    use_context_provider(|| crate::components::todo_detail::TodoDetailContext(detail_open));
+
     // Auto-rollover, once per mount: yesterday's unfinished work reappears on
     // today's plate. Guarded by a signal so re-renders never repeat it.
     let mut rolled_over = use_signal(|| false);
@@ -527,6 +532,7 @@ pub fn PlannerView() -> Element {
                 }
             }
             }
+            crate::components::todo_detail::TodoDetailCard {}
         }
     }
 }
@@ -976,6 +982,7 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
     let mut edit_buffer = use_signal(String::new);
     // U1.5: first click arms, second click deletes; leaving the row disarms.
     let mut delete_armed = use_signal(|| false);
+    let mut detail_open = use_context::<crate::components::todo_detail::TodoDetailContext>().0;
 
     let id = todo.id.clone();
     let day = today();
@@ -1106,6 +1113,16 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
             .map(|d| d.with_timezone(&Local).format("%-d %b %Y").to_string())
             .unwrap_or_default()
     });
+    // U2.2: the logbook surfaces estimate accuracy — "52m of 1h", or just the
+    // actual when the work was never estimated.
+    let actuals_line = (in_logbook && todo.actual_minutes > 0).then(|| match todo.estimate_minutes {
+        Some(est) => format!(
+            "{} of {}",
+            model::format_minutes(todo.actual_minutes),
+            model::format_minutes(est)
+        ),
+        None => model::format_minutes(todo.actual_minutes),
+    });
 
     rsx! {
         div {
@@ -1177,6 +1194,9 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
             if let Some(date_line) = completed_line {
                 span { class: "shrink-0 text-xs text-fg-muted", "{date_line}" }
             }
+            if let Some(actuals) = actuals_line {
+                span { class: "shrink-0 text-xs text-fg-muted", "{actuals}" }
+            }
             // Chips
             if show_scheduled {
                 if let Some(d) = todo.scheduled_for {
@@ -1232,6 +1252,16 @@ fn TodoRow(todo: Todo, selection: PlannerSelection) -> Element {
             if !in_logbook {
                 div {
                     class: "hidden shrink-0 items-center gap-1 group-hover:flex",
+                    // Detail card (U2.1): the full editor for this todo.
+                    button {
+                        class: "rounded p-1 text-fg-muted hover:bg-input hover:text-fg",
+                        title: "Details",
+                        onclick: {
+                            let id = id.clone();
+                            move |_| detail_open.set(Some(id.clone()))
+                        },
+                        Icon { width: 14, height: 14, icon: fi_icons::FiInfo }
+                    }
                     // Start / stop focus on this todo.
                     button {
                         class: "rounded p-1 text-primary-300 hover:bg-input hover:text-primary-200",
@@ -1444,13 +1474,16 @@ fn TodayRail() -> Element {
         state.capacity_for(day, default_capacity),
     );
     let blocks: Vec<TimeBlock> = state.blocks_on(day).into_iter().cloned().collect();
-    // Open, estimated, but not yet on the ruler — the "still to place" pool.
+    // Open but not yet on the ruler — the "still to place" pool. Unestimated
+    // todos belong here too (U2.3): placing one uses the default block length
+    // and stamps it as the estimate, so lacking an estimate must not hide the
+    // work from the timeline.
     let unblocked: Vec<Todo> = {
         let blocked_todo_ids: Vec<&str> =
             blocks.iter().filter_map(|b| b.todo_id.as_deref()).collect();
         views::in_view(&state.todos, TodoView::Today, day)
             .into_iter()
-            .filter(|t| t.estimate_minutes.is_some() && !blocked_todo_ids.contains(&t.id.as_str()))
+            .filter(|t| !blocked_todo_ids.contains(&t.id.as_str()))
             .cloned()
             .collect()
     };
@@ -1885,25 +1918,36 @@ fn TodayRail() -> Element {
                         {
                             let todo_id = todo.id.clone();
                             let title = todo.title.clone();
-                            let estimate = todo.estimate_minutes.unwrap_or(30);
+                            let estimate = todo.estimate_minutes;
+                            // Unestimated work is placed at the default block
+                            // length, which then becomes its estimate below.
+                            let duration = estimate.unwrap_or(block_minutes).max(15);
                             let busy = busy.clone();
                             rsx! {
                                 div {
                                     key: "{todo.id}",
                                     class: "flex items-center gap-2 rounded bg-card px-2 py-1.5",
                                     span { class: "flex-1 min-w-0 truncate text-xs text-fg", "{todo.title}" }
-                                    span { class: "shrink-0 text-[10px] text-fg-muted", "{model::format_minutes(estimate)}" }
+                                    if let Some(m) = estimate {
+                                        span { class: "shrink-0 text-[10px] text-fg-muted", "{model::format_minutes(m)}" }
+                                    } else {
+                                        span {
+                                            class: "shrink-0 text-[10px] text-amber-400/80",
+                                            title: "No estimate — placing uses the default block length and sets it as the estimate",
+                                            "{model::format_minutes(duration)}?"
+                                        }
+                                    }
                                     button {
                                         class: "shrink-0 rounded p-0.5 text-fg-muted hover:bg-input hover:text-fg",
                                         title: "Add to timeline at the first free slot",
                                         onclick: move |_| {
-                                            let start_min = first_free_slot(&busy, day_start, estimate);
+                                            let start_min = first_free_slot(&busy, day_start, duration);
                                             let block = TimeBlock {
                                                 id: uuid::Uuid::new_v4().to_string(),
                                                 todo_id: Some(todo_id.clone()),
                                                 title: title.clone(),
                                                 start: local_minutes_to_utc(day, start_min),
-                                                end: local_minutes_to_utc(day, start_min + estimate),
+                                                end: local_minutes_to_utc(day, start_min + duration),
                                                 source: BlockSource::Auto,
                                             };
                                             persist_block(&block);
@@ -1925,6 +1969,14 @@ fn TodayRail() -> Element {
                                                         b.id, e
                                                     );
                                                 }
+                                            }
+                                            // Estimate ↔ block sync: the block was
+                                            // born at `duration`, so stamping it as
+                                            // the estimate needs no resize.
+                                            if estimate.is_none() {
+                                                mutate_todo(planner, &todo_id, |t| {
+                                                    t.estimate_minutes = Some(duration)
+                                                });
                                             }
                                         },
                                         Icon { width: 14, height: 14, icon: fi_icons::FiPlus }

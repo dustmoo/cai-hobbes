@@ -246,7 +246,7 @@ impl Todo {
             parts.push(format!("#{}", tag));
         }
 
-        if parts.is_empty() {
+        let mut out = if parts.is_empty() {
             format!("[{}] {} {}", self.id, mark, self.title)
         } else {
             format!(
@@ -256,7 +256,20 @@ impl Todo {
                 self.title,
                 parts.join(", ")
             )
+        };
+        // Closed work reports its actuals so the AI sees estimate accuracy
+        // (groundwork for the shutdown ritual).
+        if self.status.is_closed() && self.actual_minutes > 0 {
+            match self.estimate_minutes {
+                Some(est) => out.push_str(&format!(
+                    " (took {} of {})",
+                    format_minutes(self.actual_minutes),
+                    format_minutes(est)
+                )),
+                None => out.push_str(&format!(" (took {})", format_minutes(self.actual_minutes))),
+            }
         }
+        out
     }
 }
 
@@ -729,5 +742,30 @@ mod tests {
 
         let bare = Todo::new("Bare", 0.0);
         assert!(bare.summary().ends_with("○ Bare"));
+    }
+
+    #[test]
+    fn summary_reports_actuals_only_for_closed_work() {
+        let done_at: DateTime<Utc> = "2026-08-13T10:52:00Z".parse().unwrap();
+
+        let mut t = Todo::new("Draft", 0.0);
+        t.estimate_minutes = Some(60);
+        t.actual_minutes = 52;
+        // Open work never shows actuals — the focus bar owns the live readout.
+        assert!(!t.summary().contains("took"));
+
+        t.mark_completed(done_at);
+        assert!(t.summary().ends_with("(took 52m of 1h)"), "{}", t.summary());
+
+        // Unestimated closed work reports the bare actual.
+        let mut bare = Todo::new("Email", 0.0);
+        bare.actual_minutes = 20;
+        bare.mark_completed(done_at);
+        assert!(bare.summary().ends_with("(took 20m)"), "{}", bare.summary());
+
+        // Closed without any tracked time stays clean.
+        let mut untracked = Todo::new("Call", 0.0);
+        untracked.mark_completed(done_at);
+        assert!(!untracked.summary().contains("took"));
     }
 }

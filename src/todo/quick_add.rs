@@ -98,7 +98,9 @@ pub fn parse_quick_add(input: &str, today: NaiveDate) -> QuickAddParse {
 }
 
 /// `"30m"`, `"1h30m"`, `"2h"`, or bare `"90"` (minutes). Rejects zero.
-fn parse_duration_minutes(s: &str) -> Option<u32> {
+/// Also the grammar of the detail card's estimate field — one duration
+/// syntax everywhere.
+pub(crate) fn parse_duration_minutes(s: &str) -> Option<u32> {
     if s.is_empty() {
         return None;
     }
