@@ -86,6 +86,7 @@ These calls use the `x-api-key` header for authentication and are used for admin
 | `delete_auth_config()` | DELETE | `/api/v3/auth_configs/{id}` | Delete a toolkit's auth config (full removal + dedupe) |
 | `delete_connected_account()` | DELETE | `/api/v3/connected_accounts/{id}` | Delete a connected account (prune / full removal) |
 | `create_fresh_mcp_server()` | POST | `/api/v3/mcp/servers/custom` | Provision a **fresh** server seeded with one toolkit (Recreate recovery). Composio rejects an empty server — error 1153 `MCP_MissingAuthConfigsOrToolkits` — so it must have ≥1 toolkit/auth_config |
+| `delete_mcp_server()` | DELETE | `/api/v3/mcp/{server_id}` | Soft-delete a server (returns `{id, deleted: true}`). Recreate retires the old server with this after a successful migration |
 
 ### Removal / cleanup lifecycle (mirrors the connect lifecycle)
 
@@ -99,7 +100,8 @@ duplicates/orphans accumulate on the single shared server, one invalid `auth_con
 makes every fail-fast PATCH reject, wedging the server. Mitigations: `get_auth_config_id`
 dedupes (keep one, `delete_auth_config` the rest); failed connects roll back the config/account
 they created; and `create_empty_mcp_server` + `recreate_composio_server` rebuild a server
-that is already wedged (the old server is abandoned — there is **no** delete-server endpoint).
+that is already wedged (the old server is then soft-deleted via `delete_mcp_server` —
+`DELETE /api/v3/mcp/{id}` — so abandoned servers no longer accumulate).
 
 ---
 

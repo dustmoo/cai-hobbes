@@ -7,11 +7,13 @@ use dioxus_free_icons::{icons::fi_icons, Icon};
 pub fn InlineCommentPopover(
     on_save: EventHandler<String>,
     on_cancel: EventHandler<()>,
-    initial_value: Option<String>,
+    // Draft lives in the parent so it survives popover unmount/remount and the
+    // parent can warn before discarding unsaved text.
+    draft: Signal<String>,
     position_top: f64,
     position_left: f64,
 ) -> Element {
-    let mut comment_text = use_signal(|| initial_value.unwrap_or_default());
+    let mut draft = draft;
     let settings = use_context::<Signal<Settings>>();
 
     rsx! {
@@ -31,16 +33,16 @@ pub fn InlineCommentPopover(
                 placeholder: "Add a comment...",
                 // Uncontrolled: controlled bindings race re-renders and snap the
                 // caret to the end mid-typing (see shared::set_chat_draft).
-                initial_value: "{comment_text}",
-                oninput: move |e| comment_text.set(e.value()),
+                initial_value: "{draft.peek()}",
+                oninput: move |e| draft.set(e.value()),
                 onkeydown: move |evt: KeyboardEvent| {
                     let hotkeys = settings.read().hotkeys.clone();
                     let is_force_submit = matches_hotkey(&evt, &hotkeys.submit_chat);
                     let is_standard_submit = evt.key() == Key::Enter && !evt.modifiers().contains(Modifiers::SHIFT);
 
-                    if (is_force_submit || is_standard_submit) && !comment_text().trim().is_empty() {
+                    if (is_force_submit || is_standard_submit) && !draft().trim().is_empty() {
                         evt.prevent_default();
-                        on_save.call(comment_text());
+                        on_save.call(draft());
                     }
                 },
                 autofocus: true,
@@ -58,8 +60,8 @@ pub fn InlineCommentPopover(
                 button {
                     class: "p-1.5 text-primary-400 hover:text-primary-300 hover:bg-primary-900/30 rounded transition-colors",
                     onclick: move |_| {
-                        if !comment_text().trim().is_empty() {
-                            on_save.call(comment_text());
+                        if !draft().trim().is_empty() {
+                            on_save.call(draft());
                         }
                     },
                     title: "Save (Enter)",

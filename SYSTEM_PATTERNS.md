@@ -400,9 +400,11 @@ the dropped ids → drop its on-demand tools (profile-keyed bucket) + settings
 - **Recreate to recover** — `recreate_composio_server` resolves auth for the kept
   toolkits, provisions a fresh server **seeded with the first** toolkit
   (`create_fresh_mcp_server` — Composio rejects an empty server, error 1153), then
-  binds the rest, repoints `base_url` + the servers map. This is the **only**
-  recovery for an already-wedged server. There is **no delete-server endpoint**;
-  the old server is abandoned.
+  binds the rest (re-applying the locally persisted per-toolkit `enabled_tools`
+  curation), repoints `base_url` + the servers map, then soft-deletes the old
+  server (`delete_mcp_server`, `DELETE /api/v3/mcp/{id}`) so abandoned servers
+  don't accumulate and can't be mis-targeted later. This is the **only**
+  recovery for an already-wedged server.
 
 **If broken**: connects fail with 400s on the shared server; removals also fail;
 the only escape is Recreate.

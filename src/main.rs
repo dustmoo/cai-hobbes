@@ -21,6 +21,8 @@ mod biometric_auth;
 mod components;
 mod constants;
 mod context;
+mod entitlement;
+mod fleet;
 mod formatters;
 mod gemini;
 mod hotkey;
@@ -54,6 +56,7 @@ mod settings;
 mod skills;
 mod theme;
 mod tray;
+mod focus_tray;
 
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 use tray_icon::TrayIcon;
@@ -383,7 +386,82 @@ fn app() -> Element {
     // The planner is hydrated in full at startup — its rows are small and
     // bounded by human effort, so there is no lazy-loading path to justify.
     // Safe here: session_store::init() ran in main() before the app launched.
-    use_context_provider(|| Signal::new(todo::PlannerState::load()));
+    let planner_state = use_context_provider(|| Signal::new(todo::PlannerState::load()));
+
+    // Fleet (Pro): the hook listener runs on plain tokio tasks with its
+    // canonical state in `fleet::shared()` — this signal is a UI mirror fed
+    // by the drain loop below. Signals are never touched from server tasks.
+    let mut fleet_state = use_context_provider(|| Signal::new(fleet::FleetState::default()));
+    let mut fleet_runtime_started = use_signal(|| false);
+    use_effect(move || {
+        if *fleet_runtime_started.peek() {
+            return;
+        }
+        fleet_runtime_started.set(true);
+
+        // Drain loop: mirror state snapshots into the signal and surface
+        // newly needs-attention sessions through the existing toast strip
+        // (no new notification machinery).
+        spawn(async move {
+            let shared = fleet::shared().clone();
+            let mut rx = shared.subscribe();
+            loop {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+                let snapshot = shared.snapshot();
+                {
+                    let prev = fleet_state.peek().clone();
+                    for (id, s) in &snapshot.sessions {
+                        let was = prev
+                            .sessions
+                            .get(id)
+                            .map(|p| p.status.needs_attention())
+                            .unwrap_or(false);
+                        if s.status.needs_attention() && !was {
+                            flash_timer_toast(format!("🛰 {} needs your attention", s.name));
+                        }
+                    }
+                }
+                fleet_state.set(snapshot);
+            }
+        });
+
+        // Supervisor: keep the listener's lifecycle in sync with the Pro
+        // entitlement (hydrated asynchronously with the secrets) and the
+        // fleet_enabled setting. Polling sidesteps needing reactive plumbing
+        // into the entitlement statics; a few seconds of start/stop latency
+        // is fine for an observation feature.
+        spawn(async move {
+            let shared = fleet::shared().clone();
+            let mut server: Option<fleet::server::FleetServer> = None;
+            let mut hydrated = false;
+            loop {
+                let want = settings.peek().fleet_enabled && crate::entitlement::pro_active();
+                if want && server.is_none() {
+                    if !hydrated {
+                        // Sessions left live by a previous process re-enter
+                        // the map; the sweep and span caps keep them honest.
+                        shared.hydrate_from_store();
+                        hydrated = true;
+                    }
+                    match fleet::server::start_from_meta(shared.clone()).await {
+                        Ok(s) => {
+                            fleet::set_running_port(Some(s.port));
+                            server = Some(s);
+                        }
+                        Err(e) => tracing::error!("fleet: listener failed to start: {e}"),
+                    }
+                } else if !want {
+                    if let Some(s) = server.take() {
+                        s.shutdown();
+                        fleet::set_running_port(None);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    });
 
     // Pattern: Grounded App Initialization
     // Masks transient desyncs during the first render tick
@@ -501,6 +579,12 @@ fn app() -> Element {
                 }).await;
 
                 if let Ok(sm) = loaded_secrets {
+                    // Verify + activate the stored Pro license (if any) now
+                    // that the secret cache is hydrated.
+                    crate::entitlement::hydrate_from_stored_key(
+                        sm.get(crate::entitlement::LICENSE_KEYCHAIN_KEY)
+                            .map(|s| s.as_str()),
+                    );
                     // Update secret manager with loaded secrets
                     secret_manager.set(sm);
 
@@ -667,6 +751,12 @@ fn app() -> Element {
                 .await;
 
                 if let Ok(sm) = loaded_secrets {
+                    // Verify + activate the stored Pro license (if any) now
+                    // that the secret cache is hydrated.
+                    crate::entitlement::hydrate_from_stored_key(
+                        sm.get(crate::entitlement::LICENSE_KEYCHAIN_KEY)
+                            .map(|s| s.as_str()),
+                    );
                     secret_manager.set(sm);
 
                     // Phase 1: Read all secrets (immutable borrow) and collect migration tasks
@@ -1464,6 +1554,11 @@ fn app() -> Element {
     // Call the summarization scheduler hook BEFORE the hotkey manager
     processing::summarization_scheduler::use_summarization_scheduler();
 
+    // Background calendar sync: an immediate pass on launch, then every 15
+    // minutes (or on CalendarSyncMsg::SyncNow). Gated internally on
+    // settings.planner_enabled.
+    todo::calendar_sync::use_calendar_sync();
+
     // Unconditionally call the hotkey manager hook, passing in the permission status signal.
     // The hook itself will handle the conditional logic internally.
     hotkey::use_hotkey_manager(permission_status_signal);
@@ -1543,19 +1638,79 @@ fn app() -> Element {
         });
     });
 
-    // Effect to manage the tray icon's visibility based on settings
+    // The single tray icon is owned by the focus-timer sync effect below —
+    // it reads both `settings.show_tray_icon` and the planner's focus state,
+    // so the icon exists when either wants it (the icon hosts the timer for
+    // the duration of a focus session even with the setting off).
+
+    // ── Tray icon + focus timer (single owner) ───────────────────────────
+    // While a todo is in focus, the tray icon mirrors the FocusBar's live
+    // readout (macOS: menu-bar title text; Windows: tooltip) and reverts to
+    // plain when focus ends. The effect reacts to every planner and settings
+    // change (focus start/stop/complete, show_tray_icon toggle → immediate),
+    // and a ~30s ticker keeps the elapsed minutes honest in between. Runs on
+    // the main thread (a macOS requirement for tray creation), like all
+    // effects. Tray listening starts inside `tray::init_tray`.
+    let mut focus_tray_tick = use_signal(|| 0u64);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            focus_tray_tick += 1;
+        }
+    });
     use_effect(move || {
-        let show = settings.read().show_tray_icon;
-        if show {
-            if tray_icon.peek().is_none() {
-                tray_icon.set(Some(tray::init_tray()));
-                tracing::debug!("Tray icon has been created.");
-            }
+        let _subscribe = *focus_tray_tick.read();
+        let show_tray = settings.read().show_tray_icon;
+        let snapshot = if settings.read().planner_enabled {
+            focus_tray::focus_snapshot(&planner_state.read(), chrono::Utc::now())
         } else {
-            if tray_icon.peek().is_some() {
-                tray_icon.set(None);
-                tracing::debug!("Tray icon has been removed.");
-            }
+            None
+        };
+        // Local/Cloud indicator: resolved from the ACTIVE session's effective
+        // connector (sessions can pin their own). Subscribes to the session
+        // *id* and to settings — connector pinning always writes settings too
+        // (SwitchModel/SwitchProvider update the global default), so peeking
+        // the session map avoids re-running this on every streamed token.
+        let privacy = if settings.read().show_privacy_indicator {
+            let s = settings.read();
+            let session_state = session_state.peek();
+            let sid = current_session_id.read().clone();
+            let connector = match session_state.sessions.get(&sid) {
+                Some(session) => s.connector_for_session(session),
+                None => s.active_connector(),
+            };
+            Some(focus_tray::privacy_status(
+                connector,
+                !s.composio_profiles.is_empty(),
+            ))
+        } else {
+            None
+        };
+        focus_tray::sync_tray(
+            &mut tray_icon.write(),
+            show_tray,
+            snapshot.as_ref(),
+            privacy.as_ref(),
+        );
+    });
+
+    // Focus-timer tray clicks: surface the window and reveal the focused
+    // todo in the planner. Direct signal sets (not ChatCommand::TogglePlanner)
+    // because a toggle would close the planner when it is already open.
+    let window_for_focus_tray = window.clone();
+    use_effect(move || {
+        let clicks = *focus_tray::FOCUS_TRAY_CLICKS.read();
+        if clicks == 0 {
+            return; // initial run at mount — nothing was clicked yet
+        }
+        *WINDOW_VISIBLE.write() = true;
+        window_for_focus_tray.set_minimized(false);
+        window_for_focus_tray.set_visible(true);
+        window_for_focus_tray.set_focus();
+        planner_tab_open.set(true);
+        planner_active.set(true);
+        if let Some(id) = planner_state.peek().focused().map(|t| t.id.clone()) {
+            *focus_tray::PLANNER_REVEAL_TODO.write() = Some(id);
         }
     });
 

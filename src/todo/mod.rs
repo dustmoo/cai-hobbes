@@ -11,13 +11,16 @@
 //!
 //! See `PLANNER_DESIGN.md` for the full specification.
 //!
+pub mod calendar_sync;
+pub mod composio_calendar;
 pub mod handlers;
+pub mod ics;
 pub mod model;
 pub mod quick_add;
 pub mod store;
 pub mod views;
 
-use model::{Area, DayPlan, Project, TimeBlock, Todo};
+use model::{Area, DayPlan, FocusActor, FocusEndReason, FocusSession, Project, TimeBlock, Todo};
 
 /// The whole planner, hydrated in memory.
 ///
@@ -31,6 +34,15 @@ pub struct PlannerState {
     pub areas: Vec<Area>,
     pub blocks: Vec<TimeBlock>,
     pub day_plans: Vec<DayPlan>,
+    /// Focus-session history (person vs agent time). The lifecycle lives at
+    /// this layer — every path that starts or banks focus opens/closes a row
+    /// here — so the model's `fold_elapsed` stays pure.
+    pub focus_sessions: Vec<FocusSession>,
+    /// Session rows touched since the last [`Self::take_dirty_focus_sessions`]
+    /// drain. Lets every caller persist exactly what changed without the
+    /// lifecycle methods growing store side effects (handlers pass
+    /// `persist: false` in tests and must stay off the database).
+    dirty_focus_sessions: Vec<String>,
 }
 
 impl PlannerState {
@@ -46,6 +58,11 @@ impl PlannerState {
                 }
             }
             tracing::info!("Paused stale focus session on todo {}", id);
+        }
+        for s in state.take_dirty_focus_sessions() {
+            if let Err(e) = store::save_focus_session(&s) {
+                tracing::error!("Failed to persist recovered focus session {}: {}", s.id, e);
+            }
         }
         state
     }
@@ -93,6 +110,10 @@ impl PlannerState {
         // Blocks referencing the todo would otherwise linger on the timeline
         // pointing at nothing.
         self.blocks.retain(|b| b.todo_id.as_deref() != Some(id));
+        // Deleting mid-focus is abandoning the work: the session row must not
+        // stay open forever (session history itself is kept — the time was
+        // still spent).
+        self.close_focus_rows_for(id, chrono::Utc::now(), FocusEndReason::Cancelled);
         Some(self.todos.remove(idx))
     }
 
@@ -104,30 +125,96 @@ impl PlannerState {
             .find(|t| t.status == model::TodoStatus::InProgress)
     }
 
+    // ── Focus-session rows ──────────────────────────────────────────────────
+
+    /// The live (unended) focus-session row, if any. The lifecycle below keeps
+    /// at most one open — the row-level mirror of the single-focus invariant.
+    #[allow(dead_code)] // invariant checks in tests; UI surfaces use _for(todo_id)
+    pub fn open_focus_session(&self) -> Option<&FocusSession> {
+        self.focus_sessions.iter().find(|s| s.is_open())
+    }
+
+    pub fn open_focus_session_for(&self, todo_id: &str) -> Option<&FocusSession> {
+        self.focus_sessions
+            .iter()
+            .find(|s| s.is_open() && s.todo_id == todo_id)
+    }
+
+    /// Drain the ids of session rows touched since the last drain, returning
+    /// the rows to persist. Every mutation path calls this after the operation
+    /// (handlers gate the actual store write on their `persist` flag).
+    pub fn take_dirty_focus_sessions(&mut self) -> Vec<FocusSession> {
+        let mut ids = std::mem::take(&mut self.dirty_focus_sessions);
+        ids.dedup();
+        ids.iter()
+            .filter_map(|id| self.focus_sessions.iter().find(|s| &s.id == id).cloned())
+            .collect()
+    }
+
+    fn open_focus_row(&mut self, todo_id: &str, now: chrono::DateTime<chrono::Utc>, actor: FocusActor) {
+        let s = FocusSession::open(todo_id, now, actor);
+        self.dirty_focus_sessions.push(s.id.clone());
+        self.focus_sessions.push(s);
+    }
+
+    /// Close every open session row on one todo with `reason`. Plural on
+    /// purpose: a duplicate open row (crash artifact) must not survive as a
+    /// forever-live session.
+    fn close_focus_rows_for(
+        &mut self,
+        todo_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        reason: FocusEndReason,
+    ) {
+        let mut dirty = Vec::new();
+        for s in self
+            .focus_sessions
+            .iter_mut()
+            .filter(|s| s.is_open() && s.todo_id == todo_id)
+        {
+            s.close(now, reason);
+            dirty.push(s.id.clone());
+        }
+        self.dirty_focus_sessions.extend(dirty);
+    }
+
     /// Enter focus on one todo, pausing whichever held it before — at most one
     /// task is ever in progress (the Sunsama model: focus is singular).
+    ///
+    /// `actor` records who is driving the sitting (UI buttons pass `Person`,
+    /// the AI's `HOBBES_TODO_UPDATE` passes `Agent` with its chat session id);
+    /// a `FocusSession` row opens for it, and any preempted todo's row closes
+    /// as `preempted`.
     ///
     /// Focus means "working on it now", so a focused todo that isn't on
     /// today's plan contradicts itself: any todo not already scheduled today
     /// is pulled onto today, pruning its off-day blocks per the
     /// schedule↔timebox rule. Returns the ids of every todo whose state
     /// changed (for persistence) and the pruned blocks (the caller must
-    /// delete their store rows).
+    /// delete their store rows). Touched session rows are persisted via
+    /// [`Self::take_dirty_focus_sessions`].
     pub fn start_focus(
         &mut self,
         todo_id: &str,
         now: chrono::DateTime<chrono::Utc>,
+        actor: FocusActor,
     ) -> (Vec<String>, Vec<TimeBlock>) {
         if self.todo(todo_id).is_none() {
             return (Vec::new(), Vec::new());
         }
         let mut changed = Vec::new();
+        let mut preempted = Vec::new();
         for t in &mut self.todos {
             if t.status == model::TodoStatus::InProgress && t.id != todo_id {
                 t.pause(now);
                 changed.push(t.id.clone());
+                preempted.push(t.id.clone());
             }
         }
+        for id in preempted {
+            self.close_focus_rows_for(&id, now, FocusEndReason::Preempted);
+        }
+        let mut started = false;
         if let Some(t) = self.todo_mut(todo_id) {
             if t.status != model::TodoStatus::InProgress {
                 t.fold_elapsed(now); // defensive: a stray marker never double-counts
@@ -135,7 +222,17 @@ impl PlannerState {
                 t.started_at = Some(now);
                 t.updated_at = now;
                 changed.push(t.id.clone());
+                started = true;
             }
+        }
+        if started {
+            // Defensive: a stray open row on this todo would double-open.
+            self.close_focus_rows_for(todo_id, now, FocusEndReason::Recovered);
+            self.open_focus_row(todo_id, now, actor);
+        } else if self.open_focus_session_for(todo_id).is_none() {
+            // Already in progress but row-less (pre-migration in-flight
+            // session): give the live session a row so the invariant holds.
+            self.open_focus_row(todo_id, now, actor);
         }
         let today = now.with_timezone(&chrono::Local).date_naive();
         let mut pruned = Vec::new();
@@ -153,17 +250,71 @@ impl PlannerState {
     }
 
     /// Leave focus mode, banking the session. Returns the paused todo's id.
+    /// The open session row closes as `paused`.
     pub fn stop_focus(&mut self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
         let id = self.focused().map(|t| t.id.clone())?;
         if let Some(t) = self.todo_mut(&id) {
             t.pause(now);
         }
+        self.close_focus_rows_for(&id, now, FocusEndReason::Paused);
         Some(id)
+    }
+
+    /// Complete a todo, closing its focus session (if live) as `completed`.
+    /// The state-level entry for every "done" surface — going through
+    /// `Todo::mark_completed` directly would leave the session row open.
+    pub fn complete_todo(&mut self, id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let Some(t) = self.todo_mut(id) else {
+            return false;
+        };
+        let was_in_progress = t.status == model::TodoStatus::InProgress;
+        t.mark_completed(now);
+        if was_in_progress {
+            self.close_focus_rows_for(id, now, FocusEndReason::Completed);
+        }
+        true
+    }
+
+    /// Reopen a todo. Banking an in-progress one closes its session row as
+    /// `stopped`; reopening closed work touches no session.
+    pub fn reopen_todo(&mut self, id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let Some(t) = self.todo_mut(id) else {
+            return false;
+        };
+        let was_in_progress = t.status == model::TodoStatus::InProgress;
+        t.reopen(now);
+        if was_in_progress {
+            self.close_focus_rows_for(id, now, FocusEndReason::Stopped);
+        }
+        true
+    }
+
+    /// Cancel a todo. Cancelling mid-focus still banks the elapsed time (the
+    /// work happened even if the goal was abandoned) and closes the session
+    /// row as `cancelled`. The logbook orders by `completed_at`; a cancelled
+    /// todo's "closed moment" is when it was abandoned.
+    pub fn cancel_todo(&mut self, id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let Some(t) = self.todo_mut(id) else {
+            return false;
+        };
+        let was_in_progress = t.status == model::TodoStatus::InProgress;
+        t.fold_elapsed(now);
+        t.status = model::TodoStatus::Cancelled;
+        t.completed_at = Some(now);
+        t.updated_at = now;
+        if was_in_progress {
+            self.close_focus_rows_for(id, now, FocusEndReason::Cancelled);
+        }
+        true
     }
 
     /// A focus session that survived an app quit is almost certainly abandoned
     /// — pause it on load, capping the banked time at two hours so a forgotten
     /// overnight session can't pollute the actuals. Returns the affected ids.
+    ///
+    /// The session row is closed honestly: `end_reason = recovered`, its real
+    /// wall-clock bounds kept, `minutes` matching the clamped bank, and the
+    /// real elapsed noted in `unclamped_minutes` when the clamp bit.
     pub fn sanitize_stale_focus(&mut self, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
         let mut changed = Vec::new();
         for t in &mut self.todos {
@@ -178,6 +329,19 @@ impl PlannerState {
                 changed.push(t.id.clone());
             }
         }
+        // Close EVERY open row, not just those of in-progress todos — an
+        // orphaned open row (crash between writes) must not live forever.
+        let mut dirty = Vec::new();
+        for s in self.focus_sessions.iter_mut().filter(|s| s.is_open()) {
+            s.close(now, model::FocusEndReason::Recovered);
+            let real = s.minutes;
+            if real > 120 {
+                s.minutes = 120;
+                s.unclamped_minutes = Some(real);
+            }
+            dirty.push(s.id.clone());
+        }
+        self.dirty_focus_sessions.extend(dirty);
         changed
     }
 
@@ -466,7 +630,7 @@ mod tests {
         state.upsert_todo(b);
 
         let today = now.with_timezone(&chrono::Local).date_naive();
-        let (changed, pruned) = state.start_focus(&id_a, now);
+        let (changed, pruned) = state.start_focus(&id_a, now, model::FocusActor::Person);
         assert_eq!(changed, vec![id_a.clone()]);
         assert!(pruned.is_empty());
         assert_eq!(state.focused().unwrap().id, id_a);
@@ -474,7 +638,7 @@ mod tests {
         assert_eq!(state.todo(&id_a).unwrap().scheduled_for, Some(today));
 
         // Focusing b pauses a — both report as changed.
-        let (changed, _) = state.start_focus(&id_b, now);
+        let (changed, _) = state.start_focus(&id_b, now, model::FocusActor::Person);
         assert_eq!(changed.len(), 2);
         assert_eq!(state.focused().unwrap().id, id_b);
         assert_eq!(
@@ -484,9 +648,9 @@ mod tests {
         );
 
         // Re-focusing the focused todo is a no-op (no double-start).
-        assert!(state.start_focus(&id_b, now).0.is_empty());
+        assert!(state.start_focus(&id_b, now, model::FocusActor::Person).0.is_empty());
         // Unknown ids change nothing.
-        assert!(state.start_focus("nope", now).0.is_empty());
+        assert!(state.start_focus("nope", now, model::FocusActor::Person).0.is_empty());
 
         assert_eq!(state.stop_focus(now), Some(id_b.clone()));
         assert!(state.focused().is_none());
@@ -513,7 +677,7 @@ mod tests {
             source: BlockSource::Manual,
         });
 
-        let (changed, pruned) = state.start_focus("td_1", now);
+        let (changed, pruned) = state.start_focus("td_1", now, model::FocusActor::Person);
         assert_eq!(changed, vec!["td_1".to_string()]);
         assert_eq!(
             state.todo("td_1").unwrap().scheduled_for,
@@ -526,9 +690,186 @@ mod tests {
 
         // A todo already scheduled today keeps its date and blocks.
         state.stop_focus(now);
-        let (_, pruned) = state.start_focus("td_1", now);
+        let (_, pruned) = state.start_focus("td_1", now, model::FocusActor::Person);
         assert!(pruned.is_empty());
         assert_eq!(state.todo("td_1").unwrap().scheduled_for, Some(today));
+    }
+
+    // ── Focus-session rows ──────────────────────────────────────────────────
+
+    /// The row-level invariant: exactly one open session row exists iff one
+    /// todo is `InProgress`, and it points at that todo.
+    fn assert_focus_invariant(state: &PlannerState) {
+        let open: Vec<&model::FocusSession> =
+            state.focus_sessions.iter().filter(|s| s.is_open()).collect();
+        match state.focused() {
+            Some(t) => {
+                assert_eq!(open.len(), 1, "one InProgress todo ⇒ exactly one open row");
+                assert_eq!(open[0].todo_id, t.id, "the open row tracks the focused todo");
+            }
+            None => assert!(open.is_empty(), "no InProgress todo ⇒ no open rows"),
+        }
+    }
+
+    fn reasons_for<'a>(state: &'a PlannerState, todo_id: &str) -> Vec<&'a str> {
+        state
+            .focus_sessions
+            .iter()
+            .filter(|s| s.todo_id == todo_id)
+            .filter_map(|s| s.end_reason.map(|r| r.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn focus_lifecycle_opens_and_closes_session_rows() {
+        let start: chrono::DateTime<chrono::Utc> = "2026-08-13T10:00:00Z".parse().unwrap();
+        let later: chrono::DateTime<chrono::Utc> = "2026-08-13T10:25:00Z".parse().unwrap();
+        let mut state = PlannerState::default();
+        let t = Todo::new("deep work", 0.0);
+        let id = t.id.clone();
+        state.upsert_todo(t);
+
+        state.start_focus(&id, start, model::FocusActor::Person);
+        assert_focus_invariant(&state);
+        let open = state.open_focus_session_for(&id).expect("row opened");
+        assert_eq!(open.actor, model::FocusActor::Person);
+        assert_eq!(open.started_at, start);
+
+        // Stop banks the sitting: closed as 'paused' with its minutes.
+        state.stop_focus(later);
+        assert_focus_invariant(&state);
+        let row = &state.focus_sessions[0];
+        assert_eq!(row.end_reason, Some(model::FocusEndReason::Paused));
+        assert_eq!(row.minutes, 25);
+        assert_eq!(row.ended_at, Some(later));
+        assert_eq!(
+            state.todo(&id).unwrap().actual_minutes,
+            25,
+            "the aggregate and the row must agree"
+        );
+
+        // Every touched row is queued for persistence, and draining is one-shot.
+        let dirty = state.take_dirty_focus_sessions();
+        assert_eq!(dirty.len(), 1, "opened and closed the same row: one persist");
+        assert!(state.take_dirty_focus_sessions().is_empty());
+    }
+
+    #[test]
+    fn preemption_closes_the_previous_row_as_preempted() {
+        let now = chrono::Utc::now();
+        let mut state = PlannerState::default();
+        let (a, b) = (Todo::new("a", 0.0), Todo::new("b", 0.0));
+        let (id_a, id_b) = (a.id.clone(), b.id.clone());
+        state.upsert_todo(a);
+        state.upsert_todo(b);
+
+        state.start_focus(&id_a, now, model::FocusActor::Person);
+        state.start_focus(&id_b, now, model::FocusActor::Person);
+        assert_focus_invariant(&state);
+        assert_eq!(reasons_for(&state, &id_a), vec!["preempted"]);
+        assert!(state.open_focus_session_for(&id_b).is_some());
+
+        // Re-focusing the focused todo neither closes nor duplicates the row.
+        state.start_focus(&id_b, now, model::FocusActor::Person);
+        assert_focus_invariant(&state);
+        assert_eq!(state.focus_sessions.len(), 2);
+    }
+
+    #[test]
+    fn agent_focus_records_the_driving_chat_session() {
+        let now = chrono::Utc::now();
+        let mut state = PlannerState::default();
+        let t = Todo::new("delegated", 0.0);
+        let id = t.id.clone();
+        state.upsert_todo(t);
+
+        state.start_focus(
+            &id,
+            now,
+            model::FocusActor::Agent {
+                session_id: Some("sess-42".into()),
+            },
+        );
+        let open = state.open_focus_session_for(&id).unwrap();
+        assert!(open.actor.is_agent());
+        assert_eq!(open.actor.agent_session_id(), Some("sess-42"));
+    }
+
+    #[test]
+    fn closing_transitions_stamp_their_end_reasons() {
+        let now = chrono::Utc::now();
+        let mut state = PlannerState::default();
+        for title in ["complete me", "reopen me", "cancel me"] {
+            state.upsert_todo(Todo::new(title, 0.0));
+        }
+        let ids: Vec<String> = state.todos.iter().map(|t| t.id.clone()).collect();
+
+        // Complete an in-progress todo → 'completed'.
+        state.start_focus(&ids[0], now, model::FocusActor::Person);
+        assert!(state.complete_todo(&ids[0], now));
+        assert_focus_invariant(&state);
+        assert_eq!(reasons_for(&state, &ids[0]), vec!["completed"]);
+        assert_eq!(state.todo(&ids[0]).unwrap().status, model::TodoStatus::Completed);
+
+        // Reopen (banking an in-progress) → 'stopped'.
+        state.start_focus(&ids[1], now, model::FocusActor::Person);
+        assert!(state.reopen_todo(&ids[1], now));
+        assert_focus_invariant(&state);
+        assert_eq!(reasons_for(&state, &ids[1]), vec!["stopped"]);
+        assert_eq!(state.todo(&ids[1]).unwrap().status, model::TodoStatus::Open);
+
+        // Cancel mid-focus → 'cancelled', with the time still banked.
+        state.start_focus(&ids[2], now, model::FocusActor::Person);
+        assert!(state.cancel_todo(&ids[2], now));
+        assert_focus_invariant(&state);
+        assert_eq!(reasons_for(&state, &ids[2]), vec!["cancelled"]);
+        let t = state.todo(&ids[2]).unwrap();
+        assert_eq!(t.status, model::TodoStatus::Cancelled);
+        assert!(t.completed_at.is_some());
+
+        // Reopening completed (not in-progress) work touches no session.
+        let rows_before = state.focus_sessions.len();
+        assert!(state.reopen_todo(&ids[0], now));
+        assert_eq!(state.focus_sessions.len(), rows_before);
+        assert_focus_invariant(&state);
+
+        // Unknown ids are harmless no-ops.
+        assert!(!state.complete_todo("nope", now));
+        assert!(!state.reopen_todo("nope", now));
+        assert!(!state.cancel_todo("nope", now));
+    }
+
+    #[test]
+    fn open_row_exists_iff_a_todo_is_in_progress() {
+        let now = chrono::Utc::now();
+        let mut state = PlannerState::default();
+        let (a, b) = (Todo::new("a", 0.0), Todo::new("b", 0.0));
+        let (id_a, id_b) = (a.id.clone(), b.id.clone());
+        state.upsert_todo(a);
+        state.upsert_todo(b);
+
+        assert_focus_invariant(&state);
+        state.start_focus(&id_a, now, model::FocusActor::Person);
+        assert_focus_invariant(&state);
+        state.stop_focus(now);
+        assert_focus_invariant(&state);
+        state.start_focus(
+            &id_b,
+            now,
+            model::FocusActor::Agent { session_id: None },
+        );
+        assert_focus_invariant(&state);
+        state.start_focus(&id_a, now, model::FocusActor::Person); // preempts b
+        assert_focus_invariant(&state);
+        state.complete_todo(&id_a, now);
+        assert_focus_invariant(&state);
+        state.sanitize_stale_focus(now);
+        assert_focus_invariant(&state);
+        // Deleting a focused todo must not strand an open row.
+        state.start_focus(&id_b, now, model::FocusActor::Person);
+        assert_focus_invariant(&state);
+        state.remove_todo(&id_b);
+        assert_focus_invariant(&state);
     }
 
     #[test]
@@ -547,6 +888,67 @@ mod tests {
         assert_eq!(t.status, model::TodoStatus::Open);
         assert_eq!(t.actual_minutes, 120, "overnight sessions cap at 2h");
         assert!(t.started_at.is_none());
+    }
+
+    #[test]
+    fn sanitize_closes_the_session_row_honestly() {
+        let now: chrono::DateTime<chrono::Utc> = "2026-08-13T09:00:00Z".parse().unwrap();
+        let started = now - chrono::Duration::hours(14);
+        let mut state = PlannerState::default();
+        let mut t = Todo::new("forgotten overnight", 0.0);
+        t.status = model::TodoStatus::InProgress;
+        t.started_at = Some(started);
+        let id = t.id.clone();
+        state.upsert_todo(t);
+        // The row a previous process left open (as start_focus writes it).
+        state
+            .focus_sessions
+            .push(model::FocusSession::open(&id, started, model::FocusActor::Person));
+
+        state.sanitize_stale_focus(now);
+        assert_focus_invariant(&state);
+        let row = &state.focus_sessions[0];
+        assert_eq!(row.end_reason, Some(model::FocusEndReason::Recovered));
+        // Honest bounds, clamped bank, real elapsed noted.
+        assert_eq!(row.started_at, started);
+        assert_eq!(row.ended_at, Some(now), "real wall-clock end, not the clamp");
+        assert_eq!(row.minutes, 120, "the row's bank matches the clamped aggregate");
+        assert_eq!(row.unclamped_minutes, Some(14 * 60), "the truth is noted in data");
+        assert_eq!(state.todo(&id).unwrap().actual_minutes, 120);
+        // The closed row is queued for persistence (PlannerState::load drains it).
+        assert_eq!(state.take_dirty_focus_sessions().len(), 1);
+
+        // A short stale session (under the clamp) closes without the note.
+        let mut state = PlannerState::default();
+        let mut t = Todo::new("brief", 0.0);
+        t.status = model::TodoStatus::InProgress;
+        t.started_at = Some(now - chrono::Duration::minutes(30));
+        let id = t.id.clone();
+        state.upsert_todo(t);
+        state.focus_sessions.push(model::FocusSession::open(
+            &id,
+            now - chrono::Duration::minutes(30),
+            model::FocusActor::Person,
+        ));
+        state.sanitize_stale_focus(now);
+        let row = &state.focus_sessions[0];
+        assert_eq!(row.minutes, 30);
+        assert_eq!(row.unclamped_minutes, None);
+
+        // Orphaned open rows (no matching InProgress todo) are closed too —
+        // nothing survives sanitize as a forever-live session.
+        let mut state = PlannerState::default();
+        state.focus_sessions.push(model::FocusSession::open(
+            "td_gone",
+            now - chrono::Duration::minutes(10),
+            model::FocusActor::Person,
+        ));
+        state.sanitize_stale_focus(now);
+        assert_focus_invariant(&state);
+        assert_eq!(
+            state.focus_sessions[0].end_reason,
+            Some(model::FocusEndReason::Recovered)
+        );
     }
 
     #[test]

@@ -48,6 +48,11 @@ tools.json
 docs/
 
 # Security - Local Keys
+# License signing keypair for the mint helper — the private key must never
+# be committed or shipped (the *.key rule below also covers it; listed
+# explicitly so the intent is unmissable).
+scripts/mint_license/keys/
+scripts/mint_license/target/
 *.p12
 *.key
 *.certSigningRequest

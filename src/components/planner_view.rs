@@ -16,7 +16,9 @@ use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
 use crate::settings::Settings;
-use crate::todo::model::{self, BlockSource, TimeBlock, TimeOfDay, Todo, TodoBucket, TodoStatus};
+use crate::todo::model::{
+    self, BlockSource, FocusActor, TimeBlock, TimeOfDay, Todo, TodoBucket, TodoStatus,
+};
 use crate::todo::store;
 use crate::todo::views::{self, TodoView};
 use crate::todo::PlannerState;
@@ -24,11 +26,26 @@ use crate::todo::PlannerState;
 /// Vertical scale of the day timeline.
 const PX_PER_HOUR: f64 = 48.0;
 
-/// What the centre column is showing: a built-in view or a single project.
+/// Current-time indicator color: warm orange, complementary to the cool
+/// blue/green block palette and distinct from the subscription palette's red.
+const NOW_LINE_COLOR: &str = "#fb923c";
+
+/// Pixel offset of the current-time line inside the ruler, or `None` when
+/// "now" falls outside the rendered workday window.
+fn now_line_offset(now_min: i64, day_start: u32, day_end: u32) -> Option<f64> {
+    if now_min < day_start as i64 || now_min > day_end as i64 {
+        return None;
+    }
+    Some((now_min - day_start as i64) as f64 / 60.0 * PX_PER_HOUR)
+}
+
+/// What the centre column is showing: a built-in view, a single project, or
+/// the fleet panel (Pro).
 #[derive(Clone, Debug, PartialEq)]
 enum PlannerSelection {
     View(TodoView),
     Project(String),
+    Fleet,
 }
 
 /// Which timeline block is selected on the Today rail. Provided at the
@@ -67,6 +84,16 @@ pub(crate) fn persist_todo(planner: &Signal<PlannerState>, id: &str) {
 pub(crate) fn persist_block(block: &TimeBlock) {
     if let Err(e) = store::save_block(block) {
         tracing::error!("planner: failed to save block {}: {}", block.id, e);
+    }
+}
+
+/// Write through the focus-session rows the last state operation touched
+/// (start/stop/complete/… open and close them at the PlannerState layer).
+pub(crate) fn persist_focus_sessions(planner: &mut Signal<PlannerState>) {
+    for s in planner.write().take_dirty_focus_sessions() {
+        if let Err(e) = store::save_focus_session(&s) {
+            tracing::error!("planner: failed to save focus session {}: {}", s.id, e);
+        }
     }
 }
 
@@ -148,6 +175,121 @@ fn off_window(start_min: i64, end_min: i64, day_start: u32, day_end: u32) -> Opt
     }
 }
 
+/// [`block_geometry`] plus honesty about the clamp: external (calendar) blocks
+/// that spill past a workday edge render clamped with a dashed cue on the
+/// clamped side instead of silently looking shorter than the meeting is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClampedGeometry {
+    top: f64,
+    height: f64,
+    /// The block starts before the workday window opens.
+    clamped_top: bool,
+    /// The block ends after the workday window closes.
+    clamped_bottom: bool,
+}
+
+/// Geometry for an external block: identical pixels to [`block_geometry`],
+/// with flags for which edge (if either) was clamped to the window. `None` for
+/// zero-length spans and blocks entirely outside the window — those are
+/// tallied into the off-window count strip, never drawn.
+fn clamped_block_geometry(
+    start_min: i64,
+    end_min: i64,
+    day_start: u32,
+    day_end: u32,
+) -> Option<ClampedGeometry> {
+    if end_min <= start_min {
+        return None; // zero-length guard, mirrors block_geometry
+    }
+    let (top, height) = block_geometry(start_min, end_min, day_start, day_end)?;
+    Some(ClampedGeometry {
+        top,
+        height,
+        clamped_top: start_min < day_start as i64,
+        clamped_bottom: end_min > day_end as i64,
+    })
+}
+
+/// Label for external events the ruler can't show at all: `"2 earlier · 1
+/// later"`. `None` when there is nothing outside the window.
+fn fmt_outside_counts(earlier: usize, later: usize) -> Option<String> {
+    match (earlier, later) {
+        (0, 0) => None,
+        (e, 0) => Some(format!("{} earlier", e)),
+        (0, l) => Some(format!("{} later", l)),
+        (e, l) => Some(format!("{} earlier · {} later", e, l)),
+    }
+}
+
+/// Resolve a subscription id to its display color. `None` when the block has
+/// no subscription or the subscription no longer exists — callers fall back
+/// to the muted external style.
+fn subscription_color(
+    subs: &[crate::settings::CalendarSubscription],
+    subscription_id: Option<&str>,
+) -> Option<String> {
+    let id = subscription_id?;
+    subs.iter().find(|s| s.id == id).map(|s| s.color.clone())
+}
+
+/// Inline style for an external block: geometry, subscription tint (left color
+/// bar + translucent fill — `26` is ~15% alpha appended to the hex), and
+/// dashed cues on window-clamped edges. Non-busy (free / focus-time) events
+/// get a subtler treatment — fainter fill (`14` ≈ 8% alpha), a dashed left
+/// bar, and reduced opacity — so they read as non-blocking. Tentative busy
+/// meetings keep the full busy tint (they still block time) but swap the
+/// solid left bar for a dashed one — pencilled in, not inked. Inline because
+/// Tailwind purges computed class names.
+fn external_block_style(
+    top: f64,
+    height: f64,
+    color: Option<&str>,
+    clamped_top: bool,
+    clamped_bottom: bool,
+    busy: bool,
+    tentative: bool,
+) -> String {
+    let mut style = format!("top: {top}px; height: {height}px;");
+    if let Some(c) = color {
+        if busy {
+            let bar = if tentative { "dashed" } else { "solid" };
+            style.push_str(&format!(
+                " border-left: 3px {bar} {c}; background-color: {c}26;"
+            ));
+        } else {
+            style.push_str(&format!(
+                " border-left: 3px dashed {c}; background-color: {c}14;"
+            ));
+        }
+    }
+    if !busy {
+        style.push_str(" opacity: 0.65;");
+    }
+    if clamped_top {
+        style.push_str(" border-top-width: 2px; border-top-style: dashed;");
+    }
+    if clamped_bottom {
+        style.push_str(" border-bottom-width: 2px; border-bottom-style: dashed;");
+    }
+    style
+}
+
+/// Today's all-day events for enabled subscriptions, for the banner row above
+/// the timeline. All-day events are cached but never materialized as blocks
+/// (a 24h block would wreck the ruler), so the banner reads the cache
+/// directly. Multi-day spans show on every local day they cover; the end is
+/// exclusive, so an event ending at local midnight does not bleed into the
+/// next day.
+fn all_day_events_for(
+    events: &[model::CalendarEvent],
+    enabled_subscriptions: &std::collections::HashSet<String>,
+    day: NaiveDate,
+) -> Vec<model::CalendarEvent> {
+    // Shared with the planner_today context and HOBBES_CALENDAR_LIST — one
+    // definition of "today's all-day events" for every surface.
+    crate::todo::views::all_day_events_on(events, enabled_subscriptions, day)
+}
+
 /// Round down to the nearest quarter hour, so clicked blocks land on tidy edges.
 fn snap_to_quarter(minutes: u32) -> u32 {
     minutes - minutes % 15
@@ -198,6 +340,95 @@ fn first_free_slot(busy: &[(u32, u32)], day_start: u32, duration: u32) -> u32 {
         }
     }
     candidate
+}
+
+/// Where automatic placement starts searching for a free slot.
+///
+/// For today, never before *now*: auto-placing work into the morning that has
+/// already passed plans fiction. The current minute snaps FORWARD to the
+/// quarter grid so placed blocks keep tidy edges, and the workday start still
+/// applies as a floor. Future days search from the workday start as before.
+/// Only automatic placement is clamped — manual drags and explicit AI times
+/// stay allowed anywhere (user intent wins).
+fn placement_search_start(workday_start_min: u32, now_min_local: u32, is_today: bool) -> u32 {
+    if !is_today {
+        return workday_start_min;
+    }
+    workday_start_min.max(now_min_local.div_ceil(15) * 15)
+}
+
+/// Assign side-by-side columns to overlapping timeline blocks.
+///
+/// Input: `(id, start_min, end_min)` per block. Output: id → `(column_index,
+/// column_count)`. Blocks are grouped into clusters of *transitively*
+/// overlapping intervals (touching edges — end == next start — do NOT overlap,
+/// consistent with `TimeBlock::overlaps`); within a cluster, a greedy sweep
+/// places each block (sorted by start) into the first column whose last block
+/// ends at or before its start. The column count is capped at 3: a block that
+/// would land in column ≥ 3 shares column 2 instead — a slight visual overlap
+/// beats unreadably thin slivers. Single-block clusters keep `(0, 1)`, i.e.
+/// full width.
+fn assign_overlap_columns(
+    blocks: &[(String, u32, u32)],
+) -> std::collections::HashMap<String, (usize, usize)> {
+    const MAX_COLUMNS: usize = 3;
+    let mut out = std::collections::HashMap::new();
+
+    let mut sorted: Vec<&(String, u32, u32)> = blocks.iter().filter(|(_, s, e)| e > s).collect();
+    sorted.sort_by_key(|(_, s, e)| (*s, *e));
+
+    let mut i = 0;
+    while i < sorted.len() {
+        // Grow the cluster while the next block starts before the furthest
+        // end seen so far (strict <: touching edges start a new cluster).
+        let mut cluster_end = sorted[i].2;
+        let mut j = i + 1;
+        while j < sorted.len() && sorted[j].1 < cluster_end {
+            cluster_end = cluster_end.max(sorted[j].2);
+            j += 1;
+        }
+
+        // Greedy column assignment within the cluster.
+        let mut column_ends: Vec<u32> = Vec::new(); // last end per column
+        let mut assigned: Vec<(&str, usize)> = Vec::new();
+        for (id, s, e) in &sorted[i..j] {
+            let col = match column_ends.iter().position(|end| *end <= *s) {
+                Some(col) => {
+                    column_ends[col] = *e;
+                    col
+                }
+                None => {
+                    column_ends.push(*e);
+                    column_ends.len() - 1
+                }
+            };
+            assigned.push((id, col));
+        }
+        let count = column_ends.len().min(MAX_COLUMNS);
+        for (id, col) in assigned {
+            out.insert(id.to_string(), (col.min(MAX_COLUMNS - 1), count));
+        }
+        i = j;
+    }
+    out
+}
+
+/// The horizontal style fragment for a timeline block in its overlap column.
+///
+/// Column 0 of 1 (no overlap) keeps the classic full-width footprint
+/// (44px hour-label gutter on the left, 4px margin on the right). Overlapping
+/// blocks split the usable width evenly with a small gutter between columns.
+/// Inline style, composed with the vertical geometry — Tailwind purges
+/// computed class names.
+fn overlap_column_style(col: usize, count: usize) -> String {
+    if count <= 1 {
+        return " left: 44px; right: 4px;".to_string();
+    }
+    let frac = 1.0 / count as f64;
+    let left_frac = frac * col as f64;
+    format!(
+        " left: calc(44px + (100% - 48px) * {left_frac:.4}); width: calc((100% - 48px) * {frac:.4} - 3px);"
+    )
 }
 
 /// A local wall-clock minute on `date`, as UTC. Clamped to the day; DST gaps
@@ -288,6 +519,8 @@ fn empty_state_line(selection: &PlannerSelection) -> &'static str {
         PlannerSelection::View(TodoView::Someday) => "Nothing on the back burner.",
         PlannerSelection::View(TodoView::Logbook) => "Nothing finished yet.",
         PlannerSelection::Project(_) => "No todos in this project yet.",
+        // The fleet renders its own empty state; no todo list exists there.
+        PlannerSelection::Fleet => "",
     }
 }
 
@@ -313,6 +546,7 @@ fn todos_for_selection(state: &PlannerState, selection: &PlannerSelection, day: 
             });
             out
         }
+        PlannerSelection::Fleet => Vec::new(),
     }
 }
 
@@ -338,6 +572,12 @@ fn FocusBar() -> Element {
     let Some(focus) = planner.read().focused().cloned() else {
         return rsx! {};
     };
+    // Who is driving this sitting: the live session row records the actor.
+    let agent_driven = planner
+        .read()
+        .open_focus_session_for(&focus.id)
+        .map(|s| s.actor.is_agent())
+        .unwrap_or(false);
     let now = Utc::now();
     let elapsed = focus.elapsed_minutes(now);
     let readout = match focus.estimate_minutes {
@@ -357,6 +597,13 @@ fn FocusBar() -> Element {
             class: "flex items-center gap-3 border-b border-subtle bg-primary-700/30 px-4 py-2",
             span { class: "h-2 w-2 shrink-0 rounded-full bg-primary-400 animate-pulse" }
             span { class: "min-w-0 truncate text-sm font-medium text-fg", "{focus.title}" }
+            if agent_driven {
+                span {
+                    class: "shrink-0 rounded-full border border-subtle px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-fg-muted",
+                    title: "This focus session was started by the assistant",
+                    "◇ agent"
+                }
+            }
             span {
                 class: if over { "shrink-0 text-xs text-red-400" } else { "shrink-0 text-xs text-fg-muted" },
                 "{readout}"
@@ -365,7 +612,12 @@ fn FocusBar() -> Element {
             button {
                 class: "shrink-0 rounded bg-btn-primary px-2 py-1 text-xs font-medium text-fg hover:bg-btn-primary-hover",
                 onclick: move |_| {
-                    mutate_todo(planner, &done_id, |t| t.mark_completed(Utc::now()));
+                    // State-level complete: also closes the live focus-session
+                    // row as 'completed'.
+                    if planner.write().complete_todo(&done_id, Utc::now()) {
+                        persist_todo(&planner, &done_id);
+                        persist_focus_sessions(&mut planner);
+                    }
                 },
                 "Done"
             }
@@ -376,6 +628,7 @@ fn FocusBar() -> Element {
                     let _ = &focus_id;
                     if planner.write().stop_focus(Utc::now()).is_some() {
                         persist_todo(&planner, &focus_id);
+                        persist_focus_sessions(&mut planner);
                     }
                 },
                 "Stop"
@@ -401,6 +654,33 @@ pub fn PlannerView() -> Element {
     // timebox chip on a row can select the block it navigates to.
     let selected_block = use_signal(|| Option::<String>::None);
     use_context_provider(|| SelectedBlockContext(selected_block));
+
+    // Menu-bar timer → planner reveal: the tray click handler (main.rs) parks
+    // the focused todo's id in this global because selection/detail state is
+    // local to this component and it may not even be mounted yet. Drain it:
+    // jump to Today, open the todo's detail card, and highlight its timeline
+    // block if it has one (the existing selection mechanism — no new pulse
+    // machinery). Setting the global back to None re-runs the effect once,
+    // which then no-ops.
+    {
+        let mut selection = selection;
+        let mut detail_open = detail_open;
+        let mut selected_block = selected_block;
+        use_effect(move || {
+            let pending = crate::focus_tray::PLANNER_REVEAL_TODO.read().clone();
+            let Some(id) = pending else { return };
+            selection.set(PlannerSelection::View(TodoView::Today));
+            let block_id = planner
+                .peek()
+                .blocks_on(today())
+                .iter()
+                .find(|b| b.todo_id.as_deref() == Some(id.as_str()))
+                .map(|b| b.id.clone());
+            selected_block.set(block_id);
+            detail_open.set(Some(id));
+            *crate::focus_tray::PLANNER_REVEAL_TODO.write() = None;
+        });
+    }
 
     // Auto-rollover, once per mount: yesterday's unfinished work reappears on
     // today's plate. Guarded by a signal so re-renders never repeat it.
@@ -578,7 +858,12 @@ fn RailItem<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static
 #[component]
 fn LeftRail(mut selection: Signal<PlannerSelection>) -> Element {
     let planner = use_context::<Signal<PlannerState>>();
+    let settings = use_context::<Signal<Settings>>();
+    let fleet_state = use_context::<Signal<crate::fleet::FleetState>>();
     let day = today();
+
+    let show_fleet = settings.read().fleet_enabled && crate::entitlement::pro_active();
+    let fleet_attention = fleet_state.read().attention_count();
 
     let state = planner.read();
     let count = |view: TodoView| views::in_view(&state.todos, view, day).len();
@@ -674,6 +959,18 @@ fn LeftRail(mut selection: Signal<PlannerSelection>) -> Element {
                 onclick: move |_| selection.set(PlannerSelection::View(TodoView::Logbook)),
             }
 
+            // Fleet (Pro surface): only when the feature is on AND Pro is
+            // active. The badge counts sessions waiting on the user.
+            if show_fleet {
+                RailItem {
+                    icon: fi_icons::FiMonitor,
+                    label: "Fleet",
+                    count: fleet_attention,
+                    selected: sel == PlannerSelection::Fleet,
+                    onclick: move |_| selection.set(PlannerSelection::Fleet),
+                }
+            }
+
             if has_tree {
                 div { class: "my-2 border-t border-faint" }
             }
@@ -725,8 +1022,15 @@ fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
     let planner = use_context::<Signal<PlannerState>>();
     let sel = selection.read().clone();
 
+    // The fleet panel replaces the todo column wholesale — it has its own
+    // header, list, and empty state.
+    if sel == PlannerSelection::Fleet {
+        return rsx! { crate::components::fleet_view::FleetView {} };
+    }
+
     let title = match &sel {
         PlannerSelection::View(v) => view_title(*v).to_string(),
+        PlannerSelection::Fleet => unreachable!("handled above"),
         PlannerSelection::Project(id) => planner
             .read()
             .projects
@@ -1106,13 +1410,18 @@ fn TodoRow(todo: Todo, mut selection: Signal<PlannerSelection>) -> Element {
                 .todo(&id)
                 .map(|t| t.status.is_closed())
                 .unwrap_or(false);
-            mutate_todo(planner, &id, |t| {
+            // State-level transitions: completing (or reopening an
+            // in-progress todo) must also close its focus-session row.
+            {
+                let mut state = planner.write();
                 if currently_done {
-                    t.reopen(now);
+                    state.reopen_todo(&id, now);
                 } else {
-                    t.mark_completed(now);
+                    state.complete_todo(&id, now);
                 }
-            });
+            }
+            persist_todo(&planner, &id);
+            persist_focus_sessions(&mut planner);
         }
     };
 
@@ -1148,6 +1457,8 @@ fn TodoRow(todo: Todo, mut selection: Signal<PlannerSelection>) -> Element {
                 tracing::error!("planner: failed to delete todo {}: {}", id, e);
             }
             planner.write().remove_todo(&id);
+            // Deleting mid-focus closed its session row; keep the history.
+            persist_focus_sessions(&mut planner);
         }
     };
 
@@ -1339,13 +1650,15 @@ fn TodoRow(todo: Todo, mut selection: Signal<PlannerSelection>) -> Element {
                                 if in_focus {
                                     if planner.write().stop_focus(now).is_some() {
                                         persist_todo(&planner, &id);
+                                        persist_focus_sessions(&mut planner);
                                     }
                                 } else {
                                     // Focus implies today: start_focus may
                                     // reschedule the todo and prune off-day
                                     // blocks, whose rows we must delete.
-                                    let (changed, pruned) =
-                                        planner.write().start_focus(&id, now);
+                                    let (changed, pruned) = planner
+                                        .write()
+                                        .start_focus(&id, now, FocusActor::Person);
                                     for cid in &changed {
                                         persist_todo(&planner, cid);
                                     }
@@ -1357,6 +1670,7 @@ fn TodoRow(todo: Todo, mut selection: Signal<PlannerSelection>) -> Element {
                                             );
                                         }
                                     }
+                                    persist_focus_sessions(&mut planner);
                                 }
                             }
                         },
@@ -1375,8 +1689,9 @@ fn TodoRow(todo: Todo, mut selection: Signal<PlannerSelection>) -> Element {
                             let todo = todo.clone();
                             let id = id.clone();
                             move |_| {
-                                let (changed, pruned) =
-                                    planner.write().start_focus(&id, Utc::now());
+                                let (changed, pruned) = planner
+                                    .write()
+                                    .start_focus(&id, Utc::now(), FocusActor::Person);
                                 for cid in &changed {
                                     persist_todo(&planner, cid);
                                 }
@@ -1388,6 +1703,7 @@ fn TodoRow(todo: Todo, mut selection: Signal<PlannerSelection>) -> Element {
                                         );
                                     }
                                 }
+                                persist_focus_sessions(&mut planner);
                                 chat_command.set(Some(
                                     crate::components::chat_input::ChatCommand::StartTodoInChat(
                                         activation_seed(&todo),
@@ -1479,7 +1795,7 @@ fn TodoRow(todo: Todo, mut selection: Signal<PlannerSelection>) -> Element {
 // ── Right rail: capacity + timeline (Today only) ────────────────────────────
 
 #[component]
-fn CapacityBar(planned: u32, done: u32, capacity: u32, summary: String) -> Element {
+fn CapacityBar(planned: u32, done: u32, capacity: u32, agent: u32, summary: String) -> Element {
     // The bar's full width represents whichever is larger, so overcommitment
     // shows as a red tail instead of silently clipping at 100%. `planned`
     // includes `done`: finished work fills from the left with its own tint so
@@ -1490,6 +1806,11 @@ fn CapacityBar(planned: u32, done: u32, capacity: u32, summary: String) -> Eleme
     let done_pct = (done.min(within) as f64 / denom) * 100.0;
     let open_pct = (within.saturating_sub(done) as f64 / denom) * 100.0;
     let over_pct = (planned.saturating_sub(capacity) as f64 / denom) * 100.0;
+    // The agent lane shares the person bar's scale but never its space:
+    // agent minutes consume no capacity, so they render as their own thin
+    // strip below rather than a segment of the day.
+    let agent_pct = ((agent as f64 / denom) * 100.0).min(100.0);
+    let agent_label = format!("{} agent focus today", model::format_minutes(agent));
 
     rsx! {
         div {
@@ -1513,6 +1834,17 @@ fn CapacityBar(planned: u32, done: u32, capacity: u32, summary: String) -> Eleme
                     }
                 }
             }
+            if agent > 0 {
+                div {
+                    class: "w-full overflow-hidden rounded-full bg-input border border-faint flex",
+                    style: "height: 4px;",
+                    title: "{agent_label}",
+                    div {
+                        class: "h-full",
+                        style: "width: {agent_pct}%; background-color: #a78bfa;",
+                    }
+                }
+            }
             p { class: "text-xs text-fg-muted", "{summary}" }
         }
     }
@@ -1522,7 +1854,20 @@ fn CapacityBar(planned: u32, done: u32, capacity: u32, summary: String) -> Eleme
 fn TodayRail() -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let settings = use_context::<Signal<Settings>>();
+    let fleet_state = use_context::<Signal<crate::fleet::FleetState>>();
     let mut selected_block = use_context::<SelectedBlockContext>().0;
+
+    // Current-time indicator: a once-a-minute tick is enough for a line that
+    // moves ~0.8 px/min; subscribing to it re-renders the rail so the line
+    // crawls without any other state changing.
+    let mut now_tick = use_signal(|| 0u64);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            now_tick += 1;
+        }
+    });
+    let _subscribe_now = *now_tick.read();
 
     let day = today();
     let settings_read = settings.read();
@@ -1531,14 +1876,73 @@ fn TodayRail() -> Element {
         &settings_read.planner_workday_end,
     );
     let default_capacity = settings_read.planner_daily_capacity_minutes;
+    let meetings_count = settings_read.planner_calendar_counts_against_capacity;
+    let calendar_subs = settings_read.planner_calendar_subscriptions.clone();
     drop(settings_read);
 
+    // All-day events render as a banner, not blocks — they exist only in the
+    // calendar cache, never as TimeBlocks. The memo re-reads the cache when
+    // the planner state or the subscription set changes (sync passes write the
+    // planner signal), keeping per-render cost at a clone, not a SQLite query.
+    let all_day_memo = use_memo(move || {
+        let enabled: std::collections::HashSet<String> = settings
+            .read()
+            .planner_calendar_subscriptions
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.id.clone())
+            .collect();
+        let _ = planner.read().blocks.len(); // re-read after a sync pass lands
+        let events = store::load_calendar_events(None).unwrap_or_else(|e| {
+            tracing::error!("planner: failed to load calendar cache: {}", e);
+            Vec::new()
+        });
+        all_day_events_for(&events, &enabled, today())
+    });
+    let all_day_events: Vec<model::CalendarEvent> = all_day_memo.read().clone();
+
     let state = planner.read();
-    let capacity = model::measure_capacity(
+    let mut capacity = model::measure_capacity_full(
         &state.todos,
+        &state.blocks,
+        &state.focus_sessions,
         day,
         state.capacity_for(day, default_capacity),
+        meetings_count,
     );
+    // Pro surfaces: the agent lane (+ its summary suffix) and the strategic
+    // readout. Recording is never gated — the rows exist either way; a Free
+    // build simply doesn't display the split.
+    let pro = crate::entitlement::pro_active();
+    let strategic_line: Option<String> = if pro {
+        let person_today = model::person_minutes_on(&state.focus_sessions, day);
+        let agent_today = model::agent_minutes_on(&state.focus_sessions, day);
+        let (gap_count, gap_minutes) =
+            model::strategic_gaps(&state.focus_sessions, (day_start, day_end), day);
+        (person_today > 0 || agent_today > 0).then(|| {
+            format!(
+                "{} person · {} agent · {}x strategic gaps · {}",
+                model::format_minutes(person_today),
+                model::format_minutes(agent_today),
+                gap_count,
+                model::format_minutes(gap_minutes),
+            )
+        })
+    } else {
+        None
+    };
+    // Fleet time joins the agent lane: external Claude Code sessions'
+    // active minutes today, from the fleet's own tables/state — a distinct
+    // source from in-app agent focus sessions, summed only for display.
+    // `agent_lane_minutes` zeroes the whole lane for Free builds (the lane
+    // is a Pro surface; recording is never gated).
+    let fleet_today = if pro {
+        crate::fleet::fleet_agent_minutes_on(&fleet_state.read(), day, Utc::now())
+    } else {
+        0
+    };
+    capacity.agent_minutes =
+        crate::fleet::agent_lane_minutes(pro, capacity.agent_minutes, fleet_today);
     let blocks: Vec<TimeBlock> = state.blocks_on(day).into_iter().cloned().collect();
     // Open but not yet on the ruler — the "still to place" pool. Unestimated
     // todos belong here too (U2.3): placing one uses the default block length
@@ -1575,9 +1979,13 @@ fn TodayRail() -> Element {
 
     // Blocks the ruler culls (fully outside the workday window) still exist
     // and still count — first-fit overflow is deliberately honest — so they
-    // get a strip of their own instead of rendering nowhere.
+    // get a strip of their own instead of rendering nowhere. External blocks
+    // are excluded: the strip carries select/delete affordances that must not
+    // exist for read-only mirrored events, so they get a compact count
+    // indicator on the ruler instead.
     let off_window_blocks: Vec<(TimeBlock, OffWindow)> = blocks
         .iter()
+        .filter(|b| !matches!(b.source, BlockSource::External { .. }))
         .filter_map(|b| {
             off_window(
                 minutes_in_local_day(&b.start),
@@ -1589,7 +1997,26 @@ fn TodayRail() -> Element {
         })
         .collect();
 
+    // External events entirely outside the workday window: counted, not drawn.
+    let (external_earlier, external_later) = blocks
+        .iter()
+        .filter(|b| matches!(b.source, BlockSource::External { .. }))
+        .fold((0usize, 0usize), |(e, l), b| {
+            match off_window(
+                minutes_in_local_day(&b.start),
+                minutes_in_local_day(&b.end),
+                day_start,
+                day_end,
+            ) {
+                Some(OffWindow::Early) => (e + 1, l),
+                Some(OffWindow::After) => (e, l + 1),
+                None => (e, l),
+            }
+        });
+    let outside_label = fmt_outside_counts(external_earlier, external_later);
+
     let timeline_height = (day_end - day_start) as f64 / 60.0 * PX_PER_HOUR;
+    let now_line_top = now_line_offset(minutes_in_local_day(&Utc::now()), day_start, day_end);
     let hours: Vec<u32> = (day_start / 60..=day_end / 60)
         .filter(|h| h * 60 >= day_start && h * 60 <= day_end)
         .collect();
@@ -1630,8 +2057,11 @@ fn TodayRail() -> Element {
         }
     };
 
+    // Auto-placement's busy set. Non-busy external blocks (free / focus-time
+    // mirrors) are NOT busy — tasks may be placed over them.
     let busy: Vec<(u32, u32)> = blocks
         .iter()
+        .filter(|b| !matches!(b.source, BlockSource::External { busy: false, .. }))
         .map(|b| {
             (
                 minutes_in_local_day(&b.start).max(0) as u32,
@@ -1639,6 +2069,22 @@ fn TodayRail() -> Element {
             )
         })
         .collect();
+
+    // Overlap columns for the ruler: computed from the *stored* positions of
+    // every block on the day (a mid-drag preview keeps its column — width
+    // reflow mid-drag would jitter). Keyed by block id.
+    let overlap_columns = assign_overlap_columns(
+        &blocks
+            .iter()
+            .map(|b| {
+                (
+                    b.id.clone(),
+                    minutes_in_local_day(&b.start).max(0) as u32,
+                    minutes_in_local_day(&b.end).max(0) as u32,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
 
     // Timeline drag: (block id, mode, anchor screen-y, orig start, orig end).
     // The preview holds the snapped (start, end) under the cursor; because it
@@ -1709,7 +2155,57 @@ fn TodayRail() -> Element {
                 planned: capacity.planned_minutes,
                 done: capacity.done_minutes,
                 capacity: capacity.capacity_minutes,
+                agent: capacity.agent_minutes,
                 summary: capacity.summary(),
+            }
+            // Strategic-time readout v1 (Pro): person vs agent focus totals
+            // and the usable gaps between person sittings in the workday.
+            if let Some(line) = strategic_line {
+                p { class: "text-xs text-fg-muted", "{line}" }
+            }
+
+            // All-day events: a thin banner row above the timeline. These are
+            // cached calendar events, never TimeBlocks — a 24h block would
+            // wreck the ruler geometry.
+            if !all_day_events.is_empty() {
+                div {
+                    class: "flex flex-wrap gap-1",
+                    for ev in all_day_events {
+                        {
+                            let color = subscription_color(&calendar_subs, Some(&ev.subscription_id))
+                                .unwrap_or_else(|| "#94a3b8".to_string());
+                            let url = ev.url.clone();
+                            let has_url = url.is_some();
+                            rsx! {
+                                div {
+                                    key: "allday-{ev.subscription_id}-{ev.uid}",
+                                    class: if has_url {
+                                        "flex min-w-0 items-center gap-1.5 rounded-full bg-input px-2 py-0.5 cursor-pointer hover:bg-card"
+                                    } else {
+                                        "flex min-w-0 items-center gap-1.5 rounded-full bg-input px-2 py-0.5"
+                                    },
+                                    title: if has_url { "All-day event — click to open" } else { "All-day event" },
+                                    onclick: move |evt| {
+                                        evt.stop_propagation();
+                                        if let Some(url) = &url {
+                                            if let Err(e) = open::that_detached(url) {
+                                                tracing::error!("planner: failed to open event link: {}", e);
+                                            }
+                                        }
+                                    },
+                                    span {
+                                        class: "h-2 w-2 shrink-0 rounded-full",
+                                        style: "background-color: {color};",
+                                    }
+                                    span { class: "min-w-0 truncate text-[11px] text-fg-muted", "{ev.title}" }
+                                    if has_url {
+                                        Icon { width: 10, height: 10, icon: fi_icons::FiExternalLink }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Hour-ruled timeline. All geometry is inline style — Tailwind
@@ -1722,6 +2218,14 @@ fn TodayRail() -> Element {
                     let minutes = day_start + (y / PX_PER_HOUR * 60.0).max(0.0) as u32;
                     create_block_at(minutes);
                 },
+                // External events the window can't show at all, as an honest
+                // count. Non-interactive so it never eats a create-block click.
+                if let Some(label) = outside_label {
+                    span {
+                        class: "pointer-events-none absolute right-1 top-0.5 z-10 rounded-full bg-input px-2 py-0.5 text-[10px] text-fg-muted",
+                        "{label}"
+                    }
+                }
                 for hour in hours {
                     {
                         let top = (hour * 60 - day_start) as f64 / 60.0 * PX_PER_HOUR;
@@ -1738,20 +2242,72 @@ fn TodayRail() -> Element {
                         }
                     }
                 }
+                // Current-time line (this rail IS today). Complementary warm
+                // orange against the cool block palette; hidden outside the
+                // workday window. Non-interactive so create-block clicks and
+                // drags pass straight through it.
+                if let Some(top) = now_line_top {
+                    div {
+                        class: "pointer-events-none absolute left-0 right-0 z-20",
+                        style: "top: {top}px;",
+                        div {
+                            style: "position: absolute; left: 40px; right: 0; border-top: 2px solid {NOW_LINE_COLOR};",
+                        }
+                        div {
+                            style: "position: absolute; left: 36px; top: -3px; width: 8px; height: 8px; border-radius: 9999px; background: {NOW_LINE_COLOR};",
+                        }
+                    }
+                }
                 // Blocks fully outside the workday window are filtered before
-                // rsx so the loop body positions unconditionally.
-                for (block, s_min, e_min, top, height) in blocks.iter().filter_map(|b| {
+                // rsx so the loop body positions unconditionally. External
+                // blocks carry clamp flags for the dashed-edge cue; manual and
+                // auto blocks keep the plain geometry (their off-window home
+                // is the strip below the ruler).
+                for (block, s_min, e_min, geo) in blocks.iter().filter_map(|b| {
                     // A block mid-drag renders at its previewed position, not
                     // its stored one.
                     let (s_min, e_min) = match &preview_for {
                         Some((pid, ps, pe)) if *pid == b.id => (*ps as i64, *pe as i64),
                         _ => (minutes_in_local_day(&b.start), minutes_in_local_day(&b.end)),
                     };
-                    block_geometry(s_min, e_min, day_start, day_end)
-                        .map(|(top, height)| (b, s_min, e_min, top, height))
+                    let geo = if matches!(b.source, BlockSource::External { .. }) {
+                        clamped_block_geometry(s_min, e_min, day_start, day_end)
+                    } else {
+                        block_geometry(s_min, e_min, day_start, day_end).map(|(top, height)| {
+                            ClampedGeometry { top, height, clamped_top: false, clamped_bottom: false }
+                        })
+                    };
+                    geo.map(|geo| (b, s_min, e_min, geo))
                 }) {
                     {
                         let is_external = matches!(block.source, BlockSource::External { .. });
+                        // Subscription tint + deep link for mirrored calendar
+                        // events. A block whose subscription is unknown (legacy
+                        // or just removed) keeps the muted fallback style.
+                        let (ext_color, ext_url, ext_busy, ext_tentative) = match &block.source {
+                            BlockSource::External { subscription_id, url, busy, tentative, .. } => (
+                                subscription_color(&calendar_subs, subscription_id.as_deref()),
+                                url.clone(),
+                                *busy,
+                                *tentative,
+                            ),
+                            _ => (None, None, true, false),
+                        };
+                        let has_url = ext_url.is_some();
+                        let click_url = ext_url.clone();
+                        let ClampedGeometry { top, height, clamped_top, clamped_bottom } = geo;
+                        let mut block_style = if is_external {
+                            external_block_style(top, height, ext_color.as_deref(), clamped_top, clamped_bottom, ext_busy, ext_tentative)
+                        } else {
+                            format!("top: {top}px; height: {height}px;")
+                        };
+                        // Overlapping blocks share the rail width side by side;
+                        // a lone block keeps the classic full-width footprint.
+                        let (col, count) = overlap_columns
+                            .get(&block.id)
+                            .copied()
+                            .unwrap_or((0, 1));
+                        block_style.push_str(&overlap_column_style(col, count));
                         let is_selected = selected_block.read().as_deref() == Some(block.id.as_str());
                         let is_dragging_this = preview_for.as_ref().is_some_and(|(pid, _, _)| *pid == block.id);
                         let (display_title, is_done, is_focus_block) = linked_info
@@ -1769,12 +2325,19 @@ fn TodayRail() -> Element {
                         let end_label = fmt_hhmm(e_min.max(0) as u32);
                         // Three-way conditional lives outside rsx: the macro's
                         // conditional-attribute form only supports if/else.
+                        // Horizontal placement (left/width) arrives via the
+                        // inline overlap-column style, never via classes.
                         let block_class = if is_external {
-                            "absolute left-11 right-1 overflow-hidden rounded border border-faint bg-input px-1.5 py-0.5 text-fg-muted"
+                            if ext_color.is_some() {
+                                // Fill and left bar arrive via inline style.
+                                "absolute overflow-hidden rounded border border-faint px-1.5 py-0.5 text-fg-muted"
+                            } else {
+                                "absolute overflow-hidden rounded border border-faint bg-input px-1.5 py-0.5 text-fg-muted"
+                            }
                         } else if is_selected {
-                            "absolute left-11 right-1 overflow-hidden rounded border border-subtle bg-btn-primary-hover px-1.5 py-0.5 text-fg cursor-grab"
+                            "absolute overflow-hidden rounded border border-subtle bg-btn-primary-hover px-1.5 py-0.5 text-fg cursor-grab"
                         } else {
-                            "absolute left-11 right-1 overflow-hidden rounded border border-subtle bg-btn-primary px-1.5 py-0.5 text-fg cursor-grab"
+                            "absolute overflow-hidden rounded border border-subtle bg-btn-primary px-1.5 py-0.5 text-fg cursor-grab"
                         };
                         rsx! {
                                 div {
@@ -1782,15 +2345,23 @@ fn TodayRail() -> Element {
                                     class: "{block_class}",
                                     class: if is_dragging_this { "z-10 ring-1 ring-primary-400" },
                                     class: if is_focus_block { "ring-1 ring-primary-300" },
-                                    style: "top: {top}px; height: {height}px;",
+                                    class: if is_external && has_url { "cursor-pointer" },
+                                    // Tentative invitations announce themselves in
+                                    // the hover tooltip; the dashed left bar is the
+                                    // at-a-glance cue.
+                                    title: if is_external && ext_tentative { "(tentative) {display_title}" },
+                                    style: "{block_style}",
                                     // Selection also runs through the drag: a
                                     // press that never leaves its quarter-hour
                                     // commits as a click in commit_block_drag.
                                     onmousedown: move |evt| {
-                                        if is_external {
-                                            return; // mirrored calendar events are read-only
-                                        }
+                                        // Mirrored calendar events are read-only:
+                                        // never start a drag, and never let the
+                                        // press reach the timeline surface.
                                         evt.stop_propagation();
+                                        if is_external {
+                                            return;
+                                        }
                                         block_drag.set(Some((
                                             drag_id.clone(),
                                             BlockDragMode::Move,
@@ -1799,12 +2370,33 @@ fn TodayRail() -> Element {
                                             orig_e,
                                         )));
                                     },
+                                    // Only external blocks handle click (deep
+                                    // link); stopping propagation also keeps
+                                    // the timeline's create-block onclick from
+                                    // minting a phantom block under the event.
+                                    onclick: move |evt| {
+                                        if is_external {
+                                            evt.stop_propagation();
+                                            if let Some(url) = &click_url {
+                                                if let Err(e) = open::that_detached(url) {
+                                                    tracing::error!("planner: failed to open event link: {}", e);
+                                                }
+                                            }
+                                        }
+                                    },
                                     div {
                                         class: "flex items-start justify-between gap-1",
                                         p {
                                             class: "truncate text-xs font-medium leading-4",
                                             class: if is_done { "line-through opacity-60" },
                                             "{display_title}"
+                                        }
+                                        if is_external && has_url {
+                                            span {
+                                                class: "shrink-0 opacity-70",
+                                                title: "Open in calendar",
+                                                Icon { width: 10, height: 10, icon: fi_icons::FiExternalLink }
+                                            }
                                         }
                                         if is_selected && !is_external {
                                             button {
@@ -2007,7 +2599,17 @@ fn TodayRail() -> Element {
                                         class: "shrink-0 rounded p-0.5 text-fg-muted hover:bg-input hover:text-fg",
                                         title: "Add to timeline at the first free slot",
                                         onclick: move |_| {
-                                            let start_min = first_free_slot(&busy, day_start, duration);
+                                            // Auto-placement never lands before now on today
+                                            // (this rail IS today): search from the current
+                                            // minute, snapped forward to the quarter grid.
+                                            let now_min =
+                                                minutes_in_local_day(&Utc::now()).max(0) as u32;
+                                            let search_from = placement_search_start(
+                                                day_start,
+                                                now_min,
+                                                day == today(),
+                                            );
+                                            let start_min = first_free_slot(&busy, search_from, duration);
                                             let block = TimeBlock {
                                                 id: uuid::Uuid::new_v4().to_string(),
                                                 todo_id: Some(todo_id.clone()),
@@ -2062,6 +2664,173 @@ fn TodayRail() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{CalendarSource, CalendarSubscription};
+    use chrono::{DateTime, Duration, TimeZone};
+    use std::collections::HashSet;
+
+    fn sub(id: &str, color: &str) -> CalendarSubscription {
+        CalendarSubscription {
+            id: id.into(),
+            name: format!("Sub {}", id),
+            color: color.into(),
+            enabled: true,
+            source: CalendarSource::Ics {},
+        }
+    }
+
+    /// A UTC instant at `hour`:00 **local** time on `day` — matches how the
+    /// planner builds instants, so tests stay timezone-independent.
+    fn local_instant(day: NaiveDate, hour: u32) -> DateTime<Utc> {
+        Local
+            .from_local_datetime(&day.and_hms_opt(hour, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn cal_event(sub: &str, uid: &str, start: DateTime<Utc>, end: DateTime<Utc>, all_day: bool) -> model::CalendarEvent {
+        model::CalendarEvent {
+            uid: uid.into(),
+            subscription_id: sub.into(),
+            title: format!("Event {}", uid),
+            start,
+            end,
+            all_day,
+            url: None,
+            location: None,
+            busy: true,
+            tentative: false,
+        }
+    }
+
+    #[test]
+    fn clamped_geometry_matches_block_geometry_when_fully_inside() {
+        // 09:30–10:15 in a 09:00–17:00 window: same pixels, no clamp flags.
+        let geo = clamped_block_geometry(570, 615, 540, 1020).unwrap();
+        assert_eq!((geo.top, geo.height), block_geometry(570, 615, 540, 1020).unwrap());
+        assert!(!geo.clamped_top && !geo.clamped_bottom);
+    }
+
+    #[test]
+    fn clamped_geometry_flags_the_clamped_side() {
+        // 08:00–10:00 against a 09:00 open: clamped at the top only.
+        let geo = clamped_block_geometry(480, 600, 540, 1020).unwrap();
+        assert_eq!((geo.top, geo.height), block_geometry(480, 600, 540, 1020).unwrap());
+        assert!(geo.clamped_top && !geo.clamped_bottom);
+        assert_eq!(geo.top, 0.0);
+
+        // 16:30–18:00 against a 17:00 close: clamped at the bottom only.
+        let geo = clamped_block_geometry(990, 1080, 540, 1020).unwrap();
+        assert!(!geo.clamped_top && geo.clamped_bottom);
+
+        // 08:00–18:00 spans the whole window: clamped on both sides.
+        let geo = clamped_block_geometry(480, 1080, 540, 1020).unwrap();
+        assert!(geo.clamped_top && geo.clamped_bottom);
+        assert_eq!(geo.top, 0.0);
+        assert_eq!(geo.height, 8.0 * PX_PER_HOUR);
+    }
+
+    #[test]
+    fn clamped_geometry_excludes_fully_outside_and_zero_length() {
+        // Entirely before the window / entirely after: not drawn (counted
+        // instead, via off_window).
+        assert_eq!(clamped_block_geometry(420, 540, 540, 1020), None);
+        assert_eq!(clamped_block_geometry(1020, 1080, 540, 1020), None);
+        assert_eq!(off_window(420, 540, 540, 1020), Some(OffWindow::Early));
+        assert_eq!(off_window(1020, 1080, 540, 1020), Some(OffWindow::After));
+        // Zero- and negative-length guard.
+        assert_eq!(clamped_block_geometry(600, 600, 540, 1020), None);
+        assert_eq!(clamped_block_geometry(600, 570, 540, 1020), None);
+    }
+
+    #[test]
+    fn fmt_outside_counts_reads_naturally() {
+        assert_eq!(fmt_outside_counts(0, 0), None);
+        assert_eq!(fmt_outside_counts(2, 0), Some("2 earlier".into()));
+        assert_eq!(fmt_outside_counts(0, 1), Some("1 later".into()));
+        assert_eq!(fmt_outside_counts(2, 1), Some("2 earlier · 1 later".into()));
+    }
+
+    #[test]
+    fn subscription_color_resolves_known_ids_and_falls_back() {
+        let subs = vec![sub("s1", "#4f9cf9"), sub("s2", "#34d399")];
+        assert_eq!(subscription_color(&subs, Some("s2")), Some("#34d399".into()));
+        assert_eq!(subscription_color(&subs, Some("gone")), None);
+        assert_eq!(subscription_color(&subs, None), None);
+        assert_eq!(subscription_color(&[], Some("s1")), None);
+    }
+
+    #[test]
+    fn external_block_style_carries_tint_and_clamp_cues() {
+        let plain = external_block_style(24.0, 36.0, None, false, false, true, false);
+        assert_eq!(plain, "top: 24px; height: 36px;");
+
+        let tinted = external_block_style(0.0, 48.0, Some("#34d399"), true, false, true, false);
+        assert!(tinted.contains("border-left: 3px solid #34d399;"));
+        assert!(tinted.contains("background-color: #34d39926;"), "{}", tinted);
+        assert!(tinted.contains("border-top-style: dashed;"));
+        assert!(!tinted.contains("border-bottom-style"));
+        assert!(!tinted.contains("opacity"), "busy blocks keep full opacity");
+
+        let bottom = external_block_style(0.0, 48.0, None, false, true, true, false);
+        assert!(bottom.contains("border-bottom-style: dashed;"));
+        assert!(!bottom.contains("border-top-style"));
+    }
+
+    #[test]
+    fn non_busy_external_block_style_reads_as_non_blocking() {
+        let free = external_block_style(0.0, 48.0, Some("#34d399"), false, false, false, false);
+        assert!(free.contains("border-left: 3px dashed #34d399;"), "{}", free);
+        assert!(free.contains("background-color: #34d39914;"), "fainter fill: {}", free);
+        assert!(free.contains("opacity: 0.65;"), "{}", free);
+
+        // Colorless free block still gets the opacity cue.
+        let plain_free = external_block_style(0.0, 48.0, None, false, false, false, false);
+        assert!(plain_free.contains("opacity: 0.65;"), "{}", plain_free);
+    }
+
+    #[test]
+    fn tentative_external_block_style_dashes_the_bar_but_keeps_the_busy_tint() {
+        let maybe = external_block_style(0.0, 48.0, Some("#34d399"), false, false, true, true);
+        assert!(maybe.contains("border-left: 3px dashed #34d399;"), "{}", maybe);
+        assert!(
+            maybe.contains("background-color: #34d39926;"),
+            "tentative keeps the full busy fill: {}",
+            maybe
+        );
+        assert!(
+            !maybe.contains("opacity"),
+            "tentative still blocks time — no free-style fade: {}",
+            maybe
+        );
+    }
+
+    #[test]
+    fn all_day_partition_filters_by_flag_subscription_and_day() {
+        let day: NaiveDate = "2026-08-12".parse().unwrap();
+        let enabled: HashSet<String> = ["s1".to_string()].into();
+        let midnight = local_instant(day, 0);
+
+        let events = vec![
+            // Today's all-day event on an enabled subscription: kept.
+            cal_event("s1", "offsite", midnight, midnight + Duration::days(1), true),
+            // Timed event: not an all-day banner.
+            cal_event("s1", "standup", local_instant(day, 9), local_instant(day, 10), false),
+            // Disabled subscription: dropped.
+            cal_event("s2", "other", midnight, midnight + Duration::days(1), true),
+            // Yesterday only (end is exclusive — it closes at today's
+            // midnight and must not bleed into today).
+            cal_event("s1", "yesterday", midnight - Duration::days(1), midnight, true),
+            // Multi-day span covering today: kept.
+            cal_event("s1", "conf", midnight - Duration::days(1), midnight + Duration::days(2), true),
+        ];
+
+        let uids: Vec<String> = all_day_events_for(&events, &enabled, day)
+            .into_iter()
+            .map(|e| e.uid)
+            .collect();
+        assert_eq!(uids, vec!["conf".to_string(), "offsite".to_string()]);
+    }
 
     #[test]
     fn parse_hhmm_accepts_valid_and_rejects_junk() {
@@ -2073,6 +2842,16 @@ mod tests {
         assert_eq!(parse_hhmm("nine"), None);
         assert_eq!(parse_hhmm("09"), None);
         assert_eq!(parse_hhmm(""), None);
+    }
+
+    #[test]
+    fn now_line_appears_only_inside_the_workday_window() {
+        // 09:00–17:00 window: before, at start, mid-day, at end, after.
+        assert_eq!(now_line_offset(8 * 60, 540, 1020), None);
+        assert_eq!(now_line_offset(540, 540, 1020), Some(0.0));
+        assert_eq!(now_line_offset(12 * 60 + 30, 540, 1020), Some(3.5 * PX_PER_HOUR));
+        assert_eq!(now_line_offset(1020, 540, 1020), Some(8.0 * PX_PER_HOUR));
+        assert_eq!(now_line_offset(1021, 540, 1020), None);
     }
 
     #[test]
@@ -2204,6 +2983,215 @@ mod tests {
         assert_eq!(first_free_slot(&[(630, 720), (540, 600)], 540, 30), 600);
         // Busy ends snap up to the next quarter hour.
         assert_eq!(first_free_slot(&[(540, 610)], 540, 30), 615);
+    }
+
+    /// Regression for Phase 5's busy-time verification: the timeline's
+    /// auto-place ("Add to timeline") builds its busy set from `blocks_on`,
+    /// which must include external calendar blocks (`todo_id: None`,
+    /// `BlockSource::External`) — a meeting is not free time.
+    #[test]
+    fn auto_placement_treats_external_meetings_as_busy() {
+        let day: NaiveDate = "2026-08-12".parse().unwrap();
+        let mut state = PlannerState::default();
+        state.blocks.push(TimeBlock {
+            id: "own".into(),
+            todo_id: None,
+            title: "Deep work".into(),
+            start: local_instant(day, 8),
+            end: local_instant(day, 9),
+            source: BlockSource::Manual,
+        });
+        state.blocks.push(TimeBlock {
+            id: "ext".into(),
+            todo_id: None,
+            title: "Board meeting".into(),
+            start: local_instant(day, 9),
+            end: local_instant(day, 11),
+            source: BlockSource::External {
+                uid: "mtg-1".into(),
+                subscription_id: Some("s1".into()),
+                url: None,
+                busy: true,
+                tentative: false,
+            },
+        });
+
+        // Exactly the component's construction (blocks_on → minute spans).
+        let blocks: Vec<TimeBlock> = state.blocks_on(day).into_iter().cloned().collect();
+        let busy: Vec<(u32, u32)> = blocks
+            .iter()
+            .map(|b| {
+                (
+                    minutes_in_local_day(&b.start).max(0) as u32,
+                    minutes_in_local_day(&b.end).max(0) as u32,
+                )
+            })
+            .collect();
+        // A 60-minute todo placed from 08:00 must skip both the own block and
+        // the meeting, landing at 11:00 — not 09:00, which is mid-meeting.
+        assert_eq!(first_free_slot(&busy, 8 * 60, 60), 11 * 60);
+    }
+
+    /// Mirror of the component's busy-set construction: non-busy external
+    /// blocks (free / focus time) are excluded, so auto-placement may place
+    /// tasks over them.
+    #[test]
+    fn auto_placement_ignores_non_busy_external_blocks() {
+        let day: NaiveDate = "2026-08-12".parse().unwrap();
+        let mut state = PlannerState::default();
+        state.blocks.push(TimeBlock {
+            id: "focus-hold".into(),
+            todo_id: None,
+            title: "Focus time".into(),
+            start: local_instant(day, 9),
+            end: local_instant(day, 11),
+            source: BlockSource::External {
+                uid: "ft-1".into(),
+                subscription_id: Some("s1".into()),
+                url: None,
+                busy: false,
+                tentative: false,
+            },
+        });
+        state.blocks.push(TimeBlock {
+            id: "mtg".into(),
+            todo_id: None,
+            title: "Board meeting".into(),
+            start: local_instant(day, 11),
+            end: local_instant(day, 12),
+            source: BlockSource::External {
+                uid: "mtg-1".into(),
+                subscription_id: Some("s1".into()),
+                url: None,
+                busy: true,
+                tentative: false,
+            },
+        });
+
+        let blocks: Vec<TimeBlock> = state.blocks_on(day).into_iter().cloned().collect();
+        let busy: Vec<(u32, u32)> = blocks
+            .iter()
+            .filter(|b| !matches!(b.source, BlockSource::External { busy: false, .. }))
+            .map(|b| {
+                (
+                    minutes_in_local_day(&b.start).max(0) as u32,
+                    minutes_in_local_day(&b.end).max(0) as u32,
+                )
+            })
+            .collect();
+        // The free 9–11 hold doesn't block: a 60m task from 09:00 lands right
+        // at 09:00. Only the real meeting (11–12) is busy.
+        assert_eq!(first_free_slot(&busy, 9 * 60, 60), 9 * 60);
+        assert_eq!(first_free_slot(&busy, 11 * 60, 60), 12 * 60);
+    }
+
+    #[test]
+    fn placement_search_start_clamps_today_to_now() {
+        let day_start = 540; // 09:00
+
+        // Before the workday opens: the workday start wins.
+        assert_eq!(placement_search_start(day_start, 7 * 60, true), 540);
+        // Mid-day: now wins, snapped FORWARD to the quarter grid (13:07 → 13:15).
+        assert_eq!(placement_search_start(day_start, 13 * 60 + 7, true), 13 * 60 + 15);
+        // Already on the grid: no over-snap (13:15 stays 13:15).
+        assert_eq!(placement_search_start(day_start, 13 * 60 + 15, true), 13 * 60 + 15);
+        // One minute past a grid line still snaps forward, never back.
+        assert_eq!(placement_search_start(day_start, 541, true), 555);
+        // After the workday ends: the search starts past the day end — the
+        // caller's first-fit overflows honestly rather than planning fiction.
+        assert_eq!(placement_search_start(day_start, 18 * 60, true), 18 * 60);
+        // Future days are untouched.
+        assert_eq!(placement_search_start(day_start, 18 * 60, false), 540);
+        assert_eq!(placement_search_start(day_start, 0, false), 540);
+    }
+
+    // ── Overlap columns ─────────────────────────────────────────────────────
+
+    fn cols(entries: &[(&str, u32, u32)]) -> std::collections::HashMap<String, (usize, usize)> {
+        let owned: Vec<(String, u32, u32)> = entries
+            .iter()
+            .map(|(id, s, e)| (id.to_string(), *s, *e))
+            .collect();
+        assign_overlap_columns(&owned)
+    }
+
+    #[test]
+    fn disjoint_blocks_keep_full_width() {
+        let map = cols(&[("a", 540, 600), ("b", 660, 720), ("c", 780, 840)]);
+        for id in ["a", "b", "c"] {
+            assert_eq!(map[id], (0, 1), "{id} keeps the classic footprint");
+        }
+    }
+
+    #[test]
+    fn two_overlapping_blocks_split_in_half() {
+        let map = cols(&[("a", 540, 600), ("b", 570, 630)]);
+        assert_eq!(map["a"], (0, 2));
+        assert_eq!(map["b"], (1, 2));
+    }
+
+    #[test]
+    fn staggered_chain_shares_one_cluster() {
+        // A–B overlap and B–C overlap but A–C don't: transitively one cluster.
+        // A and C never coexist, so greedy reuses column 0 for C.
+        let map = cols(&[("a", 540, 600), ("b", 570, 660), ("c", 620, 700)]);
+        assert_eq!(map["a"], (0, 2));
+        assert_eq!(map["b"], (1, 2));
+        assert_eq!(map["c"], (0, 2), "C reuses A's column; the cluster needs 2");
+    }
+
+    #[test]
+    fn four_concurrent_blocks_cap_at_three_columns() {
+        let map = cols(&[
+            ("a", 540, 660),
+            ("b", 540, 660),
+            ("c", 540, 660),
+            ("d", 540, 660),
+        ]);
+        assert_eq!(map["a"], (0, 3));
+        assert_eq!(map["b"], (1, 3));
+        assert_eq!(map["c"], (2, 3));
+        assert_eq!(map["d"], (2, 3), "overflow shares column 2 (0-based)");
+    }
+
+    #[test]
+    fn touching_edges_stay_separate_clusters() {
+        // end == next start does not overlap (TimeBlock::overlaps parity).
+        let map = cols(&[("a", 540, 600), ("b", 600, 660)]);
+        assert_eq!(map["a"], (0, 1));
+        assert_eq!(map["b"], (0, 1));
+
+        // ...even inside a mixed set: the meeting overlapping a timebox splits,
+        // the back-to-back one doesn't.
+        let map = cols(&[("box", 540, 600), ("mtg", 570, 630), ("next", 630, 690)]);
+        assert_eq!(map["box"], (0, 2));
+        assert_eq!(map["mtg"], (1, 2));
+        assert_eq!(map["next"], (0, 1));
+    }
+
+    #[test]
+    fn overlap_columns_skip_degenerate_spans() {
+        let map = cols(&[("zero", 600, 600), ("real", 540, 660)]);
+        assert!(!map.contains_key("zero"));
+        assert_eq!(map["real"], (0, 1));
+    }
+
+    #[test]
+    fn overlap_column_style_composes_inline_geometry() {
+        // Single column: the classic full-width footprint, unchanged look.
+        assert_eq!(overlap_column_style(0, 1), " left: 44px; right: 4px;");
+
+        // Two columns: halves with a gutter, offset by the column index.
+        let left = overlap_column_style(0, 2);
+        assert!(left.contains("left: calc(44px + (100% - 48px) * 0.0000)"), "{left}");
+        assert!(left.contains("width: calc((100% - 48px) * 0.5000 - 3px)"), "{left}");
+        let right = overlap_column_style(1, 2);
+        assert!(right.contains("left: calc(44px + (100% - 48px) * 0.5000)"), "{right}");
+
+        // Three columns: thirds.
+        let mid = overlap_column_style(1, 3);
+        assert!(mid.contains("* 0.3333)"), "{mid}");
+        assert!(mid.contains("* 0.3333 - 3px)"), "{mid}");
     }
 
     #[test]

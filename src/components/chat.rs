@@ -220,6 +220,10 @@ pub fn ChatWindow(
         // By reading the session state here, the effect becomes dependent on it.
         // Any change to messages will cause this to re-run.
         let _ = stream_update_trigger.read();
+        // Tool-call cards are written into session_state directly by the
+        // StreamManager (no MessageBubble on_content_update fires for them), so
+        // subscribe to stream_activity to auto-scroll when they appear/update.
+        let _ = stream_manager.stream_activity.read();
         let current_session_id = current_target_id.read().clone();
 
         let mut is_session_switch = false;
@@ -1257,6 +1261,11 @@ pub fn MessageBubble(
             let mut selection_data = use_signal(SelectionState::default);
             let mut editing_comment_id = use_signal(|| None::<String>);
             let mut is_mouse_over_toolbar = use_signal(|| false);
+            // Comment draft lives here (not in the popover) so it survives popover
+            // remounts and can be checked before discarding unsaved text.
+            let mut comment_draft = use_signal(String::new);
+            let mut comment_draft_original = use_signal(String::new);
+            let mut show_discard_comment_confirm = use_signal(|| false);
 
             // State tracking for "Thinking" vs "Generating"
             let is_streaming = stream_manager.is_generating(&message.id);
@@ -1498,11 +1507,19 @@ pub fn MessageBubble(
                 "bottom-[-25px] right-[-25px]"
             };
 
+            // AI bubbles leave room for the hover controls hanging off the
+            // right edge; the 2/3 cap only kicks in on wide windows.
+            let wrapper_width_class = if is_user {
+                "max-w-full"
+            } else {
+                "max-w-[calc(100%-2.5rem)] lg:max-w-[66%]"
+            };
+
             rsx! {
             div {
                 class: "{container_classes} w-full",
                 div {
-                    class: "flex flex-col max-w-full min-w-0 group",
+                    class: "flex flex-col {wrapper_width_class} min-w-0 group",
                     div {
                         id: "message-bubble-{message.id}",
                         class: "relative rounded-2xl {bubble_classes} max-w-full",
@@ -1554,11 +1571,13 @@ pub fn MessageBubble(
                                     },
                                     on_comment_edit: {
                                         let message_comments = message.comments.clone();
-                                        move |comment_id: String| {
+                                        move |(comment_id, top, left): (String, f64, f64)| {
                                             // Find the comment to get its current text
                                             if let Some(comment) = message_comments.iter().find(|c| c.id == comment_id) {
+                                                comment_draft.set(comment.comment.clone());
+                                                comment_draft_original.set(comment.comment.clone());
                                                 editing_comment_id.set(Some(comment_id));
-                                                selection_data.set(SelectionState { text: comment.text_selection.clone(), markdown: comment.text_selection.clone(), top: 100.0, left: 100.0 });
+                                                selection_data.set(SelectionState { text: comment.text_selection.clone(), markdown: comment.text_selection.clone(), top, left });
                                                 selection_mode.set(SelectionMode::CommentEdit);
                                             }
                                         }
@@ -1645,6 +1664,8 @@ pub fn MessageBubble(
                                     selection_mode.set(SelectionMode::None);
                                 },
                                 on_comment: move |_| {
+                                    comment_draft.set(String::new());
+                                    comment_draft_original.set(String::new());
                                     selection_mode.set(SelectionMode::CommentInput);
                                     on_selection.call((selection_data.read().text.clone(), selection_data.read().top, selection_data.read().left));
                                 }
@@ -1655,6 +1676,7 @@ pub fn MessageBubble(
                             crate::components::inline_comment_popover::InlineCommentPopover {
                                 position_top: selection_data.read().top,
                                 position_left: selection_data.read().left,
+                                draft: comment_draft,
                                 on_save: move |comment_text: String| {
                                     let text = selection_data.read().text.clone();
                                     let new_comment = Comment {
@@ -1675,50 +1697,69 @@ pub fn MessageBubble(
 
                                     on_comment.call(());
 
+                                    comment_draft.set(String::new());
                                     selection_mode.set(SelectionMode::None);
                                 },
                                 on_cancel: move |_| {
-                                    selection_mode.set(SelectionMode::None);
+                                    if comment_draft.peek().trim() != comment_draft_original.peek().trim() {
+                                        show_discard_comment_confirm.set(true);
+                                    } else {
+                                        selection_mode.set(SelectionMode::None);
+                                    }
                                 }
                             }
                         }
 
                         if *selection_mode.read() == SelectionMode::CommentEdit {
-                            // Get the comment being edited
-                            {{
-                                let current_comment_text = editing_comment_id.read().as_ref().and_then(|comment_id| {
-                                    message.comments.iter()
-                                        .find(|c| &c.id == comment_id)
-                                        .map(|c| c.comment.clone())
-                                });
-
-                                rsx! {
-                                    crate::components::inline_comment_popover::InlineCommentPopover {
-                                        position_top: 150.0,
-                                        position_left: 150.0,
-                                        initial_value: current_comment_text,
-                                        on_save: move |new_comment_text: String| {
-                                            if let Some(comment_id) = editing_comment_id.read().clone() {
-                                                // Update the comment in session state
-                                                let mut state = session_state.write();
-                                                if let Some(msg) = state.get_message_mut(&message.id) {
-                                                    if let Some(comment) = msg.comments.iter_mut().find(|c| c.id == comment_id) {
-                                                        comment.comment = new_comment_text;
-                                                    }
-                                                }
-                                                drop(state);
-                                                crate::session::SessionState::save_signal(&session_state, Some(save_error));
+                            crate::components::inline_comment_popover::InlineCommentPopover {
+                                position_top: selection_data.read().top,
+                                position_left: selection_data.read().left,
+                                draft: comment_draft,
+                                on_save: move |new_comment_text: String| {
+                                    if let Some(comment_id) = editing_comment_id.read().clone() {
+                                        // Update the comment in session state
+                                        let mut state = session_state.write();
+                                        if let Some(msg) = state.get_message_mut(&message.id) {
+                                            if let Some(comment) = msg.comments.iter_mut().find(|c| c.id == comment_id) {
+                                                comment.comment = new_comment_text;
                                             }
-                                            editing_comment_id.set(None);
-                                            selection_mode.set(SelectionMode::None);
-                                        },
-                                        on_cancel: move |_| {
-                                            editing_comment_id.set(None);
-                                            selection_mode.set(SelectionMode::None);
                                         }
+                                        drop(state);
+                                        crate::session::SessionState::save_signal(&session_state, Some(save_error));
+                                    }
+                                    comment_draft.set(String::new());
+                                    editing_comment_id.set(None);
+                                    selection_mode.set(SelectionMode::None);
+                                },
+                                on_cancel: move |_| {
+                                    if comment_draft.peek().trim() != comment_draft_original.peek().trim() {
+                                        show_discard_comment_confirm.set(true);
+                                    } else {
+                                        editing_comment_id.set(None);
+                                        selection_mode.set(SelectionMode::None);
                                     }
                                 }
-                            }}
+                            }
+                        }
+
+                        if *show_discard_comment_confirm.read() {
+                            crate::components::confirm_delete_modal::ConfirmDeleteModal {
+                                is_visible: show_discard_comment_confirm,
+                                title: "Discard comment?".to_string(),
+                                message: "You have unsaved changes. Discard them?".to_string(),
+                                confirm_button_text: "Discard".to_string(),
+                                show_dont_ask_again: false,
+                                on_confirm: move |_| {
+                                    show_discard_comment_confirm.set(false);
+                                    comment_draft.set(String::new());
+                                    comment_draft_original.set(String::new());
+                                    editing_comment_id.set(None);
+                                    selection_mode.set(SelectionMode::None);
+                                },
+                                on_cancel: move |_| {
+                                    show_discard_comment_confirm.set(false);
+                                }
+                            }
                         }
 
                         if !is_thinking {

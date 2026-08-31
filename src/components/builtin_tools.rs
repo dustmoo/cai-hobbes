@@ -54,6 +54,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_PLAN_DAY",
     "HOBBES_TIME_BLOCK",
     "HOBBES_PROJECT_UPSERT",
+    "HOBBES_CALENDAR_LIST",
 ];
 
 #[allow(dead_code)]
@@ -69,6 +70,7 @@ pub fn is_planner_tool(name: &str) -> bool {
         || matches!(
             name,
             "HOBBES_PLAN_DAY" | "HOBBES_TIME_BLOCK" | "HOBBES_PROJECT_UPSERT"
+                | "HOBBES_CALENDAR_LIST"
         )
 }
 
@@ -221,15 +223,25 @@ fn run_planner_tool(
             handlers::handle_todo_create(&mut planner.write(), args_json, session_id, today, true)
         }
         "HOBBES_TODO_UPDATE" => {
-            handlers::handle_todo_update(&mut planner.write(), args_json, today, true)
+            // session_id threads through so `status: in_progress` opens an
+            // agent-actor focus session attributed to this chat (the same
+            // provenance source as TodoOrigin::Ai in HOBBES_TODO_CREATE).
+            handlers::handle_todo_update(&mut planner.write(), args_json, session_id, today, true)
         }
         "HOBBES_TODO_LIST" => handlers::handle_todo_list(&planner.read(), args_json, today),
         "HOBBES_PLAN_DAY" => {
-            let default_capacity = deps.settings.read().planner_daily_capacity_minutes;
+            let (default_capacity, meetings_count) = {
+                let s = deps.settings.read();
+                (
+                    s.planner_daily_capacity_minutes,
+                    s.planner_calendar_counts_against_capacity,
+                )
+            };
             handlers::handle_plan_day(
                 &mut planner.write(),
                 args_json,
                 default_capacity,
+                meetings_count,
                 today,
                 true,
             )
@@ -239,6 +251,23 @@ fn run_planner_tool(
         }
         "HOBBES_PROJECT_UPSERT" => {
             handlers::handle_project_upsert(&mut planner.write(), args_json, today, true)
+        }
+        "HOBBES_CALENDAR_LIST" => {
+            // Read-only over the calendar cache — no planner mutation, so no
+            // state/persist. Subscription roster and sync errors are resolved
+            // here at the edge; the handler and its formatter stay pure over
+            // what they're given.
+            let subscriptions = deps.settings.read().planner_calendar_subscriptions.clone();
+            let sync_errors: Vec<(String, String)> = subscriptions
+                .iter()
+                .filter(|s| s.enabled)
+                .filter_map(|s| {
+                    crate::todo::calendar_sync::load_sync_state(&s.id)
+                        .last_error
+                        .map(|e| (s.name.clone(), e))
+                })
+                .collect();
+            handlers::handle_calendar_list(args_json, &subscriptions, &sync_errors, today)
         }
         other => (
             ToolCallStatus::Error,

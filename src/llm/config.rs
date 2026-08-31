@@ -37,10 +37,10 @@ impl Default for GeminiConfig {
     fn default() -> Self {
         Self {
             api_key: None,
-            chat_model: GeminiModel::Gemini3_5Flash
+            chat_model: GeminiModel::Gemini3_7Flash
                 .canonical_slug()
                 .to_string(),
-            summary_model: GeminiModel::Gemini3_5Flash
+            summary_model: GeminiModel::Gemini3_7Flash
                 .canonical_slug()
                 .to_string(),
             thinking_enabled: false,
@@ -64,20 +64,22 @@ pub fn default_cache_ttl() -> u32 {
 
 pub fn default_model_slots() -> Vec<String> {
     vec![
+        GeminiModel::Gemini3_7Flash
+            .canonical_slug()
+            .to_string(),
+        GeminiModel::Gemini3_6Flash
+            .canonical_slug()
+            .to_string(),
         GeminiModel::Gemini3_5Flash
             .canonical_slug()
             .to_string(),
         GeminiModel::Gemini3_1ProPreview
             .canonical_slug()
             .to_string(),
-        GeminiModel::Gemini3_1FlashLitePreview
-            .canonical_slug()
-            .to_string(),
-        GeminiModel::Gemini3_0FlashPreview
+        GeminiModel::Gemini3_5FlashLite
             .canonical_slug()
             .to_string(),
         GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
-        "".to_string(), // Slot 6
         "".to_string(), // Slot 7
         "".to_string(), // Slot 8
         "".to_string(), // Slot 9
@@ -407,11 +409,13 @@ mod tests {
     fn test_default_model_slots_has_gemini_slugs() {
         let slots = default_model_slots();
         assert_eq!(slots.len(), 10);
-        // First 5 should be non-empty Gemini slugs
-        assert!(!slots[0].is_empty(), "Slot 0 should have a Gemini model slug");
-        assert!(slots[0].contains("gemini"), "Slot 0 should be a Gemini model");
-        // Last 5 should be empty
-        for i in 5..10 {
+        // First 6 should be non-empty Gemini slugs, latest-gen Flash first
+        assert_eq!(slots[0], "gemini-3.7-flash");
+        for i in 0..6 {
+            assert!(slots[i].contains("gemini"), "Slot {} should be a Gemini model", i);
+        }
+        // Last 4 should be empty
+        for i in 6..10 {
             assert!(slots[i].is_empty(), "Slot {} should be empty", i);
         }
     }

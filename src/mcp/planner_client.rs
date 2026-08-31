@@ -74,7 +74,7 @@ impl PlannerClient {
                 name: "HOBBES_TODO_UPDATE".into(),
                 description: Some(format!(
                     "Update one or more todos: patch any mutable field, or set 'status' to \
-                    complete, cancel, or reopen them. Setting status to in_progress starts focus mode: only one todo is ever in focus, the previous one is paused automatically with its elapsed time banked. Pass an explicit JSON null to CLEAR an \
+                    complete, cancel, or reopen them. Setting status to in_progress starts focus mode: only one todo is ever in focus, the previous one is paused automatically with its elapsed time banked. Setting status back to 'open' on an in-progress todo pauses its timer and banks the elapsed time — this is how you stop a focus timer you started. Pass an explicit JSON null to CLEAR an \
                     optional field (scheduled_for, time_of_day, deadline, estimate_minutes, \
                     project_id) — omitted fields are left untouched. Replacing 'checklist' \
                     resets item completion. {}",
@@ -213,6 +213,34 @@ impl PlannerClient {
                     .unwrap_or_default(),
                 ),
                 title: Some("Time Block".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            Tool {
+                name: "HOBBES_CALENDAR_LIST".into(),
+                description: Some(
+                    "List the user's external calendar events (meetings and all-day events) \
+                    for a range of local dates. This is READ-ONLY mirrored data from the \
+                    user's calendar subscriptions, synced periodically — Hobbes cannot \
+                    create, edit, or RSVP to calendar events, and the mirror may lag the \
+                    real calendar by a few minutes. Use it to check availability or see \
+                    commitments beyond today before planning or timeboxing work."
+                        .to_string()
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "start_date": { "type": "string", "description": "First day to list (YYYY-MM-DD, 'today' or 'tomorrow'). Defaults to today." },
+                            "days": { "type": "integer", "description": "How many days to list, starting at start_date. Default 1, max 14 (larger values are clamped)." }
+                        }
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("List Calendar Events".to_string()),
                 output_schema: None,
                 annotations: None,
                 icons: None,

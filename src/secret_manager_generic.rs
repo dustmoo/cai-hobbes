@@ -183,18 +183,28 @@ impl SecretManagerTrait for SecretManager {
             }
         }
 
-        // Load per-connector LLM API keys from their index
-        if let Ok(entry) = Entry::new(SERVICE_NAME, secret_types::LLM_KEYS_INDEX_KEY) {
-            if let Ok(index_csv) = entry.get_password() {
-                for key in secret_types::parse_index_csv(&index_csv) {
-                    if let Ok(entry) = Entry::new(SERVICE_NAME, key) {
-                        match entry.get_password() {
-                            Ok(value) => {
-                                self.secrets.insert(key.to_string(), value);
-                                tracing::debug!("Loaded LLM connector key: {}", key);
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to load indexed LLM key '{}': {}", key, e);
+        // Load per-connector LLM API keys and per-subscription calendar URLs
+        // from their discovery indexes.
+        for index_key in [
+            secret_types::LLM_KEYS_INDEX_KEY,
+            secret_types::CAL_KEYS_INDEX_KEY,
+        ] {
+            if let Ok(entry) = Entry::new(SERVICE_NAME, index_key) {
+                if let Ok(index_csv) = entry.get_password() {
+                    for key in secret_types::parse_index_csv(&index_csv) {
+                        if let Ok(entry) = Entry::new(SERVICE_NAME, key) {
+                            match entry.get_password() {
+                                Ok(value) => {
+                                    self.secrets.insert(key.to_string(), value);
+                                    tracing::debug!("Loaded indexed key: {}", key);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to load indexed key '{}': {}",
+                                        key,
+                                        e
+                                    );
+                                }
                             }
                         }
                     }

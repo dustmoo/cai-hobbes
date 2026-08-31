@@ -128,30 +128,33 @@ impl SecretManager {
             }
         }
 
-        // Load per-connector LLM API keys from their index
-        match keychain_ffi::find_generic_password_with_context(
+        // Load per-connector LLM API keys and per-subscription calendar URLs
+        // from their discovery indexes.
+        for index_key in [
             secret_types::LLM_KEYS_INDEX_KEY,
-            context,
-        ) {
-            Ok(index_csv) => {
-                for key in secret_types::parse_index_csv(&index_csv) {
-                    match keychain_ffi::find_generic_password_with_context(key, context) {
-                        Ok(value) => {
-                            self.secrets.insert(key.to_string(), value);
-                            tracing::debug!("Loaded LLM connector key with context: {}", key);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to load indexed LLM key '{}' with context: {}",
-                                key,
-                                e
-                            );
+            secret_types::CAL_KEYS_INDEX_KEY,
+        ] {
+            match keychain_ffi::find_generic_password_with_context(index_key, context) {
+                Ok(index_csv) => {
+                    for key in secret_types::parse_index_csv(&index_csv) {
+                        match keychain_ffi::find_generic_password_with_context(key, context) {
+                            Ok(value) => {
+                                self.secrets.insert(key.to_string(), value);
+                                tracing::debug!("Loaded indexed key with context: {}", key);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to load indexed key '{}' with context: {}",
+                                    key,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
-            }
-            Err(_) => {
-                tracing::debug!("No LLM connector key index found.");
+                Err(_) => {
+                    tracing::debug!("No index found for {}.", index_key);
+                }
             }
         }
 
@@ -268,23 +271,29 @@ impl SecretManagerTrait for SecretManager {
             }
         }
 
-        // Load per-connector LLM API keys from their index
-        match keychain_ffi::find_generic_password(secret_types::LLM_KEYS_INDEX_KEY) {
-            Ok(index_csv) => {
-                for key in secret_types::parse_index_csv(&index_csv) {
-                    match keychain_ffi::find_generic_password(key) {
-                        Ok(value) => {
-                            self.secrets.insert(key.to_string(), value);
-                            tracing::debug!("Loaded LLM connector key: {}", key);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to load indexed LLM key '{}': {}", key, e);
+        // Load per-connector LLM API keys and per-subscription calendar URLs
+        // from their discovery indexes.
+        for index_key in [
+            secret_types::LLM_KEYS_INDEX_KEY,
+            secret_types::CAL_KEYS_INDEX_KEY,
+        ] {
+            match keychain_ffi::find_generic_password(index_key) {
+                Ok(index_csv) => {
+                    for key in secret_types::parse_index_csv(&index_csv) {
+                        match keychain_ffi::find_generic_password(key) {
+                            Ok(value) => {
+                                self.secrets.insert(key.to_string(), value);
+                                tracing::debug!("Loaded indexed key: {}", key);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to load indexed key '{}': {}", key, e);
+                            }
                         }
                     }
                 }
-            }
-            Err(_) => {
-                tracing::debug!("No LLM connector key index found.");
+                Err(_) => {
+                    tracing::debug!("No index found for {}.", index_key);
+                }
             }
         }
 

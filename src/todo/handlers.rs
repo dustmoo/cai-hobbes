@@ -19,8 +19,8 @@ use serde_json::Value;
 use crate::components::shared::ToolCallStatus;
 
 use super::model::{
-    self, Area, BlockSource, ChecklistItem, DayPlan, Project, TimeBlock, TimeOfDay, Todo,
-    TodoBucket, TodoOrigin, TodoStatus, SORT_STEP,
+    self, Area, BlockSource, CalendarEvent, ChecklistItem, DayPlan, Project, TimeBlock, TimeOfDay,
+    Todo, TodoBucket, TodoOrigin, TodoStatus, SORT_STEP,
 };
 use super::views::{self, TodoView};
 use super::{store, PlannerState};
@@ -162,6 +162,19 @@ fn persist_block(block: &TimeBlock, persist: bool) {
     }
 }
 
+/// Drain and (when `persist`) write through the focus-session rows the last
+/// operation touched. Always drains — tests with `persist: false` must not
+/// leave dirty ids accumulating across calls.
+fn persist_focus_sessions(state: &mut PlannerState, persist: bool) {
+    for s in state.take_dirty_focus_sessions() {
+        if persist {
+            if let Err(e) = store::save_focus_session(&s) {
+                tracing::error!("Failed to persist focus session {}: {}", s.id, e);
+            }
+        }
+    }
+}
+
 // ── HOBBES_TODO_CREATE ──────────────────────────────────────────────────────
 
 pub fn handle_todo_create(
@@ -275,6 +288,7 @@ fn new_checklist_item(title: &str) -> ChecklistItem {
 pub fn handle_todo_update(
     state: &mut PlannerState,
     args: &Value,
+    session_id: &str,
     today: NaiveDate,
     persist: bool,
 ) -> (ToolCallStatus, String) {
@@ -300,48 +314,81 @@ pub fn handle_todo_update(
     let mut resized_blocks = 0usize;
     for (i, item) in items.iter().enumerate() {
         match apply_todo_update(state, item, today, now) {
-            Ok((summary, wants_focus)) => {
+            Ok((summary, status_intent)) => {
                 let mut summary = summary;
                 // The borrow of the patched todo has ended; re-fetch by id for
                 // the store write.
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                    if wants_focus {
-                        let scheduled_before = state.todo(id).and_then(|t| t.scheduled_for);
-                        // Single-focus: starting this one pauses any other.
-                        // Focus also implies today (see start_focus), so the
-                        // pruned off-day blocks need their store rows deleted.
-                        let (changed, pruned) = state.start_focus(id, now);
-                        for changed in changed {
-                            if let Some(t) = state.todo(&changed) {
-                                persist_todo(t, persist);
+                    match status_intent {
+                        Some(TodoStatus::InProgress) => {
+                            let scheduled_before = state.todo(id).and_then(|t| t.scheduled_for);
+                            // Single-focus: starting this one pauses any other.
+                            // Focus also implies today (see start_focus), so the
+                            // pruned off-day blocks need their store rows deleted.
+                            // The AI drove this, so the session is agent-actor,
+                            // attributed to the chat session — the same
+                            // provenance source as TodoOrigin::Ai.
+                            let (changed, pruned) = state.start_focus(
+                                id,
+                                now,
+                                model::FocusActor::Agent {
+                                    session_id: Some(session_id.to_string()),
+                                },
+                            );
+                            for changed in changed {
+                                if let Some(t) = state.todo(&changed) {
+                                    persist_todo(t, persist);
+                                }
                             }
-                        }
-                        if persist {
-                            for b in &pruned {
-                                if let Err(e) = store::delete_block(&b.id) {
-                                    tracing::error!(
-                                        "Failed to delete stale block {}: {}",
-                                        b.id,
-                                        e
-                                    );
+                            if persist {
+                                for b in &pruned {
+                                    if let Err(e) = store::delete_block(&b.id) {
+                                        tracing::error!(
+                                            "Failed to delete stale block {}: {}",
+                                            b.id,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            pruned_blocks += pruned.len();
+                            // Re-summarise so the response shows ▶, not the
+                            // pre-focus state — and say so when focus pulled the
+                            // todo onto today, so the model knows the date moved.
+                            if let Some(t) = state.todo(id) {
+                                summary = t.summary();
+                                if t.scheduled_for != scheduled_before {
+                                    if let Some(d) = t.scheduled_for {
+                                        summary.push_str(&format!(
+                                            "\nScheduled '{}' onto {}.",
+                                            t.title, d
+                                        ));
+                                    }
                                 }
                             }
                         }
-                        pruned_blocks += pruned.len();
-                        // Re-summarise so the response shows ▶, not the
-                        // pre-focus state — and say so when focus pulled the
-                        // todo onto today, so the model knows the date moved.
-                        if let Some(t) = state.todo(id) {
-                            summary = t.summary();
-                            if t.scheduled_for != scheduled_before {
-                                if let Some(d) = t.scheduled_for {
-                                    summary.push_str(&format!(
-                                        "\nScheduled '{}' onto {}.",
-                                        t.title, d
-                                    ));
-                                }
+                        // The closing transitions run at the PlannerState
+                        // layer so the open focus-session row (if this todo
+                        // holds one) closes with the matching end_reason.
+                        Some(TodoStatus::Completed) => {
+                            state.complete_todo(id, now);
+                            if let Some(t) = state.todo(id) {
+                                summary = t.summary();
                             }
                         }
+                        Some(TodoStatus::Open) => {
+                            state.reopen_todo(id, now);
+                            if let Some(t) = state.todo(id) {
+                                summary = t.summary();
+                            }
+                        }
+                        Some(TodoStatus::Cancelled) => {
+                            state.cancel_todo(id, now);
+                            if let Some(t) = state.todo(id) {
+                                summary = t.summary();
+                            }
+                        }
+                        None => {}
                     }
                     if let Some(todo) = state.todo(id) {
                         persist_todo(todo, persist);
@@ -361,6 +408,9 @@ pub fn handle_todo_update(
         }
     }
 
+    // Session rows opened/closed by the status transitions above.
+    persist_focus_sessions(state, persist);
+
     let (status, mut out) = compose_batch_response("Updated", &updated, &errors);
     if pruned_blocks > 0 {
         out.push_str(&format!(
@@ -377,15 +427,18 @@ pub fn handle_todo_update(
     (status, out)
 }
 
-/// Returns the patched todo's summary plus whether the item asked for focus
-/// (`status: in_progress`), which the caller applies via `start_focus` once
-/// this borrow has ended.
+/// Returns the patched todo's summary plus the requested status transition,
+/// if any. Status changes are whole-state operations (focus pauses the
+/// previous focus; every closing transition must also close the open
+/// focus-session row), so they can't run inside this single-todo borrow —
+/// the caller applies them through the `PlannerState`-level methods once the
+/// borrow has ended and re-summarises.
 fn apply_todo_update(
     state: &mut PlannerState,
     item: &Value,
     today: NaiveDate,
     now: DateTime<Utc>,
-) -> Result<(String, bool), String> {
+) -> Result<(String, Option<TodoStatus>), String> {
     let obj = item.as_object().ok_or("expected an object")?;
     let id = obj
         .get("id")
@@ -457,26 +510,8 @@ fn apply_todo_update(
             .map(new_checklist_item)
             .collect();
     }
-    let mut wants_focus = false;
-    match status {
-        Some(TodoStatus::Completed) => todo.mark_completed(now),
-        Some(TodoStatus::Open) => todo.reopen(now),
-        Some(TodoStatus::Cancelled) => {
-            // Cancelling mid-focus still banks the session time.
-            todo.fold_elapsed(now);
-            todo.status = TodoStatus::Cancelled;
-            // The logbook orders by completed_at; a cancelled todo's "closed
-            // moment" is when it was abandoned.
-            todo.completed_at = Some(now);
-        }
-        // Focus is a whole-state operation (it pauses the previous focus), so
-        // it can't run inside this single-todo borrow — the caller applies it
-        // through PlannerState::start_focus.
-        Some(TodoStatus::InProgress) => wants_focus = true,
-        None => {}
-    }
     todo.updated_at = now;
-    Ok((todo.summary(), wants_focus))
+    Ok((todo.summary(), status))
 }
 
 /// The inverse rule: placing a linked block on a day schedules the todo there
@@ -681,6 +716,7 @@ pub fn handle_plan_day(
     state: &mut PlannerState,
     args: &Value,
     default_capacity: u32,
+    meetings_count_against_capacity: bool,
     today: NaiveDate,
     persist: bool,
 ) -> (ToolCallStatus, String) {
@@ -791,7 +827,14 @@ pub fn handle_plan_day(
         }
     }
 
-    let cap = model::measure_capacity(&state.todos, date, capacity);
+    let cap = model::measure_capacity_full(
+        &state.todos,
+        &state.blocks,
+        &state.focus_sessions,
+        date,
+        capacity,
+        meetings_count_against_capacity,
+    );
     let mut out = String::new();
     // The product opinion: overcommitment leads the response, never a footnote.
     if cap.is_overcommitted() {
@@ -882,12 +925,18 @@ fn block_line(state: &PlannerState, block: &TimeBlock) -> String {
 
 /// Overlap note against every *other* block, or None when the slot is clear.
 /// A warning rather than an error: double-booking is sometimes deliberate, and
-/// the honest move is to flag it, not forbid it.
+/// the honest move is to flag it, not forbid it. Non-busy external blocks
+/// (free / focus-time mirrors) don't clash — placing work over them is the
+/// point of marking them free.
 fn overlap_warning(state: &PlannerState, block: &TimeBlock) -> Option<String> {
     let clashes: Vec<String> = state
         .blocks
         .iter()
-        .filter(|b| b.id != block.id && b.overlaps(block))
+        .filter(|b| {
+            b.id != block.id
+                && b.overlaps(block)
+                && !matches!(b.source, BlockSource::External { busy: false, .. })
+        })
         .map(|b| block_line(state, b))
         .collect();
     if clashes.is_empty() {
@@ -1099,6 +1148,176 @@ fn time_block_delete(
     (
         ToolCallStatus::Completed,
         format!("Deleted {}", block_line(state, &removed)),
+    )
+}
+
+// ── HOBBES_CALENDAR_LIST ────────────────────────────────────────────────────
+
+/// Longest range the calendar tool will list. Matches the tool schema's
+/// documented max; larger requests clamp rather than fail.
+const CALENDAR_LIST_MAX_DAYS: u32 = 14;
+
+/// Parse `start_date` (default today) and `days` (default 1, clamped to
+/// 1..=[`CALENDAR_LIST_MAX_DAYS`]) from the tool args.
+fn calendar_list_range(args: &Value, today: NaiveDate) -> Result<(NaiveDate, u32), String> {
+    let start = match args.get("start_date").and_then(|v| v.as_str()) {
+        Some(raw) => parse_date(raw, today).map_err(|e| format!("start_date: {}", e))?,
+        None => today,
+    };
+    let days = match args.get("days").filter(|v| !v.is_null()) {
+        Some(v) => v
+            .as_i64()
+            .ok_or_else(|| "invalid 'days' — expected an integer".to_string())?
+            .clamp(1, CALENDAR_LIST_MAX_DAYS as i64) as u32,
+        None => 1,
+    };
+    Ok((start, days))
+}
+
+/// Pure formatter for the calendar listing, testable over injected events.
+///
+/// Events from disabled subscriptions are excluded (with a note naming the
+/// disabled calendar); `sync_errors` — `(subscription name, error)` pairs read
+/// from sync state at the dispatch edge — are appended as notes so the model
+/// knows when the mirror may be stale. Timed events land on their local start
+/// day; all-day events appear on every local day they cover.
+fn calendar_list_over(
+    events: &[CalendarEvent],
+    subscriptions: &[crate::settings::CalendarSubscription],
+    sync_errors: &[(String, String)],
+    start: NaiveDate,
+    days: u32,
+    today: NaiveDate,
+) -> String {
+    let end_exclusive = start + chrono::Duration::days(days as i64);
+    let end_inclusive = end_exclusive - chrono::Duration::days(1);
+    let enabled: std::collections::HashSet<String> = subscriptions
+        .iter()
+        .filter(|s| s.enabled)
+        .map(|s| s.id.clone())
+        .collect();
+
+    let mut day_lines: Vec<(NaiveDate, Vec<String>)> = Vec::new();
+    let mut total = 0usize;
+    for offset in 0..days {
+        let day = start + chrono::Duration::days(offset as i64);
+        let mut lines: Vec<String> = views::all_day_events_on(events, &enabled, day)
+            .iter()
+            .map(|e| {
+                format!(
+                    "(all day) {}{}",
+                    truncate_title(&e.title),
+                    e.location
+                        .as_deref()
+                        .map(|l| format!(" @ {}", l))
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
+        let mut timed: Vec<&CalendarEvent> = events
+            .iter()
+            .filter(|e| !e.all_day && enabled.contains(&e.subscription_id))
+            .filter(|e| e.start.with_timezone(&chrono::Local).date_naive() == day)
+            .collect();
+        timed.sort_by_key(|e| e.start);
+        lines.extend(timed.iter().map(|e| {
+            format!(
+                "{}–{} {}{}",
+                e.start.with_timezone(&chrono::Local).format("%H:%M"),
+                e.end.with_timezone(&chrono::Local).format("%H:%M"),
+                truncate_title(&e.title),
+                e.location
+                    .as_deref()
+                    .map(|l| format!(" @ {}", l))
+                    .unwrap_or_default()
+            )
+        }));
+        if !lines.is_empty() {
+            total += lines.len();
+            day_lines.push((day, lines));
+        }
+    }
+
+    let mut notes: Vec<String> = subscriptions
+        .iter()
+        .filter(|s| !s.enabled)
+        .map(|s| {
+            format!(
+                "Note: calendar '{}' is disabled in Settings — its events are hidden.",
+                s.name
+            )
+        })
+        .collect();
+    notes.extend(sync_errors.iter().map(|(name, err)| {
+        format!(
+            "Note: calendar '{}' failed its last sync ({}) — events may be stale or missing.",
+            name, err
+        )
+    }));
+
+    let range_label = if days == 1 {
+        views::friendly_date(start, today)
+    } else {
+        format!(
+            "{} to {}",
+            views::friendly_date(start, today),
+            views::friendly_date(end_inclusive, today)
+        )
+    };
+
+    let mut out = if total == 0 {
+        format!("No calendar events {}.", range_label)
+    } else {
+        let mut body = format!("Calendar — {} event(s) {}:", total, range_label);
+        let mut emitted = 0usize;
+        'outer: for (day, lines) in &day_lines {
+            body.push_str(&format!("\n{}:", views::friendly_date(*day, today)));
+            for line in lines {
+                if emitted >= MAX_LIST_LINES {
+                    body.push_str(&format!("\n…and {} more", total - emitted));
+                    break 'outer;
+                }
+                body.push_str(&format!("\n  {}", line));
+                emitted += 1;
+            }
+        }
+        body
+    };
+    for note in notes {
+        out.push('\n');
+        out.push_str(&note);
+    }
+    out
+}
+
+/// `HOBBES_CALENDAR_LIST` — read-only listing of the mirrored calendar cache.
+///
+/// Deliberately takes no `&mut PlannerState` / `persist`: it reads the
+/// `todo_calendar_events` cache (which holds events beyond the ±14-day block
+/// materialization window), never blocks, and writes nothing. The store read
+/// sits here at the edge; all formatting is in [`calendar_list_over`].
+pub fn handle_calendar_list(
+    args: &Value,
+    subscriptions: &[crate::settings::CalendarSubscription],
+    sync_errors: &[(String, String)],
+    today: NaiveDate,
+) -> (ToolCallStatus, String) {
+    let (start, days) = match calendar_list_range(args, today) {
+        Ok(r) => r,
+        Err(e) => return (ToolCallStatus::Error, e),
+    };
+    let events = match store::load_calendar_events(None) {
+        Ok(events) => events,
+        Err(e) => {
+            return (
+                ToolCallStatus::Error,
+                format!("calendar cache unavailable: {}", e),
+            )
+        }
+    };
+    (
+        ToolCallStatus::Completed,
+        calendar_list_over(&events, subscriptions, sync_errors, start, days, today),
     )
 }
 
@@ -1321,7 +1540,15 @@ fn last_touched_project<'a>(state: &'a PlannerState, item: &Value) -> Option<&'a
 /// *every* prompt, so it is budgeted like a header, not a report — the model
 /// can always call HOBBES_TODO_LIST for the rest.
 const CTX_MAX_TODOS: usize = 20;
-const CTX_MAX_BLOCKS: usize = 10;
+/// Hobbes-owned timeboxes (`Manual` / `Auto`) keep the full historical block
+/// budget to themselves; external meetings get their own smaller lane. The
+/// split (rather than one shared cap) is the point: a meeting-heavy day must
+/// never crowd Hobbes' own timeboxes out of the context.
+const CTX_MAX_OWN_BLOCKS: usize = 10;
+const CTX_MAX_MEETINGS: usize = 8;
+/// All-day events are banner facts ("company offsite"), not schedule rows —
+/// a couple of lines is plenty.
+const CTX_MAX_ALL_DAY: usize = 3;
 const CTX_MAX_OVERDUE: usize = 5;
 const CTX_MAX_TITLE_CHARS: usize = 80;
 
@@ -1336,6 +1563,11 @@ fn truncate_title(title: &str) -> String {
 
 /// The `planner_today` block injected into system context, or `None` when the
 /// planner (or the injection) is disabled in Settings.
+///
+/// The store-reading edge: loads today's all-day calendar events from the
+/// cache (all-day events never materialize as blocks, so `PlannerState` cannot
+/// supply them) and delegates to the pure [`planner_today_context_with_events`].
+/// A missing/unavailable store degrades to "no all-day events", never an error.
 pub fn planner_today_context(
     planner: &PlannerState,
     settings: &crate::settings::Settings,
@@ -1344,9 +1576,36 @@ pub fn planner_today_context(
     if !settings.planner_enabled || !settings.planner_inject_today_context {
         return None;
     }
+    let calendar_events = store::load_calendar_events(None).unwrap_or_default();
+    planner_today_context_with_events(planner, settings, today, &calendar_events)
+}
+
+/// Pure core of [`planner_today_context`]: everything but the store read, so
+/// tests can inject `CalendarEvent`s directly.
+pub fn planner_today_context_with_events(
+    planner: &PlannerState,
+    settings: &crate::settings::Settings,
+    today: NaiveDate,
+    calendar_events: &[CalendarEvent],
+) -> Option<serde_json::Value> {
+    if !settings.planner_enabled || !settings.planner_inject_today_context {
+        return None;
+    }
 
     let capacity = planner.capacity_for(today, settings.planner_daily_capacity_minutes);
-    let cap = model::measure_capacity(&planner.todos, today, capacity);
+    let mut cap = model::measure_capacity_full(
+        &planner.todos,
+        &planner.blocks,
+        &planner.focus_sessions,
+        today,
+        capacity,
+        settings.planner_calendar_counts_against_capacity,
+    );
+    // Per-actor minutes ride as their own compact keys below; keep the
+    // capacity line itself in its familiar shape.
+    cap.agent_minutes = 0;
+    let person_done_minutes = model::person_minutes_on(&planner.focus_sessions, today);
+    let agent_done_minutes = model::agent_minutes_on(&planner.focus_sessions, today);
 
     let todos: Vec<String> = views::in_view(&planner.todos, TodoView::Today, today)
         .into_iter()
@@ -1358,18 +1617,54 @@ pub fn planner_today_context(
         })
         .collect();
 
-    let blocks: Vec<String> = planner
+    // Interleave with priority: Hobbes-owned timeboxes first, then external
+    // meetings, each group time-sorted (blocks_on sorts; partition preserves
+    // order) and capped separately so meetings can't evict timeboxes.
+    let (own, meetings): (Vec<&TimeBlock>, Vec<&TimeBlock>) = planner
         .blocks_on(today)
         .into_iter()
-        .take(CTX_MAX_BLOCKS)
-        .map(|b| {
-            format!(
-                "{}–{} {}",
-                b.start.with_timezone(&chrono::Local).format("%H:%M"),
-                b.end.with_timezone(&chrono::Local).format("%H:%M"),
-                truncate_title(&planner.block_display_title(b))
-            )
-        })
+        .partition(|b| !matches!(b.source, BlockSource::External { .. }));
+    let block_line = |b: &TimeBlock, suffix: &str| {
+        format!(
+            "{}–{} {}{}",
+            b.start.with_timezone(&chrono::Local).format("%H:%M"),
+            b.end.with_timezone(&chrono::Local).format("%H:%M"),
+            truncate_title(&planner.block_display_title(b)),
+            suffix
+        )
+    };
+    let mut blocks: Vec<String> = own
+        .into_iter()
+        .take(CTX_MAX_OWN_BLOCKS)
+        .map(|b| block_line(b, ""))
+        .collect();
+    blocks.extend(meetings.into_iter().take(CTX_MAX_MEETINGS).map(|b| {
+        // Free/focus-time mirrors are labeled so the model knows it may plan
+        // work over them; tentative invitations are labeled so the model
+        // knows they don't count as planned time; busy firm meetings stay
+        // fixed commitments.
+        let suffix = match b.source {
+            BlockSource::External { busy: false, .. } => " (meeting, free)",
+            BlockSource::External {
+                tentative: true, ..
+            } => " (meeting, tentative)",
+            _ => " (meeting)",
+        };
+        block_line(b, suffix)
+    }));
+
+    // Today's all-day events (enabled subscriptions only) from the calendar
+    // cache — they never exist as blocks, so they'd otherwise be invisible.
+    let enabled_subs: std::collections::HashSet<String> = settings
+        .planner_calendar_subscriptions
+        .iter()
+        .filter(|s| s.enabled)
+        .map(|s| s.id.clone())
+        .collect();
+    let all_day: Vec<String> = views::all_day_events_on(calendar_events, &enabled_subs, today)
+        .into_iter()
+        .take(CTX_MAX_ALL_DAY)
+        .map(|e| format!("{} (all day)", truncate_title(&e.title)))
         .collect();
 
     let overdue: Vec<String> = views::overdue(&planner.todos, today)
@@ -1398,15 +1693,25 @@ pub fn planner_today_context(
         )
     });
 
-    Some(serde_json::json!({
+    let mut ctx = serde_json::json!({
         "date": today.to_string(),
         "capacity": cap.summary(),
         "in_focus": focus,
         "todos": todos,
         "blocks": blocks,
+        "all_day": all_day,
         "overdue": overdue,
-        "instruction": "The user's shared to-do list for today. Manage it with the HOBBES_TODO_* / HOBBES_PLAN_DAY / HOBBES_TIME_BLOCK tools. Setting a todo's status to in_progress starts focus mode on it (only one at a time); completing or reopening it ends the session.",
-    }))
+        "instruction": "The user's shared to-do list for today. Manage it with the HOBBES_TODO_* / HOBBES_PLAN_DAY / HOBBES_TIME_BLOCK tools. Setting a todo's status to in_progress starts focus mode on it (only one at a time); completing or reopening it ends the session. Blocks marked (meeting) and the all_day list mirror the user's external calendar — fixed commitments that cannot be moved or deleted; plan around them (HOBBES_CALENDAR_LIST shows more days).",
+    });
+    // Per-actor focus minutes for today, so the model can reason about person
+    // vs agent load. Only when nonzero — an untouched day stays compact.
+    if person_done_minutes > 0 {
+        ctx["person_done_minutes"] = serde_json::json!(person_done_minutes);
+    }
+    if agent_done_minutes > 0 {
+        ctx["agent_done_minutes"] = serde_json::json!(agent_done_minutes);
+    }
+    Some(ctx)
 }
 
 #[cfg(test)]
@@ -1425,7 +1730,7 @@ mod tests {
     }
 
     fn update(state: &mut PlannerState, args: Value) -> (ToolCallStatus, String) {
-        handle_todo_update(state, &args, today(), false)
+        handle_todo_update(state, &args, "sess-1", today(), false)
     }
 
     fn list(state: &PlannerState, args: Value) -> (ToolCallStatus, String) {
@@ -1433,7 +1738,7 @@ mod tests {
     }
 
     fn plan(state: &mut PlannerState, args: Value) -> (ToolCallStatus, String) {
-        handle_plan_day(state, &args, 360, today(), false)
+        handle_plan_day(state, &args, 360, false, today(), false)
     }
 
     fn block(state: &mut PlannerState, args: Value) -> (ToolCallStatus, String) {
@@ -1671,6 +1976,119 @@ mod tests {
         assert_eq!(status, ToolCallStatus::Completed);
         assert!(state.focused().is_none());
         assert!(state.todo(&b).unwrap().started_at.is_none());
+    }
+
+    #[test]
+    fn ai_focus_opens_an_agent_session_and_status_changes_close_it() {
+        use crate::todo::model::FocusEndReason;
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Delegated", "today");
+
+        // status: in_progress → an agent-actor row attributed to the chat
+        // session the dispatcher passed (the update() helper's "sess-1").
+        let (status, _) = update(
+            &mut state,
+            json!({"updates": [{"id": id, "status": "in_progress"}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        let open = state.open_focus_session_for(&id).expect("agent row opened");
+        assert!(open.actor.is_agent());
+        assert_eq!(open.actor.agent_session_id(), Some("sess-1"));
+
+        // status: open is the agent's stop path — the row closes as 'stopped'
+        // (banking an in-progress todo) and nothing stays live.
+        let (status, _) = update(&mut state, json!({"updates": [{"id": id, "status": "open"}]}));
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(state.open_focus_session_for(&id).is_none());
+        assert_eq!(
+            state.focus_sessions.last().unwrap().end_reason,
+            Some(FocusEndReason::Stopped)
+        );
+
+        // Completing mid-focus closes as 'completed'.
+        update(&mut state, json!({"updates": [{"id": id, "status": "in_progress"}]}));
+        update(&mut state, json!({"updates": [{"id": id, "status": "completed"}]}));
+        assert!(state.focus_sessions.iter().all(|s| !s.is_open()));
+        assert_eq!(
+            state.focus_sessions.last().unwrap().end_reason,
+            Some(FocusEndReason::Completed)
+        );
+
+        // Cancelling mid-focus closes as 'cancelled'.
+        let other = seed_todo(&mut state, "Doomed", "today");
+        update(&mut state, json!({"updates": [{"id": other, "status": "in_progress"}]}));
+        update(&mut state, json!({"updates": [{"id": other, "status": "cancelled"}]}));
+        assert!(state.focus_sessions.iter().all(|s| !s.is_open()));
+        assert_eq!(
+            state.focus_sessions.last().unwrap().end_reason,
+            Some(FocusEndReason::Cancelled)
+        );
+        // persist=false throughout: rows lived purely in memory, and the
+        // dirty queue was drained by the handler itself.
+        assert!(state.take_dirty_focus_sessions().is_empty());
+    }
+
+    #[test]
+    fn ai_refocus_preempts_the_previous_agent_session() {
+        use crate::todo::model::FocusEndReason;
+        let mut state = PlannerState::default();
+        let a = seed_todo(&mut state, "First", "today");
+        let b = seed_todo(&mut state, "Second", "today");
+
+        update(&mut state, json!({"updates": [{"id": a, "status": "in_progress"}]}));
+        update(&mut state, json!({"updates": [{"id": b, "status": "in_progress"}]}));
+
+        assert!(state.open_focus_session_for(&b).is_some());
+        let a_row = state
+            .focus_sessions
+            .iter()
+            .find(|s| s.todo_id == a)
+            .unwrap();
+        assert_eq!(a_row.end_reason, Some(FocusEndReason::Preempted));
+    }
+
+    #[test]
+    fn context_reports_per_actor_done_minutes() {
+        use crate::todo::model::{FocusActor, FocusEndReason, FocusSession};
+        let mut state = PlannerState::default();
+        seed_todo(&mut state, "Tracked", "today");
+        let settings = crate::settings::Settings::default();
+
+        // Untouched day: the keys stay absent — context is token-budgeted.
+        let ctx = planner_today_context(&state, &settings, today()).expect("context on");
+        assert!(ctx.get("person_done_minutes").is_none());
+        assert!(ctx.get("agent_done_minutes").is_none());
+
+        // Sessions land on the *real* local day — the context aggregates over
+        // the `today` it is handed, so hand it that day. Local noon keeps the
+        // sitting inside that day in any timezone at any test hour.
+        use chrono::TimeZone;
+        let real_today = chrono::Local::now().date_naive();
+        let start = chrono::Local
+            .from_local_datetime(&real_today.and_hms_opt(12, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc);
+        let todo_id = state.todos[0].id.clone();
+        let mut person = FocusSession::open(&todo_id, start, FocusActor::Person);
+        person.close(start + chrono::Duration::minutes(30), FocusEndReason::Paused);
+        let mut agent = FocusSession::open(
+            &todo_id,
+            start,
+            FocusActor::Agent {
+                session_id: Some("sess-1".into()),
+            },
+        );
+        agent.close(start + chrono::Duration::minutes(45), FocusEndReason::Completed);
+        state.focus_sessions.push(person);
+        state.focus_sessions.push(agent);
+
+        let ctx = planner_today_context(&state, &settings, real_today).expect("context on");
+        assert_eq!(ctx.get("person_done_minutes").unwrap().as_u64(), Some(30));
+        assert_eq!(ctx.get("agent_done_minutes").unwrap().as_u64(), Some(45));
+        // The capacity line keeps its familiar wording; the split rides in
+        // the dedicated keys.
+        assert!(!ctx.get("capacity").unwrap().as_str().unwrap().contains("agent"));
     }
 
     #[test]
@@ -2328,6 +2746,65 @@ mod tests {
     }
 
     #[test]
+    fn non_busy_external_blocks_do_not_trigger_overlap_warnings() {
+        let mut state = PlannerState::default();
+        // A free/focus-time mirror 9–11 and a busy meeting 14–15, both today.
+        seed_external_block(&mut state, "focus-hold", 9, 11);
+        mark_block_free(&mut state, "ext_focus-hold");
+        seed_external_block(&mut state, "standup", 14, 15);
+
+        // Create over the free block: clean, no warning.
+        let (status, resp) = block(
+            &mut state,
+            json!({"action": "create", "title": "Deep work", "date": TODAY, "start": "09:00", "end": "10:00"}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(!resp.contains("Warning"), "free time doesn't clash: {resp}");
+
+        // Move onto the busy meeting: still warns.
+        let own_id = state
+            .blocks
+            .iter()
+            .find(|b| b.title == "Deep work")
+            .unwrap()
+            .id
+            .clone();
+        let (_, resp) = block(
+            &mut state,
+            json!({"action": "move", "id": own_id, "start": "14:15", "end": "15:15"}),
+        );
+        assert!(resp.contains("Warning — overlaps"), "{resp}");
+
+        // Move back over the free block: clean again on the move path too.
+        let (_, resp) = block(
+            &mut state,
+            json!({"action": "move", "id": own_id, "start": "10:00", "end": "11:00"}),
+        );
+        assert!(!resp.contains("Warning"), "{resp}");
+    }
+
+    #[test]
+    fn today_context_labels_free_and_tentative_meetings() {
+        let mut state = PlannerState::default();
+        seed_external_block(&mut state, "standup", 9, 10);
+        seed_external_block(&mut state, "focus", 10, 12);
+        mark_block_free(&mut state, "ext_focus");
+        seed_external_block(&mut state, "maybe", 13, 14);
+        mark_block_tentative(&mut state, "ext_maybe");
+
+        let ctx = planner_today_context(&state, &ctx_settings(true, true), today()).unwrap();
+        let blocks: Vec<&str> = ctx["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(blocks[0].ends_with("(meeting)"), "{:?}", blocks);
+        assert!(blocks[1].ends_with("(meeting, free)"), "{:?}", blocks);
+        assert!(blocks[2].ends_with("(meeting, tentative)"), "{:?}", blocks);
+    }
+
+    #[test]
     fn time_block_validates_input() {
         let mut state = PlannerState::default();
 
@@ -2421,6 +2898,122 @@ mod tests {
         assert!(resp.contains("missing required 'title'"));
     }
 
+    // ── external meetings vs capacity ───────────────────────────────────────
+
+    /// An external (calendar-mirrored) block on TODAY, `from_h`:00–`to_h`:00
+    /// local time.
+    fn seed_external_block(state: &mut PlannerState, uid: &str, from_h: u32, to_h: u32) {
+        use chrono::TimeZone;
+        let at = |h: u32| {
+            chrono::Local
+                .from_local_datetime(&today().and_hms_opt(h, 0, 0).unwrap())
+                .earliest()
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        state.blocks.push(crate::todo::model::TimeBlock {
+            id: format!("ext_{}", uid),
+            todo_id: None,
+            title: uid.into(),
+            start: at(from_h),
+            end: at(to_h),
+            source: crate::todo::model::BlockSource::External {
+                uid: uid.into(),
+                subscription_id: Some("sub1".into()),
+                url: None,
+                busy: true,
+                tentative: false,
+            },
+        });
+    }
+
+    /// Flip an already-seeded external block to non-busy (free/focus time).
+    fn mark_block_free(state: &mut PlannerState, block_id: &str) {
+        let block = state
+            .blocks
+            .iter_mut()
+            .find(|b| b.id == block_id)
+            .expect("seeded block exists");
+        if let crate::todo::model::BlockSource::External { ref mut busy, .. } = block.source {
+            *busy = false;
+        }
+    }
+
+    /// Flip an already-seeded external block to tentative.
+    fn mark_block_tentative(state: &mut PlannerState, block_id: &str) {
+        let block = state
+            .blocks
+            .iter_mut()
+            .find(|b| b.id == block_id)
+            .expect("seeded block exists");
+        if let crate::todo::model::BlockSource::External {
+            ref mut tentative, ..
+        } = block.source
+        {
+            *tentative = true;
+        }
+    }
+
+    #[test]
+    fn plan_day_counts_meetings_as_planned_when_enabled() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Deep work", "today");
+        // 9–12 local: 3h of meetings against a 6h day.
+        seed_external_block(&mut state, "offsite", 9, 12);
+
+        let args = json!({"items": [{"id": id, "estimate_minutes": 240}]});
+        let (status, out) =
+            handle_plan_day(&mut state, &args, 360, true, today(), false);
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(
+            out.starts_with("OVERCOMMITTED"),
+            "4h of tasks + 3h of meetings into a 6h day must lead the response: {}",
+            out
+        );
+        assert!(out.contains("7h planned"), "meetings join planned: {}", out);
+
+        // Toggle off: the old todo-only math, and the day fits.
+        let (_, out) = handle_plan_day(&mut state, &args, 360, false, today(), false);
+        assert!(!out.starts_with("OVERCOMMITTED"), "{}", out);
+    }
+
+    #[test]
+    fn today_context_capacity_reflects_meetings() {
+        let mut state = PlannerState::default();
+        create(
+            &mut state,
+            json!({"todos": [{"title": "t", "scheduled_for": "today", "estimate_minutes": 60}]}),
+        );
+        seed_external_block(&mut state, "standup", 12, 14);
+
+        // On: 1h of tasks + 2h of meetings = 3h planned against a full 6h day.
+        let on = ctx_settings(true, true); // counts_against_capacity defaults true
+        let ctx = planner_today_context(&state, &on, today()).unwrap();
+        assert_eq!(ctx["capacity"], "3h planned · 3h free");
+
+        let mut off = ctx_settings(true, true);
+        off.planner_calendar_counts_against_capacity = false;
+        let ctx = planner_today_context(&state, &off, today()).unwrap();
+        assert_eq!(ctx["capacity"], "1h planned · 5h free");
+    }
+
+    #[test]
+    fn today_context_capacity_ignores_tentative_and_free_meetings() {
+        let mut state = PlannerState::default();
+        create(
+            &mut state,
+            json!({"todos": [{"title": "t", "scheduled_for": "today", "estimate_minutes": 60}]}),
+        );
+        seed_external_block(&mut state, "maybe", 9, 11);
+        mark_block_tentative(&mut state, "ext_maybe");
+        seed_external_block(&mut state, "hold", 12, 14);
+        mark_block_free(&mut state, "ext_hold");
+
+        // Neither the tentative nor the free mirror adds planned time.
+        let ctx = planner_today_context(&state, &ctx_settings(true, true), today()).unwrap();
+        assert_eq!(ctx["capacity"], "1h planned · 5h free");
+    }
+
     // ── planner_today context ───────────────────────────────────────────────
 
     fn ctx_settings(enabled: bool, inject: bool) -> crate::settings::Settings {
@@ -2500,5 +3093,283 @@ mod tests {
         let line = ctx["todos"][0].as_str().unwrap();
         assert!(line.contains('…'));
         assert!(!line.contains(&"x".repeat(100)));
+    }
+
+    // ── context interleaving & calendar (Phase 5) ───────────────────────────
+
+    /// A UTC instant at `h`:`m` **local** on the test day, so assertions are
+    /// timezone-independent (the same trick as `seed_external_block`).
+    fn local_utc(day: NaiveDate, h: u32, m: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        chrono::Local
+            .from_local_datetime(&day.and_hms_opt(h, m, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn cal_sub(id: &str, name: &str, enabled: bool) -> crate::settings::CalendarSubscription {
+        crate::settings::CalendarSubscription {
+            id: id.into(),
+            name: name.into(),
+            color: "#4f9cf9".into(),
+            enabled,
+            source: crate::settings::CalendarSource::Ics {},
+        }
+    }
+
+    fn cal_ev(
+        sub: &str,
+        uid: &str,
+        title: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        all_day: bool,
+    ) -> CalendarEvent {
+        CalendarEvent {
+            uid: uid.into(),
+            subscription_id: sub.into(),
+            title: title.into(),
+            start,
+            end,
+            all_day,
+            url: None,
+            location: None,
+            busy: true,
+            tentative: false,
+        }
+    }
+
+    /// An all-day event covering exactly the local day `d`.
+    fn all_day_ev(sub: &str, uid: &str, title: &str, d: NaiveDate) -> CalendarEvent {
+        let midnight = local_utc(d, 0, 0);
+        cal_ev(sub, uid, title, midnight, midnight + chrono::Duration::days(1), true)
+    }
+
+    #[test]
+    fn today_context_keeps_own_timeboxes_on_meeting_heavy_days() {
+        let mut state = PlannerState::default();
+        // 12 meetings (over the 8-meeting lane) crowd the day...
+        for i in 0..12 {
+            seed_external_block(&mut state, &format!("mtg{:02}", i), 6 + i, 7 + i);
+        }
+        // ...and 3 own timeboxes land late, after every meeting has started.
+        for i in 0..3 {
+            block(
+                &mut state,
+                json!({"action": "create", "title": format!("focus{}", i), "date": TODAY,
+                       "start": format!("19:{:02}", i * 10), "end": format!("19:{:02}", i * 10 + 5)}),
+            );
+        }
+
+        let ctx = planner_today_context(&state, &ctx_settings(true, true), today()).unwrap();
+        let blocks: Vec<&str> = ctx["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Own timeboxes survive AND lead the list, despite starting last.
+        assert_eq!(blocks.len(), 3 + 8, "3 own + capped meetings: {:?}", blocks);
+        for line in &blocks[..3] {
+            assert!(line.contains("focus"), "own blocks first: {:?}", blocks);
+            assert!(!line.contains("(meeting)"), "{:?}", blocks);
+        }
+        for line in &blocks[3..] {
+            assert!(line.contains("(meeting)"), "meetings marked: {:?}", blocks);
+        }
+        // Meetings are time-sorted within their lane and cap at the earliest 8.
+        assert!(blocks[3].contains("mtg00") && blocks[10].contains("mtg07"), "{:?}", blocks);
+    }
+
+    #[test]
+    fn today_context_caps_own_blocks_and_meetings_separately() {
+        let mut state = PlannerState::default();
+        for i in 0..12 {
+            block(
+                &mut state,
+                json!({"action": "create", "title": format!("b{}", i), "date": TODAY,
+                       "start": format!("12:{:02}", i * 4), "end": format!("12:{:02}", i * 4 + 3)}),
+            );
+        }
+        for i in 0..10 {
+            seed_external_block(&mut state, &format!("m{}", i), 6 + i, 7 + i);
+        }
+        let ctx = planner_today_context(&state, &ctx_settings(true, true), today()).unwrap();
+        let blocks = ctx["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), CTX_MAX_OWN_BLOCKS + CTX_MAX_MEETINGS);
+    }
+
+    #[test]
+    fn today_context_lists_capped_all_day_events_from_enabled_subs() {
+        let state = PlannerState::default();
+        let mut settings = ctx_settings(true, true);
+        settings.planner_calendar_subscriptions =
+            vec![cal_sub("s1", "Work", true), cal_sub("s2", "Personal", false)];
+
+        let mut events: Vec<CalendarEvent> = (0..5)
+            .map(|i| all_day_ev("s1", &format!("ad{}", i), &format!("Offsite {}", i), today()))
+            .collect();
+        // Disabled subscription and a different day: both invisible.
+        events.push(all_day_ev("s2", "hidden", "Hidden holiday", today()));
+        events.push(all_day_ev(
+            "s1",
+            "tomorrow",
+            "Tomorrow only",
+            today() + chrono::Duration::days(1),
+        ));
+
+        let ctx =
+            planner_today_context_with_events(&state, &settings, today(), &events).unwrap();
+        let all_day: Vec<&str> = ctx["all_day"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(all_day.len(), CTX_MAX_ALL_DAY, "{:?}", all_day);
+        for line in &all_day {
+            assert!(line.contains("(all day)"), "{:?}", all_day);
+            assert!(!line.contains("Hidden") && !line.contains("Tomorrow"), "{:?}", all_day);
+        }
+    }
+
+    #[test]
+    fn today_context_all_day_is_empty_without_events() {
+        let state = PlannerState::default();
+        let ctx = planner_today_context_with_events(
+            &state,
+            &ctx_settings(true, true),
+            today(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(ctx["all_day"].as_array().unwrap().len(), 0);
+    }
+
+    // ── HOBBES_CALENDAR_LIST ────────────────────────────────────────────────
+
+    #[test]
+    fn calendar_list_range_defaults_parses_and_clamps() {
+        assert_eq!(calendar_list_range(&json!({}), today()).unwrap(), (today(), 1));
+        assert_eq!(
+            calendar_list_range(&json!({"start_date": "tomorrow", "days": 3}), today()).unwrap(),
+            (today() + chrono::Duration::days(1), 3)
+        );
+        assert_eq!(
+            calendar_list_range(&json!({"start_date": "2026-09-01"}), today()).unwrap(),
+            ("2026-09-01".parse().unwrap(), 1)
+        );
+        // Clamped, not rejected.
+        assert_eq!(calendar_list_range(&json!({"days": 0}), today()).unwrap().1, 1);
+        assert_eq!(calendar_list_range(&json!({"days": -5}), today()).unwrap().1, 1);
+        assert_eq!(
+            calendar_list_range(&json!({"days": 99}), today()).unwrap().1,
+            CALENDAR_LIST_MAX_DAYS
+        );
+        assert!(calendar_list_range(&json!({"start_date": "junk"}), today()).is_err());
+        assert!(calendar_list_range(&json!({"days": "many"}), today()).is_err());
+    }
+
+    #[test]
+    fn calendar_list_handler_rejects_bad_dates_before_touching_the_store() {
+        let (status, resp) =
+            handle_calendar_list(&json!({"start_date": "someday"}), &[], &[], today());
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(resp.contains("start_date"), "{resp}");
+    }
+
+    #[test]
+    fn calendar_list_groups_by_day_and_marks_all_day() {
+        let subs = vec![cal_sub("s1", "Work", true)];
+        let tomorrow = today() + chrono::Duration::days(1);
+        let events = vec![
+            cal_ev("s1", "b", "Standup", local_utc(today(), 9, 0), local_utc(today(), 9, 15), false),
+            cal_ev("s1", "a", "Review", local_utc(today(), 14, 0), local_utc(today(), 15, 0), false),
+            all_day_ev("s1", "c", "Conference", today()),
+            cal_ev("s1", "d", "1:1", local_utc(tomorrow, 10, 30), local_utc(tomorrow, 11, 0), false),
+        ];
+        let out = calendar_list_over(&events, &subs, &[], today(), 2, today());
+        assert!(out.starts_with("Calendar — 4 event(s) Today to Tomorrow:"), "{out}");
+        let today_pos = out.find("\nToday:").unwrap();
+        let tomorrow_pos = out.find("\nTomorrow:").unwrap();
+        assert!(today_pos < tomorrow_pos, "{out}");
+        // All-day leads its day; timed events follow sorted by start.
+        let allday_pos = out.find("(all day) Conference").unwrap();
+        let standup_pos = out.find("09:00–09:15 Standup").unwrap();
+        let review_pos = out.find("14:00–15:00 Review").unwrap();
+        assert!(allday_pos < standup_pos && standup_pos < review_pos, "{out}");
+        assert!(tomorrow_pos < out.find("10:30–11:00 1:1").unwrap(), "{out}");
+    }
+
+    #[test]
+    fn calendar_list_empty_range_is_friendly() {
+        let subs = vec![cal_sub("s1", "Work", true)];
+        let out = calendar_list_over(&[], &subs, &[], today(), 1, today());
+        assert_eq!(out, "No calendar events Today.");
+        // A multi-day empty range names the span.
+        let out = calendar_list_over(&[], &subs, &[], today(), 3, today());
+        assert!(out.starts_with("No calendar events Today to"), "{out}");
+    }
+
+    #[test]
+    fn calendar_list_notes_disabled_subscriptions_and_sync_errors() {
+        let subs = vec![cal_sub("s1", "Work", true), cal_sub("s2", "Personal", false)];
+        let events = vec![
+            cal_ev("s1", "ok", "Kept", local_utc(today(), 9, 0), local_utc(today(), 10, 0), false),
+            cal_ev("s2", "no", "Dropped", local_utc(today(), 11, 0), local_utc(today(), 12, 0), false),
+        ];
+        let errors = vec![("Work".to_string(), "HTTP 404".to_string())];
+        let out = calendar_list_over(&events, &subs, &errors, today(), 1, today());
+        assert!(out.contains("Kept"), "{out}");
+        assert!(!out.contains("Dropped"), "disabled sub's events must be hidden: {out}");
+        assert!(out.contains("1 event(s)"), "{out}");
+        assert!(out.contains("'Personal' is disabled"), "{out}");
+        assert!(out.contains("'Work' failed its last sync (HTTP 404)"), "{out}");
+    }
+
+    #[test]
+    fn calendar_list_includes_location_when_present() {
+        let subs = vec![cal_sub("s1", "Work", true)];
+        let mut ev = cal_ev("s1", "x", "Lunch", local_utc(today(), 12, 0), local_utc(today(), 13, 0), false);
+        ev.location = Some("Cafe Rio".into());
+        let out = calendar_list_over(&[ev], &subs, &[], today(), 1, today());
+        assert!(out.contains("12:00–13:00 Lunch @ Cafe Rio"), "{out}");
+    }
+
+    // ── busy-time verification (Phase 5) ────────────────────────────────────
+
+    #[test]
+    fn time_block_overlap_warning_includes_external_meetings() {
+        let mut state = PlannerState::default();
+        seed_external_block(&mut state, "boardmtg", 9, 12);
+        let (status, resp) = block(
+            &mut state,
+            json!({"action": "create", "title": "Focus", "date": TODAY,
+                   "start": "10:00", "end": "11:00"}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(resp.contains("Warning — overlaps"), "{resp}");
+        assert!(resp.contains("boardmtg"), "the meeting must be named in the warning: {resp}");
+    }
+
+    #[test]
+    fn time_block_move_overlap_warning_includes_external_meetings() {
+        let mut state = PlannerState::default();
+        seed_external_block(&mut state, "standup", 9, 10);
+        let (_, resp) = block(
+            &mut state,
+            json!({"action": "create", "title": "Focus", "date": TODAY,
+                   "start": "14:00", "end": "15:00"}),
+        );
+        assert!(!resp.contains("Warning"), "{resp}");
+        let id = state.blocks.iter().find(|b| b.title == "Focus").unwrap().id.clone();
+        let (status, resp) = block(
+            &mut state,
+            json!({"action": "move", "id": id, "start": "09:30", "end": "10:30"}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(resp.contains("Warning — overlaps"), "{resp}");
+        assert!(resp.contains("standup"), "{resp}");
     }
 }

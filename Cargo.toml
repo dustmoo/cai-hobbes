@@ -14,6 +14,9 @@ members = [
     "packages/feature_clipboard",
     "packages/hobbes_core",
 ]
+# The license mint helper is a standalone tool (own lockfile, never shipped);
+# it must not build with the app.
+exclude = ["scripts/mint_license"]
 
 [workspace.dependencies]
 dioxus = { version = "0.6.3", features = ["router", "desktop"] }
@@ -38,7 +41,7 @@ rmcp = { version = "0.10.0", features = ["client", "transport-child-process", "t
 [dependencies]
 dioxus = { version = "0.6.3", features = ["router", "desktop"] }
 dioxus-desktop = "0.6.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 tray-icon = "0.19.3"
 image = { version = "0.25.1", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 dioxus-signals = "0.6.3"
@@ -48,6 +51,11 @@ futures-util = "0.3.31"
 serde_json = "1.0.141"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# Fleet listener (src/fleet/server.rs). hyper 1.x + hyper-util are already in
+# the dependency graph via reqwest/rmcp — this only turns on the server half.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 tracing-appender = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 # macos-accessibility-client is now only in target-specific dependencies
@@ -64,12 +72,18 @@ hobbes_core = { workspace = true }
 thiserror = "1.0"
 futures = "0.3.31"
 chrono = { version = "0.4.41", features = ["serde"] }
+chrono-tz = "0.10"
+icalendar = { version = "0.17", features = ["recurrence"] }
+rrule = "0.14"
 rmcp = { workspace = true }
 http = "1.1.0"
 cfg-if = "1.0.3"
 rfd = "0.15.4"
 ammonia = "4.1.2"
 base64 = "0.22.1"
+# Pro license verification (src/entitlement.rs). Verify-only in the app:
+# signing/keygen lives in the standalone scripts/mint_license helper.
+ed25519-dalek = "2"
 async-trait = "0.1.80"
 arboard = "3.6.1"
 dioxus-sdk = { version = "0.6.0", features = ["clipboard"] }

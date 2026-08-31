@@ -646,7 +646,7 @@ pub fn MarkdownRenderer(
     content: String,
     comments: Option<Vec<Comment>>,
     pending_highlight: Option<String>,
-    #[props(default)] on_comment_edit: Option<EventHandler<String>>,
+    #[props(default)] on_comment_edit: Option<EventHandler<(String, f64, f64)>>,
     #[props(default)] on_comment_delete: Option<EventHandler<String>>,
 ) -> Element {
     // ⚠️  DO NOT WRAP THIS BLOCK IN `use_memo` ⚠️
@@ -1066,7 +1066,21 @@ pub fn MarkdownRenderer(
                             const commentIdEl = target.closest('[data-comment-id]');
                             const commentId = commentIdEl ? commentIdEl.getAttribute('data-comment-id') : null;
                             if (commentId) {{
-                                dioxus.send({{ action: action, comment_id: commentId }});
+                                // Anchor the edit popover to the comment span, using the
+                                // same prefer-below/flip-above logic as the selection handler.
+                                const rect = commentIdEl.getBoundingClientRect();
+                                const popoverHeight = 160;
+                                const popoverWidth = 384; // max-w-[24rem]
+                                const spaceBelow = window.innerHeight - rect.bottom;
+                                let top;
+                                if (spaceBelow < popoverHeight + 20) {{
+                                    top = rect.top + window.scrollY - popoverHeight - 8;
+                                }} else {{
+                                    top = rect.bottom + window.scrollY + 8;
+                                }}
+                                let left = rect.left + window.scrollX;
+                                left = Math.max(8, Math.min(left, window.innerWidth - popoverWidth - 8));
+                                dioxus.send({{ action: action, comment_id: commentId, top: top, left: left }});
                             }}
                         }}
                     }});
@@ -1079,6 +1093,10 @@ pub fn MarkdownRenderer(
             struct CommentAction {
                 action: String,
                 comment_id: String,
+                #[serde(default)]
+                top: f64,
+                #[serde(default)]
+                left: f64,
             }
 
             while let Ok(msg) = eval.recv().await {
@@ -1086,7 +1104,7 @@ pub fn MarkdownRenderer(
                     match action.action.as_str() {
                         "edit" => {
                             if let Some(handler) = &on_edit {
-                                handler.call(action.comment_id);
+                                handler.call((action.comment_id, action.top, action.left));
                             }
                         }
                         "delete" => {

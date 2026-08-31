@@ -72,10 +72,15 @@ fn seed_seq_from_db(conn: &Connection) {
     let meta_max: i64 = conn
         .query_row("SELECT COALESCE(MAX(seq), 0) FROM meta", [], |r| r.get(0))
         .unwrap_or(0);
-    // The planner's tables share this counter — omitting them would restart the
-    // seq below existing planner rows and silently reject every planner write.
+    // The planner's and fleet's tables share this counter — omitting either
+    // would restart the seq below their existing rows and silently reject
+    // every subsequent write in that domain.
     let todo_max = crate::todo::store::max_seq(conn);
-    SEQ.fetch_max(sessions_max.max(meta_max).max(todo_max) + 1, Ordering::SeqCst);
+    let fleet_max = crate::fleet::store::max_seq(conn);
+    SEQ.fetch_max(
+        sessions_max.max(meta_max).max(todo_max).max(fleet_max) + 1,
+        Ordering::SeqCst,
+    );
 }
 
 pub fn get_db_path() -> Option<PathBuf> {
@@ -120,9 +125,10 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
          );",
     )?;
 
-    // The planner shares this database and connection. Creating its schema here
-    // means test databases get the planner tables too.
-    crate::todo::store::create_schema(conn)
+    // The planner and the fleet share this database and connection. Creating
+    // their schemas here means test databases get their tables too.
+    crate::todo::store::create_schema(conn)?;
+    crate::fleet::store::create_schema(conn)
 }
 
 /// Open the global connection, create the schema, and run the one-time
@@ -489,6 +495,14 @@ fn meta_get_conn(conn: &Connection, key: &str) -> rusqlite::Result<Option<String
 
 pub fn meta_get(key: &str) -> Option<String> {
     with_conn(|conn| meta_get_conn(conn, key)).ok().flatten()
+}
+
+/// Write one meta key immediately on the calling thread. Used by sibling
+/// domains (calendar sync state) for small standalone values that don't ride
+/// the session save path.
+pub fn meta_set(key: &str, value: &str) -> Result<(), String> {
+    let seq = next_seq();
+    with_conn(|conn| meta_set_conn(conn, key, value, seq))
 }
 
 

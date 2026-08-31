@@ -113,7 +113,7 @@ pub fn ChatInput(
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let SessionIdContext(current_session_id) = use_context::<SessionIdContext>();
-    let mut settings = use_context::<Signal<Settings>>();
+    let settings = use_context::<Signal<Settings>>();
     let _settings_manager = use_context::<Signal<SettingsManager>>();
     let _mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
@@ -988,7 +988,6 @@ pub fn ChatInput(
                                             class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
                                             for (index, profile) in profiles.iter().enumerate() {
                                                 {
-                                                    let profile_id = profile.id.clone();
                                                     let profile_name = profile.name.clone();
                                                     let profile_color = profile.color.clone();
                                                     let profile_initial = profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
@@ -998,10 +997,11 @@ pub fn ChatInput(
                                                             button {
                                                                 class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
                                                                 onclick: move |_| {
-                                                                    if let Some(session) = session_state.write().get_active_session_mut() {
-                                                                        session.composio_profile = Some(profile_id.clone());
-                                                                    }
-                                                                    settings.write().active_composio_profile = Some(profile_id.clone());
+                                                                    // Route through the global command so the session
+                                                                    // pin is PERSISTED (save_async) — writing the
+                                                                    // signals directly here loses the selection on app
+                                                                    // restart unless something else saves the session.
+                                                                    chat_command.set(Some(ChatCommand::SwitchProfile(index)));
 
                                                                     // Trigger summary refresh
                                                                     scheduler.send(SchedulerSignal::ForceRefresh);

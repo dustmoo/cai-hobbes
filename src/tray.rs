@@ -1,8 +1,54 @@
 use dioxus_signals::{GlobalSignal, Signal};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 pub static WINDOW_VISIBLE: GlobalSignal<bool> = Signal::global(|| true);
 pub static APP_QUIT: GlobalSignal<bool> = Signal::global(|| false);
+
+/// Start the single global `TrayIconEvent` drain thread, exactly once.
+///
+/// There is one tray icon and one crossbeam channel; exactly one consumer
+/// must exist (competing receivers would steal each other's clicks). Clicks
+/// are routed by focus mode *at event time*: while a focus session is active
+/// the icon is the timer — a left-click release bumps the focus-click
+/// counter (drained by an effect in `main.rs` that surfaces the window and
+/// planner, never hides them); with no focus active, the historical
+/// any-click visibility toggle applies.
+pub fn ensure_tray_listener() {
+    static LISTENER: std::sync::Once = std::sync::Once::new();
+    LISTENER.call_once(|| {
+        let tray_channel = TrayIconEvent::receiver();
+        std::thread::spawn(move || {
+            tracing::info!("Tray listener thread started.");
+            loop {
+                let Ok(event) = tray_channel.recv() else {
+                    // The static channel never closes; if it somehow does,
+                    // there is nothing left to listen for.
+                    return;
+                };
+                if let TrayIconEvent::Click {
+                    button,
+                    button_state,
+                    ..
+                } = event
+                {
+                    if crate::focus_tray::focus_mode_active() {
+                        // One action per physical click: count only the
+                        // left-button release. Never toggles visibility —
+                        // focus mode must not hide the window.
+                        if button == MouseButton::Left && button_state == MouseButtonState::Up {
+                            tracing::info!("Tray clicked in focus mode.");
+                            *crate::focus_tray::FOCUS_TRAY_CLICKS.write() += 1;
+                        }
+                    } else {
+                        tracing::info!("Tray icon clicked, toggling visibility.");
+                        let mut visible = WINDOW_VISIBLE.write();
+                        *visible = !*visible;
+                    }
+                }
+            }
+        });
+    });
+}
 
 pub fn init_tray() -> TrayIcon {
     // Runtime Branding: Select tray icon based on distribution variant.
@@ -30,21 +76,11 @@ pub fn init_tray() -> TrayIcon {
         Icon::from_rgba(vec![0, 0, 0, 0], 1, 1).unwrap()
     });
 
-    // Build a tray icon without a menu to avoid the muda class conflict.
-    // The main application menu is handled separately in menu.rs.
-    // Use the TrayIconEvent receiver for direct clicks.
-    let tray_channel = TrayIconEvent::receiver();
-
-    std::thread::spawn(move || {
-        tracing::info!("Tray listener thread started.");
-        loop {
-            if let Ok(TrayIconEvent::Click { .. }) = tray_channel.recv() {
-                tracing::info!("Tray icon clicked, toggling visibility.");
-                let mut visible = WINDOW_VISIBLE.write();
-                *visible = !*visible;
-            }
-        }
-    });
+    // Build a tray icon without a menu to avoid the muda class conflict
+    // (dioxus-desktop's muda 0.11 and tray-icon's muda 0.15 both register the
+    // ObjC class `MudaMenuItem`). The main application menu is handled
+    // separately in menu.rs. Use the TrayIconEvent receiver for direct clicks.
+    ensure_tray_listener();
 
     TrayIconBuilder::new()
         .with_icon(icon)

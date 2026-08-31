@@ -245,6 +245,11 @@ pub struct Settings {
     pub project_folder: Option<String>,
     pub chat_history_length: usize,
     pub show_tray_icon: bool,
+    /// Menu-bar Local/Cloud indicator: a leading ⌂/☁ glyph on the tray icon
+    /// showing at a glance whether AI prompts and tool calls leave this
+    /// machine. Rides on the tray icon when it exists; never summons it.
+    #[serde(default = "default_true")]
+    pub show_privacy_indicator: bool,
     pub permission_settings: PermissionSettings,
     #[serde(default = "default_true")]
     pub confirm_on_delete: bool,
@@ -341,10 +346,22 @@ pub struct Settings {
     /// Roll unfinished todos scheduled for a past day forward onto today.
     #[serde(default = "default_true")]
     pub planner_auto_rollover: bool,
-    /// Composio profile to read calendar events from. `None` disables the
-    /// calendar overlay.
+    /// DEPRECATED: pre-subscription calendar stub. Migrated on load into a
+    /// disabled `CalendarSource::Composio` subscription and cleared; kept
+    /// serialized for downgrade safety.
     #[serde(default)]
     pub planner_calendar_profile: Option<String>,
+    /// External calendars mirrored into the timeline as read-only blocks.
+    #[serde(default)]
+    pub planner_calendar_subscriptions: Vec<CalendarSubscription>,
+    /// Whether firm busy external meetings count as planned time in the
+    /// day's capacity math (capacity itself stays the full configured day;
+    /// meeting time overlapping a task block is not double-counted — the
+    /// task wins). A day with 4h of meetings has 4h already spoken for. Opt
+    /// out to restore the old todo-only planned math. The field name
+    /// predates the additive model and is kept for settings serde compat.
+    #[serde(default = "default_true")]
+    pub planner_calendar_counts_against_capacity: bool,
     /// Estimate auto-filled onto quick-added todos when the input carries no
     /// `~duration` token. 0 disables the auto-fill.
     #[serde(default)]
@@ -353,6 +370,14 @@ pub struct Settings {
     /// quick-add `@time` token on a todo without an estimate.
     #[serde(default = "default_planner_block_minutes")]
     pub planner_default_block_minutes: u32,
+
+    // ── Fleet (Pro) ─────────────────────────────────────────────────────────
+    /// Master switch for fleet observation: when on (and Pro is active), the
+    /// localhost hook listener runs and the Fleet view appears in the
+    /// planner. Off by default — observing every Claude Code session on the
+    /// machine is strictly opt-in.
+    #[serde(default)]
+    pub fleet_enabled: bool,
 }
 
 fn default_planner_block_minutes() -> u32 {
@@ -507,6 +532,13 @@ pub struct ComposioToolkitConfig {
     /// flag is what marks them as connected in the UI.
     #[serde(default)]
     pub no_auth: bool,
+    /// User's curated tool whitelist for this toolkit (Edit Tools modal).
+    /// `None` = no curation, all tools enabled. This local copy is the durable
+    /// source of truth: the Composio server's `allowed_tools` is a projection
+    /// of it, and it is re-applied on server recreation and toolkit re-add so
+    /// curation survives server wipes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
 }
 
 impl ComposioToolkitConfig {
@@ -555,6 +587,42 @@ impl ProviderInstance {
     }
 }
 
+/// Where a calendar subscription's events come from.
+///
+/// The transport-specific details live here; everything downstream (sync loop,
+/// cache, materialization, UI) is transport-agnostic.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CalendarSource {
+    /// An ICS/webcal feed. The URL is a secret (Google/Outlook "secret
+    /// address" feeds embed tokens) and lives in the keychain as
+    /// `cal_url_<subscription_id>` — settings holds only the id.
+    Ics {},
+    /// A Google Calendar read through a Composio profile's connection.
+    Composio {
+        profile_id: String,
+        calendar_id: String,
+    },
+}
+
+/// A read-only external calendar mirrored into the planner timeline.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CalendarSubscription {
+    #[serde(default = "default_uuid")]
+    pub id: String,
+    pub name: String,
+    /// Hex color (e.g. "#4f9cf9") tinting this subscription's blocks.
+    #[serde(default = "default_calendar_color")]
+    pub color: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub source: CalendarSource,
+}
+
+fn default_calendar_color() -> String {
+    "#4f9cf9".to_string()
+}
+
 /// A Composio profile containing connection settings for one Composio account
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ComposioProfile {
@@ -577,6 +645,12 @@ pub struct ComposioProfile {
     /// Prevents OAuth credentials from landing in the wrong Chrome profile.
     #[serde(default)]
     pub chrome_profile_directory: Option<String>,
+    /// Curation (`enabled_tools`) of toolkits the user has removed, keyed by
+    /// slug. Held so a later re-add restores the user's tool selection instead
+    /// of re-running LLM selection from scratch (delete → re-add is the normal
+    /// reauth dance and must not lose curation).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub retained_curation: HashMap<String, Vec<String>>,
 }
 
 fn default_profile_color() -> String {
@@ -599,6 +673,7 @@ impl Default for ComposioProfile {
             toolkit_configs: Vec::new(),
             color: default_profile_color(),
             chrome_profile_directory: None,
+            retained_curation: HashMap::new(),
         }
     }
 }
@@ -621,7 +696,15 @@ impl ComposioProfile {
 
     /// Remove a toolkit's config entry (used when a toolkit is fully removed
     /// from the Composio server). Mirrors `Settings::remove_profile`.
+    /// The toolkit's tool curation is retained so a later re-add restores it.
     pub fn remove_toolkit_config(&mut self, slug: &str) {
+        for c in &self.toolkit_configs {
+            if c.slug.eq_ignore_ascii_case(slug) {
+                if let Some(tools) = c.enabled_tools.clone().filter(|t| !t.is_empty()) {
+                    self.retained_curation.insert(c.slug.to_lowercase(), tools);
+                }
+            }
+        }
         self.toolkit_configs
             .retain(|c| !c.slug.eq_ignore_ascii_case(slug));
     }
@@ -648,6 +731,7 @@ impl Default for Settings {
             project_folder: None,
             chat_history_length: 75,
             show_tray_icon: true,
+            show_privacy_indicator: true,
             permission_settings: PermissionSettings {
                 auto_approval_enabled: true,
                 granular_permissions,
@@ -689,8 +773,11 @@ impl Default for Settings {
             planner_daily_capacity_minutes: default_daily_capacity_minutes(),
             planner_auto_rollover: true,
             planner_calendar_profile: None,
+            planner_calendar_subscriptions: Vec::new(),
+            planner_calendar_counts_against_capacity: true,
             planner_default_estimate_minutes: 0,
             planner_default_block_minutes: default_planner_block_minutes(),
+            fleet_enabled: false,
         }
     }
 }
@@ -703,6 +790,11 @@ pub fn get_default_model_icon(model_slug: &str) -> String {
     // --- Gemini family ---
     if slug.contains("experimental") {
         "🧪".to_string()
+    } else if slug.contains("gemini-3.7")
+        || slug.contains("gemini-3.6")
+        || slug.contains("gemini-3.5")
+    {
+        "⚡".to_string()
     } else if slug.contains("gemini-3.1") {
         "✨".to_string()
     } else if slug.contains("image") {
@@ -1050,6 +1142,124 @@ impl Settings {
         }
     }
 
+    // ========================================================================
+    // Calendar subscriptions
+    // ========================================================================
+
+    /// Look up a calendar subscription by its stable ID.
+    #[allow(dead_code)] // consumer is the Phase 4 settings UI
+    pub fn calendar_subscription_by_id(&self, id: &str) -> Option<&CalendarSubscription> {
+        self.planner_calendar_subscriptions
+            .iter()
+            .find(|s| s.id == id)
+    }
+
+    /// Mutable lookup of a calendar subscription by its stable ID.
+    #[allow(dead_code)] // consumer is the Phase 4 settings UI (enable toggle, color)
+    pub fn calendar_subscription_by_id_mut(
+        &mut self,
+        id: &str,
+    ) -> Option<&mut CalendarSubscription> {
+        self.planner_calendar_subscriptions
+            .iter_mut()
+            .find(|s| s.id == id)
+    }
+
+    /// Add a calendar subscription with a unique display name (auto-suffixed
+    /// like `add_connector`). Returns its ID.
+    pub fn add_calendar_subscription(
+        &mut self,
+        name: &str,
+        color: &str,
+        source: CalendarSource,
+    ) -> String {
+        let base_name = if name.trim().is_empty() {
+            "Calendar".to_string()
+        } else {
+            name.trim().to_string()
+        };
+        let mut unique_name = base_name.clone();
+        let mut counter = 1;
+        while self
+            .planner_calendar_subscriptions
+            .iter()
+            .any(|s| s.name == unique_name)
+        {
+            counter += 1;
+            unique_name = format!("{base_name} {counter}");
+        }
+        let subscription = CalendarSubscription {
+            id: Uuid::new_v4().to_string(),
+            name: unique_name,
+            color: if color.trim().is_empty() {
+                default_calendar_color()
+            } else {
+                color.trim().to_string()
+            },
+            enabled: true,
+            source,
+        };
+        let id = subscription.id.clone();
+        self.planner_calendar_subscriptions.push(subscription);
+        id
+    }
+
+    /// Remove a calendar subscription by ID. Returns whether one was removed.
+    /// The caller owns the follow-up cleanup (cached events, blocks, keychain
+    /// URL) — this only edits settings.
+    #[allow(dead_code)] // consumer is the Phase 4 settings UI
+    pub fn remove_calendar_subscription(&mut self, id: &str) -> bool {
+        let before = self.planner_calendar_subscriptions.len();
+        self.planner_calendar_subscriptions.retain(|s| s.id != id);
+        self.planner_calendar_subscriptions.len() != before
+    }
+
+    /// Rename a calendar subscription, keeping display names unique.
+    #[allow(dead_code)] // consumer is the Phase 4 settings UI
+    pub fn rename_calendar_subscription(&mut self, id: &str, name: &str) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let taken = self
+            .planner_calendar_subscriptions
+            .iter()
+            .any(|s| s.id != id && s.name == trimmed);
+        if taken {
+            return;
+        }
+        if let Some(s) = self.calendar_subscription_by_id_mut(id) {
+            s.name = trimmed.to_string();
+        }
+    }
+
+    /// One-time migration: convert the legacy `planner_calendar_profile` stub
+    /// into a disabled Composio subscription and clear the field. Disabled
+    /// because the stub never synced anything — enabling is an explicit user
+    /// action once the Composio fetcher lands. Returns true when it changed
+    /// anything (caller persists).
+    pub fn migrate_legacy_calendar_profile(&mut self) -> bool {
+        let Some(profile_id) = self.planner_calendar_profile.take() else {
+            return false;
+        };
+        if profile_id.trim().is_empty() {
+            return true; // cleared a meaningless value; still worth persisting
+        }
+        let id = self.add_calendar_subscription(
+            "Google Calendar",
+            &default_calendar_color(),
+            CalendarSource::Composio {
+                profile_id,
+                calendar_id: "primary".into(),
+            },
+        );
+        if let Some(s) = self.calendar_subscription_by_id_mut(&id) {
+            s.enabled = false;
+        }
+        tracing::info!("Migrated legacy planner_calendar_profile to a disabled calendar subscription");
+        true
+    }
+
     /// The connector a session should use.
     /// Resolution: session's pinned connector ID → first connector matching the
     /// session's legacy pinned provider kind → globally active connector.
@@ -1331,6 +1541,7 @@ impl Settings {
                 toolkit_configs: Vec::new(),
                 color: default_profile_color(),
                 chrome_profile_directory: None,
+                retained_curation: HashMap::new(),
             };
             let profile_id = profile.id.clone();
             self.add_profile(profile);
@@ -1564,8 +1775,10 @@ impl SettingsManager {
             settings.migrate_active_profile_name_to_id();
             settings.sync_chat_model_to_slots();
             settings.seed_default_claude_slots_if_empty();
-            if settings.migrate_legacy_llm_config() && self.save(&settings).is_err() {
-                tracing::error!("Failed to persist migrated LLM connector settings.");
+            let migrated_llm = settings.migrate_legacy_llm_config();
+            let migrated_calendar = settings.migrate_legacy_calendar_profile();
+            if (migrated_llm || migrated_calendar) && self.save(&settings).is_err() {
+                tracing::error!("Failed to persist migrated settings.");
             }
             return settings;
         }
@@ -1688,6 +1901,7 @@ impl SettingsManager {
         // (Mirrors the happy-path call at L793.)
         settings.migrate_active_profile_name_to_id();
         settings.migrate_legacy_llm_config();
+        settings.migrate_legacy_calendar_profile();
 
         // After migrating, save the repaired settings file for the next run.
         if self.save(&settings).is_err() {
@@ -2061,6 +2275,34 @@ mod tests {
     }
 
     #[test]
+    fn remove_toolkit_config_retains_curation_for_readd() {
+        let mut profile = ComposioProfile::default();
+        profile.toolkit_configs.push(ComposioToolkitConfig {
+            slug: "gmail".to_string(),
+            display_name: "Gmail".to_string(),
+            enabled_tools: Some(vec!["GMAIL_FETCH_EMAILS".to_string()]),
+            ..Default::default()
+        });
+        profile.toolkit_configs.push(ComposioToolkitConfig {
+            slug: "github".to_string(),
+            display_name: "GitHub".to_string(),
+            ..Default::default()
+        });
+
+        // Curated toolkit: removal stashes its curation for a later re-add.
+        profile.remove_toolkit_config("Gmail");
+        assert!(profile.toolkit_configs.iter().all(|c| c.slug != "gmail"));
+        assert_eq!(
+            profile.retained_curation.get("gmail"),
+            Some(&vec!["GMAIL_FETCH_EMAILS".to_string()])
+        );
+
+        // Uncurated toolkit: nothing to retain.
+        profile.remove_toolkit_config("github");
+        assert!(!profile.retained_curation.contains_key("github"));
+    }
+
+    #[test]
     fn seed_fills_empty_claude_slots() {
         let mut s = Settings::default();
         s.claude_config.model_slots = vec![]; // simulate a persisted empty vec
@@ -2121,6 +2363,96 @@ mod tests {
         mgr.save(&settings).unwrap();
 
         assert_eq!(mgr.load().user_name.as_deref(), Some("Grace"));
+    }
+
+    // ========================================================================
+    // Calendar subscription tests
+    // ========================================================================
+
+    #[test]
+    fn calendar_subscription_crud() {
+        let mut s = Settings::default();
+
+        let id = s.add_calendar_subscription("Work", "#ff0000", CalendarSource::Ics {});
+        // Duplicate names auto-suffix like connectors.
+        let id2 = s.add_calendar_subscription("Work", "", CalendarSource::Ics {});
+        assert_eq!(s.planner_calendar_subscriptions.len(), 2);
+        let sub = s.calendar_subscription_by_id(&id).unwrap();
+        assert_eq!(sub.name, "Work");
+        assert_eq!(sub.color, "#ff0000");
+        assert!(sub.enabled);
+        let sub2 = s.calendar_subscription_by_id(&id2).unwrap();
+        assert_eq!(sub2.name, "Work 2");
+        assert_eq!(sub2.color, "#4f9cf9", "empty color falls back to the default");
+
+        // Rename keeps names unique: colliding rename is a no-op.
+        s.rename_calendar_subscription(&id2, "Work");
+        assert_eq!(s.calendar_subscription_by_id(&id2).unwrap().name, "Work 2");
+        s.rename_calendar_subscription(&id2, "  Personal  ");
+        assert_eq!(s.calendar_subscription_by_id(&id2).unwrap().name, "Personal");
+        s.rename_calendar_subscription(&id2, "   ");
+        assert_eq!(s.calendar_subscription_by_id(&id2).unwrap().name, "Personal");
+
+        assert!(s.remove_calendar_subscription(&id));
+        assert!(!s.remove_calendar_subscription(&id), "already gone");
+        assert!(s.calendar_subscription_by_id(&id).is_none());
+        assert_eq!(s.planner_calendar_subscriptions.len(), 1);
+    }
+
+    #[test]
+    fn calendar_source_serde_shape_is_tagged() {
+        let ics = serde_json::to_value(CalendarSource::Ics {}).unwrap();
+        assert_eq!(ics, serde_json::json!({"kind": "ics"}));
+
+        let composio = serde_json::to_value(CalendarSource::Composio {
+            profile_id: "p1".into(),
+            calendar_id: "primary".into(),
+        })
+        .unwrap();
+        assert_eq!(composio["kind"], "composio");
+        assert_eq!(composio["profile_id"], "p1");
+
+        // Round-trip through the subscription wrapper, exercising defaults.
+        let json = serde_json::json!({"name": "Work", "source": {"kind": "ics"}});
+        let sub: CalendarSubscription = serde_json::from_value(json).unwrap();
+        assert!(sub.enabled);
+        assert!(!sub.id.is_empty());
+        assert_eq!(sub.color, "#4f9cf9");
+    }
+
+    #[test]
+    fn legacy_calendar_profile_migrates_to_disabled_subscription() {
+        let mut s = Settings {
+            planner_calendar_profile: Some("profile-123".to_string()),
+            ..Default::default()
+        };
+
+        assert!(s.migrate_legacy_calendar_profile());
+        assert!(s.planner_calendar_profile.is_none(), "field must be cleared");
+        assert_eq!(s.planner_calendar_subscriptions.len(), 1);
+        let sub = &s.planner_calendar_subscriptions[0];
+        assert_eq!(sub.name, "Google Calendar");
+        assert!(!sub.enabled, "the stub never synced — enabling is explicit");
+        assert_eq!(
+            sub.source,
+            CalendarSource::Composio {
+                profile_id: "profile-123".into(),
+                calendar_id: "primary".into(),
+            }
+        );
+
+        // Idempotent: nothing left to migrate.
+        assert!(!s.migrate_legacy_calendar_profile());
+        assert_eq!(s.planner_calendar_subscriptions.len(), 1);
+
+        // An empty legacy value is cleared without minting a subscription.
+        let mut empty = Settings {
+            planner_calendar_profile: Some("  ".to_string()),
+            ..Default::default()
+        };
+        assert!(empty.migrate_legacy_calendar_profile());
+        assert!(empty.planner_calendar_subscriptions.is_empty());
+        assert!(empty.planner_calendar_profile.is_none());
     }
 
     // ========================================================================

@@ -19,7 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::session_store::{next_seq, with_conn};
 
-use super::model::{Area, DayPlan, Project, TimeBlock, Todo};
+use super::model::{Area, CalendarEvent, DayPlan, FocusSession, Project, TimeBlock, Todo};
 use super::PlannerState;
 
 // ── Schema & migrations ─────────────────────────────────────────────────────
@@ -88,9 +88,47 @@ const MIGRATION_V1: &str = "
     );
 ";
 
+/// External calendar event cache. The full `CalendarEvent` is serialized into
+/// `data`; the time columns are denormalized for windowed queries. Recurring
+/// events land pre-expanded, one row per occurrence, hence `starts_at` in the
+/// primary key.
+const MIGRATION_V2: &str = "
+    CREATE TABLE IF NOT EXISTS todo_calendar_events (
+        uid             TEXT NOT NULL,
+        subscription_id TEXT NOT NULL,
+        starts_at       TEXT NOT NULL,
+        ends_at         TEXT NOT NULL,
+        seq             INTEGER NOT NULL,
+        data            TEXT NOT NULL,
+        PRIMARY KEY (subscription_id, uid, starts_at)
+    );
+    CREATE INDEX IF NOT EXISTS idx_todo_calendar_events_start ON todo_calendar_events(starts_at);
+";
+
+/// Focus-session history: one row per focus sitting, `person` vs `agent`
+/// attribution. The full `FocusSession` serializes into `data`; the columns
+/// we filter and aggregate on are denormalized. `ended_at` is NULL while the
+/// session is live.
+const MIGRATION_V3: &str = "
+    CREATE TABLE IF NOT EXISTS todo_focus_sessions (
+        id          TEXT PRIMARY KEY,
+        todo_id     TEXT NOT NULL,
+        actor       TEXT NOT NULL,
+        agent_session_id TEXT,
+        started_at  TEXT NOT NULL,
+        ended_at    TEXT,
+        minutes     INTEGER NOT NULL DEFAULT 0,
+        end_reason  TEXT,
+        seq         INTEGER NOT NULL,
+        data        TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_todo_focus_sessions_todo  ON todo_focus_sessions(todo_id);
+    CREATE INDEX IF NOT EXISTS idx_todo_focus_sessions_start ON todo_focus_sessions(started_at);
+";
+
 /// Ordered migrations. Append only — never edit a shipped entry, since
 /// databases in the wild have already recorded it as applied.
-const MIGRATIONS: &[(i32, &str)] = &[(1, MIGRATION_V1)];
+const MIGRATIONS: &[(i32, &str)] = &[(1, MIGRATION_V1), (2, MIGRATION_V2), (3, MIGRATION_V3)];
 
 /// Create the planner schema and apply any pending migrations.
 ///
@@ -137,7 +175,15 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
 /// and the upsert guards below silently reject every update — writes that appear
 /// to succeed and vanish on restart.
 pub(crate) fn max_seq(conn: &Connection) -> i64 {
-    ["todos", "todo_projects", "todo_areas", "todo_blocks", "todo_day_plans"]
+    [
+        "todos",
+        "todo_projects",
+        "todo_areas",
+        "todo_blocks",
+        "todo_day_plans",
+        "todo_calendar_events",
+        "todo_focus_sessions",
+    ]
         .iter()
         .map(|table| {
             conn.query_row(
@@ -273,6 +319,123 @@ pub fn upsert_day_plan_conn(conn: &Connection, plan: &DayPlan, seq: i64) -> rusq
     Ok(())
 }
 
+pub fn upsert_focus_session_conn(
+    conn: &Connection,
+    session: &FocusSession,
+    seq: i64,
+) -> rusqlite::Result<()> {
+    let data = serde_json::to_string(session)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    conn.execute(
+        "INSERT INTO todo_focus_sessions (id, todo_id, actor, agent_session_id, started_at,
+                                          ended_at, minutes, end_reason, seq, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(id) DO UPDATE SET
+             todo_id = excluded.todo_id, actor = excluded.actor,
+             agent_session_id = excluded.agent_session_id,
+             started_at = excluded.started_at, ended_at = excluded.ended_at,
+             minutes = excluded.minutes, end_reason = excluded.end_reason,
+             seq = excluded.seq, data = excluded.data
+         WHERE excluded.seq >= todo_focus_sessions.seq",
+        params![
+            session.id,
+            session.todo_id,
+            session.actor.as_str(),
+            session.actor.agent_session_id(),
+            fmt_ts(&session.started_at),
+            session.ended_at.as_ref().map(fmt_ts),
+            session.minutes,
+            session.end_reason.map(|r| r.as_str()),
+            seq,
+            data
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_calendar_event_conn(
+    conn: &Connection,
+    event: &CalendarEvent,
+    seq: i64,
+) -> rusqlite::Result<()> {
+    let data = serde_json::to_string(event)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    conn.execute(
+        "INSERT INTO todo_calendar_events (uid, subscription_id, starts_at, ends_at, seq, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(subscription_id, uid, starts_at) DO UPDATE SET
+             ends_at = excluded.ends_at, seq = excluded.seq, data = excluded.data
+         WHERE excluded.seq >= todo_calendar_events.seq",
+        params![
+            event.uid,
+            event.subscription_id,
+            fmt_ts(&event.start),
+            fmt_ts(&event.end),
+            seq,
+            data
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn delete_calendar_event_conn(
+    conn: &Connection,
+    subscription_id: &str,
+    uid: &str,
+    start: &chrono::DateTime<chrono::Utc>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM todo_calendar_events
+         WHERE subscription_id = ?1 AND uid = ?2 AND starts_at = ?3",
+        params![subscription_id, uid, fmt_ts(start)],
+    )?;
+    Ok(())
+}
+
+pub fn delete_calendar_events_for_subscription_conn(
+    conn: &Connection,
+    subscription_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM todo_calendar_events WHERE subscription_id = ?1",
+        params![subscription_id],
+    )?;
+    Ok(())
+}
+
+/// Cached calendar events, optionally scoped to one subscription, ordered by
+/// start time (lexicographic on the RFC3339 column == chronological).
+pub fn load_calendar_events_conn(
+    conn: &Connection,
+    subscription_id: Option<&str>,
+) -> rusqlite::Result<Vec<CalendarEvent>> {
+    let mut out = Vec::new();
+    let mut collect = |raw: String| match serde_json::from_str::<CalendarEvent>(&raw) {
+        Ok(v) => out.push(v),
+        Err(e) => tracing::error!("Skipping unreadable todo_calendar_events row: {}", e),
+    };
+    match subscription_id {
+        Some(id) => {
+            let mut stmt = conn.prepare(
+                "SELECT data FROM todo_calendar_events WHERE subscription_id = ?1 ORDER BY starts_at",
+            )?;
+            let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                collect(row?);
+            }
+        }
+        None => {
+            let mut stmt =
+                conn.prepare("SELECT data FROM todo_calendar_events ORDER BY starts_at")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                collect(row?);
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn delete_by_id_conn(conn: &Connection, table: &str, id: &str) -> rusqlite::Result<()> {
     let column = if table == "todo_day_plans" { "date" } else { "id" };
     conn.execute(
@@ -311,6 +474,8 @@ pub fn load_all_conn(conn: &Connection) -> rusqlite::Result<PlannerState> {
         areas: load_data_column(conn, "todo_areas")?,
         blocks: load_data_column(conn, "todo_blocks")?,
         day_plans: load_data_column(conn, "todo_day_plans")?,
+        focus_sessions: load_data_column(conn, "todo_focus_sessions")?,
+        dirty_focus_sessions: Vec::new(),
     })
 }
 
@@ -350,6 +515,11 @@ pub fn save_day_plan(plan: &DayPlan) -> Result<(), String> {
     with_conn(|conn| upsert_day_plan_conn(conn, plan, seq))
 }
 
+pub fn save_focus_session(session: &FocusSession) -> Result<(), String> {
+    let seq = next_seq();
+    with_conn(|conn| upsert_focus_session_conn(conn, session, seq))
+}
+
 /// Deleting a todo also deletes its time blocks. The cascade lives here, not
 /// in each caller: a caller that forgets it leaves orphaned block rows that
 /// resurrect on the calendar at next launch.
@@ -374,6 +544,29 @@ pub fn delete_area(id: &str) -> Result<(), String> {
 
 pub fn delete_block(id: &str) -> Result<(), String> {
     with_conn(|conn| delete_by_id_conn(conn, "todo_blocks", id))
+}
+
+pub fn save_calendar_event(event: &CalendarEvent) -> Result<(), String> {
+    let seq = next_seq();
+    with_conn(|conn| upsert_calendar_event_conn(conn, event, seq))
+}
+
+pub fn load_calendar_events(subscription_id: Option<&str>) -> Result<Vec<CalendarEvent>, String> {
+    with_conn(|conn| load_calendar_events_conn(conn, subscription_id))
+}
+
+pub fn delete_calendar_event(
+    subscription_id: &str,
+    uid: &str,
+    start: &chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    with_conn(|conn| delete_calendar_event_conn(conn, subscription_id, uid, start))
+}
+
+/// Purge a removed/disabled subscription's whole cache in one statement.
+#[allow(dead_code)] // consumer is the Phase 4 settings UI (remove subscription)
+pub fn delete_calendar_events_for_subscription(subscription_id: &str) -> Result<(), String> {
+    with_conn(|conn| delete_calendar_events_for_subscription_conn(conn, subscription_id))
 }
 
 #[cfg(test)]
@@ -616,7 +809,13 @@ mod tests {
                 title: "Standup".into(),
                 start: now,
                 end: now + chrono::Duration::minutes(15),
-                source: BlockSource::External { uid: "cal-99".into() },
+                source: BlockSource::External {
+                    uid: "cal-99".into(),
+                    subscription_id: Some("sub1".into()),
+                    url: Some("https://cal.example/e/99".into()),
+                    busy: true,
+                    tentative: false,
+                },
             };
             let plan = DayPlan::new(date("2026-08-12"), 360);
 
@@ -685,6 +884,315 @@ mod tests {
             // Re-running must not drop data or re-apply an applied migration.
             assert_eq!(load_all_conn(conn).unwrap().todos.len(), 1);
         });
+    }
+
+    // ── Calendar event cache ────────────────────────────────────────────────
+
+    fn sample_event(uid: &str, sub: &str, start: &str) -> CalendarEvent {
+        let start: chrono::DateTime<Utc> = start.parse().unwrap();
+        CalendarEvent {
+            uid: uid.into(),
+            subscription_id: sub.into(),
+            title: "Standup".into(),
+            start,
+            end: start + chrono::Duration::minutes(30),
+            all_day: false,
+            url: Some("https://cal.example/e/1".into()),
+            location: Some("Room 4".into()),
+            busy: true,
+            tentative: false,
+        }
+    }
+
+    #[test]
+    fn calendar_event_survives_a_write_and_read() {
+        with_db(|conn| {
+            let event = sample_event("ev1", "sub1", "2026-08-12T16:00:00Z");
+            upsert_calendar_event_conn(conn, &event, 1).unwrap();
+
+            let loaded = load_calendar_events_conn(conn, None).unwrap();
+            assert_eq!(loaded, vec![event]);
+
+            // Denormalized columns mirror the record.
+            let (uid, sub, starts): (String, String, String) = conn
+                .query_row(
+                    "SELECT uid, subscription_id, starts_at FROM todo_calendar_events",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(uid, "ev1");
+            assert_eq!(sub, "sub1");
+            assert_eq!(starts, "2026-08-12T16:00:00.000000Z");
+        });
+    }
+
+    #[test]
+    fn calendar_events_filter_by_subscription() {
+        with_db(|conn| {
+            upsert_calendar_event_conn(conn, &sample_event("a", "sub1", "2026-08-12T16:00:00Z"), 1)
+                .unwrap();
+            upsert_calendar_event_conn(conn, &sample_event("b", "sub2", "2026-08-12T09:00:00Z"), 2)
+                .unwrap();
+            // Recurring: same uid, different occurrence start — its own row.
+            upsert_calendar_event_conn(conn, &sample_event("a", "sub1", "2026-08-13T16:00:00Z"), 3)
+                .unwrap();
+
+            assert_eq!(load_calendar_events_conn(conn, None).unwrap().len(), 3);
+            let sub1 = load_calendar_events_conn(conn, Some("sub1")).unwrap();
+            assert_eq!(sub1.len(), 2);
+            assert!(sub1.iter().all(|e| e.subscription_id == "sub1"));
+            // Ordered by start.
+            assert!(sub1[0].start < sub1[1].start);
+            assert!(load_calendar_events_conn(conn, Some("nope")).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_stale_calendar_write_cannot_clobber_a_newer_row() {
+        with_db(|conn| {
+            let mut newer = sample_event("ev1", "sub1", "2026-08-12T16:00:00Z");
+            newer.title = "current".into();
+            upsert_calendar_event_conn(conn, &newer, 10).unwrap();
+
+            let mut stale = newer.clone();
+            stale.title = "stale".into();
+            upsert_calendar_event_conn(conn, &stale, 5).unwrap();
+
+            let loaded = load_calendar_events_conn(conn, None).unwrap();
+            assert_eq!(loaded[0].title, "current");
+
+            // An equal-or-newer seq updates in place (no duplicate row).
+            newer.title = "updated".into();
+            upsert_calendar_event_conn(conn, &newer, 11).unwrap();
+            let loaded = load_calendar_events_conn(conn, None).unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].title, "updated");
+        });
+    }
+
+    #[test]
+    fn calendar_event_deletes_by_key_and_by_subscription() {
+        with_db(|conn| {
+            let ev1 = sample_event("a", "sub1", "2026-08-12T16:00:00Z");
+            let ev2 = sample_event("a", "sub1", "2026-08-13T16:00:00Z");
+            let ev3 = sample_event("b", "sub2", "2026-08-12T09:00:00Z");
+            for (e, seq) in [(&ev1, 1), (&ev2, 2), (&ev3, 3)] {
+                upsert_calendar_event_conn(conn, e, seq).unwrap();
+            }
+
+            // Keyed delete removes one occurrence, not the whole series.
+            delete_calendar_event_conn(conn, "sub1", "a", &ev1.start).unwrap();
+            assert_eq!(load_calendar_events_conn(conn, Some("sub1")).unwrap(), vec![ev2]);
+
+            delete_calendar_events_for_subscription_conn(conn, "sub1").unwrap();
+            assert!(load_calendar_events_conn(conn, Some("sub1")).unwrap().is_empty());
+            assert_eq!(load_calendar_events_conn(conn, None).unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn max_seq_covers_the_calendar_table() {
+        with_db(|conn| {
+            upsert_todo_conn(conn, &sample(), 3).unwrap();
+            upsert_calendar_event_conn(
+                conn,
+                &sample_event("ev1", "sub1", "2026-08-12T16:00:00Z"),
+                77,
+            )
+            .unwrap();
+
+            // Seeding without todo_calendar_events would restart below 77 and
+            // silently reject every subsequent calendar write.
+            assert_eq!(max_seq(conn), 77);
+        });
+    }
+
+    #[test]
+    fn migration_v2_applies_to_an_existing_v1_database() {
+        // A database that already recorded v1 (simulating a pre-calendar
+        // install) must gain the calendar table from the append-only list.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                 domain  TEXT PRIMARY KEY,
+                 version INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATION_V1).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (domain, version) VALUES ('todo', 1)",
+            [],
+        )
+        .unwrap();
+        // Pre-existing data must survive the upgrade.
+        upsert_todo_conn(&conn, &sample(), 1).unwrap();
+
+        create_schema(&conn).unwrap();
+
+        let version: i32 = conn
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE domain = 'todo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // A v1 database runs forward through every later migration.
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
+        assert_eq!(load_all_conn(&conn).unwrap().todos.len(), 1);
+        upsert_calendar_event_conn(&conn, &sample_event("ev1", "s", "2026-08-12T16:00:00Z"), 2)
+            .unwrap();
+        assert_eq!(load_calendar_events_conn(&conn, None).unwrap().len(), 1);
+    }
+
+    // ── Focus sessions ──────────────────────────────────────────────────────
+
+    fn sample_session(id: &str) -> FocusSession {
+        use crate::todo::model::{FocusActor, FocusEndReason};
+        let started: chrono::DateTime<Utc> = "2026-08-12T16:00:00Z".parse().unwrap();
+        let mut s = FocusSession::open(
+            "td_1",
+            started,
+            FocusActor::Agent {
+                session_id: Some("sess-7".into()),
+            },
+        );
+        s.id = id.into();
+        s.close(started + chrono::Duration::minutes(25), FocusEndReason::Paused);
+        s
+    }
+
+    #[test]
+    fn focus_session_round_trips_and_mirrors_columns() {
+        with_db(|conn| {
+            let session = sample_session("fs_1");
+            upsert_focus_session_conn(conn, &session, 1).unwrap();
+
+            let loaded = load_all_conn(conn).unwrap();
+            assert_eq!(loaded.focus_sessions, vec![session.clone()]);
+
+            let (actor, chat, started, ended, minutes, reason): (
+                String,
+                String,
+                String,
+                Option<String>,
+                i64,
+                Option<String>,
+            ) = conn
+                .query_row(
+                    "SELECT actor, agent_session_id, started_at, ended_at, minutes, end_reason
+                     FROM todo_focus_sessions WHERE id = 'fs_1'",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(actor, "agent");
+            assert_eq!(chat, "sess-7");
+            assert_eq!(started, "2026-08-12T16:00:00.000000Z");
+            assert_eq!(ended.as_deref(), Some("2026-08-12T16:25:00.000000Z"));
+            assert_eq!(minutes, 25);
+            assert_eq!(reason.as_deref(), Some("paused"));
+
+            // A live person session mirrors NULLs where it should.
+            let open = FocusSession::open(
+                "td_2",
+                "2026-08-12T17:00:00Z".parse().unwrap(),
+                crate::todo::model::FocusActor::Person,
+            );
+            upsert_focus_session_conn(conn, &open, 2).unwrap();
+            let (actor, chat, ended, reason): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = conn
+                .query_row(
+                    "SELECT actor, agent_session_id, ended_at, end_reason
+                     FROM todo_focus_sessions WHERE id = ?1",
+                    params![open.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(actor, "person");
+            assert_eq!(chat, None);
+            assert_eq!(ended, None);
+            assert_eq!(reason, None);
+        });
+    }
+
+    #[test]
+    fn a_stale_focus_session_write_cannot_clobber_a_newer_row() {
+        with_db(|conn| {
+            let mut newer = sample_session("fs_1");
+            newer.minutes = 40;
+            upsert_focus_session_conn(conn, &newer, 10).unwrap();
+
+            let mut stale = sample_session("fs_1");
+            stale.minutes = 5;
+            upsert_focus_session_conn(conn, &stale, 4).unwrap();
+
+            let loaded = load_all_conn(conn).unwrap();
+            assert_eq!(loaded.focus_sessions.len(), 1);
+            assert_eq!(loaded.focus_sessions[0].minutes, 40);
+        });
+    }
+
+    #[test]
+    fn max_seq_covers_the_focus_session_table() {
+        with_db(|conn| {
+            upsert_todo_conn(conn, &sample(), 3).unwrap();
+            upsert_focus_session_conn(conn, &sample_session("fs_1"), 91).unwrap();
+
+            // Seeding without todo_focus_sessions would restart below 91 and
+            // silently reject every subsequent session write.
+            assert_eq!(max_seq(conn), 91);
+        });
+    }
+
+    #[test]
+    fn migration_v3_applies_to_an_existing_v2_database() {
+        // A database that already recorded v2 (a pre-focus-session install)
+        // must gain the session table from the append-only list.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                 domain  TEXT PRIMARY KEY,
+                 version INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATION_V1).unwrap();
+        conn.execute_batch(MIGRATION_V2).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (domain, version) VALUES ('todo', 2)",
+            [],
+        )
+        .unwrap();
+        upsert_todo_conn(&conn, &sample(), 1).unwrap();
+
+        create_schema(&conn).unwrap();
+
+        let version: i32 = conn
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE domain = 'todo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 3);
+        assert_eq!(load_all_conn(&conn).unwrap().todos.len(), 1);
+        upsert_focus_session_conn(&conn, &sample_session("fs_1"), 2).unwrap();
+        assert_eq!(load_all_conn(&conn).unwrap().focus_sessions.len(), 1);
     }
 
     #[test]

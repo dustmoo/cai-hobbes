@@ -220,6 +220,31 @@ impl ComposioClient {
         execution::create_fresh_mcp_server(self, seed_toolkit, seed_auth_config_id).await
     }
 
+    /// Soft-delete an MCP server (DELETE /api/v3/mcp/{id}). Used to retire the
+    /// old server after a successful Recreate migration.
+    pub async fn delete_mcp_server(&self, server_id: &str) -> Result<(), String> {
+        execution::delete_mcp_server(self, server_id).await
+    }
+
+    /// Full `allowed_tools` whitelist of the current server (empty = all-tools
+    /// mode). Recreate reads this off the old server to carry curation over.
+    pub async fn server_allowed_tools(&self) -> Result<Vec<String>, String> {
+        execution::server_allowed_tools(self).await
+    }
+
+    /// Hydrate and return the toolkit slugs (lowercased) that have an ACTIVE
+    /// connected account for the current user. Pure REST — works even while
+    /// the MCP server itself is wedged. Recreate uses this to flag toolkits
+    /// whose auth config resolves but has no live account behind it (they bind
+    /// fine yet fail every call with an AUTH error).
+    pub async fn active_account_slugs(&self) -> std::collections::HashSet<String> {
+        let _ = auth::list_connected_accounts(self).await;
+        self.toolkit_account_map
+            .read()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Diagnostic: (server_id, bound toolkits, auth_config_ids) for the current server.
     pub async fn server_config_summary(
         &self,

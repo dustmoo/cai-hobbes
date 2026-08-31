@@ -1,0 +1,17 @@
+[package]
+name = "mint_license"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone tool: the empty [workspace] table opts this crate out of the
+# repository's root workspace, so `cargo build`/`cargo test` at the repo root
+# never touch it. Build it from this directory.
+[workspace]
+
+[dependencies]
+ed25519-dalek = "2"
+base64 = "0.22"
+serde_json = "1"
+chrono = "0.4"
+getrandom = "0.2"

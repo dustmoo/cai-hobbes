@@ -8,7 +8,7 @@
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::model::{TimeOfDay, Todo, TodoBucket};
+use super::model::{CalendarEvent, TimeOfDay, Todo, TodoBucket};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -131,6 +131,37 @@ pub fn friendly_date(d: NaiveDate, today: NaiveDate) -> String {
     } else {
         d.format("%a %-d %b %Y").to_string()
     }
+}
+
+/// All-day calendar events covering the local day `day`, for enabled
+/// subscriptions only. All-day events are cached but never materialized as
+/// `TimeBlock`s (a 24h block would wreck the timeline ruler), so every surface
+/// that shows them — the timeline banner, the `planner_today` context, the
+/// HOBBES_CALENDAR_LIST tool — reads the cache through this one filter.
+/// Multi-day spans show on every local day they cover; the end is exclusive,
+/// so an event ending at local midnight does not bleed into the next day.
+pub fn all_day_events_on(
+    events: &[CalendarEvent],
+    enabled_subscriptions: &std::collections::HashSet<String>,
+    day: NaiveDate,
+) -> Vec<CalendarEvent> {
+    let mut out: Vec<CalendarEvent> = events
+        .iter()
+        .filter(|e| e.all_day && enabled_subscriptions.contains(&e.subscription_id))
+        .filter(|e| {
+            let start_day = e.start.with_timezone(&chrono::Local).date_naive();
+            // Exclusive end; degenerate spans (end <= start) still cover
+            // their start day.
+            let last_day = (e.end - chrono::Duration::seconds(1))
+                .with_timezone(&chrono::Local)
+                .date_naive()
+                .max(start_day);
+            start_day <= day && day <= last_day
+        })
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| a.title.cmp(&b.title).then(a.uid.cmp(&b.uid)));
+    out
 }
 
 /// Upcoming grouped by scheduled date, dates ascending, within each date in

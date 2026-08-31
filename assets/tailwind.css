@@ -2000,6 +2000,10 @@ video {
   max-width: 70%;
 }
 
+.max-w-\[calc\(100\%-2\.5rem\)\] {
+  max-width: calc(100% - 2.5rem);
+}
+
 .max-w-full {
   max-width: 100%;
 }
@@ -4278,5 +4282,11 @@ video {
 @media (min-width: 768px) {
   .md\:grid-cols-3 {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1024px) {
+  .lg\:max-w-\[66\%\] {
+    max-width: 66%;
   }
 }

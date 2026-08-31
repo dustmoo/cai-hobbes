@@ -523,6 +523,8 @@ impl StreamManagerContext {
                                 new_id
                             }
                         };
+                        // Notify the scroll effect: a tool-call card just appeared.
+                        *self.stream_activity.write() += 1;
 
                         let mcp_manager = self.mcp_manager;
                         let mut session_state = self.session_state;
@@ -574,6 +576,8 @@ impl StreamManagerContext {
                                     }
                                     state.touch_session(&session_id_inner);
                                 }
+                                // Notify the scroll effect: the card's status/response changed size.
+                                *self.stream_activity.write() += 1;
                                 if persist {
                                     crate::session::SessionState::save_async(&session_state.read(), None);
                                 }
@@ -793,6 +797,10 @@ impl StreamManagerContext {
                                     }
                                 }
                             }
+                            drop(state);
+                            // Notify the scroll effect: the card's status/response changed size
+                            // (or it became a PermissionRequest prompt).
+                            *self.stream_activity.write() += 1;
 
                             if !is_permission_request {
                                 let record = crate::components::shared::ToolCallRecord {

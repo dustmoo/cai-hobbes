@@ -1163,6 +1163,11 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
             toolkits_loading.set(false);
             // ALSO sync local_settings with global settings
             local_settings.set(settings.read().clone());
+            // Nudge the fetch effect: it subscribes to refresh_trigger (not to
+            // profile identity), so without this the cleared panel would sit on
+            // "No toolkits found" until a manual refresh.
+            let cur = *refresh_trigger.peek();
+            refresh_trigger.set(cur + 1);
         }
         last_profile_id.set(active_profile_id);
     });
@@ -1655,6 +1660,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                             force_load: false,
                                                                             load_mode: new_mode,
                                                                             no_auth: false,
+                                                                            enabled_tools: None,
                                                                         });
                                                                     }
                                                                 }
@@ -1914,7 +1920,8 @@ fn ToolkitToolEditor(
 ) -> Element {
     let mcp_manager = use_context::<Signal<McpManager>>();
     let mut mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
-    let settings = use_context::<Signal<Settings>>();
+    let mut settings = use_context::<Signal<Settings>>();
+    let settings_manager = use_context::<Signal<SettingsManager>>();
 
     let mut checked_tools: Signal<std::collections::HashSet<String>> =
         use_signal(std::collections::HashSet::new);
@@ -1974,8 +1981,10 @@ fn ToolkitToolEditor(
 
     let on_save = {
         let toolkit_slug = toolkit_slug.clone();
+        let display_name = display_name.clone();
         move |_| {
             let slug = toolkit_slug.clone();
+            let display_name = display_name.clone();
             let selected: Vec<String> = {
                 let mut v: Vec<String> = checked_tools.peek().iter().cloned().collect();
                 v.sort();
@@ -1991,10 +2000,37 @@ fn ToolkitToolEditor(
                 let manager = mcp_manager.read().clone();
                 let settings_snapshot = settings.peek().clone();
                 match manager
-                    .set_composio_toolkit_tools(&slug, selected, &settings_snapshot)
+                    .set_composio_toolkit_tools(&slug, selected.clone(), &settings_snapshot)
                     .await
                 {
                     Ok(()) => {
+                        // Mirror the curation locally so it survives server
+                        // recreation and toolkit delete/re-add cycles.
+                        {
+                            let mut s = settings.write();
+                            if let Some(profile) = s.get_active_profile_mut() {
+                                if let Some(config) = profile
+                                    .toolkit_configs
+                                    .iter_mut()
+                                    .find(|c| c.slug.eq_ignore_ascii_case(&slug))
+                                {
+                                    config.enabled_tools = Some(selected.clone());
+                                } else {
+                                    profile.toolkit_configs.push(
+                                        crate::settings::ComposioToolkitConfig {
+                                            slug: slug.clone(),
+                                            display_name: display_name.clone(),
+                                            enabled_tools: Some(selected.clone()),
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        let updated_settings = settings.peek().clone();
+                        if let Err(e) = settings_manager.read().save(&updated_settings) {
+                            tracing::error!("Failed to persist tool curation locally: {}", e);
+                        }
                         let new_context = manager.get_mcp_context(None).await;
                         mcp_context.set(new_context);
                         let current = *refresh_trigger.peek();

@@ -2928,6 +2928,41 @@ impl McpManager {
             .ok_or_else(|| "Composio client not initialized or not connected".to_string())
     }
 
+    /// Resolve the native Composio client for a **specific profile**, cloning
+    /// its Arc so the servers lock is released before any network call.
+    ///
+    /// Strict, unlike `find_composio_client`: never falls back to the bare
+    /// prefix or an arbitrary Composio client — callers like the calendar
+    /// sync pin a subscription to a profile, and silently reading a different
+    /// profile's Google account would be worse than an honest error.
+    pub async fn composio_client_for_profile(
+        &self,
+        profile_id: &str,
+    ) -> Result<Arc<crate::mcp::composio_client::ComposioClient>, String> {
+        let servers = self.servers.lock().await;
+        let scoped = composio_server_key(profile_id);
+        servers
+            .get(&scoped)
+            .or_else(|| {
+                servers
+                    .iter()
+                    .find(|(k, c)| {
+                        is_composio_native(k) && c.profile_id.as_deref() == Some(profile_id)
+                    })
+                    .map(|(_, v)| v)
+            })
+            .and_then(|v| match &v.service {
+                McpClientType::NativeComposio(c) => Some(c.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                format!(
+                    "No connected Composio client for profile '{}'",
+                    profile_id
+                )
+            })
+    }
+
     /// Data for the toolkit tool editor: every tool the toolkit offers
     /// (name + description) and the currently enabled subset. An empty enabled
     /// list means no whitelist entries exist yet — all tools are enabled.
@@ -3062,8 +3097,11 @@ impl McpManager {
     /// `auth_config_ids` reject every PATCH, so removal can't help. Provisions a
     /// FRESH empty server, repoints the active profile at it, and best-effort
     /// re-binds the toolkits the user already had (existing accounts/configs
-    /// survive, so most rebind without new OAuth). The old server is abandoned
-    /// (Composio has no delete-server endpoint). Returns
+    /// survive, so most rebind without new OAuth). Per-toolkit tool curation is
+    /// carried over — locally persisted `enabled_tools` wins, falling back to
+    /// the old server's `allowed_tools` entries — and re-applied to the new
+    /// server. On success the old server is soft-deleted (`delete_mcp_server`)
+    /// so abandoned servers don't accumulate. Returns
     /// `(rebound, needs_reconnect)` slug lists for a UI summary.
     pub async fn recreate_composio_server(
         &self,
@@ -3090,11 +3128,19 @@ impl McpManager {
             .unwrap_or_else(|| "default".to_string());
         let entity_id = profile.entity_id.clone();
         let chrome_dir = profile.chrome_profile_directory.clone();
-        let kept: Vec<(String, bool)> = profile
+        let kept: Vec<(String, bool, Option<Vec<String>>)> = profile
             .toolkit_configs
             .iter()
-            .map(|c| (c.slug.clone(), c.no_auth))
+            .map(|c| (c.slug.clone(), c.no_auth, c.enabled_tools.clone()))
             .collect();
+
+        // The old server's id, so it can be retired after a successful migration.
+        let old_server_id: Option<String> = base_url
+            .split("/mcp/")
+            .nth(1)
+            .map(|s| s.split('?').next().unwrap_or(s))
+            .map(|s| s.trim_end_matches("/mcp").to_string())
+            .filter(|s| !s.is_empty());
 
         // Owned, mutable client (mirrors connect_toolkit) so we can repoint its
         // base_url and clone it into the servers map.
@@ -3107,19 +3153,63 @@ impl McpManager {
             chrome_dir,
         );
 
+        // 0. Snapshot the old server's allowed_tools while the client still
+        //    points at it (GET works even on a wedged server — only PATCH is
+        //    rejected). Fallback source for curation carry-over.
+        let old_allowed_tools: Vec<String> = match client.server_allowed_tools().await {
+            Ok(tools) => tools,
+            Err(e) => {
+                tracing::warn!(
+                    "[RECREATE] Could not read old server's allowed_tools ({}); \
+                     relying on locally persisted curation only",
+                    e
+                );
+                Vec::new()
+            }
+        };
+
         // 1. Resolve auth configs for all kept toolkits FIRST. This only hits
         //    /auth_configs, so it works even while the old server is wedged.
-        let mut resolved: Vec<(String, Option<String>)> = Vec::new();
+        //    Reconcile curation per toolkit: local enabled_tools wins, else the
+        //    old server's whitelist entries for the toolkit's prefix.
+        //    A toolkit whose auth config has no ACTIVE connected account binds
+        //    fine but fails every call with AUTH — flag it honestly.
+        let active_slugs = client.active_account_slugs().await;
+        let mut resolved: Vec<(String, Option<String>, Option<Vec<String>>)> = Vec::new();
         let mut needs_reconnect: Vec<String> = Vec::new();
-        for (slug, no_auth) in kept {
+        let mut auth_missing: Vec<String> = Vec::new();
+        for (slug, no_auth, local_curation) in kept {
+            let curation = local_curation.or_else(|| {
+                let prefix = format!("{}_", slug.to_uppercase().replace('-', "_"));
+                let from_server: Vec<String> = old_allowed_tools
+                    .iter()
+                    .filter(|t| t.to_uppercase().starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                if from_server.is_empty() {
+                    None
+                } else {
+                    Some(from_server)
+                }
+            });
             if no_auth {
-                resolved.push((slug, None));
+                resolved.push((slug, None, curation));
                 continue;
             }
             match client.get_auth_config_id(&slug).await {
-                Ok(id) => resolved.push((slug, Some(id))),
+                Ok(id) => {
+                    if !active_slugs.contains(&slug.to_lowercase()) {
+                        tracing::warn!(
+                            "[RECREATE] '{}' has an auth config but no ACTIVE connected \
+                             account — binding it, but it needs a reconnect (OAuth)",
+                            slug
+                        );
+                        auth_missing.push(slug.clone());
+                    }
+                    resolved.push((slug, Some(id), curation));
+                }
                 Err(e) if crate::mcp::composio_client::auth::is_no_auth_toolkit_error(&e) => {
-                    resolved.push((slug, None));
+                    resolved.push((slug, None, curation));
                 }
                 Err(e) => {
                     tracing::warn!("[RECREATE] '{}' auth resolve failed: {}", slug, e);
@@ -3131,7 +3221,7 @@ impl McpManager {
         // Composio rejects a server with no applications (error 1153
         // MCP_MissingAuthConfigsOrToolkits), so the fresh server must be seeded
         // with at least one toolkit.
-        let Some((seed_slug, seed_auth)) = resolved.first().cloned() else {
+        let Some((seed_slug, seed_auth, _)) = resolved.first().cloned() else {
             return Err(
                 "No toolkits available to provision a fresh server — connect a toolkit first."
                     .to_string(),
@@ -3179,6 +3269,8 @@ impl McpManager {
         }
 
         // 4. Bind the remaining toolkits (the seed is already bound by creation).
+        //    Tools are bound without a whitelist first; curation is re-applied
+        //    in one pass afterwards so the all-mode guard only expands once.
         let mut rebound = vec![seed_slug.clone()];
         tracing::info!(
             "[RECREATE] Seeded new server with '{}' (auth={:?}); binding {} more",
@@ -3186,20 +3278,80 @@ impl McpManager {
             seed_auth,
             resolved.len().saturating_sub(1)
         );
-        for (slug, auth) in resolved.into_iter().skip(1) {
-            match client
-                .add_toolkit_to_server(&slug, auth.as_deref(), None)
-                .await
-            {
+        for (slug, auth, _) in resolved.iter().skip(1) {
+            match client.add_toolkit_to_server(slug, auth.as_deref(), None).await {
                 Ok(_) => {
                     tracing::info!("[RECREATE] Bound '{}' (auth={:?})", slug, auth);
-                    rebound.push(slug);
+                    rebound.push(slug.clone());
                 }
                 Err(e) => {
                     tracing::warn!("[RECREATE] Failed to re-bind '{}': {}", slug, e);
-                    needs_reconnect.push(slug);
+                    needs_reconnect.push(slug.clone());
                 }
             }
+        }
+
+        // Surface bound-but-account-less toolkits in the reconnect list so the
+        // UI reports them honestly instead of counting them as restored.
+        for slug in auth_missing {
+            if !needs_reconnect.contains(&slug) {
+                needs_reconnect.push(slug);
+            }
+        }
+
+        // 4b. Re-apply the carried-over curation to the new server. Best-effort:
+        //     a failure here leaves the toolkit serving all tools (never zero).
+        let mut recovered_curation: Vec<(String, Vec<String>)> = Vec::new();
+        for (slug, _, curation) in &resolved {
+            let Some(tools) = curation else { continue };
+            if tools.is_empty() || !rebound.contains(slug) {
+                continue;
+            }
+            match client
+                .set_toolkit_enabled_tools(slug, tools.clone())
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "[RECREATE] Re-applied curation for '{}' ({} tools)",
+                        slug,
+                        tools.len()
+                    );
+                    recovered_curation.push((slug.clone(), tools.clone()));
+                }
+                Err(e) => tracing::warn!(
+                    "[RECREATE] Could not re-apply curation for '{}' ({} tools): {} — \
+                     toolkit will serve all tools until re-curated",
+                    slug,
+                    tools.len(),
+                    e
+                ),
+            }
+        }
+
+        // Mirror the applied curation into local settings so it stays the
+        // durable source of truth (covers curation recovered from the old
+        // server that was never persisted locally).
+        if !recovered_curation.is_empty() {
+            {
+                let mut s = settings_signal.write();
+                if let Some(p) = s.composio_profiles.iter_mut().find(|p| p.id == profile_id) {
+                    for (slug, tools) in &recovered_curation {
+                        if let Some(config) = p
+                            .toolkit_configs
+                            .iter_mut()
+                            .find(|c| c.slug.eq_ignore_ascii_case(slug))
+                        {
+                            config.enabled_tools = Some(tools.clone());
+                        }
+                    }
+                }
+            }
+            let updated_curation = settings_signal.peek().clone();
+            let sm = settings_manager.clone();
+            spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || sm.save(&updated_curation)).await;
+            });
         }
 
         // Verify what actually persisted on the new server (config-level state,
@@ -3212,6 +3364,27 @@ impl McpManager {
                 auth_ids
             ),
             Err(e) => tracing::warn!("[RECREATE] Could not read new server config: {}", e),
+        }
+
+        // 4c. Retire the old server (soft delete) now that the profile points at
+        //     the new one. Best-effort: a leftover server is only clutter, but
+        //     deleting it prevents any future write from mis-targeting it.
+        if let Some(old_id) = old_server_id {
+            if new_url.contains(&old_id) {
+                tracing::warn!(
+                    "[RECREATE] New URL unexpectedly matches old server id {}; skipping delete",
+                    old_id
+                );
+            } else {
+                match client.delete_mcp_server(&old_id).await {
+                    Ok(()) => tracing::info!("[RECREATE] Retired old server {}", old_id),
+                    Err(e) => tracing::warn!(
+                        "[RECREATE] Could not delete old server {}: {}",
+                        old_id,
+                        e
+                    ),
+                }
+            }
         }
 
         // 5. Reload tools + refresh context/status.
@@ -3792,12 +3965,46 @@ impl McpManager {
         // Step 4: Smart Selection & Binding
         // SECURITY: Skip re-selection if admin has pre-configured allowed_tools for this toolkit.
         // This prevents Hobbes from overwriting admin curation (e.g., disabled SEND actions).
+        // Locally saved curation (Edit Tools) is checked next — it survives server wipes and
+        // delete/re-add cycles, unlike the on-server state the admin guard reads.
+        let saved_curation: Option<Vec<String>> = settings_signal
+            .peek()
+            .get_active_profile()
+            .and_then(|p| {
+                p.toolkit_configs
+                    .iter()
+                    .find(|c| c.slug.eq_ignore_ascii_case(&toolkit_slug))
+                    .and_then(|c| c.enabled_tools.clone())
+                    // Curation retained across a delete → re-add cycle.
+                    .or_else(|| p.retained_curation.get(&toolkit_slug.to_lowercase()).cloned())
+            })
+            .filter(|t| !t.is_empty());
+        // LLM selection applied this connect, to persist as local curation in Step 5.
+        let mut applied_selection: Option<Vec<String>> = None;
         if admin_tools_detected {
             tracing::info!(
                 "[Step 4/5] Skipping tool selection — admin-configured tools are authoritative for '{}'",
                 toolkit_slug
             );
             connection_status.set("Admin tools preserved".to_string());
+        } else if let Some(saved) = saved_curation.clone() {
+            tracing::info!(
+                "[Step 4/5] Re-applying saved curation for '{}' ({} tools) — skipping LLM selection",
+                toolkit_slug,
+                saved.len()
+            );
+            connection_status.set("Restoring your tool selection...".to_string());
+            match client
+                .add_toolkit_to_server(&toolkit_slug, auth_config_id.as_deref(), Some(saved.clone()))
+                .await
+            {
+                Ok(_) => applied_selection = Some(saved),
+                Err(e) => tracing::warn!(
+                    "Failed to re-apply saved curation for '{}': {} — toolkit will serve all tools",
+                    toolkit_slug,
+                    e
+                ),
+            }
         } else {
             tracing::info!("[Step 4/5] optimizing Tool Selection...");
             connection_status.set("Optimizing Tools...".to_string());
@@ -3857,13 +4064,15 @@ impl McpManager {
                         }
                     }
                     Ok(tools) if !tools.is_empty() => {
-                        // Small toolkit: use all tools explicitly
+                        // Small toolkit: leave the backend default (all tools).
+                        // Writing an explicit whitelist here used to flip the
+                        // shared server into whitelist mode for no benefit.
                         tracing::info!(
-                            "Toolkit '{}' has {} tools (under threshold), using all.",
+                            "Toolkit '{}' has {} tools (under threshold), keeping all enabled.",
                             toolkit_slug,
                             tools.len()
                         );
-                        Some(tools.into_iter().map(|(name, _)| name).collect())
+                        None
                     }
                     _ => None,
                 };
@@ -3871,11 +4080,12 @@ impl McpManager {
             // If selected_tools is present, re-patch to apply filter
             if let Some(tools) = selected_tools.clone() {
                 tracing::info!("Applying smart selection of {} tools", tools.len());
-                if let Err(e) = client
-                    .add_toolkit_to_server(&toolkit_slug, auth_config_id.as_deref(), Some(tools))
+                match client
+                    .add_toolkit_to_server(&toolkit_slug, auth_config_id.as_deref(), Some(tools.clone()))
                     .await
                 {
-                    tracing::warn!("Failed to apply smart tool selection: {}", e);
+                    Ok(_) => applied_selection = Some(tools),
+                    Err(e) => tracing::warn!("Failed to apply smart tool selection: {}", e),
                 }
             }
         } // end of !admin_tools_detected branch
@@ -3894,6 +4104,11 @@ impl McpManager {
             );
             let mut s = settings_signal.write();
             if let Some(profile) = s.get_active_profile_mut() {
+                // The curation (if any) is applied and about to be recorded on
+                // the live config entry; drop the delete-retained copy.
+                profile
+                    .retained_curation
+                    .remove(&toolkit_slug.to_lowercase());
                 if let Some(existing) = profile
                     .toolkit_configs
                     .iter_mut()
@@ -3902,6 +4117,11 @@ impl McpManager {
                     // Keep the no-auth flag current (a no-auth toolkit has no
                     // connected account, so this flag is what marks it connected).
                     existing.no_auth = effective_no_auth;
+                    // Persist the LLM's selection as local curation so the user
+                    // can review/edit it and it survives server recreation.
+                    if let Some(sel) = applied_selection.clone() {
+                        existing.enabled_tools = Some(sel);
+                    }
                 } else {
                     profile
                         .toolkit_configs
@@ -3912,6 +4132,7 @@ impl McpManager {
                             force_load: false,
                             load_mode: crate::settings::ToolkitLoadMode::OnDemand,
                             no_auth: effective_no_auth,
+                            enabled_tools: applied_selection.clone(),
                         });
                 }
             }
