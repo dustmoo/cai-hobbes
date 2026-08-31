@@ -17,6 +17,8 @@ pub fn MessageList(
     show_scroll_button: Signal<bool>,
     on_delete: EventHandler<Uuid>,
     on_fork: EventHandler<Uuid>,
+    on_edit_save: EventHandler<(Uuid, String)>,
+    on_edit_resend: EventHandler<(Uuid, String)>,
     on_comment: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
@@ -185,6 +187,14 @@ pub fn MessageList(
                                                                 on_fork: {
                                                                     let msg_id = message.id;
                                                                     move |_| on_fork.call(msg_id)
+                                                                },
+                                                                on_edit_save: {
+                                                                    let msg_id = message.id;
+                                                                    move |text: String| on_edit_save.call((msg_id, text))
+                                                                },
+                                                                on_edit_resend: {
+                                                                    let msg_id = message.id;
+                                                                    move |text: String| on_edit_resend.call((msg_id, text))
                                                                 },
                                                                 on_comment: move |_| on_comment.call(()),
                                                             }

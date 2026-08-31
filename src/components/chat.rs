@@ -856,6 +856,68 @@ pub fn ChatWindow(
         }
     };
 
+    // Inline edit — Save: mutate the message text in place and journal
+    // MessageEdited. No rewind, no model turn; the projector applies the edit
+    // by id, preserving attachments/comments/usage.
+    let edit_message_save = move |(message_id, new_text): (Uuid, String)| {
+        let session_id = current_target_id.read().clone();
+        let mut applied = false;
+        {
+            let mut state = session_state.write();
+            if let Some(session) = state.sessions.get_mut(&session_id) {
+                if let Some(msg) = session.messages.iter_mut().find(|m| m.id == message_id) {
+                    if let MessageContent::Text { content, .. } = &mut msg.content {
+                        *content = new_text.clone();
+                        applied = true;
+                    }
+                }
+            }
+        }
+        if applied {
+            log_event(
+                &session_id,
+                SessionEvent::MessageEdited { message_id, content: new_text },
+            );
+            stream_update_trigger.set(stream_update_trigger() + 1);
+            crate::session::SessionState::save_async(&session_state.read(), None);
+        }
+    };
+
+    // Inline edit — Save & Resend: journal MessageEdited for provenance
+    // (synchronously, so it lands before the rewind's RewoundTo row), rewind
+    // to just before this message (same machinery as delete: replay for
+    // journal-complete sessions, legacy in-place otherwise), then re-dispatch
+    // the edited text through the normal send path so streaming, context, and
+    // journaling all behave as a fresh send.
+    let edit_message_resend = {
+        let send_message = send_message.clone();
+        move |(message_id, new_text): (Uuid, String)| {
+            let session_id = current_target_id.read().clone();
+            let attachments = session_state
+                .read()
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
+                .map(|m| m.attachments.clone())
+                .unwrap_or_default();
+            crate::session_events::log_event_sync(
+                &session_id,
+                SessionEvent::MessageEdited { message_id, content: new_text.clone() },
+            );
+            {
+                let mut state = session_state.write();
+                crate::session_events::rewind_session_state(
+                    &mut state,
+                    &session_id,
+                    &message_id.to_string(),
+                );
+            }
+            stream_update_trigger.set(stream_update_trigger() + 1);
+            crate::session::SessionState::save_async(&session_state.read(), None);
+            send_message((new_text, attachments));
+        }
+    };
+
     // Fork-from-message: copy the journal up to this message's first event
     // (inclusive) into a new session and open it as a tab. Only offered for
     // journal-complete sessions — pre-journal history refuses gracefully.
@@ -1004,6 +1066,8 @@ pub fn ChatWindow(
                     show_scroll_button: show_scroll_button,
                     on_delete: delete_message,
                     on_fork: fork_from_message,
+                    on_edit_save: edit_message_save,
+                    on_edit_resend: edit_message_resend,
                     on_comment: move |_| has_new_comments.set(true),
                 },
                 ChatInput {
@@ -1239,6 +1303,8 @@ pub fn MessageBubble(
     on_selection: EventHandler<(String, f64, f64)>,
     on_delete: EventHandler<()>,
     #[props(default)] on_fork: EventHandler<()>,
+    #[props(default)] on_edit_save: EventHandler<String>,
+    #[props(default)] on_edit_resend: EventHandler<String>,
     on_comment: EventHandler<()>,
 ) -> Element {
     let is_user = message.author == "User";
@@ -1290,6 +1356,11 @@ pub fn MessageBubble(
 
             let display_mode = ui_state.read().token_display_mode.clone();
             let usage_data = message.usage.clone();
+
+            // Inline edit state (user-authored text messages only)
+            let mut editing = use_signal(|| false);
+            let mut edit_draft = use_signal(String::new);
+            let SessionIdContext(bubble_session_id) = use_context::<SessionIdContext>();
 
             // Inline comment state
             let mut selection_mode = use_signal(|| SelectionMode::None);
@@ -1507,6 +1578,11 @@ pub fn MessageBubble(
             });
 
             let is_thinking = is_streaming && !has_content;
+            // Editing is disabled while this session streams: a Save would race
+            // the in-flight turn's journal batch, and a Save & Resend would
+            // rewind under an active stream. (Delete has no such guard today —
+            // it restores to draft — so the guard lives here, on both actions.)
+            let session_streaming = stream_manager.is_session_streaming(&bubble_session_id.read());
 
             let bubble_classes = if is_thinking {
                 "bg-transparent border border-dashed border-faint animate-pulse self-start mr-auto"
@@ -1578,6 +1654,70 @@ pub fn MessageBubble(
                                             if let Some(summary) = local_thought_summary.read().as_ref() {
                                                  ThinkingMarkdownRenderer { content: summary.clone(), compact: false }
                                             }
+                                        }
+                                    }
+                                }
+                            } else if *editing.read() {
+                                // Inline edit mode: textarea prefilled with the
+                                // current text, Save / Save & Resend / Cancel.
+                                div {
+                                    class: "flex flex-col gap-2 w-full min-w-[280px]",
+                                    textarea {
+                                        class: "w-full bg-black/20 text-white text-sm leading-relaxed rounded-lg border border-white/30 focus:border-white/60 focus:outline-none p-2 resize-y",
+                                        rows: "{edit_draft.read().lines().count().clamp(3, 12)}",
+                                        value: "{edit_draft}",
+                                        autofocus: true,
+                                        oninput: move |e| edit_draft.set(e.value()),
+                                        onkeydown: move |e| {
+                                            if e.key() == Key::Escape {
+                                                editing.set(false);
+                                            } else if e.key() == Key::Enter
+                                                && (e.modifiers().contains(Modifiers::SUPER)
+                                                    || e.modifiers().contains(Modifiers::CONTROL))
+                                            {
+                                                let new_text = edit_draft.peek().trim().to_string();
+                                                if !new_text.is_empty() && !session_streaming {
+                                                    editing.set(false);
+                                                    on_edit_resend.call(new_text);
+                                                }
+                                            }
+                                        },
+                                    }
+                                    div {
+                                        class: "flex items-center justify-end gap-2",
+                                        button {
+                                            class: "px-2 py-1 text-xs rounded-md text-white/70 hover:text-white transition-colors",
+                                            onclick: move |_| editing.set(false),
+                                            "Cancel"
+                                        }
+                                        button {
+                                            class: "px-2 py-1 text-xs rounded-md bg-white/15 hover:bg-white/25 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                            disabled: session_streaming,
+                                            title: "Save the edit in place (no model turn)",
+                                            onclick: move |_| {
+                                                let new_text = edit_draft.peek().trim().to_string();
+                                                if new_text.is_empty() {
+                                                    return;
+                                                }
+                                                content.set(new_text.clone());
+                                                editing.set(false);
+                                                on_edit_save.call(new_text);
+                                            },
+                                            "Save"
+                                        }
+                                        button {
+                                            class: "px-2 py-1 text-xs rounded-md bg-white/15 hover:bg-white/25 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                            disabled: session_streaming,
+                                            title: "Rewind to this point and resend the edited message (⌘⏎)",
+                                            onclick: move |_| {
+                                                let new_text = edit_draft.peek().trim().to_string();
+                                                if new_text.is_empty() {
+                                                    return;
+                                                }
+                                                editing.set(false);
+                                                on_edit_resend.call(new_text);
+                                            },
+                                            "Save & Resend"
                                         }
                                     }
                                 }
@@ -1824,11 +1964,25 @@ pub fn MessageBubble(
                                 }
 
                                 if is_user {
+                                    // Inline edit (pencil): swap the bubble body to a
+                                    // textarea. Disabled while this session streams.
+                                    button {
+                                        class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                        disabled: session_streaming,
+                                        onclick: move |_| {
+                                            edit_draft.set(content.peek().clone());
+                                            editing.set(true);
+                                        },
+                                        title: "Edit message",
+                                        Icon { width: 14, height: 14, icon: fi_icons::FiEdit2 }
+                                    }
+                                    // Undo from here: restore this message to the
+                                    // draft and rewind the session past it.
                                     button {
                                         class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors",
                                         onclick: move |_| on_delete.call(()),
-                                        title: "Edit message",
-                                        Icon { width: 14, height: 14, icon: fi_icons::FiEdit2 }
+                                        title: "Undo from here",
+                                        Icon { width: 14, height: 14, icon: fi_icons::FiRotateCcw }
                                     }
                                 }
                             }

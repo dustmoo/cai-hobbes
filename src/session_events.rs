@@ -110,6 +110,14 @@ pub enum SessionEvent {
     /// journal up to `at_seq` (source seqs, inclusive). No-op on replay; kept
     /// for provenance.
     SessionForked { from_session_id: String, at_seq: i64 },
+    /// A user-authored text message was edited in place. Replaces only the
+    /// text of `MessageContent::Text`; attachments, comments, usage, and
+    /// `created_at` are untouched. A target that doesn't exist at fold time —
+    /// unknown id, or a message truncated by an earlier `RewoundTo` — is
+    /// skipped with a warning: the natural consequence of the fold. (The
+    /// Save & Resend flow journals the edit *before* the rewind for
+    /// provenance; either ordering projects to the same state.)
+    MessageEdited { message_id: uuid::Uuid, content: String },
 }
 
 impl SessionEvent {
@@ -137,6 +145,7 @@ impl SessionEvent {
             SessionEvent::CommentRemoved { .. } => "CommentRemoved",
             SessionEvent::ComposioProfileSet { .. } => "ComposioProfileSet",
             SessionEvent::SessionForked { .. } => "SessionForked",
+            SessionEvent::MessageEdited { .. } => "MessageEdited",
         }
     }
 }
@@ -318,6 +327,20 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
         }
         E::ComposioProfileSet { profile } => session.composio_profile = profile.clone(),
         E::SessionForked { .. } => {} // provenance marker — no state effect
+        E::MessageEdited { message_id, content } => {
+            use crate::components::shared::MessageContent;
+            match session.messages.iter_mut().find(|m| &m.id == message_id) {
+                Some(msg) => match &mut msg.content {
+                    MessageContent::Text { content: text, .. } => *text = content.clone(),
+                    _ => tracing::warn!(
+                        "project: MessageEdited targets non-text message {message_id}; skipping"
+                    ),
+                },
+                None => tracing::warn!(
+                    "project: MessageEdited targets unknown (or truncated) message {message_id}; skipping"
+                ),
+            }
+        }
     }
 }
 
@@ -907,6 +930,195 @@ mod tests {
                 .expect_err("missing journal fork must fail");
             assert!(err2.contains("predates the event journal"));
             assert_eq!(ts::load_events_for_test(conn, "fork", 0).len(), 0);
+        });
+    }
+
+    // ── MessageEdited (Phase 3) ─────────────────────────────────────────────
+
+    /// The projector replaces only the text: attachments, comments, usage,
+    /// created_at, and message ordering all survive the edit.
+    #[test]
+    fn message_edited_replaces_text_preserving_metadata() {
+        let mut target = text_message("User", "original text", 1);
+        target.attachments.push(hobbes_core::models::Attachment {
+            file_name: "a.png".into(),
+            mime_type: "image/png".into(),
+            data: "b64data".into(),
+        });
+        target.usage = usage(10, 0.001);
+        let reply = text_message("Hobbes", "reply", 2);
+        let comment = Comment {
+            id: "c1".into(),
+            text_selection: "original".into(),
+            start_offset: 0,
+            end_offset: 0,
+            comment: "note".into(),
+        };
+
+        let events = loaded(vec![
+            SessionEvent::SessionCreated { id: "s1".into(), name: "Edit".into() },
+            SessionEvent::UserMessage { message: target.clone() },
+            SessionEvent::AssistantMessage { message: reply.clone() },
+            SessionEvent::CommentAdded {
+                message_id: target.id.to_string(),
+                comment: comment.clone(),
+            },
+            SessionEvent::MessageEdited {
+                message_id: target.id,
+                content: "edited text".into(),
+            },
+        ]);
+
+        let s = project(None, &events);
+        // Ordering stable: the edit rewrites in place, it never moves the slot.
+        assert_eq!(s.messages.len(), 2);
+        assert_eq!(s.messages[0].id, target.id);
+        assert_eq!(s.messages[1].id, reply.id);
+        let m = &s.messages[0];
+        assert_eq!(m.content.get_text_content().as_deref(), Some("edited text"));
+        assert_eq!(m.attachments, target.attachments);
+        assert_eq!(m.comments, vec![comment]);
+        assert_eq!(m.usage, target.usage);
+        assert_eq!(m.created_at, target.created_at);
+        // The neighbor is untouched.
+        assert_eq!(s.messages[1].content.get_text_content().as_deref(), Some("reply"));
+    }
+
+    /// Unknown target ids skip with a warn; so does a target truncated by an
+    /// earlier RewoundTo — the natural consequence of the fold. No panics,
+    /// no resurrection.
+    #[test]
+    fn message_edited_unknown_or_truncated_target_skips() {
+        let keep = text_message("User", "keep", 0);
+        let victim = text_message("User", "will be rewound", 1);
+
+        let events = loaded(vec![
+            SessionEvent::SessionCreated { id: "s1".into(), name: "Skip".into() },
+            SessionEvent::UserMessage { message: keep.clone() },
+            SessionEvent::UserMessage { message: victim.clone() },
+            // Unknown id: this message never existed.
+            SessionEvent::MessageEdited {
+                message_id: uuid::Uuid::new_v4(),
+                content: "ghost".into(),
+            },
+            SessionEvent::RewoundTo { seq: 3, message_id: victim.id.to_string() },
+            // Target was truncated by the rewind above — must skip, not re-add.
+            SessionEvent::MessageEdited {
+                message_id: victim.id,
+                content: "too late".into(),
+            },
+        ]);
+
+        let s = project(None, &events);
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0].id, keep.id);
+        assert_eq!(s.messages[0].content.get_text_content().as_deref(), Some("keep"));
+    }
+
+    /// Save & Resend provenance: an edit journaled before a rewind of a LATER
+    /// message replays to the edited prefix.
+    #[test]
+    fn edit_then_rewind_replays_edited_prefix() {
+        let first = text_message("User", "hello", 1);
+        let reply = text_message("Hobbes", "hi there", 2);
+        let second = text_message("User", "follow-up", 3);
+
+        let events = loaded(vec![
+            SessionEvent::SessionCreated { id: "s1".into(), name: "Prefix".into() },
+            SessionEvent::UserMessage { message: first.clone() },
+            SessionEvent::AssistantMessage { message: reply.clone() },
+            SessionEvent::UserMessage { message: second.clone() },
+            SessionEvent::MessageEdited {
+                message_id: first.id,
+                content: "hello, edited".into(),
+            },
+            SessionEvent::RewoundTo { seq: 4, message_id: second.id.to_string() },
+        ]);
+
+        let s = project(None, &events);
+        assert_eq!(s.messages.len(), 2);
+        assert_eq!(s.messages[0].id, first.id);
+        assert_eq!(
+            s.messages[0].content.get_text_content().as_deref(),
+            Some("hello, edited")
+        );
+        assert_eq!(s.messages[1].id, reply.id);
+    }
+
+    /// The new variant round-trips through the store byte-for-byte and folds
+    /// on load.
+    #[test]
+    fn message_edited_round_trips_through_store() {
+        use crate::session_store::test_support as ts;
+        ts::with_test_db(|conn| {
+            let msg = text_message("User", "original", 1);
+            let edit = SessionEvent::MessageEdited {
+                message_id: msg.id,
+                content: "edited".into(),
+            };
+            ts::append_events_conn(
+                conn,
+                "s1",
+                &[
+                    SessionEvent::SessionCreated { id: "s1".into(), name: "RT".into() },
+                    SessionEvent::UserMessage { message: msg.clone() },
+                    edit.clone(),
+                ],
+            );
+            let events = ts::load_events_for_test(conn, "s1", 0);
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[2].event, edit);
+            assert_eq!(events[2].event.kind(), "MessageEdited");
+            let s = project(None, &events);
+            assert_eq!(s.messages.len(), 1);
+            assert_eq!(s.messages[0].content.get_text_content().as_deref(), Some("edited"));
+        });
+    }
+
+    /// Scripted Save flow on a journal-complete session: the live in-place
+    /// mutation and the journal projection agree.
+    #[test]
+    fn save_flow_event_and_projection_match_live_mutation() {
+        use crate::session_store::test_support as ts;
+        ts::with_test_db(|conn| {
+            let msg = text_message("User", "a tpyo here", 1);
+            let reply = text_message("Hobbes", "noted", 2);
+            ts::append_events_conn(
+                conn,
+                "s1",
+                &[
+                    SessionEvent::SessionCreated { id: "s1".into(), name: "Save".into() },
+                    SessionEvent::UserMessage { message: msg.clone() },
+                    SessionEvent::AssistantMessage { message: reply.clone() },
+                ],
+            );
+            assert!(ts::journal_complete_for_test(conn, "s1"));
+
+            // Live Save: mutate the hydrated session in place (what the UI
+            // does)…
+            let mut live = project(None, &ts::load_events_for_test(conn, "s1", 0));
+            if let MessageContent::Text { content, .. } = &mut live.messages[0].content {
+                *content = "a typo fixed".to_string();
+            } else {
+                panic!("expected text message");
+            }
+            // …and journal the same edit (what the Save handler appends).
+            ts::append_events_conn(
+                conn,
+                "s1",
+                &[SessionEvent::MessageEdited {
+                    message_id: msg.id,
+                    content: "a typo fixed".into(),
+                }],
+            );
+
+            let projected = project(None, &ts::load_events_for_test(conn, "s1", 0));
+            assert_eq!(projected.messages.len(), live.messages.len());
+            for (p, l) in projected.messages.iter().zip(live.messages.iter()) {
+                assert_eq!(p.id, l.id);
+                assert_eq!(p.content, l.content);
+                assert_eq!(p.created_at, l.created_at);
+            }
         });
     }
 
