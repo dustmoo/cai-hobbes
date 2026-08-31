@@ -15,6 +15,7 @@ use crate::context::permissions::PermissionManager;
 use crate::context::prompt_builder::PromptBuilder;
 use crate::mcp::manager::{is_composio_native, COMPOSIO_NATIVE_PREFIX};
 use crate::session::ActiveContext;
+use crate::session_events::{log_event, SessionEvent};
 use crate::settings::Settings;
 use dioxus::html::geometry::euclid::Rect;
 use dioxus::prelude::*;
@@ -388,13 +389,18 @@ pub fn ChatWindow(
                         let mut state = session_state.write();
 
                         // Update message status
+                        let mut result_snapshot: Option<crate::components::chat::Message> = None;
                         if let Some(msg) = state.get_message_mut(&msg_id) {
                             if let crate::components::shared::MessageContent::ToolCall(tc) =
                                 &mut msg.content
                             {
                                 tc.status = status;
                                 tc.response = response_str.clone();
+                                result_snapshot = Some(msg.clone());
                             }
+                        }
+                        if let Some(message) = result_snapshot {
+                            log_event(&active_session_id, SessionEvent::ToolResult { message });
                         }
 
                         // Add to history for context
@@ -572,65 +578,82 @@ pub fn ChatWindow(
                     let turn_count = session_state.read().sessions.get(&target_id)
                         .map(|s| s.current_ai_turn_count).unwrap_or(0);
                     if permission_manager.read().is_turn_limit_reached_for(turn_count) {
-                        let mut state = session_state.write();
-                        if let Some(session) = state.sessions.get_mut(&target_id) {
-                            session.messages.push(Message {
-                                id: Uuid::new_v4(),
-                                author: "User".to_string(),
-                                content: MessageContent::Text {
-                                    content: user_message.clone(),
-                                    thought_signature: None,
-                                    thought_summary: None,
-                                },
-                                attachments,
-                                comments: Vec::new(),
-                                created_at: chrono::Utc::now(),
-                                usage: None,
-                            });
-                            session.messages.push(Message {
-                        id: Uuid::new_v4(),
-                        author: "Hobbes".to_string(),
-                        content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings_read.permission_settings.max_ai_turns), thought_signature: None, thought_summary: None },
-                        attachments: Vec::new(),
-                        comments: Vec::new(),
-                        created_at: chrono::Utc::now(),
-                        usage: None,
-                    });
+                        let user_msg = Message {
+                            id: Uuid::new_v4(),
+                            author: "User".to_string(),
+                            content: MessageContent::Text {
+                                content: user_message.clone(),
+                                thought_signature: None,
+                                thought_summary: None,
+                            },
+                            attachments,
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        let warning_msg = Message {
+                            id: Uuid::new_v4(),
+                            author: "Hobbes".to_string(),
+                            content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings_read.permission_settings.max_ai_turns), thought_signature: None, thought_summary: None },
+                            attachments: Vec::new(),
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        {
+                            let mut state = session_state.write();
+                            if let Some(session) = state.sessions.get_mut(&target_id) {
+                                session.messages.push(user_msg.clone());
+                                session.messages.push(warning_msg.clone());
+                            }
                         }
+                        crate::session_events::log_events(
+                            &target_id,
+                            vec![
+                                SessionEvent::UserMessage { message: user_msg },
+                                SessionEvent::AssistantMessage { message: warning_msg },
+                            ],
+                        );
                         return;
                     }
 
                     let hobbes_message_id = Uuid::new_v4();
                     {
-                        let mut state = session_state.write();
-                        if let Some(session) = state.sessions.get_mut(&target_id) {
-                            session.messages.push(Message {
-                                id: Uuid::new_v4(),
-                                author: "User".to_string(),
-                                content: MessageContent::Text {
-                                    content: user_message.clone(),
-                                    thought_signature: None,
-                                    thought_summary: None,
-                                },
-                                attachments,
-                                comments: Vec::new(),
-                                created_at: chrono::Utc::now(),
-                                usage: None,
-                            });
-                            session.messages.push(Message {
-                                id: hobbes_message_id,
-                                author: "Hobbes".to_string(),
-                                content: MessageContent::Text {
-                                    content: "".to_string(),
-                                    thought_signature: None,
-                                    thought_summary: None,
-                                },
-                                attachments: Vec::new(),
-                                comments: Vec::new(),
-                                created_at: chrono::Utc::now(),
-                                usage: None,
-                            });
+                        let user_msg = Message {
+                            id: Uuid::new_v4(),
+                            author: "User".to_string(),
+                            content: MessageContent::Text {
+                                content: user_message.clone(),
+                                thought_signature: None,
+                                thought_summary: None,
+                            },
+                            attachments,
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        {
+                            let mut state = session_state.write();
+                            if let Some(session) = state.sessions.get_mut(&target_id) {
+                                session.messages.push(user_msg.clone());
+                                // Streaming placeholder — finalized (and journaled)
+                                // by stream_manager at end of turn.
+                                session.messages.push(Message {
+                                    id: hobbes_message_id,
+                                    author: "Hobbes".to_string(),
+                                    content: MessageContent::Text {
+                                        content: "".to_string(),
+                                        thought_signature: None,
+                                        thought_summary: None,
+                                    },
+                                    attachments: Vec::new(),
+                                    comments: Vec::new(),
+                                    created_at: chrono::Utc::now(),
+                                    usage: None,
+                                });
+                            }
                         }
+                        log_event(&target_id, SessionEvent::UserMessage { message: user_msg });
                     }
                     // Scroll to bottom immediately so the new messages are visible
                     // without waiting for the first streaming chunk.
@@ -840,6 +863,19 @@ pub fn ChatWindow(
         let routing_target = *optimization_target.read();
         match routing_target {
             OptimizationTarget::Session => {
+                let notice_msg = Message {
+                    id: Uuid::new_v4(),
+                    author: "Hobbes".to_string(),
+                    content: MessageContent::Text {
+                        content: format!("✨ **Memory Optimized**\n\n{}", summary),
+                        thought_signature: None,
+                        thought_summary: None,
+                    },
+                    attachments: Vec::new(),
+                    comments: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                };
                 {
                     let mut state = session_state.write();
                     if let Some(session) = state.sessions.get_mut(&*current_target_id.read()) {
@@ -847,21 +883,13 @@ pub fn ChatWindow(
                         session.memory_optimization_summary = Some(summary.clone());
 
                         // Insert Internal Turn Message
-                        session.messages.push(Message {
-                            id: Uuid::new_v4(),
-                            author: "Hobbes".to_string(),
-                            content: MessageContent::Text {
-                                content: format!("✨ **Memory Optimized**\n\n{}", summary),
-                                thought_signature: None,
-                                thought_summary: None,
-                            },
-                            attachments: Vec::new(),
-                            comments: Vec::new(),
-                            created_at: chrono::Utc::now(),
-                            usage: None,
-                        });
+                        session.messages.push(notice_msg.clone());
                     }
                 }
+                log_event(
+                    &current_target_id.read().clone(),
+                    SessionEvent::AssistantMessage { message: notice_msg },
+                );
                 crate::session::SessionState::save_async(&session_state.read(), None);
                 // Force refresh messagelist
                 stream_update_trigger.set(stream_update_trigger() + 1);

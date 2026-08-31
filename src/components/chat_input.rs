@@ -22,6 +22,7 @@ use crate::components::skill_autocomplete::SkillAutocomplete;
 use crate::components::stream_manager::StreamManagerContext;
 use crate::hotkey::matches_hotkey;
 use crate::processing::summarization_scheduler::SchedulerSignal;
+use crate::session_events::{log_event, log_events, SessionEvent};
 use crate::skills::{Skill, SkillRegistry};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -289,27 +290,41 @@ pub fn ChatInput(
             if trimmed.starts_with("/unload ") {
                 let skill_name = trimmed.trim_start_matches("/unload ").trim();
                 if !skill_name.is_empty() {
-                    let mut state = session_state.write();
-                    if let Some(session) = state.get_active_session_mut() {
-                        if session.loaded_skills.remove(skill_name).is_some() {
-                            // Push a confirmation message
-                            session.messages.push(crate::components::chat::Message {
-                                id: uuid::Uuid::new_v4(),
-                                author: "User".to_string(),
-                                content: crate::components::shared::MessageContent::Text {
-                                    content: format!("Unloaded skill '{}' from session context.", skill_name),
-                                    thought_signature: None,
-                                    thought_summary: None,
-                                },
-                                attachments: Vec::new(),
-                                comments: Vec::new(),
-                                created_at: chrono::Utc::now(),
-                                usage: None,
-                            });
-                            tracing::info!("Unloaded skill '{}' from session.loaded_skills", skill_name);
-                        } else {
-                            tracing::warn!("Skill '{}' not found in loaded_skills", skill_name);
+                    let mut unload_log: Option<(String, crate::components::chat::Message)> = None;
+                    {
+                        let mut state = session_state.write();
+                        if let Some(session) = state.get_active_session_mut() {
+                            if session.loaded_skills.remove(skill_name).is_some() {
+                                // Push a confirmation message
+                                let confirmation = crate::components::chat::Message {
+                                    id: uuid::Uuid::new_v4(),
+                                    author: "User".to_string(),
+                                    content: crate::components::shared::MessageContent::Text {
+                                        content: format!("Unloaded skill '{}' from session context.", skill_name),
+                                        thought_signature: None,
+                                        thought_summary: None,
+                                    },
+                                    attachments: Vec::new(),
+                                    comments: Vec::new(),
+                                    created_at: chrono::Utc::now(),
+                                    usage: None,
+                                };
+                                unload_log = Some((session.id.clone(), confirmation.clone()));
+                                session.messages.push(confirmation);
+                                tracing::info!("Unloaded skill '{}' from session.loaded_skills", skill_name);
+                            } else {
+                                tracing::warn!("Skill '{}' not found in loaded_skills", skill_name);
+                            }
                         }
+                    }
+                    if let Some((session_id, confirmation)) = unload_log {
+                        log_events(
+                            &session_id,
+                            vec![
+                                SessionEvent::SkillUnloaded { name: skill_name.to_string() },
+                                SessionEvent::UserMessage { message: confirmation },
+                            ],
+                        );
                     }
                 }
                 return;
@@ -403,11 +418,22 @@ pub fn ChatInput(
 
                         let msg_id = skill_message.id;
                         let mut state = session_state.write();
+                        let mut skill_session_id: Option<String> = None;
                         if let Some(session) = state.get_active_session_mut() {
-                            session.messages.push(user_bubble);
-                            session.messages.push(skill_message);
+                            skill_session_id = Some(session.id.clone());
+                            session.messages.push(user_bubble.clone());
+                            session.messages.push(skill_message.clone());
                         }
                         drop(state); // Drop lock before async
+                        if let Some(sid) = &skill_session_id {
+                            log_events(
+                                sid,
+                                vec![
+                                    SessionEvent::UserMessage { message: user_bubble },
+                                    SessionEvent::ToolCall { message: skill_message },
+                                ],
+                            );
+                        }
 
                         // Spawn Execution
                         let mut sc_clone = skill_call.clone();
@@ -424,13 +450,17 @@ pub fn ChatInput(
                                 Ok(result) => {
                                     // Update message with completed SkillCall
                                     let mut state = session_state.write();
+                                    let mut skill_events: Vec<SessionEvent> = Vec::new();
+                                    let mut event_session_id: Option<String> = None;
                                     if let Some(session) = state.get_active_session_mut() {
+                                        event_session_id = Some(session.id.clone());
                                         if let Some(msg) =
                                             session.messages.iter_mut().find(|m| m.id == msg_id)
                                         {
                                             sc_clone.status = result.status;
                                             sc_clone.response = result.output;
                                             msg.content = crate::components::shared::MessageContent::SkillCall(sc_clone.clone());
+                                            skill_events.push(SessionEvent::ToolResult { message: msg.clone() });
                                         }
                                         // Persist skill into session.loaded_skills so it
                                         // remains in system context across all future turns
@@ -439,17 +469,26 @@ pub fn ChatInput(
                                                 sc_clone.skill_name.clone(),
                                                 sc_clone.response.clone(),
                                             );
+                                            skill_events.push(SessionEvent::SkillLoaded {
+                                                name: sc_clone.skill_name.clone(),
+                                                payload: sc_clone.response.clone(),
+                                            });
                                             tracing::info!("Persisted skill '{}' into session.loaded_skills", sc_clone.skill_name);
                                         }
                                     }
                                     drop(state); // Release lock before triggering
+                                    if let Some(sid) = &event_session_id {
+                                        log_events(sid, skill_events);
+                                    }
                                                  // Auto-trigger LLM to respond with the injected skill context
                                     chat_command.set(Some(ChatCommand::TriggerAiAnalysis));
                                 }
                                 Err(e) => {
                                     tracing::error!("Skill execution failed: {}", e);
                                     let mut state = session_state.write();
+                                    let mut error_log: Option<(String, crate::components::chat::Message)> = None;
                                     if let Some(session) = state.get_active_session_mut() {
+                                        let sid = session.id.clone();
                                         if let Some(msg) =
                                             session.messages.iter_mut().find(|m| m.id == msg_id)
                                         {
@@ -457,7 +496,12 @@ pub fn ChatInput(
                                                 crate::components::shared::SkillCallStatus::Error;
                                             sc_clone.response = format!("Error: {}", e);
                                             msg.content = crate::components::shared::MessageContent::SkillCall(sc_clone);
+                                            error_log = Some((sid, msg.clone()));
                                         }
+                                    }
+                                    drop(state);
+                                    if let Some((sid, message)) = error_log {
+                                        log_event(&sid, SessionEvent::ToolResult { message });
                                     }
                                 }
                             }
@@ -478,9 +522,21 @@ pub fn ChatInput(
                         };
 
                         let mut state = session_state.write();
+                        let mut prompt_session_id: Option<String> = None;
                         if let Some(session) = state.get_active_session_mut() {
-                            session.messages.push(user_bubble);
-                            session.messages.push(skill_message);
+                            prompt_session_id = Some(session.id.clone());
+                            session.messages.push(user_bubble.clone());
+                            session.messages.push(skill_message.clone());
+                        }
+                        drop(state);
+                        if let Some(sid) = &prompt_session_id {
+                            log_events(
+                                sid,
+                                vec![
+                                    SessionEvent::UserMessage { message: user_bubble },
+                                    SessionEvent::UserMessage { message: skill_message },
+                                ],
+                            );
                         }
                     }
 

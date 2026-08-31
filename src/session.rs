@@ -202,6 +202,21 @@ impl Session {
                 if count > 0 {
                     self.active_context.conversation_summary = Default::default();
                     tracing::debug!("Reset conversation_summary after undo ({} messages removed)", count);
+
+                    // Journal the rewind so Phase 2 has history. The anchor is
+                    // the seq of the first journaled event referencing the
+                    // deleted message; 0 when it predates the journal.
+                    let rewind_seq = crate::session_store::first_event_seq_for_message(
+                        &self.id, message_id,
+                    )
+                    .unwrap_or(0);
+                    crate::session_events::log_event(
+                        &self.id,
+                        crate::session_events::SessionEvent::RewoundTo {
+                            seq: rewind_seq,
+                            message_id: message_id.to_string(),
+                        },
+                    );
                 }
 
                 self.last_updated = Utc::now();
@@ -530,7 +545,11 @@ impl SessionState {
         }
 
         if let Some(session) = self.sessions.get_mut(session_id) {
-            session.scratchpad = content;
+            session.scratchpad = content.clone();
+            crate::session_events::log_event(
+                session_id,
+                crate::session_events::SessionEvent::ScratchpadSet { content },
+            );
             tracing::info!(
                 "HOBBES_UPDATE_SCRATCHPAD: Scratchpad updated ({} chars, limit {})",
                 char_count, max_scratchpad_chars
@@ -642,8 +661,12 @@ impl SessionState {
                     format!("Session '{}' not found", session_id),
                 );
             };
-            session.scheduled_timers.push(timer);
+            session.scheduled_timers.push(timer.clone());
         }
+        crate::session_events::log_event(
+            session_id,
+            crate::session_events::SessionEvent::TimerCreated { timer },
+        );
         Self::save_async(self, None);
 
         let human = {
@@ -727,6 +750,12 @@ impl SessionState {
         };
 
         if cancelled {
+            crate::session_events::log_event(
+                session_id,
+                crate::session_events::SessionEvent::TimerCancelled {
+                    timer_id: timer_id.clone(),
+                },
+            );
             Self::save_async(self, None);
             (
                 ToolCallStatus::Completed,
@@ -1344,6 +1373,12 @@ impl SessionState {
     }
 
     pub fn update_session_name_raw(&mut self, id: &str, new_name: String) {
+        crate::session_events::log_event(
+            id,
+            crate::session_events::SessionEvent::SessionRenamed {
+                name: new_name.clone(),
+            },
+        );
         if let Some(session) = self.sessions.get_mut(id) {
             session.name = new_name;
         } else {
