@@ -4738,13 +4738,21 @@ pub fn SettingsPanel() -> Element {
                                             }
                                             // Purge the active session's loaded payload; persisted
                                             // sessions keep their self-contained snapshots by design.
-                                            let session_dirty = {
+                                            let (session_dirty, unload_sid) = {
                                                 let mut state = session_state.write();
                                                 state.get_active_session_mut()
-                                                    .map(|s| s.loaded_skills.remove(&name).is_some())
-                                                    .unwrap_or(false)
+                                                    .map(|s| (s.loaded_skills.remove(&name).is_some(), Some(s.id.clone())))
+                                                    .unwrap_or((false, None))
                                             };
                                             if session_dirty {
+                                                if let Some(sid) = &unload_sid {
+                                                    crate::session_events::log_event(
+                                                        sid,
+                                                        crate::session_events::SessionEvent::SkillUnloaded {
+                                                            name: name.clone(),
+                                                        },
+                                                    );
+                                                }
                                                 crate::session::SessionState::save_signal(&session_state, None);
                                             }
                                             crate::skills::SkillRegistry::reload_into_signal(skill_registry).await;

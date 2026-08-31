@@ -252,7 +252,7 @@ pub fn SkillEditor(props: SkillEditorProps) -> Element {
                                     let sm = settings_manager.peek().clone();
                                     sm.save_async(settings.peek().clone(), None);
                                 }
-                                let session_dirty = {
+                                let (session_dirty, rename_log) = {
                                     let mut state = session_state.write();
                                     if let Some(session) = state.get_active_session_mut() {
                                         if let Some(payload) =
@@ -260,15 +260,29 @@ pub fn SkillEditor(props: SkillEditorProps) -> Element {
                                         {
                                             session
                                                 .loaded_skills
-                                                .insert(new_name.clone(), payload);
-                                            true
+                                                .insert(new_name.clone(), payload.clone());
+                                            (true, Some((session.id.clone(), payload)))
                                         } else {
-                                            false
+                                            (false, None)
                                         }
                                     } else {
-                                        false
+                                        (false, None)
                                     }
                                 };
+                                if let Some((sid, payload)) = rename_log {
+                                    crate::session_events::log_events(
+                                        &sid,
+                                        vec![
+                                            crate::session_events::SessionEvent::SkillUnloaded {
+                                                name: orig.to_string(),
+                                            },
+                                            crate::session_events::SessionEvent::SkillLoaded {
+                                                name: new_name.clone(),
+                                                payload,
+                                            },
+                                        ],
+                                    );
+                                }
                                 if session_dirty {
                                     SessionState::save_signal(&session_state, None);
                                 }

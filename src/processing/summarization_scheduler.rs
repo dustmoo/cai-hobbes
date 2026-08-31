@@ -57,6 +57,8 @@ pub fn use_summarization_scheduler() {
                             .generate_summary(&active_session, &settings_guard)
                             .await
                         {
+                            let summary_value =
+                                serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
                             // Write the new summary back to the session
                             session_state
                                 .write()
@@ -64,6 +66,12 @@ pub fn use_summarization_scheduler() {
                                 .unwrap()
                                 .active_context
                                 .conversation_summary = summary;
+                            crate::session_events::log_event(
+                                &active_session.id,
+                                crate::session_events::SessionEvent::SummaryComputed {
+                                    summary: summary_value,
+                                },
+                            );
                             last_summarized_message_count = current_message_count;
                             tracing::info!("Conversation summary updated (Forced).");
                         }
@@ -93,6 +101,8 @@ pub fn use_summarization_scheduler() {
                                 .generate_summary(&active_session, &settings_guard)
                                 .await
                             {
+                                let summary_value = serde_json::to_value(&summary)
+                                    .unwrap_or(serde_json::Value::Null);
                                 // Write the new summary back to the session
                                 session_state
                                     .write()
@@ -100,6 +110,12 @@ pub fn use_summarization_scheduler() {
                                     .unwrap()
                                     .active_context
                                     .conversation_summary = summary;
+                                crate::session_events::log_event(
+                                    &active_session.id,
+                                    crate::session_events::SessionEvent::SummaryComputed {
+                                        summary: summary_value,
+                                    },
+                                );
                                 last_summarized_message_count = current_message_count;
                                 tracing::info!("Conversation summary updated.");
                             }

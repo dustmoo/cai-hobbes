@@ -15,6 +15,7 @@ use crate::context::permissions::PermissionManager;
 use crate::context::prompt_builder::PromptBuilder;
 use crate::mcp::manager::{is_composio_native, COMPOSIO_NATIVE_PREFIX};
 use crate::session::ActiveContext;
+use crate::session_events::{log_event, SessionEvent};
 use crate::settings::Settings;
 use dioxus::html::geometry::euclid::Rect;
 use dioxus::prelude::*;
@@ -406,13 +407,18 @@ pub fn ChatWindow(
                         let mut state = session_state.write();
 
                         // Update message status
+                        let mut result_snapshot: Option<crate::components::chat::Message> = None;
                         if let Some(msg) = state.get_message_mut(&msg_id) {
                             if let crate::components::shared::MessageContent::ToolCall(tc) =
                                 &mut msg.content
                             {
                                 tc.status = status;
                                 tc.response = response_str.clone();
+                                result_snapshot = Some(msg.clone());
                             }
+                        }
+                        if let Some(message) = result_snapshot {
+                            log_event(&active_session_id, SessionEvent::ToolResult { message });
                         }
 
                         // Add to history for context
@@ -604,65 +610,82 @@ pub fn ChatWindow(
                     let turn_count = session_state.read().sessions.get(&target_id)
                         .map(|s| s.current_ai_turn_count).unwrap_or(0);
                     if permission_manager.read().is_turn_limit_reached_for(turn_count) {
-                        let mut state = session_state.write();
-                        if let Some(session) = state.sessions.get_mut(&target_id) {
-                            session.messages.push(Message {
-                                id: Uuid::new_v4(),
-                                author: "User".to_string(),
-                                content: MessageContent::Text {
-                                    content: user_message.clone(),
-                                    thought_signature: None,
-                                    thought_summary: None,
-                                },
-                                attachments,
-                                comments: Vec::new(),
-                                created_at: chrono::Utc::now(),
-                                usage: None,
-                            });
-                            session.messages.push(Message {
-                        id: Uuid::new_v4(),
-                        author: "Hobbes".to_string(),
-                        content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings_read.permission_settings.max_ai_turns), thought_signature: None, thought_summary: None },
-                        attachments: Vec::new(),
-                        comments: Vec::new(),
-                        created_at: chrono::Utc::now(),
-                        usage: None,
-                    });
+                        let user_msg = Message {
+                            id: Uuid::new_v4(),
+                            author: "User".to_string(),
+                            content: MessageContent::Text {
+                                content: user_message.clone(),
+                                thought_signature: None,
+                                thought_summary: None,
+                            },
+                            attachments,
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        let warning_msg = Message {
+                            id: Uuid::new_v4(),
+                            author: "Hobbes".to_string(),
+                            content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings_read.permission_settings.max_ai_turns), thought_signature: None, thought_summary: None },
+                            attachments: Vec::new(),
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        {
+                            let mut state = session_state.write();
+                            if let Some(session) = state.sessions.get_mut(&target_id) {
+                                session.messages.push(user_msg.clone());
+                                session.messages.push(warning_msg.clone());
+                            }
                         }
+                        crate::session_events::log_events(
+                            &target_id,
+                            vec![
+                                SessionEvent::UserMessage { message: user_msg },
+                                SessionEvent::AssistantMessage { message: warning_msg },
+                            ],
+                        );
                         return;
                     }
 
                     let hobbes_message_id = Uuid::new_v4();
                     {
-                        let mut state = session_state.write();
-                        if let Some(session) = state.sessions.get_mut(&target_id) {
-                            session.messages.push(Message {
-                                id: Uuid::new_v4(),
-                                author: "User".to_string(),
-                                content: MessageContent::Text {
-                                    content: user_message.clone(),
-                                    thought_signature: None,
-                                    thought_summary: None,
-                                },
-                                attachments,
-                                comments: Vec::new(),
-                                created_at: chrono::Utc::now(),
-                                usage: None,
-                            });
-                            session.messages.push(Message {
-                                id: hobbes_message_id,
-                                author: "Hobbes".to_string(),
-                                content: MessageContent::Text {
-                                    content: "".to_string(),
-                                    thought_signature: None,
-                                    thought_summary: None,
-                                },
-                                attachments: Vec::new(),
-                                comments: Vec::new(),
-                                created_at: chrono::Utc::now(),
-                                usage: None,
-                            });
+                        let user_msg = Message {
+                            id: Uuid::new_v4(),
+                            author: "User".to_string(),
+                            content: MessageContent::Text {
+                                content: user_message.clone(),
+                                thought_signature: None,
+                                thought_summary: None,
+                            },
+                            attachments,
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        {
+                            let mut state = session_state.write();
+                            if let Some(session) = state.sessions.get_mut(&target_id) {
+                                session.messages.push(user_msg.clone());
+                                // Streaming placeholder — finalized (and journaled)
+                                // by stream_manager at end of turn.
+                                session.messages.push(Message {
+                                    id: hobbes_message_id,
+                                    author: "Hobbes".to_string(),
+                                    content: MessageContent::Text {
+                                        content: "".to_string(),
+                                        thought_signature: None,
+                                        thought_summary: None,
+                                    },
+                                    attachments: Vec::new(),
+                                    comments: Vec::new(),
+                                    created_at: chrono::Utc::now(),
+                                    usage: None,
+                                });
+                            }
                         }
+                        log_event(&target_id, SessionEvent::UserMessage { message: user_msg });
                     }
                     // Scroll to bottom immediately so the new messages are visible
                     // without waiting for the first streaming chunk.
@@ -857,15 +880,113 @@ pub fn ChatWindow(
         } else {
             restore_message_to_draft(message_id);
 
-            // Delete the message and everything after
+            // Delete the message and everything after. Journal-complete
+            // sessions rewind by replay (RewoundTo + project); pre-journal
+            // sessions take the legacy in-place path.
             let message_id_str = message_id.to_string();
             let active_session_id = current_target_id.read().clone();
-            if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
-                session.delete_message_and_after(&message_id_str);
-                // Trigger update
-                stream_update_trigger.set(stream_update_trigger() + 1);
+            {
+                let mut state = session_state.write();
+                crate::session_events::rewind_session_state(
+                    &mut state,
+                    &active_session_id,
+                    &message_id_str,
+                );
             }
+            stream_update_trigger.set(stream_update_trigger() + 1);
             crate::session::SessionState::save_async(&session_state.read(), None);
+        }
+    };
+
+    // Inline edit — Save: mutate the message text in place and journal
+    // MessageEdited. No rewind, no model turn; the projector applies the edit
+    // by id, preserving attachments/comments/usage.
+    let edit_message_save = move |(message_id, new_text): (Uuid, String)| {
+        let session_id = current_target_id.read().clone();
+        let mut applied = false;
+        {
+            let mut state = session_state.write();
+            if let Some(session) = state.sessions.get_mut(&session_id) {
+                if let Some(msg) = session.messages.iter_mut().find(|m| m.id == message_id) {
+                    if let MessageContent::Text { content, .. } = &mut msg.content {
+                        *content = new_text.clone();
+                        applied = true;
+                    }
+                }
+            }
+        }
+        if applied {
+            log_event(
+                &session_id,
+                SessionEvent::MessageEdited { message_id, content: new_text },
+            );
+            stream_update_trigger.set(stream_update_trigger() + 1);
+            crate::session::SessionState::save_async(&session_state.read(), None);
+        }
+    };
+
+    // Inline edit — Save & Resend: journal MessageEdited for provenance
+    // (synchronously, so it lands before the rewind's RewoundTo row), rewind
+    // to just before this message (same machinery as delete: replay for
+    // journal-complete sessions, legacy in-place otherwise), then re-dispatch
+    // the edited text through the normal send path so streaming, context, and
+    // journaling all behave as a fresh send.
+    let edit_message_resend = {
+        let send_message = send_message.clone();
+        move |(message_id, new_text): (Uuid, String)| {
+            let session_id = current_target_id.read().clone();
+            let attachments = session_state
+                .read()
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
+                .map(|m| m.attachments.clone())
+                .unwrap_or_default();
+            crate::session_events::log_event_sync(
+                &session_id,
+                SessionEvent::MessageEdited { message_id, content: new_text.clone() },
+            );
+            {
+                let mut state = session_state.write();
+                crate::session_events::rewind_session_state(
+                    &mut state,
+                    &session_id,
+                    &message_id.to_string(),
+                );
+            }
+            stream_update_trigger.set(stream_update_trigger() + 1);
+            crate::session::SessionState::save_async(&session_state.read(), None);
+            send_message((new_text, attachments));
+        }
+    };
+
+    // Fork-from-message: copy the journal up to this message's first event
+    // (inclusive) into a new session and open it as a tab. Only offered for
+    // journal-complete sessions — pre-journal history refuses gracefully.
+    let fork_save_error = consume_context::<crate::components::shared::SaveErrorContext>().0;
+    let fork_from_message = move |message_id: Uuid| {
+        let mut fork_save_error = fork_save_error;
+        let session_id = current_target_id.read().clone();
+        let anchor = crate::session_store::first_event_seq_for_message(
+            &session_id,
+            &message_id.to_string(),
+        );
+        let Some(at_seq) = anchor.filter(|&s| s > 0) else {
+            fork_save_error.set(Some(
+                "This message predates the session journal — fork unavailable.".to_string(),
+            ));
+            return;
+        };
+        let result = session_state.write().fork_session(&session_id, Some(at_seq));
+        match result {
+            Ok(new_id) => {
+                crate::session::SessionState::save_async(&session_state.read(), None);
+                chat_command.set(Some(super::chat_input::ChatCommand::SwitchToSession(new_id)));
+            }
+            Err(e) => {
+                tracing::warn!("fork_from_message failed: {e}");
+                fork_save_error.set(Some(e));
+            }
         }
     };
 
@@ -882,6 +1003,19 @@ pub fn ChatWindow(
         let routing_target = *optimization_target.read();
         match routing_target {
             OptimizationTarget::Session => {
+                let notice_msg = Message {
+                    id: Uuid::new_v4(),
+                    author: "Hobbes".to_string(),
+                    content: MessageContent::Text {
+                        content: format!("✨ **Memory Optimized**\n\n{}", summary),
+                        thought_signature: None,
+                        thought_summary: None,
+                    },
+                    attachments: Vec::new(),
+                    comments: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                };
                 {
                     let mut state = session_state.write();
                     if let Some(session) = state.sessions.get_mut(&*current_target_id.read()) {
@@ -889,21 +1023,20 @@ pub fn ChatWindow(
                         session.memory_optimization_summary = Some(summary.clone());
 
                         // Insert Internal Turn Message
-                        session.messages.push(Message {
-                            id: Uuid::new_v4(),
-                            author: "Hobbes".to_string(),
-                            content: MessageContent::Text {
-                                content: format!("✨ **Memory Optimized**\n\n{}", summary),
-                                thought_signature: None,
-                                thought_summary: None,
-                            },
-                            attachments: Vec::new(),
-                            comments: Vec::new(),
-                            created_at: chrono::Utc::now(),
-                            usage: None,
-                        });
+                        session.messages.push(notice_msg.clone());
                     }
                 }
+                // MemoryOptimized journals only the summary: the wholesale
+                // active_context replacement is deliberately NOT replayed —
+                // mcp_tools/tools/extra are reactively rebuilt (P-001 sync,
+                // ToolCallSummarizer), so the summary is the durable outcome.
+                crate::session_events::log_events(
+                    &current_target_id.read().clone(),
+                    vec![
+                        SessionEvent::MemoryOptimized { summary: summary.clone() },
+                        SessionEvent::AssistantMessage { message: notice_msg },
+                    ],
+                );
                 crate::session::SessionState::save_async(&session_state.read(), None);
                 // Force refresh messagelist
                 stream_update_trigger.set(stream_update_trigger() + 1);
@@ -974,6 +1107,9 @@ pub fn ChatWindow(
                     stream_update_trigger: stream_update_trigger,
                     show_scroll_button: show_scroll_button,
                     on_delete: delete_message,
+                    on_fork: fork_from_message,
+                    on_edit_save: edit_message_save,
+                    on_edit_resend: edit_message_resend,
                     on_comment: move |_| has_new_comments.set(true),
                 },
                 ChatInput {
@@ -1049,11 +1185,15 @@ pub fn ChatWindow(
                             }
 
                             let active_session_id = current_target_id.read().clone();
-                            if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
-                                session.delete_message_and_after(id);
-                                // Trigger update
-                                stream_update_trigger.set(stream_update_trigger() + 1);
+                            {
+                                let mut state = session_state.write();
+                                crate::session_events::rewind_session_state(
+                                    &mut state,
+                                    &active_session_id,
+                                    id,
+                                );
                             }
+                            stream_update_trigger.set(stream_update_trigger() + 1);
                             crate::session::SessionState::save_async(&session_state.read(), None);
                         }
                         show_delete_confirm_modal.set(false);
@@ -1204,6 +1344,9 @@ pub fn MessageBubble(
     on_content_update: EventHandler<()>,
     on_selection: EventHandler<(String, f64, f64)>,
     on_delete: EventHandler<()>,
+    #[props(default)] on_fork: EventHandler<()>,
+    #[props(default)] on_edit_save: EventHandler<String>,
+    #[props(default)] on_edit_resend: EventHandler<String>,
     on_comment: EventHandler<()>,
 ) -> Element {
     let is_user = message.author == "User";
@@ -1255,6 +1398,11 @@ pub fn MessageBubble(
 
             let display_mode = ui_state.read().token_display_mode.clone();
             let usage_data = message.usage.clone();
+
+            // Inline edit state (user-authored text messages only)
+            let mut editing = use_signal(|| false);
+            let mut edit_draft = use_signal(String::new);
+            let SessionIdContext(bubble_session_id) = use_context::<SessionIdContext>();
 
             // Inline comment state
             let mut selection_mode = use_signal(|| SelectionMode::None);
@@ -1477,6 +1625,11 @@ pub fn MessageBubble(
             });
 
             let is_thinking = is_streaming && !has_content;
+            // Editing is disabled while this session streams: a Save would race
+            // the in-flight turn's journal batch, and a Save & Resend would
+            // rewind under an active stream. (Delete has no such guard today —
+            // it restores to draft — so the guard lives here, on both actions.)
+            let session_streaming = stream_manager.is_session_streaming(&bubble_session_id.read());
 
             let bubble_classes = if is_thinking {
                 "bg-transparent border border-dashed border-faint animate-pulse self-start mr-auto"
@@ -1559,6 +1712,70 @@ pub fn MessageBubble(
                                         }
                                     }
                                 }
+                            } else if *editing.read() {
+                                // Inline edit mode: textarea prefilled with the
+                                // current text, Save / Save & Resend / Cancel.
+                                div {
+                                    class: "flex flex-col gap-2 w-full min-w-[280px]",
+                                    textarea {
+                                        class: "w-full bg-black/20 text-white text-sm leading-relaxed rounded-lg border border-white/30 focus:border-white/60 focus:outline-none p-2 resize-y",
+                                        rows: "{edit_draft.read().lines().count().clamp(3, 12)}",
+                                        value: "{edit_draft}",
+                                        autofocus: true,
+                                        oninput: move |e| edit_draft.set(e.value()),
+                                        onkeydown: move |e| {
+                                            if e.key() == Key::Escape {
+                                                editing.set(false);
+                                            } else if e.key() == Key::Enter
+                                                && (e.modifiers().contains(Modifiers::SUPER)
+                                                    || e.modifiers().contains(Modifiers::CONTROL))
+                                            {
+                                                let new_text = edit_draft.peek().trim().to_string();
+                                                if !new_text.is_empty() && !session_streaming {
+                                                    editing.set(false);
+                                                    on_edit_resend.call(new_text);
+                                                }
+                                            }
+                                        },
+                                    }
+                                    div {
+                                        class: "flex items-center justify-end gap-2",
+                                        button {
+                                            class: "px-2 py-1 text-xs rounded-md text-white/70 hover:text-white transition-colors",
+                                            onclick: move |_| editing.set(false),
+                                            "Cancel"
+                                        }
+                                        button {
+                                            class: "px-2 py-1 text-xs rounded-md bg-white/15 hover:bg-white/25 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                            disabled: session_streaming,
+                                            title: "Save the edit in place (no model turn)",
+                                            onclick: move |_| {
+                                                let new_text = edit_draft.peek().trim().to_string();
+                                                if new_text.is_empty() {
+                                                    return;
+                                                }
+                                                content.set(new_text.clone());
+                                                editing.set(false);
+                                                on_edit_save.call(new_text);
+                                            },
+                                            "Save"
+                                        }
+                                        button {
+                                            class: "px-2 py-1 text-xs rounded-md bg-white/15 hover:bg-white/25 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                            disabled: session_streaming,
+                                            title: "Rewind to this point and resend the edited message (⌘⏎)",
+                                            onclick: move |_| {
+                                                let new_text = edit_draft.peek().trim().to_string();
+                                                if new_text.is_empty() {
+                                                    return;
+                                                }
+                                                editing.set(false);
+                                                on_edit_resend.call(new_text);
+                                            },
+                                            "Save & Resend"
+                                        }
+                                    }
+                                }
                             } else {
                                 MarkdownRenderer {
                                     id: Some(message.id),
@@ -1591,10 +1808,18 @@ pub fn MessageBubble(
                                         move |comment_id: String| {
                                             // Delete the comment from session state
                                             let mut state = session_state.write();
+                                            let session_id = state.active_session_id.clone();
                                             if let Some(msg) = state.get_message_mut(&message_id) {
                                                 msg.comments.retain(|c| c.id != comment_id);
                                             }
                                             drop(state);
+                                            log_event(
+                                                &session_id,
+                                                SessionEvent::CommentRemoved {
+                                                    message_id: message_id.to_string(),
+                                                    comment_id,
+                                                },
+                                            );
                                             crate::session::SessionState::save_signal(&session_state, Some(save_error));
                                         }
                                     }
@@ -1689,10 +1914,18 @@ pub fn MessageBubble(
 
                                     // Update session state
                                     let mut state = session_state.write();
+                                    let session_id = state.active_session_id.clone();
                                     if let Some(msg) = state.get_message_mut(&message.id) {
-                                        msg.comments.push(new_comment);
+                                        msg.comments.push(new_comment.clone());
                                     }
                                     drop(state);
+                                    log_event(
+                                        &session_id,
+                                        SessionEvent::CommentAdded {
+                                            message_id: message.id.to_string(),
+                                            comment: new_comment,
+                                        },
+                                    );
                                     crate::session::SessionState::save_signal(&session_state, Some(save_error));
 
                                     on_comment.call(());
@@ -1719,12 +1952,26 @@ pub fn MessageBubble(
                                     if let Some(comment_id) = editing_comment_id.read().clone() {
                                         // Update the comment in session state
                                         let mut state = session_state.write();
+                                        let session_id = state.active_session_id.clone();
+                                        let mut updated_comment: Option<Comment> = None;
                                         if let Some(msg) = state.get_message_mut(&message.id) {
                                             if let Some(comment) = msg.comments.iter_mut().find(|c| c.id == comment_id) {
                                                 comment.comment = new_comment_text;
+                                                updated_comment = Some(comment.clone());
                                             }
                                         }
                                         drop(state);
+                                        // Edits journal as CommentAdded — the projector
+                                        // upserts by comment id.
+                                        if let Some(comment) = updated_comment {
+                                            log_event(
+                                                &session_id,
+                                                SessionEvent::CommentAdded {
+                                                    message_id: message.id.to_string(),
+                                                    comment,
+                                                },
+                                            );
+                                        }
                                         crate::session::SessionState::save_signal(&session_state, Some(save_error));
                                     }
                                     comment_draft.set(String::new());
@@ -1788,12 +2035,33 @@ pub fn MessageBubble(
                                     }
                                 }
 
+                                button {
+                                    class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors",
+                                    onclick: move |_| on_fork.call(()),
+                                    title: "Fork from here",
+                                    Icon { width: 14, height: 14, icon: fi_icons::FiGitBranch }
+                                }
+
                                 if is_user {
+                                    // Inline edit (pencil): swap the bubble body to a
+                                    // textarea. Disabled while this session streams.
+                                    button {
+                                        class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                        disabled: session_streaming,
+                                        onclick: move |_| {
+                                            edit_draft.set(content.peek().clone());
+                                            editing.set(true);
+                                        },
+                                        title: "Edit message",
+                                        Icon { width: 14, height: 14, icon: fi_icons::FiEdit2 }
+                                    }
+                                    // Undo from here: restore this message to the
+                                    // draft and rewind the session past it.
                                     button {
                                         class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors",
                                         onclick: move |_| on_delete.call(()),
-                                        title: "Edit message",
-                                        Icon { width: 14, height: 14, icon: fi_icons::FiEdit2 }
+                                        title: "Undo from here",
+                                        Icon { width: 14, height: 14, icon: fi_icons::FiRotateCcw }
                                     }
                                 }
                             }

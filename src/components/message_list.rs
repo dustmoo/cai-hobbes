@@ -16,6 +16,9 @@ pub fn MessageList(
     stream_update_trigger: Signal<i32>,
     show_scroll_button: Signal<bool>,
     on_delete: EventHandler<Uuid>,
+    on_fork: EventHandler<Uuid>,
+    on_edit_save: EventHandler<(Uuid, String)>,
+    on_edit_resend: EventHandler<(Uuid, String)>,
     on_comment: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
@@ -181,6 +184,18 @@ pub fn MessageList(
                                                                     let msg_id = message.id;
                                                                     move |_| on_delete.call(msg_id)
                                                                 },
+                                                                on_fork: {
+                                                                    let msg_id = message.id;
+                                                                    move |_| on_fork.call(msg_id)
+                                                                },
+                                                                on_edit_save: {
+                                                                    let msg_id = message.id;
+                                                                    move |text: String| on_edit_save.call((msg_id, text))
+                                                                },
+                                                                on_edit_resend: {
+                                                                    let msg_id = message.id;
+                                                                    move |text: String| on_edit_resend.call((msg_id, text))
+                                                                },
                                                                 on_comment: move |_| on_comment.call(()),
                                                             }
                                                         }
@@ -245,6 +260,10 @@ pub fn MessageList(
                                                             on_delete: {
                                                                 let msg_id = message.id;
                                                                 move |_| on_delete.call(msg_id)
+                                                            },
+                                                            on_fork: {
+                                                                let msg_id = message.id;
+                                                                move |_| on_fork.call(msg_id)
                                                             },
                                                             on_comment: move |_| on_comment.call(()),
                                                         }
@@ -348,9 +367,11 @@ pub fn MessageList(
                                                                                                 tracing::info!("Skill executed: {:?}", result.status);
                                                                                                 // Update message with completed SkillCall
                                                                                                 let mut state = session_state.write();
+                                                                                                let mut skill_events: Vec<crate::session_events::SessionEvent> = Vec::new();
                                                                                                 if let Some(session) = state.sessions.get_mut(&session_id) {
                                                                                                     if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
                                                                                                         msg.content = MessageContent::SkillCall(sc.clone());
+                                                                                                        skill_events.push(crate::session_events::SessionEvent::ToolResult { message: msg.clone() });
                                                                                                     }
                                                                                                     // Persist skill into session.loaded_skills
                                                                                                     if sc.status == crate::components::shared::SkillCallStatus::Completed {
@@ -358,10 +379,15 @@ pub fn MessageList(
                                                                                                             sc.skill_name.clone(),
                                                                                                             sc.response.clone(),
                                                                                                         );
+                                                                                                        skill_events.push(crate::session_events::SessionEvent::SkillLoaded {
+                                                                                                            name: sc.skill_name.clone(),
+                                                                                                            payload: sc.response.clone(),
+                                                                                                        });
                                                                                                         tracing::info!("Persisted skill '{}' into session.loaded_skills (permission path)", sc.skill_name);
                                                                                                     }
                                                                                                 }
                                                                                                 drop(state);
+                                                                                                crate::session_events::log_events(&session_id, skill_events);
                                                                                                 // Trigger continuation so LLM responds to skill output
                                                                                                 chat_command.set(Some(crate::components::chat_input::ChatCommand::TriggerAiAnalysis));
                                                                                             }
@@ -370,10 +396,16 @@ pub fn MessageList(
                                                                                                 sc.status = crate::components::shared::SkillCallStatus::Error;
                                                                                                 sc.response = e.to_string();
                                                                                                 let mut state = session_state.write();
+                                                                                                let mut error_snapshot: Option<crate::components::chat::Message> = None;
                                                                                                 if let Some(session) = state.sessions.get_mut(&session_id) {
                                                                                                     if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
                                                                                                         msg.content = MessageContent::SkillCall(sc);
+                                                                                                        error_snapshot = Some(msg.clone());
                                                                                                     }
+                                                                                                }
+                                                                                                drop(state);
+                                                                                                if let Some(message) = error_snapshot {
+                                                                                                    crate::session_events::log_event(&session_id, crate::session_events::SessionEvent::ToolResult { message });
                                                                                                 }
                                                                                             }
                                                                                         }
@@ -388,6 +420,7 @@ pub fn MessageList(
                                                                                 let session_id = session_id.clone();
                                                                                 // Mark skill as denied
                                                                                 let mut state = session_state.write();
+                                                                                let mut denied_snapshot: Option<crate::components::chat::Message> = None;
                                                                                 if let Some(session) = state.sessions.get_mut(&session_id) {
                                                                                     if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
                                                                                         if let MessageContent::SkillPermissionRequest(sc) = &msg.content {
@@ -395,8 +428,16 @@ pub fn MessageList(
                                                                                             denied_sc.status = crate::components::shared::SkillCallStatus::Error;
                                                                                             denied_sc.response = "Permission denied by user.".to_string();
                                                                                             msg.content = MessageContent::SkillCall(denied_sc);
+                                                                                            denied_snapshot = Some(msg.clone());
                                                                                         }
                                                                                     }
+                                                                                }
+                                                                                drop(state);
+                                                                                // Denials journal as ToolResult — consistent with the
+                                                                                // approval path: the deny mutates the same message in
+                                                                                // place, and the projector upserts by message id.
+                                                                                if let Some(message) = denied_snapshot {
+                                                                                    crate::session_events::log_event(&session_id, crate::session_events::SessionEvent::ToolResult { message });
                                                                                 }
                                                                                 tracing::info!("Skill permission denied for execution_id: {}", execution_id);
                                                                             }

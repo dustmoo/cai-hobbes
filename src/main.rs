@@ -47,6 +47,7 @@ use secret_manager_generic as secret_manager;
 pub use secret_types::SecretManagerTrait;
 mod services;
 mod session;
+mod session_events;
 mod session_store;
 mod str_utils;
 mod timers;
@@ -1308,14 +1309,24 @@ fn app() -> Element {
                     .values()
                     .any(|s| s.scheduled_timers.iter().any(|t| t.is_due(now)))
                 {
-                    let mut state = session_state.write();
-                    for session in state.sessions.values_mut() {
-                        for t in session.scheduled_timers.iter_mut() {
-                            if t.is_due(now) {
-                                t.status = crate::timers::TimerStatus::Fired;
-                                missed.push(t.label.clone().unwrap_or_else(|| "(timer)".into()));
+                    let mut missed_timers: Vec<crate::timers::ScheduledTimer> = Vec::new();
+                    {
+                        let mut state = session_state.write();
+                        for session in state.sessions.values_mut() {
+                            for t in session.scheduled_timers.iter_mut() {
+                                if t.is_due(now) {
+                                    t.status = crate::timers::TimerStatus::Fired;
+                                    missed.push(t.label.clone().unwrap_or_else(|| "(timer)".into()));
+                                    missed_timers.push(t.clone());
+                                }
                             }
                         }
+                    }
+                    for t in &missed_timers {
+                        crate::session_events::log_event(
+                            &t.session_id,
+                            crate::session_events::SessionEvent::TimerFired { timer: t.clone() },
+                        );
                     }
                 }
                 if !missed.is_empty() {
@@ -1354,6 +1365,12 @@ fn app() -> Element {
                                 }
                             }
                         }
+                    }
+                    for t in &fired {
+                        crate::session_events::log_event(
+                            &t.session_id,
+                            crate::session_events::SessionEvent::TimerFired { timer: t.clone() },
+                        );
                     }
                     crate::session::SessionState::save_async(&session_state.read(), None);
 
@@ -1871,6 +1888,12 @@ fn app() -> Element {
                         }
 
                         if session_changed {
+                            crate::session_events::log_event(
+                                &current_session_id.read().clone(),
+                                crate::session_events::SessionEvent::ComposioProfileSet {
+                                    profile: settings.peek().active_composio_profile.clone(),
+                                },
+                            );
                             SessionState::save_async(&session_state.read(), Some(save_error));
                             mcp_manager.read().invalidate_status_cache();
                         }
@@ -1925,6 +1948,14 @@ fn app() -> Element {
                             // Session-only pin: do NOT update global settings so other
                             // tabs keep their current connector/model unaffected.
                             if session_changed {
+                                crate::session_events::log_event(
+                                    &current_session_id.read().clone(),
+                                    crate::session_events::SessionEvent::ConnectorPinned {
+                                        connector_id: Some(instance.id.clone()),
+                                        provider: Some(format!("{:?}", instance.provider())),
+                                        model: Some(new_model.clone()),
+                                    },
+                                );
                                 SessionState::save_async(&session_state.read(), Some(save_error));
                             }
                         } else {
@@ -1963,6 +1994,14 @@ fn app() -> Element {
                             // other tabs keep their current connector unaffected. Global
                             // changes belong in the Settings panel, not the per-tab picker.
                             if session_changed {
+                                crate::session_events::log_event(
+                                    &current_session_id.read().clone(),
+                                    crate::session_events::SessionEvent::ConnectorPinned {
+                                        connector_id: Some(instance.id.clone()),
+                                        provider: Some(format!("{:?}", instance.provider())),
+                                        model: None,
+                                    },
+                                );
                                 SessionState::save_async(&session_state.read(), Some(save_error));
                             }
                             tracing::info!(
@@ -2052,6 +2091,11 @@ fn app() -> Element {
                     let mut hydrated = session_state.peek().sessions.contains_key(&session_id);
                     if !hydrated {
                         if let Some(session) = crate::session_store::load_session(&session_id) {
+                            // Drift guard (debug builds): compare the stored row
+                            // against its journal projection; warn on divergence,
+                            // never block hydration.
+                            #[cfg(debug_assertions)]
+                            crate::session_events::debug_check_drift(&session);
                             session_state
                                 .write()
                                 .sessions

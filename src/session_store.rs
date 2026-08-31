@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::session::Session;
+use crate::session_events::SessionEvent;
 
 static CONN: OnceLock<Mutex<Connection>> = OnceLock::new();
 static FINGERPRINTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
@@ -72,13 +73,21 @@ fn seed_seq_from_db(conn: &Connection) {
     let meta_max: i64 = conn
         .query_row("SELECT COALESCE(MAX(seq), 0) FROM meta", [], |r| r.get(0))
         .unwrap_or(0);
-    // The planner's and fleet's tables share this counter — omitting either
-    // would restart the seq below their existing rows and silently reject
-    // every subsequent write in that domain.
+    // The planner's, fleet's, and session-journal's tables share this counter —
+    // omitting any of them would restart the seq below their existing rows and
+    // silently reject every subsequent write in that domain.
     let todo_max = crate::todo::store::max_seq(conn);
     let fleet_max = crate::fleet::store::max_seq(conn);
+    let events_max: i64 = conn
+        .query_row("SELECT COALESCE(MAX(seq), 0) FROM session_events", [], |r| r.get(0))
+        .unwrap_or(0);
     SEQ.fetch_max(
-        sessions_max.max(meta_max).max(todo_max).max(fleet_max) + 1,
+        sessions_max
+            .max(meta_max)
+            .max(todo_max)
+            .max(fleet_max)
+            .max(events_max)
+            + 1,
         Ordering::SeqCst,
     );
 }
@@ -122,6 +131,14 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL,
              seq   INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS session_events (
+             session_id TEXT NOT NULL,
+             seq        INTEGER NOT NULL,
+             ts         TEXT NOT NULL,
+             kind       TEXT NOT NULL,
+             payload    TEXT NOT NULL,
+             PRIMARY KEY (session_id, seq)
          );",
     )?;
 
@@ -581,24 +598,26 @@ pub fn most_recent_session_id() -> Option<String> {
 }
 
 /// Delete a session row, returning its (total_cost, total_tokens) for
-/// harvesting into the lifetime counters.
+/// harvesting into the lifetime counters. Also deletes the session's
+/// event journal — events must not outlive their session.
 pub fn delete_session(id: &str) -> Option<(f64, i64)> {
     forget_fingerprint(id);
     tombstones().lock().unwrap().insert(id.to_string(), next_seq());
-    with_conn(|conn| {
-        use rusqlite::OptionalExtension;
-        let harvest: Option<(f64, i64)> = conn
-            .query_row(
-                "SELECT total_cost, total_tokens FROM sessions WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
-        Ok(harvest)
-    })
-    .ok()
-    .flatten()
+    with_conn(|conn| delete_session_conn(conn, id)).ok().flatten()
+}
+
+fn delete_session_conn(conn: &Connection, id: &str) -> rusqlite::Result<Option<(f64, i64)>> {
+    use rusqlite::OptionalExtension;
+    let harvest: Option<(f64, i64)> = conn
+        .query_row(
+            "SELECT total_cost, total_tokens FROM sessions WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+    conn.execute("DELETE FROM session_events WHERE session_id = ?1", params![id])?;
+    Ok(harvest)
 }
 
 /// Rename a session directly in the DB (for sessions not hydrated in memory).
@@ -771,6 +790,284 @@ pub fn insert_if_absent(session: &Session) -> bool {
     with_conn(|conn| upsert_row(conn, &row)).is_ok()
 }
 
+// ── Session event journal (append-only, Phase 1: write-only) ───────────────
+
+/// A serialized event ready for insertion. Built on the calling thread
+/// (P-009); only these owned buffers move to the background writer.
+pub struct SessionEventRow {
+    pub session_id: String,
+    pub seq: i64,
+    pub ts: String,
+    pub kind: String,
+    pub payload: String,
+}
+
+/// An event read back from the journal.
+#[derive(Debug, Clone)]
+pub struct LoadedSessionEvent {
+    pub seq: i64,
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub event: SessionEvent,
+}
+
+/// Serialize events into rows on the calling thread. Seqs come from the same
+/// process-wide counter as session/meta writes, so journal order interleaves
+/// correctly with row saves. The row `ts` is captured here, at append time —
+/// replay never needs a clock.
+pub fn prepare_event_rows(session_id: &str, events: &[SessionEvent]) -> Vec<SessionEventRow> {
+    let ts = fmt_ts(&chrono::Utc::now());
+    events
+        .iter()
+        .filter_map(|event| match serde_json::to_string(event) {
+            Ok(payload) => Some(SessionEventRow {
+                session_id: session_id.to_string(),
+                seq: next_seq(),
+                ts: ts.clone(),
+                kind: event.kind().to_string(),
+                payload,
+            }),
+            Err(e) => {
+                tracing::error!("session_events: failed to serialize {} event: {e}", event.kind());
+                None
+            }
+        })
+        .collect()
+}
+
+fn insert_event_rows_conn(conn: &Connection, rows: &[SessionEventRow]) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR IGNORE INTO session_events (session_id, seq, ts, kind, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for row in rows {
+            stmt.execute(params![row.session_id, row.seq, row.ts, row.kind, row.payload])?;
+        }
+    }
+    tx.commit()
+}
+
+/// Write prepared event rows. Called on a blocking thread by `append_events`,
+/// or directly by non-async callers.
+pub fn write_event_rows(rows: &[SessionEventRow]) -> Result<(), String> {
+    with_conn(|conn| insert_event_rows_conn(conn, rows))
+}
+
+/// Append events to a session's journal (batch-friendly; a turn can produce
+/// several). Serializes on the calling thread, then moves only the prepared
+/// rows to a background blocking task — or writes inline when no tokio
+/// runtime is available (tests, non-async callers). Failures are logged and
+/// swallowed: the journal is dual-write-only in this phase and must never
+/// affect app behavior.
+pub fn append_events(session_id: &str, events: Vec<SessionEvent>) {
+    if events.is_empty() {
+        return;
+    }
+    if CONN.get().is_none() {
+        tracing::debug!("session_events: store not initialized, dropping {} event(s)", events.len());
+        return;
+    }
+    let rows = prepare_event_rows(session_id, &events);
+    if rows.is_empty() {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || write_event_rows(&rows)).await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::error!("session_events: append failed: {e}"),
+                    Err(e) => tracing::error!("session_events: append task panicked: {e}"),
+                }
+            });
+        }
+        Err(_) => {
+            if let Err(e) = write_event_rows(&rows) {
+                tracing::error!("session_events: append failed: {e}");
+            }
+        }
+    }
+}
+
+fn load_events_conn(
+    conn: &Connection,
+    session_id: &str,
+    after_seq: i64,
+) -> rusqlite::Result<Vec<LoadedSessionEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, ts, kind, payload FROM session_events
+         WHERE session_id = ?1 AND seq > ?2 ORDER BY seq",
+    )?;
+    let mut rows = stmt.query(params![session_id, after_seq])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let seq: i64 = row.get(0)?;
+        let ts_str: String = row.get(1)?;
+        let kind: String = row.get(2)?;
+        let payload: String = row.get(3)?;
+        // Version tolerance: rows are deserialized individually. A kind this
+        // build doesn't know (written by a newer version) — or a corrupt
+        // payload — is skipped with a warning, never fails the whole read.
+        let event = match serde_json::from_str::<SessionEvent>(&payload) {
+            Ok(ev) => ev,
+            Err(e) => {
+                tracing::warn!(
+                    "session_events: skipping unreadable event (session={session_id}, seq={seq}, kind={kind}): {e}"
+                );
+                continue;
+            }
+        };
+        let ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .unwrap_or_default();
+        out.push(LoadedSessionEvent { seq, ts, event });
+    }
+    Ok(out)
+}
+
+/// Read a session's journal in seq order, skipping unknown kinds.
+/// `after_seq = 0` reads from the beginning.
+pub fn load_events(session_id: &str, after_seq: i64) -> Vec<LoadedSessionEvent> {
+    with_conn(|conn| load_events_conn(conn, session_id, after_seq)).unwrap_or_else(|e| {
+        tracing::error!("session_events: load failed for {session_id}: {e}");
+        Vec::new()
+    })
+}
+
+/// The seq of the earliest journaled event referencing a message id — the
+/// rewind anchor for `RewoundTo`. Substring match on the payload is exact
+/// enough: message ids are UUIDs.
+pub fn first_event_seq_for_message(session_id: &str, message_id: &str) -> Option<i64> {
+    with_conn(|conn| {
+        conn.query_row(
+            "SELECT MIN(seq) FROM session_events WHERE session_id = ?1 AND payload LIKE ?2",
+            params![session_id, format!("%{message_id}%")],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+    })
+    .ok()
+    .flatten()
+}
+
+/// A session is "journal-complete" iff its journal starts with a
+/// `SessionCreated` event — only then can it be rebuilt from nothing via
+/// `session_events::project(None, …)`. Pre-journal sessions (created before
+/// the birth event existed) fail this and keep the legacy code paths.
+pub fn journal_starts_with_creation(session_id: &str) -> bool {
+    with_conn(|conn| journal_starts_with_creation_conn(conn, session_id))
+        .unwrap_or(false)
+}
+
+fn journal_starts_with_creation_conn(conn: &Connection, session_id: &str) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension;
+    let first_kind: Option<String> = conn
+        .query_row(
+            "SELECT kind FROM session_events WHERE session_id = ?1 ORDER BY seq LIMIT 1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(first_kind.as_deref() == Some("SessionCreated"))
+}
+
+/// Fork a journal-complete session's history (Phase 2, Part D).
+///
+/// Copies `source_id`'s events with seq ≤ `at_seq` (inclusive; `None` = all)
+/// into `new_id` with NEW seqs from the shared counter, rewriting the copied
+/// `SessionCreated` to the new identity and appending a `SessionForked`
+/// provenance marker. Row timestamps are preserved from the source rows (the
+/// marker gets append-time now). Returns the new journal (with its new seqs)
+/// so the caller can `project()` it without a read-back.
+///
+/// Errors when the source journal is empty or does not start with
+/// `SessionCreated` (pre-journal session).
+pub fn fork_events(
+    source_id: &str,
+    at_seq: Option<i64>,
+    new_id: &str,
+    new_name: &str,
+) -> Result<Vec<LoadedSessionEvent>, String> {
+    with_conn(|conn| fork_events_conn(conn, source_id, at_seq, new_id, new_name))?
+}
+
+fn fork_events_conn(
+    conn: &Connection,
+    source_id: &str,
+    at_seq: Option<i64>,
+    new_id: &str,
+    new_name: &str,
+) -> rusqlite::Result<Result<Vec<LoadedSessionEvent>, String>> {
+    let mut source = load_events_conn(conn, source_id, 0)?;
+    if let Some(cut) = at_seq {
+        source.retain(|e| e.seq <= cut);
+    }
+
+    match source.first() {
+        Some(first) if matches!(first.event, SessionEvent::SessionCreated { .. }) => {}
+        _ => {
+            return Ok(Err(format!(
+                "Session '{source_id}' predates the event journal (no SessionCreated) — fork unavailable."
+            )));
+        }
+    }
+
+    let last_copied_seq = source.last().map(|e| e.seq).unwrap_or(0);
+    let last_ts = source.last().map(|e| e.ts).unwrap_or_default();
+    let had_rename = source
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::SessionRenamed { .. }));
+
+    // Rewrite the birth event to the fork's identity.
+    if let Some(first) = source.first_mut() {
+        first.event = SessionEvent::SessionCreated {
+            id: new_id.to_string(),
+            name: new_name.to_string(),
+        };
+    }
+    // A later copied SessionRenamed would clobber the fork's name on replay —
+    // re-assert it when the prefix contains one.
+    if had_rename {
+        source.push(LoadedSessionEvent {
+            seq: 0, // rewritten below
+            ts: last_ts,
+            event: SessionEvent::SessionRenamed { name: new_name.to_string() },
+        });
+    }
+    // Provenance marker, timestamped at fork time.
+    source.push(LoadedSessionEvent {
+        seq: 0, // rewritten below
+        ts: chrono::Utc::now(),
+        event: SessionEvent::SessionForked {
+            from_session_id: source_id.to_string(),
+            at_seq: at_seq.unwrap_or(last_copied_seq),
+        },
+    });
+
+    // Mint new seqs from the shared counter and insert under the new id,
+    // preserving each row's original timestamp.
+    let mut rows = Vec::with_capacity(source.len());
+    for loaded in source.iter_mut() {
+        loaded.seq = next_seq();
+        match serde_json::to_string(&loaded.event) {
+            Ok(payload) => rows.push(SessionEventRow {
+                session_id: new_id.to_string(),
+                seq: loaded.seq,
+                ts: fmt_ts(&loaded.ts),
+                kind: loaded.event.kind().to_string(),
+                payload,
+            }),
+            Err(e) => tracing::error!(
+                "fork_events: failed to serialize {} event: {e}",
+                loaded.event.kind()
+            ),
+        }
+    }
+    insert_event_rows_conn(conn, &rows)?;
+    Ok(Ok(source))
+}
+
 // ── Test support ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -840,5 +1137,269 @@ pub mod test_support {
         conn.query_row("SELECT data FROM sessions WHERE id = ?1", params![id], |r| r.get(0))
             .optional()
             .unwrap()
+    }
+
+    // ── Event journal test helpers (conn-parameterized) ─────────────────────
+
+    pub fn append_events_conn(conn: &Connection, session_id: &str, events: &[SessionEvent]) {
+        let rows = prepare_event_rows(session_id, events);
+        insert_event_rows_conn(conn, &rows).unwrap();
+    }
+
+    pub fn load_events_for_test(
+        conn: &Connection,
+        session_id: &str,
+        after_seq: i64,
+    ) -> Vec<LoadedSessionEvent> {
+        load_events_conn(conn, session_id, after_seq).unwrap()
+    }
+
+    /// Insert a raw journal row directly (e.g. an unknown future kind).
+    pub fn insert_raw_event(conn: &Connection, session_id: &str, kind: &str, payload: &str) {
+        insert_raw_event_with_seq(conn, session_id, next_seq(), kind, payload);
+    }
+
+    pub fn insert_raw_event_with_seq(
+        conn: &Connection,
+        session_id: &str,
+        seq: i64,
+        kind: &str,
+        payload: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO session_events (session_id, seq, ts, kind, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, seq, fmt_ts(&chrono::Utc::now()), kind, payload],
+        )
+        .unwrap();
+    }
+
+    pub fn event_count(conn: &Connection, session_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    pub fn delete_session_for_test(conn: &Connection, id: &str) -> Option<(f64, i64)> {
+        delete_session_conn(conn, id).unwrap()
+    }
+
+    pub fn fork_events_for_test(
+        conn: &Connection,
+        source_id: &str,
+        at_seq: Option<i64>,
+        new_id: &str,
+        new_name: &str,
+    ) -> Result<Vec<LoadedSessionEvent>, String> {
+        fork_events_conn(conn, source_id, at_seq, new_id, new_name).unwrap()
+    }
+
+    pub fn journal_complete_for_test(conn: &Connection, session_id: &str) -> bool {
+        journal_starts_with_creation_conn(conn, session_id).unwrap()
+    }
+}
+
+// ── Event journal tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod event_tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::components::chat::Message;
+    use crate::components::shared::MessageContent;
+    use crate::timers::{ScheduledTimer, TimerMode, TimerStatus};
+
+    fn text_message(author: &str, content: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4(),
+            author: author.to_string(),
+            content: MessageContent::Text {
+                content: content.to_string(),
+                thought_signature: None,
+                thought_summary: None,
+            },
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            created_at: chrono::Utc::now(),
+            usage: None,
+        }
+    }
+
+    fn tool_call_message(status: crate::components::shared::ToolCallStatus) -> Message {
+        let mut tc = crate::components::shared::ToolCall::new(
+            "server".to_string(),
+            "TOOL_NAME".to_string(),
+            serde_json::json!({"arg": 1}),
+            None,
+            None,
+        );
+        tc.status = status;
+        Message {
+            id: uuid::Uuid::new_v4(),
+            author: "Hobbes".to_string(),
+            content: MessageContent::ToolCall(tc),
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            created_at: chrono::Utc::now(),
+            usage: None,
+        }
+    }
+
+    fn timer(id: &str, session_id: &str) -> ScheduledTimer {
+        let now = chrono::Utc::now();
+        ScheduledTimer {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            created_at: now,
+            fire_at: now + chrono::Duration::seconds(60),
+            mode: TimerMode::Notify,
+            label: Some("test".to_string()),
+            prompt: None,
+            status: TimerStatus::Pending,
+        }
+    }
+
+    /// Every variant survives an append → load round-trip, in order.
+    #[test]
+    fn test_event_roundtrip_all_variants() {
+        let events = vec![
+            SessionEvent::UserMessage { message: text_message("User", "hi") },
+            SessionEvent::AssistantMessage { message: text_message("Hobbes", "hello") },
+            SessionEvent::ToolCall {
+                message: tool_call_message(crate::components::shared::ToolCallStatus::Running),
+            },
+            SessionEvent::ToolResult {
+                message: tool_call_message(crate::components::shared::ToolCallStatus::Completed),
+            },
+            SessionEvent::ScratchpadSet { content: "notes".to_string() },
+            SessionEvent::SkillLoaded {
+                name: "my-skill".to_string(),
+                payload: "{\"skill\":\"my-skill\"}".to_string(),
+            },
+            SessionEvent::SkillUnloaded { name: "my-skill".to_string() },
+            SessionEvent::SummaryComputed {
+                summary: serde_json::json!({"summary": "we talked", "sentiment": "good"}),
+            },
+            SessionEvent::TimerCreated { timer: timer("tmr_1", "s1") },
+            SessionEvent::TimerCancelled { timer_id: "tmr_1".to_string() },
+            SessionEvent::TimerFired { timer: timer("tmr_2", "s1") },
+            SessionEvent::ConnectorPinned {
+                connector_id: Some("conn-1".to_string()),
+                provider: Some("Gemini".to_string()),
+                model: Some("gemini-pro".to_string()),
+            },
+            SessionEvent::SessionRenamed { name: "New Name".to_string() },
+            SessionEvent::RewoundTo { seq: 7, message_id: "abc".to_string() },
+        ];
+
+        with_test_db(|conn| {
+            append_events_conn(conn, "s1", &events);
+            let loaded = load_events_for_test(conn, "s1", 0);
+            assert_eq!(loaded.len(), events.len());
+            for (got, want) in loaded.iter().zip(events.iter()) {
+                assert_eq!(&got.event, want);
+            }
+            // seqs strictly ascending
+            for pair in loaded.windows(2) {
+                assert!(pair[0].seq < pair[1].seq);
+            }
+            // after_seq filters
+            let after = load_events_for_test(conn, "s1", loaded[2].seq);
+            assert_eq!(after.len(), events.len() - 3);
+            assert_eq!(after[0].event, events[3]);
+        });
+    }
+
+    /// Seqs come from the shared process-wide counter: interleaved appends to
+    /// two sessions still order globally by append time.
+    #[test]
+    fn test_event_seq_monotonic_across_sessions() {
+        with_test_db(|conn| {
+            append_events_conn(conn, "a", &[SessionEvent::SessionRenamed { name: "1".into() }]);
+            append_events_conn(conn, "b", &[SessionEvent::SessionRenamed { name: "2".into() }]);
+            append_events_conn(conn, "a", &[SessionEvent::SessionRenamed { name: "3".into() }]);
+
+            let a = load_events_for_test(conn, "a", 0);
+            let b = load_events_for_test(conn, "b", 0);
+            assert_eq!(a.len(), 2);
+            assert_eq!(b.len(), 1);
+            assert!(a[0].seq < b[0].seq, "first a before b");
+            assert!(b[0].seq < a[1].seq, "b before second a");
+        });
+    }
+
+    /// A row whose kind this build doesn't know is skipped, not fatal — and
+    /// rows around it still load.
+    #[test]
+    fn test_unknown_kind_row_is_skipped() {
+        with_test_db(|conn| {
+            append_events_conn(conn, "s1", &[SessionEvent::ScratchpadSet { content: "a".into() }]);
+            insert_raw_event(
+                conn,
+                "s1",
+                "TeleportedFromTheFuture",
+                r#"{"kind":"TeleportedFromTheFuture","wormhole":true}"#,
+            );
+            append_events_conn(conn, "s1", &[SessionEvent::ScratchpadSet { content: "b".into() }]);
+
+            assert_eq!(event_count(conn, "s1"), 3);
+            let loaded = load_events_for_test(conn, "s1", 0);
+            assert_eq!(loaded.len(), 2, "unknown kind skipped, not fatal");
+            assert_eq!(
+                loaded[0].event,
+                SessionEvent::ScratchpadSet { content: "a".into() }
+            );
+            assert_eq!(
+                loaded[1].event,
+                SessionEvent::ScratchpadSet { content: "b".into() }
+            );
+        });
+    }
+
+    /// Deleting a session deletes its journal too.
+    #[test]
+    fn test_delete_session_removes_events() {
+        with_test_db(|conn| {
+            let mut state = crate::session::SessionState::default();
+            let sid = state.create_session_raw(None);
+            upsert(conn, state.sessions.get(&sid).unwrap());
+            // A second session that must keep its events.
+            let other = state.create_session_raw(None);
+            upsert(conn, state.sessions.get(&other).unwrap());
+
+            append_events_conn(conn, &sid, &[SessionEvent::ScratchpadSet { content: "x".into() }]);
+            append_events_conn(conn, &other, &[SessionEvent::ScratchpadSet { content: "y".into() }]);
+            assert_eq!(event_count(conn, &sid), 1);
+
+            delete_session_for_test(conn, &sid);
+            assert_eq!(event_count(conn, &sid), 0, "deleted session's events removed");
+            assert_eq!(event_count(conn, &other), 1, "other session's events survive");
+            assert!(get_row_name(conn, &sid).is_none());
+        });
+    }
+
+    /// seed_seq must account for the events table's high-water mark, or a
+    /// fresh process would mint seqs below already-journaled rows.
+    #[test]
+    fn test_seed_seq_accounts_for_events_high_water() {
+        with_test_db(|conn| {
+            let high = next_seq() + 100_000;
+            insert_raw_event_with_seq(
+                conn,
+                "s1",
+                high,
+                "ScratchpadSet",
+                r#"{"kind":"ScratchpadSet","content":"from a longer-lived process"}"#,
+            );
+            seed_seq(conn);
+            let fresh = next_seq();
+            assert!(
+                fresh > high,
+                "seq counter must clear the events high-water mark (got {fresh}, high {high})"
+            );
+        });
     }
 }

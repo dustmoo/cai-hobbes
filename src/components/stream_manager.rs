@@ -6,6 +6,7 @@ use crate::components::shared::{StreamMessage, ToolCallStatus};
 
 use crate::services::tool_call_summarizer::ToolCallSummarizer;
 use crate::session::SessionState;
+use crate::session_events::{log_event, SessionEvent};
 use crate::settings::Settings;
 use dioxus::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -389,33 +390,42 @@ impl StreamManagerContext {
 
                         // Save error message to session
                         {
-                            let mut state = self.session_state.write();
-                            if is_first_message {
-                                // Update the placeholder message with the error
-                                if let Some(msg) =
-                                    state.get_message_mut_in_session(&session_id, &message_id)
-                                {
-                                    msg.content =
-                                        crate::components::shared::MessageContent::Error {
-                                            message: error_msg.clone(),
+                            let mut error_snapshot: Option<crate::components::chat::Message> = None;
+                            {
+                                let mut state = self.session_state.write();
+                                if is_first_message {
+                                    // Update the placeholder message with the error
+                                    if let Some(msg) =
+                                        state.get_message_mut_in_session(&session_id, &message_id)
+                                    {
+                                        msg.content =
+                                            crate::components::shared::MessageContent::Error {
+                                                message: error_msg.clone(),
+                                            };
+                                        error_snapshot = Some(msg.clone());
+                                    }
+                                } else {
+                                    // Create a new error message
+                                    let new_id = Uuid::new_v4();
+                                    if let Some(session) = state.sessions.get_mut(&session_id) {
+                                        let message = crate::components::chat::Message {
+                                            id: new_id,
+                                            author: "Hobbes".to_string(),
+                                            content: crate::components::shared::MessageContent::Error {
+                                                message: error_msg.clone(),
+                                            },
+                                            attachments: Vec::new(),
+                                            comments: Vec::new(),
+                                            created_at: chrono::Utc::now(),
+                                            usage: None,
                                         };
+                                        error_snapshot = Some(message.clone());
+                                        session.messages.push(message);
+                                    }
                                 }
-                            } else {
-                                // Create a new error message
-                                let new_id = Uuid::new_v4();
-                                if let Some(session) = state.sessions.get_mut(&session_id) {
-                                    session.messages.push(crate::components::chat::Message {
-                                        id: new_id,
-                                        author: "Hobbes".to_string(),
-                                        content: crate::components::shared::MessageContent::Error {
-                                            message: error_msg.clone(),
-                                        },
-                                        attachments: Vec::new(),
-                                        comments: Vec::new(),
-                                        created_at: chrono::Utc::now(),
-                                        usage: None,
-                                    });
-                                }
+                            }
+                            if let Some(message) = error_snapshot {
+                                log_event(&session_id, SessionEvent::AssistantMessage { message });
                             }
                         }
 
@@ -488,6 +498,7 @@ impl StreamManagerContext {
                         }
 
                         tool_call_count += 1;
+                        let mut tool_call_snapshot: Option<crate::components::chat::Message> = None;
                         let tool_call_message_id = {
                             let mut state = self.session_state.write();
                             // Message Upgrading: Only the FIRST tool call upgrades the
@@ -502,12 +513,13 @@ impl StreamManagerContext {
                                         crate::components::shared::MessageContent::ToolCall(
                                             tool_call.clone(),
                                         );
+                                    tool_call_snapshot = Some(msg.clone());
                                 }
                                 message_id
                             } else {
                                 let new_id = Uuid::new_v4();
                                 if let Some(session) = state.sessions.get_mut(&session_id) {
-                                    session.messages.push(crate::components::chat::Message {
+                                    let message = crate::components::chat::Message {
                                         id: new_id,
                                         author: "Hobbes".to_string(),
                                         content:
@@ -518,13 +530,18 @@ impl StreamManagerContext {
                                         comments: Vec::new(),
                                         created_at: chrono::Utc::now(),
                                         usage: None,
-                                    });
+                                    };
+                                    tool_call_snapshot = Some(message.clone());
+                                    session.messages.push(message);
                                 }
                                 new_id
                             }
                         };
                         // Notify the scroll effect: a tool-call card just appeared.
                         *self.stream_activity.write() += 1;
+                        if let Some(message) = tool_call_snapshot {
+                            log_event(&session_id, SessionEvent::ToolCall { message });
+                        }
 
                         let mcp_manager = self.mcp_manager;
                         let mut session_state = self.session_state;
@@ -567,14 +584,21 @@ impl StreamManagerContext {
                                 } = outcome;
 
                                 {
-                                    let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
-                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
-                                            tc.status = status;
-                                            tc.response = response.clone();
+                                    let mut result_snapshot: Option<crate::components::chat::Message> = None;
+                                    {
+                                        let mut state = session_state.write();
+                                        if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
+                                            if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                                                tc.status = status;
+                                                tc.response = response.clone();
+                                            }
+                                            result_snapshot = Some(msg.clone());
                                         }
+                                        state.touch_session(&session_id_inner);
                                     }
-                                    state.touch_session(&session_id_inner);
+                                    if let Some(message) = result_snapshot {
+                                        log_event(&session_id_inner, SessionEvent::ToolResult { message });
+                                    }
                                 }
                                 // Notify the scroll effect: the card's status/response changed size.
                                 *self.stream_activity.write() += 1;
@@ -773,6 +797,7 @@ impl StreamManagerContext {
 
                             let mut state = session_state.write();
 
+                            let mut result_snapshot: Option<crate::components::chat::Message> = None;
                             if let Some(msg) = state.get_message_mut_in_session(
                                 &session_id_inner,
                                 &tool_call_message_id,
@@ -795,12 +820,16 @@ impl StreamManagerContext {
                                     if image_path.is_some() {
                                         tc.cached_image_path = image_path.clone();
                                     }
+                                    result_snapshot = Some(msg.clone());
                                 }
                             }
                             drop(state);
                             // Notify the scroll effect: the card's status/response changed size
                             // (or it became a PermissionRequest prompt).
                             *self.stream_activity.write() += 1;
+                            if let Some(message) = result_snapshot {
+                                log_event(&session_id_inner, SessionEvent::ToolResult { message });
+                            }
 
                             if !is_permission_request {
                                 let record = crate::components::shared::ToolCallRecord {
@@ -857,18 +886,25 @@ impl StreamManagerContext {
             }
 
             if !final_text_for_this_turn.trim().is_empty() {
-                let mut state = self.session_state.write();
-                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
-                    if let crate::components::shared::MessageContent::Text {
-                        content,
-                        thought_signature,
-                        thought_summary,
-                    } = &mut msg.content
-                    {
-                        *content = final_text_for_this_turn.clone();
-                        *thought_signature = thought_signature_for_this_turn.clone();
-                        *thought_summary = thought_summary_for_this_turn.clone();
+                let mut final_snapshot: Option<crate::components::chat::Message> = None;
+                {
+                    let mut state = self.session_state.write();
+                    if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
+                        if let crate::components::shared::MessageContent::Text {
+                            content,
+                            thought_signature,
+                            thought_summary,
+                        } = &mut msg.content
+                        {
+                            *content = final_text_for_this_turn.clone();
+                            *thought_signature = thought_signature_for_this_turn.clone();
+                            *thought_summary = thought_summary_for_this_turn.clone();
+                            final_snapshot = Some(msg.clone());
+                        }
                     }
+                }
+                if let Some(message) = final_snapshot {
+                    log_event(&session_id, SessionEvent::AssistantMessage { message });
                 }
             } else if tool_call_count == 0 && thought_summary_for_this_turn.is_some() {
                 // No meaningful text content, no tool calls, but thinking WAS produced.
@@ -877,20 +913,27 @@ impl StreamManagerContext {
                 // Promote the thinking content to be the visible response text so the
                 // user sees the analysis directly instead of a hidden "Thinking Process."
                 let promoted_text = thought_summary_for_this_turn.clone().unwrap_or_default();
-                let mut state = self.session_state.write();
-                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
-                    if let crate::components::shared::MessageContent::Text {
-                        content,
-                        thought_signature,
-                        thought_summary,
-                    } = &mut msg.content
-                    {
-                        *content = promoted_text.clone();
-                        *thought_signature = thought_signature_for_this_turn.clone();
-                        // Clear thought_summary since we promoted it to content —
-                        // no need to show it twice under "Thinking Process"
-                        *thought_summary = None;
+                let mut final_snapshot: Option<crate::components::chat::Message> = None;
+                {
+                    let mut state = self.session_state.write();
+                    if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
+                        if let crate::components::shared::MessageContent::Text {
+                            content,
+                            thought_signature,
+                            thought_summary,
+                        } = &mut msg.content
+                        {
+                            *content = promoted_text.clone();
+                            *thought_signature = thought_signature_for_this_turn.clone();
+                            // Clear thought_summary since we promoted it to content —
+                            // no need to show it twice under "Thinking Process"
+                            *thought_summary = None;
+                            final_snapshot = Some(msg.clone());
+                        }
                     }
+                }
+                if let Some(message) = final_snapshot {
+                    log_event(&session_id, SessionEvent::AssistantMessage { message });
                 }
                 // Also forward to UI so the bubble renders
                 let _ = stream_tx.send(StreamMessage::Text {
@@ -904,13 +947,20 @@ impl StreamManagerContext {
                 // Surface this to the user instead of going blank (loud failure).
                 tracing::warn!("Model returned empty response — no text, thinking, or tool calls.");
                 let empty_msg = "⚠️ The model returned an empty response. This can happen when the context is too large or the model doesn't understand the instructions. Try sending your message again or switching to a different model.";
-                let mut state = self.session_state.write();
-                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
-                    if let crate::components::shared::MessageContent::Text { content, .. } =
-                        &mut msg.content
-                    {
-                        *content = empty_msg.to_string();
+                let mut final_snapshot: Option<crate::components::chat::Message> = None;
+                {
+                    let mut state = self.session_state.write();
+                    if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
+                        if let crate::components::shared::MessageContent::Text { content, .. } =
+                            &mut msg.content
+                        {
+                            *content = empty_msg.to_string();
+                            final_snapshot = Some(msg.clone());
+                        }
                     }
+                }
+                if let Some(message) = final_snapshot {
+                    log_event(&session_id, SessionEvent::AssistantMessage { message });
                 }
                 let _ = stream_tx.send(StreamMessage::Text {
                     content: empty_msg.to_string(),
@@ -1090,10 +1140,18 @@ impl StreamManagerContext {
                                             Ok(summary_json) => {
                                                 if let Ok(summary) = serde_json::from_value::<crate::session::ConversationSummary>(summary_json) {
                                                     tracing::info!(session_id = %session_id_clone, "Proactive summary updated (background)");
-                                                    let mut state = session_state.write();
-                                                    if let Some(session) = state.sessions.get_mut(&session_id_clone) {
-                                                        session.active_context.conversation_summary = summary;
+                                                    let summary_value = serde_json::to_value(&summary)
+                                                        .unwrap_or(serde_json::Value::Null);
+                                                    {
+                                                        let mut state = session_state.write();
+                                                        if let Some(session) = state.sessions.get_mut(&session_id_clone) {
+                                                            session.active_context.conversation_summary = summary;
+                                                        }
                                                     }
+                                                    log_event(
+                                                        &session_id_clone,
+                                                        SessionEvent::SummaryComputed { summary: summary_value },
+                                                    );
                                                 }
                                             }
                                             Err(e) => tracing::warn!(session_id = %session_id_clone, "Proactive summarization failed: {}", e),
@@ -1119,22 +1177,26 @@ impl StreamManagerContext {
                         "Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.",
                         max_turns
                     );
-                    let mut state = self.session_state.write();
-                    if let Some(session) = state.sessions.get_mut(&session_id) {
-                        session.messages.push(crate::components::chat::Message {
-                            id: Uuid::new_v4(),
-                            author: "Hobbes".to_string(),
-                            content: crate::components::shared::MessageContent::Text {
-                                content: warning_msg,
-                                thought_signature: None,
-                                thought_summary: None,
-                            },
-                            attachments: Vec::new(),
-                            comments: Vec::new(),
-                            created_at: chrono::Utc::now(),
-                            usage: None,
-                        });
+                    let warning_message = crate::components::chat::Message {
+                        id: Uuid::new_v4(),
+                        author: "Hobbes".to_string(),
+                        content: crate::components::shared::MessageContent::Text {
+                            content: warning_msg,
+                            thought_signature: None,
+                            thought_summary: None,
+                        },
+                        attachments: Vec::new(),
+                        comments: Vec::new(),
+                        created_at: chrono::Utc::now(),
+                        usage: None,
+                    };
+                    {
+                        let mut state = self.session_state.write();
+                        if let Some(session) = state.sessions.get_mut(&session_id) {
+                            session.messages.push(warning_message.clone());
+                        }
                     }
+                    log_event(&session_id, SessionEvent::AssistantMessage { message: warning_message });
                     return; // Stop — user must send a message to reset and continue.
                 }
 
@@ -1172,24 +1234,28 @@ impl StreamManagerContext {
                              The connection to the model was interrupted. Please continue where you left off and complete the task.".to_string();
 
                         {
-                            let mut state = self.session_state.write();
-                            if let Some(session) = state.sessions.get_mut(&session_id) {
-                                session.watch_word_recovery_count += 1;
-                                session.messages.push(crate::components::chat::Message {
-                                    id: Uuid::new_v4(),
-                                    author: "User".to_string(),
-                                    content: crate::components::shared::MessageContent::Text {
-                                        content: recovery_text,
-                                        thought_signature: None,
-                                        thought_summary: None,
-                                    },
-                                    attachments: Vec::new(),
-                                    comments: Vec::new(),
-                                    created_at: chrono::Utc::now(),
-                                    usage: None,
-                                });
-                                session.increment_turn_count();
+                            let recovery_message = crate::components::chat::Message {
+                                id: Uuid::new_v4(),
+                                author: "User".to_string(),
+                                content: crate::components::shared::MessageContent::Text {
+                                    content: recovery_text,
+                                    thought_signature: None,
+                                    thought_summary: None,
+                                },
+                                attachments: Vec::new(),
+                                comments: Vec::new(),
+                                created_at: chrono::Utc::now(),
+                                usage: None,
+                            };
+                            {
+                                let mut state = self.session_state.write();
+                                if let Some(session) = state.sessions.get_mut(&session_id) {
+                                    session.watch_word_recovery_count += 1;
+                                    session.messages.push(recovery_message.clone());
+                                    session.increment_turn_count();
+                                }
                             }
+                            log_event(&session_id, SessionEvent::UserMessage { message: recovery_message });
                         }
 
                         // Check turn limit before triggering continuation
@@ -1513,7 +1579,7 @@ impl StreamManagerContext {
         //    The model may have already produced useful text/thinking content
         //    that the user wants to keep. Only remove orphaned Running tool
         //    call messages (they have no results and break the next prompt).
-        {
+        let (partial_message, removed_message_ids) = {
             let mut state = self.session_state.write();
 
             // Check if the AI message has any content worth preserving.
@@ -1530,18 +1596,34 @@ impl StreamManagerContext {
 
             if !has_content {
                 // No content was generated — remove the empty placeholder.
+                // (Never journaled: streaming placeholders don't hit the log.)
                 state.remove_message_in_session(session_id, message_id);
             }
 
-            // Trim trailing orphaned Running tool calls
+            // Snapshot the preserved partial for the journal — end-of-turn
+            // finalization will never run for this turn, so StreamCancelled is
+            // the only event carrying the partial text.
+            let partial_message = if has_content {
+                state
+                    .sessions
+                    .get(session_id)
+                    .and_then(|s| s.messages.iter().find(|m| m.id == *message_id))
+                    .cloned()
+            } else {
+                None
+            };
+
+            // Trim trailing orphaned Running tool calls. Their ToolCall events
+            // WERE journaled at dispatch — record the removals so replay drops
+            // them too.
+            let mut removed_message_ids: Vec<Uuid> = Vec::new();
             if let Some(session) = state.sessions.get_mut(session_id) {
-                let mut removed_count = 0;
                 while let Some(last) = session.messages.last() {
                     if let crate::components::shared::MessageContent::ToolCall(tc) = &last.content {
                         if tc.status == crate::components::shared::ToolCallStatus::Running {
                             let orphan_id = last.id;
                             session.messages.pop();
-                            removed_count += 1;
+                            removed_message_ids.push(orphan_id);
                             tracing::info!(
                                 message_id = %orphan_id,
                                 "Removed orphaned Running tool call after cancel."
@@ -1551,10 +1633,10 @@ impl StreamManagerContext {
                     }
                     break;
                 }
-                if removed_count > 0 {
+                if !removed_message_ids.is_empty() {
                     tracing::info!(
                         "Removed {} orphaned Running tool call(s) after stream cancellation.",
-                        removed_count
+                        removed_message_ids.len()
                     );
                 }
             }
@@ -1563,6 +1645,15 @@ impl StreamManagerContext {
             // next prompt doesn't include CRITICAL RECOVERY INSTRUCTION or
             // stale tool context.
             state.tool_call_history.clear();
+
+            (partial_message, removed_message_ids)
+        };
+
+        if partial_message.is_some() || !removed_message_ids.is_empty() {
+            log_event(
+                session_id,
+                SessionEvent::StreamCancelled { partial_message, removed_message_ids },
+            );
         }
 
         // 3. Remove the stream receiver

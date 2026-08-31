@@ -375,6 +375,13 @@ async fn invoke_skill(
                             .insert(skill_call.skill_name.clone(), result.output.clone());
                     }
                 }
+                crate::session_events::log_event(
+                    session_id,
+                    crate::session_events::SessionEvent::SkillLoaded {
+                        name: skill_call.skill_name.clone(),
+                        payload: result.output.clone(),
+                    },
+                );
                 tracing::info!(
                     "Model invoked skill '{}' — persisted into session.loaded_skills",
                     skill_call.skill_name
