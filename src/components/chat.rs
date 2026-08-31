@@ -838,15 +838,51 @@ pub fn ChatWindow(
         } else {
             restore_message_to_draft(message_id);
 
-            // Delete the message and everything after
+            // Delete the message and everything after. Journal-complete
+            // sessions rewind by replay (RewoundTo + project); pre-journal
+            // sessions take the legacy in-place path.
             let message_id_str = message_id.to_string();
             let active_session_id = current_target_id.read().clone();
-            if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
-                session.delete_message_and_after(&message_id_str);
-                // Trigger update
-                stream_update_trigger.set(stream_update_trigger() + 1);
+            {
+                let mut state = session_state.write();
+                crate::session_events::rewind_session_state(
+                    &mut state,
+                    &active_session_id,
+                    &message_id_str,
+                );
             }
+            stream_update_trigger.set(stream_update_trigger() + 1);
             crate::session::SessionState::save_async(&session_state.read(), None);
+        }
+    };
+
+    // Fork-from-message: copy the journal up to this message's first event
+    // (inclusive) into a new session and open it as a tab. Only offered for
+    // journal-complete sessions — pre-journal history refuses gracefully.
+    let fork_save_error = consume_context::<crate::components::shared::SaveErrorContext>().0;
+    let fork_from_message = move |message_id: Uuid| {
+        let mut fork_save_error = fork_save_error;
+        let session_id = current_target_id.read().clone();
+        let anchor = crate::session_store::first_event_seq_for_message(
+            &session_id,
+            &message_id.to_string(),
+        );
+        let Some(at_seq) = anchor.filter(|&s| s > 0) else {
+            fork_save_error.set(Some(
+                "This message predates the session journal — fork unavailable.".to_string(),
+            ));
+            return;
+        };
+        let result = session_state.write().fork_session(&session_id, Some(at_seq));
+        match result {
+            Ok(new_id) => {
+                crate::session::SessionState::save_async(&session_state.read(), None);
+                chat_command.set(Some(super::chat_input::ChatCommand::SwitchToSession(new_id)));
+            }
+            Err(e) => {
+                tracing::warn!("fork_from_message failed: {e}");
+                fork_save_error.set(Some(e));
+            }
         }
     };
 
@@ -886,9 +922,16 @@ pub fn ChatWindow(
                         session.messages.push(notice_msg.clone());
                     }
                 }
-                log_event(
+                // MemoryOptimized journals only the summary: the wholesale
+                // active_context replacement is deliberately NOT replayed —
+                // mcp_tools/tools/extra are reactively rebuilt (P-001 sync,
+                // ToolCallSummarizer), so the summary is the durable outcome.
+                crate::session_events::log_events(
                     &current_target_id.read().clone(),
-                    SessionEvent::AssistantMessage { message: notice_msg },
+                    vec![
+                        SessionEvent::MemoryOptimized { summary: summary.clone() },
+                        SessionEvent::AssistantMessage { message: notice_msg },
+                    ],
                 );
                 crate::session::SessionState::save_async(&session_state.read(), None);
                 // Force refresh messagelist
@@ -960,6 +1003,7 @@ pub fn ChatWindow(
                     stream_update_trigger: stream_update_trigger,
                     show_scroll_button: show_scroll_button,
                     on_delete: delete_message,
+                    on_fork: fork_from_message,
                     on_comment: move |_| has_new_comments.set(true),
                 },
                 ChatInput {
@@ -1035,11 +1079,15 @@ pub fn ChatWindow(
                             }
 
                             let active_session_id = current_target_id.read().clone();
-                            if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
-                                session.delete_message_and_after(id);
-                                // Trigger update
-                                stream_update_trigger.set(stream_update_trigger() + 1);
+                            {
+                                let mut state = session_state.write();
+                                crate::session_events::rewind_session_state(
+                                    &mut state,
+                                    &active_session_id,
+                                    id,
+                                );
                             }
+                            stream_update_trigger.set(stream_update_trigger() + 1);
                             crate::session::SessionState::save_async(&session_state.read(), None);
                         }
                         show_delete_confirm_modal.set(false);
@@ -1190,6 +1238,7 @@ pub fn MessageBubble(
     on_content_update: EventHandler<()>,
     on_selection: EventHandler<(String, f64, f64)>,
     on_delete: EventHandler<()>,
+    #[props(default)] on_fork: EventHandler<()>,
     on_comment: EventHandler<()>,
 ) -> Element {
     let is_user = message.author == "User";
@@ -1562,10 +1611,18 @@ pub fn MessageBubble(
                                         move |comment_id: String| {
                                             // Delete the comment from session state
                                             let mut state = session_state.write();
+                                            let session_id = state.active_session_id.clone();
                                             if let Some(msg) = state.get_message_mut(&message_id) {
                                                 msg.comments.retain(|c| c.id != comment_id);
                                             }
                                             drop(state);
+                                            log_event(
+                                                &session_id,
+                                                SessionEvent::CommentRemoved {
+                                                    message_id: message_id.to_string(),
+                                                    comment_id,
+                                                },
+                                            );
                                             crate::session::SessionState::save_signal(&session_state, Some(save_error));
                                         }
                                     }
@@ -1657,10 +1714,18 @@ pub fn MessageBubble(
 
                                     // Update session state
                                     let mut state = session_state.write();
+                                    let session_id = state.active_session_id.clone();
                                     if let Some(msg) = state.get_message_mut(&message.id) {
-                                        msg.comments.push(new_comment);
+                                        msg.comments.push(new_comment.clone());
                                     }
                                     drop(state);
+                                    log_event(
+                                        &session_id,
+                                        SessionEvent::CommentAdded {
+                                            message_id: message.id.to_string(),
+                                            comment: new_comment,
+                                        },
+                                    );
                                     crate::session::SessionState::save_signal(&session_state, Some(save_error));
 
                                     on_comment.call(());
@@ -1691,12 +1756,26 @@ pub fn MessageBubble(
                                             if let Some(comment_id) = editing_comment_id.read().clone() {
                                                 // Update the comment in session state
                                                 let mut state = session_state.write();
+                                                let session_id = state.active_session_id.clone();
+                                                let mut updated_comment: Option<Comment> = None;
                                                 if let Some(msg) = state.get_message_mut(&message.id) {
                                                     if let Some(comment) = msg.comments.iter_mut().find(|c| c.id == comment_id) {
                                                         comment.comment = new_comment_text;
+                                                        updated_comment = Some(comment.clone());
                                                     }
                                                 }
                                                 drop(state);
+                                                // Edits journal as CommentAdded — the projector
+                                                // upserts by comment id.
+                                                if let Some(comment) = updated_comment {
+                                                    log_event(
+                                                        &session_id,
+                                                        SessionEvent::CommentAdded {
+                                                            message_id: message.id.to_string(),
+                                                            comment,
+                                                        },
+                                                    );
+                                                }
                                                 crate::session::SessionState::save_signal(&session_state, Some(save_error));
                                             }
                                             editing_comment_id.set(None);
@@ -1735,6 +1814,13 @@ pub fn MessageBubble(
                                     } else {
                                         Icon { width: 14, height: 14, icon: fi_icons::FiCopy }
                                     }
+                                }
+
+                                button {
+                                    class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors",
+                                    onclick: move |_| on_fork.call(()),
+                                    title: "Fork from here",
+                                    Icon { width: 14, height: 14, icon: fi_icons::FiGitBranch }
                                 }
 
                                 if is_user {

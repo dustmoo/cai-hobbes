@@ -774,9 +774,7 @@ pub struct SessionEventRow {
 }
 
 /// An event read back from the journal.
-/// Phase 1 is write-only at runtime — the read API exists for tests and for
-/// Phase 2 (replay), hence the dead_code allowance.
-#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct LoadedSessionEvent {
     pub seq: i64,
     pub ts: chrono::DateTime<chrono::Utc>,
@@ -864,7 +862,6 @@ pub fn append_events(session_id: &str, events: Vec<SessionEvent>) {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn load_events_conn(
     conn: &Connection,
     session_id: &str,
@@ -902,9 +899,7 @@ fn load_events_conn(
 }
 
 /// Read a session's journal in seq order, skipping unknown kinds.
-/// `after_seq = 0` reads from the beginning. Unused at runtime in Phase 1
-/// (the journal is write-only); Phase 2 replay reads through here.
-#[allow(dead_code)]
+/// `after_seq = 0` reads from the beginning.
 pub fn load_events(session_id: &str, after_seq: i64) -> Vec<LoadedSessionEvent> {
     with_conn(|conn| load_events_conn(conn, session_id, after_seq)).unwrap_or_else(|e| {
         tracing::error!("session_events: load failed for {session_id}: {e}");
@@ -925,6 +920,123 @@ pub fn first_event_seq_for_message(session_id: &str, message_id: &str) -> Option
     })
     .ok()
     .flatten()
+}
+
+/// A session is "journal-complete" iff its journal starts with a
+/// `SessionCreated` event — only then can it be rebuilt from nothing via
+/// `session_events::project(None, …)`. Pre-journal sessions (created before
+/// the birth event existed) fail this and keep the legacy code paths.
+pub fn journal_starts_with_creation(session_id: &str) -> bool {
+    with_conn(|conn| journal_starts_with_creation_conn(conn, session_id))
+        .unwrap_or(false)
+}
+
+fn journal_starts_with_creation_conn(conn: &Connection, session_id: &str) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension;
+    let first_kind: Option<String> = conn
+        .query_row(
+            "SELECT kind FROM session_events WHERE session_id = ?1 ORDER BY seq LIMIT 1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(first_kind.as_deref() == Some("SessionCreated"))
+}
+
+/// Fork a journal-complete session's history (Phase 2, Part D).
+///
+/// Copies `source_id`'s events with seq ≤ `at_seq` (inclusive; `None` = all)
+/// into `new_id` with NEW seqs from the shared counter, rewriting the copied
+/// `SessionCreated` to the new identity and appending a `SessionForked`
+/// provenance marker. Row timestamps are preserved from the source rows (the
+/// marker gets append-time now). Returns the new journal (with its new seqs)
+/// so the caller can `project()` it without a read-back.
+///
+/// Errors when the source journal is empty or does not start with
+/// `SessionCreated` (pre-journal session).
+pub fn fork_events(
+    source_id: &str,
+    at_seq: Option<i64>,
+    new_id: &str,
+    new_name: &str,
+) -> Result<Vec<LoadedSessionEvent>, String> {
+    with_conn(|conn| fork_events_conn(conn, source_id, at_seq, new_id, new_name))?
+}
+
+fn fork_events_conn(
+    conn: &Connection,
+    source_id: &str,
+    at_seq: Option<i64>,
+    new_id: &str,
+    new_name: &str,
+) -> rusqlite::Result<Result<Vec<LoadedSessionEvent>, String>> {
+    let mut source = load_events_conn(conn, source_id, 0)?;
+    if let Some(cut) = at_seq {
+        source.retain(|e| e.seq <= cut);
+    }
+
+    match source.first() {
+        Some(first) if matches!(first.event, SessionEvent::SessionCreated { .. }) => {}
+        _ => {
+            return Ok(Err(format!(
+                "Session '{source_id}' predates the event journal (no SessionCreated) — fork unavailable."
+            )));
+        }
+    }
+
+    let last_copied_seq = source.last().map(|e| e.seq).unwrap_or(0);
+    let last_ts = source.last().map(|e| e.ts).unwrap_or_default();
+    let had_rename = source
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::SessionRenamed { .. }));
+
+    // Rewrite the birth event to the fork's identity.
+    if let Some(first) = source.first_mut() {
+        first.event = SessionEvent::SessionCreated {
+            id: new_id.to_string(),
+            name: new_name.to_string(),
+        };
+    }
+    // A later copied SessionRenamed would clobber the fork's name on replay —
+    // re-assert it when the prefix contains one.
+    if had_rename {
+        source.push(LoadedSessionEvent {
+            seq: 0, // rewritten below
+            ts: last_ts,
+            event: SessionEvent::SessionRenamed { name: new_name.to_string() },
+        });
+    }
+    // Provenance marker, timestamped at fork time.
+    source.push(LoadedSessionEvent {
+        seq: 0, // rewritten below
+        ts: chrono::Utc::now(),
+        event: SessionEvent::SessionForked {
+            from_session_id: source_id.to_string(),
+            at_seq: at_seq.unwrap_or(last_copied_seq),
+        },
+    });
+
+    // Mint new seqs from the shared counter and insert under the new id,
+    // preserving each row's original timestamp.
+    let mut rows = Vec::with_capacity(source.len());
+    for loaded in source.iter_mut() {
+        loaded.seq = next_seq();
+        match serde_json::to_string(&loaded.event) {
+            Ok(payload) => rows.push(SessionEventRow {
+                session_id: new_id.to_string(),
+                seq: loaded.seq,
+                ts: fmt_ts(&loaded.ts),
+                kind: loaded.event.kind().to_string(),
+                payload,
+            }),
+            Err(e) => tracing::error!(
+                "fork_events: failed to serialize {} event: {e}",
+                loaded.event.kind()
+            ),
+        }
+    }
+    insert_event_rows_conn(conn, &rows)?;
+    Ok(Ok(source))
 }
 
 // ── Test support ────────────────────────────────────────────────────────────
@@ -1044,6 +1156,20 @@ pub mod test_support {
 
     pub fn delete_session_for_test(conn: &Connection, id: &str) -> Option<(f64, i64)> {
         delete_session_conn(conn, id).unwrap()
+    }
+
+    pub fn fork_events_for_test(
+        conn: &Connection,
+        source_id: &str,
+        at_seq: Option<i64>,
+        new_id: &str,
+        new_name: &str,
+    ) -> Result<Vec<LoadedSessionEvent>, String> {
+        fork_events_conn(conn, source_id, at_seq, new_id, new_name).unwrap()
+    }
+
+    pub fn journal_complete_for_test(conn: &Connection, session_id: &str) -> bool {
+        journal_starts_with_creation_conn(conn, session_id).unwrap()
     }
 }
 

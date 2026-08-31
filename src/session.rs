@@ -162,71 +162,82 @@ impl Session {
         self.watch_word_recovery_count = 0;
     }
 
-    pub fn delete_message_and_after(&mut self, message_id: &str) -> usize {
-        if let Ok(uuid) = uuid::Uuid::parse_str(message_id) {
-            if let Some(index) = self.messages.iter().position(|m| m.id == uuid) {
-                let count = self.messages.len() - index;
-                // Harvest cost/token data from the messages being deleted
-                // so the session totals never drop when messages are pruned.
-                // Also collect execution_ids from ToolCall messages so we can
-                // remove their stale tool_snapshot entries from active_context.
-                let mut deleted_execution_ids: Vec<String> = Vec::new();
-                for msg in &self.messages[index..] {
-                    if let Some(usage) = &msg.usage {
-                        if let Some(cost) = usage.cost {
-                            self.accumulated_cost += cost;
-                        }
-                        self.accumulated_tokens += usage.total_tokens;
-                    }
-                    if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
-                        deleted_execution_ids.push(tc.execution_id.clone());
-                    }
+    /// Truncate history from `message_id` (inclusive) to the end, applying the
+    /// derived undo effects. This is the single home of the rewind rules —
+    /// shared by the legacy in-place undo (`delete_message_and_after`) and by
+    /// the journal projector (`session_events::project` on `RewoundTo`):
+    ///
+    /// - Harvest cost/token usage from the deleted messages into
+    ///   `accumulated_cost`/`accumulated_tokens` so session totals never drop.
+    /// - Remove `tool_snapshot_*` extras for deleted tool calls (inserted by
+    ///   ToolCallSummarizer, serialized into SYSTEM_CONTEXT via flatten —
+    ///   without this the LLM sees phantom results and loops on stale context).
+    /// - Reset `conversation_summary` so stale context from deleted turns
+    ///   can't leak into future prompts (re-populated on the next turn).
+    ///
+    /// Pure with respect to clocks and the journal: no `Utc::now()`, no event
+    /// logging — callers own those side effects.
+    pub fn truncate_from_message(&mut self, message_id: &str) -> usize {
+        let Ok(uuid) = uuid::Uuid::parse_str(message_id) else {
+            return 0;
+        };
+        let Some(index) = self.messages.iter().position(|m| m.id == uuid) else {
+            return 0;
+        };
+        let count = self.messages.len() - index;
+        let mut deleted_execution_ids: Vec<String> = Vec::new();
+        for msg in &self.messages[index..] {
+            if let Some(usage) = &msg.usage {
+                if let Some(cost) = usage.cost {
+                    self.accumulated_cost += cost;
                 }
-                self.messages.truncate(index);
-
-                // Remove tool_snapshot_* entries for deleted tool calls.
-                // These are inserted by ToolCallSummarizer at end-of-turn and
-                // serialized into SYSTEM_CONTEXT via #[serde(flatten)]. Without
-                // this cleanup, the LLM sees phantom tool results from undone
-                // turns, causing it to loop on stale context.
-                for exec_id in &deleted_execution_ids {
-                    let key = format!("tool_snapshot_{}", exec_id);
-                    if self.active_context.extra.remove(&key).is_some() {
-                        tracing::debug!("Removed stale tool snapshot after undo: {}", key);
-                    }
-                }
-
-                // Reset conversation_summary to prevent stale context from
-                // deleted turns leaking into future prompts. The summarizer
-                // will re-populate it on the next turn's completion.
-                if count > 0 {
-                    self.active_context.conversation_summary = Default::default();
-                    tracing::debug!("Reset conversation_summary after undo ({} messages removed)", count);
-
-                    // Journal the rewind so Phase 2 has history. The anchor is
-                    // the seq of the first journaled event referencing the
-                    // deleted message; 0 when it predates the journal.
-                    let rewind_seq = crate::session_store::first_event_seq_for_message(
-                        &self.id, message_id,
-                    )
-                    .unwrap_or(0);
-                    crate::session_events::log_event(
-                        &self.id,
-                        crate::session_events::SessionEvent::RewoundTo {
-                            seq: rewind_seq,
-                            message_id: message_id.to_string(),
-                        },
-                    );
-                }
-
-                self.last_updated = Utc::now();
-                count
-            } else {
-                0
+                self.accumulated_tokens += usage.total_tokens;
             }
-        } else {
-            0
+            if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
+                deleted_execution_ids.push(tc.execution_id.clone());
+            }
         }
+        self.messages.truncate(index);
+
+        for exec_id in &deleted_execution_ids {
+            let key = format!("tool_snapshot_{}", exec_id);
+            if self.active_context.extra.remove(&key).is_some() {
+                tracing::debug!("Removed stale tool snapshot after undo: {}", key);
+            }
+        }
+
+        if count > 0 {
+            self.active_context.conversation_summary = Default::default();
+            tracing::debug!(
+                "Reset conversation_summary after undo ({} messages removed)",
+                count
+            );
+        }
+        count
+    }
+
+    /// Legacy in-place undo. Journal-complete sessions should go through
+    /// `session_events::rewind_session_state` instead (rewind-as-replay);
+    /// this path remains for pre-journal sessions and journals its own
+    /// `RewoundTo` so the history is recorded either way.
+    pub fn delete_message_and_after(&mut self, message_id: &str) -> usize {
+        let count = self.truncate_from_message(message_id);
+        if count > 0 {
+            // The anchor is the seq of the first journaled event referencing
+            // the deleted message; 0 when it predates the journal.
+            let rewind_seq =
+                crate::session_store::first_event_seq_for_message(&self.id, message_id)
+                    .unwrap_or(0);
+            crate::session_events::log_event(
+                &self.id,
+                crate::session_events::SessionEvent::RewoundTo {
+                    seq: rewind_seq,
+                    message_id: message_id.to_string(),
+                },
+            );
+            self.last_updated = Utc::now();
+        }
+        count
     }
 
     /// Calculate total cost for all messages in this session.
@@ -1194,9 +1205,57 @@ impl SessionState {
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
         };
+        // Birth event: a journal that starts with SessionCreated is
+        // "journal-complete" and can be rebuilt from nothing via project().
+        // The initial profile binding is journaled alongside so replay
+        // reproduces it (create_session_raw is its assignment site).
+        let mut birth_events = vec![crate::session_events::SessionEvent::SessionCreated {
+            id: new_id.clone(),
+            name: new_session.name.clone(),
+        }];
+        if let Some(profile) = &new_session.composio_profile {
+            birth_events.push(crate::session_events::SessionEvent::ComposioProfileSet {
+                profile: Some(profile.clone()),
+            });
+        }
+        crate::session_events::log_events(&new_id, birth_events);
+
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id.clone();
         new_id
+    }
+
+    /// Fork a journal-complete session: copy its journal up to `at_seq`
+    /// (inclusive; `None` = whole journal) into a fresh session id, rebuild
+    /// the hydrated `Session` via `project()`, and insert it into state as the
+    /// active session. The caller persists (`save_async`) and opens the tab.
+    ///
+    /// Only journal-complete sources (journal starts with `SessionCreated`)
+    /// can be forked — pre-journal sessions return a clear error.
+    pub fn fork_session(
+        &mut self,
+        source_id: &str,
+        at_seq: Option<i64>,
+    ) -> Result<String, String> {
+        let source_name = self
+            .sessions
+            .get(source_id)
+            .map(|s| s.name.clone())
+            .or_else(|| {
+                crate::session_store::metadata_by_ids(&[source_id.to_string()])
+                    .pop()
+                    .map(|m| m.name)
+            })
+            .ok_or_else(|| format!("Session '{source_id}' not found"))?;
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let new_name = format!("Fork of {source_name}");
+        let events =
+            crate::session_store::fork_events(source_id, at_seq, &new_id, &new_name)?;
+        let session = crate::session_events::project(None, &events);
+        self.sessions.insert(new_id.clone(), session);
+        self.active_session_id = new_id.clone();
+        Ok(new_id)
     }
 
     pub fn create_session(&mut self, initial_profile: Option<String>) -> String {

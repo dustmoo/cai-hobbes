@@ -1022,8 +1022,18 @@ pub fn ChatInput(
                                                             button {
                                                                 class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
                                                                 onclick: move |_| {
+                                                                    let mut pinned_session_id: Option<String> = None;
                                                                     if let Some(session) = session_state.write().get_active_session_mut() {
                                                                         session.composio_profile = Some(profile_id.clone());
+                                                                        pinned_session_id = Some(session.id.clone());
+                                                                    }
+                                                                    if let Some(sid) = pinned_session_id {
+                                                                        log_event(
+                                                                            &sid,
+                                                                            SessionEvent::ComposioProfileSet {
+                                                                                profile: Some(profile_id.clone()),
+                                                                            },
+                                                                        );
                                                                     }
                                                                     settings.write().active_composio_profile = Some(profile_id.clone());
 

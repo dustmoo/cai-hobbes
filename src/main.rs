@@ -1707,6 +1707,12 @@ fn app() -> Element {
                         }
 
                         if session_changed {
+                            crate::session_events::log_event(
+                                &current_session_id.read().clone(),
+                                crate::session_events::SessionEvent::ComposioProfileSet {
+                                    profile: settings.peek().active_composio_profile.clone(),
+                                },
+                            );
                             SessionState::save_async(&session_state.read(), Some(save_error));
                             mcp_manager.read().invalidate_status_cache();
                         }
@@ -1881,6 +1887,11 @@ fn app() -> Element {
                     let mut hydrated = session_state.peek().sessions.contains_key(&session_id);
                     if !hydrated {
                         if let Some(session) = crate::session_store::load_session(&session_id) {
+                            // Drift guard (debug builds): compare the stored row
+                            // against its journal projection; warn on divergence,
+                            // never block hydration.
+                            #[cfg(debug_assertions)]
+                            crate::session_events::debug_check_drift(&session);
                             session_state
                                 .write()
                                 .sessions

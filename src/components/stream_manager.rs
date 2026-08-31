@@ -1813,7 +1813,7 @@ impl StreamManagerContext {
         //    The model may have already produced useful text/thinking content
         //    that the user wants to keep. Only remove orphaned Running tool
         //    call messages (they have no results and break the next prompt).
-        {
+        let (partial_message, removed_message_ids) = {
             let mut state = self.session_state.write();
 
             // Check if the AI message has any content worth preserving.
@@ -1830,18 +1830,34 @@ impl StreamManagerContext {
 
             if !has_content {
                 // No content was generated — remove the empty placeholder.
+                // (Never journaled: streaming placeholders don't hit the log.)
                 state.remove_message_in_session(session_id, message_id);
             }
 
-            // Trim trailing orphaned Running tool calls
+            // Snapshot the preserved partial for the journal — end-of-turn
+            // finalization will never run for this turn, so StreamCancelled is
+            // the only event carrying the partial text.
+            let partial_message = if has_content {
+                state
+                    .sessions
+                    .get(session_id)
+                    .and_then(|s| s.messages.iter().find(|m| m.id == *message_id))
+                    .cloned()
+            } else {
+                None
+            };
+
+            // Trim trailing orphaned Running tool calls. Their ToolCall events
+            // WERE journaled at dispatch — record the removals so replay drops
+            // them too.
+            let mut removed_message_ids: Vec<Uuid> = Vec::new();
             if let Some(session) = state.sessions.get_mut(session_id) {
-                let mut removed_count = 0;
                 while let Some(last) = session.messages.last() {
                     if let crate::components::shared::MessageContent::ToolCall(tc) = &last.content {
                         if tc.status == crate::components::shared::ToolCallStatus::Running {
                             let orphan_id = last.id;
                             session.messages.pop();
-                            removed_count += 1;
+                            removed_message_ids.push(orphan_id);
                             tracing::info!(
                                 message_id = %orphan_id,
                                 "Removed orphaned Running tool call after cancel."
@@ -1851,10 +1867,10 @@ impl StreamManagerContext {
                     }
                     break;
                 }
-                if removed_count > 0 {
+                if !removed_message_ids.is_empty() {
                     tracing::info!(
                         "Removed {} orphaned Running tool call(s) after stream cancellation.",
-                        removed_count
+                        removed_message_ids.len()
                     );
                 }
             }
@@ -1863,6 +1879,15 @@ impl StreamManagerContext {
             // next prompt doesn't include CRITICAL RECOVERY INSTRUCTION or
             // stale tool context.
             state.tool_call_history.clear();
+
+            (partial_message, removed_message_ids)
+        };
+
+        if partial_message.is_some() || !removed_message_ids.is_empty() {
+            log_event(
+                session_id,
+                SessionEvent::StreamCancelled { partial_message, removed_message_ids },
+            );
         }
 
         // 3. Remove the stream receiver

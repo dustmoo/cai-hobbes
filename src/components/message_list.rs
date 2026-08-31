@@ -16,6 +16,7 @@ pub fn MessageList(
     stream_update_trigger: Signal<i32>,
     show_scroll_button: Signal<bool>,
     on_delete: EventHandler<Uuid>,
+    on_fork: EventHandler<Uuid>,
     on_comment: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
@@ -181,6 +182,10 @@ pub fn MessageList(
                                                                     let msg_id = message.id;
                                                                     move |_| on_delete.call(msg_id)
                                                                 },
+                                                                on_fork: {
+                                                                    let msg_id = message.id;
+                                                                    move |_| on_fork.call(msg_id)
+                                                                },
                                                                 on_comment: move |_| on_comment.call(()),
                                                             }
                                                         }
@@ -245,6 +250,10 @@ pub fn MessageList(
                                                             on_delete: {
                                                                 let msg_id = message.id;
                                                                 move |_| on_delete.call(msg_id)
+                                                            },
+                                                            on_fork: {
+                                                                let msg_id = message.id;
+                                                                move |_| on_fork.call(msg_id)
                                                             },
                                                             on_comment: move |_| on_comment.call(()),
                                                         }
@@ -401,6 +410,7 @@ pub fn MessageList(
                                                                                 let session_id = session_id.clone();
                                                                                 // Mark skill as denied
                                                                                 let mut state = session_state.write();
+                                                                                let mut denied_snapshot: Option<crate::components::chat::Message> = None;
                                                                                 if let Some(session) = state.sessions.get_mut(&session_id) {
                                                                                     if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
                                                                                         if let MessageContent::SkillPermissionRequest(sc) = &msg.content {
@@ -408,8 +418,16 @@ pub fn MessageList(
                                                                                             denied_sc.status = crate::components::shared::SkillCallStatus::Error;
                                                                                             denied_sc.response = "Permission denied by user.".to_string();
                                                                                             msg.content = MessageContent::SkillCall(denied_sc);
+                                                                                            denied_snapshot = Some(msg.clone());
                                                                                         }
                                                                                     }
+                                                                                }
+                                                                                drop(state);
+                                                                                // Denials journal as ToolResult — consistent with the
+                                                                                // approval path: the deny mutates the same message in
+                                                                                // place, and the projector upserts by message id.
+                                                                                if let Some(message) = denied_snapshot {
+                                                                                    crate::session_events::log_event(&session_id, crate::session_events::SessionEvent::ToolResult { message });
                                                                                 }
                                                                                 tracing::info!("Skill permission denied for execution_id: {}", execution_id);
                                                                             }
