@@ -1040,6 +1040,17 @@ fn time_block_move(
             format!("unknown block id '{}'", id),
         );
     };
+    // Mirrored calendar events are read-only: a "successful" move here would
+    // be silently reverted by the next sync pass — refuse honestly instead.
+    if matches!(existing.source, BlockSource::External { .. }) {
+        return (
+            ToolCallStatus::Error,
+            format!(
+                "'{}' is a calendar event mirrored from the user's external calendar — Hobbes cannot move it. It must be rescheduled in the source calendar (e.g. Google Calendar); sync will pick the change up within ~15 minutes.",
+                existing.title
+            ),
+        );
+    }
 
     // Unspecified parts keep the block's current local date/times, so "move it
     // to 14:00" or "push it to tomorrow" are each a single-field call.
@@ -1139,6 +1150,17 @@ fn time_block_delete(
             format!("unknown block id '{}'", id),
         );
     };
+    // Same read-only rule as time_block_move: deleting a mirrored calendar
+    // event would only "succeed" until the next sync pass re-inserts it.
+    if matches!(state.blocks[idx].source, BlockSource::External { .. }) {
+        return (
+            ToolCallStatus::Error,
+            format!(
+                "'{}' is a calendar event mirrored from the user's external calendar — Hobbes cannot delete it. It must be removed or declined in the source calendar; sync will pick the change up within ~15 minutes.",
+                state.blocks[idx].title
+            ),
+        );
+    }
     let removed = state.blocks.remove(idx);
     if persist {
         if let Err(e) = store::delete_block(id) {
@@ -2925,6 +2947,26 @@ mod tests {
                 tentative: false,
             },
         });
+    }
+
+    #[test]
+    fn external_blocks_refuse_move_and_delete() {
+        // Regression: the AI could "move"/"delete" a mirrored calendar block,
+        // report success, and have the next sync pass silently revert it.
+        let mut state = PlannerState::default();
+        seed_external_block(&mut state, "standup", 9, 10);
+
+        let (status, resp) = block(
+            &mut state,
+            json!({"action": "move", "id": "ext_standup", "start": "14:00", "end": "15:00"}),
+        );
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(resp.contains("cannot move it"), "got: {resp}");
+
+        let (status, resp) = block(&mut state, json!({"action": "delete", "id": "ext_standup"}));
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(resp.contains("cannot delete it"), "got: {resp}");
+        assert_eq!(state.blocks.len(), 1, "the mirrored block must survive");
     }
 
     /// Flip an already-seeded external block to non-busy (free/focus time).

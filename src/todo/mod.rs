@@ -218,6 +218,10 @@ impl PlannerState {
         if let Some(t) = self.todo_mut(todo_id) {
             if t.status != model::TodoStatus::InProgress {
                 t.fold_elapsed(now); // defensive: a stray marker never double-counts
+                // Focusing a closed todo revives it — full reopen semantics
+                // (see Todo::reopen): without this, a later pause parks it
+                // Open with a stale completed_at still set.
+                t.completed_at = None;
                 t.status = model::TodoStatus::InProgress;
                 t.started_at = Some(now);
                 t.updated_at = now;
@@ -486,6 +490,26 @@ mod tests {
         // Negative keys (from repeated prepends) must not drag the end backwards.
         state.upsert_todo(Todo::new("b", -9000.0));
         assert_eq!(state.next_sort_order(), 5000.0 + model::SORT_STEP);
+    }
+
+    #[test]
+    fn focusing_a_closed_todo_clears_completed_at() {
+        // Regression: start_focus revived Completed/Cancelled todos without
+        // clearing completed_at, so a later pause parked them Open with a
+        // stale completion timestamp.
+        let mut state = PlannerState::default();
+        let mut todo = Todo::new("done once", 0.0);
+        let id = todo.id.clone();
+        let now = chrono::Utc::now();
+        todo.status = model::TodoStatus::Completed;
+        todo.completed_at = Some(now);
+        state.upsert_todo(todo);
+
+        state.start_focus(&id, now, model::FocusActor::Person);
+
+        let t = state.todo(&id).unwrap();
+        assert_eq!(t.status, model::TodoStatus::InProgress);
+        assert_eq!(t.completed_at, None, "reopen semantics must clear completed_at");
     }
 
     #[test]

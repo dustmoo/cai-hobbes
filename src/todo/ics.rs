@@ -50,10 +50,11 @@ pub fn normalize_ics_url(url: &str) -> String {
 }
 
 fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
+    // .get() refuses a slice boundary inside a multibyte char (a pasted
+    // non-ASCII URL would otherwise panic here on every sync pass).
+    match s.get(..prefix.len()) {
+        Some(head) if head.eq_ignore_ascii_case(prefix) => Some(&s[prefix.len()..]),
+        _ => None,
     }
 }
 
@@ -490,6 +491,17 @@ mod tests {
 
     fn parse(body: &str) -> Vec<CalendarEvent> {
         parse_ics(&wrap(body), SUB, aug_window()).unwrap()
+    }
+
+    #[test]
+    fn normalize_ics_url_survives_multibyte_prefixes() {
+        // Regression: byte-slicing s[..prefix.len()] panicked when the boundary
+        // fell mid-char in a pasted non-ASCII URL (2-byte Cyrillic chars put
+        // every boundary at an even offset; "webcal://" is 9 bytes).
+        let cyrillic = "календарь://example.com/feed.ics";
+        assert_eq!(normalize_ics_url(cyrillic), cyrillic);
+        // Case-insensitive rewrite still works.
+        assert_eq!(normalize_ics_url("Webcal://x/y.ics"), "https://x/y.ics");
     }
 
     fn utc(s: &str) -> DateTime<Utc> {

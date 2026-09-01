@@ -270,23 +270,21 @@ pub fn window_days(today: NaiveDate) -> (NaiveDate, NaiveDate) {
 /// deriving it from `Utc::now()` shifts the edges by the UTC offset (the
 /// `blocks_on` trap).
 pub fn window_bounds(today: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
-    use chrono::TimeZone;
     let (first, last) = window_days(today);
-    let open = chrono::Local
-        .from_local_datetime(&first.and_hms_opt(0, 0, 0).expect("midnight is valid"))
-        .earliest()
-        .expect("local midnight resolves")
-        .with_timezone(&Utc);
-    let close = chrono::Local
-        .from_local_datetime(
-            &(last + Duration::days(1))
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is valid"),
-        )
-        .earliest()
-        .expect("local midnight resolves")
-        .with_timezone(&Utc);
-    (open, close)
+    (window_edge_utc(first), window_edge_utc(last + Duration::days(1)))
+}
+
+/// Local midnight of a window edge as UTC, DST-gap tolerant: in timezones that
+/// spring forward AT midnight (Santiago, Havana, Beirut) `00:00` doesn't exist
+/// on transition day and a bare `.earliest().expect(..)` would panic the sync
+/// coroutine on every pass. `ics::local_midnight` already slides such gaps
+/// forward an hour; if even that fails, fall back to UTC midnight rather than
+/// panic.
+fn window_edge_utc(date: NaiveDate) -> DateTime<Utc> {
+    use chrono::TimeZone;
+    super::ics::local_midnight(date).unwrap_or_else(|| {
+        Utc.from_utc_datetime(&date.and_time(chrono::NaiveTime::MIN))
+    })
 }
 
 /// Mirror the cached events into `PlannerState.blocks` as read-only external

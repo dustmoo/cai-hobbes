@@ -51,7 +51,11 @@ pub fn parse_quick_add(input: &str, today: NaiveDate) -> QuickAddParse {
     let mut title_words: Vec<&str> = Vec::new();
 
     for word in input.split_whitespace() {
-        let consumed = match word.split_at(word.len().min(1)) {
+        // Split after the first CHARACTER, not the first byte — a multibyte
+        // leading char (é, 🎉, CJK) makes byte index 1 a non-boundary and
+        // split_at would panic mid-keystroke.
+        let sigil_len = word.chars().next().map_or(0, char::len_utf8);
+        let consumed = match word.split_at(sigil_len) {
             ("~", rest) => match parse_duration_minutes(rest) {
                 Some(m) => {
                     out.estimate_minutes = Some(m);
@@ -247,6 +251,15 @@ mod tests {
     fn plain_titles_pass_through_untouched() {
         let p = parse_quick_add("Review the quarterly report", today());
         assert_eq!(p.title, "Review the quarterly report");
+        assert!(!p.has_tokens());
+    }
+
+    #[test]
+    fn multibyte_leading_chars_do_not_panic() {
+        // Regression: split_at(1) panicked on a non-ASCII first char, crashing
+        // the app on every keystroke of words like these.
+        let p = parse_quick_add("über Docs émail 🎉party 日本語 привет", today());
+        assert_eq!(p.title, "über Docs émail 🎉party 日本語 привет");
         assert!(!p.has_tokens());
     }
 
