@@ -431,18 +431,18 @@ fn overlap_column_style(col: usize, count: usize) -> String {
     )
 }
 
-/// A local wall-clock minute on `date`, as UTC. Clamped to the day; DST gaps
-/// resolve to the earliest valid instant.
+/// A local wall-clock minute on `date`, as UTC. Clamped to the day; DST
+/// handling delegates to the planner's single policy (`ics::local_naive_to_utc`
+/// — gaps slide an hour forward), so a dragged block lands on the same instant
+/// a tool-placed one would. The final fallback is UTC-midnight-of-date, never
+/// `Utc::now()` (which would teleport the block to "right now").
 fn local_minutes_to_utc(date: NaiveDate, minutes: u32) -> chrono::DateTime<Utc> {
     let minutes = minutes.min(23 * 60 + 59);
     let naive = date
         .and_hms_opt(minutes / 60, minutes % 60, 0)
         .unwrap_or_else(|| date.and_hms_opt(0, 0, 0).expect("midnight is always valid"));
-    Local
-        .from_local_datetime(&naive)
-        .earliest()
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now)
+    crate::todo::ics::local_naive_to_utc(&Local, &naive)
+        .unwrap_or_else(|| Utc.from_utc_datetime(&date.and_time(chrono::NaiveTime::MIN)))
 }
 
 /// Minutes since local midnight for a stored UTC instant.

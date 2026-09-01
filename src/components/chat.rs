@@ -2036,7 +2036,11 @@ pub fn MessageBubble(
                                 }
 
                                 button {
-                                    class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors",
+                                    // Same guard as Edit: forking mid-stream would
+                                    // snapshot a session the in-flight turn is still
+                                    // appending to.
+                                    class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                    disabled: session_streaming,
                                     onclick: move |_| on_fork.call(()),
                                     title: "Fork from here",
                                     Icon { width: 14, height: 14, icon: fi_icons::FiGitBranch }
@@ -2056,9 +2060,13 @@ pub fn MessageBubble(
                                         Icon { width: 14, height: 14, icon: fi_icons::FiEdit2 }
                                     }
                                     // Undo from here: restore this message to the
-                                    // draft and rewind the session past it.
+                                    // draft and rewind the session past it. Same
+                                    // streaming guard as Edit — rewinding under an
+                                    // in-flight turn leaves a ghost reply journaled
+                                    // after the RewoundTo point.
                                     button {
-                                        class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors",
+                                        class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                        disabled: session_streaming,
                                         onclick: move |_| on_delete.call(()),
                                         title: "Undo from here",
                                         Icon { width: 14, height: 14, icon: fi_icons::FiRotateCcw }

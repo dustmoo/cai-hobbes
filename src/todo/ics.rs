@@ -380,7 +380,11 @@ fn resolve_date_time(dt: &CalendarDateTime) -> Option<DateTime<Utc>> {
 /// Interpret a naive wall-clock time in `tz` and convert to UTC. Ambiguous
 /// times (DST fall-back) take the earlier instant; nonexistent times (DST
 /// spring-forward gap) slide forward an hour, matching common calendar UX.
-fn local_naive_to_utc<T: TimeZone>(tz: &T, naive: &NaiveDateTime) -> Option<DateTime<Utc>> {
+///
+/// This is the planner's ONE local→UTC policy — tool handlers, the timeline
+/// UI, and calendar sync all route through it so a block never lands on a
+/// different instant depending on which surface placed it.
+pub(crate) fn local_naive_to_utc<T: TimeZone>(tz: &T, naive: &NaiveDateTime) -> Option<DateTime<Utc>> {
     tz.from_local_datetime(naive)
         .earliest()
         .or_else(|| tz.from_local_datetime(&(*naive + Duration::hours(1))).earliest())

@@ -126,19 +126,14 @@ fn parse_estimate(v: &Value) -> Result<u32, String> {
         .ok_or_else(|| "invalid estimate_minutes — expected a non-negative integer".to_string())
 }
 
-/// Convert a local wall-clock date + time to UTC for storage. DST gaps (a local
-/// time that never occurs) are an error; ambiguous times (clock rollback) take
-/// the earlier instant.
+/// Convert a local wall-clock date + time to UTC for storage, via the
+/// planner's single DST policy (`ics::local_naive_to_utc`): ambiguous times
+/// take the earlier instant, spring-forward gaps slide an hour forward — the
+/// same instant the timeline UI and calendar sync would produce.
 fn local_to_utc(date: NaiveDate, time: NaiveTime) -> Result<DateTime<Utc>, String> {
-    use chrono::TimeZone;
-    match chrono::Local.from_local_datetime(&date.and_time(time)) {
-        chrono::LocalResult::Single(dt) => Ok(dt.with_timezone(&Utc)),
-        chrono::LocalResult::Ambiguous(earlier, _) => Ok(earlier.with_timezone(&Utc)),
-        chrono::LocalResult::None => Err(format!(
-            "local time {} {} does not exist (daylight-saving gap)",
-            date, time
-        )),
-    }
+    super::ics::local_naive_to_utc(&chrono::Local, &date.and_time(time)).ok_or_else(|| {
+        format!("local time {} {} could not be resolved to an instant", date, time)
+    })
 }
 
 // ── Persistence helpers ─────────────────────────────────────────────────────
