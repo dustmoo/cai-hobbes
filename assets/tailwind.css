@@ -4355,7 +4355,7 @@ video {
 }
 
 @media (min-width: 1024px) {
-  .lg\:max-w-\[66\%\] {
-    max-width: 66%;
+  .lg\:max-w-\[90\%\] {
+    max-width: 90%;
   }
 }

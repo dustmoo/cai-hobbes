@@ -1661,11 +1661,11 @@ pub fn MessageBubble(
             };
 
             // AI bubbles leave room for the hover controls hanging off the
-            // right edge; the 2/3 cap only kicks in on wide windows.
+            // right edge; the 90% cap only kicks in on wide windows.
             let wrapper_width_class = if is_user {
                 "max-w-full"
             } else {
-                "max-w-[calc(100%-2.5rem)] lg:max-w-[66%]"
+                "max-w-[calc(100%-2.5rem)] lg:max-w-[90%]"
             };
 
             rsx! {
