@@ -38,6 +38,7 @@
 //! agent focus and external fleet time stay separable in data even though the
 //! Today rail displays their sum in one agent lane (Pro surface).
 
+pub mod bridge;
 pub mod briefs;
 pub mod events;
 pub mod hooks_config;
@@ -118,6 +119,16 @@ pub struct SessionBrief {
     pub final_brief: bool,
 }
 
+/// Where a fleet session's events come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FleetOrigin {
+    /// An external Claude Code session reporting via HTTP hooks.
+    #[default]
+    External,
+    /// One of Hobbes' own chat tabs, reporting via [`bridge`].
+    Hobbes,
+}
+
 /// One observed Claude Code session (live map entry / `fleet_sessions` row).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FleetSession {
@@ -151,6 +162,8 @@ pub struct FleetSession {
     /// lands. Persisted, so pending briefs survive a restart.
     #[serde(default)]
     pub brief_dirty_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub origin: FleetOrigin,
 }
 
 impl FleetSession {
@@ -169,6 +182,7 @@ impl FleetSession {
             transcript_path: None,
             brief: None,
             brief_dirty_at: None,
+            origin: FleetOrigin::External,
         }
     }
 

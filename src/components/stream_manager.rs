@@ -45,6 +45,22 @@ pub struct StreamManagerContext {
 }
 
 impl StreamManagerContext {
+    /// Report this session's lifecycle into the fleet (no-op while the
+    /// bridge is disarmed). Name lookup peeks — never subscribes.
+    fn fleet_report(&self, session_id: &str, signal: crate::fleet::bridge::HobbesSignal) {
+        if !crate::fleet::bridge::enabled() {
+            return;
+        }
+        let name = self
+            .session_state
+            .peek()
+            .sessions
+            .get(session_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        crate::fleet::bridge::report(session_id, &name, signal);
+    }
+
     pub fn is_streaming(self, message_id: &Uuid) -> bool {
         self.stream_receivers.read().contains_key(message_id)
     }
@@ -164,6 +180,7 @@ impl StreamManagerContext {
     ) {
         self.streaming_sessions.write().insert(session_id.clone());
         self.stream_session_map.write().insert(message_id, session_id.clone());
+        self.fleet_report(&session_id, crate::fleet::bridge::HobbesSignal::TurnStarted);
         tracing::info!(message_id = %message_id, session_id = %session_id, "'start_stream' entered.");
         // Create a channel for the MessageBubble to receive chunks.
         let (stream_tx, stream_rx) = mpsc::unbounded_channel::<StreamMessage>();
@@ -539,6 +556,7 @@ impl StreamManagerContext {
                         };
                         // Notify the scroll effect: a tool-call card just appeared.
                         *self.stream_activity.write() += 1;
+                        self.fleet_report(&session_id, crate::fleet::bridge::HobbesSignal::Activity);
                         if let Some(message) = tool_call_snapshot {
                             log_event(&session_id, SessionEvent::ToolCall { message });
                         }
@@ -1005,6 +1023,15 @@ impl StreamManagerContext {
                     self.streaming_sessions.write().remove(&session_id);
                     *self.stream_activity.write() += 1; // Notify TabBar: stream ended
                     self.scheduler.send(SchedulerSignal::Activity);
+                    self.fleet_report(
+                        &session_id,
+                        crate::fleet::bridge::HobbesSignal::GateWaiting {
+                            tool_name: format!(
+                                "{} tool call(s)",
+                                tool_call_count - collected_records.len()
+                            ),
+                        },
+                    );
                     return; // Wait for user to approve
                 }
 
@@ -1340,6 +1367,7 @@ impl StreamManagerContext {
             self.streaming_sessions.write().remove(&session_id);
             *self.stream_activity.write() += 1; // Notify TabBar: stream ended
             self.scheduler.send(SchedulerSignal::Activity);
+            self.fleet_report(&session_id, crate::fleet::bridge::HobbesSignal::TurnCompleted);
             tracing::info!(message_id = %message_id, "Completion signal SENT.");
 
             // Remove the handle from the map upon completion
@@ -1666,6 +1694,7 @@ impl StreamManagerContext {
         self.streaming_sessions.write().remove(session_id);
         *self.stream_activity.write() += 1; // Notify TabBar: stream cancelled
         self.stream_session_map.write().remove(message_id);
+        self.fleet_report(session_id, crate::fleet::bridge::HobbesSignal::TurnCompleted);
         tracing::info!(message_id = %message_id, "Stream cancellation process complete.");
     }
 

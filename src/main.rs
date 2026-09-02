@@ -305,6 +305,7 @@ pub enum MenuAction {
     History,
     Mcp,
     Planner,
+    Fleet,
     Profile,
     Attachments,
 }
@@ -439,6 +440,10 @@ fn app() -> Element {
             let mut hydrated = false;
             loop {
                 let want = settings.peek().fleet_enabled && crate::entitlement::pro_active();
+                // Hobbes tabs report through the bridge under the same
+                // condition as the listener (which also keeps the staleness
+                // sweep running whenever Hobbes rows are live).
+                fleet::bridge::set_enabled(want);
                 if want && server.is_none() {
                     if !hydrated {
                         // Sessions left live by a previous process re-enter
@@ -1361,8 +1366,15 @@ fn app() -> Element {
     // whether the tab exists, `active` whether it (vs. the selected session's
     // chat) fills the main column. Selecting any session tab deactivates the
     // planner without closing its tab.
-    let mut planner_tab_open = use_signal(|| false);
-    let mut planner_active = use_signal(|| false);
+    // App-view tabs (planner/fleet) restore from UiState so they survive a
+    // restart — including which one was focused at exit.
+    let mut planner_tab_open = use_signal(|| ui_state.peek().planner_tab_open);
+    let mut planner_active = use_signal(|| ui_state.peek().planner_active);
+    let mut fleet_tab_open = use_signal(|| ui_state.peek().fleet_tab_open);
+    let mut fleet_active = use_signal(|| {
+        // Never restore both views active; planner wins the tie.
+        ui_state.peek().fleet_active && !ui_state.peek().planner_active
+    });
     let mut settings_panel_width = use_signal(|| ui_state.read().settings_panel_width);
     let mut is_dragging = use_signal(|| false);
     let mut drag_start_info = use_signal(|| (0.0, 0.0)); // (start_x, start_width)
@@ -1560,6 +1572,10 @@ fn app() -> Element {
         let mut ui = ui_state.write();
         ui.open_tabs = open_tabs.read().clone();
         ui.active_tab_index = *active_tab_index.read();
+        ui.planner_tab_open = *planner_tab_open.read();
+        ui.planner_active = *planner_active.read();
+        ui.fleet_tab_open = *fleet_tab_open.read();
+        ui.fleet_active = *fleet_active.read();
 
         // Snapshot targets for Pattern 12 persistence
         let ui_snapshot = ui.clone();
@@ -1593,9 +1609,10 @@ fn app() -> Element {
 
     // Tab switching - use signal copies directly in closures
     let mut switch_tab_fn = move |idx: usize| {
-        // Selecting a chat tab brings its chat forward; the planner tab (if
-        // open) stays in the bar, just no longer active.
+        // Selecting a chat tab brings its chat forward; the planner/fleet
+        // tabs (if open) stay in the bar, just no longer active.
         planner_active.set(false);
+        fleet_active.set(false);
         let tabs = open_tabs.read();
         if idx < tabs.len() {
             let session_id = tabs[idx].clone();
@@ -1656,6 +1673,13 @@ fn app() -> Element {
                 &closing_session_id,
             );
 
+            // The fleet row (if the bridge is armed) leaves the live map.
+            fleet::bridge::report(
+                &closing_session_id,
+                "",
+                fleet::bridge::HobbesSignal::Closed,
+            );
+
             // Delete the session if it has no messages (empty tab).
             // Sessions with messages are preserved in History.
             {
@@ -1696,6 +1720,7 @@ fn app() -> Element {
 
     let mut new_tab_fn = move || {
         planner_active.set(false);
+        fleet_active.set(false);
         let new_id = session_state.write().create_session(active_profile_id());
         let mut tabs = open_tabs.read().clone();
         tabs.push(new_id.clone());
@@ -1750,6 +1775,10 @@ fn app() -> Element {
                     tracing::info!("MenuAction::Planner triggered");
                     chat_command.set(Some(ChatCommand::TogglePlanner));
                 }
+                MenuAction::Fleet => {
+                    tracing::info!("MenuAction::Fleet triggered");
+                    chat_command.set(Some(ChatCommand::ToggleFleet));
+                }
                 MenuAction::Profile => {
                     tracing::info!("MenuAction::Profile triggered");
                     chat_command.set(Some(ChatCommand::ToggleProfile));
@@ -1778,6 +1807,7 @@ fn app() -> Element {
                         "view_history" => Some(MenuAction::History),
                         "view_mcp" => Some(MenuAction::Mcp),
                         "view_planner" => Some(MenuAction::Planner),
+                        "view_fleet" => Some(MenuAction::Fleet),
                         "view_profile" => Some(MenuAction::Profile),
                         "view_attachments" => Some(MenuAction::Attachments),
                         _ => None,
@@ -2207,6 +2237,23 @@ fn app() -> Element {
                         let now_active = !*planner_active.peek();
                         planner_active.set(now_active);
                     }
+                    if *planner_active.peek() {
+                        fleet_active.set(false);
+                    }
+                }
+                ChatCommand::ToggleFleet => {
+                    // Mirror of TogglePlanner: first invocation opens+focuses,
+                    // then toggles; the ✕ is the only way to close the tab.
+                    if !*fleet_tab_open.peek() {
+                        fleet_tab_open.set(true);
+                        fleet_active.set(true);
+                    } else {
+                        let now_active = !*fleet_active.peek();
+                        fleet_active.set(now_active);
+                    }
+                    if *fleet_active.peek() {
+                        planner_active.set(false);
+                    }
                 }
                 ChatCommand::DeleteSession(target_id) => {
                     if !target_id.is_empty() {
@@ -2219,8 +2266,19 @@ fn app() -> Element {
                     }
                 }
                 ChatCommand::CloseTab => {
-                    let idx = *active_tab_index.read();
-                    close_tab_fn(idx);
+                    // Cmd+W closes what the user is looking at: an active
+                    // planner/fleet view closes its own tab; only when a chat
+                    // is forward does it close the chat tab.
+                    if *fleet_active.peek() {
+                        fleet_active.set(false);
+                        fleet_tab_open.set(false);
+                    } else if *planner_active.peek() {
+                        planner_active.set(false);
+                        planner_tab_open.set(false);
+                    } else {
+                        let idx = *active_tab_index.read();
+                        close_tab_fn(idx);
+                    }
                 }
                 ChatCommand::SwitchToSession(session_id) => {
                     // Lazy hydration: sessions opened from History may not be
@@ -2477,20 +2535,34 @@ fn app() -> Element {
                                             on_new_tab: move |_| new_tab_fn(),
                                             planner_tab_open: *planner_tab_open.read(),
                                             planner_active: *planner_active.read(),
-                                            on_select_planner: move |_| planner_active.set(true),
+                                            on_select_planner: move |_| {
+                                                planner_active.set(true);
+                                                fleet_active.set(false);
+                                            },
                                             on_close_planner: move |_| {
                                                 planner_active.set(false);
                                                 planner_tab_open.set(false);
+                                            },
+                                            fleet_tab_open: *fleet_tab_open.read(),
+                                            fleet_active: *fleet_active.read(),
+                                            fleet_attention: fleet_state.read().attention_count(),
+                                            on_select_fleet: move |_| {
+                                                fleet_active.set(true);
+                                                planner_active.set(false);
+                                            },
+                                            on_close_fleet: move |_| {
+                                                fleet_active.set(false);
+                                                fleet_tab_open.set(false);
                                             },
                                         }
                                     }
                                 }
 
-                                // ChatWindow stays mounted while the planner is shown —
-                                // unmounting it mid-stream would drop live streaming
-                                // updates, so visibility is toggled with CSS instead.
+                                // ChatWindow stays mounted while the planner or fleet
+                                // is shown — unmounting it mid-stream would drop live
+                                // streaming updates, so visibility is toggled with CSS.
                                 div {
-                                    class: if *planner_active.read() { "hidden" } else { "flex-1 flex flex-col min-h-0 min-w-0" },
+                                    class: if *planner_active.read() || *fleet_active.read() { "hidden" } else { "flex-1 flex flex-col min-h-0 min-w-0" },
                                     components::chat::ChatWindow {
                                         on_content_resize: move |_| {},
                                         on_interaction: move |_| {},
@@ -2500,6 +2572,12 @@ fn app() -> Element {
                                     div {
                                         class: "flex-1 min-h-0 min-w-0",
                                         components::planner_view::PlannerView {}
+                                    }
+                                }
+                                if *fleet_active.read() {
+                                    div {
+                                        class: "flex-1 min-h-0 min-w-0 flex flex-col",
+                                        components::fleet_view::FleetView {}
                                     }
                                 }
                             }

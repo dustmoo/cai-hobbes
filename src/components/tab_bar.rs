@@ -19,6 +19,14 @@ pub struct TabBarProps {
     pub planner_active: bool,
     pub on_select_planner: EventHandler<()>,
     pub on_close_planner: EventHandler<()>,
+    /// The fleet tab follows the planner-tab idiom: an app view pinned to
+    /// the strip, open/active tracked separately.
+    pub fleet_tab_open: bool,
+    pub fleet_active: bool,
+    /// Sessions needing the user right now — badges the fleet chip.
+    pub fleet_attention: usize,
+    pub on_select_fleet: EventHandler<()>,
+    pub on_close_fleet: EventHandler<()>,
 }
 
 pub fn TabBar(props: TabBarProps) -> Element {
@@ -53,7 +61,9 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     // A session tab is never shown active while the planner tab
                     // is — the session stays *selected* underneath, but exactly
                     // one tab may carry the active styling.
-                    let is_active = idx == props.active_tab_index && !props.planner_active;
+                    let is_active = idx == props.active_tab_index
+                        && !props.planner_active
+                        && !props.fleet_active;
                     let session_name = props.tab_names.get(idx)
                         .cloned()
                         .unwrap_or_else(|| "Unknown Session".to_string());
@@ -216,6 +226,48 @@ pub fn TabBar(props: TabBarProps) -> Element {
                         onclick: move |evt| {
                             evt.stop_propagation();
                             props.on_close_planner.call(());
+                        },
+                        Icon {
+                            icon: fi_icons::FiX,
+                            width: 12,
+                            height: 12,
+                        }
+                    }
+                }
+            }
+
+            // Fleet tab — same pinned-app-view idiom as the planner, plus an
+            // attention badge (sessions waiting on the user).
+            if props.fleet_tab_open {
+                div {
+                    class: if props.fleet_active {
+                        "group relative flex items-center h-full px-3 cursor-pointer shrink-0 select-none bg-card border-b-2 border-b-primary-500"
+                    } else {
+                        "group relative flex items-center h-full px-3 cursor-pointer shrink-0 select-none hover:bg-card"
+                    },
+                    onclick: move |_| props.on_select_fleet.call(()),
+                    Icon {
+                        icon: fi_icons::FiMonitor,
+                        width: 12,
+                        height: 12,
+                        class: if props.fleet_active { "text-fg mr-1.5" } else { "text-fg-muted mr-1.5" },
+                    }
+                    span {
+                        class: if props.fleet_active { "text-xs text-fg font-medium" } else { "text-xs text-fg-muted" },
+                        "Fleet"
+                    }
+                    if props.fleet_attention > 0 {
+                        span {
+                            class: "ml-1.5 px-1.5 rounded-full text-[10px] font-bold",
+                            style: "background-color: #f59e0b22; color: #f59e0b; border: 1px solid #f59e0b;",
+                            "{props.fleet_attention}"
+                        }
+                    }
+                    button {
+                        class: "ml-2 p-0.5 rounded-md hover:bg-red-500/20 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity",
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            props.on_close_fleet.call(());
                         },
                         Icon {
                             icon: fi_icons::FiX,

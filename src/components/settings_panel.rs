@@ -3407,6 +3407,42 @@ pub fn SettingsPanel() -> Element {
                                         }
                                     }
 
+                                    // Planner Icon
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-fg-muted", "Show Planner Icon" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                            checked: "{ui_state.read().show_planner_icon}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.show_planner_icon = e.value() == "true";
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+
+                                    // Fleet Icon
+                                    div {
+                                        class: "flex items-center justify-between",
+                                        label { class: "text-sm text-fg-muted", "Show Fleet Icon" }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                            checked: "{ui_state.read().show_fleet_icon}",
+                                            onchange: move |e| {
+                                                let mut state = ui_state.write();
+                                                state.show_fleet_icon = e.value() == "true";
+                                                let state_clone = (*state).clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+
                                     // Session Cost Icon
                                     div {
                                         class: "flex items-center justify-between",
@@ -5899,7 +5935,7 @@ fn FleetSection() -> Element {
             "#22c55e",
             "Connected".to_string(),
             format!(
-                "Watching {session_count} session{} · port {cp}. Sessions appear in Planner → Fleet.",
+                "Watching {session_count} session{} · port {cp}. Sessions appear in the Fleet tab.",
                 if session_count == 1 { "" } else { "s" }
             ),
         ),

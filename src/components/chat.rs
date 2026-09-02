@@ -314,6 +314,21 @@ pub fn ChatWindow(
 
                 // Indicate activity immediately
                 stream_manager.streaming_sessions.write().insert(active_session_id.clone());
+                // Approval given: the fleet row stops waiting right away
+                // (continuation would report too, but only after the tools run).
+                if crate::fleet::bridge::enabled() {
+                    let name = session_state
+                        .peek()
+                        .sessions
+                        .get(&active_session_id)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    crate::fleet::bridge::report(
+                        &active_session_id,
+                        &name,
+                        crate::fleet::bridge::HobbesSignal::TurnStarted,
+                    );
+                }
                 // Clear the signal so we don't re-trigger loop
                 has_pending_approvals.set(false);
 

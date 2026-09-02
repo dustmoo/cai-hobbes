@@ -39,13 +39,12 @@ fn now_line_offset(now_min: i64, day_start: u32, day_end: u32) -> Option<f64> {
     Some((now_min - day_start as i64) as f64 / 60.0 * PX_PER_HOUR)
 }
 
-/// What the centre column is showing: a built-in view, a single project, or
-/// the fleet panel (Pro).
+/// What the centre column is showing: a built-in view or a single project.
+/// (The fleet lives in its own top-level tab, not in this rail.)
 #[derive(Clone, Debug, PartialEq)]
 enum PlannerSelection {
     View(TodoView),
     Project(String),
-    Fleet,
 }
 
 /// Which timeline block is selected on the Today rail. Provided at the
@@ -519,8 +518,6 @@ fn empty_state_line(selection: &PlannerSelection) -> &'static str {
         PlannerSelection::View(TodoView::Someday) => "Nothing on the back burner.",
         PlannerSelection::View(TodoView::Logbook) => "Nothing finished yet.",
         PlannerSelection::Project(_) => "No todos in this project yet.",
-        // The fleet renders its own empty state; no todo list exists there.
-        PlannerSelection::Fleet => "",
     }
 }
 
@@ -546,7 +543,6 @@ fn todos_for_selection(state: &PlannerState, selection: &PlannerSelection, day: 
             });
             out
         }
-        PlannerSelection::Fleet => Vec::new(),
     }
 }
 
@@ -858,12 +854,7 @@ fn RailItem<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static
 #[component]
 fn LeftRail(mut selection: Signal<PlannerSelection>) -> Element {
     let planner = use_context::<Signal<PlannerState>>();
-    let settings = use_context::<Signal<Settings>>();
-    let fleet_state = use_context::<Signal<crate::fleet::FleetState>>();
     let day = today();
-
-    let show_fleet = settings.read().fleet_enabled && crate::entitlement::pro_active();
-    let fleet_attention = fleet_state.read().attention_count();
 
     let state = planner.read();
     let count = |view: TodoView| views::in_view(&state.todos, view, day).len();
@@ -959,18 +950,6 @@ fn LeftRail(mut selection: Signal<PlannerSelection>) -> Element {
                 onclick: move |_| selection.set(PlannerSelection::View(TodoView::Logbook)),
             }
 
-            // Fleet (Pro surface): only when the feature is on AND Pro is
-            // active. The badge counts sessions waiting on the user.
-            if show_fleet {
-                RailItem {
-                    icon: fi_icons::FiMonitor,
-                    label: "Fleet",
-                    count: fleet_attention,
-                    selected: sel == PlannerSelection::Fleet,
-                    onclick: move |_| selection.set(PlannerSelection::Fleet),
-                }
-            }
-
             if has_tree {
                 div { class: "my-2 border-t border-faint" }
             }
@@ -1022,15 +1001,8 @@ fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
     let planner = use_context::<Signal<PlannerState>>();
     let sel = selection.read().clone();
 
-    // The fleet panel replaces the todo column wholesale — it has its own
-    // header, list, and empty state.
-    if sel == PlannerSelection::Fleet {
-        return rsx! { crate::components::fleet_view::FleetView {} };
-    }
-
     let title = match &sel {
         PlannerSelection::View(v) => view_title(*v).to_string(),
-        PlannerSelection::Fleet => unreachable!("handled above"),
         PlannerSelection::Project(id) => planner
             .read()
             .projects

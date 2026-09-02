@@ -34,6 +34,8 @@ pub enum ChatCommand {
     ToggleMcp,
     /// Show/hide the full-width Planner view in place of the chat column.
     TogglePlanner,
+    /// Show/hide the full-width Fleet view (its own tab, planner idiom).
+    ToggleFleet,
     NewChat,
     NewChatWithMemory,
     ScrollToBottom,
@@ -201,6 +203,7 @@ pub fn ChatInput(
                 | ChatCommand::ToggleHistory
                 | ChatCommand::ToggleMcp
                 | ChatCommand::TogglePlanner
+                | ChatCommand::ToggleFleet
                 | ChatCommand::StartTodoInChat(_)
                 | ChatCommand::SwitchToSettingsTab(_, _)
                 | ChatCommand::SwitchTab(_)
@@ -807,7 +810,14 @@ pub fn ChatInput(
                 ChatBarIconButton {
                     icon: fi_icons::FiCheckSquare,
                     onclick: move |_| chat_command.set(Some(ChatCommand::TogglePlanner)),
+                    visible: ui_state.read().show_planner_icon,
                     title: "Planner"
+                }
+                ChatBarIconButton {
+                    icon: fi_icons::FiMonitor,
+                    onclick: move |_| chat_command.set(Some(ChatCommand::ToggleFleet)),
+                    visible: ui_state.read().show_fleet_icon,
+                    title: "Fleet"
                 }
                 SessionCostIcon {}
 

@@ -13,6 +13,8 @@ use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
 use crate::fleet::{self, AttentionKind, FleetSession, FleetStatus};
+#[allow(unused_imports)]
+use crate::fleet::FleetOrigin;
 use crate::todo::model::format_minutes;
 
 /// "just now" / "3m ago" / "2h ago" — fleet rows churn too fast for dates.
@@ -317,7 +319,11 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
             style: "{row_style}",
             div {
                 class: "flex items-center gap-3",
-                Icon { width: 16, height: 16, icon: fi_icons::FiTerminal }
+                if session.origin == fleet::FleetOrigin::Hobbes {
+                    Icon { width: 16, height: 16, icon: fi_icons::FiMessageSquare }
+                } else {
+                    Icon { width: 16, height: 16, icon: fi_icons::FiTerminal }
+                }
                 div {
                     class: "flex-1 min-w-0",
                     div {
@@ -329,7 +335,14 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                             "{chip_label}"
                         }
                     }
-                    p { class: "text-xs text-fg-muted truncate", "{session.cwd}" }
+                    p {
+                        class: "text-xs text-fg-muted truncate",
+                        if session.origin == fleet::FleetOrigin::Hobbes {
+                            "Hobbes chat tab"
+                        } else {
+                            "{session.cwd}"
+                        }
+                    }
                 }
                 div {
                     class: "text-right shrink-0",

@@ -2040,6 +2040,10 @@ pub struct UiState {
     pub show_attachments_icon: bool,
     #[serde(default = "default_true")]
     pub show_model_selector: bool,
+    #[serde(default = "default_true")]
+    pub show_planner_icon: bool,
+    #[serde(default = "default_true")]
+    pub show_fleet_icon: bool,
     /// Whether model quick-switch slots section is expanded in settings
     #[serde(default = "default_true")]
     pub show_model_slots: bool,
@@ -2052,6 +2056,16 @@ pub struct UiState {
     /// Currently focused tab index (0-based)
     #[serde(default)]
     pub active_tab_index: usize,
+    /// App-view tabs (planner/fleet) survive restarts: whether each tab is
+    /// in the strip, and whether it was the focused view at exit.
+    #[serde(default)]
+    pub planner_tab_open: bool,
+    #[serde(default)]
+    pub planner_active: bool,
+    #[serde(default)]
+    pub fleet_tab_open: bool,
+    #[serde(default)]
+    pub fleet_active: bool,
 }
 
 fn default_token_display_mode() -> String {
@@ -2084,6 +2098,10 @@ impl Default for UiState {
             llm_config_collapsed: false,
             open_tabs: Vec::new(),
             active_tab_index: 0,
+            planner_tab_open: false,
+            planner_active: false,
+            fleet_tab_open: false,
+            fleet_active: false,
             mcp_instructions_collapsed: false,
             composio_toolkit_expanded: false,
             selected_byoa_slug: None,
@@ -2095,6 +2113,8 @@ impl Default for UiState {
             show_provider_selector: true,
             show_attachments_icon: true,
             show_model_selector: true,
+            show_planner_icon: true,
+            show_fleet_icon: true,
             show_model_slots: true,
         }
     }
