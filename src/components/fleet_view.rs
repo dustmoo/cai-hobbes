@@ -108,6 +108,12 @@ pub fn FleetView() -> Element {
             // something actually needs the user.
             div {
                 class: "px-6 pt-6 pb-3 flex items-center gap-3 flex-wrap",
+                Icon {
+                    icon: crate::components::pixel_icons::HobbesInvader,
+                    width: 22,
+                    height: 16,
+                    class: "text-fg",
+                }
                 h1 { class: "text-xl font-semibold", "Fleet" }
                 // Listener state as a glanceable icon — the port itself is
                 // debug info and lives in the log ("fleet: listening on …").

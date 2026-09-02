@@ -247,9 +247,9 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     },
                     onclick: move |_| props.on_select_fleet.call(()),
                     Icon {
-                        icon: fi_icons::FiMonitor,
-                        width: 12,
-                        height: 12,
+                        icon: crate::components::pixel_icons::HobbesInvader,
+                        width: 13,
+                        height: 10,
                         class: if props.fleet_active { "text-fg mr-1.5" } else { "text-fg-muted mr-1.5" },
                     }
                     span {
