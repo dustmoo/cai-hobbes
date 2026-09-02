@@ -48,6 +48,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_SET_TIMER",
     "HOBBES_LIST_TIMERS",
     "HOBBES_CANCEL_TIMER",
+    "HOBBES_FLEET_STATUS",
     "HOBBES_TODO_CREATE",
     "HOBBES_TODO_UPDATE",
     "HOBBES_TODO_LIST",
@@ -65,6 +66,13 @@ pub fn is_builtin_tool(name: &str) -> bool {
 /// Whether a tool belongs to the `hobbes-planner` virtual server. Used both to
 /// gate dispatch on `settings.planner_enabled` and to withhold the tool
 /// definitions from the prompt when the planner is off (system_context.rs).
+/// Whether a tool belongs to the fleet family — gated on
+/// `fleet_enabled && pro_active()` both at dispatch and when withholding
+/// definitions from the prompt (system_context.rs).
+pub fn is_fleet_tool(name: &str) -> bool {
+    name == "HOBBES_FLEET_STATUS"
+}
+
 pub fn is_planner_tool(name: &str) -> bool {
     name.starts_with("HOBBES_TODO_")
         || matches!(
@@ -157,6 +165,35 @@ pub async fn dispatch_builtin_tool(
                 status,
                 response,
                 persist: true,
+            })
+        }
+
+        "HOBBES_FLEET_STATUS" => {
+            // Belt + braces with the prompt-side withholding: a stale prompt
+            // can still emit the call after the fleet is switched off.
+            if !(deps.settings.read().fleet_enabled && crate::entitlement::pro_active()) {
+                return Some(BuiltinOutcome {
+                    status: ToolCallStatus::Error,
+                    response: "Fleet observation is disabled in Settings.".to_string(),
+                    persist: false,
+                });
+            }
+            let now = chrono::Utc::now();
+            let today = chrono::Local::now().date_naive();
+            let live = crate::fleet::shared().snapshot();
+            let ended_today: Vec<crate::fleet::FleetSession> =
+                crate::fleet::store::sessions_active_on(today)
+                    .into_iter()
+                    .filter(|r| !live.sessions.contains_key(&r.id))
+                    .collect();
+            let filter = args_json.get("session").and_then(|v| v.as_str());
+            let report =
+                crate::fleet::briefs::status_report(&live, &ended_today, filter, now, today);
+            Some(BuiltinOutcome {
+                status: ToolCallStatus::Completed,
+                response: serde_json::to_string_pretty(&report)
+                    .unwrap_or_else(|_| report.to_string()),
+                persist: false,
             })
         }
 

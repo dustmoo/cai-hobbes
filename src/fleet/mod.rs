@@ -41,6 +41,7 @@
 pub mod bridge;
 pub mod briefs;
 pub mod events;
+pub mod mention;
 pub mod hooks_config;
 pub mod server;
 pub mod store;
@@ -57,6 +58,13 @@ use events::FleetEvent;
 /// No events for this long while Working → the sweep shows the session as
 /// Idle, and unproven span tails are capped at this length.
 pub const STALENESS_MINUTES: i64 = 10;
+
+/// Idle this long with no events → the session retires off the live board
+/// (ended_at = its last event; history and banked time stay in the DB, and
+/// any later event resurrects it — see the revival path in `server`/`bridge`).
+/// Needs-attention sessions never retire: things waiting on the user must
+/// not fall off silently.
+pub const RETIRE_MINUTES: i64 = 60;
 
 /// `fleet_port` / `fleet_token` meta keys (session_store `meta` table).
 pub const META_FLEET_PORT: &str = "fleet_port";
@@ -140,9 +148,15 @@ pub struct FleetSession {
     pub last_event_at: DateTime<Utc>,
     /// Open Working span start. Survives a stale→Idle sweep (see module docs).
     pub working_since: Option<DateTime<Utc>>,
-    /// Banked active minutes per **local** day.
+    /// Banked active minutes per **local** day (legacy rows; new banking
+    /// goes to `day_seconds` — always read both via [`Self::minutes_on`]).
     #[serde(default)]
     pub day_minutes: BTreeMap<NaiveDate, u32>,
+    /// Banked active seconds per **local** day. Seconds, because chat-style
+    /// turns often run under a minute and per-span minute flooring silently
+    /// zeroed them out.
+    #[serde(default)]
+    pub day_seconds: BTreeMap<NaiveDate, u32>,
     /// When set, PermissionRequests for this session are answered with an
     /// immediate empty-body passthrough (terminal prompt appears; no UI hold).
     #[serde(default)]
@@ -176,6 +190,7 @@ impl FleetSession {
             last_event_at: now,
             working_since: None,
             day_minutes: BTreeMap::new(),
+            day_seconds: BTreeMap::new(),
             auto_passthrough: false,
             ended_at: None,
             pending_gate: None,
@@ -186,20 +201,30 @@ impl FleetSession {
         }
     }
 
+    /// Banked seconds on local day `date` (legacy minute rows included).
+    pub fn banked_seconds_on(&self, date: NaiveDate) -> u32 {
+        self.day_minutes
+            .get(&date)
+            .copied()
+            .unwrap_or(0)
+            .saturating_mul(60)
+            .saturating_add(self.day_seconds.get(&date).copied().unwrap_or(0))
+    }
+
     /// Banked + live-span minutes attributable to local day `date` as of
-    /// `now`. The live span is capped at [`STALENESS_MINUTES`] past the last
-    /// event — an unclosed span never banks more than the staleness window
-    /// beyond its last proof of life.
+    /// `now` (summed in seconds, floored once at the end — twenty 45-second
+    /// turns are 15 minutes, not zero). The live span is capped at
+    /// [`STALENESS_MINUTES`] past the last event — an unclosed span never
+    /// banks more than the staleness window beyond its last proof of life.
     pub fn minutes_on(&self, date: NaiveDate, now: DateTime<Utc>) -> u32 {
-        let banked = self.day_minutes.get(&date).copied().unwrap_or(0);
         let live = match self.working_since {
             Some(since) => {
                 let end = capped_span_end(now, self.last_event_at);
-                span_minutes_on(since, end, date)
+                span_seconds_on(since, end, date)
             }
             None => 0,
         };
-        banked.saturating_add(live)
+        self.banked_seconds_on(date).saturating_add(live) / 60
     }
 }
 
@@ -251,7 +276,7 @@ fn capped_span_end(now: DateTime<Utc>, last_event_at: DateTime<Utc>) -> DateTime
 
 /// UTC bounds of a **local** calendar day (same convention as
 /// `todo::model`'s day math).
-fn local_day_bounds_utc(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
+pub(crate) fn local_day_bounds_utc(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
     let start_local = Local
         .from_local_datetime(&date.and_hms_opt(0, 0, 0).expect("midnight exists"))
         .earliest()
@@ -272,8 +297,8 @@ fn local_day_bounds_utc(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
     )
 }
 
-/// Whole minutes of `[start, end)` that fall on local day `date`.
-fn span_minutes_on(start: DateTime<Utc>, end: DateTime<Utc>, date: NaiveDate) -> u32 {
+/// Whole seconds of `[start, end)` that fall on local day `date`.
+fn span_seconds_on(start: DateTime<Utc>, end: DateTime<Utc>, date: NaiveDate) -> u32 {
     if end <= start {
         return 0;
     }
@@ -281,16 +306,16 @@ fn span_minutes_on(start: DateTime<Utc>, end: DateTime<Utc>, date: NaiveDate) ->
     let from = start.max(day_start);
     let to = end.min(day_end);
     if to > from {
-        (to - from).num_minutes().max(0) as u32
+        (to - from).num_seconds().max(0) as u32
     } else {
         0
     }
 }
 
-/// Bank a closed span into the per-local-day minute map, splitting at local
+/// Bank a closed span into the per-local-day seconds map, splitting at local
 /// midnight so each day gets its share.
 fn bank_span(
-    day_minutes: &mut BTreeMap<NaiveDate, u32>,
+    day_seconds: &mut BTreeMap<NaiveDate, u32>,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) {
@@ -300,9 +325,9 @@ fn bank_span(
     let mut day = start.with_timezone(&Local).date_naive();
     let last = end.with_timezone(&Local).date_naive();
     while day <= last {
-        let m = span_minutes_on(start, end, day);
-        if m > 0 {
-            *day_minutes.entry(day).or_insert(0) += m;
+        let s = span_seconds_on(start, end, day);
+        if s > 0 {
+            *day_seconds.entry(day).or_insert(0) += s;
         }
         let Some(next) = day.succ_opt() else { break };
         day = next;
@@ -331,7 +356,7 @@ pub fn reduce(state: &mut FleetState, ev: &FleetEvent, now: DateTime<Utc>) -> Ve
     let close_span = |session: &mut FleetSession, proven_end: Option<DateTime<Utc>>| {
         if let Some(since) = session.working_since.take() {
             let end = proven_end.unwrap_or_else(|| capped_span_end(now, session.last_event_at));
-            bank_span(&mut session.day_minutes, since, end);
+            bank_span(&mut session.day_seconds, since, end);
         }
     };
 
@@ -527,6 +552,29 @@ pub fn sweep_stale(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSessi
     changed
 }
 
+/// Retirement sweep: Idle sessions silent past [`RETIRE_MINUTES`] leave the
+/// live map with `ended_at` set to their last event (no span is open — the
+/// stale→Idle sweep or a Stop closed it long before). Working and
+/// needs-attention sessions are exempt: work proves itself with events, and
+/// attention must never fall off the board unanswered.
+pub fn sweep_retired(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSession> {
+    let cutoff = now - chrono::Duration::minutes(RETIRE_MINUTES);
+    let retire: Vec<String> = state
+        .sessions
+        .values()
+        .filter(|s| s.status == FleetStatus::Idle && s.last_event_at < cutoff)
+        .map(|s| s.id.clone())
+        .collect();
+    let mut rows = Vec::new();
+    for id in retire {
+        if let Some(mut s) = state.sessions.remove(&id) {
+            s.ended_at = Some(s.last_event_at);
+            rows.push(s);
+        }
+    }
+    rows
+}
+
 // ── Day aggregation ─────────────────────────────────────────────────────────
 
 /// Fleet minutes on a local day from the live map only.
@@ -542,6 +590,28 @@ pub fn live_minutes_on(state: &FleetState, date: NaiveDate, now: DateTime<Utc>) 
 /// filters to `ended_at IS NOT NULL`, so nothing double-counts.
 pub fn fleet_agent_minutes_on(state: &FleetState, date: NaiveDate, now: DateTime<Utc>) -> u32 {
     live_minutes_on(state, date, now).saturating_add(store::ended_minutes_on(date))
+}
+
+/// The exocortex multiplier: agent minutes banked today over clock minutes
+/// elapsed since the fleet's first observed activity today. Parallel
+/// sessions are what push it above 1×. Returns `(multiplier,
+/// elapsed_minutes)`; `None` when there's nothing meaningful to divide
+/// (no activity, or under 5 elapsed minutes — a fresh day would show a
+/// silly spike otherwise).
+pub fn exocortex_multiplier(
+    agent_minutes: u32,
+    first_event_today: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<(f64, u32)> {
+    let first = first_event_today?;
+    let elapsed_min = (now - first).num_minutes();
+    if agent_minutes == 0 || elapsed_min < 5 {
+        return None;
+    }
+    Some((
+        agent_minutes as f64 / elapsed_min as f64,
+        elapsed_min as u32,
+    ))
 }
 
 /// The Today rail's agent-lane figure. In-app agent focus minutes and fleet
@@ -911,8 +981,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].ended_at.is_some());
         // 2 minutes of working span banked (under the cap).
-        let total: u32 = rows[0].day_minutes.values().sum();
-        assert_eq!(total, 2);
+        let total: u32 = rows[0].day_seconds.values().sum();
+        assert_eq!(total, 120);
     }
 
     #[test]
@@ -931,8 +1001,8 @@ mod tests {
             },
             local_at(day, 12, 0),
         );
-        let total: u32 = rows[0].day_minutes.values().sum();
-        assert_eq!(total, STALENESS_MINUTES as u32);
+        let total: u32 = rows[0].day_seconds.values().sum();
+        assert_eq!(total, STALENESS_MINUTES as u32 * 60);
     }
 
     #[test]
@@ -946,8 +1016,8 @@ mod tests {
         assert_eq!(s.status, FleetStatus::Working);
         assert_eq!(s.working_since, Some(local_at(day, 10, 0)));
         assert_eq!(
-            s.day_minutes.get(&day).copied().unwrap_or(0),
-            STALENESS_MINUTES as u32
+            s.banked_seconds_on(day),
+            STALENESS_MINUTES as u32 * 60
         );
     }
 
@@ -993,6 +1063,45 @@ mod tests {
     }
 
     #[test]
+    fn retirement_clears_idle_sessions_but_never_attention() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T09:00:00Z");
+        // Idle long ago; working recently; waiting on the user for hours.
+        reduce(&mut state, &start("old-idle"), t0);
+        reduce(&mut state, &stop("old-idle"), t0 + chrono::Duration::minutes(1));
+        reduce(
+            &mut state,
+            &start("fresh"),
+            t0 + chrono::Duration::minutes(90),
+        );
+        reduce(
+            &mut state,
+            &FleetEvent::Notification {
+                session_id: "stuck-gate".into(),
+                cwd: "/x".into(),
+                kind: "permission_prompt".into(),
+                message: "needs you".into(),
+            },
+            t0,
+        );
+
+        let sweep_at = t0 + chrono::Duration::minutes(95);
+        let retired = sweep_retired(&mut state, sweep_at);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].id, "old-idle");
+        assert_eq!(
+            retired[0].ended_at,
+            Some(t0 + chrono::Duration::minutes(1)),
+            "retires at its last event, not at sweep time"
+        );
+        assert!(state.sessions.contains_key("fresh"));
+        assert!(
+            state.sessions.contains_key("stuck-gate"),
+            "attention never falls off the board silently"
+        );
+    }
+
+    #[test]
     fn live_span_display_is_capped_at_the_staleness_window() {
         let mut state = FleetState::default();
         let day = date("2026-08-25");
@@ -1009,14 +1118,39 @@ mod tests {
     }
 
     #[test]
+    fn sub_minute_turns_accumulate_instead_of_flooring_to_zero() {
+        // The Hobbes-tab signature: many chat turns under a minute each.
+        // Per-span minute flooring banked all of them as 0.
+        let mut state = FleetState::default();
+        let day = date("2026-08-25");
+        let t0 = local_at(day, 9, 0);
+        for i in 0..20u32 {
+            let turn_start = t0 + chrono::Duration::seconds(i as i64 * 120);
+            reduce(
+                &mut state,
+                &FleetEvent::PromptSubmit { session_id: "tab".into(), cwd: String::new() },
+                turn_start,
+            );
+            reduce(
+                &mut state,
+                &stop("tab"),
+                turn_start + chrono::Duration::seconds(45),
+            );
+        }
+        // 20 × 45s = 15 minutes, not 0.
+        let at = local_at(day, 10, 0);
+        assert_eq!(state.sessions["tab"].minutes_on(day, at), 15);
+    }
+
+    #[test]
     fn cross_midnight_span_splits_between_local_days() {
         let day1 = date("2026-08-24");
         let day2 = date("2026-08-25");
         let mut minutes = BTreeMap::new();
         // 23:40 → 00:20 local: 20 minutes on each side of midnight.
         bank_span(&mut minutes, local_at(day1, 23, 40), local_at(day2, 0, 20));
-        assert_eq!(minutes.get(&day1).copied(), Some(20));
-        assert_eq!(minutes.get(&day2).copied(), Some(20));
+        assert_eq!(minutes.get(&day1).copied(), Some(20 * 60));
+        assert_eq!(minutes.get(&day2).copied(), Some(20 * 60));
     }
 
     #[test]
@@ -1077,6 +1211,27 @@ mod tests {
             resolve_gate_in_state(&mut state, "g1", GateOutcome::Passthrough, now).unwrap();
         assert!(row.status.needs_attention(), "terminal prompt still waits on the user");
         assert!(row.pending_gate.is_none(), "gate is no longer actionable in-app");
+    }
+
+    #[test]
+    fn exocortex_multiplier_math_and_guards() {
+        let now = utc("2026-09-02T17:00:00Z");
+        let first = utc("2026-09-02T08:30:00Z"); // 510 elapsed minutes
+        // 8h27m agent time over 8.5h clock → ~1.0×; parallel day → >1.
+        let (m, elapsed) = exocortex_multiplier(507, Some(first), now).unwrap();
+        assert_eq!(elapsed, 510);
+        assert!((m - 0.994).abs() < 0.01);
+        let (m, _) = exocortex_multiplier(1020, Some(first), now).unwrap();
+        assert!(m > 1.9 && m < 2.1);
+        // Guards: no anchor, no minutes, or a just-started day → None.
+        assert!(exocortex_multiplier(507, None, now).is_none());
+        assert!(exocortex_multiplier(0, Some(first), now).is_none());
+        assert!(exocortex_multiplier(
+            10,
+            Some(now - chrono::Duration::minutes(3)),
+            now
+        )
+        .is_none());
     }
 
     #[test]
@@ -1172,8 +1327,8 @@ mod tests {
         assert_eq!(s.status, FleetStatus::Working);
         assert_eq!(s.working_since, Some(t_return));
         assert_eq!(
-            s.day_minutes.get(&day).copied().unwrap_or(0),
-            10 + STALENESS_MINUTES as u32,
+            s.banked_seconds_on(day),
+            (10 + STALENESS_MINUTES as u32) * 60,
             "10 proven + capped background tail, no idle-gap credit"
         );
     }

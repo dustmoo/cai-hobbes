@@ -158,6 +158,35 @@ impl CoreClient {
                 meta: None,
             },
             Tool {
+                name: "HOBBES_FLEET_STATUS".into(),
+                description: Some(
+                    "Live status of the user's coding-agent fleet: every Claude Code \
+                    terminal session and Hobbes chat tab observed today — status \
+                    (working / needs_attention / idle / ended), minutes of agent time, \
+                    re-entry brief (what it did, what it's blocked on), and any pending \
+                    permission approval. Read-only. Optionally filter by a name or \
+                    path substring."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "session": {
+                                "type": "string",
+                                "description": "Optional case-insensitive substring to match against session names or paths (e.g. 'puget')."
+                            }
+                        }
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("Fleet Status".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            Tool {
                 name: "HOBBES_CANCEL_TIMER".into(),
                 description: Some(
                     "Cancel a pending timer by its id (from the set-timer confirmation or \

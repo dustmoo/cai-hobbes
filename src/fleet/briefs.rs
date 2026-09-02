@@ -209,6 +209,111 @@ pub fn fleet_context_lines(
     rollup_lines(rows, date, now, cap)
 }
 
+/// Sessions included in a `HOBBES_FLEET_STATUS` report.
+pub const STATUS_MAX_SESSIONS: usize = 20;
+
+/// The `HOBBES_FLEET_STATUS` payload: live + ended-today sessions (deduped,
+/// live wins), optionally filtered by a case-insensitive name/cwd substring.
+/// Pure — callers hand in the snapshot and the day rows.
+pub fn status_report(
+    live: &FleetState,
+    ended_today: &[FleetSession],
+    filter: Option<&str>,
+    now: DateTime<Utc>,
+    today: NaiveDate,
+) -> serde_json::Value {
+    let needle = filter.map(str::to_lowercase).filter(|f| !f.is_empty());
+    let matches = |s: &FleetSession| {
+        needle.as_ref().is_none_or(|n| {
+            s.name.to_lowercase().contains(n) || s.cwd.to_lowercase().contains(n)
+        })
+    };
+    let mut rows: Vec<&FleetSession> = ended_today
+        .iter()
+        .filter(|r| !live.sessions.contains_key(&r.id))
+        .chain(live.sessions.values())
+        .filter(|s| matches(s))
+        .collect();
+    // Attention first, then live-before-ended, then most recent.
+    rows.sort_by(|a, b| {
+        b.status
+            .needs_attention()
+            .cmp(&a.status.needs_attention())
+            .then(a.ended_at.is_some().cmp(&b.ended_at.is_some()))
+            .then(b.last_event_at.cmp(&a.last_event_at))
+    });
+    let total = rows.len();
+    let sessions: Vec<serde_json::Value> = rows
+        .into_iter()
+        .take(STATUS_MAX_SESSIONS)
+        .map(|s| {
+            let (status, attention): (&str, Option<String>) = match &s.status {
+                super::FleetStatus::Working => ("working", None),
+                super::FleetStatus::WorkingBackground => ("working_background", None),
+                super::FleetStatus::Idle if s.ended_at.is_some() => ("ended", None),
+                super::FleetStatus::Idle => ("idle", None),
+                super::FleetStatus::NeedsAttention(kind) => (
+                    "needs_attention",
+                    Some(match kind {
+                        super::AttentionKind::Gate => "waiting on a permission approval".into(),
+                        super::AttentionKind::Notification { message, .. } => {
+                            truncate_summary(message, 160)
+                        }
+                    }),
+                ),
+            };
+            let mut v = serde_json::json!({
+                "name": s.name,
+                "origin": match s.origin {
+                    super::FleetOrigin::External => "claude_code",
+                    super::FleetOrigin::Hobbes => "hobbes_tab",
+                },
+                "status": status,
+                "minutes_today": s.minutes_on(today, now),
+                "last_event_minutes_ago": (now - s.last_event_at).num_minutes().max(0),
+            });
+            if s.origin == super::FleetOrigin::External && !s.cwd.is_empty() {
+                v["cwd"] = serde_json::json!(s.cwd);
+            }
+            if let Some(a) = attention {
+                v["attention"] = serde_json::json!(a);
+            }
+            if let Some(b) = &s.brief {
+                let mut brief = serde_json::json!({
+                    "headline": truncate_summary(&b.headline, HEADLINE_MAX_CHARS),
+                });
+                if !b.bullets.is_empty() {
+                    brief["details"] = serde_json::json!(b.bullets);
+                }
+                if let Some(blocked) = &b.blocked_on {
+                    brief["blocked_on"] = serde_json::json!(truncate_summary(blocked, 160));
+                }
+                v["brief"] = brief;
+            }
+            if let Some(g) = &s.pending_gate {
+                v["pending_approval"] = serde_json::json!({
+                    "tool": g.tool_name,
+                    "input": truncate_summary(&g.input_summary, 160),
+                });
+            }
+            v
+        })
+        .collect();
+
+    let mut report = serde_json::json!({
+        "date": today.format("%Y-%m-%d").to_string(),
+        "session_count": total,
+        "agent_minutes_today": super::live_minutes_on(live, today, now)
+            .saturating_add(ended_today.iter().map(|s| s.minutes_on(today, now)).sum()),
+        "sessions": sessions,
+    });
+    if total > STATUS_MAX_SESSIONS {
+        report["note"] =
+            serde_json::json!(format!("showing {STATUS_MAX_SESSIONS} of {total} sessions"));
+    }
+    report
+}
+
 /// The one-shot framing for `LlmConnector::generate_fleet_rollup`.
 pub fn rollup_framing(date: NaiveDate, lines: &[String], total_minutes: u32) -> String {
     format!(

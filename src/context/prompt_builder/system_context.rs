@@ -379,6 +379,11 @@ impl<'a> PromptBuilder<'a> {
             tools.retain(|t| !crate::components::builtin_tools::is_planner_tool(&t.name));
         }
 
+        // Fleet tools follow the fleet's own gate (not the planner's).
+        if !(self.settings.fleet_enabled && crate::entitlement::pro_active()) {
+            tools.retain(|t| !crate::components::builtin_tools::is_fleet_tool(&t.name));
+        }
+
         // Skill-scoped tool filtering: when a skill has resolved specific tools,
         // only include those tool definitions instead of ALL tools from ALL servers.
         // IMPORTANT: Only apply this filter when the skill call is the LAST meaningful

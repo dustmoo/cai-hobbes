@@ -2306,20 +2306,27 @@ fn app() -> Element {
                     let tabs = open_tabs.read().clone();
                     if !hydrated {
                         // Fall through to command clearing without switching.
-                    } else if let Some(idx) = tabs.iter().position(|id| id == &session_id) {
-                        active_tab_index.set(idx);
-                        current_session_id.set(session_id.clone());
-                        session_state.write().active_session_id = session_id.clone();
-                        sync_profile_from_session(&session_id);
                     } else {
-                        let mut new_tabs = tabs;
-                        new_tabs.push(session_id.clone());
-                        let new_idx = new_tabs.len() - 1;
-                        open_tabs.set(new_tabs);
-                        active_tab_index.set(new_idx);
-                        current_session_id.set(session_id.clone());
-                        session_state.write().active_session_id = session_id.clone();
-                        sync_profile_from_session(&session_id);
+                        // Bring the chat forward — an active planner/fleet
+                        // view would otherwise keep covering the switched-to
+                        // session (their tabs stay in the strip).
+                        planner_active.set(false);
+                        fleet_active.set(false);
+                        if let Some(idx) = tabs.iter().position(|id| id == &session_id) {
+                            active_tab_index.set(idx);
+                            current_session_id.set(session_id.clone());
+                            session_state.write().active_session_id = session_id.clone();
+                            sync_profile_from_session(&session_id);
+                        } else {
+                            let mut new_tabs = tabs;
+                            new_tabs.push(session_id.clone());
+                            let new_idx = new_tabs.len() - 1;
+                            open_tabs.set(new_tabs);
+                            active_tab_index.set(new_idx);
+                            current_session_id.set(session_id.clone());
+                            session_state.write().active_session_id = session_id.clone();
+                            sync_profile_from_session(&session_id);
+                        }
                     }
                 }
                 ChatCommand::NewChat => {

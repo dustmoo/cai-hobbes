@@ -93,6 +93,15 @@ pub fn report(session_id: &str, name: &str, signal: HobbesSignal) {
     let shared = super::shared();
     let changed = {
         let mut state = shared.state.lock().expect("fleet state lock poisoned");
+        // Revival: a reopened tab (or one that retired for inactivity)
+        // rejoins with its stored row, keeping banked time.
+        if !state.sessions.contains_key(ev.session_id()) {
+            if let Some(mut row) = store::load_session(ev.session_id()) {
+                row.ended_at = None;
+                row.pending_gate = None;
+                state.sessions.insert(row.id.clone(), row);
+            }
+        }
         let mut changed = super::reduce(&mut state, &ev, now);
         // Patch identity on the live entry and the persisted clones: origin
         // marker plus the human tab title (created rows start "(unknown)").

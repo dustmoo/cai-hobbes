@@ -75,6 +75,8 @@ enum AutocompleteMode {
     Skill,
     /// Unload a loaded skill: `/unload skillname`
     Unload,
+    /// Fleet session reference: `@sessionname` (expanded on send).
+    Fleet,
 }
 
 /// One-line preview of a queued message for its chip. Trims, caps length with an
@@ -574,6 +576,23 @@ pub fn ChatInput(
                 }
             }
         }
+
+        // Fleet @-mentions: append the mentioned sessions' current status as
+        // a frozen-at-send context block. Gated by the bridge's armed flag
+        // (fleet on + Pro) — the same condition under which names are shown
+        // in the autocomplete.
+        let user_message = if crate::fleet::bridge::enabled() {
+            let live = crate::fleet::shared().snapshot();
+            crate::fleet::mention::expand(
+                &user_message,
+                &live,
+                chrono::Utc::now(),
+                chrono::Local::now().date_naive(),
+            )
+            .unwrap_or(user_message)
+        } else {
+            user_message
+        };
 
         on_send.call((user_message, atts));
     });
@@ -1268,9 +1287,75 @@ pub fn ChatInput(
                                         show_skill_autocomplete.set(true);
                                     }
                                     None => {
-                                        show_skill_autocomplete.set(false);
-                                        filtered_skills.set(Vec::new());
-                                        autocomplete_token.set(None);
+                                        // No /skill token — offer fleet
+                                        // @-mentions when the fleet is armed.
+                                        let fleet_q = if crate::fleet::bridge::enabled() && cursor >= 0 {
+                                            crate::fleet::mention::mention_query_at(&val, cursor as usize)
+                                        } else {
+                                            None
+                                        };
+                                        match fleet_q {
+                                            Some(q) => {
+                                                autocomplete_mode.set(AutocompleteMode::Fleet);
+                                                let live = crate::fleet::shared().snapshot();
+                                                let today = chrono::Local::now().date_naive();
+                                                let now_utc = chrono::Utc::now();
+                                                let mut rows: Vec<&crate::fleet::FleetSession> = live
+                                                    .sessions
+                                                    .values()
+                                                    .filter(|s| {
+                                                        q.query.is_empty()
+                                                            || s.name
+                                                                .to_lowercase()
+                                                                .contains(&q.query.to_lowercase())
+                                                    })
+                                                    .collect();
+                                                rows.sort_by(|a, b| a.name.cmp(&b.name));
+                                                rows.dedup_by(|a, b| a.name == b.name);
+                                                let matches: Vec<Skill> = rows
+                                                    .into_iter()
+                                                    .map(|s| Skill {
+                                                        metadata: crate::skills::parser::SkillMetadata {
+                                                            name: s.name.clone(),
+                                                            description: {
+                                                                let mut d = format!(
+                                                                    "{} today",
+                                                                    crate::todo::model::format_minutes(
+                                                                        s.minutes_on(today, now_utc),
+                                                                    )
+                                                                );
+                                                                if let Some(b) = &s.brief {
+                                                                    d.push_str(" — ");
+                                                                    d.push_str(&crate::fleet::truncate_summary(
+                                                                        &b.headline,
+                                                                        80,
+                                                                    ));
+                                                                }
+                                                                d
+                                                            },
+                                                            disable_model_invocation: false,
+                                                            user_invocable: true,
+                                                            allowed_tools: None,
+                                                            argument_hint: None,
+                                                        },
+                                                        instructions: String::new(),
+                                                        path: std::path::PathBuf::new(),
+                                                        root_path: std::path::PathBuf::new(),
+                                                        scripts: Vec::new(),
+                                                        resources: Vec::new(),
+                                                    })
+                                                    .collect();
+                                                autocomplete_token.set(Some(q.token_range));
+                                                filtered_skills.set(matches);
+                                                skill_autocomplete_index.set(0);
+                                                show_skill_autocomplete.set(true);
+                                            }
+                                            None => {
+                                                show_skill_autocomplete.set(false);
+                                                filtered_skills.set(Vec::new());
+                                                autocomplete_token.set(None);
+                                            }
+                                        }
                                     }
                                 }
                             });
@@ -1384,9 +1469,9 @@ pub fn ChatInput(
                                                     tracing::info!("Populated draft with skill command: {}", skill_command);
                                                     crate::components::shared::set_chat_draft(draft, skill_command, None, true);
                                                 }
-                                                AutocompleteMode::Skill => {
-                                                    // Splice the completed /name into the in-progress
-                                                    // token's range, preserving surrounding text.
+                                                mode @ (AutocompleteMode::Skill | AutocompleteMode::Fleet) => {
+                                                    // Splice the completed /name (or @name) into the
+                                                    // in-progress token's range, preserving text.
                                                     let token_range: Option<(usize, usize)> =
                                                         *autocomplete_token.read();
                                                     // The stored range comes from an async cursor eval and can be
@@ -1402,7 +1487,11 @@ pub fn ChatInput(
                                                         .unwrap_or((0, current_draft.len().min(
                                                             current_draft.find(' ').unwrap_or(current_draft.len()),
                                                         )));
-                                                    let completed = format!("/{} ", skill.metadata.name);
+                                                    let completed = if mode == AutocompleteMode::Fleet {
+                                                        format!("@{} ", skill.metadata.name)
+                                                    } else {
+                                                        format!("/{} ", skill.metadata.name)
+                                                    };
                                                     let mut new_draft = String::with_capacity(
                                                         current_draft.len() + completed.len(),
                                                     );
@@ -1483,7 +1572,7 @@ pub fn ChatInput(
                                         true,
                                     );
                                 }
-                                AutocompleteMode::Skill => {
+                                mode @ (AutocompleteMode::Skill | AutocompleteMode::Fleet) => {
                                     // Splice into the in-progress token, preserving context
                                     let current_draft = draft.read().clone();
                                     let token_range: Option<(usize, usize)> = *autocomplete_token.read();
@@ -1497,7 +1586,11 @@ pub fn ChatInput(
                                                 && current_draft.is_char_boundary(*e)
                                         })
                                         .unwrap_or((0, current_draft.len()));
-                                    let completed = format!("/{} ", skill.metadata.name);
+                                    let completed = if mode == AutocompleteMode::Fleet {
+                                        format!("@{} ", skill.metadata.name)
+                                    } else {
+                                        format!("/{} ", skill.metadata.name)
+                                    };
                                     let mut new_draft = String::with_capacity(current_draft.len() + completed.len());
                                     new_draft.push_str(&current_draft[..start]);
                                     new_draft.push_str(&completed);

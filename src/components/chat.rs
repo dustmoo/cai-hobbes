@@ -1414,6 +1414,19 @@ pub fn MessageBubble(
             let display_mode = ui_state.read().token_display_mode.clone();
             let usage_data = message.usage.clone();
 
+            // User bubbles: an @-mention fleet expansion stays in the stored
+            // text (the model saw it; history is honest) but renders as a
+            // collapsed disclosure instead of cluttering the bubble.
+            let fleet_ref = use_memo(move || {
+                if is_user {
+                    crate::fleet::mention::split_expansion(&content())
+                        .map(|(m, b)| (m.to_string(), b.to_string()))
+                } else {
+                    None
+                }
+            });
+            let mut show_fleet_ref = use_signal(|| false);
+
             // Inline edit state (user-authored text messages only)
             let mut editing = use_signal(|| false);
             let mut edit_draft = use_signal(String::new);
@@ -1794,7 +1807,10 @@ pub fn MessageBubble(
                             } else {
                                 MarkdownRenderer {
                                     id: Some(message.id),
-                                    content: content(),
+                                    content: match fleet_ref() {
+                                        Some((main, _)) => main,
+                                        None => content(),
+                                    },
                                     comments: message.comments.clone(),
                                     pending_highlight: if *selection_mode.read() == SelectionMode::CommentInput {
                                         Some(selection_data.read().text.clone())
@@ -1840,7 +1856,28 @@ pub fn MessageBubble(
                                     }
                                 }
 
-                                if content().starts_with("[Hobbes encountered a persistent error") 
+                                // Collapsed fleet-status attachment (from an
+                                // @-mention expansion): pop open to review.
+                                if let Some((_, block)) = fleet_ref() {
+                                    button {
+                                        class: "mt-1 flex items-center gap-1 text-xs opacity-70 hover:opacity-100 transition-opacity select-none",
+                                        onclick: move |evt| {
+                                            evt.stop_propagation();
+                                            let v = !*show_fleet_ref.peek();
+                                            show_fleet_ref.set(v);
+                                        },
+                                        span { if *show_fleet_ref.read() { "▾" } else { "▸" } }
+                                        span { "fleet status attached…" }
+                                    }
+                                    if *show_fleet_ref.read() {
+                                        pre {
+                                            class: "mt-1 rounded bg-black/20 p-2 text-xs whitespace-pre-wrap break-words",
+                                            "{block}"
+                                        }
+                                    }
+                                }
+
+                                if content().starts_with("[Hobbes encountered a persistent error")
                                     || content().starts_with("⚠️ **Tool Not Available")
                                     || content().starts_with("⚠️ **Tool Connection Issue")
                                     || content().starts_with("⚠️ **Tool Call Error") {

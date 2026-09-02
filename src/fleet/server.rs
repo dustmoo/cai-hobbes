@@ -118,8 +118,11 @@ pub async fn start(shared: Arc<FleetShared>, cfg: FleetServerConfig) -> Result<F
                     _ = rx.changed() => break,
                     _ = tokio::time::sleep(Duration::from_secs(SWEEP_INTERVAL_SECS)) => {
                         let changed = {
+                            let now = chrono::Utc::now();
                             let mut state = shared.state.lock().expect("fleet state lock poisoned");
-                            sweep_stale(&mut state, chrono::Utc::now())
+                            let mut changed = sweep_stale(&mut state, now);
+                            changed.extend(crate::fleet::sweep_retired(&mut state, now));
+                            changed
                         };
                         if !changed.is_empty() {
                             store::persist_sessions(&changed);
@@ -273,6 +276,15 @@ async fn handle(
     let transcript_path = crate::fleet::events::transcript_path_from_body(&body);
     let auto_passthrough = {
         let mut state = shared.state.lock().expect("fleet state lock poisoned");
+        // Revival: an event for a session that retired (or resumed after
+        // SessionEnd) rejoins with its stored row, keeping banked time.
+        if !state.sessions.contains_key(event.session_id()) {
+            if let Some(mut row) = store::load_session(event.session_id()) {
+                row.ended_at = None;
+                row.pending_gate = None;
+                state.sessions.insert(row.id.clone(), row);
+            }
+        }
         let mut changed = reduce(&mut state, &event, now);
         crate::fleet::note_transcript_and_dirty(
             &mut state,

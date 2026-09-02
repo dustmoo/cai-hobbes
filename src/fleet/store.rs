@@ -131,6 +131,29 @@ pub fn upsert_session_conn(
     Ok(())
 }
 
+/// One row by id, live or ended — the revival path when an event arrives for
+/// a session that retired off the live map (its banked time must survive).
+pub fn load_session_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<FleetSession>> {
+    let data: Option<String> = conn
+        .query_row(
+            "SELECT data FROM fleet_sessions WHERE id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(data.and_then(|d| serde_json::from_str(&d).ok()))
+}
+
+pub fn load_session(session_id: &str) -> Option<FleetSession> {
+    if !is_available() {
+        return None;
+    }
+    with_conn(|conn| load_session_conn(conn, session_id)).unwrap_or(None)
+}
+
 /// Live rows (`ended_at IS NULL`) for startup hydration.
 pub fn load_live_conn(conn: &Connection) -> rusqlite::Result<Vec<FleetSession>> {
     let mut stmt = conn.prepare("SELECT data FROM fleet_sessions WHERE ended_at IS NULL")?;
@@ -168,7 +191,7 @@ pub fn ended_minutes_on_conn(
     let mut total: u32 = 0;
     for row in rows {
         if let Ok(s) = serde_json::from_str::<FleetSession>(&row?) {
-            total = total.saturating_add(s.day_minutes.get(&date).copied().unwrap_or(0));
+            total = total.saturating_add(s.banked_seconds_on(date) / 60);
         }
     }
     Ok(total)
@@ -196,7 +219,7 @@ pub fn sessions_active_on_conn(
         let Ok(s) = serde_json::from_str::<FleetSession>(&row?) else {
             continue;
         };
-        let active = s.day_minutes.get(&date).copied().unwrap_or(0) > 0
+        let active = s.banked_seconds_on(date) > 0
             || on_date(&s.last_event_at)
             || s.ended_at.as_ref().is_some_and(&on_date);
         if active {
@@ -232,6 +255,32 @@ pub fn merge_session_conn(
     apply(&mut session);
     upsert_session_conn(conn, &session, seq)?;
     Ok(true)
+}
+
+/// Timestamp of the first fleet event on local day `date` — the clock-time
+/// anchor for the exocortex multiplier. (Hobbes-tab activity doesn't append
+/// events; on a terminal-quiet day this can be None even with agent minutes.)
+pub fn first_event_on_conn(
+    conn: &Connection,
+    date: chrono::NaiveDate,
+) -> rusqlite::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let (start, end) = crate::fleet::local_day_bounds_utc(date);
+    let ts: Option<String> = conn
+        .query_row(
+            "SELECT MIN(created_at) FROM fleet_events WHERE created_at >= ?1 AND created_at < ?2",
+            params![fmt_ts(&start), fmt_ts(&end)],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(ts.and_then(|t| t.parse().ok()))
+}
+
+pub fn first_event_on(date: chrono::NaiveDate) -> Option<chrono::DateTime<chrono::Utc>> {
+    if !is_available() {
+        return None;
+    }
+    with_conn(|conn| first_event_on_conn(conn, date)).unwrap_or(None)
 }
 
 // ── Events ──────────────────────────────────────────────────────────────────
@@ -617,6 +666,26 @@ mod tests {
             )
             .unwrap();
             assert!(!merge_session_conn(conn, "bad", 9_003, |_| {}).unwrap());
+        });
+    }
+
+    #[test]
+    fn revival_round_trip_keeps_banked_time() {
+        with_db(|conn| {
+            // A retired row with banked seconds…
+            let mut s = sample("cc-1");
+            s.day_seconds.insert(date("2026-08-25"), 300);
+            s.ended_at = Some(utc("2026-08-25T11:00:00Z"));
+            s.status = FleetStatus::Idle;
+            s.working_since = None;
+            upsert_session_conn(conn, &s, 5).unwrap();
+
+            // …loads by id (the revival path), banked time intact.
+            let back = load_session_conn(conn, "cc-1").unwrap().unwrap();
+            assert_eq!(back.day_seconds.get(&date("2026-08-25")).copied(), Some(300));
+            assert_eq!(back.day_minutes.get(&date("2026-08-25")).copied(), Some(40));
+            assert!(back.ended_at.is_some());
+            assert!(load_session_conn(conn, "nope").unwrap().is_none());
         });
     }
 
