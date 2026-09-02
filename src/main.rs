@@ -449,6 +449,28 @@ fn app() -> Element {
                     match fleet::server::start_from_meta(shared.clone()).await {
                         Ok(s) => {
                             fleet::set_running_port(Some(s.port));
+                            // Self-heal hook registration: the user already
+                            // consented to Connect; when a new build changes
+                            // the Hobbes-owned entry set, refresh our entries
+                            // in place rather than serving a stale set from
+                            // behind a green "Connected".
+                            if let Some(path) = fleet::hooks_config::claude_settings_path() {
+                                if fleet::hooks_config::connected_port_file(&path).is_some() {
+                                    let (port, token) = fleet::server::ensure_identity();
+                                    if !fleet::hooks_config::file_hooks_current(&path, port, &token)
+                                    {
+                                        match fleet::hooks_config::connect_file(&path, port, &token)
+                                        {
+                                            Ok(()) => tracing::info!(
+                                                "fleet: refreshed outdated hook registration"
+                                            ),
+                                            Err(e) => tracing::warn!(
+                                                "fleet: hook self-heal failed: {e}"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
                             server = Some(s);
                         }
                         Err(e) => tracing::error!("fleet: listener failed to start: {e}"),
@@ -460,6 +482,121 @@ fn app() -> Element {
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+
+        // Brief supervisor: turns dirty fleet sessions into LLM re-entry
+        // briefs. Lives on the Dioxus side because only this half of the
+        // process holds hydrated API keys (fleet tokio tasks never see
+        // Settings). One task per 15s tick — with the 45s quiet period this
+        // is the debounce — keeps cost and concurrency trivially bounded.
+        spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let s = settings.peek().clone();
+                if !(s.fleet_enabled
+                    && s.fleet_briefs_enabled
+                    && crate::entitlement::pro_active())
+                {
+                    continue;
+                }
+                let Some(instance) = s
+                    .active_connector()
+                    .filter(|i| s.is_connector_configured(i))
+                    .or_else(|| {
+                        s.llm_connectors
+                            .iter()
+                            .find(|i| s.is_connector_configured(i))
+                    })
+                    .cloned()
+                else {
+                    continue;
+                };
+
+                let today = chrono::Local::now().date_naive();
+                let live = fleet::shared().snapshot();
+                let ended = fleet::store::sessions_active_on(today);
+                let due = fleet::briefs::collect_due(&live, &ended, chrono::Utc::now());
+                let Some(task) = due.into_iter().next() else {
+                    continue;
+                };
+
+                let started_at = chrono::Utc::now();
+                let clear_dirty = |task: &fleet::briefs::BriefTask| {
+                    if !fleet::shared().clear_brief_dirty(&task.session_id, started_at) {
+                        fleet::store::merge_session(&task.session_id, |row| {
+                            if row.brief_dirty_at.is_none_or(|d| d <= started_at) {
+                                row.brief_dirty_at = None;
+                            }
+                        });
+                    }
+                };
+
+                let tail = match fleet::transcript::read_tail(
+                    &task.transcript_path,
+                    fleet::transcript::TAIL_MAX_BYTES,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            "fleet briefs: unreadable transcript for {}: {e}",
+                            task.session_id
+                        );
+                        clear_dirty(&task);
+                        continue;
+                    }
+                };
+                let digest = fleet::transcript::digest_transcript(
+                    &tail,
+                    fleet::transcript::DIGEST_MAX_TURNS,
+                    fleet::transcript::DIGEST_MAX_CHARS,
+                );
+                if digest.text.trim().is_empty() {
+                    clear_dirty(&task);
+                    continue;
+                }
+
+                let (prev, framed) = fleet::briefs::brief_framing(&task, &digest);
+                let connector = llm::build_connector_for_instance(&instance, None);
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(90),
+                    connector.generate_fleet_brief(prev, framed),
+                )
+                .await
+                {
+                    Ok(Ok(value)) => {
+                        let Some(brief) = fleet::briefs::brief_from_summary_value(
+                            &value,
+                            chrono::Utc::now(),
+                            task.is_final,
+                        ) else {
+                            clear_dirty(&task);
+                            continue;
+                        };
+                        let shared = fleet::shared();
+                        if !shared.set_brief(&task.session_id, brief.clone(), started_at) {
+                            // Ended (or just-ended) row: merge into the store.
+                            let merged =
+                                fleet::store::merge_session(&task.session_id, move |row| {
+                                    row.brief = Some(brief);
+                                    if row.brief_dirty_at.is_none_or(|d| d <= started_at) {
+                                        row.brief_dirty_at = None;
+                                    }
+                                });
+                            if merged {
+                                shared.poke();
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => tracing::warn!(
+                        "fleet briefs: generation failed for {}: {e}",
+                        task.session_id
+                    ),
+                    Err(_) => tracing::warn!(
+                        "fleet briefs: generation timed out for {}",
+                        task.session_id
+                    ),
+                }
             }
         });
     });

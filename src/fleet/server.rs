@@ -260,15 +260,27 @@ async fn handle(
     };
 
     // Append the raw event, reduce, persist — synchronous section.
-    store::append_event(
-        event.session_id(),
-        event.event_name(),
-        &String::from_utf8_lossy(&body),
-    );
+    // ToolActivity is a high-volume heartbeat: it updates state but is not
+    // worth a `fleet_events` row per tool call.
+    if !matches!(event, FleetEvent::ToolActivity { .. }) {
+        store::append_event(
+            event.session_id(),
+            event.event_name(),
+            &String::from_utf8_lossy(&body),
+        );
+    }
     let now = chrono::Utc::now();
+    let transcript_path = crate::fleet::events::transcript_path_from_body(&body);
     let auto_passthrough = {
         let mut state = shared.state.lock().expect("fleet state lock poisoned");
-        let changed = reduce(&mut state, &event, now);
+        let mut changed = reduce(&mut state, &event, now);
+        crate::fleet::note_transcript_and_dirty(
+            &mut state,
+            &mut changed,
+            &event,
+            transcript_path.as_deref(),
+            now,
+        );
         store::persist_sessions(&changed);
         state
             .sessions
@@ -644,6 +656,7 @@ mod tests {
                     "session_id": "s1",
                     "cwd": "/Users/x/dev/hobbes",
                     "hook_event_name": "Stop",
+                    "transcript_path": "/Users/x/.claude/projects/p/s1.jsonl",
                     "last_assistant_message": "done"
                 })
                 .to_string(),
@@ -657,7 +670,17 @@ mod tests {
                 .unwrap();
             assert_eq!(r.status(), 200);
         }
-        assert_eq!(shared.snapshot().sessions["s1"].status, FleetStatus::Idle);
+        {
+            let snapshot = shared.snapshot();
+            let s = &snapshot.sessions["s1"];
+            assert_eq!(s.status, FleetStatus::Idle);
+            // The Stop recorded the transcript and queued a brief.
+            assert_eq!(
+                s.transcript_path.as_deref(),
+                Some("/Users/x/.claude/projects/p/s1.jsonl")
+            );
+            assert!(s.brief_dirty_at.is_some());
+        }
 
         let r = client
             .post(format!("{base}/SessionEnd"))

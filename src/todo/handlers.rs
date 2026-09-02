@@ -1594,7 +1594,29 @@ pub fn planner_today_context(
         return None;
     }
     let calendar_events = store::load_calendar_events(None).unwrap_or_default();
-    planner_today_context_with_events(planner, settings, today, &calendar_events)
+    let mut ctx = planner_today_context_with_events(planner, settings, today, &calendar_events)?;
+
+    // Fleet briefs ride along when observation + briefs are on (Pro): one
+    // capped line per external coding-agent session active today, so any chat
+    // can answer "what did I work on today?". Store-reading, so it lives on
+    // this edge — the pure core stays fleet-free.
+    if settings.fleet_enabled
+        && settings.fleet_briefs_enabled
+        && crate::entitlement::pro_active()
+    {
+        let now = chrono::Utc::now();
+        let rows = crate::fleet::store::sessions_active_on(today);
+        let lines = crate::fleet::briefs::fleet_context_lines(
+            &rows,
+            today,
+            now,
+            crate::fleet::briefs::CTX_MAX_FLEET,
+        );
+        if !lines.is_empty() {
+            ctx["fleet"] = serde_json::json!(lines);
+        }
+    }
+    Some(ctx)
 }
 
 /// Pure core of [`planner_today_context`]: everything but the store read, so
@@ -1718,7 +1740,7 @@ pub fn planner_today_context_with_events(
         "blocks": blocks,
         "all_day": all_day,
         "overdue": overdue,
-        "instruction": "The user's shared to-do list for today. Manage it with the HOBBES_TODO_* / HOBBES_PLAN_DAY / HOBBES_TIME_BLOCK tools. Setting a todo's status to in_progress starts focus mode on it (only one at a time); completing or reopening it ends the session. Blocks marked (meeting) and the all_day list mirror the user's external calendar — fixed commitments that cannot be moved or deleted; plan around them (HOBBES_CALENDAR_LIST shows more days).",
+        "instruction": "The user's shared to-do list for today. Manage it with the HOBBES_TODO_* / HOBBES_PLAN_DAY / HOBBES_TIME_BLOCK tools. Setting a todo's status to in_progress starts focus mode on it (only one at a time); completing or reopening it ends the session. Blocks marked (meeting) and the all_day list mirror the user's external calendar — fixed commitments that cannot be moved or deleted; plan around them (HOBBES_CALENDAR_LIST shows more days). When present, `fleet` lists today's external Claude Code coding-agent sessions (name — active time — latest summary); read-only observations, not managed by any tool.",
     });
     // Per-actor focus minutes for today, so the model can reason about person
     // vs agent load. Only when nonzero — an untouched day stays compact.

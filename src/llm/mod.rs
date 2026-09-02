@@ -116,6 +116,37 @@ pub trait LlmConnector: Send + Sync {
         Ok(summary)
     }
 
+    /// Generate a fleet re-entry brief from a framed transcript digest
+    /// (`fleet::briefs::brief_framing`). Rides each provider's
+    /// `summarize_conversation` path — and therefore its cheap
+    /// `summary_model` — with the previous brief in the summary slot for
+    /// incremental updates. The fixed summarize schema is mapped onto a
+    /// `SessionBrief` by `fleet::briefs::brief_from_summary_value`.
+    async fn generate_fleet_brief(
+        &self,
+        previous_brief_json: String,
+        framed_digest: String,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.summarize_conversation(previous_brief_json, framed_digest)
+            .await
+    }
+
+    /// One-shot day-rollup narrative (`fleet::briefs::rollup_framing`).
+    /// Returns the `summary` field, falling back to the stringified payload
+    /// when the shape drifts.
+    async fn generate_fleet_rollup(
+        &self,
+        framed_day: String,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let value = self.summarize_conversation(String::new(), framed_day).await?;
+        Ok(value
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| value.to_string()))
+    }
+
     /// Optional: Perform tool selection for a specific toolkit.
     /// Default implementation returns "not supported".
     async fn select_tools_for_toolkit(
@@ -123,5 +154,62 @@ pub trait LlmConnector: Send + Sync {
         _request: &crate::mcp::tool_selection::ToolSelectionRequest,
     ) -> Result<crate::mcp::tool_selection::ToolSelectionResponse, String> {
         Err("Tool selection not supported by this provider".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Trait-object stub: canned `summarize_conversation`, no network — for
+    /// exercising the defaulted fleet-brief/rollup methods.
+    struct StubConnector(serde_json::Value);
+
+    #[async_trait]
+    impl LlmConnector for StubConnector {
+        async fn generate_content_stream(
+            &self,
+            _prompt_data: LlmPrompt,
+            _tx: mpsc::UnboundedSender<StreamMessage>,
+            _mcp_context: Option<McpContext>,
+            _session_id: Option<String>,
+        ) {
+        }
+
+        async fn summarize_conversation(
+            &self,
+            _previous_summary: String,
+            _recent_messages: String,
+        ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_rollup_extracts_summary_with_fallback() {
+        let with_summary =
+            StubConnector(serde_json::json!({"summary": "Shipped briefs.", "sentiment": "good"}));
+        assert_eq!(
+            with_summary
+                .generate_fleet_rollup("framed".into())
+                .await
+                .unwrap(),
+            "Shipped briefs."
+        );
+
+        // Empty/absent summary → stringified payload, never an empty answer.
+        let odd = StubConnector(serde_json::json!({"summary": "", "other": 1}));
+        let out = odd.generate_fleet_rollup("framed".into()).await.unwrap();
+        assert!(out.contains("other"));
+    }
+
+    #[tokio::test]
+    async fn fleet_brief_rides_summarize_conversation() {
+        let stub = StubConnector(serde_json::json!({"summary": "did x"}));
+        let v = stub
+            .generate_fleet_brief(String::new(), "framed".into())
+            .await
+            .unwrap();
+        assert_eq!(v["summary"], "did x");
     }
 }

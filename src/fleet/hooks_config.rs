@@ -1,6 +1,6 @@
 //! `~/.claude/settings.json` hook registration.
 //!
-//! Connect merges our five `type: "http"` hook entries into the user's
+//! Connect merges our eight `type: "http"` hook entries into the user's
 //! settings file; Disconnect removes exactly ours. The merge/unmerge cores
 //! are pure functions over `serde_json::Value` (unit-tested on fixtures);
 //! the file layer adds parse-refuse-on-malformed, a timestamped backup, and
@@ -32,6 +32,12 @@ pub const FLEET_HOOK_EVENTS: &[(&str, u64)] = &[
     ("Stop", 10),
     ("Notification", 10),
     ("PermissionRequest", 120),
+    // Fidelity signals: a submitted prompt proves the user is handling the
+    // session (turn starts, attention clears); each finished tool call is a
+    // liveness heartbeat during otherwise-silent working turns.
+    ("UserPromptSubmit", 10),
+    ("PostToolUse", 10),
+    ("SubagentStop", 10),
 ];
 
 /// Seconds the PermissionRequest hook is configured to wait.
@@ -175,6 +181,55 @@ pub fn connected_port(settings: &Value) -> Option<u16> {
     None
 }
 
+/// Do the Hobbes-owned entries in this settings value exactly match the
+/// current build's set — every [`FLEET_HOOK_EVENTS`] entry present with the
+/// expected URL and timeout, and no stale extras? False means Connect (or the
+/// startup self-heal) should re-merge. A file with no Hobbes entries at all
+/// is "not connected", not "outdated" — also false, callers gate on
+/// [`connected_port`] first.
+pub fn hooks_current(settings: &Value, port: u16, token: &str) -> bool {
+    use std::collections::BTreeMap;
+    let mut found: BTreeMap<String, (String, u64)> = BTreeMap::new();
+    if let Some(hooks) = settings.get("hooks").and_then(Value::as_object) {
+        for (event, groups) in hooks {
+            let Some(groups) = groups.as_array() else { return false };
+            for group in groups {
+                for handler in group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .map(|a| a.as_slice())
+                    .unwrap_or(&[])
+                {
+                    if is_our_handler(handler) {
+                        // A duplicate of ours for one event is drift too.
+                        if found
+                            .insert(
+                                event.clone(),
+                                (
+                                    handler
+                                        .get("url")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    handler.get("timeout").and_then(Value::as_u64).unwrap_or(0),
+                                ),
+                            )
+                            .is_some()
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let expected: BTreeMap<String, (String, u64)> = FLEET_HOOK_EVENTS
+        .iter()
+        .map(|(event, timeout)| ((*event).to_string(), (hook_url(port, token, event), *timeout)))
+        .collect();
+    found == expected
+}
+
 // ── File layer ──────────────────────────────────────────────────────────────
 
 /// Where the user-level Claude Code settings live.
@@ -245,6 +300,15 @@ pub fn connected_port_file(path: &Path) -> Option<u16> {
     read_settings(path).ok().and_then(|v| connected_port(&v))
 }
 
+/// [`hooks_current`] against the settings file at `path`. An unreadable file
+/// reports current (the self-heal must not rewrite a file it can't parse).
+pub fn file_hooks_current(path: &Path, port: u16, token: &str) -> bool {
+    match read_settings(path) {
+        Ok(v) => hooks_current(&v, port, token),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,10 +320,58 @@ mod tests {
     }
 
     #[test]
-    fn merge_into_empty_registers_all_five_events() {
+    fn hooks_current_detects_drift() {
+        // Freshly merged → current.
+        let v = merged_empty();
+        assert!(hooks_current(&v, 43917, "tok123"));
+
+        // Different port or token → drift.
+        assert!(!hooks_current(&v, 43918, "tok123"));
+        assert!(!hooks_current(&v, 43917, "other"));
+
+        // A missing event (older build's set) → drift.
+        let mut fewer = merged_empty();
+        fewer["hooks"].as_object_mut().unwrap().remove("PostToolUse");
+        assert!(!hooks_current(&fewer, 43917, "tok123"));
+
+        // A changed timeout → drift.
+        let mut slow = merged_empty();
+        slow["hooks"]["Stop"][0]["hooks"][0]["timeout"] = json!(99);
+        assert!(!hooks_current(&slow, 43917, "tok123"));
+
+        // A stale extra Hobbes entry for an event we no longer register →
+        // drift (merge would strip it).
+        let mut extra = merged_empty();
+        extra["hooks"]["PreToolUse"] = json!([{ "hooks": [{
+            "type": "http",
+            "url": "http://127.0.0.1:43917/fleet/tok123/PreToolUse",
+            "timeout": 10
+        }]}]);
+        assert!(!hooks_current(&extra, 43917, "tok123"));
+
+        // User-owned hooks are invisible to the check.
+        let mut with_user = merged_empty();
+        with_user["hooks"]["Stop"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "hooks": [{ "type": "command", "command": "echo hi" }] }));
+        assert!(hooks_current(&with_user, 43917, "tok123"));
+
+        // No Hobbes entries at all → not current (callers gate on
+        // connected_port first).
+        assert!(!hooks_current(&json!({}), 43917, "tok123"));
+
+        // Re-merging a drifted file makes it current again.
+        let mut healed = fewer;
+        merge_fleet_hooks(&mut healed, 43917, "tok123").unwrap();
+        assert!(hooks_current(&healed, 43917, "tok123"));
+    }
+
+    #[test]
+    fn merge_into_empty_registers_every_fleet_event() {
         let v = merged_empty();
         let hooks = v["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), 5);
+        assert_eq!(hooks.len(), FLEET_HOOK_EVENTS.len());
         for (event, timeout) in FLEET_HOOK_EVENTS {
             let groups = hooks[*event].as_array().unwrap();
             assert_eq!(groups.len(), 1);

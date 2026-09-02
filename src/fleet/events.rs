@@ -28,6 +28,16 @@ pub enum FleetEvent {
     Stop {
         session_id: String,
         cwd: String,
+        /// Background agents/tasks still running when the main turn ended
+        /// (the payload's `background_tasks` array length). Nonzero means
+        /// "idle for input, still working".
+        background_tasks: usize,
+    },
+    /// `SubagentStop` — a subagent (Task tool) finished: background-work
+    /// heartbeat.
+    SubagentStop {
+        session_id: String,
+        cwd: String,
     },
     Notification {
         session_id: String,
@@ -45,6 +55,19 @@ pub enum FleetEvent {
         tool_name: String,
         tool_input: Value,
     },
+    /// `UserPromptSubmit` — the user submitted a prompt: the turn is starting
+    /// and the user is demonstrably handling this session.
+    PromptSubmit {
+        session_id: String,
+        cwd: String,
+    },
+    /// `PostToolUse` — a tool call finished: liveness heartbeat mid-turn.
+    /// High-volume; not appended to `fleet_events` (state-only).
+    ToolActivity {
+        session_id: String,
+        cwd: String,
+        tool_name: String,
+    },
 }
 
 impl FleetEvent {
@@ -54,7 +77,10 @@ impl FleetEvent {
             | FleetEvent::SessionEnd { session_id, .. }
             | FleetEvent::Stop { session_id, .. }
             | FleetEvent::Notification { session_id, .. }
-            | FleetEvent::PermissionRequest { session_id, .. } => session_id,
+            | FleetEvent::PermissionRequest { session_id, .. }
+            | FleetEvent::PromptSubmit { session_id, .. }
+            | FleetEvent::ToolActivity { session_id, .. }
+            | FleetEvent::SubagentStop { session_id, .. } => session_id,
         }
     }
 
@@ -64,7 +90,10 @@ impl FleetEvent {
             | FleetEvent::SessionEnd { cwd, .. }
             | FleetEvent::Stop { cwd, .. }
             | FleetEvent::Notification { cwd, .. }
-            | FleetEvent::PermissionRequest { cwd, .. } => cwd,
+            | FleetEvent::PermissionRequest { cwd, .. }
+            | FleetEvent::PromptSubmit { cwd, .. }
+            | FleetEvent::ToolActivity { cwd, .. }
+            | FleetEvent::SubagentStop { cwd, .. } => cwd,
         }
     }
 
@@ -75,12 +104,26 @@ impl FleetEvent {
             FleetEvent::Stop { .. } => "Stop",
             FleetEvent::Notification { .. } => "Notification",
             FleetEvent::PermissionRequest { .. } => "PermissionRequest",
+            FleetEvent::PromptSubmit { .. } => "UserPromptSubmit",
+            FleetEvent::ToolActivity { .. } => "PostToolUse",
+            FleetEvent::SubagentStop { .. } => "SubagentStop",
         }
     }
 }
 
 fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// The payload's `transcript_path`, when present and non-empty. Read
+/// straight off the raw body — [`FleetEvent`] deliberately doesn't carry it
+/// (the enum stays frozen; hook bodies are small, the re-parse is cheap).
+pub fn transcript_path_from_body(body: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    v.get("transcript_path")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
 }
 
 /// Parse a hook POST body. Dispatches on the payload's own
@@ -109,7 +152,16 @@ pub fn parse_event(body: &[u8]) -> Result<FleetEvent, String> {
             cwd,
             reason: str_field(&v, "reason"),
         }),
-        "Stop" => Ok(FleetEvent::Stop { session_id, cwd }),
+        "Stop" => Ok(FleetEvent::Stop {
+            session_id,
+            cwd,
+            background_tasks: v
+                .get("background_tasks")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+        }),
+        "SubagentStop" => Ok(FleetEvent::SubagentStop { session_id, cwd }),
         "Notification" => Ok(FleetEvent::Notification {
             session_id,
             cwd,
@@ -122,6 +174,12 @@ pub fn parse_event(body: &[u8]) -> Result<FleetEvent, String> {
             request_id: uuid::Uuid::new_v4().to_string(),
             tool_name: str_field(&v, "tool_name"),
             tool_input: v.get("tool_input").cloned().unwrap_or(Value::Null),
+        }),
+        "UserPromptSubmit" => Ok(FleetEvent::PromptSubmit { session_id, cwd }),
+        "PostToolUse" => Ok(FleetEvent::ToolActivity {
+            session_id,
+            cwd,
+            tool_name: str_field(&v, "tool_name"),
         }),
         other => Err(format!("unsupported hook event: {other}")),
     }
@@ -191,6 +249,87 @@ mod tests {
             FleetEvent::Stop {
                 session_id: "abc123".into(),
                 cwd: "/Users/x/dev/hobbes".into(),
+                background_tasks: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn stop_counts_background_tasks_and_subagent_stop_parses() {
+        let body = serde_json::json!({
+            "session_id": "abc123",
+            "cwd": "/x",
+            "hook_event_name": "Stop",
+            "background_tasks": [{"id": "a"}, {"id": "b"}]
+        });
+        assert_eq!(
+            parse_event(body.to_string().as_bytes()).unwrap(),
+            FleetEvent::Stop {
+                session_id: "abc123".into(),
+                cwd: "/x".into(),
+                background_tasks: 2,
+            }
+        );
+        let sub = serde_json::json!({
+            "session_id": "abc123",
+            "cwd": "/x",
+            "hook_event_name": "SubagentStop"
+        });
+        assert_eq!(
+            parse_event(sub.to_string().as_bytes()).unwrap(),
+            FleetEvent::SubagentStop {
+                session_id: "abc123".into(),
+                cwd: "/x".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn transcript_path_from_body_shapes() {
+        let with = serde_json::json!({"session_id": "a", "transcript_path": "/t.jsonl"});
+        assert_eq!(
+            transcript_path_from_body(with.to_string().as_bytes()).as_deref(),
+            Some("/t.jsonl")
+        );
+        let empty = serde_json::json!({"session_id": "a", "transcript_path": ""});
+        assert!(transcript_path_from_body(empty.to_string().as_bytes()).is_none());
+        let absent = serde_json::json!({"session_id": "a"});
+        assert!(transcript_path_from_body(absent.to_string().as_bytes()).is_none());
+        assert!(transcript_path_from_body(b"not json").is_none());
+        let non_string = serde_json::json!({"transcript_path": 42});
+        assert!(transcript_path_from_body(non_string.to_string().as_bytes()).is_none());
+    }
+
+    #[test]
+    fn parses_prompt_submit_and_post_tool_use() {
+        let prompt = serde_json::json!({
+            "session_id": "abc123",
+            "cwd": "/Users/x/dev/hobbes",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "fix the tests"
+        });
+        assert_eq!(
+            parse_event(prompt.to_string().as_bytes()).unwrap(),
+            FleetEvent::PromptSubmit {
+                session_id: "abc123".into(),
+                cwd: "/Users/x/dev/hobbes".into(),
+            }
+        );
+
+        let tool = serde_json::json!({
+            "session_id": "abc123",
+            "cwd": "/Users/x/dev/hobbes",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_response": {"stdout": "…"}
+        });
+        assert_eq!(
+            parse_event(tool.to_string().as_bytes()).unwrap(),
+            FleetEvent::ToolActivity {
+                session_id: "abc123".into(),
+                cwd: "/Users/x/dev/hobbes".into(),
+                tool_name: "Bash".into(),
             }
         );
     }

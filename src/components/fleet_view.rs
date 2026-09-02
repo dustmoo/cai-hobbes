@@ -33,6 +33,7 @@ fn age_label(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
 fn status_chip(status: &FleetStatus) -> (&'static str, &'static str) {
     match status {
         FleetStatus::Working => ("working", "#34d399"),
+        FleetStatus::WorkingBackground => ("background agents", "#2dd4bf"),
         FleetStatus::Idle => ("idle", "#94a3b8"),
         FleetStatus::NeedsAttention(AttentionKind::Gate) => ("waiting on you", "#f59e0b"),
         FleetStatus::NeedsAttention(AttentionKind::Notification { .. }) => {
@@ -92,6 +93,8 @@ pub fn FleetView() -> Element {
                 }
             }
 
+            TodaySection { now, today }
+
             if sessions.is_empty() {
                 div {
                     class: "px-6 py-8 text-sm text-fg-muted space-y-2",
@@ -110,6 +113,183 @@ pub fn FleetView() -> Element {
                 class: "px-6 space-y-2 pb-16",
                 for session in sessions {
                     FleetRow { key: "{session.id}", session: session.clone(), now, today }
+                }
+            }
+        }
+    }
+}
+
+/// Everything that ran today — live and ended sessions with their latest
+/// briefs — plus the on-demand "Roll up my day" narrative (cached per date in
+/// the meta table, so it survives restarts).
+#[component]
+fn TodaySection(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
+    let fleet_state = use_context::<Signal<fleet::FleetState>>();
+    let settings = use_context::<Signal<crate::settings::Settings>>();
+
+    // Merge stored day rows with the live map (live wins: fresher status,
+    // uncommitted live-span minutes).
+    let state = fleet_state.read();
+    let mut rows: Vec<FleetSession> = fleet::store::sessions_active_on(today)
+        .into_iter()
+        .filter(|r| !state.sessions.contains_key(&r.id))
+        .collect();
+    rows.extend(state.sessions.values().cloned());
+    let total_minutes = fleet::fleet_agent_minutes_on(&state, today, now);
+    drop(state);
+    rows.sort_by(|a, b| {
+        b.minutes_on(today, now)
+            .cmp(&a.minutes_on(today, now))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    // Cached rollup for today, else yesterday's (the morning re-entry case).
+    let mut rollup = use_signal(|| Option::<fleet::briefs::DayRollup>::None);
+    let mut rollup_running = use_signal(|| false);
+    let mut rollup_error = use_signal(|| Option::<String>::None);
+    use_effect(move || {
+        let today = Local::now().date_naive();
+        let load = |d: chrono::NaiveDate| {
+            crate::session_store::meta_get(&fleet::briefs::rollup_meta_key(d))
+                .and_then(|s| serde_json::from_str::<fleet::briefs::DayRollup>(&s).ok())
+        };
+        rollup.set(load(today).or_else(|| today.pred_opt().and_then(load)));
+    });
+
+    let session_count = rows.len();
+    let on_rollup = move |_| {
+        if *rollup_running.peek() {
+            return;
+        }
+        rollup_running.set(true);
+        rollup_error.set(None);
+        spawn(async move {
+            let s = settings.peek().clone();
+            let outcome = async {
+                let instance = s
+                    .active_connector()
+                    .filter(|i| s.is_connector_configured(i))
+                    .or_else(|| {
+                        s.llm_connectors
+                            .iter()
+                            .find(|i| s.is_connector_configured(i))
+                    })
+                    .cloned()
+                    .ok_or_else(|| "No configured LLM connector.".to_string())?;
+                let now = Utc::now();
+                let today = Local::now().date_naive();
+                let state = fleet::shared().snapshot();
+                let mut rows: Vec<FleetSession> = fleet::store::sessions_active_on(today)
+                    .into_iter()
+                    .filter(|r| !state.sessions.contains_key(&r.id))
+                    .collect();
+                rows.extend(state.sessions.values().cloned());
+                if rows.is_empty() {
+                    return Err("No sessions today to roll up.".to_string());
+                }
+                let total = fleet::fleet_agent_minutes_on(&state, today, now);
+                let lines = fleet::briefs::rollup_lines(&rows, today, now, 12);
+                let framed = fleet::briefs::rollup_framing(today, &lines, total);
+                let connector = crate::llm::build_connector_for_instance(&instance, None);
+                let narrative = tokio::time::timeout(
+                    std::time::Duration::from_secs(90),
+                    connector.generate_fleet_rollup(framed),
+                )
+                .await
+                .map_err(|_| "Rollup timed out.".to_string())?
+                .map_err(|e| e.to_string())?;
+                let day_rollup = fleet::briefs::DayRollup {
+                    date: today,
+                    narrative,
+                    generated_at: now,
+                    session_count: rows.len(),
+                    total_minutes: total,
+                };
+                if let Ok(json) = serde_json::to_string(&day_rollup) {
+                    let _ = crate::session_store::meta_set(
+                        &fleet::briefs::rollup_meta_key(today),
+                        &json,
+                    );
+                }
+                Ok(day_rollup)
+            }
+            .await;
+            match outcome {
+                Ok(r) => rollup.set(Some(r)),
+                Err(e) => rollup_error.set(Some(e)),
+            }
+            rollup_running.set(false);
+        });
+    };
+
+    if session_count == 0 && rollup.read().is_none() {
+        return rsx! {};
+    }
+
+    rsx! {
+        div {
+            class: "px-6 pb-2",
+            div {
+                class: "rounded border border-subtle bg-section p-3",
+                div {
+                    class: "flex items-center gap-3",
+                    span {
+                        class: "text-sm font-semibold",
+                        { format!("Today — {} session{} · {}",
+                            session_count,
+                            if session_count == 1 { "" } else { "s" },
+                            crate::todo::model::format_minutes(total_minutes)) }
+                    }
+                    div { class: "flex-1" }
+                    button {
+                        class: "px-3 py-1 text-xs font-bold rounded bg-btn-primary hover:bg-btn-primary-hover transition-colors disabled:opacity-50",
+                        disabled: *rollup_running.read(),
+                        onclick: on_rollup,
+                        if *rollup_running.read() { "Rolling up…" } else { "Roll up my day" }
+                    }
+                }
+
+                if let Some(r) = rollup.read().clone() {
+                    p {
+                        class: "mt-2 text-sm text-fg",
+                        "{r.narrative}"
+                    }
+                    p {
+                        class: "mt-1 text-xs text-fg-muted",
+                        { if r.date == today {
+                            format!("Rolled up {}", age_label(r.generated_at, now))
+                        } else {
+                            format!("Yesterday · rolled up {}", age_label(r.generated_at, now))
+                        } }
+                    }
+                }
+                if let Some(err) = rollup_error.read().clone() {
+                    p { class: "mt-2 text-xs text-red-400", "{err}" }
+                }
+
+                if session_count > 0 {
+                    div {
+                        class: "mt-2 space-y-1",
+                        for s in rows.iter() {
+                            div {
+                                key: "{s.id}",
+                                class: "flex items-baseline gap-2 text-xs",
+                                span { class: "font-medium shrink-0", "{s.name}" }
+                                span { class: "text-fg-muted shrink-0",
+                                    { crate::todo::model::format_minutes(s.minutes_on(today, now)) } }
+                                if s.ended_at.is_some() {
+                                    span {
+                                        class: "shrink-0 px-1 rounded-full border border-faint text-fg-muted",
+                                        "ended"
+                                    }
+                                }
+                                if let Some(b) = &s.brief {
+                                    span { class: "text-fg-muted truncate",
+                                        { fleet::truncate_summary(&b.headline, 120) } }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -164,6 +344,21 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
             if let FleetStatus::NeedsAttention(AttentionKind::Notification { message, .. }) = &session.status {
                 if !message.is_empty() {
                     p { class: "mt-2 text-xs text-fg", "{message}" }
+                }
+            }
+
+            // Re-entry brief: what happened since you last looked.
+            if let Some(brief) = &session.brief {
+                p {
+                    class: "mt-2 text-xs text-fg",
+                    { fleet::truncate_summary(&brief.headline, 140) }
+                }
+                if let Some(blocked) = &brief.blocked_on {
+                    p {
+                        class: "text-xs",
+                        style: "color: #f59e0b;",
+                        { format!("blocked: {}", fleet::truncate_summary(blocked, 100)) }
+                    }
                 }
             }
 

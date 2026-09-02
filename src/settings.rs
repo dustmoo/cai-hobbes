@@ -378,6 +378,11 @@ pub struct Settings {
     /// machine is strictly opt-in.
     #[serde(default)]
     pub fleet_enabled: bool,
+    /// Generate LLM re-entry briefs from observed sessions' transcripts
+    /// (uses the active connector's summary model). Only effective while
+    /// `fleet_enabled` and Pro are on.
+    #[serde(default = "default_true")]
+    pub fleet_briefs_enabled: bool,
 }
 
 fn default_planner_block_minutes() -> u32 {
@@ -778,6 +783,7 @@ impl Default for Settings {
             planner_default_estimate_minutes: 0,
             planner_default_block_minutes: default_planner_block_minutes(),
             fleet_enabled: false,
+            fleet_briefs_enabled: true,
         }
     }
 }

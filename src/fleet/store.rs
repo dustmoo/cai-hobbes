@@ -174,6 +174,66 @@ pub fn ended_minutes_on_conn(
     Ok(total)
 }
 
+/// All rows — live AND ended — with activity on local day `date`: banked
+/// minutes on it, or a last event / end falling on it (local). Bounded by the
+/// same widened SQL window as [`ended_minutes_on_conn`]; the local-day test
+/// happens in Rust. Feeds the Fleet "Today" section and day rollups.
+pub fn sessions_active_on_conn(
+    conn: &Connection,
+    date: chrono::NaiveDate,
+) -> rusqlite::Result<Vec<FleetSession>> {
+    use chrono::Local;
+    let window_start = date
+        .pred_opt()
+        .unwrap_or(date)
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut stmt = conn.prepare("SELECT data FROM fleet_sessions WHERE last_event_at >= ?1")?;
+    let rows = stmt.query_map(params![window_start], |r| r.get::<_, String>(0))?;
+    let on_date = |ts: &chrono::DateTime<chrono::Utc>| ts.with_timezone(&Local).date_naive() == date;
+    let mut out = Vec::new();
+    for row in rows {
+        let Ok(s) = serde_json::from_str::<FleetSession>(&row?) else {
+            continue;
+        };
+        let active = s.day_minutes.get(&date).copied().unwrap_or(0) > 0
+            || on_date(&s.last_event_at)
+            || s.ended_at.as_ref().is_some_and(&on_date);
+        if active {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
+/// Seq-guard-safe read-modify-write for a row that may no longer be in the
+/// live map (e.g. the final brief after `SessionEnd`). The whole RMW runs
+/// inside one closure on the shared connection — atomic w.r.t. every other
+/// writer — and rewrites with the caller's fresh seq, so the upsert guard
+/// always accepts it. Returns false when the row is missing or unreadable.
+pub fn merge_session_conn(
+    conn: &Connection,
+    session_id: &str,
+    seq: i64,
+    apply: impl FnOnce(&mut FleetSession),
+) -> rusqlite::Result<bool> {
+    let data: Option<String> = conn
+        .query_row(
+            "SELECT data FROM fleet_sessions WHERE id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(data) = data else { return Ok(false) };
+    let Ok(mut session) = serde_json::from_str::<FleetSession>(&data) else {
+        tracing::error!("fleet: cannot merge into unreadable row {}", session_id);
+        return Ok(false);
+    };
+    apply(&mut session);
+    upsert_session_conn(conn, &session, seq)?;
+    Ok(true)
+}
+
 // ── Events ──────────────────────────────────────────────────────────────────
 
 /// One appended `fleet_events` row: hook events as they arrive, and gate
@@ -245,6 +305,26 @@ pub fn ended_minutes_on(date: chrono::NaiveDate) -> u32 {
         return 0;
     }
     with_conn(|conn| ended_minutes_on_conn(conn, date)).unwrap_or(0)
+}
+
+pub fn sessions_active_on(date: chrono::NaiveDate) -> Vec<FleetSession> {
+    if !is_available() {
+        return Vec::new();
+    }
+    with_conn(|conn| sessions_active_on_conn(conn, date)).unwrap_or_else(|e| {
+        tracing::error!("fleet: failed to load day sessions: {}", e);
+        Vec::new()
+    })
+}
+
+pub fn merge_session(session_id: &str, apply: impl FnOnce(&mut FleetSession)) -> bool {
+    if !is_available() {
+        return false;
+    }
+    with_conn(|conn| merge_session_conn(conn, session_id, next_seq(), apply)).unwrap_or_else(|e| {
+        tracing::error!("fleet: failed to merge session {}: {}", session_id, e);
+        false
+    })
 }
 
 #[cfg(test)]
@@ -462,6 +542,81 @@ mod tests {
             let live = load_live_conn(conn).unwrap();
             assert_eq!(live.len(), 1);
             assert_eq!(live[0].id, "cc-1");
+        });
+    }
+
+    #[test]
+    fn sessions_active_on_includes_live_and_ended_excludes_other_days() {
+        with_db(|conn| {
+            use chrono::{Local, TimeZone};
+            let day = date("2026-08-25");
+            let noon = Local
+                .from_local_datetime(&day.and_hms_opt(12, 0, 0).unwrap())
+                .earliest()
+                .unwrap()
+                .with_timezone(&Utc);
+
+            // Live with banked minutes today.
+            let mut live = sample("live");
+            live.last_event_at = noon;
+            upsert_session_conn(conn, &live, 1).unwrap();
+            // Ended today, no banked minutes.
+            let mut ended = FleetSession::new("ended", "/x/proj", noon);
+            ended.ended_at = Some(noon);
+            upsert_session_conn(conn, &ended, 2).unwrap();
+            // Last spoke the day before (window catches it; filter drops it).
+            let day_before = noon - chrono::Duration::hours(20);
+            let mut old = FleetSession::new("old", "/x/old", day_before);
+            old.ended_at = Some(day_before);
+            upsert_session_conn(conn, &old, 3).unwrap();
+
+            let mut ids: Vec<String> = sessions_active_on_conn(conn, day)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            ids.sort();
+            assert_eq!(ids, vec!["ended", "live"]);
+        });
+    }
+
+    #[test]
+    fn merge_session_survives_the_seq_guard() {
+        with_db(|conn| {
+            let mut session = sample("cc-1");
+            session.ended_at = Some(utc("2026-08-25T11:00:00Z"));
+            upsert_session_conn(conn, &session, 9_000).unwrap();
+
+            // Merge with a fresh higher seq: accepted despite the prior high seq.
+            let merged = merge_session_conn(conn, "cc-1", 9_001, |s| {
+                s.brief = Some(crate::fleet::SessionBrief {
+                    headline: "final brief".into(),
+                    bullets: vec![],
+                    blocked_on: None,
+                    generated_at: utc("2026-08-25T11:01:00Z"),
+                    final_brief: true,
+                });
+                s.brief_dirty_at = None;
+            })
+            .unwrap();
+            assert!(merged);
+            let data: String = conn
+                .query_row("SELECT data FROM fleet_sessions WHERE id = 'cc-1'", [], |r| r.get(0))
+                .unwrap();
+            let back: FleetSession = serde_json::from_str(&data).unwrap();
+            assert_eq!(back.brief.unwrap().headline, "final brief");
+            assert!(back.brief_dirty_at.is_none());
+            assert!(back.ended_at.is_some(), "merge preserves the rest of the row");
+
+            // Missing row → false; corrupt row → false, not an error.
+            assert!(!merge_session_conn(conn, "nope", 9_002, |_| {}).unwrap());
+            conn.execute(
+                "INSERT INTO fleet_sessions (id, cwd, name, last_event_at, seq, data)
+                 VALUES ('bad', '/x', 'x', '2026-08-25T00:00:00Z', 2, 'not json')",
+                [],
+            )
+            .unwrap();
+            assert!(!merge_session_conn(conn, "bad", 9_003, |_| {}).unwrap());
         });
     }
 

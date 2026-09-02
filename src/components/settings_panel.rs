@@ -3858,7 +3858,8 @@ pub fn SettingsPanel() -> Element {
 
                 // Fleet observation (Pro): its own card so the hook
                 // registration flow doesn't hide inside the behavior wall.
-                FleetSection { local_settings }
+                // Commits immediately (not part of this tab's draft + Save).
+                FleetSection {}
 
                    }, // End Behavior
                    crate::settings::SettingsTab::Data => rsx! {
@@ -5800,15 +5801,31 @@ fn LicenseSection() -> Element {
 
 // ── Fleet (Behavior tab card, Pro) ──────────────────────────────────────────
 
-/// The Fleet card: enable toggle (rides the tab's draft + Save flow like its
-/// neighbours), hook connect/disconnect against `~/.claude/settings.json`
-/// (immediate file ops with a timestamped backup), and a status line.
+/// The Fleet card: a single Connect/Disconnect action that commits
+/// atomically — hook registration in `~/.claude/settings.json` (timestamped
+/// backup first), `fleet_enabled`, and an immediate settings save (the
+/// calendar-row idiom, not the tab's draft + Save flow). The supervisor loop
+/// in main.rs follows `fleet_enabled` and starts/stops the listener within a
+/// few seconds; the status line polls so that transition is visible.
 #[component]
-fn FleetSection(local_settings: Signal<Settings>) -> Element {
-    // Bump to re-probe the settings file after connect/disconnect.
+fn FleetSection() -> Element {
+    let mut settings = use_context::<Signal<Settings>>();
+    let settings_manager = use_context::<Signal<SettingsManager>>();
+    let save_error = use_context::<crate::components::shared::SaveErrorContext>().0;
+    let fleet_state = use_context::<Signal<crate::fleet::FleetState>>();
+
+    // Bumped by the buttons and a slow poll: the hooks file and the running
+    // port live outside the signal graph, so re-probe while the card is up
+    // (the listener trails Connect by up to one 5s supervisor tick).
     let mut status_rev = use_signal(|| 0u32);
     let mut fleet_error = use_signal(|| Option::<String>::None);
     let _ = status_rev();
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            status_rev += 1;
+        }
+    });
 
     let pro = crate::entitlement::pro_active();
     let hooks_path = crate::fleet::hooks_config::claude_settings_path();
@@ -5816,6 +5833,14 @@ fn FleetSection(local_settings: Signal<Settings>) -> Element {
         .as_ref()
         .and_then(|p| crate::fleet::hooks_config::connected_port_file(p));
     let running_port = crate::fleet::running_port();
+    let enabled = settings.read().fleet_enabled;
+    let session_count = fleet_state.read().sessions.len();
+
+    let persist = move || {
+        settings_manager
+            .peek()
+            .save_async(settings.peek().clone(), Some(save_error));
+    };
 
     let on_connect = move |_| {
         let Some(path) = crate::fleet::hooks_config::claude_settings_path() else {
@@ -5826,7 +5851,11 @@ fn FleetSection(local_settings: Signal<Settings>) -> Element {
         // the same URLs the listener answers on.
         let (port, token) = crate::fleet::server::ensure_identity();
         match crate::fleet::hooks_config::connect_file(&path, port, &token) {
-            Ok(()) => fleet_error.set(None),
+            Ok(()) => {
+                fleet_error.set(None);
+                settings.write().fleet_enabled = true;
+                persist();
+            }
             Err(e) => fleet_error.set(Some(e)),
         }
         status_rev += 1;
@@ -5837,11 +5866,65 @@ fn FleetSection(local_settings: Signal<Settings>) -> Element {
             return;
         };
         match crate::fleet::hooks_config::disconnect_file(&path) {
-            Ok(()) => fleet_error.set(None),
+            Ok(()) => {
+                fleet_error.set(None);
+                settings.write().fleet_enabled = false;
+                persist();
+            }
             Err(e) => fleet_error.set(Some(e)),
         }
         status_rev += 1;
     };
+
+    // Tri-state status: dot color + headline + supporting line. Half-states
+    // (hooks without listener, port drift) surface as "needs attention" with
+    // the one-click fix named — Connect repairs all of them.
+    // Port match alone isn't "connected" — the entry set can drift when a
+    // build changes the hooks Hobbes registers (the supervisor self-heals
+    // this shortly after launch; the card names it in the meantime).
+    let hooks_current = match (&hooks_path, connected_port) {
+        (Some(path), Some(_)) => {
+            let (port, token) = crate::fleet::server::ensure_identity();
+            crate::fleet::hooks_config::file_hooks_current(path, port, &token)
+        }
+        _ => true,
+    };
+    let (dot_color, headline, detail) = match (connected_port, running_port) {
+        (Some(cp), Some(rp)) if cp == rp && !hooks_current => (
+            "#f59e0b",
+            "Needs attention".to_string(),
+            "This build registers a different hook set than the one in ~/.claude/settings.json — hit Connect to update it.".to_string(),
+        ),
+        (Some(cp), Some(rp)) if cp == rp => (
+            "#22c55e",
+            "Connected".to_string(),
+            format!(
+                "Watching {session_count} session{} · port {cp}. Sessions appear in Planner → Fleet.",
+                if session_count == 1 { "" } else { "s" }
+            ),
+        ),
+        (Some(cp), Some(rp)) => (
+            "#f59e0b",
+            "Needs attention".to_string(),
+            format!("Hooks point at port {cp} but the listener is on {rp} — hit Connect to update them."),
+        ),
+        (Some(_), None) if enabled => (
+            "#f59e0b",
+            "Connected".to_string(),
+            "Listener starting…".to_string(),
+        ),
+        (Some(cp), None) => (
+            "#f59e0b",
+            "Needs attention".to_string(),
+            format!("Hooks are registered (port {cp}) but observation is off — hit Connect to restart it."),
+        ),
+        (None, _) => (
+            "#6b7280",
+            "Not connected".to_string(),
+            "Hobbes isn't watching any sessions.".to_string(),
+        ),
+    };
+    let hooks_registered = connected_port.is_some();
 
     rsx! {
         div {
@@ -5861,44 +5944,25 @@ fn FleetSection(local_settings: Signal<Settings>) -> Element {
                     }
                 } else {
                     div {
-                        class: "flex items-center justify-between mb-3",
-                        div {
-                            label { class: "text-sm font-medium text-fg-muted", "Enable fleet observation" }
-                            p { class: "text-xs text-fg-muted", "Runs a localhost-only listener that Claude Code hooks report to. Off by default." }
+                        class: "flex items-center gap-2 mb-1",
+                        span {
+                            class: "inline-block w-2 h-2 rounded-full",
+                            style: "background-color: {dot_color}",
                         }
-                        input {
-                            r#type: "checkbox",
-                            checked: "{local_settings.read().fleet_enabled}",
-                            onchange: move |e| {
-                                local_settings.write().fleet_enabled = e.value() == "true";
-                            }
-                        }
+                        span { class: "text-sm font-medium", "{headline}" }
                     }
-
-                    // Status: hooks registered? listener running?
-                    p {
-                        class: "text-xs text-fg-muted mb-3",
-                        match (connected_port, running_port) {
-                            (Some(cp), Some(rp)) if cp == rp =>
-                                format!("Claude Code connected — hooks point at 127.0.0.1:{cp}, listener running."),
-                            (Some(cp), Some(rp)) =>
-                                format!("Hooks point at port {cp} but the listener is on {rp} — hit Connect again to update them."),
-                            (Some(cp), None) =>
-                                format!("Hooks registered for port {cp}; listener not running (enable the fleet and save, Pro required)."),
-                            (None, Some(rp)) =>
-                                format!("Listener running on 127.0.0.1:{rp} — Claude Code not connected yet."),
-                            (None, None) => "Not connected.".to_string(),
-                        }
-                    }
+                    p { class: "text-xs text-fg-muted mb-3 ml-4", "{detail}" }
 
                     div {
                         class: "flex gap-2",
-                        button {
-                            class: "py-2 px-4 bg-btn-primary hover:bg-btn-primary-hover rounded-md text-sm font-bold transition-colors",
-                            onclick: on_connect,
-                            "Connect Claude Code"
+                        if !hooks_registered || dot_color == "#f59e0b" {
+                            button {
+                                class: "py-2 px-4 bg-btn-primary hover:bg-btn-primary-hover rounded-md text-sm font-bold transition-colors",
+                                onclick: on_connect,
+                                "Connect Claude Code"
+                            }
                         }
-                        if connected_port.is_some() {
+                        if hooks_registered {
                             button {
                                 class: "py-2 px-4 bg-card hover:bg-input rounded-md text-sm border border-faint transition-colors",
                                 onclick: on_disconnect,
@@ -5908,7 +5972,26 @@ fn FleetSection(local_settings: Signal<Settings>) -> Element {
                     }
                     p {
                         class: "text-xs text-fg-muted mt-2",
-                        "Connect merges five hook entries into ~/.claude/settings.json (a timestamped backup is written first). Disconnect removes exactly those entries."
+                        "Connecting starts a localhost-only listener and merges eight hook entries into ~/.claude/settings.json (a timestamped backup is written first). Disconnect removes exactly those entries and stops observation."
+                    }
+                    if hooks_registered {
+                        label {
+                            class: "mt-3 flex items-center gap-2 text-sm text-fg-muted cursor-pointer select-none",
+                            input {
+                                r#type: "checkbox",
+                                class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                checked: "{settings.read().fleet_briefs_enabled}",
+                                onchange: move |e| {
+                                    settings.write().fleet_briefs_enabled = e.value() == "true";
+                                    persist();
+                                }
+                            }
+                            "Summarize sessions into re-entry briefs (uses your LLM's summary model)"
+                        }
+                        p {
+                            class: "text-xs text-fg-muted mt-1 ml-6",
+                            "Transcript excerpts are sent only to your own configured provider; briefs are stored locally."
+                        }
                     }
                     if let Some(err) = fleet_error() {
                         p { class: "text-sm text-red-400 mt-2", "{err}" }

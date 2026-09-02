@@ -38,10 +38,12 @@
 //! agent focus and external fleet time stay separable in data even though the
 //! Today rail displays their sum in one agent lane (Pro surface).
 
+pub mod briefs;
 pub mod events;
 pub mod hooks_config;
 pub mod server;
 pub mod store;
+pub mod transcript;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -73,6 +75,9 @@ pub enum AttentionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FleetStatus {
     Working,
+    /// The main turn ended (the user may type) but background subagents are
+    /// still running — idle for input, still doing work.
+    WorkingBackground,
     Idle,
     NeedsAttention(AttentionKind),
 }
@@ -93,6 +98,24 @@ pub struct PendingGate {
     /// Compact JSON of `tool_input`, truncated for display.
     pub input_summary: String,
     pub requested_at: DateTime<Utc>,
+}
+
+/// An LLM-generated re-entry brief for one session: what happened since you
+/// last looked, derived from the session's transcript tail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionBrief {
+    /// One sentence, clipped for display.
+    pub headline: String,
+    /// Key decisions / topics, capped small.
+    #[serde(default)]
+    pub bullets: Vec<String>,
+    /// What the session is blocked on / awaiting from the user, if anything.
+    #[serde(default)]
+    pub blocked_on: Option<String>,
+    pub generated_at: DateTime<Utc>,
+    /// Generated after `SessionEnd` — the session's closing brief.
+    #[serde(default)]
+    pub final_brief: bool,
 }
 
 /// One observed Claude Code session (live map entry / `fleet_sessions` row).
@@ -118,6 +141,16 @@ pub struct FleetSession {
     pub ended_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub pending_gate: Option<PendingGate>,
+    /// The session's JSONL transcript, recorded off the raw hook payload
+    /// (the parsed [`FleetEvent`] enum deliberately doesn't carry it).
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+    #[serde(default)]
+    pub brief: Option<SessionBrief>,
+    /// Set on Stop/SessionEnd; cleared when a brief generated at-or-after it
+    /// lands. Persisted, so pending briefs survive a restart.
+    #[serde(default)]
+    pub brief_dirty_at: Option<DateTime<Utc>>,
 }
 
 impl FleetSession {
@@ -133,6 +166,9 @@ impl FleetSession {
             auto_passthrough: false,
             ended_at: None,
             pending_gate: None,
+            transcript_path: None,
+            brief: None,
+            brief_dirty_at: None,
         }
     }
 
@@ -294,9 +330,18 @@ pub fn reduce(state: &mut FleetState, ev: &FleetEvent, now: DateTime<Utc>) -> Ve
             session.status = FleetStatus::Working;
             session.pending_gate = None;
         }
-        FleetEvent::Stop { .. } => {
+        FleetEvent::Stop { background_tasks, .. } => {
+            // Bank the proven span either way. With background agents still
+            // running, immediately reopen: the session is idle for input but
+            // still working, and their PostToolUse/SubagentStop heartbeats
+            // keep the new span provable.
             close_span(session, Some(now));
-            session.status = FleetStatus::Idle;
+            if *background_tasks > 0 {
+                session.working_since = Some(now);
+                session.status = FleetStatus::WorkingBackground;
+            } else {
+                session.status = FleetStatus::Idle;
+            }
             session.pending_gate = None;
         }
         FleetEvent::Notification { kind, message, .. } => {
@@ -333,10 +378,70 @@ pub fn reduce(state: &mut FleetState, ev: &FleetEvent, now: DateTime<Utc>) -> Ve
             state.sessions.remove(id);
             return vec![row];
         }
+        FleetEvent::PromptSubmit { .. } => {
+            // The user submitted a prompt: a turn is starting and the user is
+            // demonstrably handling this session — attention clears. Any
+            // stale open span (e.g. left by a background-work phase that went
+            // quiet) is banked capped, like SessionStart's resume path.
+            close_span(session, None);
+            session.working_since = Some(now);
+            session.status = FleetStatus::Working;
+            session.pending_gate = None;
+        }
+        FleetEvent::ToolActivity { .. } | FleetEvent::SubagentStop { .. } => {
+            // Proof that work ran until now: a finished tool call (main turn
+            // or subagent) or a completed subagent. Also the "answered the
+            // gate in the terminal" signal — a tool ran, so any pending
+            // prompt was resolved outside Hobbes. A background phase stays
+            // labeled as such; anything else shows Working.
+            if session.working_since.is_none() {
+                session.working_since = Some(now);
+            }
+            if session.status != FleetStatus::WorkingBackground {
+                session.status = FleetStatus::Working;
+            }
+            session.pending_gate = None;
+        }
     }
 
     session.last_event_at = now;
     vec![session.clone()]
+}
+
+/// Post-reduce marker: record the event's `transcript_path` on the session
+/// and, for `Stop`/`SessionEnd` (turn boundaries), mark the brief dirty so
+/// the brief supervisor picks it up. Mutates the live-map entry when present
+/// and the persisted clones in `changed` in lockstep — on `SessionEnd` the
+/// session is already gone from the live map, so only the returned row (the
+/// one that gets persisted with `ended_at` set) is updated.
+pub fn note_transcript_and_dirty(
+    state: &mut FleetState,
+    changed: &mut [FleetSession],
+    ev: &FleetEvent,
+    transcript_path: Option<&str>,
+    now: DateTime<Utc>,
+) {
+    let mark_dirty = matches!(ev, FleetEvent::Stop { .. } | FleetEvent::SessionEnd { .. });
+    let path = transcript_path.filter(|p| !p.is_empty());
+    if !mark_dirty && path.is_none() {
+        return;
+    }
+    let apply = |s: &mut FleetSession| {
+        if let Some(p) = path {
+            if s.transcript_path.as_deref() != Some(p) {
+                s.transcript_path = Some(p.to_string());
+            }
+        }
+        if mark_dirty {
+            s.brief_dirty_at = Some(now);
+        }
+    };
+    if let Some(s) = state.sessions.get_mut(ev.session_id()) {
+        apply(s);
+    }
+    for row in changed.iter_mut().filter(|r| r.id == ev.session_id()) {
+        apply(row);
+    }
 }
 
 /// How a held gate was resolved.
@@ -396,7 +501,11 @@ pub fn sweep_stale(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSessi
     let cutoff = now - chrono::Duration::minutes(STALENESS_MINUTES);
     let mut changed = Vec::new();
     for session in state.sessions.values_mut() {
-        if session.status == FleetStatus::Working && session.last_event_at < cutoff {
+        if matches!(
+            session.status,
+            FleetStatus::Working | FleetStatus::WorkingBackground
+        ) && session.last_event_at < cutoff
+        {
             session.status = FleetStatus::Idle;
             changed.push(session.clone());
         }
@@ -526,6 +635,67 @@ impl FleetShared {
         }
     }
 
+    /// Store a generated brief on a LIVE session. Persists and pokes.
+    /// `brief_dirty_at` is cleared only when it is at or before `started_at`
+    /// (the instant generation began) — a Stop that raced in mid-generation
+    /// keeps the session dirty so the supervisor re-briefs it. Returns
+    /// `false` when the session has left the live map (ended mid-generation);
+    /// the caller falls back to [`store::merge_session`].
+    pub fn set_brief(
+        &self,
+        session_id: &str,
+        brief: SessionBrief,
+        started_at: DateTime<Utc>,
+    ) -> bool {
+        let row = {
+            let mut state = self.state.lock().expect("fleet state lock poisoned");
+            match state.sessions.get_mut(session_id) {
+                Some(s) => {
+                    s.brief = Some(brief);
+                    if s.brief_dirty_at.is_some_and(|d| d <= started_at) {
+                        s.brief_dirty_at = None;
+                    }
+                    Some(s.clone())
+                }
+                None => None,
+            }
+        };
+        match row {
+            Some(row) => {
+                store::persist_sessions(std::slice::from_ref(&row));
+                self.poke();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Clear a LIVE session's dirty mark without writing a brief (unreadable
+    /// transcript, empty digest) so the supervisor doesn't spin on it. Same
+    /// `started_at` race rule as [`Self::set_brief`]. Returns false when the
+    /// session isn't in the live map.
+    pub fn clear_brief_dirty(&self, session_id: &str, started_at: DateTime<Utc>) -> bool {
+        let row = {
+            let mut state = self.state.lock().expect("fleet state lock poisoned");
+            match state.sessions.get_mut(session_id) {
+                Some(s) if s.brief_dirty_at.is_some_and(|d| d <= started_at) => {
+                    s.brief_dirty_at = None;
+                    Some(s.clone())
+                }
+                Some(_) => return true, // newer dirty mark: leave it
+                None => None,
+            }
+        };
+        match row {
+            Some(row) => {
+                store::persist_sessions(std::slice::from_ref(&row));
+                self.poke();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Hydrate the live map from `fleet_sessions` rows that never ended
     /// (previous process died with sessions open). Their open spans stay
     /// capped by the staleness window; the sweep idles them.
@@ -604,6 +774,7 @@ mod tests {
         FleetEvent::Stop {
             session_id: id.into(),
             cwd: "/Users/x/dev/hobbes".into(),
+            background_tasks: 0,
         }
     }
 
@@ -775,6 +946,7 @@ mod tests {
             &FleetEvent::Stop {
                 session_id: "sX".into(),
                 cwd: "/tmp/somewhere".into(),
+                background_tasks: 0,
             },
             now,
         );
@@ -921,6 +1093,285 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: FleetSession = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn stop_with_background_tasks_keeps_working_and_banking() {
+        let mut state = FleetState::default();
+        let day = date("2026-08-25");
+        let t0 = local_at(day, 9, 0);
+        reduce(&mut state, &start("s1"), t0);
+        // Main turn ends at +10 with two background agents still running.
+        let t1 = local_at(day, 9, 10);
+        reduce(
+            &mut state,
+            &FleetEvent::Stop {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                background_tasks: 2,
+            },
+            t1,
+        );
+        {
+            let s = &state.sessions["s1"];
+            assert_eq!(s.status, FleetStatus::WorkingBackground);
+            assert_eq!(s.working_since, Some(t1), "a fresh span opens for the background phase");
+        }
+        // A subagent heartbeat at +18 keeps the label and proves the span.
+        let t2 = local_at(day, 9, 18);
+        reduce(
+            &mut state,
+            &FleetEvent::SubagentStop { session_id: "s1".into(), cwd: String::new() },
+            t2,
+        );
+        assert_eq!(state.sessions["s1"].status, FleetStatus::WorkingBackground);
+        assert_eq!(state.sessions["s1"].minutes_on(day, t2), 18);
+
+        // Final Stop with nothing left in the background: idle, all banked.
+        let t3 = local_at(day, 9, 25);
+        reduce(&mut state, &stop("s1"), t3);
+        let s = &state.sessions["s1"];
+        assert_eq!(s.status, FleetStatus::Idle);
+        assert_eq!(s.working_since, None);
+        assert_eq!(s.minutes_on(day, t3), 25);
+    }
+
+    #[test]
+    fn prompt_submit_caps_a_stale_background_span() {
+        let mut state = FleetState::default();
+        let day = date("2026-08-25");
+        reduce(&mut state, &start("s1"), local_at(day, 9, 0));
+        reduce(
+            &mut state,
+            &FleetEvent::Stop { session_id: "s1".into(), cwd: String::new(), background_tasks: 1 },
+            local_at(day, 9, 10),
+        );
+        // Background work went quiet; the user comes back two hours later.
+        // The stale open span banks capped — the idle gap is never credited.
+        let t_return = local_at(day, 11, 10);
+        reduce(
+            &mut state,
+            &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: String::new() },
+            t_return,
+        );
+        let s = &state.sessions["s1"];
+        assert_eq!(s.status, FleetStatus::Working);
+        assert_eq!(s.working_since, Some(t_return));
+        assert_eq!(
+            s.day_minutes.get(&day).copied().unwrap_or(0),
+            10 + STALENESS_MINUTES as u32,
+            "10 proven + capped background tail, no idle-gap credit"
+        );
+    }
+
+    #[test]
+    fn prompt_submit_starts_working_and_clears_attention() {
+        let mut state = FleetState::default();
+        let day = date("2026-08-25");
+        // A notification left the session waiting on the user…
+        let ev = FleetEvent::Notification {
+            session_id: "s1".into(),
+            cwd: "/x/proj".into(),
+            kind: "idle_prompt".into(),
+            message: "Claude is waiting for your input".into(),
+        };
+        reduce(&mut state, &ev, local_at(day, 9, 0));
+        assert!(state.sessions["s1"].status.needs_attention());
+        // …then the user typed a prompt: handled, working, span open.
+        let t1 = local_at(day, 9, 30);
+        reduce(
+            &mut state,
+            &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: "/x/proj".into() },
+            t1,
+        );
+        let s = &state.sessions["s1"];
+        assert_eq!(s.status, FleetStatus::Working);
+        assert_eq!(s.working_since, Some(t1));
+        assert!(s.pending_gate.is_none());
+    }
+
+    #[test]
+    fn tool_activity_heartbeat_extends_liveness_and_clears_gates() {
+        let mut state = FleetState::default();
+        let day = date("2026-08-25");
+        let t0 = local_at(day, 9, 0);
+        reduce(&mut state, &start("s1"), t0);
+        // Tool heartbeats every 8 minutes keep the span provable: minutes
+        // display never hits the staleness cap mid-turn.
+        for offset in [8i64, 16, 24] {
+            reduce(
+                &mut state,
+                &FleetEvent::ToolActivity {
+                    session_id: "s1".into(),
+                    cwd: "/x/proj".into(),
+                    tool_name: "Bash".into(),
+                },
+                t0 + chrono::Duration::minutes(offset),
+            );
+        }
+        let s = &state.sessions["s1"];
+        assert_eq!(s.status, FleetStatus::Working);
+        assert_eq!(s.working_since, Some(t0), "heartbeats keep the original span");
+        // 25 minutes in, last heartbeat a minute ago: full honest credit.
+        assert_eq!(s.minutes_on(day, t0 + chrono::Duration::minutes(25)), 25);
+
+        // A pending gate answered in the terminal: the next tool run clears it.
+        reduce(
+            &mut state,
+            &FleetEvent::PermissionRequest {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                request_id: "g1".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::json!({}),
+            },
+            t0 + chrono::Duration::minutes(26),
+        );
+        assert!(state.sessions["s1"].status.needs_attention());
+        reduce(
+            &mut state,
+            &FleetEvent::ToolActivity {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                tool_name: "Bash".into(),
+            },
+            t0 + chrono::Duration::minutes(27),
+        );
+        let s = &state.sessions["s1"];
+        assert_eq!(s.status, FleetStatus::Working);
+        assert!(s.pending_gate.is_none());
+    }
+
+    fn brief(t: DateTime<Utc>) -> SessionBrief {
+        SessionBrief {
+            headline: "did things".into(),
+            bullets: vec!["a decision".into()],
+            blocked_on: None,
+            generated_at: t,
+            final_brief: false,
+        }
+    }
+
+    #[test]
+    fn note_transcript_marks_dirty_on_stop_and_records_path() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T10:00:00Z");
+        reduce(&mut state, &start("s1"), t0);
+        // SessionStart carries a path but is not a turn boundary.
+        let mut changed = vec![state.sessions["s1"].clone()];
+        note_transcript_and_dirty(&mut state, &mut changed, &start("s1"), Some("/t/s1.jsonl"), t0);
+        assert_eq!(state.sessions["s1"].transcript_path.as_deref(), Some("/t/s1.jsonl"));
+        assert!(state.sessions["s1"].brief_dirty_at.is_none());
+        assert_eq!(changed[0].transcript_path.as_deref(), Some("/t/s1.jsonl"));
+
+        // Stop marks dirty on both the live entry and the persisted clone.
+        let t1 = t0 + chrono::Duration::minutes(5);
+        let mut changed = reduce(&mut state, &stop("s1"), t1);
+        note_transcript_and_dirty(&mut state, &mut changed, &stop("s1"), None, t1);
+        assert_eq!(state.sessions["s1"].brief_dirty_at, Some(t1));
+        assert_eq!(changed[0].brief_dirty_at, Some(t1));
+        // Path recorded earlier survives.
+        assert_eq!(changed[0].transcript_path.as_deref(), Some("/t/s1.jsonl"));
+    }
+
+    #[test]
+    fn note_transcript_marks_the_removed_row_on_session_end() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T10:00:00Z");
+        reduce(&mut state, &start("s1"), t0);
+        let end = FleetEvent::SessionEnd {
+            session_id: "s1".into(),
+            cwd: String::new(),
+            reason: "logout".into(),
+        };
+        let t1 = t0 + chrono::Duration::minutes(1);
+        let mut changed = reduce(&mut state, &end, t1);
+        note_transcript_and_dirty(&mut state, &mut changed, &end, Some("/t/s1.jsonl"), t1);
+        assert!(state.sessions.is_empty());
+        assert_eq!(changed[0].brief_dirty_at, Some(t1));
+        assert_eq!(changed[0].transcript_path.as_deref(), Some("/t/s1.jsonl"));
+    }
+
+    #[test]
+    fn set_brief_clears_dirty_unless_a_stop_raced_in() {
+        let shared = FleetShared::new();
+        let t0 = utc("2026-08-25T10:00:00Z");
+        {
+            let mut state = shared.state.lock().unwrap();
+            reduce(&mut state, &stop("s1"), t0);
+            state.sessions.get_mut("s1").unwrap().brief_dirty_at = Some(t0);
+        }
+        // Generation started after the dirty mark → clears it.
+        let started = t0 + chrono::Duration::seconds(50);
+        assert!(shared.set_brief("s1", brief(started), started));
+        {
+            let state = shared.state.lock().unwrap();
+            let s = &state.sessions["s1"];
+            assert!(s.brief_dirty_at.is_none());
+            assert_eq!(s.brief.as_ref().unwrap().headline, "did things");
+        }
+        // A newer Stop raced in mid-generation → dirty survives the write.
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.sessions.get_mut("s1").unwrap().brief_dirty_at =
+                Some(started + chrono::Duration::seconds(10));
+        }
+        assert!(shared.set_brief("s1", brief(started), started));
+        {
+            let state = shared.state.lock().unwrap();
+            assert!(state.sessions["s1"].brief_dirty_at.is_some(), "racing Stop keeps it dirty");
+        }
+        // Unknown session → false (caller merges into the store instead).
+        assert!(!shared.set_brief("nope", brief(started), started));
+    }
+
+    #[test]
+    fn clear_brief_dirty_respects_the_race_rule() {
+        let shared = FleetShared::new();
+        let t0 = utc("2026-08-25T10:00:00Z");
+        {
+            let mut state = shared.state.lock().unwrap();
+            reduce(&mut state, &stop("s1"), t0);
+            state.sessions.get_mut("s1").unwrap().brief_dirty_at = Some(t0);
+        }
+        let started = t0 + chrono::Duration::seconds(50);
+        assert!(shared.clear_brief_dirty("s1", started));
+        assert!(shared.state.lock().unwrap().sessions["s1"].brief_dirty_at.is_none());
+
+        // Newer dirty mark stays.
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.sessions.get_mut("s1").unwrap().brief_dirty_at =
+                Some(started + chrono::Duration::seconds(5));
+        }
+        assert!(shared.clear_brief_dirty("s1", started));
+        assert!(shared.state.lock().unwrap().sessions["s1"].brief_dirty_at.is_some());
+        assert!(!shared.clear_brief_dirty("gone", started));
+    }
+
+    #[test]
+    fn brief_fields_survive_serde_round_trip() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T10:00:00Z");
+        reduce(&mut state, &stop("s1"), t0);
+        let mut s = state.sessions["s1"].clone();
+        s.transcript_path = Some("/t/s1.jsonl".into());
+        s.brief_dirty_at = Some(t0);
+        s.brief = Some(SessionBrief {
+            headline: "h".into(),
+            bullets: vec!["b1".into(), "b2".into()],
+            blocked_on: Some("review".into()),
+            generated_at: t0,
+            final_brief: true,
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        let back: FleetSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+        // Pre-brief rows (no new fields in the JSON) still deserialize.
+        let legacy = r#"{"id":"x","cwd":"/a","name":"a","status":"Idle",
+            "last_event_at":"2026-08-25T10:00:00Z","working_since":null}"#;
+        let old: FleetSession = serde_json::from_str(legacy).unwrap();
+        assert!(old.brief.is_none() && old.transcript_path.is_none() && old.brief_dirty_at.is_none());
     }
 
     #[test]
