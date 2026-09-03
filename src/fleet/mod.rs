@@ -519,12 +519,22 @@ pub fn reduce_with_prompt(
             session.attention_at = None;
         }
         FleetEvent::Notification { kind, message, .. } => {
-            close_span(session, Some(now));
-            session.status = FleetStatus::NeedsAttention(AttentionKind::Notification {
-                kind: kind.clone(),
-                message: message.clone(),
-            });
-            session.attention_at = Some(now);
+            // An idle "waiting for your input" nudge during a background
+            // phase does NOT mean the session needs the user — it is waiting
+            // on its own background work. Permission-flavored notifications
+            // always alert, background phase or not.
+            let permissionish = kind.contains("permission");
+            if session.status == FleetStatus::WorkingBackground && !permissionish {
+                // Hold the phase; the span stays open and the liveness tail
+                // below records the event.
+            } else {
+                close_span(session, Some(now));
+                session.status = FleetStatus::NeedsAttention(AttentionKind::Notification {
+                    kind: kind.clone(),
+                    message: message.clone(),
+                });
+                session.attention_at = Some(now);
+            }
         }
         FleetEvent::PermissionRequest {
             request_id,
@@ -574,6 +584,26 @@ pub fn reduce_with_prompt(
             close_span(session, Some(now));
             mark_prompt_stopped(session, prompt_id);
             session.status = FleetStatus::Idle;
+        }
+        FleetEvent::SubagentStop { background_tasks, .. }
+            if *background_tasks > 0
+                && matches!(
+                    &session.status,
+                    FleetStatus::NeedsAttention(AttentionKind::Notification { kind, .. })
+                        if !kind.contains("permission")
+                ) =>
+        {
+            // Hard evidence that background work continues (a subagent
+            // finished and MORE remain) while the card shows an idle-nudge
+            // alert: the ordering race — Stop under-reported, or the idle
+            // notification landed mid-phase. Demote the informational alert
+            // back to the honest state. Gates and permission notifications
+            // are never demoted.
+            if session.working_since.is_none() {
+                session.working_since = Some(now);
+            }
+            session.status = FleetStatus::WorkingBackground;
+            session.attention_at = None;
         }
         FleetEvent::ToolActivity { .. } | FleetEvent::SubagentStop { .. }
             if prompt_is_background && session.status != FleetStatus::WorkingBackground =>
@@ -1529,7 +1559,9 @@ mod tests {
         assert!(state.sessions["s1"].status.needs_attention());
         assert!(state.sessions["s1"].attention_at.is_some());
 
-        // A background monitor completes 3 minutes later, same stopped prompt.
+        // A background subagent completes 3 minutes later with MORE still
+        // running: hard evidence the session is working, not waiting — the
+        // idle-nudge alert demotes to WorkingBackground.
         let t_bg = local_at(day, 9, 14);
         reduce_with_prompt(
             &mut state,
@@ -1541,11 +1573,61 @@ mod tests {
             Some("p1"),
             t_bg,
         );
-        let s = &state.sessions["s1"];
-        assert!(s.status.needs_attention(), "alert survives background completion");
-        assert!(s.working_since.is_none(), "no phantom span");
-        assert_eq!(s.last_event_at, t_bg, "liveness still recorded");
-        assert_eq!(s.minutes_on(day, t_bg), 10, "no background minute inflation");
+        {
+            let s = &state.sessions["s1"];
+            assert_eq!(s.status, FleetStatus::WorkingBackground, "idle nudge demoted");
+            assert!(s.attention_at.is_none());
+            assert_eq!(s.last_event_at, t_bg);
+        }
+        // A further idle nudge during the background phase does NOT re-raise.
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::Notification {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                kind: "idle_prompt".into(),
+                message: "Claude is waiting for your input".into(),
+            },
+            Some("p1"),
+            local_at(day, 9, 15),
+        );
+        assert_eq!(state.sessions["s1"].status, FleetStatus::WorkingBackground);
+        // But a permission notification ALWAYS alerts, background or not.
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::Notification {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                kind: "permission_prompt".into(),
+                message: "Claude needs your permission to use Bash".into(),
+            },
+            Some("p1"),
+            local_at(day, 9, 16),
+        );
+        assert!(state.sessions["s1"].status.needs_attention());
+        // …and background completions never clear a permission alert.
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::SubagentStop {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                background_tasks: 1,
+            },
+            Some("p1"),
+            local_at(day, 9, 17),
+        );
+        assert!(
+            state.sessions["s1"].status.needs_attention(),
+            "permission alerts survive background activity"
+        );
+        // Reset to plain idle attention for the rest of the test.
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: String::new() },
+            Some("p1b"),
+            local_at(day, 9, 18),
+        );
+        reduce_with_prompt(&mut state, &stop("s1"), Some("p1b"), local_at(day, 9, 19));
 
         // A NEW prompt's heartbeat behaves normally again.
         reduce_with_prompt(

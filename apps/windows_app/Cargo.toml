@@ -16,7 +16,7 @@ path = "../../src/main.rs"
 # Workspace dependencies
 dioxus = { workspace = true, features = ["desktop"] }
 dioxus-desktop = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 tray-icon = { workspace = true }
 image = { workspace = true, features = ["png"] }
 dioxus-signals = { workspace = true }
@@ -67,6 +67,19 @@ sublime_fuzzy = "0.7.0"
 json2markdown = "0.2.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 notify = "8.2.0"
+
+# Keep in sync with the root Cargo.toml — this manifest builds the same
+# src/main.rs and silently breaks the Windows CI build when a root dep is
+# missing here (fleet listener, planner calendar, terminal, licensing).
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+portable-pty = "0.9"
+strip-ansi-escapes = "0.2"
+chrono-tz = "0.10"
+icalendar = { version = "0.17", features = ["recurrence"] }
+rrule = "0.14"
+ed25519-dalek = "2"
 
 # macOS-specific dependencies (needed when checking on macOS dev machines)
 [target.'cfg(target_os = "macos")'.dependencies]

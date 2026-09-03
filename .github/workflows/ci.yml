@@ -30,7 +30,9 @@ jobs:
 
     - name: Security Audit
       run: |
-        cargo install cargo-audit
+        # --locked: build cargo-audit from its own lockfile — a fresh
+        # resolution has broken the install before (tinyvec, 2026-09).
+        cargo install cargo-audit --locked
         # Ignore policy: an ignore is allowed ONLY when no upstream fix exists
         # (or the vulnerable code is provably not compiled), with the reason
         # recorded here. Audited 2026-07-13 — all previously stale ignores removed.
