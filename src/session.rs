@@ -126,6 +126,14 @@ pub struct Session {
     /// Per-session chat model override. None → the effective provider's configured model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_model: Option<String>,
+    /// Planner project this chat belongs to (auto-tagged by the AI from
+    /// conversation content, or set by the user via the chat-bar chip).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// True after any manual set/clear of the project tag — the auto-tagger
+    /// never touches a session the user has decided about.
+    #[serde(default)]
+    pub project_tag_user_set: bool,
     /// Skills actively loaded into this session's context.
     /// Maps skill_name → CapabilityContextPayload JSON (the response from execute_skill).
     /// Skills persist here until explicitly unloaded via /unload.
@@ -1199,6 +1207,8 @@ impl SessionState {
             llm_connector_id: None,
             llm_provider: None,
             chat_model: None,
+            project_id: None,
+            project_tag_user_set: false,
             loaded_skills: HashMap::new(),
             scratchpad: String::new(),
             current_ai_turn_count: 0,
@@ -2151,6 +2161,8 @@ mod tests {
             llm_connector_id: None,
             llm_provider: None,
             chat_model: None,
+            project_id: None,
+            project_tag_user_set: false,
             loaded_skills: HashMap::new(),
             scratchpad: String::new(),
             current_ai_turn_count: 0,

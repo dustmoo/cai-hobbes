@@ -800,6 +800,7 @@ mod tests {
                 status: TodoStatus::Open,
                 deadline: None,
                 sort_order: 0.0,
+                path: None,
                 created_at: now,
                 updated_at: now,
             };

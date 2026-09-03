@@ -22,11 +22,13 @@ pub fn use_summarization_scheduler() {
     let session_state = use_context::<Signal<SessionState>>();
     let settings = use_context::<Signal<Settings>>();
     let processor = use_context::<Signal<ConversationProcessor>>();
+    let planner = use_context::<Signal<crate::todo::PlannerState>>();
 
     let coroutine = use_coroutine(move |mut rx: UnboundedReceiver<SchedulerSignal>| {
         let mut session_state = session_state.to_owned();
         let settings = settings.to_owned();
         let processor = processor.to_owned();
+        let planner = planner.to_owned();
         async move {
             let mut last_summarized_message_count = 0;
             loop {
@@ -73,6 +75,11 @@ pub fn use_summarization_scheduler() {
                                 },
                             );
                             last_summarized_message_count = current_message_count;
+                            crate::services::project_tagger::maybe_auto_tag(
+                                &active_session.id,
+                                session_state,
+                                planner,
+                            );
                             tracing::info!("Conversation summary updated (Forced).");
                         }
                         continue;
@@ -117,6 +124,11 @@ pub fn use_summarization_scheduler() {
                                     },
                                 );
                                 last_summarized_message_count = current_message_count;
+                                crate::services::project_tagger::maybe_auto_tag(
+                                    &active_session.id,
+                                    session_state,
+                                    planner,
+                                );
                                 tracing::info!("Conversation summary updated.");
                             }
                         }

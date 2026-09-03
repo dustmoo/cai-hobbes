@@ -383,6 +383,15 @@ pub struct Settings {
     /// `fleet_enabled` and Pro are on.
     #[serde(default = "default_true")]
     pub fleet_briefs_enabled: bool,
+    /// Minutes of idle silence before a session retires off the live fleet
+    /// board (into Earlier today; any later event revives it with its banked
+    /// time). Clamped to 15–1440 at use.
+    #[serde(default = "default_fleet_retire_minutes")]
+    pub fleet_retire_minutes: u32,
+}
+
+fn default_fleet_retire_minutes() -> u32 {
+    60
 }
 
 fn default_planner_block_minutes() -> u32 {
@@ -784,6 +793,7 @@ impl Default for Settings {
             planner_default_block_minutes: default_planner_block_minutes(),
             fleet_enabled: false,
             fleet_briefs_enabled: true,
+            fleet_retire_minutes: default_fleet_retire_minutes(),
         }
     }
 }
@@ -2500,6 +2510,8 @@ mod tests {
             llm_connector_id: None,
             llm_provider: None,
             chat_model: None,
+            project_id: None,
+            project_tag_user_set: false,
             loaded_skills: HashMap::new(),
             scratchpad: String::new(),
             current_ai_turn_count: 0,

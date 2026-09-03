@@ -839,6 +839,7 @@ pub fn ChatInput(
                     title: "Fleet"
                 }
                 SessionCostIcon {}
+                crate::components::project_chip::ProjectChip {}
 
                 // LLM Connector Selector (session-scoped, mirrors the profile picker)
                 { if ui_state.read().show_provider_selector {

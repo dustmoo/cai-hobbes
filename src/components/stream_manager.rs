@@ -46,19 +46,28 @@ pub struct StreamManagerContext {
 
 impl StreamManagerContext {
     /// Report this session's lifecycle into the fleet (no-op while the
-    /// bridge is disarmed). Name lookup peeks — never subscribes.
+    /// bridge is disarmed). Name lookup peeks — never subscribes. Turn
+    /// completions carry the conversation summary so the fleet row gets a
+    /// re-entry brief without any transcript or extra LLM call.
     fn fleet_report(&self, session_id: &str, signal: crate::fleet::bridge::HobbesSignal) {
         if !crate::fleet::bridge::enabled() {
             return;
         }
-        let name = self
-            .session_state
-            .peek()
-            .sessions
-            .get(session_id)
-            .map(|s| s.name.clone())
-            .unwrap_or_default();
-        crate::fleet::bridge::report(session_id, &name, signal);
+        let (name, summary_json) = {
+            let state = self.session_state.peek();
+            match state.sessions.get(session_id) {
+                Some(s) => {
+                    let cs = &s.active_context.conversation_summary;
+                    let json = (!cs.summary.trim().is_empty()
+                        || !cs.current_task.trim().is_empty())
+                    .then(|| serde_json::to_value(cs).ok())
+                    .flatten();
+                    (s.name.clone(), json)
+                }
+                None => (String::new(), None),
+            }
+        };
+        crate::fleet::bridge::report_with_brief(session_id, &name, signal, summary_json);
     }
 
     pub fn is_streaming(self, message_id: &Uuid) -> bool {
@@ -1162,6 +1171,7 @@ impl StreamManagerContext {
 
                                     // Fire-and-forget: don't block continuation on LLM call.
                                     let mut session_state = self.session_state;
+                                    let planner_state = self.planner_state;
                                     dioxus::prelude::spawn(async move {
                                         match connector.summarize_conversation(prev_summary, recent).await {
                                             Ok(summary_json) => {
@@ -1178,6 +1188,13 @@ impl StreamManagerContext {
                                                     log_event(
                                                         &session_id_clone,
                                                         SessionEvent::SummaryComputed { summary: summary_value },
+                                                    );
+                                                    // Fresh summary → maybe auto-tag the
+                                                    // session to a planner project.
+                                                    crate::services::project_tagger::maybe_auto_tag(
+                                                        &session_id_clone,
+                                                        session_state,
+                                                        planner_state,
                                                     );
                                                 }
                                             }

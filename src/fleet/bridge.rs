@@ -85,11 +85,29 @@ fn to_event(session_id: &str, signal: &HobbesSignal) -> FleetEvent {
 /// title (patched onto the row so the fleet shows it instead of a
 /// cwd-derived name). No-op while the bridge is disarmed.
 pub fn report(session_id: &str, name: &str, signal: HobbesSignal) {
+    report_with_brief(session_id, name, signal, None);
+}
+
+/// [`report`] plus the session's `ConversationSummary` as JSON: on
+/// `TurnCompleted`/`Closed` it becomes the row's re-entry brief via the same
+/// tolerant mapper the LLM path uses (`briefs::brief_from_summary_value`) —
+/// zero extra LLM calls, and the day rollup / planner context / fleet-status
+/// tool pick it up for free.
+pub fn report_with_brief(
+    session_id: &str,
+    name: &str,
+    signal: HobbesSignal,
+    summary_json: Option<serde_json::Value>,
+) {
     if !enabled() || session_id.is_empty() {
         return;
     }
     let ev = to_event(session_id, &signal);
     let now = Utc::now();
+    let is_final = matches!(signal, HobbesSignal::Closed);
+    let brief = summary_json
+        .filter(|_| matches!(signal, HobbesSignal::TurnCompleted | HobbesSignal::Closed))
+        .and_then(|v| super::briefs::brief_from_summary_value(&v, now, is_final));
     let shared = super::shared();
     let changed = {
         let mut state = shared.state.lock().expect("fleet state lock poisoned");
@@ -104,11 +122,15 @@ pub fn report(session_id: &str, name: &str, signal: HobbesSignal) {
         }
         let mut changed = super::reduce(&mut state, &ev, now);
         // Patch identity on the live entry and the persisted clones: origin
-        // marker plus the human tab title (created rows start "(unknown)").
+        // marker plus the human tab title (created rows start "(unknown)"),
+        // and the summary-derived brief when one rode along.
         let patch = |s: &mut super::FleetSession| {
             s.origin = FleetOrigin::Hobbes;
             if !name.is_empty() && s.name != name {
                 s.name = name.to_string();
+            }
+            if let Some(b) = &brief {
+                s.brief = Some(b.clone());
             }
         };
         if let Some(s) = state.sessions.get_mut(ev.session_id()) {
@@ -198,6 +220,23 @@ mod tests {
         fold(&mut state, "tab1", "New Chat", HobbesSignal::TurnStarted);
         fold(&mut state, "tab1", "Quarterly Report", HobbesSignal::Activity);
         assert_eq!(state.sessions["tab1"].name, "Quarterly Report");
+    }
+
+    #[test]
+    fn summary_value_becomes_the_rows_brief() {
+        // The mapper contract: a ConversationSummary serialized to JSON has
+        // exactly the shape brief_from_summary_value consumes.
+        let mut cs = crate::session::ConversationSummary::default();
+        cs.summary = "Drafted the Puget proposal.".to_string();
+        cs.entities
+            .other_entities
+            .insert("blockers".into(), serde_json::json!(["waiting on legal"]));
+        let v = serde_json::to_value(&cs).unwrap();
+        let brief =
+            crate::fleet::briefs::brief_from_summary_value(&v, Utc::now(), true).unwrap();
+        assert_eq!(brief.headline, "Drafted the Puget proposal.");
+        assert_eq!(brief.blocked_on.as_deref(), Some("waiting on legal"));
+        assert!(brief.final_brief);
     }
 
     #[test]

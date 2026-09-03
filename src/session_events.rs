@@ -75,6 +75,12 @@ pub enum SessionEvent {
     },
     /// The session was renamed.
     SessionRenamed { name: String },
+    /// The session's planner-project tag changed (`None` = cleared).
+    /// `user_set` marks a manual decision the auto-tagger must respect.
+    ProjectTagged {
+        project_id: Option<String>,
+        user_set: bool,
+    },
     /// `delete_message_and_after` truncated history. `seq` is the journal seq
     /// of the first event referencing the deleted message (everything at or
     /// after it is undone); 0 when the message predates the journal.
@@ -138,6 +144,7 @@ impl SessionEvent {
             SessionEvent::TimerFired { .. } => "TimerFired",
             SessionEvent::ConnectorPinned { .. } => "ConnectorPinned",
             SessionEvent::SessionRenamed { .. } => "SessionRenamed",
+            SessionEvent::ProjectTagged { .. } => "ProjectTagged",
             SessionEvent::RewoundTo { .. } => "RewoundTo",
             SessionEvent::StreamCancelled { .. } => "StreamCancelled",
             SessionEvent::MemoryOptimized { .. } => "MemoryOptimized",
@@ -191,6 +198,8 @@ fn blank_session() -> Session {
         composio_profile: None,
         llm_connector_id: None,
         llm_provider: None,
+        project_id: None,
+        project_tag_user_set: false,
         chat_model: None,
         loaded_skills: std::collections::HashMap::new(),
         scratchpad: String::new(),
@@ -287,6 +296,15 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
             });
         }
         E::SessionRenamed { name } => session.name = name.clone(),
+        E::ProjectTagged {
+            project_id,
+            user_set,
+        } => {
+            session.project_id = project_id.clone();
+            if *user_set {
+                session.project_tag_user_set = true;
+            }
+        }
         E::RewoundTo { message_id, .. } => {
             // Single home of truth for undo semantics: harvest usage from the
             // truncated messages into accumulated_cost/accumulated_tokens,
@@ -618,6 +636,9 @@ mod tests {
             },
             SessionEvent::MemoryOptimized { summary: "trimmed old context".into() },
             SessionEvent::SessionRenamed { name: "Renamed".into() },
+            // Auto-tag, then a manual clear: the clear wins and locks.
+            SessionEvent::ProjectTagged { project_id: Some("proj-1".into()), user_set: false },
+            SessionEvent::ProjectTagged { project_id: None, user_set: true },
         ]);
 
         let s = project(None, &events);
@@ -634,6 +655,8 @@ mod tests {
         assert_eq!(s.llm_provider, Some(crate::settings::LlmProvider::Gemini));
         assert_eq!(s.chat_model.as_deref(), Some("gemini-x"));
         assert_eq!(s.memory_optimization_summary.as_deref(), Some("trimmed old context"));
+        assert_eq!(s.project_id, None, "manual clear undoes the auto-tag");
+        assert!(s.project_tag_user_set, "manual decisions lock the tag");
         // Messages: user, assistant (created_at 1.5s — sorted before the tool
         // call despite being journaled last), tool call with folded result.
         assert_eq!(s.messages.len(), 3);

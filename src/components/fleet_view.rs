@@ -335,17 +335,45 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
     let settings = use_context::<Signal<crate::settings::Settings>>();
     let mut open = use_signal(|| false);
 
-    // Cached rollup for today, else yesterday's (the morning re-entry case).
+    // Rollups cache per-date in meta ("fleet_rollup_YYYY-MM-DD") — nothing
+    // is ever replaced; the band is a window onto one day at a time, with
+    // ‹ › walking to other cached days.
+    fn load_rollup(d: chrono::NaiveDate) -> Option<fleet::briefs::DayRollup> {
+        crate::session_store::meta_get(&fleet::briefs::rollup_meta_key(d))
+            .and_then(|s| serde_json::from_str(&s).ok())
+    }
+    /// Nearest cached day strictly before/after `from`, probing two weeks.
+    fn adjacent_cached(from: chrono::NaiveDate, back: bool, today: chrono::NaiveDate)
+        -> Option<chrono::NaiveDate>
+    {
+        let mut d = from;
+        for _ in 0..14 {
+            d = if back { d.pred_opt()? } else { d.succ_opt()? };
+            if !back && d > today {
+                return None;
+            }
+            if load_rollup(d).is_some() {
+                return Some(d);
+            }
+        }
+        None
+    }
+
+    let mut viewing = use_signal(|| {
+        // Morning re-entry: no rollup yet today → open on yesterday's.
+        if load_rollup(today).is_none() {
+            if let Some(y) = today.pred_opt().filter(|y| load_rollup(*y).is_some()) {
+                return y;
+            }
+        }
+        today
+    });
     let mut rollup = use_signal(|| Option::<fleet::briefs::DayRollup>::None);
     let mut rollup_running = use_signal(|| false);
     let mut rollup_error = use_signal(|| Option::<String>::None);
     use_effect(move || {
-        let today = Local::now().date_naive();
-        let load = |d: chrono::NaiveDate| {
-            crate::session_store::meta_get(&fleet::briefs::rollup_meta_key(d))
-                .and_then(|s| serde_json::from_str::<fleet::briefs::DayRollup>(&s).ok())
-        };
-        rollup.set(load(today).or_else(|| today.pred_opt().and_then(load)));
+        let d = viewing();
+        rollup.set(load_rollup(d));
     });
 
     let on_rollup = move |_| {
@@ -406,7 +434,11 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
             }
             .await;
             match outcome {
-                Ok(r) => rollup.set(Some(r)),
+                Ok(r) => {
+                    // A fresh rollup is today's — snap the window to it.
+                    viewing.set(Local::now().date_naive());
+                    rollup.set(Some(r));
+                }
                 Err(e) => rollup_error.set(Some(e)),
             }
             rollup_running.set(false);
@@ -414,11 +446,17 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
     };
 
     let current = rollup.read().clone();
-    let band_label = match &current {
-        Some(r) if r.date == today => "Day in review — today".to_string(),
-        Some(_) => "Day in review — yesterday".to_string(),
-        None => "Day in review".to_string(),
+    let viewing_day = viewing();
+    let day_label = if viewing_day == today {
+        "today".to_string()
+    } else if today.pred_opt() == Some(viewing_day) {
+        "yesterday".to_string()
+    } else {
+        viewing_day.format("%a, %-d %b").to_string()
     };
+    let band_label = format!("Day in review — {day_label}");
+    let prev_day = adjacent_cached(viewing_day, true, today);
+    let next_day = adjacent_cached(viewing_day, false, today);
     let preview = current
         .as_ref()
         .map(|r| fleet::truncate_summary(&r.narrative, 110))
@@ -444,6 +482,35 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
                         span {
                             class: "text-[11px] text-fg-muted shrink-0",
                             { format!("rolled up {}", age_label(r.generated_at, now)) }
+                        }
+                    }
+                    // Walk between cached days — nothing is ever replaced,
+                    // each day keeps its own rollup.
+                    if prev_day.is_some() || next_day.is_some() {
+                        div {
+                            class: "flex items-center shrink-0",
+                            button {
+                                class: "px-1.5 text-xs text-fg-muted hover:text-fg disabled:opacity-30 transition-colors select-none",
+                                disabled: prev_day.is_none(),
+                                title: "Earlier day",
+                                onclick: move |_| {
+                                    if let Some(d) = prev_day {
+                                        viewing.set(d);
+                                    }
+                                },
+                                "‹"
+                            }
+                            button {
+                                class: "px-1.5 text-xs text-fg-muted hover:text-fg disabled:opacity-30 transition-colors select-none",
+                                disabled: next_day.is_none(),
+                                title: "Later day",
+                                onclick: move |_| {
+                                    if let Some(d) = next_day {
+                                        viewing.set(d);
+                                    }
+                                },
+                                "›"
+                            }
                         }
                     }
                     button {
@@ -472,6 +539,28 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
 fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
     let mut chat_command =
         use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    let planner = use_context::<Signal<crate::todo::PlannerState>>();
+    let session_state = use_context::<Signal<crate::session::SessionState>>();
+
+    // Project attribution: terminal rows map by cwd against Project.path;
+    // Hobbes rows carry their chat session's tag (hydrated tabs only).
+    let project = {
+        let p = planner.read();
+        let id = match session.origin {
+            fleet::FleetOrigin::External => {
+                crate::services::project_tagger::project_for_cwd(&p.projects, &session.cwd)
+            }
+            fleet::FleetOrigin::Hobbes => session_state
+                .read()
+                .sessions
+                .get(&session.id)
+                .and_then(|s| s.project_id.clone()),
+        };
+        id.and_then(|id| {
+            crate::services::project_tagger::project_title(&p.projects, &id)
+                .map(str::to_string)
+        })
+    };
     let (chip_label, chip_color) = status_chip(&session.status);
     let attention = session.status.needs_attention();
     // Attention rows get a loud left edge; computed color → inline style.
@@ -530,8 +619,14 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                             title: "{chip_label}",
                         }
                     }
+                    // Project leads the subtitle so truncation eats the
+                    // path, never the tag.
                     p {
                         class: "text-xs text-fg-muted truncate",
+                        if let Some(proj) = &project {
+                            span { class: "text-fg", "{proj}" }
+                            span { " · " }
+                        }
                         if session.origin == fleet::FleetOrigin::Hobbes {
                             "Hobbes chat tab"
                         } else {

@@ -59,12 +59,30 @@ use events::FleetEvent;
 /// Idle, and unproven span tails are capped at this length.
 pub const STALENESS_MINUTES: i64 = 10;
 
-/// Idle this long with no events → the session retires off the live board
-/// (ended_at = its last event; history and banked time stay in the DB, and
-/// any later event resurrects it — see the revival path in `server`/`bridge`).
-/// Needs-attention sessions never retire: things waiting on the user must
-/// not fall off silently.
+/// Default minutes of idle silence before a session retires off the live
+/// board (ended_at = its last event; history and banked time stay in the DB,
+/// and any later event resurrects it — see the revival path in
+/// `server`/`bridge`). Needs-attention sessions never retire: things waiting
+/// on the user must not fall off silently. Tunable via
+/// `settings.fleet_retire_minutes`, mirrored into [`set_retire_minutes`] by
+/// the supervisor.
 pub const RETIRE_MINUTES: i64 = 60;
+
+static RETIRE_MINUTES_SETTING: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(RETIRE_MINUTES);
+
+/// Supervisor mirror of `settings.fleet_retire_minutes` (the sweep runs on
+/// plain tokio tasks with no Settings access). Clamped to 15–1440.
+pub fn set_retire_minutes(minutes: u32) {
+    RETIRE_MINUTES_SETTING.store(
+        i64::from(minutes.clamp(15, 1440)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn retire_minutes() -> i64 {
+    RETIRE_MINUTES_SETTING.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// `fleet_port` / `fleet_token` meta keys (session_store `meta` table).
 pub const META_FLEET_PORT: &str = "fleet_port";
@@ -558,7 +576,16 @@ pub fn sweep_stale(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSessi
 /// needs-attention sessions are exempt: work proves itself with events, and
 /// attention must never fall off the board unanswered.
 pub fn sweep_retired(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSession> {
-    let cutoff = now - chrono::Duration::minutes(RETIRE_MINUTES);
+    sweep_retired_after(state, now, retire_minutes())
+}
+
+/// Core with an explicit window (tests stay isolated from the global knob).
+pub fn sweep_retired_after(
+    state: &mut FleetState,
+    now: DateTime<Utc>,
+    minutes: i64,
+) -> Vec<FleetSession> {
+    let cutoff = now - chrono::Duration::minutes(minutes);
     let retire: Vec<String> = state
         .sessions
         .values()
@@ -1086,7 +1113,7 @@ mod tests {
         );
 
         let sweep_at = t0 + chrono::Duration::minutes(95);
-        let retired = sweep_retired(&mut state, sweep_at);
+        let retired = sweep_retired_after(&mut state, sweep_at, RETIRE_MINUTES);
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].id, "old-idle");
         assert_eq!(

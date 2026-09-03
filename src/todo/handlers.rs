@@ -1499,6 +1499,9 @@ fn upsert_project(
             if let Some(s) = status {
                 project.status = s;
             }
+            if let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
+                project.path = Some(p.trim().to_string()).filter(|p| !p.is_empty());
+            }
             project.updated_at = now;
             Ok(format!("[{}] project: {}", project.id, project.title))
         }
@@ -1524,6 +1527,11 @@ fn upsert_project(
                 status: status.unwrap_or_default(),
                 deadline,
                 sort_order,
+                path: obj
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty()),
                 created_at: now,
                 updated_at: now,
             };

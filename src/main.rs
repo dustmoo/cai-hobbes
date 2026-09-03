@@ -444,6 +444,7 @@ fn app() -> Element {
                 // condition as the listener (which also keeps the staleness
                 // sweep running whenever Hobbes rows are live).
                 fleet::bridge::set_enabled(want);
+                fleet::set_retire_minutes(settings.peek().fleet_retire_minutes);
                 if want && server.is_none() {
                     if !hydrated {
                         // Sessions left live by a previous process re-enter
@@ -1673,11 +1674,22 @@ fn app() -> Element {
                 &closing_session_id,
             );
 
-            // The fleet row (if the bridge is armed) leaves the live map.
-            fleet::bridge::report(
+            // The fleet row (if the bridge is armed) leaves the live map,
+            // taking a closing brief from the conversation summary with it.
+            let closing_summary = session_state
+                .peek()
+                .sessions
+                .get(&closing_session_id)
+                .map(|s| &s.active_context.conversation_summary)
+                .filter(|cs| {
+                    !cs.summary.trim().is_empty() || !cs.current_task.trim().is_empty()
+                })
+                .and_then(|cs| serde_json::to_value(cs).ok());
+            fleet::bridge::report_with_brief(
                 &closing_session_id,
                 "",
                 fleet::bridge::HobbesSignal::Closed,
+                closing_summary,
             );
 
             // Delete the session if it has no messages (empty tab).

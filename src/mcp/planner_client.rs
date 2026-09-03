@@ -267,7 +267,8 @@ impl PlannerClient {
                                         "notes": { "type": "string" },
                                         "area_id": { "type": "string", "description": "Area to file the project under." },
                                         "deadline": { "type": "string", "description": "YYYY-MM-DD, 'today' or 'tomorrow'." },
-                                        "status": { "type": "string", "enum": ["open", "in_progress", "completed", "cancelled"] }
+                                        "status": { "type": "string", "enum": ["open", "in_progress", "completed", "cancelled"] },
+                                        "path": { "type": "string", "description": "Repo/folder root for this project (e.g. ~/Sites/puget) — used to match coding-agent sessions to the project. Empty string clears it." }
                                     }
                                 }
                             },

@@ -29,6 +29,7 @@ pub mod mcp_marketplace;
 pub mod mcp_search_form;
 pub mod fleet_view;
 pub mod pixel_icons;
+pub mod project_chip;
 pub mod onboarding;
 pub mod planner_view;
 pub mod todo_detail;

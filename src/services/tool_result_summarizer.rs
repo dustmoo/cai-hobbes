@@ -144,6 +144,8 @@ mod tests {
             llm_connector_id: None,
             llm_provider: None,
             chat_model: None,
+            project_id: None,
+            project_tag_user_set: false,
             loaded_skills: std::collections::HashMap::new(),
             scratchpad: String::new(),
             current_ai_turn_count: 0,

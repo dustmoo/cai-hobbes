@@ -542,6 +542,10 @@ pub struct Project {
     pub deadline: Option<NaiveDate>,
     #[serde(default)]
     pub sort_order: f64,
+    /// Repo/folder root for this project — lets fleet terminal sessions map
+    /// to the project by cwd (longest-prefix match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

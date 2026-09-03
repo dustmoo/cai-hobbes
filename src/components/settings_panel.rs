@@ -6028,6 +6028,30 @@ fn FleetSection() -> Element {
                             class: "text-xs text-fg-muted mt-1 ml-6",
                             "Transcript excerpts are sent only to your own configured provider; briefs are stored locally."
                         }
+                        div {
+                            class: "mt-3 flex items-center justify-between",
+                            div {
+                                label { class: "text-sm text-fg-muted", "Retire idle sessions after" }
+                                p { class: "text-xs text-fg-muted", "Minutes of silence before a card moves to \"Earlier today\" (any new activity brings it back, time intact). 15–1440." }
+                            }
+                            div {
+                                class: "flex items-center gap-1 shrink-0",
+                                input {
+                                    r#type: "number",
+                                    min: "15",
+                                    max: "1440",
+                                    class: "w-20 bg-input border border-faint rounded p-1 text-sm text-fg text-right focus:border-blue-500 focus:outline-none",
+                                    value: "{settings.read().fleet_retire_minutes}",
+                                    onchange: move |e| {
+                                        if let Ok(v) = e.value().parse::<u32>() {
+                                            settings.write().fleet_retire_minutes = v.clamp(15, 1440);
+                                            persist();
+                                        }
+                                    }
+                                }
+                                span { class: "text-xs text-fg-muted", "min" }
+                            }
+                        }
                     }
                     if let Some(err) = fleet_error() {
                         p { class: "text-sm text-red-400 mt-2", "{err}" }
