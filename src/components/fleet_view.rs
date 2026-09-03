@@ -613,6 +613,13 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                             class: "text-sm font-semibold truncate",
                             { session.display_name().to_string() }
                         }
+                        if session.dispatched_todo.is_some() {
+                            span {
+                                class: "shrink-0 px-1.5 rounded-full border border-faint text-[10px] text-fg-muted",
+                                title: "Launched by Hobbes for a todo",
+                                "dispatched"
+                            }
+                        }
                         // Status as a dot, not a pill — the full name of the
                         // state lives in the tooltip; attention pulses.
                         span {

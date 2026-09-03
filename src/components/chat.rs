@@ -383,6 +383,7 @@ pub fn ChatWindow(
                             permission_manager,
                             mcp_context: mcp_context_signal,
                             planner: planner_state,
+                            chat_command,
                         },
                         &tool_call,
                         &args_json,
@@ -396,13 +397,10 @@ pub fn ChatWindow(
                         None => {
             // Normal MCP tool dispatch
                             let manager = mcp_manager.read().clone();
-                            // Approval resume must rebuild the terminal's
-                            // session context — the approving chat owns the
-                            // tool call.
-                            let session_ctx = if tool_call.server_name
-                                == crate::mcp::manager::HOBBES_TERMINAL_SERVER
-                                || tool_call.server_name == "local-on-demand"
-                            {
+                            // Approval resume rebuilds the session context —
+                            // the approving chat owns the tool call. Built
+                            // for every tool (trust gate + decision log).
+                            let session_ctx = {
                                 let state = session_state.peek();
                                 state.sessions.get(&active_session_id).map(|s| {
                                     crate::mcp::terminal_client::TerminalCtx {
@@ -412,10 +410,9 @@ pub fn ChatWindow(
                                             &planner_state.peek(),
                                             &settings.peek(),
                                         ),
+                                        project_id: s.project_id.clone(),
                                     }
                                 })
-                            } else {
-                                None
                             };
                             let result_receiver = manager
                                 .use_mcp_tool(

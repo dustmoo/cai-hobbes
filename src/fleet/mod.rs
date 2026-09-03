@@ -214,6 +214,12 @@ pub struct FleetSession {
     /// wasn't listening.
     #[serde(default)]
     pub attention_at: Option<DateTime<Utc>>,
+    /// Set when this session was launched by HOBBES_DISPATCH for a todo.
+    /// A flag on External origin (NOT a new origin variant — reconciliation
+    /// and grouping treat dispatched runs as the Claude Code sessions they
+    /// are).
+    #[serde(default)]
+    pub dispatched_todo: Option<String>,
 }
 
 impl FleetSession {
@@ -238,6 +244,7 @@ impl FleetSession {
             active_prompt: None,
             stopped_prompts: Vec::new(),
             attention_at: None,
+            dispatched_todo: None,
         }
     }
 

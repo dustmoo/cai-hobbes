@@ -33,6 +33,8 @@ pub struct StreamManagerContext {
     /// The global planner — needed by the built-in planner tools, which run on
     /// the streaming path here (P-015: dispatch stays in builtin_tools).
     planner_state: Signal<crate::todo::PlannerState>,
+    /// The UI command bus (HOBBES_DISPATCH focuses freshly created tabs).
+    chat_command: Signal<Option<crate::components::chat_input::ChatCommand>>,
     pub stream_activity: Signal<u64>,
     pub streaming_sessions: Signal<HashSet<String>>,
     stream_session_map: Signal<HashMap<Uuid, String>>,
@@ -629,6 +631,7 @@ impl StreamManagerContext {
                                         permission_manager: self.permission_manager,
                                         mcp_context: self.mcp_context,
                                         planner: self.planner_state,
+                                        chat_command: self.chat_command,
                                     },
                                     &tool_call,
                                     &args_json,
@@ -686,13 +689,11 @@ impl StreamManagerContext {
                                 return;
                             }
 
-                            // Per-session context for the native terminal
-                            // (direct or via local-on-demand): the chat id
-                            // plus its resolved project working directory.
-                            let session_ctx = if tool_call.server_name
-                                == crate::mcp::manager::HOBBES_TERMINAL_SERVER
-                                || tool_call.server_name == "local-on-demand"
-                            {
+                            // Per-session context for EVERY tool call: the
+                            // trust gate scopes rules by project and logs
+                            // decisions with session identity; the terminal
+                            // additionally uses the resolved cwd.
+                            let session_ctx = {
                                 let state = session_state.peek();
                                 state.sessions.get(&session_id_inner).map(|s| {
                                     crate::mcp::terminal_client::TerminalCtx {
@@ -702,10 +703,9 @@ impl StreamManagerContext {
                                             &self.planner_state.peek(),
                                             &self.settings.peek(),
                                         ),
+                                        project_id: s.project_id.clone(),
                                     }
                                 })
-                            } else {
-                                None
                             };
                             let result_receiver = mcp_manager
                                 .read()
@@ -1809,6 +1809,7 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         skill_registry: consume_context::<Signal<crate::skills::SkillRegistry>>(),
         mcp_context: consume_context::<Signal<crate::mcp::manager::McpContext>>(),
         planner_state: consume_context::<Signal<crate::todo::PlannerState>>(),
+        chat_command: consume_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>(),
         stream_activity: Signal::new(0),
         streaming_sessions: Signal::new(HashSet::new()),
         stream_session_map: Signal::new(HashMap::new()),
@@ -1858,6 +1859,7 @@ mod tests {
             });
             let scheduler = use_coroutine(|_| async {});
             let mut stream_manager = use_context_provider(|| StreamManagerContext {
+                chat_command: Signal::new(None),
                 stream_receivers: Signal::new(HashMap::new()),
                 active_stream_handles: Signal::new(HashMap::new()),
                 llm_connector,
@@ -1937,6 +1939,7 @@ mod tests {
             });
             let scheduler = use_coroutine(|_| async {});
             let stream_manager = use_context_provider(|| StreamManagerContext {
+                chat_command: Signal::new(None),
                 stream_receivers: Signal::new(HashMap::new()),
                 active_stream_handles: Signal::new(HashMap::new()),
                 llm_connector,

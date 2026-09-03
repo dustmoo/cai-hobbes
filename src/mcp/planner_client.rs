@@ -249,6 +249,36 @@ impl PlannerClient {
                 meta: None,
             },
             Tool {
+                name: "HOBBES_DISPATCH".into(),
+                description: Some(
+                    "Send a todo to a worker. target 'chat' opens a new Hobbes tab that \
+                    starts on the assignment immediately; target 'claude_code' launches a \
+                    headless Claude Code run in the todo's project directory (the project \
+                    must have a path). Either way the todo links to the worker and progress \
+                    flows back onto it automatically; a headless run's permission requests \
+                    appear in the Fleet for approval."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "todo_id": { "type": "string", "description": "The todo to dispatch." },
+                            "target": { "type": "string", "enum": ["chat", "claude_code"], "description": "Where the work runs." },
+                            "instructions": { "type": "string", "description": "Extra guidance appended to the assignment." },
+                            "model": { "type": "string", "description": "Model for claude_code runs (e.g. 'sonnet', 'opus')." }
+                        },
+                        "required": ["todo_id", "target"]
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("Dispatch Todo".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            Tool {
                 name: "HOBBES_PROJECT_UPSERT".into(),
                 description: Some(format!(
                     "Create or update projects and areas. Items without an 'id' are \

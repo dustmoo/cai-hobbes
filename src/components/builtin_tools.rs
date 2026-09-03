@@ -56,6 +56,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_TIME_BLOCK",
     "HOBBES_PROJECT_UPSERT",
     "HOBBES_CALENDAR_LIST",
+    "HOBBES_DISPATCH",
 ];
 
 #[allow(dead_code)]
@@ -112,7 +113,7 @@ pub fn is_planner_tool(name: &str) -> bool {
         || matches!(
             name,
             "HOBBES_PLAN_DAY" | "HOBBES_TIME_BLOCK" | "HOBBES_PROJECT_UPSERT"
-                | "HOBBES_CALENDAR_LIST"
+                | "HOBBES_CALENDAR_LIST" | "HOBBES_DISPATCH"
         )
 }
 
@@ -127,6 +128,9 @@ pub struct BuiltinToolCtx {
     /// The global planner (to-dos, day plans, time blocks) — shared across all
     /// chat tabs, unlike the per-session state above.
     pub planner: Signal<crate::todo::PlannerState>,
+    /// The UI command bus — dispatch uses it to focus a freshly created
+    /// assignment tab (SwitchToSession opens unknown ids as new tabs).
+    pub chat_command: Signal<Option<crate::components::chat_input::ChatCommand>>,
 }
 
 pub struct BuiltinOutcome {
@@ -326,6 +330,19 @@ fn run_planner_tool(
             handlers::handle_todo_update(&mut planner.write(), args_json, session_id, today, true)
         }
         "HOBBES_TODO_LIST" => handlers::handle_todo_list(&planner.read(), args_json, today),
+        "HOBBES_DISPATCH" => {
+            // Dispatch itself is metadata-only; the dispatched work stays
+            // gated (chat = in-app approvals with trust rules; headless =
+            // fleet-held PermissionRequests; never --bare/bypass).
+            match crate::todo::dispatch::handle_dispatch(
+                deps,
+                args_json,
+                &crate::todo::dispatch::RealClaudeSpawner,
+            ) {
+                Ok(msg) => (ToolCallStatus::Completed, msg),
+                Err(e) => (ToolCallStatus::Error, e),
+            }
+        }
         "HOBBES_PLAN_DAY" => {
             let (default_capacity, meetings_count) = {
                 let s = deps.settings.read();

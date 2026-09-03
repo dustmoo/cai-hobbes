@@ -398,6 +398,33 @@ pub struct Settings {
     pub terminal_enabled: bool,
 }
 
+impl Settings {
+    /// Add a trust rule, deduplicating on the full (server, tool,
+    /// command_prefix, project_id) tuple — returns the surviving rule's id.
+    pub fn add_trust_rule(
+        &mut self,
+        rule: crate::context::permissions::TrustRule,
+    ) -> String {
+        if let Some(existing) = self.permission_settings.trust_rules.iter().find(|r| {
+            r.server == rule.server
+                && r.tool == rule.tool
+                && r.command_prefix == rule.command_prefix
+                && r.project_id == rule.project_id
+        }) {
+            return existing.id.clone();
+        }
+        let id = rule.id.clone();
+        self.permission_settings.trust_rules.push(rule);
+        id
+    }
+
+    pub fn remove_trust_rule(&mut self, id: &str) -> bool {
+        let before = self.permission_settings.trust_rules.len();
+        self.permission_settings.trust_rules.retain(|r| r.id != id);
+        self.permission_settings.trust_rules.len() != before
+    }
+}
+
 fn default_fleet_retire_minutes() -> u32 {
     360
 }
@@ -759,6 +786,7 @@ impl Default for Settings {
                 granular_permissions,
                 mcp_server_permissions: HashMap::new(),
                 skill_permissions: HashMap::new(),
+                trust_rules: Vec::new(),
                 max_ai_turns: 25,
             },
             confirm_on_delete: true,

@@ -30,13 +30,16 @@ const MAX_EXEC_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_TAIL_TIMEOUT_SECS: u64 = 5;
 const MAX_TAIL_TIMEOUT_SECS: u64 = 60;
 
-/// Per-call context resolved by the CALLER — the manager has no
-/// SessionState/PlannerState, so the call site passes the chat session id
-/// and the already-resolved working directory.
+/// Per-call session context resolved by the CALLER — the manager has no
+/// SessionState/PlannerState, so the call site passes the chat session id,
+/// resolved working directory, and project. Built for EVERY tool call now
+/// (not just terminal ones): the trust-rule gate and decision log use it;
+/// the terminal remains its only executor-side consumer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TerminalCtx {
     pub session_id: String,
     pub cwd: String,
+    pub project_id: Option<String>,
 }
 
 struct RunningCmd {
@@ -546,6 +549,7 @@ mod tests {
         let ctx = TerminalCtx {
             session_id: "t1".into(),
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            project_id: None,
         };
         let run = |cmd: &str| {
             let client = client.clone();
@@ -588,6 +592,7 @@ mod tests {
         let ctx = TerminalCtx {
             session_id: "t2".into(),
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            project_id: None,
         };
         let args = serde_json::json!({"command": "sleep 2 && echo slow-done", "timeout_secs": 1});
         let out = client.exec(&ctx, &args).await.unwrap();

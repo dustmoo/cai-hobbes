@@ -18,6 +18,29 @@ pub enum PermissionStatus {
     Denied(String),
 }
 
+/// A user-authored allow-rule, created from the permission bubble at the
+/// moment of approval. Allow-only in v1: rules can only skip a prompt the
+/// user would otherwise see, never widen anything else. Hit statistics live
+/// in the `trust_decisions` table, not here — the gate never writes settings.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TrustRule {
+    pub id: String,
+    /// Matched against the RAW `ToolCall.server_name` (what the bubble saw),
+    /// not the composio-collapsed permission name.
+    pub server: String,
+    /// None = any tool on the server.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// Terminal-command prefix (token-boundary matched, metachar-guarded —
+    /// see `context::trust::command_matches_prefix`).
+    #[serde(default)]
+    pub command_prefix: Option<String>,
+    /// None = any project.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PermissionSettings {
     pub auto_approval_enabled: bool,
@@ -26,6 +49,8 @@ pub struct PermissionSettings {
     pub mcp_server_permissions: HashMap<String, bool>,
     #[serde(default)]
     pub skill_permissions: HashMap<String, bool>,
+    #[serde(default)]
+    pub trust_rules: Vec<TrustRule>,
     pub max_ai_turns: u32,
 }
 
@@ -36,6 +61,7 @@ impl Default for PermissionSettings {
             granular_permissions: HashMap::new(),
             mcp_server_permissions: HashMap::new(),
             skill_permissions: HashMap::new(),
+            trust_rules: Vec::new(),
             max_ai_turns: 25,
         }
     }

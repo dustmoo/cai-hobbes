@@ -145,6 +145,30 @@ pub fn report_with_brief(
     shared.poke();
 }
 
+/// Pre-create a fleet row for a headless run HOBBES_DISPATCH is about to
+/// launch: the card appears instantly (Idle, dispatched chip, todo title as
+/// its name) and the run's first hook event simply finds it — `reduce`'s
+/// entry().or_insert never replaces an existing row, and events only
+/// overwrite cwd/name when non-empty. Not gated on the bridge arm: dispatch
+/// is explicit user-driven action, and the row must exist for the fleet to
+/// attribute the run.
+pub fn precreate_dispatched_session(session_id: &str, cwd: &str, title: &str, todo_id: &str) {
+    let now = Utc::now();
+    let shared = super::shared();
+    let row = {
+        let mut state = shared.state.lock().expect("fleet state lock poisoned");
+        let session = state
+            .sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| super::FleetSession::new(session_id, cwd, now));
+        session.session_title = Some(title.to_string());
+        session.dispatched_todo = Some(todo_id.to_string());
+        session.clone()
+    };
+    store::persist_sessions(std::slice::from_ref(&row));
+    shared.poke();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

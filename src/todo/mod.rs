@@ -13,6 +13,7 @@
 //!
 pub mod calendar_sync;
 pub mod composio_calendar;
+pub mod dispatch;
 pub mod handlers;
 pub mod ics;
 pub mod model;

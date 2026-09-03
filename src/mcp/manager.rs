@@ -1038,7 +1038,7 @@ impl McpManager {
     }
 
     /// Construct a sane PATH for child processes, including common dev directories
-    fn get_sane_path() -> String {
+    pub(crate) fn get_sane_path() -> String {
         let mut paths = vec![
             "/usr/local/bin".to_string(),
             "/opt/homebrew/bin".to_string(),
@@ -1060,7 +1060,7 @@ impl McpManager {
     /// Get critical environment variables needed for child processes.
     /// When launched from Finder/open, the app gets a minimal environment from launchd
     /// that's missing HOME, USER, SHELL, etc. which tools like `uvx` require.
-    fn get_critical_env_vars() -> HashMap<String, String> {
+    pub(crate) fn get_critical_env_vars() -> HashMap<String, String> {
         let mut vars = HashMap::new();
 
         // HOME is critical for uvx/uv to find its cache
@@ -2188,6 +2188,37 @@ impl McpManager {
         // Permission Check
         if !bypass_permission_check && !client.config.always_allow.contains(&tool_name.to_string())
         {
+            // Trust rules run BEFORE the permission check: a user-authored
+            // rule (matched against the RAW server name the bubble saw)
+            // skips the prompt this branch would otherwise raise — and only
+            // that. Nothing here touches always_allow or bypass paths.
+            let trust_hit: Option<String> = {
+                let settings = self.settings.peek();
+                crate::context::trust::evaluate(
+                    &settings.permission_settings.trust_rules,
+                    server_name,
+                    tool_name,
+                    &args,
+                    &crate::context::trust::TrustCtx {
+                        project_id: session_ctx.as_ref().and_then(|c| c.project_id.as_deref()),
+                    },
+                )
+                .map(|rule| rule.id.clone())
+            };
+            if let Some(rule_id) = trust_hit {
+                crate::context::trust_store::log_decision(
+                    crate::context::trust_store::TrustDecision::new(
+                        crate::context::trust_store::DecisionKind::RuleHit,
+                        server_name,
+                        tool_name,
+                        crate::context::trust_store::arg_summary(&args),
+                        session_ctx.as_ref().map(|c| c.session_id.clone()),
+                        session_ctx.as_ref().and_then(|c| c.project_id.clone()),
+                        Some(rule_id),
+                    ),
+                );
+                // Fall through as allowed.
+            } else {
             let pm = self.permission_manager.read();
             match pm.check_mcp_permission(permission_check_name) {
                 PermissionStatus::Allowed => {}
@@ -2204,6 +2235,7 @@ impl McpManager {
                 PermissionStatus::Denied(reason) => {
                     return Err(format!("Tool use denied: {}", reason));
                 }
+            }
             }
         }
 

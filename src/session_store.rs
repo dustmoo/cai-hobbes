@@ -78,6 +78,7 @@ fn seed_seq_from_db(conn: &Connection) {
     // silently reject every subsequent write in that domain.
     let todo_max = crate::todo::store::max_seq(conn);
     let fleet_max = crate::fleet::store::max_seq(conn);
+    let trust_max = crate::context::trust_store::max_seq(conn);
     let events_max: i64 = conn
         .query_row("SELECT COALESCE(MAX(seq), 0) FROM session_events", [], |r| r.get(0))
         .unwrap_or(0);
@@ -86,6 +87,7 @@ fn seed_seq_from_db(conn: &Connection) {
             .max(meta_max)
             .max(todo_max)
             .max(fleet_max)
+            .max(trust_max)
             .max(events_max)
             + 1,
         Ordering::SeqCst,
@@ -145,7 +147,8 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
     // The planner and the fleet share this database and connection. Creating
     // their schemas here means test databases get their tables too.
     crate::todo::store::create_schema(conn)?;
-    crate::fleet::store::create_schema(conn)
+    crate::fleet::store::create_schema(conn)?;
+    crate::context::trust_store::create_schema(conn)
 }
 
 /// Open the global connection, create the schema, and run the one-time

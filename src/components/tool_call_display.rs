@@ -215,8 +215,76 @@ pub struct PermissionPromptProps {
 pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
     let has_pending_approvals = consume_context::<Signal<bool>>();
+    let mut settings = consume_context::<Signal<crate::settings::Settings>>();
+    let settings_manager = consume_context::<Signal<crate::settings::SettingsManager>>();
+    let planner = consume_context::<Signal<crate::todo::PlannerState>>();
     let tool_call = props.tool_call.clone();
     let tool_call_deny = tool_call.clone();
+
+    // Trust-rule authoring context: what a rule created from THIS prompt
+    // would cover. Terminal execs get a command-prefix rule (first two
+    // tokens); everything else a server+tool rule; both optionally scoped
+    // to the active session's project.
+    let parsed_args: Option<serde_json::Value> =
+        serde_json::from_str(&tool_call.arguments).ok();
+    let command_prefix: Option<String> = parsed_args
+        .as_ref()
+        .filter(|_| {
+            tool_call.server_name == crate::mcp::manager::HOBBES_TERMINAL_SERVER
+                || tool_call.server_name == "local-on-demand"
+        })
+        .and_then(|a| a.get("command").and_then(|c| c.as_str()))
+        .map(|cmd| {
+            cmd.split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|p| !p.is_empty());
+    let session_project: Option<(String, String)> = {
+        let state = session_state.read();
+        state
+            .sessions
+            .get(&state.active_session_id)
+            .and_then(|s| s.project_id.clone())
+            .and_then(|pid| {
+                crate::services::project_tagger::project_title(&planner.read().projects, &pid)
+                    .map(|t| (pid.clone(), t.to_string()))
+            })
+    };
+    let allow_label = match &command_prefix {
+        Some(p) => format!("Always allow `{p}`"),
+        None => format!(
+            "Always allow {} on {}",
+            tool_call.tool_name, tool_call.server_name
+        ),
+    };
+    let mut make_rule = use_signal(|| false);
+    let mut scope_to_project = use_signal(|| false);
+
+    // Shared decision logger with this prompt's identity.
+    let decision_base = {
+        let tc = tool_call.clone();
+        let args = parsed_args.clone().unwrap_or(serde_json::Value::Null);
+        let session_id = session_state.peek().active_session_id.clone();
+        let project_id = session_project.as_ref().map(|(id, _)| id.clone());
+        move |kind: crate::context::trust_store::DecisionKind,
+              rule_id: Option<String>| {
+            crate::context::trust_store::log_decision(
+                crate::context::trust_store::TrustDecision::new(
+                    kind,
+                    &tc.server_name,
+                    &tc.tool_name,
+                    crate::context::trust_store::arg_summary(&args),
+                    Some(session_id.clone()),
+                    project_id.clone(),
+                    rule_id,
+                ),
+            );
+        }
+    };
+    let log_on_deny = decision_base.clone();
+    let log_on_approve = decision_base;
 
     rsx! {
         div {
@@ -239,13 +307,98 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                     span { class: "font-mono text-sm", "{tool_call.server_name}" }
                     "."
                 }
+                // What is actually being approved. For the terminal that's
+                // the command itself — approving a shell command you can't
+                // read is not an approval.
+                {
+                    let detail: Option<(&'static str, String)> = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+                        .ok()
+                        .and_then(|args| {
+                            if let Some(cmd) = args.get("command").and_then(|c| c.as_str()) {
+                                let mut line = cmd.to_string();
+                                if let Some(cwd) = args.get("cwd").and_then(|c| c.as_str()) {
+                                    line = format!("cd {cwd} && {line}");
+                                }
+                                Some(("Command", line))
+                            } else if args.as_object().is_some_and(|o| !o.is_empty()) {
+                                serde_json::to_string_pretty(&args)
+                                    .ok()
+                                    .map(|p| ("Arguments", p))
+                            } else {
+                                None
+                            }
+                        });
+                    rsx! {
+                        if let Some((label, mut text)) = detail {
+                            {
+                                if text.chars().count() > 1200 {
+                                    text = format!("{}…", text.chars().take(1200).collect::<String>());
+                                }
+                                rsx! {
+                                    div {
+                                        p { class: "text-xs uppercase tracking-wider text-yellow-400 mb-1", "{label}" }
+                                        pre {
+                                            class: "rounded bg-black/40 p-3 text-sm font-mono text-yellow-100 whitespace-pre-wrap break-all max-h-48 overflow-y-auto",
+                                            "{text}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 p { "Do you want to allow this?" }
+                // Trust-rule authoring at the moment of decision (the skill
+                // prompt's remember-choice idiom).
+                div {
+                    class: "flex flex-col gap-1 pt-1",
+                    div {
+                        class: "flex items-center gap-2 text-yellow-200/80",
+                        input {
+                            r#type: "checkbox",
+                            id: "trust-rule-make",
+                            class: "w-4 h-4 accent-white/50 cursor-pointer",
+                            checked: *make_rule.read(),
+                            onchange: move |_| {
+                                let v = !*make_rule.peek();
+                                make_rule.set(v);
+                            }
+                        }
+                        label {
+                            r#for: "trust-rule-make",
+                            class: "text-xs cursor-pointer select-none font-mono",
+                            "{allow_label}"
+                        }
+                    }
+                    if let Some((_, title)) = &session_project {
+                        div {
+                            class: "flex items-center gap-2 ml-6 text-yellow-200/60",
+                            input {
+                                r#type: "checkbox",
+                                id: "trust-rule-project",
+                                class: "w-3.5 h-3.5 accent-white/50 cursor-pointer",
+                                disabled: !*make_rule.read(),
+                                checked: *scope_to_project.read(),
+                                onchange: move |_| {
+                                    let v = !*scope_to_project.peek();
+                                    scope_to_project.set(v);
+                                }
+                            }
+                            label {
+                                r#for: "trust-rule-project",
+                                class: "text-xs cursor-pointer select-none",
+                                "only in {title}"
+                            }
+                        }
+                    }
+                }
             }
             div {
                 class: "mt-4 flex justify-end gap-4",
                 button {
                     class: "px-4 py-2 rounded-md bg-input text-fg hover:bg-gray-500",
                     onclick: move |_| {
+                        log_on_deny(crate::context::trust_store::DecisionKind::Denied, None);
                         // Deny: Convert to error/skipped state so UI can clean up
                         spawn({
                             let tool_call_deny = tool_call_deny.clone();
@@ -270,6 +423,33 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 button {
                     class: "px-4 py-2 rounded-md bg-green-600 text-fg hover:bg-green-500",
                     onclick: move |_| {
+                        // Author the rule first (when asked), then approve.
+                        if *make_rule.peek() {
+                            let rule = crate::context::permissions::TrustRule {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                server: tool_call.server_name.clone(),
+                                tool: Some(tool_call.tool_name.clone()),
+                                command_prefix: command_prefix.clone(),
+                                project_id: (*scope_to_project.peek())
+                                    .then(|| session_project.as_ref().map(|(id, _)| id.clone()))
+                                    .flatten(),
+                                created_at: chrono::Utc::now(),
+                            };
+                            let rule_id = settings.write().add_trust_rule(rule);
+                            let snapshot = settings.peek().clone();
+                            if let Err(e) = settings_manager.read().save(&snapshot) {
+                                tracing::error!("trust rule save failed: {e}");
+                            }
+                            log_on_approve(
+                                crate::context::trust_store::DecisionKind::ApprovedRuleCreated,
+                                Some(rule_id),
+                            );
+                        } else {
+                            log_on_approve(
+                                crate::context::trust_store::DecisionKind::Approved,
+                                None,
+                            );
+                        }
                         // Approve: Mark as ready for execution, signal pending approvals
                         // The lifecycle (Submit button) will handle actual execution
                         spawn({
