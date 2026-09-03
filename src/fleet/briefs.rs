@@ -33,6 +33,9 @@ pub struct BriefTask {
     pub dirty_at: DateTime<Utc>,
     /// Ended row → final brief, merged into the store (not the live map).
     pub is_final: bool,
+    /// Title of the todo linked to this session, when one is — the brief
+    /// prompt assesses progress against it.
+    pub linked_todo: Option<String>,
 }
 
 /// Debounce decision for one session.
@@ -56,6 +59,7 @@ pub fn brief_due(s: &FleetSession, now: DateTime<Utc>, quiet_secs: i64) -> bool 
 pub fn collect_due(
     live: &FleetState,
     ended_rows: &[FleetSession],
+    links: &[(String, String)],
     now: DateTime<Utc>,
 ) -> Vec<BriefTask> {
     let to_task = |s: &FleetSession| -> Option<BriefTask> {
@@ -67,6 +71,10 @@ pub fn collect_due(
             previous_brief: s.brief.clone(),
             dirty_at: s.brief_dirty_at.unwrap_or(now),
             is_final: s.ended_at.is_some(),
+            linked_todo: links
+                .iter()
+                .find(|(sid, _)| sid == &s.id)
+                .map(|(_, title)| title.clone()),
         })
     };
     let mut tasks: Vec<BriefTask> = ended_rows
@@ -87,10 +95,28 @@ pub fn brief_framing(
     task: &BriefTask,
     digest: &super::transcript::TranscriptDigest,
 ) -> (String, String) {
+    // The previous brief seeds continuity — but never its blocker: feeding a
+    // stale blocker back is how resolved blockers survive regeneration. The
+    // model must re-derive blockers from the transcript alone.
     let previous = task
         .previous_brief
         .as_ref()
-        .and_then(|b| serde_json::to_string(b).ok())
+        .map(|b| {
+            let mut b = b.clone();
+            b.blocked_on = None;
+            b
+        })
+        .and_then(|b| serde_json::to_string(&b).ok())
+        .unwrap_or_default();
+    let tracked = task
+        .linked_todo
+        .as_ref()
+        .map(|t| {
+            format!(
+                " The user's tracked task for this session: '{}' — assess progress against it.",
+                truncate_summary(t, 120)
+            )
+        })
         .unwrap_or_default();
     let framed = format!(
         "You are writing a re-entry brief for a Claude Code coding-agent session \
@@ -98,9 +124,11 @@ pub fn brief_framing(
          turns). In the 'summary' field write ONE short sentence (under 120 \
          characters) stating what was accomplished or is in progress. Put \
          concrete decisions made into entities.key_decisions and anything \
-         blocked or awaiting the user into entities.blockers. Do not invent \
-         work that is not shown in the transcript.\n--- transcript ---\n{}",
-        task.name, task.cwd, digest.turn_count, digest.text
+         blocked or awaiting the user into entities.blockers — but ONLY if \
+         the most recent turns still show it unresolved; a question the user \
+         has since answered is not a blocker. Do not invent \
+         work that is not shown in the transcript.{}\n--- transcript ---\n{}",
+        task.name, task.cwd, digest.turn_count, tracked, digest.text
     );
     (previous, framed)
 }
@@ -154,6 +182,16 @@ pub fn brief_from_summary_value(
     })
 }
 
+/// One display line from a brief: headline plus blocker, clipped — the shape
+/// written onto linked todos' `latest_progress`.
+pub fn progress_line(brief: &SessionBrief) -> String {
+    let mut line = truncate_summary(&brief.headline, 160);
+    if let Some(blocked) = &brief.blocked_on {
+        line.push_str(&format!("; blocked: {}", truncate_summary(blocked, 80)));
+    }
+    truncate_summary(&line, 200)
+}
+
 // ── Day rollup ──────────────────────────────────────────────────────────────
 
 /// A cached end-of-day narrative (session_store `meta` table, keyed by date).
@@ -187,7 +225,11 @@ pub fn rollup_lines(
         .into_iter()
         .take(cap)
         .map(|(s, m)| {
-            let mut line = format!("{} — {}", truncate_summary(&s.name, 40), format_minutes(m));
+            let mut line = format!(
+                "{} — {}",
+                truncate_summary(s.display_name(), 60),
+                format_minutes(m)
+            );
             if let Some(b) = &s.brief {
                 line.push_str(&format!(" — {}", truncate_summary(&b.headline, 140)));
                 if let Some(blocked) = &b.blocked_on {
@@ -219,6 +261,7 @@ pub fn status_report(
     live: &FleetState,
     ended_today: &[FleetSession],
     filter: Option<&str>,
+    links: &[(String, String)],
     now: DateTime<Utc>,
     today: NaiveDate,
 ) -> serde_json::Value {
@@ -263,7 +306,8 @@ pub fn status_report(
                 ),
             };
             let mut v = serde_json::json!({
-                "name": s.name,
+                "id": s.id,
+                "name": s.display_name(),
                 "origin": match s.origin {
                     super::FleetOrigin::External => "claude_code",
                     super::FleetOrigin::Hobbes => "hobbes_tab",
@@ -272,6 +316,9 @@ pub fn status_report(
                 "minutes_today": s.minutes_on(today, now),
                 "last_event_minutes_ago": (now - s.last_event_at).num_minutes().max(0),
             });
+            if let Some((_, title)) = links.iter().find(|(sid, _)| sid == &s.id) {
+                v["linked_todo"] = serde_json::json!(title);
+            }
             if s.origin == super::FleetOrigin::External && !s.cwd.is_empty() {
                 v["cwd"] = serde_json::json!(s.cwd);
             }
@@ -408,7 +455,7 @@ mod tests {
         b.brief_dirty_at = Some(dirty);
         b.ended_at = Some(now - chrono::Duration::seconds(10));
 
-        let tasks = collect_due(&live, &[a_ended, b], now);
+        let tasks = collect_due(&live, &[a_ended, b], &[], now);
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].session_id, "b");
         assert!(tasks[0].is_final);
@@ -482,12 +529,14 @@ mod tests {
                 sessions: [("s1".to_string(), s)].into_iter().collect(),
             },
             &[],
+            &[("s1".to_string(), "Ship the briefs".to_string())],
             utc("2026-09-01T10:01:00Z"),
         )
         .remove(0);
         let digest = TranscriptDigest {
             text: "USER: hi\nASSISTANT: done".into(),
             turn_count: 1,
+            title: None,
         };
         let (prev, framed) = brief_framing(&task, &digest);
         assert!(prev.contains("did things"), "previous brief rides the summary slot");
@@ -495,6 +544,10 @@ mod tests {
         assert!(framed.contains("/dev/s1"));
         assert!(framed.contains("USER: hi"));
         assert!(framed.contains("1 recent"));
+        assert!(
+            framed.contains("tracked task") && framed.contains("Ship the briefs"),
+            "linked todo rides the framing"
+        );
     }
 
     #[test]

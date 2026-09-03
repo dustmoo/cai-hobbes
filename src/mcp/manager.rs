@@ -97,6 +97,11 @@ pub const HOBBES_META_SERVER: &str = "hobbes-meta";
 /// accurately introspect all built-in tools and their origins.
 pub const HOBBES_PLANNER_SERVER: &str = "hobbes-planner";
 
+/// The native terminal (persistent per-chat pty shells). Deliberately NOT a
+/// builtin virtual server: its tools must ride the normal permission flow,
+/// and it participates in load/unload like any other server.
+pub const HOBBES_TERMINAL_SERVER: &str = crate::mcp::terminal_client::HOBBES_TERMINAL_SERVER;
+
 /// Built-in virtual servers must always stay fully loaded. `hobbes-meta`
 /// provides `MCP_LOAD_SERVER_TOOLS` itself — putting it on-demand (or
 /// unloading it) locks the loader behind the loader and makes every
@@ -461,6 +466,9 @@ pub enum McpClientType {
     /// components::builtin_tools (requires the PlannerState signal).
     /// This variant exists so the server is visible / introspectable in McpManager.
     NativePlanner,
+    /// The native terminal (HOBBES_TERMINAL_*): a REAL executor like
+    /// NativeImage — commands run here after the standard permission gate.
+    NativeTerminal(Arc<crate::mcp::terminal_client::TerminalClient>),
 }
 
 impl McpClientType {
@@ -473,7 +481,8 @@ impl McpClientType {
             | McpClientType::NativeImage(_)
             | McpClientType::NativeCore
             | McpClientType::NativeMeta
-            | McpClientType::NativePlanner => true,
+            | McpClientType::NativePlanner
+            | McpClientType::NativeTerminal(_) => true,
         }
     }
 }
@@ -1204,6 +1213,35 @@ impl McpManager {
             });
         }
 
+        // Initialize the Native Terminal (opt-in; a shell is the highest-risk
+        // tool in the app). NOT a builtin virtual server: its tools ride the
+        // normal permission flow and the load/unload machinery.
+        if self.settings.peek().terminal_enabled {
+            let tx_clone = tx.clone();
+            spawn(async move {
+                tracing::info!("Initializing native terminal server");
+                let terminal_client =
+                    Arc::new(crate::mcp::terminal_client::TerminalClient::new());
+                let tools = terminal_client.list_tools();
+                let config = McpServerConfig::native_stub(
+                    HOBBES_TERMINAL_SERVER.to_string(),
+                    "Native terminal: run shell commands in a persistent per-chat zsh \
+                     session (always behind tool approval)."
+                        .to_string(),
+                );
+                let active_client = ActiveMcpClient {
+                    config,
+                    service: McpClientType::NativeTerminal(terminal_client),
+                    tools,
+                    warning_message: None,
+                    profile_id: None,
+                };
+                if tx_clone.send(active_client).is_err() {
+                    tracing::error!("Failed to send initialized terminal client");
+                }
+            });
+        }
+
         // Initialize Native Core Client (HOBBES_PAGE_RESULT, HOBBES_UPDATE_SCRATCHPAD)
         {
             let tx_clone = tx.clone();
@@ -1881,6 +1919,11 @@ impl McpManager {
         args: serde_json::Value,
         bypass_permission_check: bool,
         profile_id: Option<String>,
+        // Chat-session context for tools that are per-session (the native
+        // terminal). A typed parameter rather than arg-injection: args
+        // serialize into the permission bubble, and the compiler enumerates
+        // every call site. None for everything else.
+        session_ctx: Option<crate::mcp::terminal_client::TerminalCtx>,
     ) -> Result<UnboundedReceiver<Result<CallToolResult, String>>, String> {
         // Intercept local on-demand meta-tools before normal dispatch
         if server_name == HOBBES_META_SERVER || tool_name == "MCP_LOAD_SERVER_TOOLS" || tool_name == "MCP_UNLOAD_SERVER_TOOLS" {
@@ -2234,6 +2277,8 @@ impl McpManager {
         // This avoids borrowing `self` inside the async move block while still
         // reading the latest key value at call time (not at launch time).
         let native_image_api_key = self.secret_manager.peek().get("gemini_api_key").cloned();
+        // Pattern 30: captured before the executor spawn (no self inside).
+        let terminal_ctx = session_ctx.clone();
         // Pattern 30: Also read image model fresh from settings at call time
         let native_image_model = self.settings.peek().image_generation_config.model.clone();
 
@@ -2335,6 +2380,12 @@ impl McpManager {
                         Ok(result) => Ok(result),
                         Err(e) => Err(e),
                     }
+                }
+                McpClientType::NativeTerminal(terminal_client) => {
+                    // A real executor: the permission gate already ran above.
+                    terminal_client
+                        .execute_tool(&tool.name, args.clone(), terminal_ctx.clone())
+                        .await
                 }
                 McpClientType::NativeCore => {
                     // HOBBES_PAGE_RESULT and HOBBES_UPDATE_SCRATCHPAD are intercepted
@@ -3572,10 +3623,56 @@ impl McpManager {
         drop(unloaded); // Release lock before sync try_lock in invalidate
                         // Pattern 150.8.1: Authoritative invalidation prevents UI state gaps
         self.invalidate_status_cache();
+        // Unloading the terminal kills every shell — hiding the tools while
+        // leaving live ptys running would be a lie.
+        self.reap_terminal_if(server_name).await;
         tracing::info!(
             "Unloaded server '{}' - tools hidden from AI, cache invalidated",
             server_name
         );
+    }
+
+    /// Kill all pty shells when `server_name` is the terminal (no-op
+    /// otherwise). Takes the `servers` lock alone (P-010).
+    async fn reap_terminal_if(&self, server_name: &str) {
+        if server_name != HOBBES_TERMINAL_SERVER {
+            return;
+        }
+        let client = {
+            let servers = self.servers.lock().await;
+            servers.get(HOBBES_TERMINAL_SERVER).and_then(|c| {
+                if let McpClientType::NativeTerminal(t) = &c.service {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(t) = client {
+            t.shutdown_all().await;
+        }
+    }
+
+    /// Kill every terminal shell (settings toggle off).
+    pub async fn shutdown_terminal(&self) {
+        self.reap_terminal_if(HOBBES_TERMINAL_SERVER).await;
+    }
+
+    /// Kill one chat session's terminal shell (tab close).
+    pub async fn kill_terminal_session(&self, session_id: &str) {
+        let client = {
+            let servers = self.servers.lock().await;
+            servers.get(HOBBES_TERMINAL_SERVER).and_then(|c| {
+                if let McpClientType::NativeTerminal(t) = &c.service {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(t) = client {
+            t.kill_session(session_id).await;
+        }
     }
 
     /// Load a server's tools back into the AI context
@@ -4357,6 +4454,7 @@ impl McpManager {
         // Status reporting for native built-in clients
         for (server_key, display_name) in [
             ("hobbes-native-image", "Image Generation"),
+            (HOBBES_TERMINAL_SERVER, "Terminal"),
             (HOBBES_CORE_SERVER, "Hobbes Core Tools"),
             (HOBBES_META_SERVER, "Hobbes Meta Tools"),
             (HOBBES_PLANNER_SERVER, "Hobbes Planner"),

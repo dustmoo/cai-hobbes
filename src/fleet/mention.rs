@@ -46,9 +46,36 @@ fn trim_token(token: &str) -> &str {
     token.trim_end_matches([',', ';', ':', '!', '?', ')', '"', '\''])
 }
 
-/// Canonical session names mentioned in `text` (case-insensitive exact match
-/// after punctuation trimming), deduped in order of first appearance.
-pub fn detect_mentions(text: &str, names: &[String]) -> Vec<String> {
+/// The unique typeable handle for a session: its cwd-derived name, suffixed
+/// with a short id (`name~3f2a`) whenever another live session shares the
+/// name — so every window is addressable individually.
+pub fn mention_handle(s: &FleetSession, live: &FleetState) -> String {
+    let duplicated = live
+        .sessions
+        .values()
+        .any(|o| o.id != s.id && o.name.eq_ignore_ascii_case(&s.name));
+    if duplicated {
+        let short: String = s.id.chars().filter(|c| c.is_ascii_alphanumeric()).take(4).collect();
+        format!("{}~{}", s.name, short)
+    } else {
+        s.name.clone()
+    }
+}
+
+/// (handle, session id) pairs for every live session.
+pub fn mention_handles(live: &FleetState) -> Vec<(String, String)> {
+    live.sessions
+        .values()
+        .map(|s| (mention_handle(s, live), s.id.clone()))
+        .collect()
+}
+
+/// Session ids mentioned in `text` (case-insensitive exact handle match
+/// after punctuation trimming), deduped in order of first appearance. A
+/// plain name shared by several windows matches nothing — ambiguity never
+/// attaches the wrong window's status; the autocomplete inserts unique
+/// handles.
+pub fn detect_mentions(text: &str, handles: &[(String, String)]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for token in text.split_whitespace() {
         let Some(raw) = token.strip_prefix('@') else {
@@ -58,9 +85,9 @@ pub fn detect_mentions(text: &str, names: &[String]) -> Vec<String> {
         if raw.is_empty() {
             continue;
         }
-        if let Some(name) = names.iter().find(|n| n.eq_ignore_ascii_case(raw)) {
-            if !out.contains(name) {
-                out.push(name.clone());
+        if let Some((_, id)) = handles.iter().find(|(h, _)| h.eq_ignore_ascii_case(raw)) {
+            if !out.contains(id) {
+                out.push(id.clone());
             }
         }
     }
@@ -82,7 +109,7 @@ fn render_session(s: &FleetSession, now: DateTime<Utc>, today: NaiveDate) -> Str
     };
     let mut lines = vec![format!(
         "{} — {} · {} today",
-        s.name,
+        s.display_name(),
         status,
         crate::todo::model::format_minutes(s.minutes_on(today, now))
     )];
@@ -124,14 +151,16 @@ pub fn expand(
     now: DateTime<Utc>,
     today: NaiveDate,
 ) -> Option<String> {
-    let names: Vec<String> = live.sessions.values().map(|s| s.name.clone()).collect();
-    let mentioned = detect_mentions(message, &names);
+    // Mentions match unique handles (name, or name~id when windows share a
+    // repo) — titles have spaces, so they ride the autocomplete instead.
+    let handles = mention_handles(live);
+    let mentioned = detect_mentions(message, &handles);
     if mentioned.is_empty() {
         return None;
     }
     let mut blocks = Vec::new();
-    for name in &mentioned {
-        if let Some(s) = live.sessions.values().find(|s| &s.name == name) {
+    for id in &mentioned {
+        if let Some(s) = live.sessions.get(id) {
             blocks.push(render_session(s, now, today));
         }
     }
@@ -179,17 +208,49 @@ mod tests {
 
     #[test]
     fn detect_matches_case_insensitively_and_trims_punctuation() {
-        let names = vec!["cai-hobbes".to_string(), "clearmirror.ai-2025".to_string()];
+        let handles = vec![
+            ("cai-hobbes".to_string(), "id-1".to_string()),
+            ("clearmirror.ai-2025".to_string(), "id-2".to_string()),
+        ];
         let found = detect_mentions(
             "How is @CAI-HOBBES, and @clearmirror.ai-2025? Also @unknown and plain@text.",
-            &names,
+            &handles,
         );
-        assert_eq!(found, vec!["cai-hobbes".to_string(), "clearmirror.ai-2025".to_string()]);
+        assert_eq!(found, vec!["id-1".to_string(), "id-2".to_string()]);
         // Deduped.
-        assert_eq!(
-            detect_mentions("@cai-hobbes @cai-hobbes", &names).len(),
-            1
+        assert_eq!(detect_mentions("@cai-hobbes @cai-hobbes", &handles).len(), 1);
+    }
+
+    #[test]
+    fn duplicate_window_names_get_unique_handles() {
+        // Two terminals in the same repo + one unique.
+        let mut state = state_with(&["puget-bench", "solo"]);
+        crate::fleet::reduce(
+            &mut state,
+            &FleetEvent::SessionStart {
+                session_id: "s9".into(),
+                cwd: "/Users/x/Sites/puget-bench".into(),
+                reason: "startup".into(),
+            },
+            Utc::now(),
         );
+        let handles = mention_handles(&state);
+        // Unique name stays plain; duplicated names carry ~id suffixes.
+        assert!(handles.iter().any(|(h, _)| h == "solo"));
+        let dup: Vec<&(String, String)> =
+            handles.iter().filter(|(h, _)| h.starts_with("puget-bench~")).collect();
+        assert_eq!(dup.len(), 2, "each window individually addressable: {handles:?}");
+        // Handles are unique.
+        let mut hs: Vec<&str> = handles.iter().map(|(h, _)| h.as_str()).collect();
+        hs.sort_unstable();
+        hs.dedup();
+        assert_eq!(hs.len(), handles.len());
+
+        // A plain ambiguous name matches nothing (never the wrong window);
+        // its unique handle matches exactly one.
+        assert!(detect_mentions("check @puget-bench", &handles).is_empty());
+        let (h, id) = dup[0];
+        assert_eq!(detect_mentions(&format!("check @{h}"), &handles), vec![id.clone()]);
     }
 
     #[test]

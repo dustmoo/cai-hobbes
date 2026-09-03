@@ -42,6 +42,7 @@ pub mod bridge;
 pub mod briefs;
 pub mod events;
 pub mod mention;
+pub mod reconcile;
 pub mod hooks_config;
 pub mod server;
 pub mod store;
@@ -66,7 +67,7 @@ pub const STALENESS_MINUTES: i64 = 10;
 /// on the user must not fall off silently. Tunable via
 /// `settings.fleet_retire_minutes`, mirrored into [`set_retire_minutes`] by
 /// the supervisor.
-pub const RETIRE_MINUTES: i64 = 60;
+pub const RETIRE_MINUTES: i64 = 360;
 
 static RETIRE_MINUTES_SETTING: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(RETIRE_MINUTES);
@@ -196,6 +197,23 @@ pub struct FleetSession {
     pub brief_dirty_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub origin: FleetOrigin,
+    /// Claude Code's own session title (from the transcript's `ai-title`
+    /// entries), refreshed with each brief. Display prefers it over the
+    /// cwd-derived `name`; the folder name stays as the stable fallback.
+    #[serde(default)]
+    pub session_title: Option<String>,
+    /// The prompt currently running (set by UserPromptSubmit).
+    #[serde(default)]
+    pub active_prompt: Option<String>,
+    /// Recently stopped prompt ids (ring, cap 8): a heartbeat carrying one
+    /// of these is background work — liveness only, never a status change.
+    #[serde(default)]
+    pub stopped_prompts: Vec<String>,
+    /// When the current NeedsAttention began — reconciliation compares it
+    /// against transcript activity to clear alerts answered while Hobbes
+    /// wasn't listening.
+    #[serde(default)]
+    pub attention_at: Option<DateTime<Utc>>,
 }
 
 impl FleetSession {
@@ -216,7 +234,20 @@ impl FleetSession {
             brief: None,
             brief_dirty_at: None,
             origin: FleetOrigin::External,
+            session_title: None,
+            active_prompt: None,
+            stopped_prompts: Vec::new(),
+            attention_at: None,
         }
+    }
+
+    /// What to call this session: the Claude Code title when known, else the
+    /// cwd-derived (or tab) name.
+    pub fn display_name(&self) -> &str {
+        self.session_title
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .unwrap_or(&self.name)
     }
 
     /// Banked seconds on local day `date` (legacy minute rows included).
@@ -259,6 +290,44 @@ impl FleetState {
             .values()
             .filter(|s| s.status.needs_attention())
             .count()
+    }
+}
+
+/// Resolve a user/AI-supplied session reference — an exact fleet session id,
+/// or a unique case-insensitive live-session name — to the session id.
+/// Ambiguous or unknown references error, naming what IS live.
+pub fn resolve_session_ref(live: &FleetState, input: &str) -> Result<String, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("empty session reference".to_string());
+    }
+    if live.sessions.contains_key(input) {
+        return Ok(input.to_string());
+    }
+    let matches: Vec<&FleetSession> = live
+        .sessions
+        .values()
+        .filter(|s| {
+            s.name.eq_ignore_ascii_case(input)
+                || s.session_title
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(input))
+        })
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0].id.clone()),
+        0 => {
+            let mut names: Vec<&str> = live.sessions.values().map(|s| s.name.as_str()).collect();
+            names.sort_unstable();
+            Err(format!(
+                "no live session matches '{input}'. Live sessions: {}",
+                if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
+            ))
+        }
+        _ => Err(format!(
+            "'{input}' matches {} live sessions — use the session id from HOBBES_FLEET_STATUS",
+            matches.len()
+        )),
     }
 }
 
@@ -359,6 +428,19 @@ fn bank_span(
 /// (its `ended_at` is set; history stays in the DB while the live map drops
 /// it).
 pub fn reduce(state: &mut FleetState, ev: &FleetEvent, now: DateTime<Utc>) -> Vec<FleetSession> {
+    reduce_with_prompt(state, ev, None, now)
+}
+
+/// [`reduce`] with the event's `prompt_id` (from the raw hook body). The
+/// prompt id is the turn discriminator: a heartbeat whose prompt was already
+/// stopped is background work — it proves liveness but must never change
+/// status, open spans, or clear alerts the user hasn't addressed.
+pub fn reduce_with_prompt(
+    state: &mut FleetState,
+    ev: &FleetEvent,
+    prompt_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Vec<FleetSession> {
     let (id, cwd) = (ev.session_id(), ev.cwd());
     let session = state
         .sessions
@@ -378,14 +460,40 @@ pub fn reduce(state: &mut FleetState, ev: &FleetEvent, now: DateTime<Utc>) -> Ve
         }
     };
 
+    // Is this event's prompt already stopped? Then it is background work.
+    let prompt_is_background = prompt_id.is_some_and(|pid| {
+        session.stopped_prompts.iter().any(|p| p == pid)
+            || session
+                .active_prompt
+                .as_deref()
+                .is_some_and(|active| active != pid)
+    });
+    let mark_prompt_stopped = |session: &mut FleetSession, pid: Option<&str>| {
+        if let Some(pid) = pid {
+            if session.active_prompt.as_deref() == Some(pid) {
+                session.active_prompt = None;
+            }
+            if !session.stopped_prompts.iter().any(|p| p == pid) {
+                session.stopped_prompts.push(pid.to_string());
+                let overflow = session.stopped_prompts.len().saturating_sub(8);
+                if overflow > 0 {
+                    session.stopped_prompts.drain(..overflow);
+                }
+            }
+        }
+    };
+
     match ev {
         FleetEvent::SessionStart { .. } => {
             // A start while a span is open (resume/clear) closes the old span
-            // without proof of continuous work.
+            // without proof of continuous work. Fresh process → fresh prompts.
             close_span(session, None);
             session.working_since = Some(now);
             session.status = FleetStatus::Working;
             session.pending_gate = None;
+            session.attention_at = None;
+            session.active_prompt = None;
+            session.stopped_prompts.clear();
         }
         FleetEvent::Stop { background_tasks, .. } => {
             // Bank the proven span either way. With background agents still
@@ -393,6 +501,7 @@ pub fn reduce(state: &mut FleetState, ev: &FleetEvent, now: DateTime<Utc>) -> Ve
             // still working, and their PostToolUse/SubagentStop heartbeats
             // keep the new span provable.
             close_span(session, Some(now));
+            mark_prompt_stopped(session, prompt_id);
             if *background_tasks > 0 {
                 session.working_since = Some(now);
                 session.status = FleetStatus::WorkingBackground;
@@ -400,6 +509,7 @@ pub fn reduce(state: &mut FleetState, ev: &FleetEvent, now: DateTime<Utc>) -> Ve
                 session.status = FleetStatus::Idle;
             }
             session.pending_gate = None;
+            session.attention_at = None;
         }
         FleetEvent::Notification { kind, message, .. } => {
             close_span(session, Some(now));
@@ -407,6 +517,7 @@ pub fn reduce(state: &mut FleetState, ev: &FleetEvent, now: DateTime<Utc>) -> Ve
                 kind: kind.clone(),
                 message: message.clone(),
             });
+            session.attention_at = Some(now);
         }
         FleetEvent::PermissionRequest {
             request_id,
@@ -416,6 +527,7 @@ pub fn reduce(state: &mut FleetState, ev: &FleetEvent, now: DateTime<Utc>) -> Ve
         } => {
             close_span(session, Some(now));
             session.status = FleetStatus::NeedsAttention(AttentionKind::Gate);
+            session.attention_at = Some(now);
             session.pending_gate = Some(PendingGate {
                 request_id: request_id.clone(),
                 tool_name: tool_name.clone(),
@@ -444,6 +556,27 @@ pub fn reduce(state: &mut FleetState, ev: &FleetEvent, now: DateTime<Utc>) -> Ve
             session.working_since = Some(now);
             session.status = FleetStatus::Working;
             session.pending_gate = None;
+            session.attention_at = None;
+            session.active_prompt = prompt_id.map(str::to_string);
+        }
+        FleetEvent::SubagentStop { background_tasks, .. }
+            if *background_tasks == 0 && session.status == FleetStatus::WorkingBackground =>
+        {
+            // The LAST background job finished: the background phase ends
+            // with full credit, regardless of which prompt owned the job.
+            close_span(session, Some(now));
+            mark_prompt_stopped(session, prompt_id);
+            session.status = FleetStatus::Idle;
+        }
+        FleetEvent::ToolActivity { .. } | FleetEvent::SubagentStop { .. }
+            if prompt_is_background && session.status != FleetStatus::WorkingBackground =>
+        {
+            // Background work after the turn ended (a monitor firing, a
+            // straggling shell): liveness only. Status, spans, gates, and
+            // alerts all belong to the USER's turn state — a background
+            // completion must not repaint the card or clear what still
+            // needs the user. (WorkingBackground sessions fall through:
+            // these events are exactly what keeps their span provable.)
         }
         FleetEvent::ToolActivity { .. } | FleetEvent::SubagentStop { .. } => {
             // Proof that work ran until now: a finished tool call (main turn
@@ -456,6 +589,7 @@ pub fn reduce(state: &mut FleetState, ev: &FleetEvent, now: DateTime<Utc>) -> Ve
             }
             if session.status != FleetStatus::WorkingBackground {
                 session.status = FleetStatus::Working;
+                session.attention_at = None;
             }
             session.pending_gate = None;
         }
@@ -478,7 +612,12 @@ pub fn note_transcript_and_dirty(
     transcript_path: Option<&str>,
     now: DateTime<Utc>,
 ) {
-    let mark_dirty = matches!(ev, FleetEvent::Stop { .. } | FleetEvent::SessionEnd { .. });
+    // PromptSubmit dirties too: the user answering is exactly when blockers
+    // die, so the next brief should regenerate against the fresh turn.
+    let mark_dirty = matches!(
+        ev,
+        FleetEvent::Stop { .. } | FleetEvent::SessionEnd { .. } | FleetEvent::PromptSubmit { .. }
+    );
     let path = transcript_path.filter(|p| !p.is_empty());
     if !mark_dirty && path.is_none() {
         return;
@@ -540,6 +679,7 @@ pub fn resolve_gate_in_state(
     match outcome {
         GateOutcome::Allow | GateOutcome::Deny => {
             session.status = FleetStatus::Working;
+            session.attention_at = None;
             session.working_since = Some(now);
             session.last_event_at = now;
         }
@@ -757,12 +897,16 @@ impl FleetShared {
         session_id: &str,
         brief: SessionBrief,
         started_at: DateTime<Utc>,
+        session_title: Option<String>,
     ) -> bool {
         let row = {
             let mut state = self.state.lock().expect("fleet state lock poisoned");
             match state.sessions.get_mut(session_id) {
                 Some(s) => {
                     s.brief = Some(brief);
+                    if let Some(t) = session_title {
+                        s.session_title = Some(t);
+                    }
                     if s.brief_dirty_at.is_some_and(|d| d <= started_at) {
                         s.brief_dirty_at = None;
                     }
@@ -778,6 +922,29 @@ impl FleetShared {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Refresh a LIVE session's Claude Code title (event-ingest path — no
+    /// LLM, no debounce). No-op when unchanged or the session left the map.
+    pub fn set_session_title(&self, session_id: &str, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            return;
+        }
+        let row = {
+            let mut state = self.state.lock().expect("fleet state lock poisoned");
+            match state.sessions.get_mut(session_id) {
+                Some(s) if s.session_title.as_deref() != Some(title) => {
+                    s.session_title = Some(title.to_string());
+                    Some(s.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(row) = row {
+            store::persist_sessions(std::slice::from_ref(&row));
+            self.poke();
         }
     }
 
@@ -887,6 +1054,41 @@ mod tests {
             cwd: "/Users/x/dev/hobbes".into(),
             background_tasks: 0,
         }
+    }
+
+    #[test]
+    fn session_refs_resolve_by_id_or_unique_name() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T10:00:00Z");
+        reduce(&mut state, &start("s1"), t0);
+        reduce(
+            &mut state,
+            &FleetEvent::SessionStart {
+                session_id: "s2".into(),
+                cwd: "/Users/x/dev/hobbes".into(), // same name as s1
+                reason: "startup".into(),
+            },
+            t0,
+        );
+        reduce(
+            &mut state,
+            &FleetEvent::SessionStart {
+                session_id: "s3".into(),
+                cwd: "/Users/x/dev/puget".into(),
+                reason: "startup".into(),
+            },
+            t0,
+        );
+        // Exact id always wins.
+        assert_eq!(resolve_session_ref(&state, "s2").unwrap(), "s2");
+        // Unique name (case-insensitive) resolves.
+        assert_eq!(resolve_session_ref(&state, "PUGET").unwrap(), "s3");
+        // Ambiguous name errors toward the id.
+        assert!(resolve_session_ref(&state, "hobbes")
+            .unwrap_err()
+            .contains("HOBBES_FLEET_STATUS"));
+        // Unknown names the live sessions.
+        assert!(resolve_session_ref(&state, "nope").unwrap_err().contains("puget"));
     }
 
     #[test]
@@ -1113,7 +1315,7 @@ mod tests {
         );
 
         let sweep_at = t0 + chrono::Duration::minutes(95);
-        let retired = sweep_retired_after(&mut state, sweep_at, RETIRE_MINUTES);
+        let retired = sweep_retired_after(&mut state, sweep_at, 60);
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].id, "old-idle");
         assert_eq!(
@@ -1292,6 +1494,135 @@ mod tests {
     }
 
     #[test]
+    fn post_turn_background_events_are_liveness_only() {
+        // The RCA smoking gun: SubagentStop/ToolActivity arriving AFTER the
+        // turn's Stop must not re-light Working, open spans, or clear alerts.
+        let mut state = FleetState::default();
+        let day = date("2026-08-25");
+        let t0 = local_at(day, 9, 0);
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: "/x".into() },
+            Some("p1"),
+            t0,
+        );
+        reduce_with_prompt(&mut state, &stop("s1"), Some("p1"), local_at(day, 9, 10));
+        // CC raises "waiting for your input".
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::Notification {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                kind: "idle_prompt".into(),
+                message: "Claude is waiting for your input".into(),
+            },
+            Some("p1"),
+            local_at(day, 9, 11),
+        );
+        assert!(state.sessions["s1"].status.needs_attention());
+        assert!(state.sessions["s1"].attention_at.is_some());
+
+        // A background monitor completes 3 minutes later, same stopped prompt.
+        let t_bg = local_at(day, 9, 14);
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::SubagentStop {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                background_tasks: 1,
+            },
+            Some("p1"),
+            t_bg,
+        );
+        let s = &state.sessions["s1"];
+        assert!(s.status.needs_attention(), "alert survives background completion");
+        assert!(s.working_since.is_none(), "no phantom span");
+        assert_eq!(s.last_event_at, t_bg, "liveness still recorded");
+        assert_eq!(s.minutes_on(day, t_bg), 10, "no background minute inflation");
+
+        // A NEW prompt's heartbeat behaves normally again.
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: String::new() },
+            Some("p2"),
+            local_at(day, 9, 20),
+        );
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::ToolActivity {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                tool_name: "Bash".into(),
+            },
+            Some("p2"),
+            local_at(day, 9, 21),
+        );
+        assert_eq!(state.sessions["s1"].status, FleetStatus::Working);
+
+        // Legacy events without prompt ids keep today's behavior.
+        reduce_with_prompt(&mut state, &stop("s1"), None, local_at(day, 9, 25));
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::ToolActivity {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                tool_name: "Bash".into(),
+            },
+            None,
+            local_at(day, 9, 26),
+        );
+        assert_eq!(state.sessions["s1"].status, FleetStatus::Working);
+    }
+
+    #[test]
+    fn last_subagent_stop_ends_the_background_phase() {
+        let mut state = FleetState::default();
+        let day = date("2026-08-25");
+        reduce_with_prompt(&mut state, &start("s1"), Some("p1"), local_at(day, 9, 0));
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::Stop { session_id: "s1".into(), cwd: String::new(), background_tasks: 1 },
+            Some("p1"),
+            local_at(day, 9, 10),
+        );
+        assert_eq!(state.sessions["s1"].status, FleetStatus::WorkingBackground);
+        // Background completion with none remaining → phase over, proven credit.
+        reduce_with_prompt(
+            &mut state,
+            &FleetEvent::SubagentStop {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                background_tasks: 0,
+            },
+            Some("p1"),
+            local_at(day, 9, 25),
+        );
+        let s = &state.sessions["s1"];
+        assert_eq!(s.status, FleetStatus::Idle);
+        assert!(s.working_since.is_none());
+        assert_eq!(s.minutes_on(day, local_at(day, 9, 25)), 25);
+    }
+
+    #[test]
+    fn stopped_prompt_ring_caps_and_resets_on_session_start() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T10:00:00Z");
+        for i in 0..12 {
+            reduce_with_prompt(
+                &mut state,
+                &stop("s1"),
+                Some(&format!("p{i}")),
+                t0 + chrono::Duration::minutes(i),
+            );
+        }
+        assert_eq!(state.sessions["s1"].stopped_prompts.len(), 8);
+        assert!(!state.sessions["s1"].stopped_prompts.contains(&"p0".to_string()));
+        reduce_with_prompt(&mut state, &start("s1"), Some("p99"), t0 + chrono::Duration::hours(1));
+        assert!(state.sessions["s1"].stopped_prompts.is_empty());
+        assert!(state.sessions["s1"].active_prompt.is_none());
+    }
+
+    #[test]
     fn stop_with_background_tasks_keeps_working_and_banking() {
         let mut state = FleetState::default();
         let day = date("2026-08-25");
@@ -1317,7 +1648,11 @@ mod tests {
         let t2 = local_at(day, 9, 18);
         reduce(
             &mut state,
-            &FleetEvent::SubagentStop { session_id: "s1".into(), cwd: String::new() },
+            &FleetEvent::SubagentStop {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                background_tasks: 1,
+            },
             t2,
         );
         assert_eq!(state.sessions["s1"].status, FleetStatus::WorkingBackground);
@@ -1499,7 +1834,7 @@ mod tests {
         }
         // Generation started after the dirty mark → clears it.
         let started = t0 + chrono::Duration::seconds(50);
-        assert!(shared.set_brief("s1", brief(started), started));
+        assert!(shared.set_brief("s1", brief(started), started, None));
         {
             let state = shared.state.lock().unwrap();
             let s = &state.sessions["s1"];
@@ -1512,13 +1847,13 @@ mod tests {
             state.sessions.get_mut("s1").unwrap().brief_dirty_at =
                 Some(started + chrono::Duration::seconds(10));
         }
-        assert!(shared.set_brief("s1", brief(started), started));
+        assert!(shared.set_brief("s1", brief(started), started, None));
         {
             let state = shared.state.lock().unwrap();
             assert!(state.sessions["s1"].brief_dirty_at.is_some(), "racing Stop keeps it dirty");
         }
         // Unknown session → false (caller merges into the store instead).
-        assert!(!shared.set_brief("nope", brief(started), started));
+        assert!(!shared.set_brief("nope", brief(started), started, None));
     }
 
     #[test]

@@ -394,8 +394,29 @@ pub fn ChatWindow(
                     let (status, response_str, persist) = match builtin {
                         Some(outcome) => (outcome.status, outcome.response, outcome.persist),
                         None => {
-                            // Normal MCP tool dispatch
+            // Normal MCP tool dispatch
                             let manager = mcp_manager.read().clone();
+                            // Approval resume must rebuild the terminal's
+                            // session context — the approving chat owns the
+                            // tool call.
+                            let session_ctx = if tool_call.server_name
+                                == crate::mcp::manager::HOBBES_TERMINAL_SERVER
+                                || tool_call.server_name == "local-on-demand"
+                            {
+                                let state = session_state.peek();
+                                state.sessions.get(&active_session_id).map(|s| {
+                                    crate::mcp::terminal_client::TerminalCtx {
+                                        session_id: active_session_id.clone(),
+                                        cwd: crate::mcp::terminal_client::resolve_session_cwd(
+                                            s,
+                                            &planner_state.peek(),
+                                            &settings.peek(),
+                                        ),
+                                    }
+                                })
+                            } else {
+                                None
+                            };
                             let result_receiver = manager
                                 .use_mcp_tool(
                                     &tool_call.server_name,
@@ -403,6 +424,7 @@ pub fn ChatWindow(
                                     args_json,
                                     true,
                                     composio_profile.clone(),
+                                    session_ctx,
                                 )
                                 .await;
 

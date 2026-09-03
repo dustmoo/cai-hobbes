@@ -34,10 +34,11 @@ pub enum FleetEvent {
         background_tasks: usize,
     },
     /// `SubagentStop` — a subagent (Task tool) finished: background-work
-    /// heartbeat.
+    /// heartbeat. `background_tasks` counts what is STILL running.
     SubagentStop {
         session_id: String,
         cwd: String,
+        background_tasks: usize,
     },
     Notification {
         session_id: String,
@@ -115,6 +116,26 @@ fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+/// The payload's `prompt_id` — the turn discriminator: a heartbeat whose
+/// prompt was already stopped is provably background work.
+pub fn prompt_id_from_body(body: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    v.get("prompt_id")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+}
+
+/// `UserPromptSubmit` carries the current tab title directly.
+pub fn session_title_from_body(body: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    v.get("session_title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
 /// The payload's `transcript_path`, when present and non-empty. Read
 /// straight off the raw body — [`FleetEvent`] deliberately doesn't carry it
 /// (the enum stays frozen; hook bodies are small, the re-parse is cheap).
@@ -161,11 +182,21 @@ pub fn parse_event(body: &[u8]) -> Result<FleetEvent, String> {
                 .map(Vec::len)
                 .unwrap_or(0),
         }),
-        "SubagentStop" => Ok(FleetEvent::SubagentStop { session_id, cwd }),
+        "SubagentStop" => Ok(FleetEvent::SubagentStop {
+            session_id,
+            cwd,
+            background_tasks: v
+                .get("background_tasks")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+        }),
         "Notification" => Ok(FleetEvent::Notification {
             session_id,
             cwd,
-            kind: str_field(&v, "type"),
+            // The payload field is `notification_type` (verified live);
+            // `type` was a doc-era guess that always parsed empty.
+            kind: str_field(&v, "notification_type"),
             message: str_field(&v, "message"),
         }),
         "PermissionRequest" => Ok(FleetEvent::PermissionRequest {
@@ -280,8 +311,20 @@ mod tests {
             FleetEvent::SubagentStop {
                 session_id: "abc123".into(),
                 cwd: "/x".into(),
+                background_tasks: 0,
             }
         );
+        // Remaining background jobs ride along.
+        let sub2 = serde_json::json!({
+            "session_id": "abc123",
+            "cwd": "/x",
+            "hook_event_name": "SubagentStop",
+            "background_tasks": [{"id": "m1", "status": "running"}]
+        });
+        assert!(matches!(
+            parse_event(sub2.to_string().as_bytes()).unwrap(),
+            FleetEvent::SubagentStop { background_tasks: 1, .. }
+        ));
     }
 
     #[test]
@@ -340,7 +383,7 @@ mod tests {
             "session_id": "abc123",
             "cwd": "/Users/x/dev/hobbes",
             "hook_event_name": "Notification",
-            "type": "permission_prompt",
+            "notification_type": "permission_prompt",
             "message": "Claude needs your permission to use Bash"
         });
         let ev = parse_event(body.to_string().as_bytes()).unwrap();

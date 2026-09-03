@@ -47,6 +47,49 @@ pub struct TranscriptDigest {
     pub text: String,
     /// Typed-user turn boundaries covered.
     pub turn_count: usize,
+    /// Claude Code's session title (latest `ai-title` entry in the tail) —
+    /// what the terminal tab shows, far more telling than the folder name.
+    pub title: Option<String>,
+}
+
+/// Tail bytes needed to find a recent `ai-title` line (Claude Code rewrites
+/// it every few transcript lines, so a modest window is plenty).
+pub const TITLE_TAIL_BYTES: u64 = 128 * 1024;
+
+/// The CURRENT session title from a transcript tail. Claude Code persists
+/// TWO title slots, rewritten as a pair on every save (`custom-title` then
+/// `ai-title`, ai-title always last) — so write order means nothing here.
+/// The display rule is the terminal tab's: a custom title (the user's
+/// rename) wins whenever present; otherwise the latest auto title.
+pub fn latest_ai_title(tail: &str) -> Option<String> {
+    let mut ai = None;
+    let mut custom = None;
+    for raw in tail.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("ai-title") => {
+                if let Some(t) = non_empty(v.get("aiTitle")) {
+                    ai = Some(t);
+                }
+            }
+            Some("custom-title") => {
+                if let Some(t) = non_empty(v.get("customTitle")) {
+                    custom = Some(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    custom.or(ai)
+}
+
+fn non_empty(v: Option<&Value>) -> Option<String> {
+    v.and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
 }
 
 /// Is this a typed human prompt (vs. a tool result or synthetic message)?
@@ -120,12 +163,25 @@ fn assistant_text(line: &Value) -> String {
 /// (truncated from the front — the most recent activity survives).
 pub fn digest_transcript(tail: &str, max_turns: usize, max_chars: usize) -> TranscriptDigest {
     // Collect rendered lines in file order, remembering typed-user positions.
+    // Title slots: custom (user rename) beats auto — see latest_ai_title.
     let mut rendered: Vec<(bool, String)> = Vec::new(); // (is_typed_user_turn, text)
+    let mut ai_title: Option<String> = None;
+    let mut custom_title: Option<String> = None;
     for raw in tail.lines() {
         let Ok(v) = serde_json::from_str::<Value>(raw) else {
             continue;
         };
         match v.get("type").and_then(Value::as_str) {
+            Some("ai-title") => {
+                if let Some(t) = non_empty(v.get("aiTitle")) {
+                    ai_title = Some(t);
+                }
+            }
+            Some("custom-title") => {
+                if let Some(t) = non_empty(v.get("customTitle")) {
+                    custom_title = Some(t);
+                }
+            }
             Some("user") => {
                 if is_typed_user(&v) {
                     let t = user_text(&v);
@@ -172,7 +228,11 @@ pub fn digest_transcript(tail: &str, max_turns: usize, max_chars: usize) -> Tran
                 .collect::<String>()
         );
     }
-    TranscriptDigest { text, turn_count }
+    TranscriptDigest {
+        text,
+        turn_count,
+        title: custom_title.or(ai_title),
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +288,34 @@ mod tests {
         assert!(!d.text.contains("big output"), "tool results dropped");
         assert!(!d.text.contains("task-notification"), "synthetic user dropped");
         assert_eq!(d.turn_count, 1);
+    }
+
+    #[test]
+    fn custom_title_beats_ai_title_regardless_of_write_order() {
+        // Claude Code rewrites both slots as a pair on every save, ai-title
+        // LAST — the observed real-world order. The rename must still win.
+        let tail = [
+            user_line("hi", "typed"),
+            serde_json::json!({"type":"custom-title","customTitle":"tribes-app"}).to_string(),
+            serde_json::json!({"type":"ai-title","aiTitle":"Branch and staging status review"}).to_string(),
+            serde_json::json!({"type":"custom-title","customTitle":"tribes-app"}).to_string(),
+            serde_json::json!({"type":"ai-title","aiTitle":"Branch and staging status review"}).to_string(),
+        ]
+        .join("\n");
+        let d = digest_transcript(&tail, 6, 10_000);
+        assert_eq!(d.title.as_deref(), Some("tribes-app"));
+        assert_eq!(latest_ai_title(&tail).as_deref(), Some("tribes-app"));
+        // No rename → latest auto title.
+        let auto_only = [
+            serde_json::json!({"type":"ai-title","aiTitle":"Old"}).to_string(),
+            serde_json::json!({"type":"ai-title","aiTitle":"Benchmark tool CSV support"}).to_string(),
+        ]
+        .join("\n");
+        assert_eq!(
+            latest_ai_title(&auto_only).as_deref(),
+            Some("Benchmark tool CSV support")
+        );
+        assert!(digest_transcript("{}", 6, 100).title.is_none());
     }
 
     #[test]

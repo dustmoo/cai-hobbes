@@ -35,7 +35,7 @@ use hyper_util::rt::TokioIo;
 
 use super::events::{parse_event, FleetEvent};
 use super::hooks_config::{GATE_TIMEOUT_MARGIN_SECS, PERMISSION_HOOK_TIMEOUT_SECS};
-use super::{reduce, resolve_gate_in_state, store, sweep_stale, FleetShared, GateOutcome};
+use super::{resolve_gate_in_state, store, sweep_stale, FleetShared, GateOutcome};
 
 /// Default fixed port; on bind failure the listener falls back to an
 /// ephemeral port (`:0`) and persists whatever it got in meta so hook
@@ -128,6 +128,12 @@ pub async fn start(shared: Arc<FleetShared>, cfg: FleetServerConfig) -> Result<F
                             store::persist_sessions(&changed);
                             shared.poke();
                         }
+                        // Truth-on-disk reconciliation: catches events lost
+                        // while Hobbes wasn't running (file IO off the lock).
+                        let shared_for_reconcile = shared.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::fleet::reconcile::reconcile_all(&shared_for_reconcile);
+                        });
                     }
                 }
             }
@@ -274,6 +280,7 @@ async fn handle(
     }
     let now = chrono::Utc::now();
     let transcript_path = crate::fleet::events::transcript_path_from_body(&body);
+    let prompt_id = crate::fleet::events::prompt_id_from_body(&body);
     let auto_passthrough = {
         let mut state = shared.state.lock().expect("fleet state lock poisoned");
         // Revival: an event for a session that retired (or resumed after
@@ -285,7 +292,8 @@ async fn handle(
                 state.sessions.insert(row.id.clone(), row);
             }
         }
-        let mut changed = reduce(&mut state, &event, now);
+        let mut changed =
+            crate::fleet::reduce_with_prompt(&mut state, &event, prompt_id.as_deref(), now);
         crate::fleet::note_transcript_and_dirty(
             &mut state,
             &mut changed,
@@ -301,6 +309,42 @@ async fn handle(
             .unwrap_or(false)
     };
     shared.poke();
+
+    // Title refresh at ingest: the card should match the Claude Code session
+    // title (terminal tab name) without waiting for the brief debounce — a
+    // small file read, off the response path.
+    // UserPromptSubmit carries the tab title directly — instant, no file
+    // read; the transcript path below covers the other events.
+    if matches!(event, FleetEvent::PromptSubmit { .. }) {
+        if let Some(title) = crate::fleet::events::session_title_from_body(&body) {
+            shared.set_session_title(event.session_id(), &title);
+        }
+    }
+    if matches!(
+        event,
+        FleetEvent::SessionStart { .. } | FleetEvent::Stop { .. }
+    ) {
+        if let Some(path) = transcript_path.clone() {
+            let shared_for_title = shared.clone();
+            let sid = event.session_id().to_string();
+            tokio::spawn(async move {
+                let title = tokio::task::spawn_blocking(move || {
+                    crate::fleet::transcript::read_tail(
+                        &path,
+                        crate::fleet::transcript::TITLE_TAIL_BYTES,
+                    )
+                    .ok()
+                    .and_then(|tail| crate::fleet::transcript::latest_ai_title(&tail))
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(t) = title {
+                    shared_for_title.set_session_title(&sid, &t);
+                }
+            });
+        }
+    }
 
     // Everything except a held gate answers immediately with an empty 2xx.
     let FleetEvent::PermissionRequest {
@@ -653,6 +697,54 @@ mod tests {
         assert!(resp.bytes().await.unwrap().is_empty());
 
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stop_refreshes_the_session_title_at_ingest() {
+        // The card name must match the Claude Code session title right after
+        // a turn ends — no brief/LLM debounce involved.
+        let dir = std::env::temp_dir().join(format!("hobbes_title_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("s-title.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Benchmark tool CSV support\"}\n",
+        )
+        .unwrap();
+
+        let (shared, server, base) = test_server(1000).await;
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "session_id": "s-title",
+            "cwd": "/Users/x/dev/puget",
+            "hook_event_name": "Stop",
+            "transcript_path": transcript.to_string_lossy(),
+        })
+        .to_string();
+        let r = client.post(format!("{base}/Stop")).body(body).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+
+        // The refresh task is fire-and-forget; poll briefly.
+        let mut title = None;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            title = shared
+                .snapshot()
+                .sessions
+                .get("s-title")
+                .and_then(|s| s.session_title.clone());
+            if title.is_some() {
+                break;
+            }
+        }
+        assert_eq!(title.as_deref(), Some("Benchmark tool CSV support"));
+        assert_eq!(
+            shared.snapshot().sessions["s-title"].display_name(),
+            "Benchmark tool CSV support"
+        );
+
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

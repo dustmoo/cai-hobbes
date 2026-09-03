@@ -312,7 +312,10 @@ fn EarlierToday(rows: Vec<FleetSession>, now: DateTime<Utc>, today: chrono::Naiv
                         div {
                             key: "{s.id}",
                             class: "flex items-baseline gap-2 text-xs",
-                            span { class: "font-medium shrink-0", "{s.name}" }
+                            span {
+                                class: "font-medium shrink-0 max-w-64 truncate",
+                                { s.display_name().to_string() }
+                            }
                             span { class: "text-fg-muted shrink-0",
                                 { crate::todo::model::format_minutes(s.minutes_on(today, now)) } }
                             if let Some(b) = &s.brief {
@@ -606,7 +609,10 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                     class: "flex-1 min-w-0",
                     div {
                         class: "flex items-center gap-2",
-                        span { class: "text-sm font-semibold truncate", "{session.name}" }
+                        span {
+                            class: "text-sm font-semibold truncate",
+                            { session.display_name().to_string() }
+                        }
                         // Status as a dot, not a pill — the full name of the
                         // state lives in the tooltip; attention pulses.
                         span {
@@ -636,6 +642,32 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                 }
             }
 
+            // The assignment this session carries, when a todo links to it.
+            {
+                let working_on = planner
+                    .read()
+                    .todos
+                    .iter()
+                    .find(|t| {
+                        t.linked_fleet_session.as_deref() == Some(session.id.as_str())
+                            && !matches!(
+                                t.status,
+                                crate::todo::model::TodoStatus::Completed
+                                    | crate::todo::model::TodoStatus::Cancelled
+                            )
+                    })
+                    .map(|t| t.title.clone());
+                rsx! {
+                    if let Some(title) = working_on {
+                        p {
+                            class: "mt-1 text-xs text-fg-muted truncate",
+                            span { class: "text-fg-muted/70", "working on: " }
+                            span { class: "text-fg", { fleet::truncate_summary(&title, 90) } }
+                        }
+                    }
+                }
+            }
+
             // Attention detail line (what the session wants).
             if let FleetStatus::NeedsAttention(AttentionKind::Notification { message, .. }) = &session.status {
                 if !message.is_empty() {
@@ -643,17 +675,40 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                 }
             }
 
-            // Re-entry brief: what happened since you last looked.
+            // Re-entry brief: what happened since you last looked. Status is
+            // ms-fresh, brief text is minutes-stale — make the age legible
+            // rather than letting the mix read as broken.
             if let Some(brief) = &session.brief {
-                p {
-                    class: "mt-2 text-xs text-fg",
-                    { fleet::truncate_summary(&brief.headline, 140) }
-                }
-                if let Some(blocked) = &brief.blocked_on {
-                    p {
-                        class: "text-xs",
-                        style: "color: #f59e0b;",
-                        { format!("blocked: {}", fleet::truncate_summary(blocked, 100)) }
+                {
+                    let brief_age_min = (session.last_event_at - brief.generated_at).num_minutes();
+                    let turn_running = matches!(
+                        session.status,
+                        FleetStatus::Working | FleetStatus::WorkingBackground
+                    );
+                    rsx! {
+                        p {
+                            class: "mt-2 text-xs text-fg",
+                            { fleet::truncate_summary(&brief.headline, 140) }
+                            if brief_age_min > 3 {
+                                span {
+                                    class: "text-fg-muted/60",
+                                    { format!("  · {}m old", brief_age_min) }
+                                }
+                            }
+                        }
+                        if let Some(blocked) = &brief.blocked_on {
+                            // Dim while a turn is running: the blocker was
+                            // written before this turn and is under re-test.
+                            p {
+                                class: "text-xs",
+                                style: if turn_running {
+                                    "color: #f59e0b; opacity: 0.55;"
+                                } else {
+                                    "color: #f59e0b;"
+                                },
+                                { format!("blocked: {}", fleet::truncate_summary(blocked, 100)) }
+                            }
+                        }
                     }
                 }
             }

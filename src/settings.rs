@@ -388,10 +388,18 @@ pub struct Settings {
     /// time). Clamped to 15–1440 at use.
     #[serde(default = "default_fleet_retire_minutes")]
     pub fleet_retire_minutes: u32,
+
+    // ── Terminal ────────────────────────────────────────────────────────────
+    /// Register the native `hobbes-terminal` MCP server (persistent per-chat
+    /// zsh the AI can run commands in — always behind the tool-approval
+    /// flow). Off by default: a shell is the highest-risk tool in the app.
+    /// Takes effect at next launch (registration happens at manager init).
+    #[serde(default)]
+    pub terminal_enabled: bool,
 }
 
 fn default_fleet_retire_minutes() -> u32 {
-    60
+    360
 }
 
 fn default_planner_block_minutes() -> u32 {
@@ -794,6 +802,7 @@ impl Default for Settings {
             fleet_enabled: false,
             fleet_briefs_enabled: true,
             fleet_retire_minutes: default_fleet_retire_minutes(),
+            terminal_enabled: false,
         }
     }
 }

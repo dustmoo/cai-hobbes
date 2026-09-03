@@ -66,6 +66,40 @@ pub fn is_builtin_tool(name: &str) -> bool {
 /// Whether a tool belongs to the `hobbes-planner` virtual server. Used both to
 /// gate dispatch on `settings.planner_enabled` and to withhold the tool
 /// definitions from the prompt when the planner is off (system_context.rs).
+/// Rewrite any non-null `linked_session` values in todo create/update args
+/// from name-or-id references to resolved fleet session ids. Returns
+/// `Ok(None)` when nothing needed resolving (avoids a clone on the hot
+/// path), `Err` with a live-session listing on failure.
+fn resolve_linked_sessions(
+    args: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    let has_refs = ["todos", "updates"].iter().any(|key| {
+        args.get(key).and_then(|v| v.as_array()).is_some_and(|items| {
+            items.iter().any(|i| {
+                i.get("linked_session").is_some_and(|v| v.is_string())
+            })
+        })
+    });
+    if !has_refs {
+        return Ok(None);
+    }
+    let live = crate::fleet::shared().snapshot();
+    let mut out = args.clone();
+    for key in ["todos", "updates"] {
+        if let Some(items) = out.get_mut(key).and_then(|v| v.as_array_mut()) {
+            for item in items {
+                let Some(reference) = item.get("linked_session").and_then(|v| v.as_str())
+                else {
+                    continue;
+                };
+                let id = crate::fleet::resolve_session_ref(&live, reference)?;
+                item["linked_session"] = serde_json::Value::String(id);
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
 /// Whether a tool belongs to the fleet family — gated on
 /// `fleet_enabled && pro_active()` both at dispatch and when withholding
 /// definitions from the prompt (system_context.rs).
@@ -187,8 +221,15 @@ pub async fn dispatch_builtin_tool(
                     .filter(|r| !live.sessions.contains_key(&r.id))
                     .collect();
             let filter = args_json.get("session").and_then(|v| v.as_str());
-            let report =
-                crate::fleet::briefs::status_report(&live, &ended_today, filter, now, today);
+            let links = crate::todo::handlers::linked_session_pairs(&deps.planner.read());
+            let report = crate::fleet::briefs::status_report(
+                &live,
+                &ended_today,
+                filter,
+                &links,
+                now,
+                today,
+            );
             Some(BuiltinOutcome {
                 status: ToolCallStatus::Completed,
                 response: serde_json::to_string_pretty(&report)
@@ -255,6 +296,24 @@ fn run_planner_tool(
     let mut planner = deps.planner;
     let today = chrono::Local::now().date_naive();
 
+    // `linked_session` values may be session names; resolve them to fleet
+    // session ids at this edge (the handlers stay fleet-free and receive
+    // pre-resolved ids). Errors name what IS live.
+    let resolved_args: serde_json::Value;
+    let args_json: &serde_json::Value =
+        if matches!(tool_name, "HOBBES_TODO_CREATE" | "HOBBES_TODO_UPDATE") {
+            match resolve_linked_sessions(args_json) {
+                Ok(Some(v)) => {
+                    resolved_args = v;
+                    &resolved_args
+                }
+                Ok(None) => args_json,
+                Err(e) => return (ToolCallStatus::Error, e),
+            }
+        } else {
+            args_json
+        };
+
     match tool_name {
         "HOBBES_TODO_CREATE" => {
             handlers::handle_todo_create(&mut planner.write(), args_json, session_id, today, true)
@@ -262,7 +321,8 @@ fn run_planner_tool(
         "HOBBES_TODO_UPDATE" => {
             // session_id threads through so `status: in_progress` opens an
             // agent-actor focus session attributed to this chat (the same
-            // provenance source as TodoOrigin::Ai in HOBBES_TODO_CREATE).
+            // provenance source as TodoOrigin::Ai in HOBBES_TODO_CREATE) and
+            // auto-links the todo to this session when unlinked.
             handlers::handle_todo_update(&mut planner.write(), args_json, session_id, today, true)
         }
         "HOBBES_TODO_LIST" => handlers::handle_todo_list(&planner.read(), args_json, today),

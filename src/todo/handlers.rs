@@ -253,6 +253,10 @@ fn build_todo(
         }
         todo.project_id = Some(project_id.to_string());
     }
+    // Pre-resolved to a session id by the dispatch layer.
+    if let Some(link) = obj.get("linked_session").and_then(|v| v.as_str()) {
+        todo.linked_fleet_session = Some(link.to_string());
+    }
     if let Some(tags) = obj.get("tags").and_then(|v| v.as_array()) {
         todo.tags = tags
             .iter()
@@ -308,7 +312,7 @@ pub fn handle_todo_update(
     let mut pruned_blocks = 0usize;
     let mut resized_blocks = 0usize;
     for (i, item) in items.iter().enumerate() {
-        match apply_todo_update(state, item, today, now) {
+        match apply_todo_update(state, item, today, now, session_id) {
             Ok((summary, status_intent)) => {
                 let mut summary = summary;
                 // The borrow of the patched todo has ended; re-fetch by id for
@@ -433,6 +437,7 @@ fn apply_todo_update(
     item: &Value,
     today: NaiveDate,
     now: DateTime<Utc>,
+    session_id: &str,
 ) -> Result<(String, Option<TodoStatus>), String> {
     let obj = item.as_object().ok_or("expected an object")?;
     let id = obj
@@ -460,6 +465,11 @@ fn apply_todo_update(
             return Err(format!("unknown project_id '{}'", pid));
         }
     }
+    // Pre-resolved to a session id by the dispatch layer (fleet lookup);
+    // explicit null clears the link.
+    let linked_session = patch_from(obj, "linked_session", |v| {
+        as_str_value(v).map(str::to_string)
+    })?;
     let bucket = match obj.get("bucket").and_then(|v| v.as_str()) {
         Some(raw) => Some(parse_bucket(raw)?),
         None => None,
@@ -491,6 +501,15 @@ fn apply_todo_update(
     time_of_day.apply(&mut todo.time_of_day);
     estimate.apply(&mut todo.estimate_minutes);
     project_id.apply(&mut todo.project_id);
+    linked_session.apply(&mut todo.linked_fleet_session);
+    // Auto-link: agent focus starting on an unlinked todo binds it to the
+    // driving chat session (never overwrites an existing link).
+    if status == Some(TodoStatus::InProgress)
+        && todo.linked_fleet_session.is_none()
+        && !session_id.is_empty()
+    {
+        todo.linked_fleet_session = Some(session_id.to_string());
+    }
     if let Some(tags) = obj.get("tags").and_then(|v| v.as_array()) {
         todo.tags = tags
             .iter()
@@ -1559,6 +1578,44 @@ fn last_touched_project<'a>(state: &'a PlannerState, item: &Value) -> Option<&'a
     }
 }
 
+/// (session_id, todo title) pairs for every open todo linked to a fleet
+/// session — feeds brief framing and the fleet status report.
+pub fn linked_session_pairs(state: &PlannerState) -> Vec<(String, String)> {
+    state
+        .todos
+        .iter()
+        .filter(|t| !matches!(t.status, TodoStatus::Completed | TodoStatus::Cancelled))
+        .filter_map(|t| {
+            t.linked_fleet_session
+                .clone()
+                .map(|sid| (sid, t.title.clone()))
+        })
+        .collect()
+}
+
+/// Write a linked session's fresh brief line onto its open todos — display
+/// only, never touches status (progress is reported, not judged). Returns
+/// changed todo ids; callers persist each via `store::save_todo`.
+pub fn apply_brief_progress(
+    state: &mut PlannerState,
+    session_id: &str,
+    line: &str,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    for todo in state.todos.iter_mut() {
+        if todo.linked_fleet_session.as_deref() == Some(session_id)
+            && !matches!(todo.status, TodoStatus::Completed | TodoStatus::Cancelled)
+            && todo.latest_progress.as_deref() != Some(line)
+        {
+            todo.latest_progress = Some(line.to_string());
+            todo.updated_at = now;
+            changed.push(todo.id.clone());
+        }
+    }
+    changed
+}
+
 // ── planner_today context injection ─────────────────────────────────────────
 
 /// Hard caps for the `planner_today` system-context block. The block rides on
@@ -1804,6 +1861,81 @@ mod tests {
         );
         assert_eq!(status, ToolCallStatus::Completed);
         state.todos.last().unwrap().id.clone()
+    }
+
+    #[test]
+    fn linked_session_sets_clears_and_auto_links() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Ship briefs", "today");
+
+        // Explicit set (pre-resolved id arrives from the dispatch layer).
+        let (status, _) = update(
+            &mut state,
+            json!({"updates": [{"id": id, "linked_session": "term-1"}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert_eq!(
+            state.todo(&id).unwrap().linked_fleet_session.as_deref(),
+            Some("term-1")
+        );
+
+        // in_progress does NOT overwrite an existing link…
+        let (status, _) =
+            update(&mut state, json!({"updates": [{"id": id, "status": "in_progress"}]}));
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert_eq!(
+            state.todo(&id).unwrap().linked_fleet_session.as_deref(),
+            Some("term-1")
+        );
+
+        // Explicit null clears.
+        let (status, _) = update(
+            &mut state,
+            json!({"updates": [{"id": id, "linked_session": null}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(state.todo(&id).unwrap().linked_fleet_session.is_none());
+
+        // …and starting focus on an UNLINKED todo auto-links the caller.
+        let id2 = seed_todo(&mut state, "Second", "today");
+        let (status, _) =
+            update(&mut state, json!({"updates": [{"id": id2, "status": "in_progress"}]}));
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert_eq!(
+            state.todo(&id2).unwrap().linked_fleet_session.as_deref(),
+            Some("sess-1")
+        );
+    }
+
+    #[test]
+    fn brief_progress_lands_on_linked_open_todos_only() {
+        let mut state = PlannerState::default();
+        let a = seed_todo(&mut state, "Linked open", "today");
+        let b = seed_todo(&mut state, "Linked done", "today");
+        let c = seed_todo(&mut state, "Unlinked", "today");
+        state.todo_mut(&a).unwrap().linked_fleet_session = Some("s1".into());
+        state.todo_mut(&b).unwrap().linked_fleet_session = Some("s1".into());
+        state.complete_todo(&b, Utc::now());
+
+        let changed = apply_brief_progress(&mut state, "s1", "Did the thing", Utc::now());
+        assert_eq!(changed, vec![a.clone()]);
+        assert_eq!(
+            state.todo(&a).unwrap().latest_progress.as_deref(),
+            Some("Did the thing")
+        );
+        assert!(state.todo(&b).unwrap().latest_progress.is_none());
+        assert!(state.todo(&c).unwrap().latest_progress.is_none());
+        assert_eq!(
+            state.todo(&a).unwrap().status,
+            TodoStatus::Open,
+            "progress never drives status"
+        );
+        // Same line again → no-op (no churn, no updated_at bump).
+        assert!(apply_brief_progress(&mut state, "s1", "Did the thing", Utc::now()).is_empty());
+
+        // Pairs feed framing/status: only open linked todos.
+        let pairs = linked_session_pairs(&state);
+        assert_eq!(pairs, vec![("s1".to_string(), "Linked open".to_string())]);
     }
 
     /// Create a block linked to `todo_id` on `TODAY` and return its id.

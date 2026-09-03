@@ -84,29 +84,36 @@ pub fn ProjectChip() -> Element {
             class: "relative",
             if let Some(title) = &label {
                 button {
-                    class: "max-w-36 truncate px-2 py-0.5 rounded-full border border-faint text-xs text-fg-muted hover:text-fg hover:border-subtle transition-colors select-none",
+                    class: "max-w-44 flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-faint text-xs text-fg-muted cursor-pointer hover:text-fg hover:border-primary-500 hover:bg-card transition-colors select-none",
                     title: "Project: {title} — click to change",
                     onclick: move |_| {
                         let v = !*open.peek();
                         open.set(v);
                     },
-                    "{title}"
+                    span { class: "truncate", "{title}" }
+                    // The caret is the "this opens something" signal — a
+                    // label without it reads as static metadata.
+                    span { class: "text-[9px] opacity-60 shrink-0", "▾" }
                 }
             } else {
                 button {
-                    class: "px-1 text-xs text-fg-muted/60 hover:text-fg-muted transition-colors select-none",
+                    class: "flex items-center gap-1 px-2.5 py-1 rounded-full border border-dashed border-faint text-xs text-fg-muted/70 cursor-pointer hover:text-fg hover:border-subtle hover:bg-card transition-colors select-none",
                     title: "Tag this chat to a project",
                     onclick: move |_| {
                         let v = !*open.peek();
                         open.set(v);
                     },
-                    "+ project"
+                    span { "+ project" }
                 }
             }
 
             if *open.read() {
                 div {
-                    class: "absolute bottom-8 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                    class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1 max-h-72 overflow-y-auto",
+                    p {
+                        class: "px-4 pt-2 pb-1 text-[11px] uppercase tracking-wider text-fg-muted",
+                        "Tag this chat"
+                    }
                     button {
                         class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors",
                         onclick: move |_| set_tag(None),

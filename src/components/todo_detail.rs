@@ -548,6 +548,16 @@ fn DetailCardInner(todo_id: String) -> Element {
                     }
                 }
 
+                // Latest progress from the linked fleet session (read-only —
+                // reported by briefs, never driving status).
+                if let Some(progress) = &todo.latest_progress {
+                    div {
+                        class: "rounded border border-faint bg-input/30 px-3 py-2",
+                        p { class: "text-[11px] uppercase tracking-wider text-fg-muted mb-1", "Latest progress" }
+                        p { class: "text-xs text-fg leading-relaxed", "{progress}" }
+                    }
+                }
+
                 // Read-only footer
                 div {
                     class: "flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-faint pt-3 text-xs text-fg-muted",

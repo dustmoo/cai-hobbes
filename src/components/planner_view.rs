@@ -1305,6 +1305,8 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
 fn TodoRow(todo: Todo, mut selection: Signal<PlannerSelection>) -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let settings = use_context::<Signal<Settings>>();
+    let fleet_state = use_context::<Signal<crate::fleet::FleetState>>();
+    let session_state = use_context::<Signal<crate::session::SessionState>>();
     let mut chat_command =
         use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
     let mut editing = use_signal(|| false);
@@ -1536,6 +1538,46 @@ fn TodoRow(todo: Todo, mut selection: Signal<PlannerSelection>) -> Element {
             }
             if let Some(actuals) = actuals_line {
                 span { class: "shrink-0 text-xs text-fg-muted", "{actuals}" }
+            }
+            // Linked fleet session: the assignment's carrier. Hobbes tabs are
+            // doors (click opens the chat); terminal sessions are labels.
+            if let Some(link_id) = todo.linked_fleet_session.clone() {
+                {
+                    let is_chat = session_state.read().sessions.contains_key(&link_id);
+                    let label = fleet_state
+                        .read()
+                        .sessions
+                        .get(&link_id)
+                        .map(|s| s.name.clone())
+                        .or_else(|| {
+                            session_state.read().sessions.get(&link_id).map(|s| s.name.clone())
+                        })
+                        .unwrap_or_else(|| "session".to_string());
+                    rsx! {
+                        button {
+                            class: if is_chat {
+                                "shrink-0 flex items-center gap-1 rounded-full border border-subtle px-2 py-0.5 text-xs text-fg-muted hover:text-fg hover:border-primary-500 max-w-32"
+                            } else {
+                                "shrink-0 flex items-center gap-1 rounded-full border border-subtle px-2 py-0.5 text-xs text-fg-muted max-w-32 cursor-default"
+                            },
+                            title: if is_chat { "Carried by this chat — click to open" } else { "Carried by this coding-agent session" },
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                if is_chat {
+                                    chat_command.set(Some(
+                                        crate::components::chat_input::ChatCommand::SwitchToSession(link_id.clone()),
+                                    ));
+                                }
+                            },
+                            Icon {
+                                width: 10,
+                                height: 10,
+                                icon: crate::components::pixel_icons::HobbesInvader,
+                            }
+                            span { class: "truncate", "{label}" }
+                        }
+                    }
+                }
             }
             // Chips
             if show_scheduled {

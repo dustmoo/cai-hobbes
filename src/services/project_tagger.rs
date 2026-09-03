@@ -80,7 +80,7 @@ pub fn suggest_project(
 
 /// Normalize a project path for prefix matching: `~` expanded, trailing
 /// slashes trimmed.
-fn norm_path(p: &str) -> Option<String> {
+pub(crate) fn norm_path(p: &str) -> Option<String> {
     let p = p.trim();
     if p.is_empty() {
         return None;

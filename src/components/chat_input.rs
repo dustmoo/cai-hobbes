@@ -1301,35 +1301,43 @@ pub fn ChatInput(
                                                 let live = crate::fleet::shared().snapshot();
                                                 let today = chrono::Local::now().date_naive();
                                                 let now_utc = chrono::Utc::now();
-                                                let mut rows: Vec<&crate::fleet::FleetSession> = live
+                                                // Unique handle per WINDOW (name~id when a repo
+                                                // has several sessions) — never dedupe windows.
+                                                let mut rows: Vec<(String, &crate::fleet::FleetSession)> = live
                                                     .sessions
                                                     .values()
-                                                    .filter(|s| {
+                                                    .map(|s| (crate::fleet::mention::mention_handle(s, &live), s))
+                                                    .filter(|(h, s)| {
                                                         q.query.is_empty()
-                                                            || s.name
-                                                                .to_lowercase()
-                                                                .contains(&q.query.to_lowercase())
+                                                            || h.to_lowercase().contains(&q.query.to_lowercase())
+                                                            || s.session_title
+                                                                .as_deref()
+                                                                .is_some_and(|t| t.to_lowercase().contains(&q.query.to_lowercase()))
                                                     })
                                                     .collect();
-                                                rows.sort_by(|a, b| a.name.cmp(&b.name));
-                                                rows.dedup_by(|a, b| a.name == b.name);
+                                                rows.sort_by(|a, b| a.0.cmp(&b.0));
                                                 let matches: Vec<Skill> = rows
                                                     .into_iter()
-                                                    .map(|s| Skill {
+                                                    .map(|(handle, s)| Skill {
                                                         metadata: crate::skills::parser::SkillMetadata {
-                                                            name: s.name.clone(),
+                                                            name: handle,
                                                             description: {
-                                                                let mut d = format!(
+                                                                let mut d = String::new();
+                                                                if let Some(t) = &s.session_title {
+                                                                    d.push_str(&crate::fleet::truncate_summary(t, 60));
+                                                                    d.push_str(" · ");
+                                                                }
+                                                                d.push_str(&format!(
                                                                     "{} today",
                                                                     crate::todo::model::format_minutes(
                                                                         s.minutes_on(today, now_utc),
                                                                     )
-                                                                );
+                                                                ));
                                                                 if let Some(b) = &s.brief {
                                                                     d.push_str(" — ");
                                                                     d.push_str(&crate::fleet::truncate_summary(
                                                                         &b.headline,
-                                                                        80,
+                                                                        60,
                                                                     ));
                                                                 }
                                                                 d

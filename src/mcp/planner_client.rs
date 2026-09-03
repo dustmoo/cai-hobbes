@@ -53,6 +53,7 @@ impl PlannerClient {
                                         "deadline": { "type": "string", "description": "The day it is actually due (YYYY-MM-DD, 'today' or 'tomorrow')." },
                                         "estimate_minutes": { "type": "integer", "description": "Estimated focused minutes of work." },
                                         "project_id": { "type": "string", "description": "Id of an existing project to file it under." },
+                                        "linked_session": { "type": "string", "description": "Fleet session carrying this todo: a session id from HOBBES_FLEET_STATUS, or a unique live session name." },
                                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Free-form tags." },
                                         "checklist": { "type": "array", "items": { "type": "string" }, "description": "Sub-step titles." }
                                     },
@@ -100,6 +101,7 @@ impl PlannerClient {
                                         "deadline": { "type": ["string", "null"], "description": "YYYY-MM-DD, 'today' or 'tomorrow'; null clears it." },
                                         "estimate_minutes": { "type": ["integer", "null"], "description": "null clears it." },
                                         "project_id": { "type": ["string", "null"], "description": "null clears it." },
+                                        "linked_session": { "type": ["string", "null"], "description": "Fleet session carrying this todo (id from HOBBES_FLEET_STATUS or unique live name); null clears the link. Setting status to in_progress auto-links the calling session when unlinked." },
                                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Replaces the full tag list." },
                                         "checklist": { "type": "array", "items": { "type": "string" }, "description": "Replaces the full checklist." }
                                     },

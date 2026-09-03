@@ -67,7 +67,40 @@ impl StreamManagerContext {
                 None => (String::new(), None),
             }
         };
+        let brief_source = summary_json.clone();
+        let is_turn_end = matches!(
+            signal,
+            crate::fleet::bridge::HobbesSignal::TurnCompleted
+                | crate::fleet::bridge::HobbesSignal::Closed
+        );
         crate::fleet::bridge::report_with_brief(session_id, &name, signal, summary_json);
+
+        // Progress flows onto todos linked to THIS chat session too
+        // (display-only, mirroring the transcript-brief path).
+        if is_turn_end {
+            if let Some(brief) = brief_source.and_then(|v| {
+                crate::fleet::briefs::brief_from_summary_value(&v, chrono::Utc::now(), false)
+            }) {
+                let line = crate::fleet::briefs::progress_line(&brief);
+                let mut planner = self.planner_state;
+                let changed = crate::todo::handlers::apply_brief_progress(
+                    &mut planner.write(),
+                    session_id,
+                    &line,
+                    chrono::Utc::now(),
+                );
+                if !changed.is_empty() {
+                    let p = planner.peek();
+                    for id in &changed {
+                        if let Some(t) = p.todo(id) {
+                            if let Err(e) = crate::todo::store::save_todo(t) {
+                                tracing::error!("progress persist failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn is_streaming(self, message_id: &Uuid) -> bool {
@@ -653,6 +686,27 @@ impl StreamManagerContext {
                                 return;
                             }
 
+                            // Per-session context for the native terminal
+                            // (direct or via local-on-demand): the chat id
+                            // plus its resolved project working directory.
+                            let session_ctx = if tool_call.server_name
+                                == crate::mcp::manager::HOBBES_TERMINAL_SERVER
+                                || tool_call.server_name == "local-on-demand"
+                            {
+                                let state = session_state.peek();
+                                state.sessions.get(&session_id_inner).map(|s| {
+                                    crate::mcp::terminal_client::TerminalCtx {
+                                        session_id: session_id_inner.clone(),
+                                        cwd: crate::mcp::terminal_client::resolve_session_cwd(
+                                            s,
+                                            &self.planner_state.peek(),
+                                            &self.settings.peek(),
+                                        ),
+                                    }
+                                })
+                            } else {
+                                None
+                            };
                             let result_receiver = mcp_manager
                                 .read()
                                 .use_mcp_tool(
@@ -661,6 +715,7 @@ impl StreamManagerContext {
                                     args_json,
                                     false,
                                     profile_id.clone(),
+                                    session_ctx,
                                 )
                                 .await;
 

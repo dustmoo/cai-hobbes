@@ -3897,6 +3897,9 @@ pub fn SettingsPanel() -> Element {
                 // Commits immediately (not part of this tab's draft + Save).
                 FleetSection {}
 
+                // Native terminal: opt-in, commits immediately.
+                TerminalSection {}
+
                    }, // End Behavior
                    crate::settings::SettingsTab::Data => rsx! {
                 // Data Management Section
@@ -5828,6 +5831,58 @@ fn LicenseSection() -> Element {
                         class: "mt-3 py-2 px-4 bg-btn-primary hover:bg-btn-primary-hover rounded-md text-sm font-bold transition-colors",
                         onclick: on_activate,
                         "Activate"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The native terminal card: one opt-in toggle, committed immediately (the
+/// calendar-row idiom). Registration happens at MCP manager init, so
+/// enabling takes effect at next launch; disabling also kills any live
+/// shells right away.
+#[component]
+fn TerminalSection() -> Element {
+    let mut settings = use_context::<Signal<Settings>>();
+    let settings_manager = use_context::<Signal<SettingsManager>>();
+    let save_error = use_context::<crate::components::shared::SaveErrorContext>().0;
+    let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
+
+    let enabled = settings.read().terminal_enabled;
+    rsx! {
+        div {
+            class: "border border-subtle rounded-lg mb-4",
+            div {
+                class: "p-4 bg-section rounded-lg",
+                h3 { class: "text-md font-semibold mb-1", "Terminal" }
+                p {
+                    class: "text-xs text-fg-muted mb-3",
+                    "A persistent shell per chat the AI can run commands in — every command goes through the tool-approval prompt, and the working directory follows the chat's tagged project."
+                }
+                div {
+                    class: "flex items-center justify-between",
+                    div {
+                        label { class: "text-sm font-medium text-fg-muted", "Enable Terminal" }
+                        p { class: "text-xs text-fg-muted", "AI can run shell commands (with your approval). Takes effect at next launch; turning it off kills any running shells now." }
+                    }
+                    input {
+                        r#type: "checkbox",
+                        class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                        checked: "{enabled}",
+                        onchange: move |e| {
+                            let on = e.value() == "true";
+                            settings.write().terminal_enabled = on;
+                            settings_manager
+                                .peek()
+                                .save_async(settings.peek().clone(), Some(save_error));
+                            if !on {
+                                let mgr = mcp_manager.peek().clone();
+                                spawn(async move {
+                                    mgr.shutdown_terminal().await;
+                                });
+                            }
+                        }
                     }
                 }
             }

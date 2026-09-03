@@ -388,7 +388,7 @@ fn app() -> Element {
     // The planner is hydrated in full at startup — its rows are small and
     // bounded by human effort, so there is no lazy-loading path to justify.
     // Safe here: session_store::init() ran in main() before the app launched.
-    let planner_state = use_context_provider(|| Signal::new(todo::PlannerState::load()));
+    let mut planner_state = use_context_provider(|| Signal::new(todo::PlannerState::load()));
 
     // Fleet (Pro): the hook listener runs on plain tokio tasks with its
     // canonical state in `fleet::shared()` — this signal is a UI mirror fed
@@ -448,8 +448,14 @@ fn app() -> Element {
                 if want && server.is_none() {
                     if !hydrated {
                         // Sessions left live by a previous process re-enter
-                        // the map; the sweep and span caps keep them honest.
+                        // the map; the sweep and span caps keep them honest,
+                        // and reconciliation corrects anything that changed
+                        // on disk while Hobbes wasn't listening.
                         shared.hydrate_from_store();
+                        let shared_for_reconcile = shared.clone();
+                        tokio::task::spawn_blocking(move || {
+                            fleet::reconcile::reconcile_all(&shared_for_reconcile);
+                        });
                         hydrated = true;
                     }
                     match fleet::server::start_from_meta(shared.clone()).await {
@@ -522,7 +528,8 @@ fn app() -> Element {
                 let today = chrono::Local::now().date_naive();
                 let live = fleet::shared().snapshot();
                 let ended = fleet::store::sessions_active_on(today);
-                let due = fleet::briefs::collect_due(&live, &ended, chrono::Utc::now());
+                let links = crate::todo::handlers::linked_session_pairs(&planner_state.peek());
+                let due = fleet::briefs::collect_due(&live, &ended, &links, chrono::Utc::now());
                 let Some(task) = due.into_iter().next() else {
                     continue;
                 };
@@ -562,6 +569,7 @@ fn app() -> Element {
                     continue;
                 }
 
+                let session_title = digest.title.clone();
                 let (prev, framed) = fleet::briefs::brief_framing(&task, &digest);
                 let connector = llm::build_connector_for_instance(&instance, None);
                 match tokio::time::timeout(
@@ -580,17 +588,45 @@ fn app() -> Element {
                             continue;
                         };
                         let shared = fleet::shared();
-                        if !shared.set_brief(&task.session_id, brief.clone(), started_at) {
+                        if !shared.set_brief(
+                            &task.session_id,
+                            brief.clone(),
+                            started_at,
+                            session_title.clone(),
+                        ) {
                             // Ended (or just-ended) row: merge into the store.
+                            let brief_for_merge = brief.clone();
                             let merged =
                                 fleet::store::merge_session(&task.session_id, move |row| {
-                                    row.brief = Some(brief);
+                                    row.brief = Some(brief_for_merge);
+                                    if let Some(t) = session_title {
+                                        row.session_title = Some(t);
+                                    }
                                     if row.brief_dirty_at.is_none_or(|d| d <= started_at) {
                                         row.brief_dirty_at = None;
                                     }
                                 });
                             if merged {
                                 shared.poke();
+                            }
+                        }
+                        // Progress flows onto linked todos (display-only —
+                        // never status; progress is reported, not judged).
+                        let line = fleet::briefs::progress_line(&brief);
+                        let changed = crate::todo::handlers::apply_brief_progress(
+                            &mut planner_state.write(),
+                            &task.session_id,
+                            &line,
+                            chrono::Utc::now(),
+                        );
+                        if !changed.is_empty() {
+                            let p = planner_state.peek();
+                            for id in &changed {
+                                if let Some(t) = p.todo(id) {
+                                    if let Err(e) = crate::todo::store::save_todo(t) {
+                                        tracing::error!("progress persist failed: {e}");
+                                    }
+                                }
                             }
                         }
                     }
@@ -1691,6 +1727,15 @@ fn app() -> Element {
                 fleet::bridge::HobbesSignal::Closed,
                 closing_summary,
             );
+
+            // A closed tab's terminal shell dies with it.
+            {
+                let mgr = mcp_manager.peek().clone();
+                let sid = closing_session_id.clone();
+                spawn(async move {
+                    mgr.kill_terminal_session(&sid).await;
+                });
+            }
 
             // Delete the session if it has no messages (empty tab).
             // Sessions with messages are preserved in History.

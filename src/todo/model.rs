@@ -395,6 +395,16 @@ pub struct Todo {
     #[serde(default)]
     pub origin: TodoOrigin,
 
+    /// The fleet session carrying this todo (terminal Claude Code uuid, or a
+    /// Hobbes chat session id). Set by the AI tools or auto-set when agent
+    /// focus starts; the fleet side derives its view by scanning todos.
+    #[serde(default)]
+    pub linked_fleet_session: Option<String>,
+    /// Display-only: the linked session's latest brief line ("did X;
+    /// blocked: Y"). Never drives status — progress is reported, not judged.
+    #[serde(default)]
+    pub latest_progress: Option<String>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -423,6 +433,8 @@ impl Todo {
             started_at: None,
             sort_order,
             origin: TodoOrigin::User,
+            linked_fleet_session: None,
+            latest_progress: None,
             created_at: now,
             updated_at: now,
             completed_at: None,
