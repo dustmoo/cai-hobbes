@@ -266,6 +266,64 @@ pub fn merge_session_conn(
     Ok(true)
 }
 
+/// One `fleet_events` row as the intra-day replay consumes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredEvent {
+    pub session_id: String,
+    pub event: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Raw body JSON — the replay pulls `background_tasks` etc. from it.
+    pub data: String,
+}
+
+/// Every stored event whose timestamp falls on local day `date`, time-ordered.
+/// Same widened-SQL-window + Rust local-day pattern as
+/// [`sessions_active_on_conn`].
+pub fn events_on_conn(
+    conn: &Connection,
+    date: chrono::NaiveDate,
+) -> rusqlite::Result<Vec<StoredEvent>> {
+    use chrono::Local;
+    let window_start = date
+        .pred_opt()
+        .unwrap_or(date)
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut stmt = conn.prepare(
+        "SELECT session_id, event, created_at, data FROM fleet_events
+         WHERE created_at >= ?1 ORDER BY created_at, seq",
+    )?;
+    let rows = stmt.query_map(params![window_start], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (session_id, event, created_at, data) = row?;
+        let Ok(ts) = created_at.parse::<chrono::DateTime<chrono::Utc>>() else {
+            continue;
+        };
+        if ts.with_timezone(&Local).date_naive() == date {
+            out.push(StoredEvent { session_id, event, created_at: ts, data });
+        }
+    }
+    Ok(out)
+}
+
+pub fn events_on(date: chrono::NaiveDate) -> Vec<StoredEvent> {
+    if !is_available() {
+        return Vec::new();
+    }
+    with_conn(|conn| events_on_conn(conn, date)).unwrap_or_else(|e| {
+        tracing::error!("fleet: failed to load events for {}: {}", date, e);
+        Vec::new()
+    })
+}
+
 // ── Engaged-time coverage ───────────────────────────────────────────────────
 
 /// Upsert one day's engaged-seconds total. Guarded on `>`: within a day the

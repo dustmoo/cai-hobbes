@@ -46,6 +46,7 @@ pub mod briefs;
 pub mod events;
 pub mod mention;
 pub mod reconcile;
+pub mod replay;
 pub mod hooks_config;
 pub mod server;
 pub mod store;

@@ -104,6 +104,17 @@ pub fn report_with_brief(
     }
     let ev = to_event(session_id, &signal);
     let now = Utc::now();
+    // Chat events land in `fleet_events` too — skipping the high-volume
+    // Activity heartbeat, mirroring the listener — so intra-day replays
+    // (the boost ribbon) see Hobbes tabs beside external sessions.
+    if !matches!(ev, FleetEvent::ToolActivity { .. }) {
+        let body = serde_json::json!({
+            "session_id": ev.session_id(),
+            "origin": "hobbes",
+            "name": name,
+        });
+        store::append_event(ev.session_id(), ev.event_name(), &body.to_string());
+    }
     let is_final = matches!(signal, HobbesSignal::Closed);
     let brief = summary_json
         .filter(|_| matches!(signal, HobbesSignal::TurnCompleted | HobbesSignal::Closed))
