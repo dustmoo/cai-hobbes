@@ -27,7 +27,10 @@
 //! that proves the turn ran until then (`Stop`, `Notification`,
 //! `PermissionRequest`). Closes without such evidence — `SessionEnd`, a
 //! superseding `SessionStart`, or aggregation over a span that never closed —
-//! are capped at [`STALENESS_MINUTES`] past the last event, so one abandoned
+//! are capped at the session's provable window past the last event —
+//! [`STALENESS_MINUTES`] for a foreground turn, [`BACKGROUND_STALENESS_MINUTES`]
+//! for a background phase (silent by design; its quiet stretch is real agent
+//! work and accrues live, feeding the exocortex numerator) — so one abandoned
 //! terminal can't bank hours. The staleness sweep only flips display status
 //! to Idle; it deliberately does NOT close the span, because a long tool-less
 //! turn emits no events between start and stop and would otherwise lose real
@@ -277,15 +280,33 @@ impl FleetSession {
             .saturating_add(self.day_seconds.get(&date).copied().unwrap_or(0))
     }
 
+    /// How far past the last event this session's open span stays provable.
+    /// Background phases are silent by design (their jobs emit nothing until
+    /// they finish), so they get the long window — the same trade the
+    /// staleness sweep makes for display status.
+    fn provable_window_minutes(&self) -> i64 {
+        if self.status == FleetStatus::WorkingBackground {
+            BACKGROUND_STALENESS_MINUTES
+        } else {
+            STALENESS_MINUTES
+        }
+    }
+
+    /// The latest instant this session's open span may extend to without a
+    /// proving event.
+    fn provable_end(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now.min(self.last_event_at + chrono::Duration::minutes(self.provable_window_minutes()))
+    }
+
     /// Banked + live-span minutes attributable to local day `date` as of
     /// `now` (summed in seconds, floored once at the end — twenty 45-second
-    /// turns are 15 minutes, not zero). The live span is capped at
-    /// [`STALENESS_MINUTES`] past the last event — an unclosed span never
-    /// banks more than the staleness window beyond its last proof of life.
+    /// turns are 15 minutes, not zero). The live span is capped at the
+    /// session's provable window past the last event — an unclosed span
+    /// never banks more than that window beyond its last proof of life.
     pub fn minutes_on(&self, date: NaiveDate, now: DateTime<Utc>) -> u32 {
         let live = match self.working_since {
             Some(since) => {
-                let end = capped_span_end(now, self.last_event_at);
+                let end = self.provable_end(now);
                 span_seconds_on(since, end, date)
             }
             None => 0,
@@ -381,11 +402,6 @@ pub fn truncate_summary(s: &str, max_chars: usize) -> String {
 
 // ── Span math (UTC storage, local-day split) ────────────────────────────────
 
-/// The latest instant an unproven span may extend to.
-fn capped_span_end(now: DateTime<Utc>, last_event_at: DateTime<Utc>) -> DateTime<Utc> {
-    now.min(last_event_at + chrono::Duration::minutes(STALENESS_MINUTES))
-}
-
 /// UTC bounds of a **local** calendar day (same convention as
 /// `todo::model`'s day math).
 pub(crate) fn local_day_bounds_utc(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
@@ -478,9 +494,13 @@ pub fn reduce_with_prompt(
 
     // Span closes: full credit when the event proves the turn ran until now,
     // capped when it doesn't (see module docs).
+    // Unproven closes cap at the session's provable window — status-aware,
+    // so a background phase's quiet stretch (real work, silent by design)
+    // banks when the user's PromptSubmit or a resume closes it, while an
+    // abandoned foreground turn still caps at the short window.
     let close_span = |session: &mut FleetSession, proven_end: Option<DateTime<Utc>>| {
         if let Some(since) = session.working_since.take() {
-            let end = proven_end.unwrap_or_else(|| capped_span_end(now, session.last_event_at));
+            let end = proven_end.unwrap_or_else(|| session.provable_end(now));
             bank_span(&mut session.day_seconds, since, end);
         }
     };
@@ -830,9 +850,10 @@ pub fn fleet_agent_minutes_on(state: &FleetState, date: NaiveDate, now: DateTime
 
 /// Is this session accruing engaged time right now? An open span counts
 /// only while its provable end keeps up with the clock — a span the
-/// staleness cap has left behind is open in name only.
+/// staleness cap has left behind is open in name only. Background phases
+/// keep up through their long window: a silent benchmark is agent work.
 fn session_accruing(s: &FleetSession, now: DateTime<Utc>) -> bool {
-    s.working_since.is_some() && capped_span_end(now, s.last_event_at) >= now
+    s.working_since.is_some() && s.provable_end(now) >= now
 }
 
 /// Maintain the engaged-time union. Call after any state change (reduce,
@@ -853,7 +874,7 @@ pub fn sync_coverage(state: &mut FleetState, now: DateTime<Utc>) -> Vec<(NaiveDa
             let end = state
                 .sessions
                 .values()
-                .map(|s| capped_span_end(now, s.last_event_at))
+                .map(|s| s.provable_end(now))
                 .max()
                 .unwrap_or(now)
                 .clamp(since, now);
@@ -1971,7 +1992,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_submit_caps_a_stale_background_span() {
+    fn background_quiet_time_credits_live_and_caps_at_the_long_window() {
         let mut state = FleetState::default();
         let day = date("2026-08-25");
         reduce(&mut state, &start("s1"), local_at(day, 9, 0));
@@ -1980,8 +2001,11 @@ mod tests {
             &FleetEvent::Stop { session_id: "s1".into(), cwd: String::new(), background_tasks: 1 },
             local_at(day, 9, 10),
         );
-        // Background work went quiet; the user comes back two hours later.
-        // The stale open span banks capped — the idle gap is never credited.
+        // A silent two-hour background stretch is real agent work: it shows
+        // live (the exocortex numerator keeps up) and banks in full when the
+        // user's return closes the span.
+        let s = &state.sessions["s1"];
+        assert_eq!(s.minutes_on(day, local_at(day, 11, 0)), 120, "quiet background accrues live");
         let t_return = local_at(day, 11, 10);
         reduce(
             &mut state,
@@ -1993,8 +2017,33 @@ mod tests {
         assert_eq!(s.working_since, Some(t_return));
         assert_eq!(
             s.banked_seconds_on(day),
-            (10 + STALENESS_MINUTES as u32) * 60,
-            "10 proven + capped background tail, no idle-gap credit"
+            (10 + 120) * 60,
+            "10 proven + the full background stretch"
+        );
+    }
+
+    #[test]
+    fn background_span_still_caps_past_the_long_window() {
+        let mut state = FleetState::default();
+        let day = date("2026-08-25");
+        reduce(&mut state, &start("s1"), local_at(day, 8, 0));
+        reduce(
+            &mut state,
+            &FleetEvent::Stop { session_id: "s1".into(), cwd: String::new(), background_tasks: 1 },
+            local_at(day, 8, 10),
+        );
+        // Six silent hours: only the long window past the last event is
+        // provable — a killed terminal can't bank the whole afternoon.
+        let t_return = local_at(day, 14, 10);
+        reduce(
+            &mut state,
+            &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: String::new() },
+            t_return,
+        );
+        assert_eq!(
+            state.sessions["s1"].banked_seconds_on(day),
+            (10 + BACKGROUND_STALENESS_MINUTES as u32) * 60,
+            "10 proven + the capped background tail"
         );
     }
 
