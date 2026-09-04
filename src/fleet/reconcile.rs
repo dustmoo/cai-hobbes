@@ -13,7 +13,10 @@
 use chrono::{DateTime, Utc};
 
 use super::transcript;
-use super::{FleetOrigin, FleetSession, FleetShared, FleetStatus, STALENESS_MINUTES};
+use super::{
+    FleetOrigin, FleetSession, FleetShared, FleetStatus, BACKGROUND_STALENESS_MINUTES,
+    STALENESS_MINUTES,
+};
 
 /// What reconciliation decided for one session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,10 +39,16 @@ pub fn reconcile_verdict(
     match status {
         FleetStatus::Working | FleetStatus::WorkingBackground => {
             // Working with a transcript that hasn't moved in over the
-            // staleness window: the Stop was lost.
+            // staleness window: the Stop was lost. Background phases get the
+            // long window — their jobs write nothing until they finish, so a
+            // still transcript is their normal state, not a lost Stop.
+            let window = if *status == FleetStatus::WorkingBackground {
+                BACKGROUND_STALENESS_MINUTES
+            } else {
+                STALENESS_MINUTES
+            };
             let mtime = transcript_mtime?;
-            (now - mtime > chrono::Duration::minutes(STALENESS_MINUTES))
-                .then_some(Correction::Idle)
+            (now - mtime > chrono::Duration::minutes(window)).then_some(Correction::Idle)
         }
         FleetStatus::NeedsAttention(_) => {
             // The user typed after the alert was raised → they answered it.
@@ -199,6 +208,19 @@ mod tests {
         );
         // Working + unreadable transcript → no verdict (never guess).
         assert_eq!(reconcile_verdict(&FleetStatus::Working, None, None, None, now), None);
+
+        // Background phase + transcript still for an hour → hold: its jobs
+        // write nothing until they finish, so stillness proves nothing.
+        assert_eq!(
+            reconcile_verdict(&FleetStatus::WorkingBackground, None, Some(old), None, now),
+            None
+        );
+        // Background phase still past even the long window → lost end.
+        let ancient = now - chrono::Duration::minutes(BACKGROUND_STALENESS_MINUTES + 1);
+        assert_eq!(
+            reconcile_verdict(&FleetStatus::WorkingBackground, None, Some(ancient), None, now),
+            Some(Correction::Idle)
+        );
 
         // Attention + user typed AFTER the alert → clear.
         let alert = utc("2026-09-03T11:30:00Z");

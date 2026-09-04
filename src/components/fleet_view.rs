@@ -44,6 +44,22 @@ fn status_chip(status: &FleetStatus) -> (&'static str, &'static str) {
     }
 }
 
+/// Visible label for a background phase — the one state where a silent dot
+/// misleads (silence is its normal operating mode). Past the foreground
+/// staleness window the quiet age is spelled out, so "silently crunching"
+/// and "actively heartbeating" read differently at a glance.
+fn background_label(status: &FleetStatus, last_event_at: DateTime<Utc>, now: DateTime<Utc>) -> Option<String> {
+    if *status != FleetStatus::WorkingBackground {
+        return None;
+    }
+    let quiet_min = (now - last_event_at).num_minutes();
+    if quiet_min > fleet::STALENESS_MINUTES {
+        Some(format!("background · quiet {quiet_min}m"))
+    } else {
+        Some("background".to_string())
+    }
+}
+
 /// Needs-attention first, then most recent activity.
 fn sorted_sessions(state: &fleet::FleetState) -> Vec<FleetSession> {
     let mut sessions: Vec<FleetSession> = state.sessions.values().cloned().collect();
@@ -631,6 +647,15 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                             style: "background-color: {chip_color};",
                             title: "{chip_label}",
                         }
+                        // Background phases are silent by design — a bare
+                        // dot reads as idle, so this one state gets words.
+                        if let Some(label) = background_label(&session.status, session.last_event_at, now) {
+                            span {
+                                class: "shrink-0 text-[10px] text-fg-muted",
+                                style: "color: {chip_color};",
+                                { label }
+                            }
+                        }
                     }
                     // Project leads the subtitle so truncation eats the
                     // path, never the tag.
@@ -703,17 +728,16 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                                 }
                             }
                         }
+                        // Hidden while a turn or background phase runs: a
+                        // session doing work is not blocked-waiting on the
+                        // user, whatever an older brief believed.
                         if let Some(blocked) = &brief.blocked_on {
-                            // Dim while a turn is running: the blocker was
-                            // written before this turn and is under re-test.
-                            p {
-                                class: "text-xs",
-                                style: if turn_running {
-                                    "color: #f59e0b; opacity: 0.55;"
-                                } else {
-                                    "color: #f59e0b;"
-                                },
-                                { format!("blocked: {}", fleet::truncate_summary(blocked, 100)) }
+                            if !turn_running {
+                                p {
+                                    class: "text-xs",
+                                    style: "color: #f59e0b;",
+                                    { format!("blocked: {}", fleet::truncate_summary(blocked, 100)) }
+                                }
                             }
                         }
                     }
@@ -806,6 +830,23 @@ mod tests {
         assert_eq!(age_label(now - chrono::Duration::minutes(3), now), "3m ago");
         assert_eq!(age_label(now - chrono::Duration::hours(5), now), "5h ago");
         assert_eq!(age_label(now - chrono::Duration::days(2), now), "2d ago");
+    }
+
+    #[test]
+    fn background_label_spells_out_quiet_age() {
+        let now = utc("2026-09-04T12:00:00Z");
+        let fresh = now - chrono::Duration::minutes(2);
+        let quiet = now - chrono::Duration::minutes(25);
+        assert_eq!(
+            background_label(&FleetStatus::WorkingBackground, fresh, now).as_deref(),
+            Some("background")
+        );
+        assert_eq!(
+            background_label(&FleetStatus::WorkingBackground, quiet, now).as_deref(),
+            Some("background · quiet 25m")
+        );
+        assert_eq!(background_label(&FleetStatus::Working, quiet, now), None);
+        assert_eq!(background_label(&FleetStatus::Idle, quiet, now), None);
     }
 
     #[test]

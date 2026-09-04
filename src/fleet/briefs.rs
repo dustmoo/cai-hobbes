@@ -10,7 +10,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{truncate_summary, FleetSession, FleetState, SessionBrief};
+use super::{truncate_summary, FleetSession, FleetState, FleetStatus, SessionBrief};
 
 /// A Stop marks the session dirty; the brief generates once the session has
 /// been quiet this long (SessionEnd rows skip the wait). Coalesces the
@@ -36,6 +36,10 @@ pub struct BriefTask {
     /// Title of the todo linked to this session, when one is — the brief
     /// prompt assesses progress against it.
     pub linked_todo: Option<String>,
+    /// The session had background work running when this task was collected
+    /// — the prompt is told, so the model stops resurrecting blockers the
+    /// running work has already moved past.
+    pub background_active: bool,
 }
 
 /// Debounce decision for one session.
@@ -75,6 +79,7 @@ pub fn collect_due(
                 .iter()
                 .find(|(sid, _)| sid == &s.id)
                 .map(|(_, title)| title.clone()),
+            background_active: s.status == FleetStatus::WorkingBackground,
         })
     };
     let mut tasks: Vec<BriefTask> = ended_rows
@@ -118,6 +123,13 @@ pub fn brief_framing(
             )
         })
         .unwrap_or_default();
+    let background = if task.background_active {
+        " This session currently has background work RUNNING (a shell or \
+         monitor it launched itself) — it is not blocked or waiting on the \
+         user; do not list what that work waits on as a blocker."
+    } else {
+        ""
+    };
     let framed = format!(
         "You are writing a re-entry brief for a Claude Code coding-agent session \
          in project '{}' ({}). Below is the tail of its transcript ({} recent \
@@ -127,8 +139,8 @@ pub fn brief_framing(
          blocked or awaiting the user into entities.blockers — but ONLY if \
          the most recent turns still show it unresolved; a question the user \
          has since answered is not a blocker. Do not invent \
-         work that is not shown in the transcript.{}\n--- transcript ---\n{}",
-        task.name, task.cwd, digest.turn_count, tracked, digest.text
+         work that is not shown in the transcript.{}{}\n--- transcript ---\n{}",
+        task.name, task.cwd, digest.turn_count, tracked, background, digest.text
     );
     (previous, framed)
 }
@@ -524,6 +536,7 @@ mod tests {
         s.transcript_path = Some("/t/s1.jsonl".into());
         s.brief_dirty_at = Some(utc("2026-09-01T10:00:00Z"));
         s.brief = Some(brief_at("2026-09-01T09:00:00Z"));
+        s.status = FleetStatus::WorkingBackground;
         let task = collect_due(
             &FleetState {
                 sessions: [("s1".to_string(), s)].into_iter().collect(),
@@ -548,6 +561,10 @@ mod tests {
         assert!(
             framed.contains("tracked task") && framed.contains("Ship the briefs"),
             "linked todo rides the framing"
+        );
+        assert!(
+            task.background_active && framed.contains("background work RUNNING"),
+            "a live background phase is declared to the model"
         );
     }
 

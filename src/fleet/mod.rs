@@ -60,6 +60,16 @@ use events::FleetEvent;
 /// Idle, and unproven span tails are capped at this length.
 pub const STALENESS_MINUTES: i64 = 10;
 
+/// The staleness window for `WorkingBackground` sessions. Background jobs
+/// (a long benchmark shell, a monitor with an hour-long timeout) emit no
+/// hook events and never touch the transcript until they finish — silence
+/// is their normal operating state, not evidence of death. The generous
+/// window covers multi-hour runs; the cost is that a hard-killed terminal
+/// (no `SessionEnd`) mid-background-phase shows "background agents" for up
+/// to this long before idling. Time accounting is unaffected either way:
+/// span credit is capped at [`STALENESS_MINUTES`] past the last proof.
+pub const BACKGROUND_STALENESS_MINUTES: i64 = 240;
+
 /// Default minutes of idle silence before a session retires off the live
 /// board (ended_at = its last event; history and banked time stay in the DB,
 /// and any later event resurrects it — see the revival path in
@@ -737,17 +747,19 @@ pub fn resolve_gate_in_state(
 }
 
 /// Staleness sweep: Working sessions silent for over [`STALENESS_MINUTES`]
-/// show as Idle. The open span is deliberately kept (module docs) — display
-/// math caps it, and a later `Stop` restores full credit.
+/// show as Idle; `WorkingBackground` sessions get
+/// [`BACKGROUND_STALENESS_MINUTES`] — background jobs are silent by design.
+/// The open span is deliberately kept (module docs) — display math caps it,
+/// and a later `Stop` restores full credit.
 pub fn sweep_stale(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSession> {
-    let cutoff = now - chrono::Duration::minutes(STALENESS_MINUTES);
     let mut changed = Vec::new();
     for session in state.sessions.values_mut() {
-        if matches!(
-            session.status,
-            FleetStatus::Working | FleetStatus::WorkingBackground
-        ) && session.last_event_at < cutoff
-        {
+        let window = match session.status {
+            FleetStatus::Working => STALENESS_MINUTES,
+            FleetStatus::WorkingBackground => BACKGROUND_STALENESS_MINUTES,
+            _ => continue,
+        };
+        if session.last_event_at < now - chrono::Duration::minutes(window) {
             session.status = FleetStatus::Idle;
             changed.push(session.clone());
         }
@@ -1395,6 +1407,32 @@ mod tests {
         reduce(&mut state, &stop("s1"), stop_at);
         let day = now.with_timezone(&Local).date_naive();
         assert_eq!(state.sessions["s1"].minutes_on(day, stop_at), 30);
+    }
+
+    #[test]
+    fn sweep_gives_background_phases_the_long_staleness_window() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T09:00:00Z");
+        reduce(&mut state, &start("s1"), t0);
+        // Turn ends with a long-running background shell: WorkingBackground.
+        reduce(
+            &mut state,
+            &FleetEvent::Stop { session_id: "s1".into(), cwd: String::new(), background_tasks: 1 },
+            t0 + chrono::Duration::minutes(5),
+        );
+        assert_eq!(state.sessions["s1"].status, FleetStatus::WorkingBackground);
+
+        // 30 quiet minutes — well past the foreground window — is normal
+        // for a background job: the sweep must not demote it.
+        let quiet = t0 + chrono::Duration::minutes(35);
+        assert!(sweep_stale(&mut state, quiet).is_empty());
+        assert_eq!(state.sessions["s1"].status, FleetStatus::WorkingBackground);
+
+        // Past the background window it finally idles.
+        let long_gone = t0 + chrono::Duration::minutes(5 + BACKGROUND_STALENESS_MINUTES + 1);
+        let changed = sweep_stale(&mut state, long_gone);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(state.sessions["s1"].status, FleetStatus::Idle);
     }
 
     #[test]
