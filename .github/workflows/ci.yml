@@ -45,7 +45,11 @@ jobs:
         #   wayland-scanner (Linux build-time codegen of trusted wayland
         #   protocol XML; not attacker-reachable). Its latest release still
         #   pins ^0.39 — drop these when wayland-scanner moves to >=0.41.
-        cargo audit --ignore RUSTSEC-2026-0189 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+        # RUSTSEC-2026-0257: webbrowser BROWSER-env argument injection. Fix
+        #   is webbrowser >=1.2.2 but dioxus-desktop 0.6 pins ^0.8; exploit
+        #   requires an attacker-controlled BROWSER env var on the user's
+        #   own machine (local desktop app). Drop on the Dioxus 0.7 upgrade.
+        cargo audit --ignore RUSTSEC-2026-0189 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0257
 
   # Cross-platform build check (fast, no tests or full build)
   build-check:
