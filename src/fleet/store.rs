@@ -40,8 +40,17 @@ const MIGRATION_V1: &str = "
     CREATE INDEX IF NOT EXISTS idx_fleet_events_session ON fleet_events(session_id, created_at);
 ";
 
+/// Engaged-time union per local day (the exocortex denominator). Seconds
+/// only ever grow within a day, so writes guard on `>` instead of a seq.
+const MIGRATION_V2: &str = "
+    CREATE TABLE IF NOT EXISTS fleet_coverage (
+        date    TEXT PRIMARY KEY,
+        seconds INTEGER NOT NULL
+    );
+";
+
 /// Ordered migrations. Append only — never edit a shipped entry.
-const MIGRATIONS: &[(i32, &str)] = &[(1, MIGRATION_V1)];
+const MIGRATIONS: &[(i32, &str)] = &[(1, MIGRATION_V1), (2, MIGRATION_V2)];
 
 /// Create the fleet schema / apply pending migrations. Called from
 /// `session_store::create_schema`, so real startup and every in-memory test
@@ -257,30 +266,36 @@ pub fn merge_session_conn(
     Ok(true)
 }
 
-/// Timestamp of the first fleet event on local day `date` — the clock-time
-/// anchor for the exocortex multiplier. (Hobbes-tab activity doesn't append
-/// events; on a terminal-quiet day this can be None even with agent minutes.)
-pub fn first_event_on_conn(
+// ── Engaged-time coverage ───────────────────────────────────────────────────
+
+/// Upsert one day's engaged-seconds total. Guarded on `>`: within a day the
+/// union only grows, so a stale in-memory total can never clobber a bigger
+/// persisted one (mirrors the seq guard on session rows).
+pub fn save_coverage_conn(
     conn: &Connection,
     date: chrono::NaiveDate,
-) -> rusqlite::Result<Option<chrono::DateTime<chrono::Utc>>> {
-    let (start, end) = crate::fleet::local_day_bounds_utc(date);
-    let ts: Option<String> = conn
-        .query_row(
-            "SELECT MIN(created_at) FROM fleet_events WHERE created_at >= ?1 AND created_at < ?2",
-            params![fmt_ts(&start), fmt_ts(&end)],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    Ok(ts.and_then(|t| t.parse().ok()))
+    seconds: u32,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO fleet_coverage (date, seconds) VALUES (?1, ?2)
+         ON CONFLICT(date) DO UPDATE SET seconds = excluded.seconds
+         WHERE excluded.seconds > fleet_coverage.seconds",
+        params![date.to_string(), seconds],
+    )?;
+    Ok(())
 }
 
-pub fn first_event_on(date: chrono::NaiveDate) -> Option<chrono::DateTime<chrono::Utc>> {
-    if !is_available() {
-        return None;
-    }
-    with_conn(|conn| first_event_on_conn(conn, date)).unwrap_or(None)
+pub fn load_coverage_conn(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(chrono::NaiveDate, u32)>> {
+    let mut stmt = conn.prepare("SELECT date, seconds FROM fleet_coverage")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?))
+    })?;
+    Ok(rows
+        .filter_map(|r| r.ok())
+        .filter_map(|(d, s)| d.parse().ok().map(|d| (d, s)))
+        .collect())
 }
 
 // ── Events ──────────────────────────────────────────────────────────────────
@@ -345,6 +360,27 @@ pub fn load_live() -> Vec<FleetSession> {
     }
     with_conn(load_live_conn).unwrap_or_else(|e| {
         tracing::error!("fleet: failed to load live sessions: {}", e);
+        Vec::new()
+    })
+}
+
+pub fn save_coverage(days: &[(chrono::NaiveDate, u32)]) {
+    if !is_available() || days.is_empty() {
+        return;
+    }
+    for (date, seconds) in days {
+        if let Err(e) = with_conn(|conn| save_coverage_conn(conn, *date, *seconds)) {
+            tracing::error!("fleet: failed to persist coverage for {}: {}", date, e);
+        }
+    }
+}
+
+pub fn load_coverage() -> Vec<(chrono::NaiveDate, u32)> {
+    if !is_available() {
+        return Vec::new();
+    }
+    with_conn(load_coverage_conn).unwrap_or_else(|e| {
+        tracing::error!("fleet: failed to load coverage: {}", e);
         Vec::new()
     })
 }
@@ -523,6 +559,20 @@ mod tests {
     }
 
     #[test]
+    fn coverage_round_trips_and_never_shrinks() {
+        with_db(|conn| {
+            let day = date("2026-09-04");
+            save_coverage_conn(conn, day, 2400).unwrap();
+            save_coverage_conn(conn, day, 1200).unwrap(); // stale total ignored
+            save_coverage_conn(conn, day, 3000).unwrap();
+            save_coverage_conn(conn, date("2026-09-03"), 600).unwrap();
+            let mut rows = load_coverage_conn(conn).unwrap();
+            rows.sort();
+            assert_eq!(rows, vec![(date("2026-09-03"), 600), (day, 3000)]);
+        });
+    }
+
+    #[test]
     fn migration_is_recorded_and_idempotent() {
         with_db(|conn| {
             let version: i32 = conn
@@ -564,7 +614,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(fleet_v, 1);
+        assert_eq!(fleet_v, MIGRATIONS.last().unwrap().0);
         // The todo domain's version is untouched by the fleet migration.
         let todo_v: i32 = conn
             .query_row(

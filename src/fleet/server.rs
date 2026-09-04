@@ -122,6 +122,10 @@ pub async fn start(shared: Arc<FleetShared>, cfg: FleetServerConfig) -> Result<F
                             let mut state = shared.state.lock().expect("fleet state lock poisoned");
                             let mut changed = sweep_stale(&mut state, now);
                             changed.extend(crate::fleet::sweep_retired(&mut state, now));
+                            // Time passing (not just events) can end an
+                            // engaged period — this tick is what closes
+                            // coverage after a silent walk-away.
+                            store::save_coverage(&crate::fleet::sync_coverage(&mut state, now));
                             changed
                         };
                         if !changed.is_empty() {
@@ -302,6 +306,7 @@ async fn handle(
             now,
         );
         store::persist_sessions(&changed);
+        store::save_coverage(&crate::fleet::sync_coverage(&mut state, now));
         state
             .sessions
             .get(event.session_id())

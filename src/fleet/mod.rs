@@ -289,6 +289,14 @@ impl FleetSession {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FleetState {
     pub sessions: HashMap<String, FleetSession>,
+    /// Banked "engaged" wall-clock seconds per local day: the union of time
+    /// when at least one session was provably working. This is the exocortex
+    /// denominator — overlapping agents bank once here while each banks its
+    /// own `day_seconds`, which is exactly what makes the ratio read as
+    /// "how many of you the fleet is while you're driving it".
+    pub coverage_seconds: BTreeMap<NaiveDate, u32>,
+    /// Open engaged period, if any session is currently accruing.
+    pub coverage_open: Option<DateTime<Utc>>,
 }
 
 impl FleetState {
@@ -796,25 +804,79 @@ pub fn fleet_agent_minutes_on(state: &FleetState, date: NaiveDate, now: DateTime
     live_minutes_on(state, date, now).saturating_add(store::ended_minutes_on(date))
 }
 
-/// The exocortex multiplier: agent minutes banked today over clock minutes
-/// elapsed since the fleet's first observed activity today. Parallel
-/// sessions are what push it above 1×. Returns `(multiplier,
-/// elapsed_minutes)`; `None` when there's nothing meaningful to divide
-/// (no activity, or under 5 elapsed minutes — a fresh day would show a
+/// Is this session accruing engaged time right now? An open span counts
+/// only while its provable end keeps up with the clock — a span the
+/// staleness cap has left behind is open in name only.
+fn session_accruing(s: &FleetSession, now: DateTime<Utc>) -> bool {
+    s.working_since.is_some() && capped_span_end(now, s.last_event_at) >= now
+}
+
+/// Maintain the engaged-time union. Call after any state change (reduce,
+/// sweeps) — NOT time-critical: a missed call only delays a transition
+/// until the next event or sweep tick. Returns the `(day, total_seconds)`
+/// rows that were banked and should be persisted (empty on most calls).
+pub fn sync_coverage(state: &mut FleetState, now: DateTime<Utc>) -> Vec<(NaiveDate, u32)> {
+    let accruing = state.sessions.values().any(|s| session_accruing(s, now));
+    match (state.coverage_open, accruing) {
+        (None, true) => {
+            state.coverage_open = Some(now);
+            Vec::new()
+        }
+        (Some(since), false) => {
+            // The engaged period ends at the latest provable activity, not
+            // at the sweep tick that noticed it — a walk-away must not bank
+            // the walk.
+            let end = state
+                .sessions
+                .values()
+                .map(|s| capped_span_end(now, s.last_event_at))
+                .max()
+                .unwrap_or(now)
+                .clamp(since, now);
+            state.coverage_open = None;
+            bank_span(&mut state.coverage_seconds, since, end);
+            let mut day = since.with_timezone(&Local).date_naive();
+            let last = end.with_timezone(&Local).date_naive();
+            let mut banked = Vec::new();
+            while day <= last {
+                if let Some(total) = state.coverage_seconds.get(&day) {
+                    banked.push((day, *total));
+                }
+                let Some(next) = day.succ_opt() else { break };
+                day = next;
+            }
+            banked
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Engaged wall-clock seconds on a local day: banked union plus the live
+/// tail of an open engaged period.
+pub fn engaged_seconds_on(state: &FleetState, date: NaiveDate, now: DateTime<Utc>) -> u32 {
+    let banked = state.coverage_seconds.get(&date).copied().unwrap_or(0);
+    let open = state
+        .coverage_open
+        .map(|since| span_seconds_on(since, now, date))
+        .unwrap_or(0);
+    banked.saturating_add(open)
+}
+
+/// The exocortex multiplier: agent minutes banked today over ENGAGED
+/// wall-clock minutes — time when at least one agent was actually working.
+/// This is average concurrency while driving the fleet ("3 agents for an
+/// hour = 3×"), so it holds steady through planning, breaks, and walks
+/// instead of decaying like a momentum score. Returns `(multiplier,
+/// engaged_minutes)`; `None` when there's nothing meaningful to divide
+/// (no work yet, or under 5 engaged minutes — a fresh day would show a
 /// silly spike otherwise).
-pub fn exocortex_multiplier(
-    agent_minutes: u32,
-    first_event_today: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> Option<(f64, u32)> {
-    let first = first_event_today?;
-    let elapsed_min = (now - first).num_minutes();
-    if agent_minutes == 0 || elapsed_min < 5 {
+pub fn exocortex_multiplier(agent_minutes: u32, engaged_minutes: u32) -> Option<(f64, u32)> {
+    if agent_minutes == 0 || engaged_minutes < 5 {
         return None;
     }
     Some((
-        agent_minutes as f64 / elapsed_min as f64,
-        elapsed_min as u32,
+        agent_minutes as f64 / engaged_minutes as f64,
+        engaged_minutes,
     ))
 }
 
@@ -1016,13 +1078,20 @@ impl FleetShared {
     /// capped by the staleness window; the sweep idles them.
     pub fn hydrate_from_store(&self) {
         let rows = store::load_live();
-        if rows.is_empty() {
+        let coverage = store::load_coverage();
+        if rows.is_empty() && coverage.is_empty() {
             return;
         }
         {
             let mut state = self.state.lock().expect("fleet state lock poisoned");
             for row in rows {
                 state.sessions.entry(row.id.clone()).or_insert(row);
+            }
+            // Banked engaged time survives restarts; the open tail (if the
+            // process died mid-work) is lost — the next event reopens it.
+            for (day, secs) in coverage {
+                let slot = state.coverage_seconds.entry(day).or_insert(0);
+                *slot = (*slot).max(secs);
             }
         }
         self.poke();
@@ -1481,23 +1550,87 @@ mod tests {
 
     #[test]
     fn exocortex_multiplier_math_and_guards() {
-        let now = utc("2026-09-02T17:00:00Z");
-        let first = utc("2026-09-02T08:30:00Z"); // 510 elapsed minutes
-        // 8h27m agent time over 8.5h clock → ~1.0×; parallel day → >1.
-        let (m, elapsed) = exocortex_multiplier(507, Some(first), now).unwrap();
-        assert_eq!(elapsed, 510);
-        assert!((m - 0.994).abs() < 0.01);
-        let (m, _) = exocortex_multiplier(1020, Some(first), now).unwrap();
-        assert!(m > 1.9 && m < 2.1);
-        // Guards: no anchor, no minutes, or a just-started day → None.
-        assert!(exocortex_multiplier(507, None, now).is_none());
-        assert!(exocortex_multiplier(0, Some(first), now).is_none());
-        assert!(exocortex_multiplier(
-            10,
-            Some(now - chrono::Duration::minutes(3)),
-            now
-        )
-        .is_none());
+        // 3 agents driven through one engaged hour → 3×; a solo hour → 1×.
+        let (m, engaged) = exocortex_multiplier(180, 60).unwrap();
+        assert_eq!(engaged, 60);
+        assert!((m - 3.0).abs() < 0.001);
+        let (m, _) = exocortex_multiplier(60, 60).unwrap();
+        assert!((m - 1.0).abs() < 0.001);
+        // Guards: no work, or a just-started day → None.
+        assert!(exocortex_multiplier(0, 60).is_none());
+        assert!(exocortex_multiplier(10, 3).is_none());
+    }
+
+    #[test]
+    fn coverage_unions_parallel_sessions_and_skips_breaks() {
+        let mut state = FleetState::default();
+        let day = date("2026-09-04");
+        let submit = |id: &str| FleetEvent::PromptSubmit {
+            session_id: id.into(),
+            cwd: "/tmp/a".into(),
+        };
+        // s1 starts at 9:00, s2 joins at 9:10; s1 stops at 9:30, s2 at 9:40.
+        reduce(&mut state, &submit("s1"), local_at(day, 9, 0));
+        assert!(sync_coverage(&mut state, local_at(day, 9, 0)).is_empty());
+        reduce(&mut state, &submit("s2"), local_at(day, 9, 10));
+        sync_coverage(&mut state, local_at(day, 9, 10));
+        // s2 heartbeats (tool activity) — without events a span stops
+        // provably accruing after the staleness cap.
+        let beat = |state: &mut FleetState, at| {
+            reduce(
+                state,
+                &FleetEvent::ToolActivity {
+                    session_id: "s2".into(),
+                    cwd: "/tmp/a".into(),
+                    tool_name: "Bash".into(),
+                },
+                at,
+            );
+        };
+        beat(&mut state, local_at(day, 9, 20));
+        reduce(&mut state, &stop("s1"), local_at(day, 9, 30));
+        beat(&mut state, local_at(day, 9, 30));
+        // s2 still accruing → the engaged period stays open.
+        assert!(sync_coverage(&mut state, local_at(day, 9, 30)).is_empty());
+        assert!(state.coverage_open.is_some());
+        reduce(&mut state, &stop("s2"), local_at(day, 9, 40));
+        let banked = sync_coverage(&mut state, local_at(day, 9, 40));
+        // Union = 40 engaged minutes; agent time = 30 + 30 = 60 → 1.5×.
+        assert_eq!(banked, vec![(day, 2400)]);
+        let engaged = engaged_seconds_on(&state, day, local_at(day, 9, 40)) / 60;
+        let agent = live_minutes_on(&state, day, local_at(day, 9, 40));
+        assert_eq!((engaged, agent), (40, 60));
+        let (m, _) = exocortex_multiplier(agent, engaged).unwrap();
+        assert!((m - 1.5).abs() < 0.001);
+        // A long break does NOT accrue; re-engaging reopens and the live
+        // tail counts from there.
+        assert!(sync_coverage(&mut state, local_at(day, 11, 0)).is_empty());
+        reduce(&mut state, &submit("s1"), local_at(day, 12, 0));
+        sync_coverage(&mut state, local_at(day, 12, 0));
+        assert_eq!(
+            engaged_seconds_on(&state, day, local_at(day, 12, 5)),
+            2400 + 300
+        );
+    }
+
+    #[test]
+    fn coverage_walk_away_banks_only_the_provable_tail() {
+        let mut state = FleetState::default();
+        let day = date("2026-09-04");
+        reduce(
+            &mut state,
+            &FleetEvent::PromptSubmit {
+                session_id: "s1".into(),
+                cwd: "/tmp/a".into(),
+            },
+            local_at(day, 9, 0),
+        );
+        sync_coverage(&mut state, local_at(day, 9, 0));
+        // The session goes silent; the 9:30 sweep tick closes coverage at
+        // the staleness cap past the last event — not at the tick itself.
+        let banked = sync_coverage(&mut state, local_at(day, 9, 30));
+        assert_eq!(banked, vec![(day, STALENESS_MINUTES as u32 * 60)]);
+        assert!(state.coverage_open.is_none());
     }
 
     #[test]

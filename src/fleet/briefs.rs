@@ -527,6 +527,7 @@ mod tests {
         let task = collect_due(
             &FleetState {
                 sessions: [("s1".to_string(), s)].into_iter().collect(),
+                ..Default::default()
             },
             &[],
             &[("s1".to_string(), "Ship the briefs".to_string())],

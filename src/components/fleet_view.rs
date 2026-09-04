@@ -88,6 +88,7 @@ pub fn FleetView() -> Element {
         })
         .count();
     let agent_minutes = fleet::fleet_agent_minutes_on(&state, today, now);
+    let engaged_minutes = fleet::engaged_seconds_on(&state, today, now) / 60;
     let ended_today: Vec<FleetSession> = fleet::store::sessions_active_on(today)
         .into_iter()
         .filter(|r| !state.sessions.contains_key(&r.id))
@@ -157,20 +158,19 @@ pub fn FleetView() -> Element {
                         label: "agent time",
                         accent: None,
                     }
-                    // The exocortex multiplier: agent-hours per clock-hour
-                    // since the day's first activity. The whole fleet thesis
-                    // in one number — parallel agents are why it beats 1×.
-                    if let Some((mult, elapsed)) = fleet::exocortex_multiplier(
-                        agent_minutes,
-                        fleet::store::first_event_on(today),
-                        now,
-                    ) {
+                    // The exocortex multiplier: agent minutes over ENGAGED
+                    // minutes (wall-clock with ≥1 agent working) — average
+                    // concurrency while driving the fleet. Breaks, planning,
+                    // and walks don't decay it; parallel agents raise it.
+                    if let Some((mult, engaged)) =
+                        fleet::exocortex_multiplier(agent_minutes, engaged_minutes)
+                    {
                         div {
                             class: "flex items-baseline gap-1.5",
                             title: format!(
-                                "{} of agent work in {} of clock time — your exocortex multiplier",
+                                "{} of agent work across {} engaged — how many of you the fleet is while you're driving it",
                                 crate::todo::model::format_minutes(agent_minutes),
-                                crate::todo::model::format_minutes(elapsed),
+                                crate::todo::model::format_minutes(engaged),
                             ),
                             Icon {
                                 width: 14,

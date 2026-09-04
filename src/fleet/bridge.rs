@@ -139,6 +139,7 @@ pub fn report_with_brief(
         for row in changed.iter_mut() {
             patch(row);
         }
+        store::save_coverage(&super::sync_coverage(&mut state, now));
         changed
     };
     store::persist_sessions(&changed);
