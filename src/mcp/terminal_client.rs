@@ -9,10 +9,15 @@
 //! real executor arm.
 //!
 //! Concurrency shape: all PTY reads happen on a dedicated OS thread per
-//! shell, feeding an unbounded byte channel; the async side only ever awaits
-//! `tokio::time::timeout(_, rx.recv())`, so a hung command can never wedge
-//! the turn (there is no global tool timeout upstream). The reader thread
-//! holds only the channel sender — never the session Arc — so Drop runs.
+//! shell, feeding a CAPPED ring buffer ([`RING_CAP_BYTES`]); the async side
+//! only ever awaits `tokio::time::timeout(_, notify.notified())`, so a hung
+//! command can never wedge the turn (there is no global tool timeout
+//! upstream). Every buffer on this path is bounded — the ring, the async
+//! accumulator ([`ACC_CAP_BYTES`]), and the carry saved across a timeout —
+//! because the MCP dispatch awaits on the Dioxus main-thread executor: a
+//! chatty long-running command must cost O(cap) memory and per-chunk CPU,
+//! never O(total output). The reader thread holds only the ring Arc — never
+//! the session Arc — so Drop runs.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -25,6 +30,14 @@ pub const HOBBES_TERMINAL_SERVER: &str = "hobbes-terminal";
 
 /// Output kept per command (the tail survives; a marker notes truncation).
 const OUTPUT_CAP_BYTES: usize = 100 * 1024;
+/// Reader-side ring cap: bounds memory while NOBODY is reading (a command
+/// printing for minutes between TAIL calls). Must comfortably exceed the
+/// accumulator cap so the sentinel tail always survives.
+const RING_CAP_BYTES: usize = 512 * 1024;
+/// Async-side accumulator cap: bounds the per-chunk sentinel scan (which
+/// walks the whole accumulation) and the final `clean_output` input. Output
+/// cap plus slack so the truncation marker, not the trim, decides display.
+const ACC_CAP_BYTES: usize = OUTPUT_CAP_BYTES + 8 * 1024;
 const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 30;
 const MAX_EXEC_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_TAIL_TIMEOUT_SECS: u64 = 5;
@@ -45,6 +58,20 @@ pub struct TerminalCtx {
 struct RunningCmd {
     sentinel: String,
     command: String,
+    /// Output already drained from the ring when a read timed out — seeds the
+    /// next TAIL's accumulator so partial output isn't silently dropped.
+    carry: Vec<u8>,
+    /// The carry was front-trimmed at some point — survives across TAILs so
+    /// the eventual output is marked truncated.
+    carry_trimmed: bool,
+}
+
+/// Reader-thread → async-side handoff: a capped byte ring plus a wake
+/// signal. The reader appends and trims under the (never-awaited) lock.
+#[derive(Default)]
+struct OutputRing {
+    buf: Vec<u8>,
+    closed: bool,
 }
 
 struct PtySession {
@@ -52,8 +79,40 @@ struct PtySession {
     child: std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     /// Kept alive for the pty's lifetime; dropping it hangs up the shell.
     _master: std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>,
-    output_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    ring: Arc<(std::sync::Mutex<OutputRing>, tokio::sync::Notify)>,
     running: std::sync::Mutex<Option<RunningCmd>>,
+}
+
+/// One `read_until_sentinel` outcome: the command finished, or the deadline
+/// hit first (the drained-so-far bytes ride along as the carry). The bool is
+/// "the accumulator was front-trimmed": display length alone can't detect it
+/// (ANSI/CR stripping shrinks the text back under the cap), so the trim
+/// reports itself.
+enum ReadOutcome {
+    Done(String, i32, bool),
+    Pending(Vec<u8>, bool),
+}
+
+/// Keep only the last `cap` bytes; reports whether anything was dropped.
+fn trim_front(buf: &mut Vec<u8>, cap: usize) -> bool {
+    if buf.len() > cap {
+        buf.drain(..buf.len() - cap);
+        true
+    } else {
+        false
+    }
+}
+
+/// Display shaping shared by EXEC and TAIL: clean, cap, and make sure a
+/// front-trimmed accumulation is marked even when the cleaned text no longer
+/// exceeds the display cap.
+fn shape_output(output: &str, was_trimmed: bool) -> String {
+    let cleaned = clean_output(output, OUTPUT_CAP_BYTES);
+    if was_trimmed && !cleaned.starts_with("[output truncated") {
+        format!("[output truncated — showing the tail]\n{cleaned}")
+    } else {
+        cleaned
+    }
 }
 
 impl Drop for PtySession {
@@ -178,16 +237,32 @@ fn spawn_shell(cwd: &str) -> Result<PtySession, String> {
         .take_writer()
         .map_err(|e| format!("pty writer: {e}"))?;
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let ring = Arc::new((
+        std::sync::Mutex::new(OutputRing::default()),
+        tokio::sync::Notify::new(),
+    ));
+    let ring_writer = ring.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
             match std::io::Read::read(&mut reader, &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
-                        break;
+                Ok(0) | Err(_) => {
+                    let (lock, notify) = &*ring_writer;
+                    if let Ok(mut r) = lock.lock() {
+                        r.closed = true;
                     }
+                    notify.notify_one();
+                    break;
+                }
+                Ok(n) => {
+                    let (lock, notify) = &*ring_writer;
+                    let Ok(mut r) = lock.lock() else { break };
+                    r.buf.extend_from_slice(&buf[..n]);
+                    // The cap bounds idle-time growth; a command's middle can
+                    // be lost, its tail (where the sentinel lands) cannot.
+                    let _ = trim_front(&mut r.buf, RING_CAP_BYTES);
+                    drop(r);
+                    notify.notify_one();
                 }
             }
         }
@@ -197,7 +272,7 @@ fn spawn_shell(cwd: &str) -> Result<PtySession, String> {
         writer: std::sync::Mutex::new(writer),
         child: std::sync::Mutex::new(child),
         _master: std::sync::Mutex::new(pair.master),
-        output_rx: tokio::sync::Mutex::new(rx),
+        ring,
         running: std::sync::Mutex::new(None),
     };
 
@@ -325,14 +400,18 @@ impl TerminalClient {
         session.write_line(&format!("{wrapped}\nprintf '\\n{sentinel} %d\\n' $?"))?;
 
         match self
-            .read_until_sentinel(&session, &sentinel, timeout_secs)
+            .read_until_sentinel(&session, &sentinel, timeout_secs, Vec::new(), false)
             .await?
         {
-            Some((output, code)) => Ok(format!("{}\n(exit code: {code})", clean_output(&output, OUTPUT_CAP_BYTES))),
-            None => {
+            ReadOutcome::Done(output, code, trimmed) => {
+                Ok(format!("{}\n(exit code: {code})", shape_output(&output, trimmed)))
+            }
+            ReadOutcome::Pending(carry, carry_trimmed) => {
                 *session.running.lock().map_err(|_| "state poisoned")? = Some(RunningCmd {
                     sentinel,
                     command: command.to_string(),
+                    carry,
+                    carry_trimmed,
                 });
                 Ok(format!(
                     "Command still running after {timeout_secs}s. Use HOBBES_TERMINAL_TAIL \
@@ -354,69 +433,95 @@ impl TerminalClient {
         }
         .ok_or("No shell is running for this session — use HOBBES_TERMINAL_EXEC first.")?;
 
-        let sentinel = session
+        // Take the carry out (rather than clone) so a re-timeout replaces it
+        // instead of duplicating what this read already drained.
+        let taken = session
             .running
             .lock()
             .map_err(|_| "state poisoned")?
-            .as_ref()
-            .map(|r| r.sentinel.clone());
-        let Some(sentinel) = sentinel else {
+            .as_mut()
+            .map(|r| {
+                (
+                    r.sentinel.clone(),
+                    std::mem::take(&mut r.carry),
+                    r.carry_trimmed,
+                )
+            });
+        let Some((sentinel, carry, carry_trimmed)) = taken else {
             return Ok("No command is running; nothing new to read.".to_string());
         };
         match self
-            .read_until_sentinel(&session, &sentinel, timeout_secs)
+            .read_until_sentinel(&session, &sentinel, timeout_secs, carry, carry_trimmed)
             .await?
         {
-            Some((output, code)) => {
+            ReadOutcome::Done(output, code, trimmed) => {
                 *session.running.lock().map_err(|_| "state poisoned")? = None;
                 Ok(format!(
                     "{}\n(command finished — exit code: {code})",
-                    clean_output(&output, OUTPUT_CAP_BYTES)
+                    shape_output(&output, trimmed)
                 ))
             }
-            None => Ok(
-                "Still running. Use HOBBES_TERMINAL_TAIL again to keep reading, or \
-                 HOBBES_TERMINAL_RESET to kill the shell."
-                    .to_string(),
-            ),
+            ReadOutcome::Pending(carry, carry_trimmed) => {
+                if let Some(r) = session
+                    .running
+                    .lock()
+                    .map_err(|_| "state poisoned")?
+                    .as_mut()
+                {
+                    r.carry = carry;
+                    r.carry_trimmed = carry_trimmed;
+                }
+                Ok(
+                    "Still running. Use HOBBES_TERMINAL_TAIL again to keep reading, or \
+                     HOBBES_TERMINAL_RESET to kill the shell."
+                        .to_string(),
+                )
+            }
         }
     }
 
-    /// Accumulate channel output until the sentinel or the deadline.
-    /// `Ok(None)` = timed out (partial output stays in the accumulated buf —
-    /// returned to the caller inside the timeout message flow via `pending`
-    /// semantics folded into the running marker; v1 returns the guidance
-    /// only, output arrives on the next TAIL).
+    /// Drain the ring into a CAPPED accumulator until the sentinel or the
+    /// deadline. `Pending` carries the drained-so-far bytes so the caller can
+    /// stash them on the running marker — the next TAIL seeds from it and no
+    /// partial output is lost. Every structure here is bounded: the sentinel
+    /// scan and the eventual `clean_output` see at most [`ACC_CAP_BYTES`],
+    /// however much the command prints.
     async fn read_until_sentinel(
         &self,
         session: &Arc<PtySession>,
         sentinel: &str,
         timeout_secs: u64,
-    ) -> Result<Option<(String, i32)>, String> {
+        mut acc: Vec<u8>,
+        mut trimmed: bool,
+    ) -> Result<ReadOutcome, String> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        let mut buf: Vec<u8> = Vec::new();
-        let mut rx = session.output_rx.lock().await;
+        let (lock, notify) = &*session.ring;
         loop {
+            let (chunk, closed) = {
+                let mut r = lock.lock().map_err(|_| "pty ring poisoned")?;
+                (std::mem::take(&mut r.buf), r.closed)
+            };
+            if !chunk.is_empty() {
+                acc.extend_from_slice(&chunk);
+                trimmed |= trim_front(&mut acc, ACC_CAP_BYTES);
+                if let Some(hit) = split_at_sentinel(&acc, sentinel) {
+                    return Ok(ReadOutcome::Done(hit.0, hit.1, trimmed));
+                }
+            }
+            if closed {
+                return Err(
+                    "The shell exited unexpectedly. HOBBES_TERMINAL_EXEC will start a \
+                     fresh one."
+                        .to_string(),
+                );
+            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Ok(None);
+                return Ok(ReadOutcome::Pending(acc, trimmed));
             }
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(bytes)) => {
-                    buf.extend_from_slice(&bytes);
-                    if let Some(hit) = split_at_sentinel(&buf, sentinel) {
-                        return Ok(Some(hit));
-                    }
-                }
-                Ok(None) => {
-                    return Err(
-                        "The shell exited unexpectedly. HOBBES_TERMINAL_EXEC will start a \
-                         fresh one."
-                            .to_string(),
-                    )
-                }
-                Err(_) => return Ok(None),
-            }
+            // A wake lost to the drain-then-wait race is caught by the next
+            // loop's drain (Notify stores one permit).
+            let _ = tokio::time::timeout(remaining, notify.notified()).await;
         }
     }
 
@@ -594,7 +699,10 @@ mod tests {
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             project_id: None,
         };
-        let args = serde_json::json!({"command": "sleep 2 && echo slow-done", "timeout_secs": 1});
+        let args = serde_json::json!({
+            "command": "echo early-part && sleep 2 && echo slow-done",
+            "timeout_secs": 1
+        });
         let out = client.exec(&ctx, &args).await.unwrap();
         assert!(out.contains("still running"), "got: {out}");
 
@@ -609,8 +717,42 @@ mod tests {
             .tail(&ctx, &serde_json::json!({"timeout_secs": 20}))
             .await
             .unwrap();
+        assert!(
+            out.contains("early-part"),
+            "pre-timeout output survives via the carry: {out}"
+        );
         assert!(out.contains("slow-done"), "got: {out}");
         assert!(out.contains("exit code: 0"));
         client.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn chatty_output_stays_bounded_and_completes() {
+        let client = TerminalClient::new();
+        let ctx = TerminalCtx {
+            session_id: "t3".into(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            project_id: None,
+        };
+        // ~2MB of output — far past every cap. Must finish promptly (the
+        // per-chunk sentinel scan is bounded by the accumulator cap, not the
+        // total printed) and come back truncated to the tail.
+        let args = serde_json::json!({"command": "seq 1 300000", "timeout_secs": 60});
+        let out = client.exec(&ctx, &args).await.unwrap();
+        assert!(out.contains("[output truncated"), "got head: {}", &out[..200.min(out.len())]);
+        assert!(out.contains("300000"), "tail survives");
+        assert!(out.contains("(exit code: 0)"));
+        client.shutdown_all().await;
+    }
+
+    #[test]
+    fn trim_front_keeps_the_tail() {
+        let mut b: Vec<u8> = (0u8..=255).collect();
+        assert!(trim_front(&mut b, 16));
+        assert_eq!(b.len(), 16);
+        assert_eq!(*b.last().unwrap(), 255);
+        let mut small = vec![1u8, 2];
+        assert!(!trim_front(&mut small, 16));
+        assert_eq!(small, vec![1, 2]);
     }
 }
