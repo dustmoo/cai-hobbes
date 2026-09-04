@@ -202,6 +202,23 @@ pub fn FleetView() -> Element {
                             }
                             span { class: "text-[11px] uppercase tracking-wider text-fg-muted", "exocortex" }
                         }
+                    } else {
+                        // Not enough signal yet (no agent work, or under 5
+                        // engaged minutes) — dim the speedometer instead of
+                        // removing it, so the dashboard keeps its shape.
+                        div {
+                            class: "flex items-baseline gap-1.5",
+                            title: "Shows once the fleet has agent work and ≥5 engaged minutes today",
+                            Icon {
+                                width: 14,
+                                height: 14,
+                                icon: fi_icons::FiZap,
+                                class: "self-center opacity-40",
+                                style: "color: #a78bfa;",
+                            }
+                            span { class: "text-lg font-semibold tabular-nums text-fg-muted opacity-60", "—×" }
+                            span { class: "text-[11px] uppercase tracking-wider text-fg-muted", "exocortex" }
+                        }
                     }
                 }
             }
@@ -545,10 +562,203 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
                     } else {
                         p { class: "mt-2 text-xs text-fg-muted", "Roll up your day to get a short review of what every session got done, what's blocked, and what to pick up next." }
                     }
+                    BoostRibbon { date: viewing_day, today, now }
                 }
                 if let Some(err) = rollup_error.read().clone() {
                     p { class: "mt-2 text-xs text-red-400", "{err}" }
                 }
+            }
+        }
+    }
+}
+
+// ── Boost ribbon ────────────────────────────────────────────────────────────
+
+/// The exocortex identity color (the header multiplier's violet). The ribbon
+/// is that stat's intra-day view, so it wears the same hue — in two strength
+/// steps, because driven vs background is one measure at two intensities,
+/// not two categories (the status green/teal pair fails CVD separation as
+/// adjacent area fills; a single hue can't).
+const BOOST_COLOR: &str = "#a78bfa";
+
+/// Ribbon viewBox height and the headroom above the tallest bucket.
+const RIBBON_H: f32 = 44.0;
+const RIBBON_TOP_PAD: f32 = 6.0;
+
+/// Closed SVG polygon (`points` attr) for an area drawn through bucket
+/// centers and squared off to the baseline at both ends. `upto` trims the
+/// future portion of a live day; x is one viewBox unit per bucket.
+fn area_points(values: &[f32], upto: usize, max: f32) -> String {
+    let upto = upto.min(values.len());
+    if upto == 0 || max <= 0.0 {
+        return String::new();
+    }
+    let y = |v: f32| RIBBON_H - (v.max(0.0) / max) * (RIBBON_H - RIBBON_TOP_PAD);
+    let mut pts = Vec::with_capacity(upto + 4);
+    pts.push(format!("0,{RIBBON_H}"));
+    pts.push(format!("0,{:.2}", y(values[0])));
+    for (i, v) in values[..upto].iter().enumerate() {
+        pts.push(format!("{:.1},{:.2}", i as f32 + 0.5, y(*v)));
+    }
+    pts.push(format!("{upto},{:.2}", y(values[upto - 1])));
+    pts.push(format!("{upto},{RIBBON_H}"));
+    pts.join(" ")
+}
+
+/// The honesty caption under the ribbon: replayed minutes against the banked
+/// truth. The reconstruction is boundary-events-only, so the two legitimately
+/// differ — the caption quantifies by how much instead of implying exactness.
+fn fidelity_line(replayed: u32, banked: u32) -> Option<String> {
+    if replayed == 0 && banked == 0 {
+        return None;
+    }
+    let pct = (replayed.min(banked) * 100) / replayed.max(banked);
+    Some(format!(
+        "replayed {} of {} banked agent time · {}% match",
+        format_minutes(replayed),
+        format_minutes(banked),
+        pct
+    ))
+}
+
+/// Native-tooltip text for one bucket: time window, total boost, the split.
+fn bucket_tip(i: usize, bucket_minutes: u32, driven: f32, total: f32) -> String {
+    let m0 = i as u32 * bucket_minutes;
+    let m1 = (m0 + bucket_minutes).min(24 * 60);
+    let hm = |m: u32| format!("{}:{:02}", m / 60, m % 60);
+    format!(
+        "{}–{} · {:.1}× — {:.1} driven + {:.1} background",
+        hm(m0),
+        hm(m1),
+        total,
+        driven,
+        (total - driven).max(0.0)
+    )
+}
+
+/// The boost ribbon: the exocortex through the day, replayed from the event
+/// log as a stacked area — solid violet is turns you drove, the haze above
+/// it is background work grinding alongside. Follows the review band's
+/// viewed day; today's strip ends at now instead of drawing hours that
+/// haven't happened. Hidden when the day has no events (nothing to show).
+#[component]
+fn BoostRibbon(date: chrono::NaiveDate, today: chrono::NaiveDate, now: DateTime<Utc>) -> Element {
+    const BUCKET_MIN: u32 = 15;
+    let fleet_state = use_context::<Signal<fleet::FleetState>>();
+
+    let events = fleet::store::events_on(date);
+    if events.is_empty() {
+        return rsx! {};
+    }
+    let (day_start, day_end) = fleet::local_day_bounds_utc(date);
+    let bound = if date == today { now } else { day_end };
+    let spans = fleet::replay::replay_day_spans(&events, bound);
+    let total = fleet::replay::concurrency_curve(&spans, date, BUCKET_MIN);
+    let driven_spans: Vec<fleet::replay::DaySpan> =
+        spans.iter().filter(|s| !s.background).cloned().collect();
+    let driven = fleet::replay::concurrency_curve(&driven_spans, date, BUCKET_MIN);
+    let upto = if date == today {
+        let elapsed = (now - day_start).num_minutes().clamp(0, 24 * 60) as u32;
+        (elapsed.div_ceil(BUCKET_MIN) as usize).min(total.len())
+    } else {
+        total.len()
+    };
+    let peak = total[..upto].iter().copied().fold(0f32, f32::max);
+    if peak <= 0.0 {
+        return rsx! {};
+    }
+    let max = peak.max(1.0);
+    let total_pts = area_points(&total, upto, max);
+    let driven_pts = area_points(&driven, upto, max);
+    let n = total.len();
+    let one_y = RIBBON_H - (1.0 / max) * (RIBBON_H - RIBBON_TOP_PAD);
+
+    let replayed = fleet::replay::replayed_minutes_on(&spans, date);
+    let banked = fleet::fleet_agent_minutes_on(&fleet_state.read(), date, now);
+    let caption = fidelity_line(replayed, banked);
+    let tips: Vec<(usize, String)> = (0..upto)
+        .filter(|&i| total[i] > 0.05)
+        .map(|i| (i, bucket_tip(i, BUCKET_MIN, driven[i], total[i])))
+        .collect();
+
+    rsx! {
+        div {
+            class: "mt-3",
+            div {
+                class: "flex items-baseline gap-2",
+                span {
+                    class: "text-[11px] font-semibold",
+                    style: "color: {BOOST_COLOR};",
+                    "Boost through the day"
+                }
+                if peak >= 1.05 {
+                    span {
+                        class: "text-[11px] tabular-nums text-fg-muted",
+                        { format!("peak {:.1}×", peak) }
+                    }
+                }
+                div { class: "flex-1" }
+                // One hue, two strengths — the legend teaches the split.
+                span { class: "w-2 h-2 rounded-sm self-center", style: "background: {BOOST_COLOR};" }
+                span { class: "text-[10px] text-fg-muted", "driven" }
+                span {
+                    class: "w-2 h-2 rounded-sm self-center ml-1",
+                    style: "background: {BOOST_COLOR}; opacity: 0.32;",
+                }
+                span { class: "text-[10px] text-fg-muted", "background" }
+            }
+            svg {
+                class: "w-full mt-1 rounded-sm",
+                style: "background: rgba(255,255,255,0.02); display: block;",
+                height: "44",
+                view_box: "0 0 {n} 44",
+                preserve_aspect_ratio: "none",
+                // Quarter-day ticks (6a / 12p / 6p): thin rects instead of
+                // strokes — stroke widths distort under the stretched
+                // viewBox, sub-unit rects stay ≈1px.
+                for x in [n / 4, n / 2, 3 * n / 4] {
+                    rect {
+                        x: "{x}",
+                        y: "0",
+                        width: "0.12",
+                        height: "{RIBBON_H}",
+                        fill: "rgba(255,255,255,0.06)",
+                    }
+                }
+                // The 1× guide: above this line the fleet outnumbers you.
+                if max > 1.2 {
+                    rect {
+                        x: "0",
+                        y: "{one_y}",
+                        width: "{n}",
+                        height: "0.4",
+                        fill: "rgba(255,255,255,0.10)",
+                    }
+                }
+                polygon { points: "{total_pts}", fill: "{BOOST_COLOR}", opacity: "0.30" }
+                polygon { points: "{driven_pts}", fill: "{BOOST_COLOR}", opacity: "0.85" }
+                // Invisible per-bucket hit targets carrying native tooltips.
+                for (i, tip) in tips {
+                    rect {
+                        x: "{i}",
+                        y: "0",
+                        width: "1",
+                        height: "{RIBBON_H}",
+                        fill: "transparent",
+                        title { "{tip}" }
+                    }
+                }
+            }
+            div {
+                class: "flex justify-between text-[10px] text-fg-muted/70 mt-0.5",
+                span { "12a" }
+                span { "6a" }
+                span { "12p" }
+                span { "6p" }
+                span { "12a" }
+            }
+            if let Some(c) = caption {
+                p { class: "mt-1 text-[10px] text-fg-muted/70", "{c}" }
             }
         }
     }
@@ -878,6 +1088,45 @@ mod tests {
         let sorted = sorted_sessions(&state);
         let ids: Vec<&str> = sorted.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["stale-gate", "fresh-working", "old-idle"]);
+    }
+
+    #[test]
+    fn area_points_close_to_the_baseline_and_trim_the_future() {
+        // Empty and all-future cases render nothing.
+        assert_eq!(area_points(&[], 0, 2.0), "");
+        assert_eq!(area_points(&[1.0, 1.0], 0, 2.0), "");
+
+        let pts = area_points(&[2.0, 0.0], 2, 2.0);
+        let coords: Vec<&str> = pts.split(' ').collect();
+        assert_eq!(coords.first(), Some(&"0,44"), "opens on the baseline");
+        assert_eq!(coords.last(), Some(&"2,44"), "closes on the baseline");
+        // Full-scale value reaches the top pad, zero sits on the baseline.
+        assert!(pts.contains("0.5,6.00"), "got: {pts}");
+        assert!(pts.contains("1.5,44.00"), "got: {pts}");
+
+        // upto trims: the polygon's right edge is the trim point, not the
+        // day's end.
+        let trimmed = area_points(&[1.0, 1.0, 1.0, 1.0], 2, 1.0);
+        assert!(trimmed.ends_with("2,44"), "got: {trimmed}");
+    }
+
+    #[test]
+    fn fidelity_line_quantifies_and_hides_the_empty_case() {
+        assert_eq!(fidelity_line(0, 0), None);
+        let line = fidelity_line(90, 100).unwrap();
+        assert!(line.contains("1h 30m") && line.contains("1h 40m"), "got: {line}");
+        assert!(line.contains("90% match"), "got: {line}");
+        // Over-replay reads the same way — the ratio is symmetric.
+        assert!(fidelity_line(100, 90).unwrap().contains("90% match"));
+        assert!(fidelity_line(50, 0).unwrap().contains("0% match"));
+    }
+
+    #[test]
+    fn bucket_tips_name_the_window_and_the_split() {
+        let tip = bucket_tip(38, 15, 2.0, 3.2);
+        assert!(tip.starts_with("9:30–9:45"), "got: {tip}");
+        assert!(tip.contains("3.2×"), "got: {tip}");
+        assert!(tip.contains("2.0 driven + 1.2 background"), "got: {tip}");
     }
 
     #[test]
