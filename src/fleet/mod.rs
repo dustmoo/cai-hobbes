@@ -623,6 +623,18 @@ pub fn reduce_with_prompt(
             session.status = FleetStatus::WorkingBackground;
             session.attention_at = None;
         }
+        FleetEvent::SubagentStop { background_tasks, .. }
+            if *background_tasks > 0 && session.status == FleetStatus::Idle =>
+        {
+            // A background job finished and MORE remain while the card reads
+            // Idle: the phase outlived a staleness demotion, a restart, or a
+            // pre-fix persisted row. Heal to the honest state — same
+            // evidence standard as the alert demotion above.
+            if session.working_since.is_none() {
+                session.working_since = Some(now);
+            }
+            session.status = FleetStatus::WorkingBackground;
+        }
         FleetEvent::ToolActivity { .. } | FleetEvent::SubagentStop { .. }
             if prompt_is_background && session.status != FleetStatus::WorkingBackground =>
         {
@@ -1433,6 +1445,37 @@ mod tests {
         let changed = sweep_stale(&mut state, long_gone);
         assert_eq!(changed.len(), 1);
         assert_eq!(state.sessions["s1"].status, FleetStatus::Idle);
+    }
+
+    #[test]
+    fn subagent_stop_with_remaining_tasks_heals_an_idle_demotion() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T09:00:00Z");
+        reduce(&mut state, &start("s1"), t0);
+        reduce(
+            &mut state,
+            &FleetEvent::Stop { session_id: "s1".into(), cwd: String::new(), background_tasks: 2 },
+            t0 + chrono::Duration::minutes(5),
+        );
+        // Something already demoted the phase to Idle (an old build's sweep,
+        // a persisted pre-fix row).
+        state.sessions.get_mut("s1").unwrap().status = FleetStatus::Idle;
+        state.sessions.get_mut("s1").unwrap().working_since = None;
+
+        // One background job finishes, one remains: proof the phase is live.
+        let t1 = t0 + chrono::Duration::minutes(40);
+        reduce(
+            &mut state,
+            &FleetEvent::SubagentStop {
+                session_id: "s1".into(),
+                cwd: String::new(),
+                background_tasks: 1,
+            },
+            t1,
+        );
+        let s = &state.sessions["s1"];
+        assert_eq!(s.status, FleetStatus::WorkingBackground, "idle card healed");
+        assert_eq!(s.working_since, Some(t1), "a fresh provable span opens");
     }
 
     #[test]
