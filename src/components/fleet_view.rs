@@ -126,10 +126,9 @@ pub fn FleetView() -> Element {
             div {
                 class: "px-6 pt-6 pb-3 flex items-center gap-3 flex-wrap",
                 Icon {
-                    icon: crate::components::pixel_icons::HobbesInvader,
+                    icon: crate::components::pixel_icons::HobbesTiger,
                     width: 22,
-                    height: 16,
-                    class: "text-fg",
+                    height: 22,
                 }
                 h1 { class: "text-xl font-semibold", "Fleet" }
                 // Listener state as a glanceable icon — the port itself is

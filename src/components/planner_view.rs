@@ -1572,7 +1572,7 @@ fn TodoRow(todo: Todo, mut selection: Signal<PlannerSelection>) -> Element {
                             Icon {
                                 width: 10,
                                 height: 10,
-                                icon: crate::components::pixel_icons::HobbesInvader,
+                                icon: crate::components::pixel_icons::HobbesTigerStencil,
                             }
                             span { class: "truncate", "{label}" }
                         }

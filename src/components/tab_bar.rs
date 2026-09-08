@@ -247,10 +247,10 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     },
                     onclick: move |_| props.on_select_fleet.call(()),
                     Icon {
-                        icon: crate::components::pixel_icons::HobbesInvader,
-                        width: 13,
-                        height: 10,
-                        class: if props.fleet_active { "text-fg mr-1.5" } else { "text-fg-muted mr-1.5" },
+                        icon: crate::components::pixel_icons::HobbesTiger,
+                        width: 14,
+                        height: 14,
+                        class: if props.fleet_active { "mr-1.5" } else { "mr-1.5 opacity-70" },
                     }
                     span {
                         class: if props.fleet_active { "text-xs text-fg font-medium" } else { "text-xs text-fg-muted" },
