@@ -10,6 +10,10 @@
 //! isn't supported there). When focus ends the icon reverts to plain — empty
 //! title, default tooltip — and disappears entirely if the setting is off.
 //!
+//! The icon artwork itself is built in `tray::init_tray`, rasterised at
+//! runtime from the mascot grid in `components::pixel_icons` (no PNG asset):
+//! a 36×36 template on macOS, which AppKit tints for the menu bar.
+//!
 //! Click routing (in `tray::ensure_tray_listener`) switches on focus mode at
 //! event time: with a focus active, a left-click release surfaces the window
 //! and reveals the focused todo in the planner (never hides the window);

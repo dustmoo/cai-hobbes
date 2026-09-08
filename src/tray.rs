@@ -50,29 +50,34 @@ pub fn ensure_tray_listener() {
     });
 }
 
+/// Build the one tray icon, rasterised from the mascot grid at runtime.
+///
+/// The mark comes from `pixel_icons::tiger_rgba` — the same 16×16 grid the
+/// chat-bar sprite is drawn from — so there is no PNG asset and no
+/// sandboxed/Pro branding split for the tray: one stencil serves both.
+///
+/// macOS takes the *template* (ink opaque black, holes transparent) and
+/// tints it for the menu bar's light/dark/highlighted states. tray-icon
+/// 0.19.3 sizes the NSImage itself — `set_icon_with_as_template` calls
+/// `setSize` with a fixed 18pt height and a width scaled to the image's
+/// aspect ratio — so a square 36×36 raster lands as 18×18pt at @2x backing
+/// resolution. Hence `cell_px = 2` over the 18-cell canvas.
+///
+/// Windows has no template concept, so it gets the colour raster at the same
+/// 36×36.
 pub fn init_tray() -> TrayIcon {
-    // Runtime Branding: Select tray icon based on distribution variant.
-    // Sandboxed (App Store) = standard favicon, Unsandboxed (Pro) = pro icon.
-    let image_bytes: &[u8] = if crate::settings::is_sandboxed() {
-        include_bytes!("../assets/favicon.png")
-    } else {
-        include_bytes!("../assets/icon-pro-tray.png")
-    };
-    let image = match image::load_from_memory(image_bytes) {
-        Ok(img) => img.to_rgba8(),
-        Err(e) => {
-            tracing::error!("Failed to load tray icon from memory: {}", e);
-            // Return dummy 1x1 transparent image or panic if critical?
-            // Since we can't easily return early here without changing return type,
-            // we'll try to create a fallback 1x1 image to prevent crash.
-            image::RgbaImage::new(1, 1)
-        }
-    };
-    let (width, height) = image.dimensions();
-    let icon_data = image.into_raw();
-    let icon = Icon::from_rgba(icon_data, width, height).unwrap_or_else(|e| {
-        tracing::error!("Failed to create tray icon from RGBA: {}", e);
-        // Last resort fallback - empty icon
+    let cell_px = 2;
+    #[cfg(target_os = "macos")]
+    let as_template = true;
+    #[cfg(not(target_os = "macos"))]
+    let as_template = false;
+
+    let (rgba, width, height) = crate::components::pixel_icons::tiger_rgba(cell_px, !as_template);
+    // Infallible in practice: the rasteriser always returns width*height*4
+    // bytes for a non-zero canvas, which is the only thing `from_rgba`
+    // validates. An empty icon is better than a panic if that ever changes.
+    let icon = Icon::from_rgba(rgba, width, height).unwrap_or_else(|e| {
+        tracing::error!("Failed to build tray icon from the mascot raster: {}", e);
         Icon::from_rgba(vec![0, 0, 0, 0], 1, 1).unwrap()
     });
 
@@ -82,9 +87,10 @@ pub fn init_tray() -> TrayIcon {
     // separately in menu.rs. Use the TrayIconEvent receiver for direct clicks.
     ensure_tray_listener();
 
-    TrayIconBuilder::new()
+    let builder = TrayIconBuilder::new()
         .with_icon(icon)
-        .with_tooltip("Hobbes")
-        .build()
-        .unwrap()
+        .with_tooltip("Hobbes");
+    #[cfg(target_os = "macos")]
+    let builder = builder.with_icon_as_template(as_template);
+    builder.build().unwrap()
 }

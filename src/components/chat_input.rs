@@ -833,7 +833,7 @@ pub fn ChatInput(
                     title: "Planner"
                 }
                 ChatBarIconButton {
-                    icon: crate::components::pixel_icons::HobbesInvader,
+                    icon: crate::components::pixel_icons::HobbesTiger,
                     onclick: move |_| chat_command.set(Some(ChatCommand::ToggleFleet)),
                     visible: ui_state.read().show_fleet_icon,
                     title: "Fleet"
