@@ -3605,22 +3605,6 @@ pub fn SettingsPanel() -> Element {
                                         class: "flex flex-col gap-1",
                                         div {
                                             class: "flex items-center justify-between",
-                                            label { class: "text-sm text-fg-muted", "Show Local/Cloud indicator in the menu bar" }
-                                            input {
-                                                r#type: "checkbox",
-                                                class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                                checked: "{local_settings.read().show_privacy_indicator}",
-                                                onchange: move |e| {
-                                                    local_settings.write().show_privacy_indicator = e.value() == "true";
-                                                }
-                                            }
-                                        }
-                                        p { class: "text-xs text-fg-muted/70", "Adds a ⌂ (local) or ☁ (cloud) glyph on the tray icon showing whether AI prompts and tool calls leave this machine." }
-                                    }
-                                    div {
-                                        class: "flex flex-col gap-1",
-                                        div {
-                                            class: "flex items-center justify-between",
                                             label { class: "text-sm text-fg-muted", "Focus window when a timer fires" }
                                             input {
                                                 r#type: "checkbox",

@@ -1907,31 +1907,10 @@ fn app() -> Element {
         } else {
             None
         };
-        // Local/Cloud indicator: resolved from the ACTIVE session's effective
-        // connector (sessions can pin their own). Subscribes to the session
-        // *id* and to settings — connector pinning always writes settings too
-        // (SwitchModel/SwitchProvider update the global default), so peeking
-        // the session map avoids re-running this on every streamed token.
-        let privacy = if settings.read().show_privacy_indicator {
-            let s = settings.read();
-            let session_state = session_state.peek();
-            let sid = current_session_id.read().clone();
-            let connector = match session_state.sessions.get(&sid) {
-                Some(session) => s.connector_for_session(session),
-                None => s.active_connector(),
-            };
-            Some(focus_tray::privacy_status(
-                connector,
-                !s.composio_profiles.is_empty(),
-            ))
-        } else {
-            None
-        };
         focus_tray::sync_tray(
             &mut tray_icon.write(),
             show_tray,
             snapshot.as_ref(),
-            privacy.as_ref(),
         );
     });
 

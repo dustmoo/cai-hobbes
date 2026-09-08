@@ -245,11 +245,6 @@ pub struct Settings {
     pub project_folder: Option<String>,
     pub chat_history_length: usize,
     pub show_tray_icon: bool,
-    /// Menu-bar Local/Cloud indicator: a leading ⌂/☁ glyph on the tray icon
-    /// showing at a glance whether AI prompts and tool calls leave this
-    /// machine. Rides on the tray icon when it exists; never summons it.
-    #[serde(default = "default_true")]
-    pub show_privacy_indicator: bool,
     pub permission_settings: PermissionSettings,
     #[serde(default = "default_true")]
     pub confirm_on_delete: bool,
@@ -780,7 +775,6 @@ impl Default for Settings {
             project_folder: None,
             chat_history_length: 75,
             show_tray_icon: true,
-            show_privacy_indicator: true,
             permission_settings: PermissionSettings {
                 auto_approval_enabled: true,
                 granular_permissions,
