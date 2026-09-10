@@ -6,6 +6,8 @@ use dioxus::{html::HasFileData, prelude::*};
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use image::{imageops, DynamicImage, ImageFormat};
 use rfd::FileDialog;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::time::SystemTime;
 
@@ -109,9 +111,13 @@ fn display_name_for_provider(provider: &LlmProvider, model_slug: &str) -> String
 #[component]
 pub fn ChatInput(
     is_sending: Signal<bool>,
-    has_new_comments: Signal<bool>,
-    has_pending_approvals: Signal<bool>,
-    on_send: EventHandler<(String, Vec<Attachment>)>,
+    /// Session ids with unsent inline comments / approved tool calls. Both are
+    /// per-session: a background tab's pending work must not light up this one.
+    has_new_comments: Signal<HashSet<String>>,
+    has_pending_approvals: Signal<HashSet<String>>,
+    /// `(text, attachments, target_session_id)` — the target is explicit so a
+    /// queued message can drain into a background session.
+    on_send: EventHandler<(String, Vec<Attachment>, String)>,
     on_cancel: EventHandler<()>,
     on_interaction: EventHandler<()>,
     on_new_chat_with_memory: EventHandler<()>,
@@ -154,6 +160,61 @@ pub fn ChatInput(
     // the whole draft.
     let mut autocomplete_token: Signal<Option<(usize, usize)>> = use_signal(|| None);
 
+    // Draft text + attachments are per session. ChatInput never unmounts, so the
+    // visible `draft`/`attachments` signals are singletons; every other tab's
+    // in-progress input is parked here and swapped back in on a tab switch.
+    //
+    // NOTE on ordering: in Dioxus 0.6, effect run order is NOT registration
+    // order — it is the order of the signal writes that woke each effect's
+    // task (dioxus-core-0.6.3/src/tasks.rs:230-237). This effect and the
+    // pending-seed effect below both react to `current_session_id` changing
+    // (directly, or via `pending_seed` becoming Some alongside it), so either
+    // one may run first. `StartTodoInChat` in main.rs happens to write
+    // `current_session_id` (via `new_tab_fn`) before `pending_chat_seed`, but
+    // that only fixes the write order, not which effect body executes first.
+    // To stay correct regardless of order, the pending-seed effect below
+    // checks whether this swap has already caught up (`draft_session_id ==
+    // current_session_id`); if not, it stashes the seed in
+    // `pending_seed_target` and this effect applies it once it does catch up
+    // (see `park_and_restore` / the `pending_seed_target` check below).
+    let mut session_drafts = use_signal(HashMap::<String, (String, Vec<Attachment>)>::new);
+    let mut draft_session_id = use_signal(|| current_session_id.peek().clone());
+    // Holds a seed (target session id, text) that arrived before this swap
+    // effect had a chance to move `draft_session_id` to that target. Cleared
+    // by whichever of the two effects applies it first.
+    let mut pending_seed_target = use_signal(|| Option::<(String, String)>::None);
+    use_effect(move || {
+        let next_id = current_session_id.read().clone();
+        let prev_id = draft_session_id.peek().clone();
+        if next_id == prev_id {
+            return;
+        }
+        let current = (draft.peek().clone(), attachments.peek().clone());
+        let (mut text, atts) = {
+            let mut drafts = session_drafts.write();
+            park_and_restore(&mut drafts, &prev_id, &next_id, current)
+        };
+        draft_session_id.set(next_id.clone());
+
+        // A seed for this exact session may have been stashed by the
+        // pending-seed effect if it ran before this swap caught up. Apply it
+        // now instead of the restored draft, so the seed always wins.
+        let mut caret = None;
+        let mut focus = false;
+        let stashed_seed = pending_seed_target.peek().clone();
+        if let Some((seed_target, seed_text)) = stashed_seed {
+            if seed_target == next_id {
+                pending_seed_target.set(None);
+                caret = Some(seed_text.encode_utf16().count());
+                focus = true;
+                text = seed_text;
+            }
+        }
+
+        attachments.set(atts);
+        crate::components::shared::set_chat_draft(draft, text, caret, focus);
+    });
+
     // Active Focus Management: Reclaim focus when context reverts to ChatInput
     use_effect(move || {
         let current_context = *focus_context.read();
@@ -182,8 +243,24 @@ pub fn ChatInput(
         // Consume before applying: the write re-runs this effect, which then
         // sees None and stops — one application per activation.
         pending_seed.set(None);
-        let caret = text.encode_utf16().count();
-        crate::components::shared::set_chat_draft(draft, text, Some(caret), true);
+        let target = current_session_id.peek().clone();
+        // `current_session_id.peek()` always reflects main.rs's tab switch
+        // already (signal writes commit synchronously; only effect
+        // *scheduling* is unordered), but `draft_session_id` — the session
+        // the visible `draft` signal currently belongs to — only catches up
+        // once the draft-swap effect above actually runs. If it hasn't run
+        // yet, applying the seed here would just get clobbered when it does
+        // run and restores (empty) parked state for the new session. Stash
+        // it instead so the swap effect applies it when it catches up.
+        match resolve_seed_target(&target, &draft_session_id.peek()) {
+            SeedApplication::Immediate => {
+                let caret = text.encode_utf16().count();
+                crate::components::shared::set_chat_draft(draft, text, Some(caret), true);
+            }
+            SeedApplication::Parked => {
+                pending_seed_target.set(Some((target, text)));
+            }
+        }
     });
 
     // Listen for global chat commands (from menu hotkeys)
@@ -300,7 +377,8 @@ pub fn ChatInput(
                     // is the single correct path to resume the AI turn.
                     // DO NOT also call on_send / has_new_comments here — that would
                     // create a second parallel LLM stream (double-turn regression).
-                    has_pending_approvals.set(true);
+                    let sid = current_session_id.read().clone();
+                    has_pending_approvals.write().insert(sid);
                 }
             }
 
@@ -313,7 +391,8 @@ pub fn ChatInput(
     // the exact same skill-detection + send logic as a freshly typed message.
     // Deliberately does NOT touch the draft — when draining a queued message the
     // draft may hold unrelated live text; clearing it is the caller's job.
-    let submit = use_callback(move |(user_message, atts): (String, Vec<Attachment>)| {
+    let submit = use_callback(
+        move |(user_message, atts, target_sid): (String, Vec<Attachment>, String)| {
         // Skill Command Detection
         {
             // /unload command — remove a loaded skill from session context.
@@ -325,7 +404,7 @@ pub fn ChatInput(
                     let mut unload_log: Option<(String, crate::components::chat::Message)> = None;
                     {
                         let mut state = session_state.write();
-                        if let Some(session) = state.get_active_session_mut() {
+                        if let Some(session) = state.sessions.get_mut(&target_sid) {
                             if session.loaded_skills.remove(skill_name).is_some() {
                                 // Push a confirmation message
                                 let confirmation = crate::components::chat::Message {
@@ -403,7 +482,7 @@ pub fn ChatInput(
                         profile_color: {
                             let settings_read = settings.read();
                             let profile_name =
-                                session_state.read().get_active_session().and_then(|s| {
+                                session_state.read().sessions.get(&target_sid).and_then(|s| {
                                     settings_read.resolve_session_profile_display_name(
                                         s.composio_profile.as_deref(),
                                     )
@@ -451,7 +530,7 @@ pub fn ChatInput(
                         let msg_id = skill_message.id;
                         let mut state = session_state.write();
                         let mut skill_session_id: Option<String> = None;
-                        if let Some(session) = state.get_active_session_mut() {
+                        if let Some(session) = state.sessions.get_mut(&target_sid) {
                             skill_session_id = Some(session.id.clone());
                             session.messages.push(user_bubble.clone());
                             session.messages.push(skill_message.clone());
@@ -467,7 +546,9 @@ pub fn ChatInput(
                             );
                         }
 
-                        // Spawn Execution
+                        // Spawn Execution — pinned to the session that invoked
+                        // the skill, not to whichever tab is active when it ends.
+                        let skill_sid = target_sid.clone();
                         let mut sc_clone = skill_call.clone();
                         let mut session_state = session_state; // move clone into closure
                         let mut mcp_context = _mcp_context.read().clone();
@@ -484,7 +565,7 @@ pub fn ChatInput(
                                     let mut state = session_state.write();
                                     let mut skill_events: Vec<SessionEvent> = Vec::new();
                                     let mut event_session_id: Option<String> = None;
-                                    if let Some(session) = state.get_active_session_mut() {
+                                    if let Some(session) = state.sessions.get_mut(&skill_sid) {
                                         event_session_id = Some(session.id.clone());
                                         if let Some(msg) =
                                             session.messages.iter_mut().find(|m| m.id == msg_id)
@@ -512,14 +593,16 @@ pub fn ChatInput(
                                     if let Some(sid) = &event_session_id {
                                         log_events(sid, skill_events);
                                     }
-                                                 // Auto-trigger LLM to respond with the injected skill context
-                                    chat_command.set(Some(ChatCommand::TriggerAiAnalysis));
+                                    // Auto-trigger the LLM to respond with the
+                                    // injected skill context, on the invoking
+                                    // session (not the active tab).
+                                    has_pending_approvals.write().insert(skill_sid.clone());
                                 }
                                 Err(e) => {
                                     tracing::error!("Skill execution failed: {}", e);
                                     let mut state = session_state.write();
                                     let mut error_log: Option<(String, crate::components::chat::Message)> = None;
-                                    if let Some(session) = state.get_active_session_mut() {
+                                    if let Some(session) = state.sessions.get_mut(&skill_sid) {
                                         let sid = session.id.clone();
                                         if let Some(msg) =
                                             session.messages.iter_mut().find(|m| m.id == msg_id)
@@ -555,7 +638,7 @@ pub fn ChatInput(
 
                         let mut state = session_state.write();
                         let mut prompt_session_id: Option<String> = None;
-                        if let Some(session) = state.get_active_session_mut() {
+                        if let Some(session) = state.sessions.get_mut(&target_sid) {
                             prompt_session_id = Some(session.id.clone());
                             session.messages.push(user_bubble.clone());
                             session.messages.push(skill_message.clone());
@@ -594,8 +677,9 @@ pub fn ChatInput(
             user_message
         };
 
-        on_send.call((user_message, atts));
-    });
+        on_send.call((user_message, atts, target_sid));
+    },
+    );
 
     // Reset the auto-grown textarea back to its base height after a send/queue.
     let reset_textarea_height = move || {
@@ -614,17 +698,17 @@ pub fn ChatInput(
         }
         let user_message = draft.read().clone();
         let atts = attachments.read().clone();
+        let session_id = current_session_id.read().clone();
         if user_message.is_empty()
             && atts.is_empty()
-            && !*has_new_comments.read()
-            && !*has_pending_approvals.read()
+            && !has_new_comments.read().contains(&session_id)
+            && !has_pending_approvals.read().contains(&session_id)
         {
             return;
         }
 
         // If this session's turn is still in flight, queue the message instead of
         // sending. The turn drains it on completion (see the drain effect below).
-        let session_id = current_session_id.read().clone();
         if stream_manager.is_session_streaming(&session_id) {
             if !user_message.is_empty() || !atts.is_empty() {
                 chat_queue::queue_push(
@@ -641,46 +725,69 @@ pub fn ChatInput(
             return;
         }
 
-        submit.call((user_message, atts));
+        submit.call((user_message, atts, session_id));
         crate::components::shared::set_chat_draft(draft, String::new(), None, false);
         attachments.set(Vec::new());
         reset_textarea_height();
     };
 
-    // Drain one queued message whenever the active session is idle — either it
-    // just finished a turn, or the user switched back to a session that has a
-    // backlog. `dispatching` guards the async gap between dispatching a message
-    // and its stream actually starting, so a burst of other-tab stream activity
-    // can't pop a second message and race two turns on one session.
-    let mut dispatching = use_signal(|| false);
+    // Drain one queued message per idle session — the active tab AND any
+    // background tab whose turn has finished. `dispatching` is keyed by session
+    // so one tab's async gap can't block another's drain.
+    let mut dispatching = use_signal(HashSet::<String>::new);
     use_effect(move || {
         // Re-run on any stream state change, active-session switch, or explicit
-        // drain request (e.g. a fired timer enqueuing for the active session).
+        // drain request (e.g. a fired timer enqueuing for a session).
         let _ = stream_manager.stream_activity.read();
         let _ = chat_queue::QUEUE_DRAIN_TICK.read();
-        let session_id = current_session_id.read().clone();
+        let _ = current_session_id.read();
 
-        if stream_manager.is_session_streaming(&session_id) {
-            // The message we dispatched has started streaming — release the guard.
-            if *dispatching.peek() {
-                dispatching.set(false);
+        let backlog: Vec<String> = CHAT_QUEUE
+            .read()
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(sid, _)| sid.clone())
+            .collect();
+
+        for session_id in backlog {
+            if stream_manager.is_session_streaming(&session_id) {
+                // The message we dispatched has started streaming — release
+                // this session's guard.
+                if dispatching.peek().contains(&session_id) {
+                    dispatching.write().remove(&session_id);
+                }
+                continue;
             }
-            return;
-        }
-        if *dispatching.peek() {
-            return;
-        }
+            if dispatching.peek().contains(&session_id) {
+                continue;
+            }
+            // Don't pop for a session that isn't in state: deleted, or not yet
+            // hydrated (History opens it lazily). `queue_pop_next` removes the
+            // message, and `submit` would have nowhere to put it — the message
+            // would be silently eaten. Leave it queued until the session is
+            // there; a delete clears its queue separately (delete_session_fn).
+            if !session_state.peek().sessions.contains_key(&session_id) {
+                continue;
+            }
 
-        if let Some(qm) = chat_queue::queue_pop_next(&mut CHAT_QUEUE.write(), &session_id) {
-            dispatching.set(true);
-            submit.call((qm.text, qm.attachments));
-            // Failsafe: a queued no-op (e.g. a command that starts no stream)
-            // must not wedge the queue. Real turns clear the guard sooner via the
-            // is_streaming branch above; this only fires if nothing ever streams.
-            spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                dispatching.set(false);
-            });
+            // Bind the pop result before branching: keeping it inline in the
+            // `if let` would hold the `CHAT_QUEUE.write()` scrutinee's guard
+            // alive for the whole then-block, so `submit` (which can itself
+            // touch CHAT_QUEUE) would run while the queue is still mutably
+            // borrowed.
+            let popped = chat_queue::queue_pop_next(&mut CHAT_QUEUE.write(), &session_id);
+            if let Some(qm) = popped {
+                dispatching.write().insert(session_id.clone());
+                submit.call((qm.text, qm.attachments, session_id.clone()));
+                // Failsafe: a queued no-op (e.g. a command that starts no stream)
+                // must not wedge the queue. Real turns clear the guard sooner via
+                // the is_streaming branch above; this only fires if nothing ever
+                // streams.
+                spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    dispatching.write().remove(&session_id);
+                });
+            }
         }
     });
 
@@ -1645,7 +1752,7 @@ pub fn ChatInput(
                                                         }
 
                                                         let settings_reader = settings.read();
-                                                        let builder = PromptBuilder::new(&session_for_debug, &settings_reader, &state)
+                                                        let builder = PromptBuilder::new(&session_for_debug, &settings_reader)
                                                             .with_planner_today(crate::todo::handlers::planner_today_context(
                                                                 &_planner_state.read(),
                                                                 &settings_reader,
@@ -1762,7 +1869,12 @@ pub fn ChatInput(
                                 on_interaction.call(());
                                 send_message();
                             },
-                            if *has_new_comments.read() || *has_pending_approvals.read() { "Submit" } else { "Send" }
+                            {
+                                let sid = current_session_id.read().clone();
+                                if has_new_comments.read().contains(&sid)
+                                    || has_pending_approvals.read().contains(&sid)
+                                { "Submit" } else { "Send" }
+                            }
                         }
                     } else {
                         button {
@@ -2094,5 +2206,111 @@ fn SessionCostIcon() -> Element {
                 }
             }
         }
+    }
+}
+
+/// Parks the outgoing session's draft (unless empty) into `drafts`, then pops
+/// and returns whatever is parked for the incoming session (empty default if
+/// none). Pure so the draft-swap effect's park/restore logic can be unit
+/// tested without a Dioxus runtime.
+fn park_and_restore(
+    drafts: &mut HashMap<String, (String, Vec<Attachment>)>,
+    prev: &str,
+    next: &str,
+    current: (String, Vec<Attachment>),
+) -> (String, Vec<Attachment>) {
+    if current.0.is_empty() && current.1.is_empty() {
+        drafts.remove(prev);
+    } else {
+        drafts.insert(prev.to_string(), current);
+    }
+    drafts.remove(next).unwrap_or_default()
+}
+
+/// Whether a just-consumed pending-chat-seed can be written straight to the
+/// visible draft, or must be stashed until the draft-swap effect moves
+/// `draft_session_id` to match the seed's target session.
+#[derive(Debug, PartialEq, Eq)]
+enum SeedApplication {
+    /// The draft signal already belongs to the seed's target session.
+    Immediate,
+    /// The draft-swap effect hasn't caught up yet; park the seed.
+    Parked,
+}
+
+fn resolve_seed_target(current_session_id: &str, draft_session_id: &str) -> SeedApplication {
+    if current_session_id == draft_session_id {
+        SeedApplication::Immediate
+    } else {
+        SeedApplication::Parked
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn att(name: &str) -> Attachment {
+        Attachment {
+            file_name: name.to_string(),
+            mime_type: "image/png".to_string(),
+            data: String::new(),
+        }
+    }
+
+    #[test]
+    fn park_and_restore_empty_draft_removes_entry() {
+        let mut drafts = HashMap::new();
+        drafts.insert("a".to_string(), ("stale".to_string(), vec![]));
+        let restored = park_and_restore(&mut drafts, "a", "b", (String::new(), vec![]));
+        assert!(!drafts.contains_key("a"));
+        assert_eq!(restored, (String::new(), vec![]));
+    }
+
+    #[test]
+    fn park_and_restore_non_empty_parks() {
+        let mut drafts = HashMap::new();
+        let restored = park_and_restore(
+            &mut drafts,
+            "a",
+            "b",
+            ("hello".to_string(), vec![att("x.png")]),
+        );
+        assert_eq!(
+            drafts.get("a"),
+            Some(&("hello".to_string(), vec![att("x.png")]))
+        );
+        assert_eq!(restored, (String::new(), vec![]));
+    }
+
+    #[test]
+    fn park_and_restore_switching_back_restores() {
+        let mut drafts = HashMap::new();
+        // a -> b, parking a's draft.
+        park_and_restore(&mut drafts, "a", "b", ("a-text".to_string(), vec![]));
+        // b -> a, should restore a's parked draft.
+        let restored = park_and_restore(&mut drafts, "b", "a", (String::new(), vec![]));
+        assert_eq!(restored, ("a-text".to_string(), vec![]));
+        assert!(!drafts.contains_key("a"));
+    }
+
+    #[test]
+    fn park_and_restore_no_parked_draft_yields_empty() {
+        let mut drafts = HashMap::new();
+        let restored = park_and_restore(&mut drafts, "a", "c", (String::new(), vec![]));
+        assert_eq!(restored, (String::new(), vec![]));
+    }
+
+    #[test]
+    fn resolve_seed_target_immediate_when_sessions_match() {
+        assert_eq!(
+            resolve_seed_target("s1", "s1"),
+            SeedApplication::Immediate
+        );
+    }
+
+    #[test]
+    fn resolve_seed_target_parked_when_swap_not_caught_up() {
+        assert_eq!(resolve_seed_target("s2", "s1"), SeedApplication::Parked);
     }
 }

@@ -163,8 +163,18 @@ pub fn ChatWindow(
     let mut show_delete_confirm_modal = use_signal(|| false);
     let mut pending_delete_message_id = use_signal(|| None::<String>);
     let mut delete_message_count = use_signal(|| 0);
-    let mut has_new_comments = use_signal(|| false);
-    let mut has_pending_approvals = use_signal(|| false);
+    // Per-session, not global: a comment or an approval belongs to the tab it
+    // was made in, and both survive a tab switch while work is in flight.
+    let mut has_new_comments = use_signal(std::collections::HashSet::<String>::new);
+    let mut has_pending_approvals = use_signal(std::collections::HashSet::<String>::new);
+    // Tool-call message ids currently being executed by the approval effect.
+    // Approval-pending and executing calls are both `ToolCallStatus::Running`
+    // (the status enum is matched in ~190 places, so a new variant is not
+    // worth the churn), which means a second approval in the same session
+    // would otherwise re-collect a call already in flight and run it twice.
+    // Ids are claimed in the collecting write and released when the result
+    // lands.
+    let mut claimed_tool_calls = use_signal(std::collections::HashSet::<uuid::Uuid>::new);
     // Dismiss state for the small-context-window warning banner.
     let mut ctx_window_warning_dismissed = use_signal(|| false);
     use_context_provider(|| has_pending_approvals);
@@ -304,52 +314,67 @@ pub fn ChatWindow(
         }
     });
 
+    // Approved tool calls execute here, keyed by the session that OWNS them.
+    // The approval signal carries owning session ids, so a tab switch while an
+    // MCP call is in flight can never route the result into another chat.
     use_effect(move || {
-        if *has_pending_approvals.read() {
+        let pending: Vec<String> = has_pending_approvals.read().iter().cloned().collect();
+        if pending.is_empty() {
+            return;
+        }
+        // Clear up front; the re-run this write triggers sees an empty set.
+        has_pending_approvals.write().clear();
+
+        for owning_id in pending {
             spawn(async move {
                 let mut session_state = session_state;
                 let mcp_manager = mcp_manager;
-                let active_session_id = current_target_id.read().clone();
                 let mut tools_to_run = Vec::new();
 
                 // Indicate activity immediately
-                stream_manager.streaming_sessions.write().insert(active_session_id.clone());
+                stream_manager.streaming_sessions.write().insert(owning_id.clone());
+                *stream_manager.stream_activity.write() += 1;
                 // Approval given: the fleet row stops waiting right away
                 // (continuation would report too, but only after the tools run).
                 if crate::fleet::bridge::enabled() {
                     let name = session_state
                         .peek()
                         .sessions
-                        .get(&active_session_id)
+                        .get(&owning_id)
                         .map(|s| s.name.clone())
                         .unwrap_or_default();
                     crate::fleet::bridge::report(
-                        &active_session_id,
+                        &owning_id,
                         &name,
                         crate::fleet::bridge::HobbesSignal::TurnStarted,
                     );
                 }
-                // Clear the signal so we don't re-trigger loop
-                has_pending_approvals.set(false);
 
                 // 1. Identify tools that need to be run and capture profile context
-                let active_session_id_inner = active_session_id.clone();
                 let composio_profile = {
                     let state = session_state.read();
                     state
                         .sessions
-                        .get(&active_session_id_inner)
+                        .get(&owning_id)
                         .and_then(|s| s.composio_profile.clone())
                 };
 
                 {
                     let state = session_state.read();
-                    if let Some(session) = state.sessions.get(&active_session_id) {
+                    // Claim each call in the same write that collects it: two
+                    // approvals landing for one session both scan for
+                    // `Running` calls, and without a claim the second would
+                    // re-execute calls the first is already running. `insert`
+                    // returning false means someone else owns this one.
+                    let mut claimed = claimed_tool_calls.write();
+                    if let Some(session) = state.sessions.get(&owning_id) {
                         for msg in &session.messages {
                             if let crate::components::shared::MessageContent::ToolCall(tc) =
                                 &msg.content
                             {
-                                if tc.status == crate::components::shared::ToolCallStatus::Running {
+                                if tc.status == crate::components::shared::ToolCallStatus::Running
+                                    && claimed.insert(msg.id)
+                                {
                                     tools_to_run.push((msg.id, tc.clone()));
                                 }
                             }
@@ -360,10 +385,11 @@ pub fn ChatWindow(
                 if tools_to_run.is_empty() {
                     // This could be a Skill continuation (no tools to run).
                     // Reset streaming state since we won't be executing any tools
-                    stream_manager.streaming_sessions.write().remove(&active_session_id);
+                    stream_manager.streaming_sessions.write().remove(&owning_id);
+                    *stream_manager.stream_activity.write() += 1;
                     // Clear this session's in-flight guard before re-triggering
-                    continuation_controller.write().clear_in_flight(&active_session_id);
-                    continuation_controller.write().trigger_continuation(active_session_id.clone());
+                    continuation_controller.write().clear_in_flight(&owning_id);
+                    continuation_controller.write().trigger_continuation(owning_id.clone());
                     return;
                 }
 
@@ -387,7 +413,7 @@ pub fn ChatWindow(
                         },
                         &tool_call,
                         &args_json,
-                        &active_session_id,
+                        &owning_id,
                         composio_profile.as_ref(),
                     )
                     .await;
@@ -402,9 +428,9 @@ pub fn ChatWindow(
                             // for every tool (trust gate + decision log).
                             let session_ctx = {
                                 let state = session_state.peek();
-                                state.sessions.get(&active_session_id).map(|s| {
+                                state.sessions.get(&owning_id).map(|s| {
                                     crate::mcp::terminal_client::TerminalCtx {
-                                        session_id: active_session_id.clone(),
+                                        session_id: owning_id.clone(),
                                         cwd: crate::mcp::terminal_client::resolve_session_cwd(
                                             s,
                                             &planner_state.peek(),
@@ -442,7 +468,7 @@ pub fn ChatWindow(
 
                         // Update message status
                         let mut result_snapshot: Option<crate::components::chat::Message> = None;
-                        if let Some(msg) = state.get_message_mut(&msg_id) {
+                        if let Some(msg) = state.get_message_mut_in_session(&owning_id, &msg_id) {
                             if let crate::components::shared::MessageContent::ToolCall(tc) =
                                 &mut msg.content
                             {
@@ -452,27 +478,30 @@ pub fn ChatWindow(
                             }
                         }
                         if let Some(message) = result_snapshot {
-                            log_event(&active_session_id, SessionEvent::ToolResult { message });
+                            log_event(&owning_id, SessionEvent::ToolResult { message });
                         }
 
-                        // Add to history for context
-                        state
-                            .tool_call_history
-                            .push(crate::components::shared::ToolCallRecord {
-                                call: tool_call.clone(),
-                                result: crate::components::shared::ToolResult {
-                                    status,
-                                    response: response_str,
-                                },
-                                profile_color: {
-                                    let settings_read = settings.read();
-                                    crate::components::shared::resolve_profile_color(
-                                        composio_profile.as_ref(),
-                                        &settings_read,
-                                    )
-                                },
-                            });
+                        // Add to the OWNING session's history for context
+                        let record = crate::components::shared::ToolCallRecord {
+                            call: tool_call.clone(),
+                            result: crate::components::shared::ToolResult {
+                                status,
+                                response: response_str,
+                            },
+                            profile_color: {
+                                let settings_read = settings.read();
+                                crate::components::shared::resolve_profile_color(
+                                    composio_profile.as_ref(),
+                                    &settings_read,
+                                )
+                            },
+                        };
+                        if let Some(session) = state.sessions.get_mut(&owning_id) {
+                            session.tool_call_history.push(record);
+                        }
                     }
+                    // Result written — the call is no longer in flight.
+                    claimed_tool_calls.write().remove(&msg_id);
 
                     // Built-ins that mutate durable session state (scratchpad,
                     // skills, timers) must survive a restart; pagination is
@@ -483,7 +512,7 @@ pub fn ChatWindow(
                 }
 
                 // 3. Trigger continuation to send results back to LLM
-                continuation_controller.write().trigger_continuation(active_session_id.clone());
+                continuation_controller.write().trigger_continuation(owning_id.clone());
             });
         }
     });
@@ -533,8 +562,10 @@ pub fn ChatWindow(
         }
     };
 
+    // `target_id` is explicit: a queued message can drain into a BACKGROUND
+    // session, so the send path must never infer its target from the active tab.
     let send_message = std::rc::Rc::new(
-        move |(user_message, attachments): (String, Vec<Attachment>)| {
+        move |(user_message, attachments, target_id): (String, Vec<Attachment>, String)| {
             spawn({
                 let mut session_state = session_state;
                 let settings = settings;
@@ -545,15 +576,17 @@ pub fn ChatWindow(
 
                 async move {
                     let settings_read = settings.read().clone();
-                    let target_id = current_target_id.read().clone();
 
                     // Reset the AI turn count every time the user sends a message.
                     if let Some(session) = session_state.write().sessions.get_mut(&target_id) {
                         session.reset_turn_count();
                     }
 
-                    // Clear the tool call history to ensure a fresh start for the new turn.
-                    session_state.write().tool_call_history.clear();
+                    // Clear the target session's tool call history to ensure a
+                    // fresh start for the new turn (never other tabs').
+                    if let Some(session) = session_state.write().sessions.get_mut(&target_id) {
+                        session.tool_call_history.clear();
+                    }
 
                     // Check if the last message was the turn limit warning.
                     let last_message_was_warning = session_state.read().sessions.get(&target_id)
@@ -573,8 +606,8 @@ pub fn ChatWindow(
                     }
 
                     if user_message.trim().is_empty() && attachments.is_empty() {
-                        if *has_new_comments.read() {
-                            has_new_comments.set(false);
+                        if has_new_comments.read().contains(&target_id) {
+                            has_new_comments.write().remove(&target_id);
                             let hobbes_message_id = Uuid::new_v4();
                             {
                                 let mut state = session_state.write();
@@ -605,7 +638,7 @@ pub fn ChatWindow(
                                 let state = session_state.read();
                                 if let Some(session) = state.sessions.get(&target_id) {
                                     let builder =
-                                        PromptBuilder::new(session, &settings_read, &state)
+                                        PromptBuilder::new(session, &settings_read)
                                             .with_planner_today(
                                                 crate::todo::handlers::planner_today_context(
                                                     &planner_state.read(),
@@ -639,7 +672,7 @@ pub fn ChatWindow(
                         return;
                     }
 
-                    has_new_comments.set(false);
+                    has_new_comments.write().remove(&target_id);
 
                     let turn_count = session_state.read().sessions.get(&target_id)
                         .map(|s| s.current_ai_turn_count).unwrap_or(0);
@@ -747,7 +780,7 @@ pub fn ChatWindow(
                         let user_prompt = user_message.clone();
                         let state = session_state.read();
                         if let Some(session) = state.sessions.get(&target_id) {
-                            let builder = PromptBuilder::new(session, &settings_read, &state)
+                            let builder = PromptBuilder::new(session, &settings_read)
                                 .with_planner_today(crate::todo::handlers::planner_today_context(
                                     &planner_state.read(),
                                     &settings_read,
@@ -826,7 +859,7 @@ pub fn ChatWindow(
                 let (prompt_data, pages) = {
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&target_id) {
-                        let builder = PromptBuilder::new(session, &settings, &state)
+                        let builder = PromptBuilder::new(session, &settings)
                             .with_planner_today(crate::todo::handlers::planner_today_context(
                                 &planner_state.read(),
                                 &settings,
@@ -838,6 +871,11 @@ pub fn ChatWindow(
                         tracing::error!(
                             "Active session lost during continuation flow - aborting prompt build"
                         );
+                        // Clean up stale streaming entry if session was deleted mid-execution
+                        if stream_manager.streaming_sessions.read().contains(&target_id) {
+                            stream_manager.streaming_sessions.write().remove(&target_id);
+                            *stream_manager.stream_activity.write() += 1;
+                        }
                         return;
                     }
                 };
@@ -990,7 +1028,7 @@ pub fn ChatWindow(
             }
             stream_update_trigger.set(stream_update_trigger() + 1);
             crate::session::SessionState::save_async(&session_state.read(), None);
-            send_message((new_text, attachments));
+            send_message((new_text, attachments, session_id));
         }
     };
 
@@ -1099,6 +1137,18 @@ pub fn ChatWindow(
         show_forget_memory_modal.set(false);
     };
 
+    // Mirrors the active session's streaming state. A `use_signal` (not a
+    // `Signal::new` inside `rsx!`) so ChatInput sees one stable signal.
+    let mut is_sending = use_signal(|| false);
+    use_effect(move || {
+        // Belt-and-braces: re-run when stream_activity bumps. Real subscription is is_session_streaming.
+        let _ = stream_manager.stream_activity.read();
+        let streaming = stream_manager.is_session_streaming(&current_target_id.read());
+        if *is_sending.peek() != streaming {
+            is_sending.set(streaming);
+        }
+    });
+
     let session_guard = session.read();
 
     // Context window of the active session's connector, when it's small enough to
@@ -1144,15 +1194,18 @@ pub fn ChatWindow(
                     on_fork: fork_from_message,
                     on_edit_save: edit_message_save,
                     on_edit_resend: edit_message_resend,
-                    on_comment: move |_| has_new_comments.set(true),
+                    on_comment: move |_| {
+                        let sid = current_target_id.read().clone();
+                        has_new_comments.write().insert(sid);
+                    },
                 },
                 ChatInput {
-                    is_sending: Signal::new(stream_manager.is_session_streaming(&current_target_id.read())),
+                    is_sending: is_sending,
                     has_new_comments: has_new_comments,
                     has_pending_approvals: has_pending_approvals,
                     on_send: {
                         let send_message = send_message.clone();
-                        move |(msg, attachments)| send_message((msg, attachments))
+                        move |(msg, attachments, target)| send_message((msg, attachments, target))
                     },
                     on_cancel: move |_| cancel_message(),
                     on_interaction: on_interaction,

@@ -17,6 +17,39 @@ use crate::fleet::{self, AttentionKind, FleetSession, FleetStatus};
 use crate::fleet::FleetOrigin;
 use crate::todo::model::format_minutes;
 
+/// Whether a day-rollup LLM call is currently in flight. `on_rollup` runs the
+/// call in a root-owned `spawn_forever` task (not a component-scoped
+/// `spawn`) so navigating away from Fleet mid-generation doesn't cancel the
+/// up-to-90s request — but that means the task must not write into
+/// component-local `use_signal`s, which get dropped with the component.
+/// This (and its two siblings below) are the survives-unmount home for that
+/// state; `FleetView` reads them directly so re-entering Fleet shows the
+/// running/finished state instead of losing it.
+static FLEET_ROLLUP_RUNNING: GlobalSignal<bool> = Signal::global(|| false);
+/// Error from the most recent rollup attempt, if any.
+static FLEET_ROLLUP_ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
+/// A freshly generated rollup, staged here until some mount of `FleetView`
+/// picks it up (see the `use_effect` in `FleetView` that drains this). The
+/// meta-store write happens unconditionally inside the task regardless of
+/// whether anything is mounted to observe this signal.
+static FLEET_ROLLUP_FRESH: GlobalSignal<Option<fleet::briefs::DayRollup>> = Signal::global(|| None);
+
+/// Take the staged rollup, subscribing the caller to `FLEET_ROLLUP_FRESH`.
+///
+/// Must be called from inside a `use_effect`: only `.read()` registers the
+/// effect's reactive context (`.write()` notifies subscribers but subscribes
+/// nothing), so without the read a rollup finishing while Fleet is mounted
+/// would sit unseen until a remount. The read guard ends with its statement
+/// — holding one across the clearing `write()` panics ("already borrowed") —
+/// and the early return keeps an idle run from writing at all, since an
+/// unconditional write after the read would re-dirty the effect forever.
+fn take_fresh_rollup() -> Option<fleet::briefs::DayRollup> {
+    if FLEET_ROLLUP_FRESH.read().is_none() {
+        return None;
+    }
+    FLEET_ROLLUP_FRESH.write().take()
+}
+
 /// "just now" / "3m ago" / "2h ago" — fleet rows churn too fast for dates.
 fn age_label(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let mins = (now - t).num_minutes();
@@ -404,20 +437,30 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
         today
     });
     let mut rollup = use_signal(|| Option::<fleet::briefs::DayRollup>::None);
-    let mut rollup_running = use_signal(|| false);
-    let mut rollup_error = use_signal(|| Option::<String>::None);
     use_effect(move || {
         let d = viewing();
         rollup.set(load_rollup(d));
     });
+    // Pick up a rollup that finished (possibly while this view was
+    // unmounted, since `on_rollup` survives navigation via `spawn_forever`)
+    // and stage it into the locally-displayed signals.
+    use_effect(move || {
+        // `take_fresh_rollup` both subscribes this effect to the global
+        // (only a `.read()` does that) and clears the slot, without ever
+        // holding a read guard across the write.
+        if let Some(r) = take_fresh_rollup() {
+            viewing.set(r.date);
+            rollup.set(Some(r));
+        }
+    });
 
     let on_rollup = move |_| {
-        if *rollup_running.peek() {
+        if *FLEET_ROLLUP_RUNNING.peek() {
             return;
         }
-        rollup_running.set(true);
-        rollup_error.set(None);
-        spawn(async move {
+        *FLEET_ROLLUP_RUNNING.write() = true;
+        *FLEET_ROLLUP_ERROR.write() = None;
+        spawn_forever(async move {
             let s = settings.peek().clone();
             let outcome = async {
                 let instance = s
@@ -470,13 +513,18 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
             .await;
             match outcome {
                 Ok(r) => {
-                    // A fresh rollup is today's — snap the window to it.
-                    viewing.set(Local::now().date_naive());
-                    rollup.set(Some(r));
+                    // This task is root-owned (`spawn_forever`) and may
+                    // outlive the `FleetView` that started it — don't touch
+                    // its local `viewing`/`rollup` signals directly (they'd
+                    // be dropped along with the component if the user
+                    // navigated away). Stage the result globally instead;
+                    // the effect above picks it up on whichever mount is
+                    // current, including a fresh one on re-entry.
+                    *FLEET_ROLLUP_FRESH.write() = Some(r);
                 }
-                Err(e) => rollup_error.set(Some(e)),
+                Err(e) => *FLEET_ROLLUP_ERROR.write() = Some(e),
             }
-            rollup_running.set(false);
+            *FLEET_ROLLUP_RUNNING.write() = false;
         });
     };
 
@@ -550,9 +598,9 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
                     }
                     button {
                         class: "px-3 py-1 text-xs font-bold rounded bg-btn-primary hover:bg-btn-primary-hover transition-colors disabled:opacity-50 shrink-0",
-                        disabled: *rollup_running.read(),
+                        disabled: *FLEET_ROLLUP_RUNNING.read(),
                         onclick: on_rollup,
-                        if *rollup_running.read() { "Rolling up…" } else { "Roll up my day" }
+                        if *FLEET_ROLLUP_RUNNING.read() { "Rolling up…" } else { "Roll up my day" }
                     }
                 }
                 if *open.read() {
@@ -563,7 +611,7 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
                     }
                     BoostRibbon { date: viewing_day, today, now }
                 }
-                if let Some(err) = rollup_error.read().clone() {
+                if let Some(err) = FLEET_ROLLUP_ERROR.read().clone() {
                     p { class: "mt-2 text-xs text-red-400", "{err}" }
                 }
             }
@@ -802,6 +850,7 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
     let is_hobbes = session.origin == fleet::FleetOrigin::Hobbes;
     let session_id = session.id.clone();
     let toggle_id = session.id.clone();
+    let dismiss_id = session.id.clone();
 
     rsx! {
         div {
@@ -829,6 +878,21 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                     Icon { width: 16, height: 16, icon: fi_icons::FiMessageSquare }
                 } else {
                     Icon { width: 16, height: 16, icon: fi_icons::FiTerminal }
+                }
+                // Hide, hover-revealed like the tab-close idiom: the escape
+                // hatch for a card whose terminal went away without a
+                // SessionEnd (the sweeps never retire needs-attention rows).
+                // External only — Hobbes tabs leave the board when they close.
+                if !is_hobbes {
+                    button {
+                        class: "order-last shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-fg-muted hover:text-fg",
+                        title: "Hide this session from the fleet (it comes back on its next event)",
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            fleet::shared().dismiss_session(&dismiss_id);
+                        },
+                        Icon { width: 14, height: 14, icon: fi_icons::FiX }
+                    }
                 }
                 div {
                     class: "flex-1 min-w-0",
@@ -1135,6 +1199,113 @@ mod tests {
         assert_eq!(
             status_chip(&FleetStatus::NeedsAttention(AttentionKind::Gate)).0,
             "waiting on you"
+        );
+    }
+}
+
+/// Regression tests for the `ReviewBand` fresh-rollup drain effect.
+///
+/// The bug these pin down: inside a `use_effect`, only `.read()` registers
+/// the effect's reactive context. An effect whose body *only* writes a
+/// GlobalSignal runs once at mount and is never woken again, so a rollup
+/// that finished while Fleet was open stayed invisible until a remount.
+#[cfg(test)]
+mod fresh_rollup_effect_tests {
+    use super::*;
+    use dioxus::dioxus_core::NoOpMutations;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// One entry per run of the probe effect, holding what it took.
+        static SEEN: RefCell<Vec<Option<fleet::briefs::DayRollup>>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    fn rollup(day: &str) -> fleet::briefs::DayRollup {
+        fleet::briefs::DayRollup {
+            date: day.parse().unwrap(),
+            narrative: "narrative".to_string(),
+            generated_at: Utc::now(),
+            session_count: 1,
+            total_minutes: 30,
+        }
+    }
+
+    /// Mirrors `ReviewBand`'s drain effect, minus the local signals it
+    /// stages into: it calls the same helper and records the result.
+    #[allow(non_snake_case)]
+    fn RollupProbe() -> Element {
+        use_effect(|| {
+            let fresh = take_fresh_rollup();
+            SEEN.with(|s| s.borrow_mut().push(fresh));
+        });
+        rsx! {}
+    }
+
+    /// Pump the dom a bounded number of times so a missed wake-up fails the
+    /// assertion instead of hanging the test.
+    fn pump(dom: &mut VirtualDom) {
+        for _ in 0..8 {
+            dom.render_immediate(&mut NoOpMutations);
+        }
+    }
+
+    #[test]
+    fn rollup_staged_after_mount_is_picked_up() {
+        let mut dom = VirtualDom::new(RollupProbe);
+        dom.rebuild_in_place();
+        pump(&mut dom);
+
+        assert_eq!(
+            SEEN.with(|s| s.borrow().len()),
+            1,
+            "effect should run once at mount"
+        );
+        assert!(SEEN.with(|s| s.borrow()[0].is_none()));
+
+        // What the `spawn_forever` rollup task does when it finishes while
+        // Fleet is still mounted.
+        dom.in_runtime(|| {
+            *FLEET_ROLLUP_FRESH.write() = Some(rollup("2026-09-09"));
+        });
+        pump(&mut dom);
+
+        let shape: Vec<bool> = SEEN.with(|s| s.borrow().iter().map(|r| r.is_some()).collect());
+        let picked = SEEN.with(|s| {
+            s.borrow()
+                .iter()
+                .filter_map(|r| r.as_ref().map(|r| r.date.to_string()))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            picked,
+            vec!["2026-09-09".to_string()],
+            "a write after mount must re-run the effect (only .read() subscribes); runs were {shape:?}"
+        );
+        dom.in_runtime(|| {
+            assert!(
+                FLEET_ROLLUP_FRESH.read().is_none(),
+                "the drain must clear the staging slot"
+            );
+        });
+    }
+
+    #[test]
+    fn idle_effect_runs_do_not_loop_forever() {
+        let mut dom = VirtualDom::new(RollupProbe);
+        dom.rebuild_in_place();
+        pump(&mut dom);
+        dom.in_runtime(|| {
+            *FLEET_ROLLUP_FRESH.write() = Some(rollup("2026-09-09"));
+        });
+        pump(&mut dom);
+
+        // Mount run + the drain run. If the drain wrote unconditionally it
+        // would re-dirty its own subscription and spin.
+        let runs = SEEN.with(|s| s.borrow().len());
+        assert!(
+            runs <= 3,
+            "effect should settle after draining, ran {runs} times"
         );
     }
 }

@@ -39,6 +39,8 @@ pub const META_WINDOW_WIDTH: &str = "window_width";
 pub const META_WINDOW_HEIGHT: &str = "window_height";
 pub const META_LIFETIME_COST: &str = "lifetime_cost";
 pub const META_LIFETIME_TOKENS: &str = "lifetime_tokens";
+/// Legacy: the pre-per-session global tool-call-history blob. No longer
+/// written; `SessionState::load` deletes any surviving row.
 pub const META_TOOL_CALL_HISTORY: &str = "tool_call_history";
 const META_JSON_MIGRATED: &str = "migrated_from_json";
 
@@ -250,8 +252,6 @@ fn import_json_files(
                 meta_set_conn(conn, META_WINDOW_HEIGHT, &state.window_height.to_string(), next_seq())?;
                 meta_set_conn(conn, META_LIFETIME_COST, &state.lifetime_cost.to_string(), next_seq())?;
                 meta_set_conn(conn, META_LIFETIME_TOKENS, &state.lifetime_tokens.to_string(), next_seq())?;
-                let tch = serde_json::to_string(&state.tool_call_history).unwrap_or_else(|_| "[]".into());
-                meta_set_conn(conn, META_TOOL_CALL_HISTORY, &tch, next_seq())?;
                 Ok(())
             })();
             tx_result.map_err(|e| format!("import sessions.json rows: {e}"))?;
@@ -456,15 +456,6 @@ pub fn forget_fingerprint(id: &str) {
     fingerprints().lock().unwrap().remove(id);
 }
 
-/// Generic fingerprint check for non-session blobs (e.g. tool-call history).
-pub fn blob_changed(key: &str, data: &str) -> bool {
-    fingerprints().lock().unwrap().get(key) != Some(&hash_bytes(data))
-}
-
-pub fn mark_blob_saved(key: &str, data: &str) {
-    fingerprints().lock().unwrap().insert(key.to_string(), hash_bytes(data));
-}
-
 /// Write rows + meta entries atomically. Called on a blocking thread.
 /// Meta seqs are assigned at collect time (see `collect_meta_kv`) so an older
 /// snapshot whose write lands later cannot overwrite newer meta. Rows whose
@@ -523,6 +514,15 @@ pub fn meta_get(key: &str) -> Option<String> {
 pub fn meta_set(key: &str, value: &str) -> Result<(), String> {
     let seq = next_seq();
     with_conn(|conn| meta_set_conn(conn, key, value, seq))
+}
+
+/// Remove one meta key. Used to retire legacy keys (the pre-per-session
+/// global `tool_call_history` blob); missing keys are a no-op.
+pub fn meta_delete(key: &str) {
+    let _ = with_conn(|conn| {
+        conn.execute("DELETE FROM meta WHERE key = ?1", params![key])?;
+        Ok(())
+    });
 }
 
 
@@ -840,11 +840,31 @@ pub fn prepare_event_rows(session_id: &str, events: &[SessionEvent]) -> Vec<Sess
 fn insert_event_rows_conn(conn: &Connection, rows: &[SessionEventRow]) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
     {
+        // A tombstoned session's journal must not grow again: a stream that
+        // is still running when its tab is deleted keeps producing events
+        // (StreamCancelled, tool results, ...) after `delete_session` already
+        // dropped the row and its journal.
+        //
+        // RESURRECTION ASYMMETRY (deliberate). `write_rows_and_meta` drops
+        // only rows collected *before* the tombstone and treats a newer row
+        // as a re-create (clearing the tombstone). Event rows do carry a seq
+        // from the same counter, so the same seq comparison is available —
+        // but it is the wrong rule here, because the post-delete events this
+        // guard exists to stop are exactly the ones with a seq *newer* than
+        // the tombstone. An event is never itself evidence of a re-create,
+        // so while the tombstone stands every event for that id is dropped
+        // regardless of seq. Nothing is lost forever: a genuine re-create of
+        // the id writes a session row, and that write clears the tombstone,
+        // after which the journal accepts events again.
+        let tombs = tombstones().lock().unwrap();
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO session_events (session_id, seq, ts, kind, payload)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
         for row in rows {
+            if tombs.contains_key(&row.session_id) {
+                continue;
+            }
             stmt.execute(params![row.session_id, row.seq, row.ts, row.kind, row.payload])?;
         }
     }
@@ -1078,10 +1098,20 @@ pub mod test_support {
     use super::*;
 
     /// Run store logic against an isolated in-memory database.
+    ///
+    /// The tombstone map is process-wide, so a test that deletes a session
+    /// would otherwise leak its tombstone into every later test's writes
+    /// (silently dropping their rows and events). Clear it per test.
     pub fn with_test_db<T>(f: impl FnOnce(&Connection) -> T) -> T {
+        clear_tombstones();
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn).unwrap();
         f(&conn)
+    }
+
+    /// Drop every delete tombstone. Tests only — see `with_test_db`.
+    pub fn clear_tombstones() {
+        tombstones().lock().unwrap().clear();
     }
 
     pub fn upsert(conn: &Connection, session: &Session) {
@@ -1187,6 +1217,10 @@ pub mod test_support {
     }
 
     pub fn delete_session_for_test(conn: &Connection, id: &str) -> Option<(f64, i64)> {
+        // Mirror the public `delete_session()` exactly: forget fingerprint,
+        // insert tombstone, then delete the row and events.
+        forget_fingerprint(id);
+        tombstones().lock().unwrap().insert(id.to_string(), next_seq());
         delete_session_conn(conn, id).unwrap()
     }
 
@@ -1384,6 +1418,33 @@ mod event_tests {
         });
     }
 
+    /// A stream still writing to a deleted session must not be able to
+    /// resurrect its journal: events appended after `delete_session` are
+    /// silently dropped, not just ones collected before the delete.
+    #[test]
+    fn test_orphan_events_after_delete_are_dropped() {
+        with_test_db(|conn| {
+            let mut state = crate::session::SessionState::default();
+            let sid = state.create_session_raw(None);
+            upsert(conn, state.sessions.get(&sid).unwrap());
+
+            append_events_conn(conn, &sid, &[SessionEvent::ScratchpadSet { content: "before".into() }]);
+            assert_eq!(event_count(conn, &sid), 1);
+
+            delete_session_for_test(conn, &sid);
+            assert_eq!(event_count(conn, &sid), 0);
+
+            // A stream that was mid-flight when the tab was deleted keeps
+            // producing events for the now-tombstoned session id.
+            append_events_conn(conn, &sid, &[SessionEvent::ScratchpadSet { content: "orphan".into() }]);
+            assert_eq!(
+                event_count(conn, &sid),
+                0,
+                "events appended after delete must not be written"
+            );
+        });
+    }
+
     /// seed_seq must account for the events table's high-water mark, or a
     /// fresh process would mint seqs below already-journaled rows.
     #[test]
@@ -1402,6 +1463,31 @@ mod event_tests {
             assert!(
                 fresh > high,
                 "seq counter must clear the events high-water mark (got {fresh}, high {high})"
+            );
+        });
+    }
+
+    /// delete_session_for_test must forget fingerprints like the real delete,
+    /// so a re-created session is not masked as clean by a stale fingerprint.
+    #[test]
+    fn test_delete_for_test_forgets_fingerprint() {
+        with_test_db(|conn| {
+            let mut state = crate::session::SessionState::default();
+            let sid = state.create_session_raw(None);
+            upsert(conn, state.sessions.get(&sid).unwrap());
+
+            // Create a fingerprint by marking the row as saved.
+            let row = build_row(state.sessions.get(&sid).unwrap(), next_seq()).unwrap();
+            mark_rows_saved(std::slice::from_ref(&row));
+            assert!(fingerprints().lock().unwrap().contains_key(&sid), "fingerprint must exist after mark_rows_saved");
+
+            // Delete the session.
+            delete_session_for_test(conn, &sid);
+
+            // Fingerprint must be gone.
+            assert!(
+                !fingerprints().lock().unwrap().contains_key(&sid),
+                "fingerprint must be forgotten after delete"
             );
         });
     }

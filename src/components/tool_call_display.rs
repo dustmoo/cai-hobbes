@@ -206,20 +206,46 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
     }
 }
 
+/// The message carrying this execution id, within one session.
+fn message_mut_by_execution_id<'a>(
+    session: &'a mut crate::session::Session,
+    execution_id: &str,
+) -> Option<&'a mut crate::components::chat::Message> {
+    session.messages.iter_mut().find(|m| match &m.content {
+        super::shared::MessageContent::ToolCall(tc) => tc.execution_id == execution_id,
+        super::shared::MessageContent::PermissionRequest(tc) => tc.execution_id == execution_id,
+        _ => false,
+    })
+}
+
 #[derive(Props, Clone, PartialEq)]
 pub struct PermissionPromptProps {
     pub tool_call: ToolCall,
+    /// The session id of the tab this prompt is rendered in. MessageList only
+    /// ever renders a PermissionPrompt for the active session's own messages
+    /// (via SessionIdContext), so a click on this prompt can only ever be a
+    /// click on the tab it's displayed in — that visible tab is the owner.
+    /// Captured from context at click time, so the result still routes
+    /// correctly even if the user switches tabs before clicking.
+    pub session_id: String,
 }
 
 #[component]
 pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let has_pending_approvals = consume_context::<Signal<bool>>();
+    // Carries the session ids whose approved tool calls are ready to run — the
+    // approving tab owns the call even if the user switches away mid-flight.
+    let has_pending_approvals =
+        consume_context::<Signal<std::collections::HashSet<String>>>();
     let mut settings = consume_context::<Signal<crate::settings::Settings>>();
     let settings_manager = consume_context::<Signal<crate::settings::SettingsManager>>();
     let planner = consume_context::<Signal<crate::todo::PlannerState>>();
     let tool_call = props.tool_call.clone();
     let tool_call_deny = tool_call.clone();
+    // Captured from the visible tab's context at click time (see doc comment
+    // on PermissionPromptProps::session_id) — this IS the owning session.
+    let owning_session_id_deny = props.session_id.clone();
+    let owning_session_id_approve = props.session_id.clone();
 
     // Trust-rule authoring context: what a rule created from THIS prompt
     // would cover. Terminal execs get a command-prefix rule (first two
@@ -402,16 +428,29 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                         // Deny: Convert to error/skipped state so UI can clean up
                         spawn({
                             let tool_call_deny = tool_call_deny.clone();
+                            let owning_session_id = owning_session_id_deny.clone();
                             let mut session_state = session_state;
                             async move {
                                 {
                                     let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_by_execution_id(&tool_call_deny.execution_id) {
-                                        if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
-                                            let mut denied_tc = tc.clone();
-                                            denied_tc.status = ToolCallStatus::Error;
-                                            denied_tc.response = "Denied by user.".to_string();
-                                            msg.content = super::shared::MessageContent::ToolCall(denied_tc);
+                                    match state.sessions.get_mut(&owning_session_id) {
+                                        Some(session) => {
+                                            if let Some(msg) = message_mut_by_execution_id(
+                                                session,
+                                                &tool_call_deny.execution_id,
+                                            ) {
+                                                if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
+                                                    let mut denied_tc = tc.clone();
+                                                    denied_tc.status = ToolCallStatus::Error;
+                                                    denied_tc.response = "Denied by user.".to_string();
+                                                    msg.content = super::shared::MessageContent::ToolCall(denied_tc);
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            tracing::warn!(
+                                                "PermissionPrompt deny: session {owning_session_id} not found in state; dropping instead of scanning"
+                                            );
                                         }
                                     }
                                 }
@@ -423,6 +462,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 button {
                     class: "px-4 py-2 rounded-md bg-green-600 text-fg hover:bg-green-500",
                     onclick: move |_| {
+                        let owning_session_id = owning_session_id_approve.clone();
                         // Author the rule first (when asked), then approve.
                         if *make_rule.peek() {
                             let rule = crate::context::permissions::TrustRule {
@@ -454,21 +494,45 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                         // The lifecycle (Submit button) will handle actual execution
                         spawn({
                             let tool_call = tool_call.clone();
+                            let owning_session_id = owning_session_id.clone();
                             let mut session_state = session_state;
                             let mut has_pending_approvals = has_pending_approvals;
                             async move {
-                                {
+                                // The owning session is the tab this prompt is
+                                // rendered in (captured from context at click
+                                // time, see PermissionPromptProps::session_id) —
+                                // the executor may run after the user has
+                                // switched tabs, so this must not be re-derived
+                                // from the (possibly now-different) active tab.
+                                let found = {
                                     let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_by_execution_id(&tool_call.execution_id) {
-                                        if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
-                                            let mut approved_tc = tc.clone();
-                                            approved_tc.status = ToolCallStatus::Running;
-                                            msg.content = super::shared::MessageContent::ToolCall(approved_tc);
+                                    match state.sessions.get_mut(&owning_session_id) {
+                                        Some(session) => {
+                                            if let Some(msg) = message_mut_by_execution_id(
+                                                session,
+                                                &tool_call.execution_id,
+                                            ) {
+                                                if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
+                                                    let mut approved_tc = tc.clone();
+                                                    approved_tc.status = ToolCallStatus::Running;
+                                                    msg.content = super::shared::MessageContent::ToolCall(approved_tc);
+                                                }
+                                            }
+                                            true
+                                        }
+                                        None => {
+                                            tracing::warn!(
+                                                "PermissionPrompt approve: session {owning_session_id} not found in state; dropping instead of scanning"
+                                            );
+                                            false
                                         }
                                     }
+                                };
+                                // Signal that this session has approved tools
+                                // ready for execution.
+                                if found {
+                                    has_pending_approvals.write().insert(owning_session_id);
                                 }
-                                // Signal that there are approved tools ready for execution
-                                has_pending_approvals.set(true);
                             }
                         });
                     },
@@ -476,5 +540,127 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::message_mut_by_execution_id;
+    use crate::components::chat::Message;
+    use crate::components::shared::{MessageContent, ToolCall, ToolCallStatus};
+    use crate::session::{Session, SessionState};
+
+    fn new_session() -> (SessionState, String) {
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        (state, id)
+    }
+
+    fn tool_call_message(execution_id: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4(),
+            author: "Hobbes".to_string(),
+            content: MessageContent::ToolCall(ToolCall {
+                execution_id: execution_id.to_string(),
+                server_name: "test-server".to_string(),
+                tool_name: "test-tool".to_string(),
+                status: ToolCallStatus::Completed,
+                ..Default::default()
+            }),
+            attachments: vec![],
+            comments: vec![],
+            created_at: chrono::Utc::now(),
+            usage: None,
+        }
+    }
+
+    fn permission_request_message(execution_id: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4(),
+            author: "Hobbes".to_string(),
+            content: MessageContent::PermissionRequest(ToolCall {
+                execution_id: execution_id.to_string(),
+                server_name: "test-server".to_string(),
+                tool_name: "test-tool".to_string(),
+                status: ToolCallStatus::Running,
+                ..Default::default()
+            }),
+            attachments: vec![],
+            comments: vec![],
+            created_at: chrono::Utc::now(),
+            usage: None,
+        }
+    }
+
+    fn text_message(text: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4(),
+            author: "User".to_string(),
+            content: MessageContent::Text {
+                content: text.to_string(),
+                thought_signature: None,
+                thought_summary: None,
+            },
+            attachments: vec![],
+            comments: vec![],
+            created_at: chrono::Utc::now(),
+            usage: None,
+        }
+    }
+
+    fn session_with_messages(messages: Vec<Message>) -> (SessionState, String) {
+        let (mut state, id) = new_session();
+        {
+            let session: &mut Session = state.sessions.get_mut(&id).unwrap();
+            session.messages = messages;
+        }
+        (state, id)
+    }
+
+    #[test]
+    fn finds_tool_call_by_execution_id() {
+        let (mut state, id) = session_with_messages(vec![
+            text_message("hello"),
+            tool_call_message("exec-1"),
+        ]);
+        let session = state.sessions.get_mut(&id).unwrap();
+        let found = message_mut_by_execution_id(session, "exec-1");
+        assert!(found.is_some());
+        match &found.unwrap().content {
+            MessageContent::ToolCall(tc) => assert_eq!(tc.execution_id, "exec-1"),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finds_permission_request_by_execution_id() {
+        let (mut state, id) = session_with_messages(vec![
+            text_message("hello"),
+            permission_request_message("exec-2"),
+        ]);
+        let session = state.sessions.get_mut(&id).unwrap();
+        let found = message_mut_by_execution_id(session, "exec-2");
+        assert!(found.is_some());
+        match &found.unwrap().content {
+            MessageContent::PermissionRequest(tc) => assert_eq!(tc.execution_id, "exec-2"),
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn returns_none_for_text_message() {
+        let (mut state, id) = session_with_messages(vec![text_message("just text")]);
+        let session = state.sessions.get_mut(&id).unwrap();
+        assert!(message_mut_by_execution_id(session, "exec-3").is_none());
+    }
+
+    #[test]
+    fn returns_none_for_unknown_execution_id() {
+        let (mut state, id) = session_with_messages(vec![
+            tool_call_message("exec-known"),
+            permission_request_message("exec-known-2"),
+        ]);
+        let session = state.sessions.get_mut(&id).unwrap();
+        assert!(message_mut_by_execution_id(session, "exec-unknown").is_none());
     }
 }

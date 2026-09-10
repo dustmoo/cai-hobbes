@@ -33,11 +33,8 @@ fn create_test_session() -> Session {
         current_ai_turn_count: 0,
         watch_word_recovery_count: 0,
         scheduled_timers: Vec::new(),
+        tool_call_history: Vec::new(),
     }
-}
-
-fn create_test_session_state() -> crate::session::SessionState {
-    crate::session::SessionState::default()
 }
 
 #[test]
@@ -45,7 +42,6 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
     use crate::settings::ComposioProfile;
 
     let session = create_test_session();
-    let session_state = create_test_session_state();
 
     let settings = Settings {
         composio_profiles: vec![ComposioProfile {
@@ -59,7 +55,7 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
         ..Default::default()
     };
 
-    let builder = PromptBuilder::new(&session, &settings, &session_state);
+    let builder = PromptBuilder::new(&session, &settings);
     let prompt = builder.build_prompt("Hello".to_string());
 
     // Extract the system instruction text
@@ -85,7 +81,6 @@ fn test_composio_context_not_injected_when_profile_missing_api_key() {
     use crate::settings::ComposioProfile;
 
     let session = create_test_session();
-    let session_state = create_test_session_state();
 
     let settings = Settings {
         composio_profiles: vec![ComposioProfile {
@@ -97,7 +92,7 @@ fn test_composio_context_not_injected_when_profile_missing_api_key() {
         ..Default::default()
     };
 
-    let builder = PromptBuilder::new(&session, &settings, &session_state);
+    let builder = PromptBuilder::new(&session, &settings);
     let prompt = builder.build_prompt("Hello".to_string());
 
     let full_text = prompt.prompt.system.expect("Should have system instruction");
@@ -114,7 +109,6 @@ fn test_composio_context_not_injected_when_profile_missing_user_id() {
     use crate::settings::ComposioProfile;
 
     let session = create_test_session();
-    let session_state = create_test_session_state();
 
     let settings = Settings {
         composio_profiles: vec![ComposioProfile {
@@ -126,7 +120,7 @@ fn test_composio_context_not_injected_when_profile_missing_user_id() {
         ..Default::default()
     };
 
-    let builder = PromptBuilder::new(&session, &settings, &session_state);
+    let builder = PromptBuilder::new(&session, &settings);
     let prompt = builder.build_prompt("Hello".to_string());
 
     let full_text = prompt.prompt.system.expect("Should have system instruction");
@@ -144,7 +138,6 @@ fn test_oversized_entities_stripped_from_system_context() {
     use crate::session::ConversationSummaryEntities;
 
     let mut session = create_test_session();
-    let session_state = create_test_session_state();
     let settings = Settings::default();
 
     // Inject a conversation summary with both normal and oversized entities
@@ -167,7 +160,7 @@ fn test_oversized_entities_stripped_from_system_context() {
         },
     };
 
-    let builder = PromptBuilder::new(&session, &settings, &session_state);
+    let builder = PromptBuilder::new(&session, &settings);
     let prompt = builder.build_prompt("Hello".to_string());
 
     let full_text = prompt.prompt.system.expect("Should have system instruction");
@@ -376,8 +369,7 @@ fn current_turn_tool_result_not_condensed_on_large_window() {
     ];
 
     let settings = Settings::default();
-    let state = create_test_session_state();
-    let builder = PromptBuilder::new(&session, &settings, &state);
+    let builder = PromptBuilder::new(&session, &settings);
     let prompt = builder.build_prompt(String::new());
 
     let tool_text = tool_result_text(&prompt);
@@ -409,8 +401,7 @@ fn historical_tool_result_paginated_on_small_window() {
     settings.openai_compat_config.endpoint = "http://localhost:11434/v1".to_string();
     settings.openai_compat_config.max_context_tokens = Some(16_000);
 
-    let state = create_test_session_state();
-    let builder = PromptBuilder::new(&session, &settings, &state);
+    let builder = PromptBuilder::new(&session, &settings);
     let prompt = builder.build_prompt(String::new());
 
     let tool_text = tool_result_text(&prompt);
@@ -440,8 +431,7 @@ fn historical_tool_result_uses_summary_when_available() {
     settings.openai_compat_config.endpoint = "http://localhost:11434/v1".to_string();
     settings.openai_compat_config.max_context_tokens = Some(16_000);
 
-    let state = create_test_session_state();
-    let builder = PromptBuilder::new(&session, &settings, &state);
+    let builder = PromptBuilder::new(&session, &settings);
     let prompt = builder.build_prompt(String::new());
 
     let tool_text = tool_result_text(&prompt);
@@ -522,11 +512,10 @@ fn test_available_skills_gated_by_running_skill() {
         disable_model_invocation: false,
     }]);
     let settings = Settings::default();
-    let state = create_test_session_state();
 
     // 1. Idle session → skills advertised, loader tool present
     let session = session_with_core_tools();
-    let prompt = PromptBuilder::new(&session, &settings, &state).build_prompt("Hi".to_string());
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt("Hi".to_string());
     let system = prompt.prompt.system.clone().unwrap();
     assert!(system.contains("available_skills"), "idle: skills advertised");
     assert!(
@@ -544,7 +533,7 @@ fn test_available_skills_gated_by_running_skill() {
         user_text_msg("/news"),
         tool_call_msg("search", "results".to_string(), None),
     ];
-    let prompt = PromptBuilder::new(&session, &settings, &state).build_prompt(String::new());
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt(String::new());
     let system = prompt.prompt.system.clone().unwrap();
     assert!(
         !system.contains("available_skills"),
@@ -564,7 +553,7 @@ fn test_available_skills_gated_by_running_skill() {
         user_text_msg("check the news"),
         tool_call_msg("HOBBES_INVOKE_SKILL", "manual...".to_string(), None),
     ];
-    let prompt = PromptBuilder::new(&session, &settings, &state).build_prompt(String::new());
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt(String::new());
     assert!(
         !prompt.prompt.system.clone().unwrap().contains("available_skills"),
         "just-loaded: no other skills advertised"
@@ -577,7 +566,7 @@ fn test_available_skills_gated_by_running_skill() {
     // 4. No skills on disk → loader tool withheld even when idle
     set_available_skills_for_test(vec![]);
     let session = session_with_core_tools();
-    let prompt = PromptBuilder::new(&session, &settings, &state).build_prompt("Hi".to_string());
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt("Hi".to_string());
     assert!(
         !prompt.prompt.system.clone().unwrap().contains("available_skills"),
         "no skills: nothing advertised"
@@ -610,7 +599,6 @@ fn session_with_planner_tools() -> Session {
 #[test]
 fn planner_today_block_is_injected_when_attached() {
     let session = create_test_session();
-    let state = create_test_session_state();
     let settings = Settings::default();
 
     let planner = crate::todo::PlannerState::default();
@@ -618,7 +606,7 @@ fn planner_today_block_is_injected_when_attached() {
     let block = crate::todo::handlers::planner_today_context(&planner, &settings, today);
     assert!(block.is_some(), "enabled by default");
 
-    let prompt = PromptBuilder::new(&session, &settings, &state)
+    let prompt = PromptBuilder::new(&session, &settings)
         .with_planner_today(block)
         .build_prompt("Hi".to_string());
     let system = prompt.prompt.system.unwrap();
@@ -626,17 +614,16 @@ fn planner_today_block_is_injected_when_attached() {
     assert!(system.contains("HOBBES_PLAN_DAY"), "instruction names the tools");
 
     // Without the attachment (the default) nothing is injected.
-    let prompt = PromptBuilder::new(&session, &settings, &state).build_prompt("Hi".to_string());
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt("Hi".to_string());
     assert!(!prompt.prompt.system.unwrap().contains("planner_today"));
 }
 
 #[test]
 fn planner_tools_are_withheld_when_the_planner_is_disabled() {
-    let state = create_test_session_state();
     let session = session_with_planner_tools();
 
     let enabled = Settings::default();
-    let prompt = PromptBuilder::new(&session, &enabled, &state).build_prompt("Hi".to_string());
+    let prompt = PromptBuilder::new(&session, &enabled).build_prompt("Hi".to_string());
     assert!(
         prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_TODO_CREATE"),
         "enabled: planner tools advertised"
@@ -646,7 +633,7 @@ fn planner_tools_are_withheld_when_the_planner_is_disabled() {
         planner_enabled: false,
         ..Default::default()
     };
-    let prompt = PromptBuilder::new(&session, &disabled, &state).build_prompt("Hi".to_string());
+    let prompt = PromptBuilder::new(&session, &disabled).build_prompt("Hi".to_string());
     for tool in [
         "HOBBES_TODO_CREATE",
         "HOBBES_TODO_UPDATE",

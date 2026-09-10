@@ -97,7 +97,7 @@ impl<'a> PromptBuilder<'a> {
             }
         }
 
-        if self.session_state.tool_call_history.iter().any(|r| {
+        if self.session.tool_call_history.iter().any(|r| {
             matches!(
                 r.result.status,
                 crate::components::shared::ToolCallStatus::Error

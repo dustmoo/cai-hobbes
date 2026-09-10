@@ -18,8 +18,8 @@ impl ToolCallSummarizer {
         _settings: &Settings,
         session_id: &str,
     ) {
-        let history = std::mem::take(&mut session_state.tool_call_history);
         if let Some(session) = session_state.sessions.get_mut(session_id) {
+            let history = std::mem::take(&mut session.tool_call_history);
             for (counter, record) in history.into_iter().enumerate() {
                 let summary = format!(
                     "Tool call '{}' on server '{}' finished with status '{}'.",
@@ -96,7 +96,12 @@ mod tests {
                 },
                 profile_color: None,
             };
-            session_state.tool_call_history.push(record);
+            session_state
+                .sessions
+                .get_mut(&session_id)
+                .unwrap()
+                .tool_call_history
+                .push(record);
         }
 
         let summarizer = ToolCallSummarizer::new();
@@ -121,5 +126,54 @@ mod tests {
         for i in 10..30 {
             assert!(session_ref.active_context.extra.contains_key(&format!("tool_snapshot_exec_{}", i)));
         }
+    }
+
+    /// Regression: tool-call history is per-session. Draining one tab's
+    /// history at turn end must leave a concurrently streaming tab's
+    /// in-flight history untouched.
+    #[tokio::test]
+    async fn test_history_is_isolated_per_session() {
+        let mut session_state = SessionState::default();
+        let settings = Settings::default();
+        let session_a = session_state.create_session_raw(None);
+        let session_b = session_state.create_session_raw(None);
+
+        let record = |name: &str| ToolCallRecord {
+            call: ToolCall {
+                execution_id: format!("exec_{name}"),
+                server_name: "test-server".to_string(),
+                tool_name: name.to_string(),
+                arguments: "{}".to_string(),
+                status: ToolCallStatus::Completed,
+                response: "ok".to_string(),
+                thought_signature: None,
+                thought_summary: None,
+                cached_image_path: None,
+                result_summary: None,
+            },
+            result: ToolResult {
+                status: ToolCallStatus::Completed,
+                response: "ok".to_string(),
+            },
+            profile_color: None,
+        };
+
+        session_state.sessions.get_mut(&session_a).unwrap().tool_call_history.push(record("a_tool"));
+        session_state.sessions.get_mut(&session_b).unwrap().tool_call_history.push(record("b_tool"));
+
+        let summarizer = ToolCallSummarizer::new();
+        summarizer.summarize_and_cleanup(&mut session_state, &settings, &session_a).await;
+
+        // A drained into snapshots; B untouched and still in flight.
+        assert!(session_state.sessions[&session_a].tool_call_history.is_empty());
+        assert!(session_state.sessions[&session_a]
+            .active_context
+            .extra
+            .contains_key("tool_snapshot_exec_a_tool"));
+        assert_eq!(session_state.sessions[&session_b].tool_call_history.len(), 1);
+        assert!(!session_state.sessions[&session_b]
+            .active_context
+            .extra
+            .contains_key("tool_snapshot_exec_b_tool"));
     }
 }

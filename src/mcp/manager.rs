@@ -44,26 +44,120 @@ fn composio_server_key(profile_id: &str) -> String {
 /// `composio-native:{id}` entry, so a bare `find(is_composio_native)` returns an
 /// arbitrary client and can operate on the wrong profile (e.g. reloading tools
 /// for "Clearmirror" but binding them to "Puget").
-fn active_composio_key(
-    servers: &std::collections::HashMap<String, ActiveMcpClient>,
+/// Result of resolving which servers-map key holds the Composio-native client
+/// for a given profile. Distinguishes "no client at all" from "several
+/// clients exist but none matches" — callers that only care whether they have
+/// a usable key can collapse both into `None` via a match on the result, but
+/// UI/error-reporting call sites should surface the distinction: the second
+/// case means Composio *is* connected, just not unambiguously for this
+/// profile, which is a materially different message than "not configured".
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ComposioKeyLookup {
+    /// Exactly one client resolves for this profile (or is the unambiguous
+    /// last resort). Carries the servers-map key.
+    Found(String),
+    /// No Composio-native client exists in the servers map at all.
+    NotConnected,
+    /// Several Composio-native clients exist and none matches the requested
+    /// profile (or none was requested and more than one exists). Carries the
+    /// servers-map keys of every candidate, for diagnostics.
+    Ambiguous { candidates: Vec<String> },
+}
+
+impl ComposioKeyLookup {
+    /// Human-readable description of an unresolved lookup, naming the actual
+    /// problem instead of the generic "not initialized" callers used to emit
+    /// unconditionally.
+    pub(crate) fn describe(&self, profile_id: Option<&str>) -> String {
+        match self {
+            ComposioKeyLookup::Found(k) => format!("resolved to '{}'", k),
+            ComposioKeyLookup::NotConnected => {
+                "Composio client not initialized or not connected".to_string()
+            }
+            ComposioKeyLookup::Ambiguous { candidates } => match profile_id {
+                Some(pid) => format!(
+                    "multiple Composio profiles connected, none matches profile {}: {}",
+                    pid,
+                    candidates.join(", ")
+                ),
+                None => format!(
+                    "multiple Composio profiles connected and no profile was specified: {}",
+                    candidates.join(", ")
+                ),
+            },
+        }
+    }
+}
+
+/// Resolve the servers-map key for a specific profile's Composio-native
+/// client, generic over the client value type so it can be exercised in
+/// tests without constructing a real `ActiveMcpClient`. `profile_id_of`
+/// extracts the profile id a given client value claims, if any.
+///
+/// Prefers the profile-scoped key, then a `profile_id` field match, then the
+/// bare legacy prefix, then any Composio client as a last resort *only* when
+/// that resort is unambiguous.
+///
+/// Profile-scoping is mandatory: each connected profile has its own
+/// `composio-native:{id}` entry, so a bare `find(is_composio_native)` returns an
+/// arbitrary client and can operate on the wrong profile (e.g. reloading tools
+/// for "Clearmirror" but binding them to "Puget").
+pub(crate) fn resolve_composio_key<V>(
+    servers: &std::collections::HashMap<String, V>,
     profile_id: Option<&str>,
-) -> Option<String> {
+    profile_id_of: impl Fn(&V) -> Option<&str>,
+) -> ComposioKeyLookup {
     if let Some(pid) = profile_id {
         let scoped = composio_server_key(pid);
         if servers.contains_key(&scoped) {
-            return Some(scoped);
+            return ComposioKeyLookup::Found(scoped);
         }
         if let Some((k, _)) = servers
             .iter()
-            .find(|(k, c)| is_composio_native(k) && c.profile_id.as_deref() == Some(pid))
+            .find(|(k, c)| is_composio_native(k) && profile_id_of(c) == Some(pid))
         {
-            return Some(k.clone());
+            return ComposioKeyLookup::Found(k.clone());
         }
     }
     if servers.contains_key(COMPOSIO_NATIVE_PREFIX) {
-        return Some(COMPOSIO_NATIVE_PREFIX.to_string());
+        return ComposioKeyLookup::Found(COMPOSIO_NATIVE_PREFIX.to_string());
     }
-    servers.keys().find(|k| is_composio_native(k)).cloned()
+    // Last resort: only safe when the answer is unambiguous. Other profiles'
+    // native clients now survive a reinit, so with several of them present
+    // `find` would bind to an arbitrary profile — exactly the mis-binding
+    // profile scoping exists to prevent. Refuse instead, loudly.
+    let mut composio_keys = servers.keys().filter(|k| is_composio_native(k));
+    let Some(first) = composio_keys.next() else {
+        return ComposioKeyLookup::NotConnected;
+    };
+    if composio_keys.next().is_some() {
+        let candidates: Vec<String> = servers
+            .keys()
+            .filter(|k| is_composio_native(k))
+            .cloned()
+            .collect();
+        tracing::warn!(
+            profile_id = ?profile_id,
+            candidates = ?candidates,
+            "resolve_composio_key: several Composio native clients and no profile match; refusing to guess which profile to operate on."
+        );
+        return ComposioKeyLookup::Ambiguous { candidates };
+    }
+    ComposioKeyLookup::Found(first.clone())
+}
+
+/// Whether the bare legacy `composio-native` singleton is orphaned: its client
+/// claims no profile, or claims one that is no longer configured. Such a
+/// singleton can never be claimed by a future profile reinit, so it would
+/// otherwise linger forever as a stale `resolve_composio_key` fallback.
+fn legacy_singleton_orphaned<'a>(
+    singleton_profile_id: Option<&str>,
+    mut configured_profile_ids: impl Iterator<Item = &'a str>,
+) -> bool {
+    match singleton_profile_id {
+        None => true,
+        Some(pid) => !configured_profile_ids.any(|id| id == pid),
+    }
 }
 
 /// Cache key under which a profile's on-demand Composio tools are stored in
@@ -74,6 +168,77 @@ fn dyn_composio_key(profile_id: Option<&str>) -> String {
     profile_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| COMPOSIO_NATIVE_PREFIX.to_string())
+}
+
+/// Every servers-map key that could hold state for one Composio profile:
+/// the canonical `composio-native:{id}`, the legacy `composio-native:{name}`,
+/// and — only when this profile owns it — the bare legacy singleton
+/// `composio-native`. Shared by `purge_composio_profile_state` (removing
+/// stale state before a reinit) and `reinitialize_composio_client`'s failure
+/// branch (removing a half-initialized client after a failed reinit), so the
+/// candidate list can't drift between the two.
+fn composio_profile_keys(
+    profile_id: &str,
+    profile_name: &str,
+    owns_legacy_singleton: bool,
+) -> Vec<String> {
+    let mut keys = vec![
+        composio_server_key(profile_id),
+        format!("{}:{}", COMPOSIO_NATIVE_PREFIX, profile_name),
+    ];
+    if owns_legacy_singleton {
+        keys.push(COMPOSIO_NATIVE_PREFIX.to_string());
+    }
+    keys
+}
+
+/// Remove the state belonging to a single Composio profile ahead of a
+/// (re)initialization, leaving every other profile's state intact.
+///
+/// Scope is deliberately narrow, because a profile switch in one tab must not
+/// disturb another tab that is mid-stream:
+/// * `servers` — only this profile's native client keys: the canonical
+///   `composio-native:{id}`, the legacy `composio-native:{name}`, and the bare
+///   legacy singleton `composio-native` when this profile is the one it stands
+///   for (`owns_legacy_singleton`). Other profiles' native clients survive.
+/// * `dynamic_composio` — only this profile's `dyn_composio_key` bucket.
+/// * `dynamic_local` — never touched. On-demand local tools loaded via
+///   `MCP_LOAD_SERVER_TOOLS` are profile-independent, so they are borrowed
+///   immutably here: the type makes their survival impossible to regress.
+///
+/// Returns the servers-map keys that were actually removed.
+pub(crate) fn purge_composio_profile_state<V, T, L>(
+    servers: &mut HashMap<String, V>,
+    dynamic_composio: &mut HashMap<String, Vec<T>>,
+    dynamic_local: &[L],
+    profile_id: &str,
+    profile_name: &str,
+    owns_legacy_singleton: bool,
+) -> Vec<String> {
+    let mut removed_server_keys = Vec::new();
+    let candidates = composio_profile_keys(profile_id, profile_name, owns_legacy_singleton);
+    for key in candidates {
+        if servers.remove(&key).is_some() {
+            removed_server_keys.push(key);
+        }
+    }
+
+    let removed_composio_tools = dynamic_composio
+        .remove(&dyn_composio_key(Some(profile_id)))
+        .map(|tools| tools.len())
+        .unwrap_or(0);
+
+    tracing::info!(
+        "Purged Composio state for profile '{}' ({}): removed clients {:?}, {} cached tools; \
+         preserved {} on-demand local tools and all other profiles' clients",
+        profile_name,
+        profile_id,
+        removed_server_keys,
+        removed_composio_tools,
+        dynamic_local.len()
+    );
+
+    removed_server_keys
 }
 
 /// Gemini's practical tool limit for FunctionDeclarations.
@@ -913,52 +1078,45 @@ impl McpManager {
         // Use consistent key format with profile ID for stability
         let server_key = composio_server_key(&profile.id);
 
-        // EAGER CLEANUP: Remove ALL composio-native clients immediately (Pattern 151)
-        // This ensures that during the initialization window (which may involve network calls),
-        // we are not "accidentally" picking up stale clients from the old profile.
+        // EAGER CLEANUP (Pattern 151): drop the state of *this* profile only, so
+        // that during the initialization window (which may involve network calls)
+        // we cannot pick up a stale client for it. Other profiles' native clients
+        // and every profile's on-demand local tools are left alone — another tab
+        // may be mid-stream on them.
+        //
+        // LOCK ORDERING (P-010): servers → dynamic_local_tools → dynamic_composio_tools.
+        let active_owns_legacy = settings
+            .get_active_profile()
+            .map(|p| p.id == profile.id)
+            .unwrap_or(false);
+        let owns_legacy_singleton;
         {
             let mut servers = self.servers.lock().await;
-            // Clear specific target key if exists
-            servers.remove(&server_key);
-
-            // Also clear by name for legacy cleanup if needed
-            let name_key = format!("{}:{}", COMPOSIO_NATIVE_PREFIX, profile.name);
-            servers.remove(&name_key);
-
-            let native_keys: Vec<String> = servers
-                .keys()
-                .filter(|k| is_composio_native(k))
-                .cloned()
-                .collect();
-            for k in native_keys {
-                servers.remove(&k);
-            }
-            tracing::info!("Cleared existing Composio native clients for reinitialization.");
-        }
-
-        // Clear dynamic tool caches for the profile being reinitialized only —
-        // other profiles' on-demand tools (e.g. in other tabs) must survive.
-        {
-            let mut dynamic = self.dynamic_composio_tools.lock().await;
-            if let Some(removed) = dynamic.remove(&dyn_composio_key(Some(&profile.id))) {
-                tracing::info!(
-                    "Clearing {} stale dynamic Composio tools for reinitialized profile '{}'",
-                    removed.len(),
-                    profile.id
-                );
-            }
-        }
-        {
-            let mut dynamic_local = self.dynamic_local_tools.lock().await;
-            let mut sources = self.dynamic_local_tool_sources.lock().await;
-            if !dynamic_local.is_empty() {
-                tracing::info!(
-                    "Clearing {} stale dynamic local tools from previous profile",
-                    dynamic_local.len()
-                );
-                dynamic_local.clear();
-                sources.clear();
-            }
+            // The bare `composio-native` singleton predates profile scoping, so
+            // nothing in the key says whose it is. Purge it when this profile is
+            // the active one (the profile it stands for), or when it is orphaned
+            // — its client names no configured profile, so no reinit will ever
+            // claim it, and it would otherwise linger as a stale last-resort
+            // fallback forever.
+            let singleton_orphaned = servers
+                .get(COMPOSIO_NATIVE_PREFIX)
+                .is_some_and(|c: &ActiveMcpClient| {
+                    legacy_singleton_orphaned(
+                        c.profile_id.as_deref(),
+                        settings.composio_profiles.iter().map(|p| p.id.as_str()),
+                    )
+                });
+            owns_legacy_singleton = active_owns_legacy || singleton_orphaned;
+            let dynamic_local = self.dynamic_local_tools.lock().await;
+            let mut dynamic_composio = self.dynamic_composio_tools.lock().await;
+            purge_composio_profile_state(
+                &mut servers,
+                &mut dynamic_composio,
+                &dynamic_local,
+                &profile.id,
+                &profile.name,
+                owns_legacy_singleton,
+            );
         }
 
         tracing::info!(
@@ -986,13 +1144,12 @@ impl McpManager {
                 let error_msg = format!("Failed to reinitialize Composio: {}", e);
                 {
                     let mut servers = self.servers.lock().await;
-                    // Remove ALL composio-native clients
-                    let native_keys: Vec<String> = servers
-                        .keys()
-                        .filter(|k| is_composio_native(k))
-                        .cloned()
-                        .collect();
-                    for key in native_keys {
+                    // Remove only this profile's native client keys — a failure
+                    // here says nothing about other profiles, whose clients may
+                    // be serving other tabs.
+                    let stale =
+                        composio_profile_keys(&profile.id, &profile.name, owns_legacy_singleton);
+                    for key in stale {
                         servers.remove(&key);
                     }
 
@@ -2974,19 +3131,21 @@ impl McpManager {
             .peek()
             .get_active_profile()
             .map(|p| p.id.clone());
-        let composio_client = active_composio_key(&servers, active_profile_id.as_deref())
-            .and_then(|k| servers.get(&k));
-
-        if let Some(client) = composio_client {
-            if let McpClientType::NativeComposio(composio_client) = &client.service {
-                // Use list_connected_toolkits which:
-                // 1. Calls list_connected_accounts() to find connected toolkit slugs
-                // 2. Calls list_tools() (MCP) to count tools per toolkit
-                // This shows ALL connected toolkits, not just force-loaded ones
-                return composio_client.list_connected_toolkits().await;
+        let lookup = resolve_composio_key(&servers, active_profile_id.as_deref(), |c| {
+            c.profile_id.as_deref()
+        });
+        if let ComposioKeyLookup::Found(ref key) = lookup {
+            if let Some(client) = servers.get(key) {
+                if let McpClientType::NativeComposio(composio_client) = &client.service {
+                    // Use list_connected_toolkits which:
+                    // 1. Calls list_connected_accounts() to find connected toolkit slugs
+                    // 2. Calls list_tools() (MCP) to count tools per toolkit
+                    // This shows ALL connected toolkits, not just force-loaded ones
+                    return composio_client.list_connected_toolkits().await;
+                }
             }
         }
-        Err("Composio client not initialized or not connected".to_string())
+        Err(lookup.describe(active_profile_id.as_deref()))
     }
 
     /// Find the active native Composio client, cloning its Arc so the servers
@@ -3002,13 +3161,17 @@ impl McpManager {
             .peek()
             .get_active_profile()
             .map(|p| p.id.clone());
-        active_composio_key(&servers, active_profile_id.as_deref())
-            .and_then(|k| servers.get(&k))
-            .and_then(|v| match &v.service {
+        let lookup = resolve_composio_key(&servers, active_profile_id.as_deref(), |c| {
+            c.profile_id.as_deref()
+        });
+        let found = match &lookup {
+            ComposioKeyLookup::Found(key) => servers.get(key).and_then(|v| match &v.service {
                 McpClientType::NativeComposio(c) => Some(c.clone()),
                 _ => None,
-            })
-            .ok_or_else(|| "Composio client not initialized or not connected".to_string())
+            }),
+            _ => None,
+        };
+        found.ok_or_else(|| lookup.describe(active_profile_id.as_deref()))
     }
 
     /// Resolve the native Composio client for a **specific profile**, cloning
@@ -3626,17 +3789,33 @@ impl McpManager {
         // Populate connected toolkit slugs from cached Composio toolkit info (MCP-First, Section 6).
         // This is a pure cache read — no network calls. The cache is hydrated by
         // list_connected_toolkits() which uses the MCP `tools/list` endpoint.
-        let connected_toolkit_slugs = active_composio_key(&servers, profile_id.as_deref())
-            .and_then(|k| servers.get(&k))
-            .and_then(|client| {
-                if let McpClientType::NativeComposio(ref composio_client) = client.service {
-                    composio_client.get_cached_toolkit_info()
-                } else {
-                    None
-                }
-            })
-            .map(|infos| infos.into_iter().map(|ti| ti.slug).collect::<Vec<_>>())
-            .unwrap_or_default();
+        let composio_lookup = resolve_composio_key(&servers, profile_id.as_deref(), |c| {
+            c.profile_id.as_deref()
+        });
+        if let ComposioKeyLookup::Ambiguous { ref candidates } = composio_lookup {
+            // Not a warning here: this is the prompt-build path, called on every
+            // turn, so a degrade (silently reporting no connected toolkits) must
+            // stay traceable without being noisy.
+            tracing::info!(
+                profile_id = ?profile_id,
+                candidates = ?candidates,
+                "get_mcp_context: several Composio native clients and no profile match; \
+                 reporting no connected toolkits for this turn."
+            );
+        }
+        let connected_toolkit_slugs = match composio_lookup {
+            ComposioKeyLookup::Found(key) => servers.get(&key),
+            _ => None,
+        }
+        .and_then(|client| {
+            if let McpClientType::NativeComposio(ref composio_client) = client.service {
+                composio_client.get_cached_toolkit_info()
+            } else {
+                None
+            }
+        })
+        .map(|infos| infos.into_iter().map(|ti| ti.slug).collect::<Vec<_>>())
+        .unwrap_or_default();
 
         McpContext {
             servers: server_contexts,
@@ -3742,7 +3921,13 @@ impl McpManager {
         // find(is_composio_native) can return a different profile's client when
         // several profiles have connected, reloading the wrong profile's tools.
         let active_profile_id = settings.get_active_profile().map(|p| p.id.clone());
-        let composio_key = active_composio_key(&servers, active_profile_id.as_deref());
+        let lookup = resolve_composio_key(&servers, active_profile_id.as_deref(), |c| {
+            c.profile_id.as_deref()
+        });
+        let composio_key = match lookup {
+            ComposioKeyLookup::Found(ref key) => Some(key.clone()),
+            ComposioKeyLookup::NotConnected | ComposioKeyLookup::Ambiguous { .. } => None,
+        };
 
         if let Some(key) = composio_key {
             if let Some(active_client) = servers.get_mut(&key) {
@@ -3786,7 +3971,7 @@ impl McpManager {
                 Err("Composio client not found (inner)".to_string())
             }
         } else {
-            Err("Composio client not found".to_string())
+            Err(lookup.describe(active_profile_id.as_deref()))
         }
     }
 
@@ -4444,9 +4629,13 @@ impl McpManager {
                 .peek()
                 .get_active_profile()
                 .map(|p| p.id.clone());
-            let active_composio: Option<(&String, &ActiveMcpClient)> =
-                active_composio_key(&servers, active_profile_id.as_deref())
-                    .and_then(|k| servers.get_key_value(&k));
+            let composio_lookup = resolve_composio_key(&servers, active_profile_id.as_deref(), |c| {
+                c.profile_id.as_deref()
+            });
+            let active_composio: Option<(&String, &ActiveMcpClient)> = match &composio_lookup {
+                ComposioKeyLookup::Found(k) => servers.get_key_value(k),
+                _ => None,
+            };
 
             // Find any failed composio-native client
             let failed_composio: Option<(&String, &(McpServerConfig, String))> =
@@ -4470,6 +4659,20 @@ impl McpManager {
                 statuses.push(McpServerStatus {
                     name: display_name.clone(),
                     error_message: Some(error.clone()),
+                    ..McpServerStatus::new(display_name.clone(), "Native Composio API client".to_string(), ServerStatus::Error)
+                });
+            }
+            // Several Composio profiles are connected but none matches the active
+            // profile — this is NOT "not configured" (Composio *is* connected),
+            // so it must not render as the blue NotConfigured card. Surface it as
+            // an Error status naming the actual problem instead.
+            else if let ComposioKeyLookup::Ambiguous { candidates } = &composio_lookup {
+                statuses.push(McpServerStatus {
+                    name: display_name.clone(),
+                    error_message: Some(format!(
+                        "Several Composio profiles are connected but none is active — pick a profile in Settings. (candidates: {})",
+                        candidates.join(", ")
+                    )),
                     ..McpServerStatus::new(display_name.clone(), "Native Composio API client".to_string(), ServerStatus::Error)
                 });
             }
@@ -5309,5 +5512,197 @@ impl McpManager {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+
+    /// Stand-in for `ActiveMcpClient` / `Tool`: the purge helper is generic over
+    /// the map's value type, so tests need no real MCP client or tool.
+    #[derive(Debug, PartialEq, Clone)]
+    struct Stub(&'static str);
+
+    fn servers_with(keys: &[&str]) -> HashMap<String, Stub> {
+        keys.iter().map(|k| (k.to_string(), Stub("client"))).collect()
+    }
+
+    #[test]
+    fn reinit_of_one_profile_leaves_other_profiles_native_clients() {
+        // Profile A is streaming in another tab; profile B is being reinitialized.
+        let mut servers = servers_with(&[
+            "composio-native:profile-a",
+            "composio-native:profile-b",
+            "composio-native:Profile B Name",
+            "filesystem",
+        ]);
+        let mut dynamic_composio: HashMap<String, Vec<Stub>> = HashMap::new();
+        dynamic_composio.insert("profile-a".to_string(), vec![Stub("a-tool")]);
+        dynamic_composio.insert("profile-b".to_string(), vec![Stub("b-tool")]);
+        let local: Vec<Stub> = vec![];
+
+        let removed = purge_composio_profile_state(
+            &mut servers,
+            &mut dynamic_composio,
+            &local,
+            "profile-b",
+            "Profile B Name",
+            false,
+        );
+
+        assert!(removed.contains(&"composio-native:profile-b".to_string()));
+        assert!(removed.contains(&"composio-native:Profile B Name".to_string()));
+        // Profile A's native client — and unrelated servers — must survive.
+        assert!(servers.contains_key("composio-native:profile-a"));
+        assert!(servers.contains_key("filesystem"));
+        assert!(!servers.contains_key("composio-native:profile-b"));
+        assert!(!servers.contains_key("composio-native:Profile B Name"));
+        // Only profile B's dynamic Composio bucket is dropped.
+        assert!(dynamic_composio.contains_key("profile-a"));
+        assert!(!dynamic_composio.contains_key("profile-b"));
+    }
+
+    #[test]
+    fn legacy_singleton_removed_only_when_profile_owns_it() {
+        let mut servers = servers_with(&[COMPOSIO_NATIVE_PREFIX, "composio-native:profile-a"]);
+        let mut dynamic_composio: HashMap<String, Vec<Stub>> = HashMap::new();
+        let local: Vec<Stub> = vec![];
+
+        // Not the active profile: bare legacy key stays put.
+        purge_composio_profile_state(
+            &mut servers,
+            &mut dynamic_composio,
+            &local,
+            "profile-b",
+            "B",
+            false,
+        );
+        assert!(servers.contains_key(COMPOSIO_NATIVE_PREFIX));
+
+        // Owns the legacy singleton: it is replaced along with the scoped key.
+        purge_composio_profile_state(
+            &mut servers,
+            &mut dynamic_composio,
+            &local,
+            "profile-a",
+            "A",
+            true,
+        );
+        assert!(!servers.contains_key(COMPOSIO_NATIVE_PREFIX));
+        assert!(!servers.contains_key("composio-native:profile-a"));
+    }
+
+    #[test]
+    fn orphaned_legacy_singleton_is_recognised() {
+        let configured = ["profile-a".to_string(), "profile-b".to_string()];
+        let ids = || configured.iter().map(|s| s.as_str());
+
+        // Claims a configured profile — still owned, leave it alone.
+        assert!(!legacy_singleton_orphaned(Some("profile-a"), ids()));
+        // Claims a profile that has been removed from settings.
+        assert!(legacy_singleton_orphaned(Some("profile-gone"), ids()));
+        // Pre-profile client: claims nothing, so nothing will ever reclaim it.
+        assert!(legacy_singleton_orphaned(None, ids()));
+    }
+
+    #[test]
+    fn purge_never_clears_on_demand_local_tools() {
+        // Local on-demand tools (MCP_LOAD_SERVER_TOOLS) are profile-independent:
+        // a Composio profile switch in one tab must not destroy them.
+        let mut servers = servers_with(&["composio-native:profile-b"]);
+        let mut dynamic_composio: HashMap<String, Vec<Stub>> = HashMap::new();
+        let local = vec![Stub("read_file"), Stub("write_file")];
+
+        purge_composio_profile_state(
+            &mut servers,
+            &mut dynamic_composio,
+            &local,
+            "profile-b",
+            "B",
+            true,
+        );
+
+        assert_eq!(local, vec![Stub("read_file"), Stub("write_file")]);
+    }
+
+    /// Stand-in for `ActiveMcpClient` carrying a profile id, for exercising
+    /// `resolve_composio_key` without a real MCP client.
+    #[derive(Debug, PartialEq, Clone)]
+    struct ProfiledStub(Option<&'static str>);
+
+    fn profiled_servers(entries: &[(&'static str, Option<&'static str>)]) -> HashMap<String, ProfiledStub> {
+        entries
+            .iter()
+            .map(|(k, pid)| (k.to_string(), ProfiledStub(*pid)))
+            .collect()
+    }
+
+    #[test]
+    fn resolve_composio_key_ambiguous_when_several_and_no_profile_matches() {
+        let servers = profiled_servers(&[
+            ("composio-native:profile-a", Some("profile-a")),
+            ("composio-native:profile-b", Some("profile-b")),
+        ]);
+        match resolve_composio_key(&servers, Some("profile-c"), |c| c.0) {
+            ComposioKeyLookup::Ambiguous { candidates } => {
+                assert_eq!(candidates.len(), 2);
+                assert!(candidates.contains(&"composio-native:profile-a".to_string()));
+                assert!(candidates.contains(&"composio-native:profile-b".to_string()));
+            }
+            other => panic!("expected Ambiguous, got {:?}", other),
+        }
+
+        // No profile requested at all, with several clients present: still
+        // ambiguous, never an arbitrary guess.
+        match resolve_composio_key(&servers, None, |c| c.0) {
+            ComposioKeyLookup::Ambiguous { .. } => {}
+            other => panic!("expected Ambiguous, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_composio_key_found_when_profile_matches() {
+        let servers = profiled_servers(&[
+            ("composio-native:profile-a", Some("profile-a")),
+            ("composio-native:profile-b", Some("profile-b")),
+        ]);
+        assert_eq!(
+            resolve_composio_key(&servers, Some("profile-b"), |c| c.0),
+            ComposioKeyLookup::Found("composio-native:profile-b".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_composio_key_found_for_single_client_last_resort() {
+        let servers = profiled_servers(&[("composio-native:profile-a", Some("profile-a"))]);
+        // No profile requested, but only one Composio client exists — safe to
+        // use it as the unambiguous last resort.
+        assert_eq!(
+            resolve_composio_key(&servers, None, |c| c.0),
+            ComposioKeyLookup::Found("composio-native:profile-a".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_composio_key_not_connected_when_none_exist() {
+        let servers: HashMap<String, ProfiledStub> = profiled_servers(&[("filesystem", None)]);
+        assert_eq!(
+            resolve_composio_key(&servers, Some("profile-a"), |c| c.0),
+            ComposioKeyLookup::NotConnected
+        );
+    }
+
+    #[test]
+    fn composio_profile_keys_includes_legacy_singleton_only_when_owned() {
+        let not_owned = composio_profile_keys("profile-a", "Profile A", false);
+        assert!(!not_owned.contains(&COMPOSIO_NATIVE_PREFIX.to_string()));
+        assert!(not_owned.contains(&"composio-native:profile-a".to_string()));
+        assert!(not_owned.contains(&"composio-native:Profile A".to_string()));
+
+        let owned = composio_profile_keys("profile-a", "Profile A", true);
+        assert!(owned.contains(&COMPOSIO_NATIVE_PREFIX.to_string()));
+        assert!(owned.contains(&"composio-native:profile-a".to_string()));
+        assert!(owned.contains(&"composio-native:Profile A".to_string()));
     }
 }

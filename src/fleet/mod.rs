@@ -832,6 +832,26 @@ pub fn sweep_retired_after(
     rows
 }
 
+/// User-initiated dismissal: the session leaves the live map with
+/// `ended_at` at its last event, exactly like retirement — but on demand,
+/// and regardless of status. This is the escape hatch for the one thing the
+/// sweeps deliberately never touch: a needs-attention card whose terminal
+/// was closed without a `SessionEnd` (a crashed shell, a killed tmux pane),
+/// which would otherwise sit on the board forever. A later hook event from
+/// the same session id simply re-creates the card.
+pub fn dismiss_in_state(state: &mut FleetState, session_id: &str) -> Option<FleetSession> {
+    let mut s = state.sessions.remove(session_id)?;
+    // Any open span closes unproven — capped at the provable window, the
+    // same treatment retirement gives an abandoned turn.
+    if let Some(since) = s.working_since.take() {
+        let end = s.provable_end(s.last_event_at);
+        bank_span(&mut s.day_seconds, since, end);
+    }
+    s.ended_at = Some(s.last_event_at);
+    s.pending_gate = None;
+    Some(s)
+}
+
 // ── Day aggregation ─────────────────────────────────────────────────────────
 
 /// Fleet minutes on a local day from the live map only.
@@ -1029,6 +1049,28 @@ impl FleetShared {
             store::persist_sessions(std::slice::from_ref(&row));
             self.poke();
         }
+    }
+
+    /// Hide a session from the board (UI). Any held gate is released as a
+    /// passthrough so a still-alive hook falls back to its terminal prompt
+    /// rather than hanging. Persists the ended row, logs a `Dismissed`
+    /// ledger event, and pokes.
+    pub fn dismiss_session(&self, session_id: &str) {
+        let (row, gate_id) = {
+            let mut state = self.state.lock().expect("fleet state lock poisoned");
+            let gate_id = state
+                .sessions
+                .get(session_id)
+                .and_then(|s| s.pending_gate.as_ref().map(|g| g.request_id.clone()));
+            (dismiss_in_state(&mut state, session_id), gate_id)
+        };
+        let Some(row) = row else { return };
+        if let Some(tx) = gate_id.as_deref().and_then(|id| self.take_gate(id)) {
+            let _ = tx.send(GateOutcome::Passthrough);
+        }
+        store::persist_sessions(std::slice::from_ref(&row));
+        store::append_event(session_id, "Dismissed", "{}");
+        self.poke();
     }
 
     /// Store a generated brief on a LIVE session. Persists and pokes.
@@ -1498,6 +1540,29 @@ mod tests {
         let s = &state.sessions["s1"];
         assert_eq!(s.status, FleetStatus::WorkingBackground, "idle card healed");
         assert_eq!(s.working_since, Some(t1), "a fresh provable span opens");
+    }
+
+    #[test]
+    fn dismiss_removes_any_status_and_ends_at_last_event() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T09:00:00Z");
+        reduce(
+            &mut state,
+            &FleetEvent::Notification {
+                session_id: "stuck".into(),
+                cwd: "/x".into(),
+                kind: "idle_prompt".into(),
+                message: "waiting for your input".into(),
+            },
+            t0,
+        );
+        assert!(state.sessions["stuck"].status.needs_attention());
+
+        let row = dismiss_in_state(&mut state, "stuck").expect("session dismissed");
+        assert!(!state.sessions.contains_key("stuck"), "left the live map");
+        assert_eq!(row.ended_at, Some(t0), "ends at its last event, not now");
+        assert!(row.pending_gate.is_none());
+        assert!(dismiss_in_state(&mut state, "stuck").is_none(), "idempotent");
     }
 
     #[test]

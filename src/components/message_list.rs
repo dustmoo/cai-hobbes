@@ -241,7 +241,10 @@ pub fn MessageList(
                                                             class: "{container_classes} w-full",
                                                             div {
                                                                 class: "flex flex-col max-w-full min-w-0",
-                                                                PermissionPrompt { tool_call: tool_call.clone() },
+                                                                PermissionPrompt {
+                                                                    tool_call: tool_call.clone(),
+                                                                    session_id: session_id.clone(),
+                                                                },
                                                                 div {
                                                                     class: "{author_classes}",
                                                                     "System"

@@ -1074,10 +1074,11 @@ impl StreamManagerContext {
                     // Don't trigger continuation; user needs to approve the permission request(s).
                     // Save and clean up.
                     if !collected_records.is_empty() {
-                        self.session_state
-                            .write()
-                            .tool_call_history
-                            .extend(collected_records.clone());
+                        if let Some(session) =
+                            self.session_state.write().sessions.get_mut(&session_id)
+                        {
+                            session.tool_call_history.extend(collected_records.clone());
+                        }
                     }
                     self.active_stream_handles.write().remove(&message_id);
                     self.content_generated.write().remove(&message_id); // Cleanup
@@ -1099,12 +1100,10 @@ impl StreamManagerContext {
                     return; // Wait for user to approve
                 }
 
-                self.session_state
-                    .write()
-                    .tool_call_history
-                    .extend(collected_records.clone());
-                // Tools were called in this turn. Increment the turn counter and trigger a continuation.
+                // Tools were called in this turn. Record them against THIS
+                // session and increment its turn counter, then continue.
                 if let Some(session) = self.session_state.write().sessions.get_mut(&session_id) {
+                    session.tool_call_history.extend(collected_records.clone());
                     session.increment_turn_count();
                 }
 
@@ -1743,8 +1742,11 @@ impl StreamManagerContext {
 
             // Clear stale tool_call_history from the cancelled turn so the
             // next prompt doesn't include CRITICAL RECOVERY INSTRUCTION or
-            // stale tool context.
-            state.tool_call_history.clear();
+            // stale tool context. Scoped to the cancelled stream's session so
+            // a concurrently streaming tab keeps its in-flight history.
+            if let Some(session) = state.sessions.get_mut(session_id) {
+                session.tool_call_history.clear();
+            }
 
             (partial_message, removed_message_ids)
         };

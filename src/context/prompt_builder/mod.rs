@@ -19,7 +19,6 @@ use crate::settings::Settings;
 pub struct PromptBuilder<'a> {
     pub(crate) session: &'a Session,
     pub(crate) settings: &'a Settings,
-    pub(crate) session_state: &'a crate::session::SessionState,
     /// Prebuilt `planner_today` system-context block
     /// (`todo::handlers::planner_today_context`). Computed at the call site so
     /// the builder stays free of planner state; `None` (the default) when the
@@ -28,15 +27,10 @@ pub struct PromptBuilder<'a> {
 }
 
 impl<'a> PromptBuilder<'a> {
-    pub fn new(
-        session: &'a Session,
-        settings: &'a Settings,
-        session_state: &'a crate::session::SessionState,
-    ) -> Self {
+    pub fn new(session: &'a Session, settings: &'a Settings) -> Self {
         Self {
             session,
             settings,
-            session_state,
             planner_today: None,
         }
     }

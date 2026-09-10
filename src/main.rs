@@ -66,6 +66,42 @@ use tray_icon::TrayIcon;
 /// Set by the timer scheduler; auto-dismisses, and can be dismissed manually.
 static TIMER_TOAST: GlobalSignal<Option<String>> = Signal::global(|| None);
 
+/// Mirror of `StreamManagerContext.streaming_sessions`, kept in sync by
+/// `StreamBridge`. `app()`'s own root-scope closures (tab close/delete, the
+/// `ChatCommand` handler) cannot `consume_context::<StreamManagerContext>()`
+/// themselves — that context is provided by the `StreamManager` component,
+/// a *descendant* of the root scope, and Dioxus context only flows downward
+/// — so they consult this GlobalSignal instead, which is reachable from any
+/// scope.
+static STREAMING_SESSIONS: GlobalSignal<std::collections::HashSet<String>> =
+    Signal::global(std::collections::HashSet::new);
+
+/// Session ids `delete_session_fn` wants `StreamBridge` to cancel the active
+/// stream for. Set from the root scope (which cannot reach
+/// `StreamManagerContext` directly — see `STREAMING_SESSIONS`), drained by
+/// `StreamBridge`, which *can*. A set rather than a single id so two deletes
+/// landing between two effect runs don't drop one of the cancels.
+static CANCEL_STREAM_REQUEST: GlobalSignal<std::collections::HashSet<String>> =
+    Signal::global(std::collections::HashSet::new);
+
+/// Drain `CANCEL_STREAM_REQUEST`, subscribing the caller to it.
+///
+/// Must be called from inside a `use_effect`: only `.read()` registers the
+/// effect's reactive context (`.write()` notifies subscribers but subscribes
+/// nothing), so the read below is what makes a later insert re-run the
+/// effect. The read guard ends with its statement so it is never held across
+/// the drain's write, and the early return keeps an idle run from writing at
+/// all — an unconditional write after the read would re-dirty the effect
+/// forever.
+fn drain_cancel_stream_requests() -> Vec<String> {
+    if CANCEL_STREAM_REQUEST.read().is_empty() {
+        return Vec::new();
+    }
+    std::mem::take(&mut *CANCEL_STREAM_REQUEST.write())
+        .into_iter()
+        .collect()
+}
+
 /// Show a timer toast and auto-clear it after a few seconds (unless a newer
 /// toast replaced it in the meantime). Avoids the reminder lingering forever.
 fn flash_timer_toast(msg: String) {
@@ -217,7 +253,7 @@ use crate::{
     components::{
         confirm_delete_modal::ConfirmDeleteModal,
         shared::{SessionIdContext, SessionToDeleteContext},
-        stream_manager::StreamManager,
+        stream_manager::{StreamManager, StreamManagerContext},
     },
     llm::{GeminiConnector, LlmConnector},
     mcp::manager::McpManager,
@@ -1661,6 +1697,20 @@ fn app() -> Element {
     };
 
     let mut delete_session_fn = move |id_to_delete: String| {
+        // A stream still writing to this session would otherwise keep
+        // burning tokens/API calls for output that's about to be discarded
+        // (the session itself is going away). Request StreamBridge cancel
+        // it — StreamManagerContext isn't reachable from this root-scope
+        // closure, see STREAMING_SESSIONS/CANCEL_STREAM_REQUEST above.
+        // This is best-effort/racy with the delete below by design: even if
+        // the stream keeps running a moment longer, the session is removed
+        // from `state.sessions` immediately, so further writes are no-ops,
+        // and the session_events tombstone (session_store::delete_session,
+        // enforced in write_event_rows) stops its journal from growing.
+        if STREAMING_SESSIONS.peek().contains(&id_to_delete) {
+            CANCEL_STREAM_REQUEST.write().insert(id_to_delete.clone());
+        }
+
         let mut state = session_state.write();
         state.delete_session(&id_to_delete);
         drop(state);
@@ -1728,8 +1778,20 @@ fn app() -> Element {
                 closing_summary,
             );
 
-            // A closed tab's terminal shell dies with it.
-            {
+            // A closed tab's terminal shell dies with it — unless a stream
+            // is still writing into this session. Per stream_manager.rs
+            // (~309-312), a closed tab intentionally keeps its background
+            // stream running (the session survives on disk, closing is not
+            // deleting), and that stream's tool calls may still be using the
+            // terminal. Killing the pty out from under a running turn would
+            // break it, so skip the kill here and let it happen on a later
+            // close of the same session once it's no longer streaming.
+            if STREAMING_SESSIONS.peek().contains(&closing_session_id) {
+                tracing::info!(
+                    session_id = %closing_session_id,
+                    "close_tab: session still streaming, deferring terminal kill."
+                );
+            } else {
                 let mgr = mcp_manager.peek().clone();
                 let sid = closing_session_id.clone();
                 spawn(async move {
@@ -1941,6 +2003,21 @@ fn app() -> Element {
         let app_quit = *APP_QUIT.read();
 
         if app_quit {
+            // Flush any in-flight async saves synchronously before the
+            // window (and process) goes away — `save_async` hands rows off
+            // to a background blocking task, and nothing guarantees that
+            // task runs to completion once `window.close()` tears the
+            // runtime down. `SessionState::save()` / `SettingsManager::save()`
+            // reuse the same machinery, just inline on this thread. The
+            // session save is cheap when nothing changed (per-row
+            // fingerprints skip clean sessions); the settings save always
+            // rewrites settings.json and its .bak, changed or not.
+            if let Err(e) = session_state.peek().save() {
+                tracing::error!("Final session save on quit failed: {}", e);
+            }
+            if let Err(e) = settings_manager.peek().save(&settings.peek()) {
+                tracing::error!("Final settings save on quit failed: {}", e);
+            }
             window_clone.close();
             return;
         }
@@ -2403,6 +2480,16 @@ fn app() -> Element {
                 // SummarizationScheduler component removed; hook called above.
                 if *is_app_initialized.read() {
                     StreamManager {
+                    // Mirrors `StreamManagerContext.streaming_sessions` into a
+                    // root-level GlobalSignal. `StreamManagerContext` is only
+                    // reachable by consume_context from *descendants* of this
+                    // `StreamManager` element (Dioxus contexts flow parent →
+                    // child); `app()`'s own closures (close_tab_fn,
+                    // delete_session_fn, the ChatCommand handler) run in the
+                    // root scope, an ancestor of `StreamManager`, so they
+                    // cannot consume it directly. `StreamBridge` is mounted
+                    // *inside* `StreamManager` specifically to bridge that gap.
+                    StreamBridge {}
                     ConfirmDeleteModal {
                         is_visible: show_confirm_modal,
                         title: "Delete Session".to_string(),
@@ -2634,6 +2721,49 @@ fn app() -> Element {
     }
 }
 
+/// Bridges `StreamManagerContext.streaming_sessions` (only reachable by
+/// descendants of the `StreamManager` component) out to the root-scope
+/// `STREAMING_SESSIONS` GlobalSignal, so `app()`'s own tab-close/delete
+/// logic can consult live streaming state without a Dioxus context lookup.
+/// Renders nothing; mounted as a child of `StreamManager` purely for its
+/// scope position. See the comment at that call site and at
+/// `STREAMING_SESSIONS`'s definition for why this indirection exists.
+#[component]
+fn StreamBridge() -> Element {
+    let stream_manager = consume_context::<StreamManagerContext>();
+    use_effect(move || {
+        let sessions = stream_manager.streaming_sessions.read().clone();
+        // Only write on a real change: an unconditional write marks the
+        // global dirty every run and wakes every reader (including the tab
+        // machinery) for nothing.
+        if *STREAMING_SESSIONS.peek() != sessions {
+            *STREAMING_SESSIONS.write() = sessions;
+        }
+    });
+    // Reverse direction: root-scope code (delete_session_fn) can't call
+    // `stream_manager.cancel_stream()` itself — it has no `StreamManagerContext`
+    // — so it drops the target session id in `CANCEL_STREAM_REQUEST` and this
+    // effect (which *does* hold the context) performs the actual cancel.
+    use_effect(move || {
+        // Drain-then-act: `drain_cancel_stream_requests` both subscribes
+        // this effect to the global (only a `.read()` does that) and takes
+        // the whole pending set in one write, so no guard is alive while
+        // `cancel_stream` runs and a request arriving mid-flush isn't
+        // clobbered by a blanket clear.
+        let pending = drain_cancel_stream_requests();
+        for session_id in pending {
+            if let Some(message_id) = stream_manager.active_message_for_session(&session_id) {
+                tracing::info!(
+                    session_id = %session_id,
+                    "StreamBridge: cancelling stream for deleted session."
+                );
+                stream_manager.cancel_stream(&message_id, &session_id);
+            }
+        }
+    });
+    rsx! {}
+}
+
 #[component]
 fn LoadingScreen() -> Element {
     rsx! {
@@ -2666,5 +2796,96 @@ fn LoadingScreen() -> Element {
                 }
             }
         }
+    }
+}
+
+/// Regression tests for the `StreamBridge` cancel-drain effect.
+///
+/// The bug these pin down: inside a `use_effect`, only `.read()` registers
+/// the effect's reactive context. An effect whose body *only* writes a
+/// GlobalSignal runs once at mount and is never woken again, so a cancel id
+/// inserted later by `delete_session_fn` was never acted on.
+#[cfg(test)]
+mod stream_bridge_cancel_tests {
+    use super::*;
+    use dioxus::dioxus_core::NoOpMutations;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// One entry per run of the probe effect, holding what it drained.
+        static DRAINED: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Mirrors `StreamBridge`'s cancel effect, minus the context it needs:
+    /// it calls the same drain helper and records the result.
+    #[allow(non_snake_case)]
+    fn CancelProbe() -> Element {
+        use_effect(|| {
+            let pending = drain_cancel_stream_requests();
+            DRAINED.with(|d| d.borrow_mut().push(pending));
+        });
+        rsx! {}
+    }
+
+    /// Pump the dom a bounded number of times so a missed wake-up fails the
+    /// assertion instead of hanging the test.
+    fn pump(dom: &mut VirtualDom) {
+        for _ in 0..8 {
+            dom.render_immediate(&mut NoOpMutations);
+        }
+    }
+
+    #[test]
+    fn cancel_request_inserted_after_mount_is_drained() {
+        let mut dom = VirtualDom::new(CancelProbe);
+        dom.rebuild_in_place();
+        pump(&mut dom);
+
+        // Mount run sees nothing pending.
+        assert_eq!(
+            DRAINED.with(|d| d.borrow().clone()),
+            vec![Vec::<String>::new()],
+            "effect should run once at mount with an empty queue"
+        );
+
+        // What `delete_session_fn` does, from outside the effect.
+        dom.in_runtime(|| {
+            CANCEL_STREAM_REQUEST
+                .write()
+                .insert("session-to-cancel".to_string());
+        });
+        pump(&mut dom);
+
+        let runs = DRAINED.with(|d| d.borrow().clone());
+        assert!(
+            runs.iter()
+                .any(|r| r.as_slice() == ["session-to-cancel".to_string()]),
+            "a write after mount must re-run the effect (only .read() subscribes); runs were {runs:?}"
+        );
+        dom.in_runtime(|| {
+            assert!(
+                CANCEL_STREAM_REQUEST.read().is_empty(),
+                "the drain must clear the queue"
+            );
+        });
+    }
+
+    #[test]
+    fn idle_effect_runs_do_not_loop_forever() {
+        let mut dom = VirtualDom::new(CancelProbe);
+        dom.rebuild_in_place();
+        pump(&mut dom);
+        dom.in_runtime(|| {
+            CANCEL_STREAM_REQUEST.write().insert("a".to_string());
+        });
+        pump(&mut dom);
+
+        // Mount run + the drain run. If the drain wrote unconditionally it
+        // would re-dirty its own subscription and spin.
+        let runs = DRAINED.with(|d| d.borrow().len());
+        assert!(
+            runs <= 3,
+            "effect should settle after draining, ran {runs} times"
+        );
     }
 }

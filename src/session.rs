@@ -158,6 +158,13 @@ pub struct Session {
     /// Persisted so pending timers survive a restart and can be re-scheduled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scheduled_timers: Vec<crate::timers::ScheduledTimer>,
+    /// Tool calls executed during the current turn of THIS session.
+    /// Per-session (never global): two tabs streaming concurrently must not
+    /// see each other's tool calls, and cancelling one tab must not wipe the
+    /// other's in-flight history. Cleared on send and on cancel; drained by
+    /// `ToolCallSummarizer` at turn end.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_call_history: Vec<crate::components::shared::ToolCallRecord>,
 }
 
 impl Session {
@@ -357,9 +364,6 @@ pub fn compute_page_budget(
 /// Existing files without this field default to 0 via `#[serde(default)]`.
 pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 2;
 
-/// Fingerprint-map key for the tool-call-history meta blob (see `collect_meta_kv`).
-const TCH_FP_KEY: &str = "\0meta:tool_call_history";
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionState {
     /// Schema version for forward-compatible migrations.
@@ -370,8 +374,6 @@ pub struct SessionState {
     pub active_session_id: String,
     pub window_width: f64,
     pub window_height: f64,
-    #[serde(default)]
-    pub tool_call_history: Vec<crate::components::shared::ToolCallRecord>,
     /// All-time cumulative cost in USD across all sessions (including deleted ones).
     #[serde(default)]
     pub lifetime_cost: f64,
@@ -869,9 +871,11 @@ impl SessionState {
         let lifetime_tokens = store::meta_get(store::META_LIFETIME_TOKENS)
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let tool_call_history = store::meta_get(store::META_TOOL_CALL_HISTORY)
-            .and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_default();
+        // Legacy: tool-call history used to live in a single global meta
+        // blob. It is now per-session (`Session.tool_call_history`), so the
+        // old key is discarded on load and never written again; the stale
+        // row is removed once, here.
+        store::meta_delete(store::META_TOOL_CALL_HISTORY);
 
         // Hydration set: open tabs, the active session, sessions with timers.
         let mut ids: Vec<String> = open_tab_ids.to_vec();
@@ -910,7 +914,6 @@ impl SessionState {
             active_session_id,
             window_width,
             window_height,
-            tool_call_history,
             lifetime_cost,
             lifetime_tokens,
             save_disabled: false,
@@ -1130,11 +1133,8 @@ impl SessionState {
             if let Some(height) = value.get("window_height").and_then(|v| v.as_f64()) {
                 state.window_height = height;
             }
-            if let Some(history_val) = value.get("tool_call_history") {
-                if let Ok(history) = serde_json::from_value(history_val.clone()) {
-                    state.tool_call_history = history;
-                }
-            }
+            // Legacy global "tool_call_history" is intentionally dropped:
+            // history is per-session now and is turn-local anyway.
         }
         Ok(state)
     }
@@ -1154,40 +1154,27 @@ impl SessionState {
         use crate::session_store as store;
         let rows = store::collect_dirty_rows(&self.sessions)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let (meta, tch_mark) = self.collect_meta_kv();
+        let meta = self.collect_meta_kv();
         store::write_rows_and_meta(&rows, &meta)
             .map_err(std::io::Error::other)?;
         store::mark_rows_saved(&rows);
-        if let Some(tch) = tch_mark {
-            store::mark_blob_saved(TCH_FP_KEY, &tch);
-        }
         Ok(())
     }
 
-    /// Meta key/value pairs to persist alongside session rows. The
-    /// tool-call history blob is fingerprinted and only included when it
-    /// changed; the second return value is the blob to mark saved on success.
+    /// Meta key/value pairs to persist alongside session rows.
     /// Seqs are drawn here, at collect time on the calling thread — not at
     /// write time on the blocking pool — so overlapping saves whose writes
     /// land out of order cannot overwrite newer meta with an older snapshot.
-    fn collect_meta_kv(&self) -> (Vec<(String, String, i64)>, Option<String>) {
+    fn collect_meta_kv(&self) -> Vec<(String, String, i64)> {
         use crate::session_store as store;
-        let mut kv = vec![
+        vec![
             (store::META_SCHEMA_VERSION.to_string(), self.schema_version.to_string(), store::next_seq()),
             (store::META_ACTIVE_SESSION.to_string(), self.active_session_id.clone(), store::next_seq()),
             (store::META_WINDOW_WIDTH.to_string(), self.window_width.to_string(), store::next_seq()),
             (store::META_WINDOW_HEIGHT.to_string(), self.window_height.to_string(), store::next_seq()),
             (store::META_LIFETIME_COST.to_string(), self.lifetime_cost.to_string(), store::next_seq()),
             (store::META_LIFETIME_TOKENS.to_string(), self.lifetime_tokens.to_string(), store::next_seq()),
-        ];
-        let tch = serde_json::to_string(&self.tool_call_history).unwrap_or_else(|_| "[]".into());
-        let mark = if store::blob_changed(TCH_FP_KEY, &tch) {
-            kv.push((store::META_TOOL_CALL_HISTORY.to_string(), tch.clone(), store::next_seq()));
-            Some(tch)
-        } else {
-            None
-        };
-        (kv, mark)
+        ]
     }
 
     pub fn create_session_raw(&mut self, initial_profile: Option<String>) -> String {
@@ -1214,6 +1201,7 @@ impl SessionState {
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
+            tool_call_history: Vec::new(),
         };
         // Birth event: a journal that starts with SessionCreated is
         // "journal-complete" and can be rebuilt from nothing via project().
@@ -1399,22 +1387,19 @@ impl SessionState {
                 return;
             }
         };
-        let (meta, tch_mark) = state.collect_meta_kv();
+        let meta = state.collect_meta_kv();
 
         // Move only the prepared row/meta buffers to the background thread
         dioxus::prelude::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                store::write_rows_and_meta(&rows, &meta).map(|_| (rows, tch_mark))
+                store::write_rows_and_meta(&rows, &meta).map(|_| rows)
             })
             .await;
 
             // Back on the Dioxus runtime — safe to touch Signals
             match result {
-                Ok(Ok((rows, tch_mark))) => {
+                Ok(Ok(rows)) => {
                     store::mark_rows_saved(&rows);
-                    if let Some(tch) = tch_mark {
-                        store::mark_blob_saved(TCH_FP_KEY, &tch);
-                    }
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Failed to save session state: {}", e);
@@ -1468,23 +1453,6 @@ impl SessionState {
             .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
     }
 
-    pub fn get_message_mut_by_execution_id(
-        &mut self,
-        execution_id: &str,
-    ) -> Option<&mut super::components::chat::Message> {
-        self.get_active_session_mut().and_then(|session| {
-            session.messages.iter_mut().find(|m| match &m.content {
-                super::components::shared::MessageContent::ToolCall(tc) => {
-                    tc.execution_id == execution_id
-                }
-                super::components::shared::MessageContent::PermissionRequest(tc) => {
-                    tc.execution_id == execution_id
-                }
-                _ => false,
-            })
-        })
-    }
-
     /// Migrate session composio_profile from name-based to ID-based.
     /// Any session whose composio_profile matches a profile name (but not an ID)
     /// gets updated to the corresponding profile ID.
@@ -1524,7 +1492,6 @@ impl Default for SessionState {
             active_session_id: String::new(),
             window_width: 1440.0, // 16:9 ratio default
             window_height: 810.0,
-            tool_call_history: Vec::new(),
             lifetime_cost: 0.0,
             lifetime_tokens: 0,
             save_disabled: false,
@@ -1536,7 +1503,6 @@ impl Default for SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     // === Migration Tests ===
 
@@ -2168,6 +2134,7 @@ mod tests {
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
+            tool_call_history: Vec::new(),
         };
 
         // Simulate ToolCallSummarizer having inserted snapshots

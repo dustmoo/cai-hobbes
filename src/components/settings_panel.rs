@@ -3995,8 +3995,6 @@ pub fn SettingsPanel() -> Element {
                                                     out.push_str(&serde_json::to_string(&state.active_session_id).unwrap_or_else(|_| "\"\"".into()));
                                                     out.push_str(&format!(",\n\"window_width\": {},\n\"window_height\": {}", state.window_width, state.window_height));
                                                     out.push_str(&format!(",\n\"lifetime_cost\": {},\n\"lifetime_tokens\": {}", state.lifetime_cost, state.lifetime_tokens));
-                                                    out.push_str(",\n\"tool_call_history\": ");
-                                                    out.push_str(&serde_json::to_string(&state.tool_call_history).unwrap_or_else(|_| "[]".into()));
                                                     // Hydrated sessions may be newer than their stored rows
                                                     let hydrated: std::collections::HashMap<String, String> = state.sessions.iter()
                                                         .filter_map(|(id, s)| serde_json::to_string(s).ok().map(|j| (id.clone(), j)))
