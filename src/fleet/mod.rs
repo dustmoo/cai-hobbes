@@ -880,18 +880,30 @@ fn session_accruing(s: &FleetSession, now: DateTime<Utc>) -> bool {
 /// Maintain the engaged-time union. Call after any state change (reduce,
 /// sweeps) — NOT time-critical: a missed call only delays a transition
 /// until the next event or sweep tick. Returns the `(day, total_seconds)`
-/// rows that were banked and should be persisted (empty on most calls).
+/// rows that were banked and should be persisted.
+///
+/// Banking is PROGRESSIVE: while the period is open, every call banks the
+/// slice since the last call and advances the open marker to `now`. The
+/// open tail is therefore never more than one tick long, so a restart mid-
+/// phase (an overnight background benchmark, a `dx serve` rebuild) loses at
+/// most that tick — not the whole period. Without this, each session's
+/// numerator survived a restart (`working_since` is persisted per row)
+/// while the shared denominator did not, and the multiplier read as
+/// 100× after a rebuild. Banking up to `now` is honest while accruing:
+/// `session_accruing` means some span's provable end keeps up with the
+/// clock. Only the CLOSE caps at the latest provable end — a walk-away
+/// must not bank the walk.
 pub fn sync_coverage(state: &mut FleetState, now: DateTime<Utc>) -> Vec<(NaiveDate, u32)> {
     let accruing = state.sessions.values().any(|s| session_accruing(s, now));
-    match (state.coverage_open, accruing) {
+    let (since, end, still_open) = match (state.coverage_open, accruing) {
         (None, true) => {
             state.coverage_open = Some(now);
-            Vec::new()
+            return Vec::new();
         }
+        (Some(since), true) => (since, now, true),
         (Some(since), false) => {
             // The engaged period ends at the latest provable activity, not
-            // at the sweep tick that noticed it — a walk-away must not bank
-            // the walk.
+            // at the sweep tick that noticed it.
             let end = state
                 .sessions
                 .values()
@@ -899,22 +911,26 @@ pub fn sync_coverage(state: &mut FleetState, now: DateTime<Utc>) -> Vec<(NaiveDa
                 .max()
                 .unwrap_or(now)
                 .clamp(since, now);
-            state.coverage_open = None;
-            bank_span(&mut state.coverage_seconds, since, end);
-            let mut day = since.with_timezone(&Local).date_naive();
-            let last = end.with_timezone(&Local).date_naive();
-            let mut banked = Vec::new();
-            while day <= last {
-                if let Some(total) = state.coverage_seconds.get(&day) {
-                    banked.push((day, *total));
-                }
-                let Some(next) = day.succ_opt() else { break };
-                day = next;
-            }
-            banked
+            (since, end, false)
         }
-        _ => Vec::new(),
+        _ => return Vec::new(),
+    };
+    state.coverage_open = if still_open { Some(end) } else { None };
+    if end <= since {
+        return Vec::new();
     }
+    bank_span(&mut state.coverage_seconds, since, end);
+    let mut day = since.with_timezone(&Local).date_naive();
+    let last = end.with_timezone(&Local).date_naive();
+    let mut banked = Vec::new();
+    while day <= last {
+        if let Some(total) = state.coverage_seconds.get(&day) {
+            banked.push((day, *total));
+        }
+        let Some(next) = day.succ_opt() else { break };
+        day = next;
+    }
+    banked
 }
 
 /// Engaged wall-clock seconds on a local day: banked union plus the live
@@ -1175,12 +1191,15 @@ impl FleetShared {
             for row in rows {
                 state.sessions.entry(row.id.clone()).or_insert(row);
             }
-            // Banked engaged time survives restarts; the open tail (if the
-            // process died mid-work) is lost — the next event reopens it.
+            // Banked engaged time survives restarts. Banking is progressive
+            // (`sync_coverage`), so at most one tick of the open tail is
+            // lost; reopen right away if a restored span is still accruing
+            // rather than waiting for the next event.
             for (day, secs) in coverage {
                 let slot = state.coverage_seconds.entry(day).or_insert(0);
                 *slot = (*slot).max(secs);
             }
+            store::save_coverage(&sync_coverage(&mut state, Utc::now()));
         }
         self.poke();
     }
@@ -1741,7 +1760,8 @@ mod tests {
         reduce(&mut state, &submit("s1"), local_at(day, 9, 0));
         assert!(sync_coverage(&mut state, local_at(day, 9, 0)).is_empty());
         reduce(&mut state, &submit("s2"), local_at(day, 9, 10));
-        sync_coverage(&mut state, local_at(day, 9, 10));
+        // Progressive: each tick banks the slice since the last one.
+        assert_eq!(sync_coverage(&mut state, local_at(day, 9, 10)), vec![(day, 600)]);
         // s2 heartbeats (tool activity) — without events a span stops
         // provably accruing after the staleness cap.
         let beat = |state: &mut FleetState, at| {
@@ -1758,12 +1778,13 @@ mod tests {
         beat(&mut state, local_at(day, 9, 20));
         reduce(&mut state, &stop("s1"), local_at(day, 9, 30));
         beat(&mut state, local_at(day, 9, 30));
-        // s2 still accruing → the engaged period stays open.
-        assert!(sync_coverage(&mut state, local_at(day, 9, 30)).is_empty());
-        assert!(state.coverage_open.is_some());
+        // s2 still accruing → the engaged period stays open, marker advanced.
+        assert_eq!(sync_coverage(&mut state, local_at(day, 9, 30)), vec![(day, 1800)]);
+        assert_eq!(state.coverage_open, Some(local_at(day, 9, 30)));
         reduce(&mut state, &stop("s2"), local_at(day, 9, 40));
         let banked = sync_coverage(&mut state, local_at(day, 9, 40));
-        // Union = 40 engaged minutes; agent time = 30 + 30 = 60 → 1.5×.
+        // Union = 40 engaged minutes (cumulative day total); agent time =
+        // 30 + 30 = 60 → 1.5×.
         assert_eq!(banked, vec![(day, 2400)]);
         let engaged = engaged_seconds_on(&state, day, local_at(day, 9, 40)) / 60;
         let agent = live_minutes_on(&state, day, local_at(day, 9, 40));
@@ -1799,6 +1820,80 @@ mod tests {
         let banked = sync_coverage(&mut state, local_at(day, 9, 30));
         assert_eq!(banked, vec![(day, STALENESS_MINUTES as u32 * 60)]);
         assert!(state.coverage_open.is_none());
+    }
+
+    /// A background phase grinding through the night must bank its engaged
+    /// time as it goes: a restart mid-phase loses at most one tick, and
+    /// never the whole period — the numerator (per-row `working_since`)
+    /// survives a restart, so the denominator has to as well or the
+    /// multiplier explodes.
+    #[test]
+    fn coverage_survives_restart_mid_background_phase() {
+        let mut state = FleetState::default();
+        let day = date("2026-09-10");
+        reduce(
+            &mut state,
+            &FleetEvent::PromptSubmit { session_id: "bg".into(), cwd: "/tmp/a".into() },
+            local_at(day, 0, 0),
+        );
+        // Stop with background jobs → WorkingBackground, span reopens.
+        reduce(
+            &mut state,
+            &FleetEvent::Stop { session_id: "bg".into(), cwd: "/tmp/a".into(), background_tasks: 2 },
+            local_at(day, 0, 1),
+        );
+        sync_coverage(&mut state, local_at(day, 0, 1));
+        // Sweep ticks through the night; subagent heartbeats keep it provable.
+        let mut persisted: Vec<(NaiveDate, u32)> = Vec::new();
+        for h in 1..=9u32 {
+            reduce(
+                &mut state,
+                &FleetEvent::SubagentStop { session_id: "bg".into(), cwd: "/tmp/a".into(), background_tasks: 2 },
+                local_at(day, h, 0),
+            );
+            persisted = sync_coverage(&mut state, local_at(day, h, 0));
+        }
+        assert_eq!(persisted, vec![(day, 9 * 3600 - 60)], "banked progressively to the last tick");
+        assert_eq!(state.coverage_open, Some(local_at(day, 9, 0)));
+
+        // Restart: rows + coverage come back from the store, the open marker
+        // does not. Engaged time is intact up to the last tick.
+        let mut fresh = FleetState::default();
+        fresh.sessions = state.sessions.clone();
+        for (d, secs) in &persisted {
+            fresh.coverage_seconds.insert(*d, *secs);
+        }
+        let after = local_at(day, 9, 5);
+        assert!(sync_coverage(&mut fresh, after).is_empty(), "reopens, nothing to bank yet");
+        assert_eq!(fresh.coverage_open, Some(after));
+        let engaged = engaged_seconds_on(&fresh, day, after) / 60;
+        let agent = live_minutes_on(&fresh, day, after);
+        // 9h of agent time over 9h of engaged time (minus one lost tick): ~1×,
+        // not the 100× a lost denominator would show.
+        let (m, _) = exocortex_multiplier(agent, engaged).unwrap();
+        assert!(m < 1.05, "multiplier {m} should be ~1× after a restart");
+    }
+
+    /// Progressive banking must not soften the walk-away rule: once nothing
+    /// is provably accruing, the close still ends at the provable tail, and
+    /// slices banked earlier while accruing are not counted twice.
+    #[test]
+    fn coverage_progressive_then_walk_away_caps_at_provable_end() {
+        let mut state = FleetState::default();
+        let day = date("2026-09-04");
+        reduce(
+            &mut state,
+            &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: "/tmp/a".into() },
+            local_at(day, 9, 0),
+        );
+        sync_coverage(&mut state, local_at(day, 9, 0));
+        assert_eq!(sync_coverage(&mut state, local_at(day, 9, 5)), vec![(day, 300)]);
+        // Silent since 9:00; the 9:30 tick closes at 9:00 + staleness cap.
+        let banked = sync_coverage(&mut state, local_at(day, 9, 30));
+        assert_eq!(banked, vec![(day, STALENESS_MINUTES as u32 * 60)]);
+        assert!(state.coverage_open.is_none());
+        // Further ticks with nothing open bank nothing.
+        assert!(sync_coverage(&mut state, local_at(day, 9, 45)).is_empty());
     }
 
     #[test]

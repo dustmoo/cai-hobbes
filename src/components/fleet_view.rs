@@ -216,7 +216,7 @@ pub fn FleetView() -> Element {
                         div {
                             class: "flex items-baseline gap-1.5",
                             title: format!(
-                                "{} of agent work across {} engaged — how many of you the fleet is while you're driving it",
+                                "{} of agent work across {} engaged — average concurrency while you're driving the fleet (the ribbon's peak is the high-water mark)",
                                 crate::todo::model::format_minutes(agent_minutes),
                                 crate::todo::model::format_minutes(engaged),
                             ),
