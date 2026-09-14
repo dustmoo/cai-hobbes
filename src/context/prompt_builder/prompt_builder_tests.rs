@@ -287,6 +287,7 @@ fn user_text_msg(text: &str) -> Message {
             content: text.to_string(),
             thought_signature: None,
             thought_summary: None,
+            signature_provider: None,
         },
         attachments: vec![],
         comments: vec![],
@@ -308,6 +309,7 @@ fn tool_call_msg(tool_name: &str, response: String, result_summary: Option<Strin
             response,
             thought_signature: None,
             thought_summary: None,
+            signature_provider: None,
             cached_image_path: None,
             result_summary,
         }),
@@ -648,4 +650,247 @@ fn planner_tools_are_withheld_when_the_planner_is_disabled() {
             tool
         );
     }
+}
+
+// =========================================================================
+// Thought-signature provenance filtering (mid-chat provider switch)
+// =========================================================================
+
+use super::message_history::signature_for_provider;
+use crate::llm::types::{ChatRole, ContentBlock};
+
+/// Assistant text message carrying a thinking summary + signature.
+fn assistant_thinking_msg(
+    text: &str,
+    signature: Option<&str>,
+    minted_by: Option<LlmProvider>,
+) -> Message {
+    Message {
+        id: uuid::Uuid::new_v4(),
+        author: "Hobbes".to_string(),
+        content: MessageContent::Text {
+            content: text.to_string(),
+            thought_signature: signature.map(|s| s.to_string()),
+            thought_summary: Some("thinking...".to_string()),
+            signature_provider: minted_by,
+        },
+        attachments: vec![],
+        comments: vec![],
+        created_at: Utc::now(),
+        usage: None,
+    }
+}
+
+/// Tool-call message carrying a signature with explicit provenance.
+fn signed_tool_call_msg(
+    tool_name: &str,
+    signature: Option<&str>,
+    minted_by: Option<LlmProvider>,
+) -> Message {
+    let mut msg = tool_call_msg(tool_name, "{\"ok\":true}".to_string(), None);
+    if let MessageContent::ToolCall(tc) = &mut msg.content {
+        tc.thought_signature = signature.map(|s| s.to_string());
+        tc.thought_summary = Some("thinking...".to_string());
+        tc.signature_provider = minted_by;
+    }
+    msg
+}
+
+/// All `ContentBlock::ToolCall` signatures in prompt order.
+fn tool_call_signatures(
+    result: &crate::context::prompt_builder::PromptBuildResult,
+) -> Vec<Option<String>> {
+    result
+        .prompt
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolCall { signature, .. } => Some(signature.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Signature on the `Thinking` block of the last assistant message that has one.
+fn latest_thinking_signature(
+    result: &crate::context::prompt_builder::PromptBuildResult,
+) -> Option<Option<String>> {
+    result
+        .prompt
+        .messages
+        .iter()
+        .rev()
+        .find(|m| {
+            m.role == ChatRole::Assistant
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Thinking { .. }))
+        })
+        .and_then(|m| {
+            m.content.iter().find_map(|b| match b {
+                ContentBlock::Thinking { signature, .. } => Some(signature.clone()),
+                _ => None,
+            })
+        })
+}
+
+fn session_pinned_to(provider: LlmProvider, messages: Vec<Message>) -> Session {
+    let mut session = create_test_session();
+    session.llm_provider = Some(provider);
+    session.messages = messages;
+    session
+}
+
+#[test]
+fn test_claude_tool_call_signature_dropped_when_session_pinned_to_gemini() {
+    let session = session_pinned_to(
+        LlmProvider::Gemini,
+        vec![
+            user_text_msg("do the thing"),
+            signed_tool_call_msg("alpha", Some("claude-sig"), Some(LlmProvider::Claude)),
+            signed_tool_call_msg("beta", Some("gemini-sig"), Some(LlmProvider::Gemini)),
+        ],
+    );
+    let settings = Settings::default();
+    let result = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+
+    let sigs = tool_call_signatures(&result);
+    assert_eq!(sigs.len(), 2, "expected two tool calls in the prompt");
+    assert_eq!(
+        sigs[0], None,
+        "Claude-minted signature must be dropped for a Gemini-pinned session"
+    );
+    assert_eq!(
+        sigs[1].as_deref(),
+        Some("gemini-sig"),
+        "the later Gemini-minted signature must survive (backfill must not resurrect the Claude one)"
+    );
+}
+
+#[test]
+fn test_gemini_thinking_signature_dropped_when_session_pinned_to_claude() {
+    let session = session_pinned_to(
+        LlmProvider::Claude,
+        vec![
+            user_text_msg("hello"),
+            assistant_thinking_msg("hi there", Some("gemini-sig"), Some(LlmProvider::Gemini)),
+        ],
+    );
+    let settings = Settings::default();
+    let result = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+
+    assert_eq!(
+        latest_thinking_signature(&result),
+        Some(None),
+        "a Gemini-minted signature on the newest assistant turn must be stripped for Claude"
+    );
+}
+
+#[test]
+fn test_same_provider_signatures_pass_through_unchanged() {
+    let session = session_pinned_to(
+        LlmProvider::Gemini,
+        vec![
+            user_text_msg("hello"),
+            assistant_thinking_msg("planning", Some("gemini-sig"), Some(LlmProvider::Gemini)),
+            // No signature of its own — must inherit the Gemini baton.
+            signed_tool_call_msg("alpha", None, None),
+        ],
+    );
+    let settings = Settings::default();
+    let result = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+
+    assert_eq!(
+        tool_call_signatures(&result),
+        vec![Some("gemini-sig".to_string())],
+        "same-provider signature must be backfilled onto the later tool call (Baton Pattern)"
+    );
+}
+
+#[test]
+fn test_legacy_unstamped_signature_kept_in_latest_turn() {
+    let session = session_pinned_to(
+        LlmProvider::Gemini,
+        vec![
+            user_text_msg("hello"),
+            signed_tool_call_msg("alpha", Some("legacy-sig"), None),
+        ],
+    );
+    let settings = Settings::default();
+    let result = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+
+    assert_eq!(
+        tool_call_signatures(&result),
+        vec![Some("legacy-sig".to_string())],
+        "an unstamped signature on the most recent turn is kept (no switch can have happened mid-turn)"
+    );
+}
+
+#[test]
+fn test_legacy_unstamped_signature_dropped_in_historical_turn() {
+    let session = session_pinned_to(
+        LlmProvider::Gemini,
+        vec![
+            user_text_msg("hello"),
+            signed_tool_call_msg("alpha", Some("legacy-sig"), None),
+            user_text_msg("now do something else"),
+            signed_tool_call_msg("beta", None, None),
+        ],
+    );
+    let settings = Settings::default();
+    let result = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+
+    assert_eq!(
+        tool_call_signatures(&result),
+        vec![None, None],
+        "unstamped signatures on historical turns are dropped, and must not be backfilled forward"
+    );
+}
+
+#[test]
+fn test_signature_for_provider_matching_stamp_is_kept() {
+    assert_eq!(
+        signature_for_provider(
+            Some("sig"),
+            Some(LlmProvider::Gemini),
+            LlmProvider::Gemini,
+            false
+        ),
+        Some("sig".to_string())
+    );
+}
+
+#[test]
+fn test_signature_for_provider_foreign_stamp_is_dropped() {
+    assert_eq!(
+        signature_for_provider(
+            Some("sig"),
+            Some(LlmProvider::Claude),
+            LlmProvider::Gemini,
+            true
+        ),
+        None,
+        "a foreign stamp is dropped even inside the latest turn"
+    );
+}
+
+#[test]
+fn test_signature_for_provider_legacy_depends_on_turn() {
+    assert_eq!(
+        signature_for_provider(Some("sig"), None, LlmProvider::Gemini, true),
+        Some("sig".to_string())
+    );
+    assert_eq!(
+        signature_for_provider(Some("sig"), None, LlmProvider::Gemini, false),
+        None
+    );
+}
+
+#[test]
+fn test_signature_for_provider_none_signature_stays_none() {
+    assert_eq!(
+        signature_for_provider(None, Some(LlmProvider::Gemini), LlmProvider::Gemini, true),
+        None
+    );
 }

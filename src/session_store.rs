@@ -1257,6 +1257,7 @@ mod event_tests {
                 content: content.to_string(),
                 thought_signature: None,
                 thought_summary: None,
+                signature_provider: None,
             },
             attachments: Vec::new(),
             comments: Vec::new(),

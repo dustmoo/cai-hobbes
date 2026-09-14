@@ -68,6 +68,12 @@ pub enum MessageContent {
         thought_signature: Option<String>,
         #[serde(default)]
         thought_summary: Option<String>,
+        /// Which provider minted `thought_signature` (Claude and Gemini both
+        /// write opaque, mutually-incompatible blobs into that field, and
+        /// nothing else records which one produced a given blob). `None` on
+        /// legacy rows predating this field and on messages with no signature.
+        #[serde(default)]
+        signature_provider: Option<crate::settings::LlmProvider>,
     },
     ToolCall(ToolCall),
     PermissionRequest(ToolCall),
@@ -116,6 +122,12 @@ pub struct ToolCall {
     /// The actual thinking content (human-readable), separate from the encrypted signature
     #[serde(default)]
     pub thought_summary: Option<String>,
+    /// Which provider minted `thought_signature` (Claude and Gemini both write
+    /// opaque, mutually-incompatible blobs into that field, and nothing else
+    /// records which one produced a given blob). `None` on legacy rows
+    /// predating this field and on messages with no signature.
+    #[serde(default)]
+    pub signature_provider: Option<crate::settings::LlmProvider>,
     /// Filesystem path (`file:///…`) of a screenshot/image returned by this tool call.
     /// Set by stream_manager when MCP returns image content; read by prompt_builder to
     /// inject a `ContentBlock::Image` as vision input on the next continuation turn.
@@ -177,9 +189,23 @@ impl ToolCall {
             response: String::new(),
             thought_signature,
             thought_summary,
+            signature_provider: None,
             cached_image_path: None,
             result_summary: None,
         }
+    }
+
+    /// Attach signature provenance to a tool call built via [`ToolCall::new`].
+    /// `provider` is stamped only when `thought_signature` is actually present —
+    /// a `None` signature never needs an owning provider. Kept as a separate
+    /// builder (rather than a `ToolCall::new` parameter) so call sites in the
+    /// individual LLM connectors — which don't yet know their own provider at
+    /// construction time — don't all need updating; callers that DO know the
+    /// provider (e.g. `stream_manager`, which resolves it from the session's
+    /// connector) chain this on afterwards.
+    pub fn with_signature_provider(mut self, provider: crate::settings::LlmProvider) -> Self {
+        self.signature_provider = self.thought_signature.is_some().then_some(provider);
+        self
     }
 }
 
@@ -351,6 +377,89 @@ pub fn ChatBarIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + Partia
                 height: 20,
                 icon: icon
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod signature_provider_tests {
+    use super::*;
+    use crate::settings::LlmProvider;
+
+    /// A legacy `ToolCall` JSON row (predates `signature_provider`) must still
+    /// deserialize, with the new field defaulting to `None`.
+    #[test]
+    fn legacy_tool_call_json_deserializes_with_none_provider() {
+        let legacy_json = serde_json::json!({
+            "execution_id": "exec-1",
+            "server_name": "srv",
+            "tool_name": "tool",
+            "arguments": "{}",
+            "status": "Completed",
+            "response": "ok",
+            "thought_signature": "abc123",
+        });
+        let tc: ToolCall = serde_json::from_value(legacy_json).expect("legacy ToolCall should deserialize");
+        assert_eq!(tc.signature_provider, None);
+        assert_eq!(tc.thought_signature.as_deref(), Some("abc123"));
+    }
+
+    /// A stamped `ToolCall` round-trips its `signature_provider` through serde.
+    #[test]
+    fn stamped_tool_call_round_trips_provider() {
+        let mut tc = ToolCall::new(
+            "srv".to_string(),
+            "tool".to_string(),
+            serde_json::json!({}),
+            Some("sig-blob".to_string()),
+            None,
+        );
+        tc = tc.with_signature_provider(LlmProvider::Claude);
+        assert_eq!(tc.signature_provider, Some(LlmProvider::Claude));
+
+        let json = serde_json::to_value(&tc).expect("serialize");
+        let round_tripped: ToolCall = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped.signature_provider, Some(LlmProvider::Claude));
+    }
+
+    /// A legacy `MessageContent::Text` JSON row (predates `signature_provider`)
+    /// must still deserialize, with the new field defaulting to `None`.
+    #[test]
+    fn legacy_text_content_json_deserializes_with_none_provider() {
+        let legacy_json = serde_json::json!({
+            "Text": {
+                "content": "hello",
+                "thought_signature": "sig",
+                "thought_summary": "summary"
+            }
+        });
+        let content: MessageContent =
+            serde_json::from_value(legacy_json).expect("legacy MessageContent::Text should deserialize");
+        match content {
+            MessageContent::Text { signature_provider, thought_signature, .. } => {
+                assert_eq!(signature_provider, None);
+                assert_eq!(thought_signature.as_deref(), Some("sig"));
+            }
+            other => panic!("expected Text variant, got {:?}", other),
+        }
+    }
+
+    /// A stamped `MessageContent::Text` round-trips its `signature_provider`.
+    #[test]
+    fn stamped_text_content_round_trips_provider() {
+        let content = MessageContent::Text {
+            content: "hello".to_string(),
+            thought_signature: Some("sig".to_string()),
+            thought_summary: None,
+            signature_provider: Some(LlmProvider::Claude),
+        };
+        let json = serde_json::to_value(&content).expect("serialize");
+        let round_tripped: MessageContent = serde_json::from_value(json).expect("deserialize");
+        match round_tripped {
+            MessageContent::Text { signature_provider, .. } => {
+                assert_eq!(signature_provider, Some(LlmProvider::Claude));
+            }
+            other => panic!("expected Text variant, got {:?}", other),
         }
     }
 }

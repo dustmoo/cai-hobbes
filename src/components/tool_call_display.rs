@@ -600,6 +600,7 @@ mod tests {
                 content: text.to_string(),
                 thought_signature: None,
                 thought_summary: None,
+                signature_provider: None,
             },
             attachments: vec![],
             comments: vec![],

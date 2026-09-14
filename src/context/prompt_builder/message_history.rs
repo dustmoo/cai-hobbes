@@ -4,6 +4,47 @@ use serde_json::json;
 use super::PromptBuilder;
 use super::types::{ToolResultPosition, unwrap_json_strings};
 
+/// Decide whether a stored `thought_signature` may be replayed to the provider
+/// this prompt is being built for.
+///
+/// `thought_signature` is an opaque, provider-specific blob. Gemini expects it
+/// back as `thoughtSignature` on a function-call part; Claude expects it as
+/// `signature` on a `thinking` block. Replaying one provider's blob to the other
+/// is a hard 400, and a mid-chat model switch only re-pins the session — the
+/// history keeps whatever signatures were minted before the switch.
+///
+/// Rules:
+/// - stamped with the effective provider → keep.
+/// - stamped with a different provider → drop.
+/// - **unstamped (legacy row)** → keep only when the message belongs to the
+///   most recent turn.
+///
+/// Why that legacy rule: `signature_provider` is new, but signature *storage*
+/// is not. `git log -S thought_signature -- src/llm/claude.rs` shows the field
+/// has been written by the Claude connector since the provider landed
+/// (`99e3672 feat(llm): implement Claude (Anthropic Messages API) provider`,
+/// via its `signature_delta` handling), just as Gemini has written it since
+/// `fdc2575`. So an unstamped signature could have been minted by *either*
+/// provider and there is no per-message evidence to tell them apart. The only
+/// safe rule is therefore positional: signatures on older turns are dropped
+/// outright (losing them costs nothing but a little cache reuse), while the
+/// most recent turn — the in-flight continuation loop, where Gemini's Baton
+/// Pattern actually needs the signature back — is preserved, since a switch
+/// mid-turn is not possible (the pin changes between turns).
+pub(crate) fn signature_for_provider(
+    sig: Option<&str>,
+    minted_by: Option<crate::settings::LlmProvider>,
+    effective: crate::settings::LlmProvider,
+    in_latest_turn: bool,
+) -> Option<String> {
+    let sig = sig?;
+    match minted_by {
+        Some(p) if p == effective => Some(sig.to_string()),
+        Some(_) => None,
+        None => in_latest_turn.then(|| sig.to_string()),
+    }
+}
+
 /// Result of the message linearisation pass (Pass 1).
 pub(crate) struct LinearisedMessages {
     pub messages: Vec<ChatMessage>,
@@ -116,6 +157,10 @@ impl<'a> PromptBuilder<'a> {
             .map(|i| i + 1)
             .unwrap_or(0);
 
+        // Provider this prompt targets — stored thought signatures minted by any
+        // other provider must not be replayed (see `signature_for_provider`).
+        let effective_provider = self.effective_provider();
+
         for (offset, message) in session_messages.iter().skip(start_index).enumerate() {
             let abs_idx = start_index + offset;
             // Avoid duplicating the first message
@@ -125,17 +170,43 @@ impl<'a> PromptBuilder<'a> {
                     continue;
                 }
 
+                // A message belongs to the "latest turn" when it sits at or after
+                // the most recent user text message. Used by the signature
+                // provenance filter for legacy (unstamped) rows.
+                let in_latest_turn = abs_idx >= current_turn_start_idx;
+
                 match &message.content {
                     MessageContent::Text {
-                        thought_signature, ..
+                        thought_signature,
+                        signature_provider,
+                        ..
                     } => {
+                        // Drop signatures minted by a different provider than the
+                        // one this prompt targets (mid-chat model switch).
+                        let filtered = signature_for_provider(
+                            thought_signature.as_deref(),
+                            *signature_provider,
+                            effective_provider,
+                            in_latest_turn,
+                        );
+
                         // Track the latest thought_signature for backfilling onto
-                        // subsequent tool calls that may lack their own.
-                        if let Some(sig) = thought_signature {
-                            last_thought_signature = Some(sig.clone());
+                        // subsequent tool calls that may lack their own. A rejected
+                        // (foreign) signature resets the baton to `None` rather
+                        // than leaving a stale one to be backfilled across the
+                        // provider boundary.
+                        if thought_signature.is_some() {
+                            last_thought_signature = filtered.clone();
                         }
 
-                        let chat_msg: ChatMessage = message.clone().into();
+                        let mut chat_msg: ChatMessage = message.clone().into();
+                        // `From<Message>` copies the raw signature into the
+                        // Thinking block; overwrite it with the filtered value.
+                        for block in chat_msg.content.iter_mut() {
+                            if let ContentBlock::Thinking { signature, .. } = block {
+                                *signature = filtered.clone();
+                            }
+                        }
 
                         // Handle comments
                         if !message.comments.is_empty() {
@@ -159,14 +230,23 @@ impl<'a> PromptBuilder<'a> {
                         }
                     }
                     MessageContent::ToolCall(tc) => {
+                        // Drop a signature minted by a different provider before
+                        // it can be replayed (or backfilled onto a later call).
+                        let own_signature = signature_for_provider(
+                            tc.thought_signature.as_deref(),
+                            tc.signature_provider,
+                            effective_provider,
+                            in_latest_turn,
+                        );
                         // Backfill thought_signature from the last known one if this
                         // tool call doesn't have its own (critical for Gemini thinking mode).
-                        let current_thought_signature = tc
-                            .thought_signature
-                            .clone()
-                            .or(last_thought_signature.clone());
-                        if let Some(sig) = &tc.thought_signature {
-                            last_thought_signature = Some(sig.clone());
+                        // Only signatures that themselves passed the filter are ever
+                        // carried forward, so a backfill can never cross a provider
+                        // boundary.
+                        let current_thought_signature =
+                            own_signature.clone().or_else(|| last_thought_signature.clone());
+                        if tc.thought_signature.is_some() {
+                            last_thought_signature = own_signature;
                         }
 
                         // Sanitize tool name — MUST match the name used in function declarations.

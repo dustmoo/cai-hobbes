@@ -512,6 +512,7 @@ mod tests {
                 content: content.to_string(),
                 thought_signature: None,
                 thought_summary: None,
+                signature_provider: None,
             },
             attachments: Vec::new(),
             comments: Vec::new(),
@@ -574,6 +575,7 @@ mod tests {
             content: "done — the file says hi".to_string(),
             thought_signature: None,
             thought_summary: None,
+            signature_provider: None,
         };
         assistant.usage = usage(100, 0.01);
 

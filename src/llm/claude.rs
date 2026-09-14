@@ -144,7 +144,7 @@ impl LlmConnector for ClaudeConnector {
             .build()
             .expect("Failed to build reqwest client");
 
-        let body_str = serde_json::to_string(&native_request)
+        let mut body_str = serde_json::to_string(&native_request)
             .expect("Failed to serialize Claude request body");
 
         let model_for_cost = ClaudeModel::from_slug(&self.config.model);
@@ -196,6 +196,16 @@ impl LlmConnector for ClaudeConnector {
         // but only while NO content has been streamed to the UI yet, so a
         // mid-stream failure never duplicates output. Honors `retry-after`.
         const MAX_RETRIES: u32 = 2;
+
+        // Belt-and-braces guard (retries at most once, kept separate from the
+        // transient-failure budget above): a mid-chat provider switch can
+        // leave a `signature` minted by a different provider on a `thinking`
+        // block in history. Anthropic rejects it with a 400 naming the
+        // signature — drop every `thinking` block and retry exactly once.
+        // This never fires after stream data has been emitted, since it only
+        // triggers on the pre-stream status check below.
+        let mut signature_retry_used = false;
+
         for attempt in 0..=MAX_RETRIES {
             let backoff = std::time::Duration::from_millis(500u64 * (1u64 << attempt));
 
@@ -228,6 +238,40 @@ impl LlmConnector for ClaudeConnector {
 
             if !response.status().is_success() {
                 let code = response.status().as_u16();
+
+                // 400s are never part of the transient-failure retry budget
+                // below, so it's safe to read the body eagerly here and check
+                // for the foreign-signature shape before falling through to
+                // the generic error report.
+                if code == 400 && !signature_retry_used {
+                    let body = response.text().await.unwrap_or_default();
+                    if attempt < MAX_RETRIES
+                        && crate::llm::is_claude_thought_signature_error(code, &body)
+                    {
+                        signature_retry_used = true;
+                        tracing::warn!(
+                            provider = "claude",
+                            model = %self.config.model,
+                            "Claude rejected a foreign thinking-block signature (likely left over from a mid-chat provider switch); stripping thinking blocks and retrying once"
+                        );
+                        let mut stripped_messages = prompt_data.messages.clone();
+                        crate::llm::strip_thought_signatures(&mut stripped_messages);
+                        let stripped_prompt = LlmPrompt {
+                            system: prompt_data.system.clone(),
+                            messages: stripped_messages,
+                            tools: prompt_data.tools.clone(),
+                        };
+                        let stripped_native = self.to_native_request(&stripped_prompt, true);
+                        body_str = serde_json::to_string(&stripped_native)
+                            .expect("Failed to serialize Claude request body");
+                        continue;
+                    }
+                    let _ = tx.send(StreamMessage::Error {
+                        message: Self::format_api_error(code, &body),
+                    });
+                    return;
+                }
+
                 let retryable = code == 429 || code == 529 || response.status().is_server_error();
                 if retryable && attempt < MAX_RETRIES {
                     let delay = response
@@ -1096,5 +1140,137 @@ mod tests {
             }
             other => panic!("expected Thinking signature, got {:?}", other),
         }
+    }
+
+    // ── Foreign thought-signature guard ──────────────────────────────────
+
+    #[test]
+    fn detects_claude_thought_signature_error() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0.signature: Invalid signature for thinking block."}}"#;
+        assert!(crate::llm::is_claude_thought_signature_error(400, body));
+
+        // Case-insensitive.
+        let body_upper = r#"{"type":"error","error":{"type":"INVALID_REQUEST_ERROR","message":"Thinking block SIGNATURE is invalid."}}"#;
+        assert!(crate::llm::is_claude_thought_signature_error(400, body_upper));
+    }
+
+    #[test]
+    fn does_not_detect_unrelated_claude_400() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: model requires max_tokens"}}"#;
+        assert!(!crate::llm::is_claude_thought_signature_error(400, body));
+    }
+
+    #[test]
+    fn does_not_detect_claude_429_even_with_signature_wording() {
+        // A rate-limit body that happens to mention "signature" (e.g. inside an
+        // echoed request) must not be treated as the thought-signature case.
+        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"thinking block signature check delayed"}}"#;
+        assert!(!crate::llm::is_claude_thought_signature_error(429, body));
+    }
+
+    #[test]
+    fn strip_thought_signatures_clears_thinking_and_leaves_others_untouched() {
+        let mut messages = vec![
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        text: "reasoning".into(),
+                        signature: Some("gemini-minted-sig".into()),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "call_1".into(),
+                        name: "search".into(),
+                        arguments: json!({"q": "x"}),
+                        signature: Some("gemini-minted-sig-2".into()),
+                    },
+                    ContentBlock::Text { text: "answer".into() },
+                ],
+            },
+            ChatMessage {
+                role: ChatRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    call_id: "call_1".into(),
+                    name: "search".into(),
+                    content: json!({"ok": true}),
+                }],
+            },
+        ];
+
+        crate::llm::strip_thought_signatures(&mut messages);
+
+        match &messages[0].content[0] {
+            ContentBlock::Thinking { signature, text } => {
+                assert!(signature.is_none());
+                assert_eq!(text, "reasoning"); // text untouched
+            }
+            other => panic!("expected Thinking, got {:?}", other),
+        }
+        match &messages[0].content[1] {
+            ContentBlock::ToolCall { signature, name, .. } => {
+                assert!(signature.is_none());
+                assert_eq!(name, "search"); // other fields untouched
+            }
+            other => panic!("expected ToolCall, got {:?}", other),
+        }
+        assert_eq!(messages[0].content[2], ContentBlock::Text { text: "answer".into() });
+        // ToolResult (no signature field at all) is untouched.
+        assert_eq!(
+            messages[1].content[0],
+            ContentBlock::ToolResult {
+                call_id: "call_1".into(),
+                name: "search".into(),
+                content: json!({"ok": true}),
+            }
+        );
+    }
+
+    #[test]
+    fn stripped_thinking_block_serializes_without_signature_key() {
+        // A thinking block carrying a foreign signature, after stripping, must
+        // serialize to no `thinking` block at all (matches the existing
+        // "no signature => omitted" behavior asserted by
+        // `thinking_block_serialized_only_with_signature`), and the tool call
+        // must serialize with no `signature`-carrying field.
+        let mut messages = vec![ChatMessage {
+            role: ChatRole::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    text: "reasoning".into(),
+                    signature: Some("foreign-sig".into()),
+                },
+                ContentBlock::ToolCall {
+                    id: "call_1".into(),
+                    name: "search".into(),
+                    arguments: json!({"q": "x"}),
+                    signature: Some("foreign-sig-2".into()),
+                },
+            ],
+        }];
+        crate::llm::strip_thought_signatures(&mut messages);
+
+        let prompt = LlmPrompt {
+            system: None,
+            messages,
+            tools: vec![],
+        };
+        let req = thinking_connector(true).to_native_request(&prompt, true);
+        let blocks = req["messages"][0]["content"].as_array().unwrap();
+
+        assert!(
+            blocks.iter().all(|b| b["type"] != "thinking"),
+            "stripped thinking block must not be serialized: {:?}",
+            blocks
+        );
+        let serialized = serde_json::to_string(&req).unwrap();
+        assert!(
+            !serialized.contains("\"signature\""),
+            "no signature key should remain in the request: {}",
+            serialized
+        );
+        // The tool_use block itself is still present (Claude has no
+        // signature field on tool_use, so nothing to strip there beyond the
+        // neutral ContentBlock::ToolCall.signature we already cleared).
+        assert!(blocks.iter().any(|b| b["type"] == "tool_use"));
     }
 }

@@ -165,7 +165,7 @@ pub fn MessageList(
                                         let session_id = session_id.read().clone();
                                         rsx! {
                                             match &message.content {
-                                                MessageContent::Text { content: text, thought_signature: _, thought_summary: _ } => {
+                                                MessageContent::Text { content: text, thought_signature: _, thought_summary: _, signature_provider: _ } => {
                                                     let stream_manager = consume_context::<crate::components::stream_manager::StreamManagerContext>();
                                                     let is_generating = stream_manager.is_generating(&message.id);
                                                     // Don't render empty bubbles — thinking data (thought_signature/thought_summary)

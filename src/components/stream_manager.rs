@@ -146,6 +146,19 @@ impl StreamManagerContext {
         }
     }
 
+    /// The provider that will actually mint this turn's `thought_signature`
+    /// (resolved connector instance's provider, falling back to the legacy
+    /// global `active_llm` when no connector instance is configured). Used to
+    /// stamp `signature_provider` on assembled messages/tool calls so a later
+    /// mid-chat model switch never replays one provider's opaque signature
+    /// blob to another.
+    fn resolved_provider(&self, session_id: &str) -> crate::settings::LlmProvider {
+        match self.effective_connector(session_id) {
+            Some(inst) => inst.provider(),
+            None => self.settings.read().active_llm,
+        }
+    }
+
     /// The session's resolved OpenAI-compat config when watch-word recovery
     /// is enabled on it. Watch words are a per-instance OpenAI-compat
     /// feature: gate on the session's resolved connector config, not the
@@ -232,6 +245,11 @@ impl StreamManagerContext {
         // Store the receiver for the MessageBubble to pick up.
         self.stream_receivers.write().insert(message_id, stream_rx);
         *self.stream_activity.write() += 1;
+
+        // Resolve which provider will mint this turn's thought_signature(s) so
+        // assembled messages/tool calls below can be stamped with provenance
+        // (see `signature_provider` on MessageContent::Text / ToolCall).
+        let stream_provider = self.resolved_provider(&session_id);
 
         // Spawn a master task to manage the LLM call and state updates.
         let master_task_handle = spawn(async move {
@@ -345,11 +363,15 @@ impl StreamManagerContext {
                                     content: msg_content,
                                     thought_signature: msg_thought_sig,
                                     thought_summary: msg_thought_sum,
+                                    signature_provider: msg_sig_provider,
                                 } = &mut msg.content
                                 {
                                     *msg_content = final_text_for_this_turn.clone();
                                     *msg_thought_sig = thought_signature_for_this_turn.clone();
                                     *msg_thought_sum = thought_summary_for_this_turn.clone();
+                                    *msg_sig_provider = thought_signature_for_this_turn
+                                        .is_some()
+                                        .then_some(stream_provider);
                                 }
                             }
                         }
@@ -557,6 +579,12 @@ impl StreamManagerContext {
                         } else {
                             tracing::warn!("Tool call '{}' has NO thought_signature and none available to propagate!", tool_call.tool_name);
                         }
+
+                        // Stamp provenance: record which provider minted the
+                        // thought_signature now attached to this tool call (captured
+                        // or propagated above), so a later mid-chat provider switch
+                        // never replays it to an incompatible provider.
+                        tool_call = tool_call.with_signature_provider(stream_provider);
 
                         tool_call_count += 1;
                         let mut tool_call_snapshot: Option<crate::components::chat::Message> = None;
@@ -976,11 +1004,15 @@ impl StreamManagerContext {
                             content,
                             thought_signature,
                             thought_summary,
+                            signature_provider,
                         } = &mut msg.content
                         {
                             *content = final_text_for_this_turn.clone();
                             *thought_signature = thought_signature_for_this_turn.clone();
                             *thought_summary = thought_summary_for_this_turn.clone();
+                            *signature_provider = thought_signature_for_this_turn
+                                .is_some()
+                                .then_some(stream_provider);
                             final_snapshot = Some(msg.clone());
                         }
                     }
@@ -1003,6 +1035,7 @@ impl StreamManagerContext {
                             content,
                             thought_signature,
                             thought_summary,
+                            signature_provider,
                         } = &mut msg.content
                         {
                             *content = promoted_text.clone();
@@ -1010,6 +1043,9 @@ impl StreamManagerContext {
                             // Clear thought_summary since we promoted it to content —
                             // no need to show it twice under "Thinking Process"
                             *thought_summary = None;
+                            *signature_provider = thought_signature_for_this_turn
+                                .is_some()
+                                .then_some(stream_provider);
                             final_snapshot = Some(msg.clone());
                         }
                     }
@@ -1282,6 +1318,7 @@ impl StreamManagerContext {
                             content: warning_msg,
                             thought_signature: None,
                             thought_summary: None,
+                            signature_provider: None,
                         },
                         attachments: Vec::new(),
                         comments: Vec::new(),
@@ -1339,6 +1376,7 @@ impl StreamManagerContext {
                                     content: recovery_text,
                                     thought_signature: None,
                                     thought_summary: None,
+                                    signature_provider: None,
                                 },
                                 attachments: Vec::new(),
                                 comments: Vec::new(),
@@ -1632,6 +1670,7 @@ impl StreamManagerContext {
                         content: recovery_text,
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                     },
                     attachments: Vec::new(),
                     comments: Vec::new(),
@@ -1972,6 +2011,99 @@ mod tests {
             // Taking a stream that doesn't exist should return None
             let taken_rx = stream_manager.take_stream(&message_id);
             assert!(taken_rx.is_none());
+
+            rsx! { div {} }
+        });
+
+        dom.rebuild_in_place();
+        dom.wait_for_suspense().await;
+    }
+
+    /// `resolved_provider` is the exact lookup `start_stream` uses to derive
+    /// `stream_provider`, which is then stamped onto assembled `MessageContent::Text`
+    /// / `ToolCall` values as `signature_provider` (see the `StreamMessage::Text`
+    /// and `StreamMessage::ToolCall(..)` arms in `start_stream`'s master task).
+    /// There is no existing harness for driving a fabricated LLM stream through
+    /// `start_stream` itself (it spawns a real `LlmConnector::generate_content_stream`
+    /// call with no seam for injecting fake `StreamMessage`s), so this test instead
+    /// pins down the provider-resolution step that feeds the stamp: a session
+    /// pinned to a Claude connector instance must resolve to `LlmProvider::Claude`,
+    /// not the global default.
+    #[tokio::test]
+    async fn test_resolved_provider_uses_session_pinned_connector() {
+        let mut dom = VirtualDom::new(|| {
+            let mut settings_val = Settings::default();
+            let claude_id = settings_val
+                .add_connector(
+                    "My Claude",
+                    crate::settings::ProviderInstanceConfig::Claude(
+                        crate::settings::ClaudeConfig::default(),
+                    ),
+                )
+                .expect("add_connector should succeed");
+
+            let mut session_state_val = SessionState::new();
+            let session_id = session_state_val.create_session_raw(None);
+            if let Some(session) = session_state_val.sessions.get_mut(&session_id) {
+                session.llm_connector_id = Some(claude_id.clone());
+            }
+
+            let session_state = use_context_provider(|| Signal::new(session_state_val));
+            let settings = use_context_provider(|| Signal::new(settings_val));
+            let permission_manager =
+                use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+            let secret_manager = use_context_provider(|| Signal::new(SecretManager::new()));
+            let mcp_manager = use_context_provider(|| {
+                Signal::new(McpManager::new(
+                    PathBuf::new(),
+                    permission_manager,
+                    secret_manager,
+                    settings,
+                ))
+            });
+            let continuation_controller =
+                use_context_provider(|| Signal::new(ContinuationController::new()));
+            let llm_connector = use_context_provider(|| {
+                Signal::new(Arc::new(crate::llm::GeminiConnector::new(
+                    settings.read().gemini_config.clone(),
+                )) as Arc<dyn crate::llm::LlmConnector>)
+            });
+            let scheduler = use_coroutine(|_| async {});
+            let stream_manager = use_context_provider(|| StreamManagerContext {
+                chat_command: Signal::new(None),
+                stream_receivers: Signal::new(HashMap::new()),
+                active_stream_handles: Signal::new(HashMap::new()),
+                llm_connector,
+                session_state,
+                mcp_manager,
+                tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
+                settings,
+                continuation_controller,
+                scheduler,
+                permission_manager,
+                skill_registry: Signal::new(crate::skills::SkillRegistry::new()),
+                mcp_context: Signal::new(crate::mcp::manager::McpContext {
+                    servers: Vec::new(),
+                    connected_toolkit_slugs: Vec::new(),
+                }),
+                planner_state: Signal::new(crate::todo::PlannerState::default()),
+                stream_activity: Signal::new(0),
+                streaming_sessions: Signal::new(HashSet::new()),
+                stream_session_map: Signal::new(HashMap::new()),
+                content_generated: Signal::new(HashSet::new()),
+                save_error_signal: Signal::new(None),
+                usage_log: Signal::new(crate::usage_log::UsageLog::default()),
+                summarizing_sessions: Signal::new(HashSet::new()),
+            });
+
+            // Global default is Gemini (Settings::default()), but the session is
+            // pinned to the Claude connector instance — resolution must follow
+            // the pin, not the global default, or a mid-chat switch would stamp
+            // the wrong provider on the signature.
+            assert_eq!(
+                stream_manager.resolved_provider(&session_id),
+                crate::settings::LlmProvider::Claude
+            );
 
             rsx! { div {} }
         });

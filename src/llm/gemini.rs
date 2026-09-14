@@ -348,6 +348,28 @@ impl GeminiModel {
     }
 }
 
+/// Clear `thoughtSignature` from every `FunctionCall` part of an already-built
+/// Gemini request's `contents`. Belt-and-braces fallback for a mid-chat
+/// provider switch: history can carry a signature minted by a different
+/// provider, which Gemini rejects with a 400 naming the signature. Operates
+/// on the native, already-cache-adjusted `Content`/`Part` list rather than
+/// rebuilding from the neutral prompt, so it can't disturb any explicit
+/// context-cache trimming already applied to `request_body`. Gemini's
+/// `Part::Text { thought: Some(true), .. }` (thinking) variant carries no
+/// signature field of its own, so only function-call parts need clearing.
+fn strip_gemini_thought_signatures(contents: &mut [Content]) {
+    for content in contents.iter_mut() {
+        for part in content.parts.iter_mut() {
+            if let Part::FunctionCall {
+                thought_signature, ..
+            } = part
+            {
+                *thought_signature = None;
+            }
+        }
+    }
+}
+
 /// Calculate cost in USD based on model and token usage.
 /// Pricing per million tokens for Gemini models (as of Jul 2026).
 /// Handles dynamic rates for Context Caching.
@@ -1347,6 +1369,14 @@ impl LlmConnector for GeminiConnector {
 
         let url = self.build_model_endpoint(&model, "streamGenerateContent", &api_key) + "&alt=sse";
 
+        // Belt-and-braces guard (retries at most once): a mid-chat provider
+        // switch can leave a `thoughtSignature` minted by a different
+        // provider in history. Gemini rejects it with a 400 naming the
+        // signature — strip every function-call signature and retry exactly
+        // once. This never fires after stream data has been emitted, since
+        // it only triggers on the pre-stream status check below.
+        let mut signature_retry_used = false;
+
         for attempt in 0..MAX_RETRIES {
             let response = match client.post(&url).json(&request_body).send().await {
                 Ok(r) => r,
@@ -1365,6 +1395,25 @@ impl LlmConnector for GeminiConnector {
             if !response.status().is_success() {
                 let status = response.status();
                 let body_text = response.text().await.unwrap_or_default();
+
+                // Only take this branch if the shared attempt loop actually has
+                // another iteration to give us — never fall through to the end
+                // of the loop silently. In the extremely unlikely case where
+                // this is the last available attempt, skip straight to the
+                // normal error-reporting path below instead.
+                if !signature_retry_used
+                    && attempt + 1 < MAX_RETRIES
+                    && crate::llm::is_gemini_thought_signature_error(status.as_u16(), &body_text)
+                {
+                    signature_retry_used = true;
+                    tracing::warn!(
+                        provider = "gemini",
+                        model = %model,
+                        "Gemini rejected a foreign thought signature (likely left over from a mid-chat provider switch); stripping signatures and retrying once"
+                    );
+                    strip_gemini_thought_signatures(&mut request_body.contents);
+                    continue;
+                }
 
                 // Retry on server errors (5xx) if attempts remain — preview models often 500 transiently
                 if status.is_server_error() && attempt + 1 < MAX_RETRIES {
@@ -2681,5 +2730,236 @@ mod tests {
         assert_eq!(GeminiModel::Gemini3_0ProPreview.api_version(), "v1beta");
         assert_eq!(GeminiModel::Gemini2_5Flash.api_version(), "v1beta");
         assert_eq!(GeminiModel::Gemini2_0Flash.api_version(), "v1beta");
+    }
+
+    // ── Foreign thought-signature guard ──────────────────────────────────
+
+    #[test]
+    fn detects_gemini_thought_signature_error() {
+        let body = r#"{"error":{"code":400,"message":"Invalid thought signature provided. The thought_signature field does not match the model that produced it.","status":"INVALID_ARGUMENT"}}"#;
+        assert!(crate::llm::is_gemini_thought_signature_error(400, body));
+
+        let body2 = r#"{"error":{"code":400,"message":"Corrupted thought signature provided. Unable to submit request because it has a thought_signature field that is invalid.","status":"INVALID_ARGUMENT"}}"#;
+        assert!(crate::llm::is_gemini_thought_signature_error(400, body2));
+
+        // Case-insensitive.
+        let body_upper = r#"{"error":{"message":"THOUGHT SIGNATURE is invalid or expired","status":"INVALID_ARGUMENT"}}"#;
+        assert!(crate::llm::is_gemini_thought_signature_error(400, body_upper));
+    }
+
+    #[test]
+    fn does_not_detect_unrelated_gemini_400() {
+        // Malformed schema / bad request unrelated to signatures.
+        let body = r#"{"error":{"code":400,"message":"Invalid JSON payload received. Unknown name \"foo\".","status":"INVALID_ARGUMENT"}}"#;
+        assert!(!crate::llm::is_gemini_thought_signature_error(400, body));
+    }
+
+    #[test]
+    fn does_not_detect_gemini_429() {
+        let body = r#"{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}"#;
+        assert!(!crate::llm::is_gemini_thought_signature_error(429, body));
+    }
+
+    #[test]
+    fn strip_gemini_thought_signatures_clears_function_call_only() {
+        let mut contents = vec![Content {
+            role: "model".to_string(),
+            parts: vec![
+                Part::Text {
+                    text: "thinking...".to_string(),
+                    thought: Some(true),
+                },
+                Part::FunctionCall {
+                    function_call: FunctionCallPart {
+                        name: "search".to_string(),
+                        args: serde_json::json!({"q": "x"}),
+                    },
+                    thought_signature: Some("claude-minted-sig".to_string()),
+                },
+            ],
+        }];
+
+        strip_gemini_thought_signatures(&mut contents);
+
+        match &contents[0].parts[1] {
+            Part::FunctionCall {
+                thought_signature,
+                function_call,
+            } => {
+                assert!(thought_signature.is_none());
+                assert_eq!(function_call.name, "search"); // other fields untouched
+            }
+            other => panic!("expected FunctionCall, got {:?}", other),
+        }
+        // Text/thought part is untouched (Gemini has no signature field there).
+        match &contents[0].parts[0] {
+            Part::Text { thought, .. } => assert_eq!(*thought, Some(true)),
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stripped_function_call_serializes_without_thought_signature_key() {
+        let mut contents = vec![Content {
+            role: "model".to_string(),
+            parts: vec![Part::FunctionCall {
+                function_call: FunctionCallPart {
+                    name: "search".to_string(),
+                    args: serde_json::json!({"q": "x"}),
+                },
+                thought_signature: Some("foreign-sig".to_string()),
+            }],
+        }];
+        strip_gemini_thought_signatures(&mut contents);
+
+        let serialized = serde_json::to_string(&contents).unwrap();
+        assert!(
+            !serialized.contains("thoughtSignature"),
+            "no thoughtSignature key should remain: {}",
+            serialized
+        );
+        assert!(serialized.contains("\"search\""));
+    }
+
+    #[test]
+    fn shared_strip_thought_signatures_also_clears_gemini_tool_call_via_native_request() {
+        // Belt-and-braces: the generic ChatMessage-level stripper (shared with
+        // Claude) is equally valid input to Gemini's `to_native_request` — a
+        // cleared `ContentBlock::ToolCall.signature` must serialize with no
+        // `thoughtSignature` key.
+        let mut messages = vec![crate::llm::ChatMessage {
+            role: crate::llm::ChatRole::Assistant,
+            content: vec![crate::llm::ContentBlock::ToolCall {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"q": "x"}),
+                signature: Some("foreign-sig".to_string()),
+            }],
+        }];
+        crate::llm::strip_thought_signatures(&mut messages);
+
+        let prompt = LlmPrompt {
+            system: None,
+            messages,
+            tools: vec![],
+        };
+        let config = GeminiConfig {
+            api_key: Some("test-key".to_string()),
+            chat_model: "gemini-2.5-pro".to_string(),
+            summary_model: "gemini-2.5-flash".to_string(),
+            thinking_enabled: false,
+            thinking_level: "high".to_string(),
+            thinking_budget: None,
+            model_slots: vec![],
+            context_tuning: Default::default(),
+            context_caching_enabled: false,
+            cache_ttl_seconds: 300,
+        };
+        let connector = GeminiConnector::new(config);
+        let native = connector.to_native_request(&prompt, true);
+        let serialized = serde_json::to_string(&native).unwrap();
+        assert!(!serialized.contains("thoughtSignature"), "{}", serialized);
+    }
+
+    #[tokio::test]
+    async fn retries_once_after_stripping_foreign_thought_signature() {
+        let mock_server = MockServer::start().await;
+
+        // First attempt: Gemini rejects the foreign `thoughtSignature` left
+        // over from a mid-chat provider switch.
+        let error_body = serde_json::json!({
+            "error": {
+                "code": 400,
+                "message": "Invalid thought signature provided. The thought_signature field does not match the model that produced it.",
+                "status": "INVALID_ARGUMENT"
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-2.5-pro:streamGenerateContent"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(&error_body))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Second attempt (after stripping): succeeds normally.
+        let content_json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "text": "Recovered after stripping the signature." }]
+                }
+            }]
+        });
+        let response_body = format!("data: {}\n\n", content_json);
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-2.5-pro:streamGenerateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(response_body))
+            .mount(&mock_server)
+            .await;
+
+        let config = GeminiConfig {
+            api_key: Some("test-key".to_string()),
+            chat_model: "gemini-2.5-pro".to_string(),
+            summary_model: "gemini-1.5-flash-latest".to_string(),
+            thinking_enabled: false,
+            thinking_level: "high".to_string(),
+            thinking_budget: None,
+            model_slots: vec![],
+            context_tuning: Default::default(),
+            context_caching_enabled: false,
+            cache_ttl_seconds: 300,
+        };
+        let connector = GeminiConnector::new(config).with_base_url(mock_server.uri());
+
+        // History carries a ToolCall signature (as if minted by a different
+        // provider before a mid-chat switch to Gemini).
+        let prompt_data = LlmPrompt {
+            system: None,
+            messages: vec![
+                crate::llm::ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![crate::llm::ContentBlock::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "search".to_string(),
+                        arguments: serde_json::json!({"q": "x"}),
+                        signature: Some("foreign-provider-sig".to_string()),
+                    }],
+                },
+                crate::llm::ChatMessage {
+                    role: crate::llm::ChatRole::Tool,
+                    content: vec![crate::llm::ContentBlock::ToolResult {
+                        call_id: "call_1".to_string(),
+                        name: "search".to_string(),
+                        content: serde_json::json!({"ok": true}),
+                    }],
+                },
+                crate::llm::ChatMessage {
+                    role: crate::llm::ChatRole::User,
+                    content: vec![crate::llm::ContentBlock::Text {
+                        text: "Continue.".to_string(),
+                    }],
+                },
+            ],
+            tools: vec![],
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        connector
+            .generate_content_stream(prompt_data, tx, None, None)
+            .await;
+
+        let mut recovered = false;
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                StreamMessage::Error { message } => panic!("unexpected error: {}", message),
+                StreamMessage::Text { content, .. } if content.contains("Recovered") => {
+                    recovered = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            recovered,
+            "expected the retried (stripped) request to succeed"
+        );
     }
 }

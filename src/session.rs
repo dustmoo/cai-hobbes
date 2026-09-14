@@ -1555,10 +1555,12 @@ mod tests {
                 content,
                 thought_signature,
                 thought_summary,
+                signature_provider,
             } => {
                 assert_eq!(content, "Hello world");
                 assert!(thought_signature.is_none());
                 assert!(thought_summary.is_none());
+                assert!(signature_provider.is_none());
             }
             other => panic!("Expected Text variant, got {:?}", other),
         }
@@ -1832,6 +1834,7 @@ mod tests {
                     content: "Hello".to_string(),
                     thought_signature: None,
                     thought_summary: None,
+                    signature_provider: None,
                 },
                 attachments: Vec::new(),
                 comments: Vec::new(),
@@ -1878,6 +1881,7 @@ mod tests {
                         content: "test".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                     },
                     attachments: Vec::new(),
                     comments: Vec::new(),
@@ -2049,6 +2053,7 @@ mod tests {
                         content: "Hello".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                     },
                     attachments: vec![],
                     comments: vec![],
@@ -2062,6 +2067,7 @@ mod tests {
                         content: "Do something".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                     },
                     attachments: vec![],
                     comments: vec![],
@@ -2080,6 +2086,7 @@ mod tests {
                         response: "file contents".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                         cached_image_path: None,
                         result_summary: None,
                     }),
@@ -2100,6 +2107,7 @@ mod tests {
                         response: "ok".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                         cached_image_path: None,
                         result_summary: None,
                     }),

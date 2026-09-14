@@ -24,6 +24,77 @@ use crate::mcp::manager::McpContext;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+/// True when a Gemini HTTP error body describes an invalid/mismatched
+/// `thoughtSignature` on a function-call (or thought) part — the shape
+/// returned when history carries a signature minted by a different provider
+/// after a mid-chat model switch.
+///
+/// Observed wording (Gemini `generateContent`/`streamGenerateContent` 400s,
+/// `status: "INVALID_ARGUMENT"`):
+///   - "Invalid thought signature provided. ..."
+///   - "Corrupted thought signature provided. ..."
+///   - "Unable to submit request because it has a thought_signature field
+///     that is invalid ..."
+///   - "The thought signature ... is invalid/does not match/expired"
+///
+/// Matched conservatively: the status must be 400, and the body must mention
+/// "signature" together with either "thought" or "INVALID_ARGUMENT"
+/// (case-insensitive) so unrelated 400s (bad API key, malformed schema,
+/// safety blocks, etc.) never trigger a retry.
+pub fn is_gemini_thought_signature_error(status: u16, body: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("signature") && (lower.contains("thought") || lower.contains("invalid_argument"))
+}
+
+/// True when an Anthropic HTTP error body describes an invalid/mismatched
+/// `signature` on a `thinking` content block — the shape returned when
+/// history carries a signature minted by a different provider after a
+/// mid-chat model switch.
+///
+/// Observed wording (Anthropic Messages API 400s, `error.type ==
+/// "invalid_request_error"`):
+///   - "messages.N.content.M.signature: Invalid signature for thinking
+///     block."
+///   - "... thinking block signature ... invalid/does not match/unable to
+///     verify"
+///
+/// Matched conservatively: the status must be 400, the body must be an
+/// `invalid_request_error`, and it must mention "signature" together with
+/// "thinking" (case-insensitive) so unrelated 400s (bad model, missing
+/// max_tokens, etc.) never trigger a retry.
+pub fn is_claude_thought_signature_error(status: u16, body: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("invalid_request_error")
+        && lower.contains("signature")
+        && lower.contains("thinking")
+}
+
+/// Clear provider-minted thought/thinking signatures from a message history.
+/// Used as a belt-and-braces guard when history carries a signature minted by
+/// a *different* provider than the one about to be called — that signature
+/// will always be rejected. Both connectors' `to_native_request` already
+/// treat a cleared signature safely: Gemini omits `thoughtSignature` on the
+/// function-call part; Claude drops the `thinking` block entirely rather than
+/// sending one without a signature (which would itself 400). So clearing here
+/// is sufficient to make the retried request valid.
+pub fn strip_thought_signatures(messages: &mut [ChatMessage]) {
+    for message in messages.iter_mut() {
+        for block in message.content.iter_mut() {
+            match block {
+                ContentBlock::Thinking { signature, .. } => *signature = None,
+                ContentBlock::ToolCall { signature, .. } => *signature = None,
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Build a connector for a specific connector instance, optionally overriding
 /// the chat model (per-session model pins). Gemini connectors share a
 /// process-wide cache store, so per-request construction does not orphan
@@ -211,5 +282,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v["summary"], "did x");
+    }
+
+    // ── Foreign thought-signature guard: shared matcher/stripper ─────────
+    // Per-connector wording/serialization tests live in gemini.rs and
+    // claude.rs; these cover the pure, provider-agnostic pieces.
+
+    #[test]
+    fn gemini_matcher_requires_400_and_signature_plus_thought_or_invalid_argument() {
+        assert!(is_gemini_thought_signature_error(
+            400,
+            r#"{"error":{"message":"Invalid thought signature provided.","status":"INVALID_ARGUMENT"}}"#
+        ));
+        // Wrong status code entirely.
+        assert!(!is_gemini_thought_signature_error(
+            500,
+            r#"{"error":{"message":"Invalid thought signature provided.","status":"INVALID_ARGUMENT"}}"#
+        ));
+        // 400 but no signature wording at all.
+        assert!(!is_gemini_thought_signature_error(
+            400,
+            r#"{"error":{"message":"The model is overloaded.","status":"INVALID_ARGUMENT"}}"#
+        ));
+    }
+
+    #[test]
+    fn claude_matcher_requires_400_invalid_request_error_signature_and_thinking() {
+        assert!(is_claude_thought_signature_error(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"thinking block signature mismatch"}}"#
+        ));
+        assert!(!is_claude_thought_signature_error(
+            401,
+            r#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#
+        ));
+        // invalid_request_error mentioning signature but not thinking (e.g. an
+        // unrelated field) must not match.
+        assert!(!is_claude_thought_signature_error(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"webhook signature header missing"}}"#
+        ));
+    }
+
+    #[test]
+    fn strip_thought_signatures_is_a_no_op_on_text_and_tool_result_blocks() {
+        let mut messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: vec![
+                ContentBlock::Text { text: "hi".into() },
+                ContentBlock::ToolResult {
+                    call_id: "c1".into(),
+                    name: "search".into(),
+                    content: serde_json::json!({"ok": true}),
+                },
+                ContentBlock::Image {
+                    mime_type: "image/png".into(),
+                    data: "base64data".into(),
+                },
+            ],
+        }];
+        let before = messages.clone();
+        strip_thought_signatures(&mut messages);
+        assert_eq!(messages, before, "non-signature-bearing blocks must be untouched");
     }
 }
