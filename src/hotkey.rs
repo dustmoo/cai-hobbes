@@ -309,6 +309,109 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
     });
 }
 
+/// Renders a stored hotkey combo (e.g. "CmdOrCtrl+Shift+T") the way a user on
+/// this platform expects to see it: symbol glyphs joined with no separator on
+/// macOS (`⇧⌘T`), `Ctrl+`-joined words elsewhere (`Ctrl+Shift+T`).
+pub fn display_combo(combo: &str) -> String {
+    display_combo_internal(combo, cfg!(target_os = "macos"))
+}
+
+/// Platform-parameterized implementation so both branches are unit-testable
+/// on a single machine.
+fn display_combo_internal(combo: &str, is_mac: bool) -> String {
+    let combo = combo.trim();
+    if combo.is_empty() {
+        return String::new();
+    }
+
+    let parts: Vec<&str> = combo.split('+').filter(|p| !p.is_empty()).collect();
+    let Some((key_part, mod_parts)) = parts.split_last() else {
+        return String::new();
+    };
+
+    if is_mac {
+        // Canonical macOS modifier order: Control, Option, Shift, Command.
+        let mut ctrl = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut cmd = false;
+        for p in mod_parts {
+            match p.to_lowercase().as_str() {
+                "cmdorctrl" | "cmd" | "command" | "super" | "meta" => cmd = true,
+                "shift" => shift = true,
+                "alt" | "option" => alt = true,
+                "ctrl" | "control" => ctrl = true,
+                _ => {}
+            }
+        }
+
+        let mut out = String::new();
+        if ctrl {
+            out.push('⌃');
+        }
+        if alt {
+            out.push('⌥');
+        }
+        if shift {
+            out.push('⇧');
+        }
+        if cmd {
+            out.push('⌘');
+        }
+        out.push_str(&display_key_symbol(key_part));
+        out
+    } else {
+        let mut mods: Vec<String> = Vec::new();
+        for p in mod_parts {
+            let mapped = match p.to_lowercase().as_str() {
+                "cmdorctrl" | "cmd" | "command" | "super" | "meta" => "Ctrl".to_string(),
+                "shift" => "Shift".to_string(),
+                "alt" | "option" => "Alt".to_string(),
+                "ctrl" | "control" => "Ctrl".to_string(),
+                _ => capitalize(p),
+            };
+            if !mods.contains(&mapped) {
+                mods.push(mapped);
+            }
+        }
+        mods.push(display_key_symbol(key_part));
+        mods.join("+")
+    }
+}
+
+/// Maps a stored key token to what should be displayed for it. Single
+/// characters (letters, digits, and punctuation like `,`/`.`/`/`) are shown
+/// uppercased/as-is; named keys (as spelled by the JS matcher / hotkey
+/// defaults in `settings.rs`, e.g. `Space`, `ArrowDown`, `Enter`) map to their
+/// conventional symbol.
+fn display_key_symbol(key: &str) -> String {
+    match key.to_lowercase().as_str() {
+        "space" => "Space".to_string(),
+        "enter" | "return" => "⏎".to_string(),
+        "escape" | "esc" => "⎋".to_string(),
+        "backspace" => "⌫".to_string(),
+        "delete" => "⌦".to_string(),
+        "tab" => "⇥".to_string(),
+        "arrowup" | "up" => "↑".to_string(),
+        "arrowdown" | "down" => "↓".to_string(),
+        "arrowleft" | "left" => "←".to_string(),
+        "arrowright" | "right" => "→".to_string(),
+        "comma" => ",".to_string(),
+        "period" => ".".to_string(),
+        "slash" => "/".to_string(),
+        _ if key.chars().count() == 1 => key.to_uppercase(),
+        _ => capitalize(key),
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Checks if a Dioxus KeyboardEvent matches a hotkey string (e.g. "CmdOrCtrl+Enter").
 pub fn matches_hotkey(evt: &KeyboardEvent, hotkey_str: &str) -> bool {
     matches_hotkey_internal(evt.modifiers(), &evt.key(), hotkey_str)
@@ -439,5 +542,41 @@ mod tests {
             &Key::Character(".".to_string()),
             "CmdOrCtrl+."
         ));
+    }
+
+    #[test]
+    fn test_display_combo_mac_shift_letter() {
+        // Canonical macOS order is Control-Option-Shift-Command, so Command
+        // sits immediately before the key.
+        assert_eq!(display_combo_internal("CmdOrCtrl+Shift+T", true), "⇧⌘T");
+    }
+
+    #[test]
+    fn test_display_combo_mac_comma() {
+        assert_eq!(display_combo_internal("CmdOrCtrl+,", true), "⌘,");
+    }
+
+    #[test]
+    fn test_display_combo_mac_alt_shift() {
+        assert_eq!(display_combo_internal("Alt+Shift+F", true), "⌥⇧F");
+    }
+
+    #[test]
+    fn test_display_combo_empty() {
+        assert_eq!(display_combo_internal("", true), "");
+        assert_eq!(display_combo_internal("", false), "");
+    }
+
+    #[test]
+    fn test_display_combo_non_mac() {
+        assert_eq!(
+            display_combo_internal("CmdOrCtrl+Shift+T", false),
+            "Ctrl+Shift+T"
+        );
+        assert_eq!(display_combo_internal("CmdOrCtrl+,", false), "Ctrl+,");
+        assert_eq!(
+            display_combo_internal("Alt+Shift+F", false),
+            "Alt+Shift+F"
+        );
     }
 }

@@ -88,7 +88,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     // positions relative to the viewport instead of this
                     // (clipped) ancestor.
                     div {
-                        class: "fixed top-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                        class: "fixed top-10 left-0 w-60 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1.5",
                         AppMenuRow {
                             icon: fi_icons::FiCheckSquare,
                             label: "Planner",
@@ -109,6 +109,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                 show_app_menu.set(false);
                             },
                         }
+                        div { class: "border-t border-faint my-1" }
                         AppMenuRow {
                             icon: fi_icons::FiClock,
                             label: "History",
@@ -424,17 +425,20 @@ fn AppMenuRow<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'stat
         return rsx! {};
     }
 
+    let display_hotkey = crate::hotkey::display_combo(&hotkey);
+
     rsx! {
         button {
-            class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg flex items-center justify-between",
+            class: "w-full flex items-center gap-3 px-3 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg whitespace-nowrap",
             onclick: move |evt| onclick.call(evt),
-            div {
-                class: "flex items-center gap-2",
-                Icon { icon: icon, width: 14, height: 14 }
-                span { "{label}" }
-            }
-            if !hotkey.is_empty() {
-                span { class: "text-xs font-mono text-fg-muted", "{hotkey}" }
+            Icon { icon: icon, width: 16, height: 16 }
+            span { "{label}" }
+            div { class: "flex-1" }
+            if !display_hotkey.is_empty() {
+                span {
+                    class: "text-[11px] font-mono text-fg-muted/70 tabular-nums tracking-wide pl-6",
+                    "{display_hotkey}"
+                }
             }
         }
     }
