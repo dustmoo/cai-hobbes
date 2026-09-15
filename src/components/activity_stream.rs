@@ -217,6 +217,45 @@ pub fn run_usage(messages: &[Message]) -> (f64, i32) {
         })
 }
 
+/// Whether the cost figure is shown for `UiState::token_display_mode`.
+/// Unrecognised modes fall back to "all" (the field's own default).
+fn show_cost_for_mode(mode: &str) -> bool {
+    mode != "none" && mode != "tokens"
+}
+
+/// Whether the token-count figure is shown for `UiState::token_display_mode`.
+fn show_tokens_for_mode(mode: &str) -> bool {
+    mode != "none" && mode != "cost"
+}
+
+/// The block header's cost/token readout, honouring `token_display_mode`
+/// ("all" | "tokens" | "cost" | "none"). `None` means the setting says to
+/// show nothing, so the caller should render no readout at all rather than
+/// an empty one.
+pub fn format_usage_summary(mode: &str, cost: f64, tokens: i32) -> Option<String> {
+    match (show_cost_for_mode(mode), show_tokens_for_mode(mode)) {
+        (false, false) => None,
+        (true, false) => Some(format!("${cost:.4}")),
+        (false, true) => Some(format!("{:.1}k tok", tokens as f64 / 1000.0)),
+        (true, true) => Some(format!("${cost:.4} · {:.1}k tok", tokens as f64 / 1000.0)),
+    }
+}
+
+/// Whether a row's expanded detail is showing. Thinking rows start open when
+/// `thinking_open_by_default` (from `UiState::default_tool_thought_open`) is
+/// set; every other row starts closed. Either way, a manual click on the row
+/// (its key landing in `toggled`) flips that starting state — so the setting
+/// picks the default and the click is always a toggle away from it.
+pub fn is_row_open(
+    kind: StepKind,
+    key: &str,
+    thinking_open_by_default: bool,
+    toggled: &std::collections::HashSet<String>,
+) -> bool {
+    let default_open = kind == StepKind::Thinking && thinking_open_by_default;
+    default_open ^ toggled.contains(key)
+}
+
 /// Best-effort exit code out of a terminal response (JSON field or a trailing
 /// `exit code: N` line). `None` when nothing parseable is there.
 pub fn parse_exit_code(response: &str) -> Option<i64> {
@@ -354,6 +393,10 @@ pub struct StepRow {
     pub running: bool,
     pub tool_call: Option<ToolCall>,
     pub usage: Option<UsageData>,
+    /// Full, untruncated text for a [`StepKind::Thinking`] row — `label` is
+    /// clipped to a lead-in for the collapsed line, this is what a click (or
+    /// `default_tool_thought_open`) reveals underneath it.
+    pub full_text: Option<String>,
 }
 
 /// Flatten a run of messages into rows, pinning permission requests to the top
@@ -391,6 +434,7 @@ pub fn build_rows(
                 running: true,
                 tool_call: None,
                 usage: None,
+                full_text: summary.clone(),
             });
             continue;
         }
@@ -405,6 +449,7 @@ pub fn build_rows(
                 running: false,
                 tool_call: Some(tc.clone()),
                 usage: m.usage.clone(),
+                full_text: None,
             }),
             MessageContent::ToolCall(tc) => {
                 if let Some(thought) = tc.thought_summary.as_ref().filter(|t| !t.trim().is_empty())
@@ -424,6 +469,7 @@ pub fn build_rows(
                     running: tc.status == ToolCallStatus::Running,
                     tool_call: Some(tc.clone()),
                     usage: m.usage.clone(),
+                    full_text: None,
                 });
             }
             MessageContent::Text {
@@ -451,6 +497,7 @@ fn thinking_row(id: Uuid, tag: &str, thought: &str, offset: i64) -> StepRow {
         running: false,
         tool_call: None,
         usage: None,
+        full_text: Some(thought.to_string()),
     }
 }
 
@@ -563,6 +610,7 @@ pub struct ActivityStreamProps {
 #[component]
 pub fn ActivityStream(props: ActivityStreamProps) -> Element {
     let ExpansionStateContext(mut expansion_state) = use_context::<ExpansionStateContext>();
+    let ui_state = consume_context::<Signal<crate::settings::UiState>>();
     let mut filter = use_signal(|| RowFilter::All);
     let mut open_rows = use_signal(std::collections::HashSet::<String>::new);
     // Bumped once a second while live so elapsed times re-render; see Ticker.
@@ -582,6 +630,8 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
     let rows = build_rows(&messages, turn_start, props.is_live.then_some(now));
     let (steps, commands, todos, failed) = row_counts(&rows);
     let (cost, tokens) = run_usage(&messages);
+    let token_mode = ui_state.read().token_display_mode.clone();
+    let thinking_open_by_default = ui_state.read().default_tool_thought_open;
 
     let last_activity = messages
         .iter()
@@ -642,6 +692,11 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
 
     let toggle_key = block_key.clone();
     let header_height = if expanded { "h-9" } else { "h-8" };
+    let live_usage_text = match format_usage_summary(&token_mode, cost, tokens) {
+        Some(usage) => format!("{steps} steps · {usage}"),
+        None => format!("{steps} steps"),
+    };
+    let finished_usage_text = format_usage_summary(&token_mode, cost, tokens);
 
     rsx! {
         div {
@@ -683,7 +738,7 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
                                     class: "ml-auto flex items-center gap-2 shrink-0",
                                     span {
                                         class: "font-mono text-fg-muted",
-                                        "{steps} steps · ${cost:.4}"
+                                        "{live_usage_text}"
                                     }
                                     button {
                                         class: "px-2 py-0.5 rounded border border-faint text-fg-muted hover:text-fg hover:bg-card transition-colors",
@@ -722,9 +777,11 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
                                 } else if cancelled {
                                     span { class: "text-yellow-500 shrink-0", "cancelled" }
                                 }
-                                div {
-                                    class: "ml-auto flex items-center gap-2 shrink-0 font-mono text-fg-muted",
-                                    "${cost:.4} · {tokens as f64 / 1000.0:.1}k tok"
+                                if let Some(usage_text) = &finished_usage_text {
+                                    div {
+                                        class: "ml-auto flex items-center gap-2 shrink-0 font-mono text-fg-muted",
+                                        "{usage_text}"
+                                    }
                                 }
                             }
                             if expanded {
@@ -766,7 +823,12 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
                                         key: "{row.key}",
                                         row: row.clone(),
                                         session_id: props.session_id.clone(),
-                                        open: open_rows.read().contains(&row.key),
+                                        open: is_row_open(
+                                            row.kind,
+                                            &row.key,
+                                            thinking_open_by_default,
+                                            &open_rows.read(),
+                                        ),
                                         on_toggle: {
                                             let key = row.key.clone();
                                             move |_| {
@@ -897,6 +959,16 @@ fn ActivityRow(props: ActivityRowProps) -> Element {
             if props.open {
                 if let Some(tc) = row.tool_call.clone() {
                     RowDetail { tool_call: tc, usage: row.usage.clone() }
+                } else if row.kind == StepKind::Thinking {
+                    if let Some(full) = row.full_text.clone().filter(|t| !t.trim().is_empty()) {
+                        div {
+                            class: "px-3 pb-2",
+                            pre {
+                                class: "px-2 py-1 rounded bg-app font-mono text-[11px] text-fg-muted whitespace-pre-wrap break-all",
+                                "{full}"
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -943,6 +1015,11 @@ fn step_icon(kind: StepKind, running: bool) -> Element {
 /// and the arguments behind the same disclosure the old card used.
 #[component]
 fn RowDetail(tool_call: ToolCall, usage: Option<UsageData>) -> Element {
+    let ui_state = consume_context::<Signal<crate::settings::UiState>>();
+    let token_mode = ui_state.read().token_display_mode.clone();
+    let show_response_default = ui_state.read().default_tool_response_open;
+    let show_arguments_default = ui_state.read().default_tool_arguments_open;
+
     let meta = {
         let mut parts = vec![tool_call.server_name.clone(), tool_call.tool_name.clone()];
         if let Some(cwd) = arg_str(&tool_call.arguments, "cwd") {
@@ -952,10 +1029,14 @@ fn RowDetail(tool_call: ToolCall, usage: Option<UsageData>) -> Element {
             parts.push(format!("exit {code}"));
         }
         if let Some(u) = &usage {
-            if let Some(c) = u.cost {
-                parts.push(format!("${c:.6}"));
+            if show_cost_for_mode(&token_mode) {
+                if let Some(c) = u.cost {
+                    parts.push(format!("${c:.6}"));
+                }
             }
-            parts.push(format!("{} tok", u.total_tokens));
+            if show_tokens_for_mode(&token_mode) {
+                parts.push(format!("{} tok", u.total_tokens));
+            }
         }
         parts.join(" · ")
     };
@@ -965,13 +1046,18 @@ fn RowDetail(tool_call: ToolCall, usage: Option<UsageData>) -> Element {
             class: "px-3 pb-2 flex flex-col gap-1",
             div { class: "text-[11px] text-fg-muted font-mono truncate", "{meta}" }
             if !tool_call.response.is_empty() {
-                pre {
-                    class: "px-2 py-1 rounded bg-app font-mono text-[11px] text-fg max-h-[140px] overflow-auto whitespace-pre-wrap break-all",
-                    "{tool_call.response}"
+                Collapsible {
+                    label: "Response".to_string(),
+                    open_default: show_response_default,
+                    pre {
+                        class: "px-2 py-1 rounded bg-app font-mono text-[11px] text-fg max-h-[140px] overflow-auto whitespace-pre-wrap break-all",
+                        "{tool_call.response}"
+                    }
                 }
             }
             Collapsible {
                 label: "Arguments".to_string(),
+                open_default: show_arguments_default,
                 crate::components::chat::CodeBlock {
                     code: tool_call.arguments.clone(),
                     lang: "json".to_string(),
@@ -1343,6 +1429,69 @@ mod tests {
         let (cost, tokens) = run_usage(&[a, b, c]);
         assert_eq!(tokens, 2000);
         assert!((cost - 0.0036).abs() < 1e-9);
+    }
+
+    // ---- token_display_mode ----
+
+    #[test]
+    fn usage_summary_all_shows_cost_and_tokens() {
+        let s = format_usage_summary("all", 1.2345, 2500).unwrap();
+        assert_eq!(s, "$1.2345 · 2.5k tok");
+    }
+
+    #[test]
+    fn usage_summary_cost_only_hides_tokens() {
+        let s = format_usage_summary("cost", 1.2345, 2500).unwrap();
+        assert_eq!(s, "$1.2345");
+    }
+
+    #[test]
+    fn usage_summary_tokens_only_hides_cost() {
+        let s = format_usage_summary("tokens", 1.2345, 2500).unwrap();
+        assert_eq!(s, "2.5k tok");
+    }
+
+    #[test]
+    fn usage_summary_none_hides_both() {
+        assert_eq!(format_usage_summary("none", 1.2345, 2500), None);
+    }
+
+    #[test]
+    fn usage_summary_unknown_mode_falls_back_to_all() {
+        // An unrecognised persisted value should behave like the field's own
+        // documented default ("all") rather than silently going blank.
+        let s = format_usage_summary("bogus", 0.5, 1000).unwrap();
+        assert_eq!(s, "$0.5000 · 1.0k tok");
+    }
+
+    // ---- default_tool_thought_open / row expansion ----
+
+    #[test]
+    fn thinking_row_open_by_default_when_setting_is_on() {
+        let toggled = std::collections::HashSet::new();
+        assert!(is_row_open(StepKind::Thinking, "k", true, &toggled));
+    }
+
+    #[test]
+    fn thinking_row_closed_by_default_when_setting_is_off() {
+        let toggled = std::collections::HashSet::new();
+        assert!(!is_row_open(StepKind::Thinking, "k", false, &toggled));
+    }
+
+    #[test]
+    fn non_thinking_row_closed_by_default_regardless_of_setting() {
+        let toggled = std::collections::HashSet::new();
+        assert!(!is_row_open(StepKind::Tool, "k", true, &toggled));
+    }
+
+    #[test]
+    fn clicking_a_row_toggles_away_from_its_default() {
+        let mut toggled = std::collections::HashSet::new();
+        // Setting on: starts open, a click (key now toggled) closes it.
+        toggled.insert("k".to_string());
+        assert!(!is_row_open(StepKind::Thinking, "k", true, &toggled));
+        // Setting off: starts closed, a click opens it.
+        assert!(is_row_open(StepKind::Tool, "k", false, &toggled));
     }
 
     // ---- row building ----

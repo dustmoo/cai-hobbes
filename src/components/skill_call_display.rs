@@ -142,8 +142,8 @@ pub fn SkillCallDisplay(props: SkillCallDisplayProps) -> Element {
     let ui_state = consume_context::<Signal<crate::settings::UiState>>();
 
     // Local signals initialized from global defaults - sticky per bubble
-    let mut show_arguments = use_signal(|| false);
-    let mut show_response = use_signal(|| true); // Expand response by default for visibility
+    let mut show_arguments = use_signal(|| ui_state.read().default_skill_arguments_open);
+    let mut show_response = use_signal(|| ui_state.read().default_skill_response_open);
     let mut show_tools_detail = use_signal(|| false); // Collapsed by default to reduce noise
     let mut show_instructions = use_signal(|| ui_state.read().default_skill_instructions_open);
 

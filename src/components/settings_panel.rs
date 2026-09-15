@@ -3367,7 +3367,8 @@ pub fn SettingsPanel() -> Element {
                             // 2. Chat Bar Icons
                             div {
                                 class: "pt-4 border-t border-subtle",
-                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Chat Bar Icons" }
+                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Toolbar & Composer Controls" }
+                                p { class: "text-xs text-fg-muted mb-3", "History, MCP, Planner and Fleet live in the tab strip and tiger app menu now; Session Cost, Profile, Provider, Attachments and Model are pills in the composer footer." }
                                 div {
                                     class: "grid grid-cols-2 gap-3",
 
@@ -3624,7 +3625,7 @@ pub fn SettingsPanel() -> Element {
                             div {
                                 class: "pt-4 border-t border-subtle",
                                 h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Tool Display Defaults" }
-                                p { class: "text-xs text-fg-muted mb-3", "Set initial state for collapsible sections in tool call bubbles." }
+                                p { class: "text-xs text-fg-muted mb-3", "Set initial state for the Arguments/Response disclosures and thinking rows inside a turn's activity block." }
 
                                 div {
                                     class: "space-y-3",
