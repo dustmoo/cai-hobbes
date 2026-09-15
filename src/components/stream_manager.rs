@@ -619,14 +619,24 @@ impl StreamManagerContext {
                                 && (is_first_message || final_text_for_this_turn.is_empty())
                             {
                                 first_tool_call_placed = true;
-                                if let Some(msg) =
-                                    state.get_message_mut_in_session(&session_id, &message_id)
-                                {
-                                    msg.content =
-                                        crate::components::shared::MessageContent::ToolCall(
-                                            tool_call.clone(),
-                                        );
-                                    tool_call_snapshot = Some(msg.clone());
+                                if let Some(session) = state.sessions.get_mut(&session_id) {
+                                    if let Some(msg) =
+                                        session.messages.iter_mut().find(|m| m.id == message_id)
+                                    {
+                                        msg.content =
+                                            crate::components::shared::MessageContent::ToolCall(
+                                                tool_call.clone(),
+                                            );
+                                    }
+                                    // The placeholder was minted at turn start —
+                                    // before the prompt was even built. Restamp it to
+                                    // the moment the stream emitted this call, so the
+                                    // activity stream measures the step's real start
+                                    // (and `completed_at - created_at` its real
+                                    // duration) instead of the whole round trip.
+                                    session.restamp_message(&message_id, chrono::Utc::now());
+                                    tool_call_snapshot =
+                                        session.messages.iter().find(|m| m.id == message_id).cloned();
                                 }
                                 message_id
                             } else {
@@ -1064,22 +1074,84 @@ impl StreamManagerContext {
             if !final_text_for_this_turn.trim().is_empty() {
                 let mut final_snapshot: Option<crate::components::chat::Message> = None;
                 {
+                    let now = chrono::Utc::now();
                     let mut state = self.session_state.write();
-                    if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
-                        if let crate::components::shared::MessageContent::Text {
-                            content,
-                            thought_signature,
-                            thought_summary,
-                            signature_provider,
-                        } = &mut msg.content
-                        {
-                            *content = final_text_for_this_turn.clone();
-                            *thought_signature = thought_signature_for_this_turn.clone();
-                            *thought_summary = thought_summary_for_this_turn.clone();
-                            *signature_provider = thought_signature_for_this_turn
-                                .is_some()
-                                .then_some(stream_provider);
-                            final_snapshot = Some(msg.clone());
+                    if let Some(session) = state.sessions.get_mut(&session_id) {
+                        let placeholder_is_text = session
+                            .messages
+                            .iter()
+                            .find(|m| m.id == message_id)
+                            .map(|m| {
+                                matches!(
+                                    m.content,
+                                    crate::components::shared::MessageContent::Text { .. }
+                                )
+                            });
+                        match placeholder_is_text {
+                            Some(true) => {
+                                if let Some(msg) =
+                                    session.messages.iter_mut().find(|m| m.id == message_id)
+                                {
+                                    if let crate::components::shared::MessageContent::Text {
+                                        content,
+                                        thought_signature,
+                                        thought_summary,
+                                        signature_provider,
+                                    } = &mut msg.content
+                                    {
+                                        *content = final_text_for_this_turn.clone();
+                                        *thought_signature =
+                                            thought_signature_for_this_turn.clone();
+                                        *thought_summary = thought_summary_for_this_turn.clone();
+                                        *signature_provider = thought_signature_for_this_turn
+                                            .is_some()
+                                            .then_some(stream_provider);
+                                    }
+                                }
+                                // The reply follows this turn's work. Its
+                                // placeholder was pushed at turn start, so when
+                                // tool calls landed after it, leaving it in place
+                                // renders the activity block BELOW the answer that
+                                // block produced. Move it past them (vec order and
+                                // `created_at` together, so the journal replays the
+                                // same layout).
+                                final_snapshot = if tool_call_count > 0 {
+                                    session.move_message_to_end(&message_id, now)
+                                } else {
+                                    session.messages.iter().find(|m| m.id == message_id).cloned()
+                                };
+                            }
+                            // The placeholder was upgraded into this turn's FIRST
+                            // tool call, so text that arrived after it has nowhere
+                            // to land — it used to be dropped on the floor. Give it
+                            // its own message, after the calls it followed.
+                            Some(false) => {
+                                let created_at = match session.messages.last() {
+                                    Some(last) => now.max(last.created_at),
+                                    None => now,
+                                };
+                                let message = crate::components::chat::Message {
+                                    id: Uuid::new_v4(),
+                                    author: "Hobbes".to_string(),
+                                    content: crate::components::shared::MessageContent::Text {
+                                        content: final_text_for_this_turn.clone(),
+                                        thought_signature: thought_signature_for_this_turn.clone(),
+                                        thought_summary: thought_summary_for_this_turn.clone(),
+                                        signature_provider: thought_signature_for_this_turn
+                                            .is_some()
+                                            .then_some(stream_provider),
+                                    },
+                                    attachments: Vec::new(),
+                                    comments: Vec::new(),
+                                    created_at,
+                                    usage: None,
+                                };
+                                session.messages.push(message.clone());
+                                final_snapshot = Some(message);
+                            }
+                            // Message gone (cancelled/rewound mid-turn): nothing to
+                            // finalize, and nothing to resurrect.
+                            None => {}
                         }
                     }
                 }
@@ -1184,6 +1256,12 @@ impl StreamManagerContext {
                     }
                     self.active_stream_handles.write().remove(&message_id);
                     self.content_generated.write().remove(&message_id); // Cleanup
+            self.stream_receivers.write().remove(&message_id);
+                self.stream_receivers.write().remove(&message_id);
+                    // A placeholder absorbed by a live activity block never
+                    // mounted a bubble, so nobody ever took its receiver —
+                    // drop it here rather than leaking the turn's chunks.
+                    self.stream_receivers.write().remove(&message_id);
                     self.stream_session_map.write().remove(&message_id);
                     crate::session::SessionState::save_async(&self.session_state.read(), None);
                     on_complete();
@@ -1545,6 +1623,7 @@ impl StreamManagerContext {
                             // Clean up current stream state before triggering retry.
                             self.active_stream_handles.write().remove(&message_id);
                             self.content_generated.write().remove(&message_id);
+                            self.stream_receivers.write().remove(&message_id);
                             self.stream_session_map.write().remove(&message_id);
                             crate::session::SessionState::save_async(
                                 &self.session_state.read(),
@@ -2054,6 +2133,158 @@ mod tests {
     use crate::settings::Settings;
     use dioxus_signals::Signal;
     use std::path::PathBuf;
+
+    /// Build the message pair a turn starts with: the user prompt and the
+    /// assistant placeholder that the stream writes into.
+    fn seeded_session(state: &mut SessionState) -> (String, Uuid) {
+        let session_id = state.create_session_raw(None);
+        let placeholder_id = Uuid::new_v4();
+        let session = state.sessions.get_mut(&session_id).unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::seconds(30);
+        session.messages.push(crate::components::chat::Message {
+            id: Uuid::new_v4(),
+            author: "User".to_string(),
+            content: crate::components::shared::MessageContent::Text {
+                content: "what's on today?".to_string(),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            },
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            created_at: t0,
+            usage: None,
+        });
+        session.messages.push(crate::components::chat::Message {
+            id: placeholder_id,
+            author: "Hobbes".to_string(),
+            content: crate::components::shared::MessageContent::Text {
+                content: String::new(),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            },
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            created_at: t0,
+            usage: None,
+        });
+        (session_id, placeholder_id)
+    }
+
+    /// The first tool call of a turn upgrades the turn-start placeholder in
+    /// place. Restamping it at emission is what makes the step's clock real:
+    /// `created_at` is when the stream emitted the call, `completed_at` when
+    /// its result landed — not the turn-start stamp the placeholder carried.
+    #[test]
+    fn tool_call_message_is_stamped_at_emission_not_turn_start() {
+        let mut state = SessionState::default();
+        let (session_id, placeholder_id) = seeded_session(&mut state);
+        let turn_start = state.sessions[&session_id].messages[1].created_at;
+
+        // Emission: the placeholder becomes the call, stamped now.
+        let emitted_at = {
+            let session = state.sessions.get_mut(&session_id).unwrap();
+            if let Some(msg) = session.messages.iter_mut().find(|m| m.id == placeholder_id) {
+                msg.content = crate::components::shared::MessageContent::ToolCall(
+                    crate::components::shared::ToolCall::new(
+                        "hobbes-terminal".to_string(),
+                        "HOBBES_TERMINAL_EXEC".to_string(),
+                        serde_json::json!({ "command": "date" }),
+                        None,
+                        None,
+                    ),
+                );
+            }
+            session
+                .restamp_message(&placeholder_id, chrono::Utc::now())
+                .expect("placeholder is in the vec")
+        };
+        assert!(
+            emitted_at > turn_start,
+            "the call must be stamped at emission, not at turn start"
+        );
+
+        // Result: completion stamps the call, strictly after its start.
+        let completed_at = chrono::Utc::now() + chrono::Duration::seconds(2);
+        if let Some(msg) = state.get_message_mut_in_session(&session_id, &placeholder_id) {
+            if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                tc.status = crate::components::shared::ToolCallStatus::Completed;
+                tc.response = "Mon 15 Sep".to_string();
+                tc.completed_at = Some(completed_at);
+            }
+        }
+
+        let msg = &state.sessions[&session_id].messages[1];
+        assert_eq!(msg.created_at, emitted_at);
+        let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content else {
+            panic!("placeholder should have been upgraded to a tool call");
+        };
+        assert_eq!(
+            (tc.completed_at.unwrap() - msg.created_at).num_seconds(),
+            2,
+            "duration must be measured from emission"
+        );
+        // Ordering invariant: the vec stays created_at-monotonic.
+        let stamps: Vec<_> = state.sessions[&session_id]
+            .messages
+            .iter()
+            .map(|m| m.created_at)
+            .collect();
+        assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    /// A turn that streams prose *and* a tool call: the reply is finalized
+    /// into the turn-start placeholder, which must end up after the call it
+    /// preceded — vec order and `created_at` moving together.
+    #[test]
+    fn finalized_reply_moves_past_the_turn_s_tool_calls() {
+        let mut state = SessionState::default();
+        let (session_id, placeholder_id) = seeded_session(&mut state);
+        let session = state.sessions.get_mut(&session_id).unwrap();
+
+        // A later tool call gets its own message (the placeholder already holds text).
+        let call_id = Uuid::new_v4();
+        session.messages.push(crate::components::chat::Message {
+            id: call_id,
+            author: "Hobbes".to_string(),
+            content: crate::components::shared::MessageContent::ToolCall(
+                crate::components::shared::ToolCall::new(
+                    "hobbes-terminal".to_string(),
+                    "HOBBES_TERMINAL_EXEC".to_string(),
+                    serde_json::json!({ "command": "date" }),
+                    None,
+                    None,
+                ),
+            ),
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            created_at: chrono::Utc::now(),
+            usage: None,
+        });
+
+        // Finalization: write the prose, then move it past the turn's calls.
+        if let Some(msg) = session.messages.iter_mut().find(|m| m.id == placeholder_id) {
+            if let crate::components::shared::MessageContent::Text { content, .. } =
+                &mut msg.content
+            {
+                *content = "You have three things today.".to_string();
+            }
+        }
+        let moved = session
+            .move_message_to_end(&placeholder_id, chrono::Utc::now())
+            .expect("placeholder is in the vec");
+
+        let ids: Vec<_> = session.messages.iter().map(|m| m.id).collect();
+        assert_eq!(ids[1], call_id, "the tool call now precedes the reply");
+        assert_eq!(ids[2], placeholder_id);
+        assert!(moved.created_at >= session.messages[1].created_at);
+        let stamps: Vec<_> = session.messages.iter().map(|m| m.created_at).collect();
+        assert!(
+            stamps.windows(2).all(|w| w[0] <= w[1]),
+            "vec order must stay created_at-monotonic"
+        );
+    }
 
     #[tokio::test]
     async fn test_stream_registration_and_deregistration() {

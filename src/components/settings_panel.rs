@@ -4437,6 +4437,15 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Toggle Fleet" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.toggle_fleet.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_fleet = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
                                         label { class: "text-sm text-fg-muted", "Open Profile Selector" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_profile.clone(),

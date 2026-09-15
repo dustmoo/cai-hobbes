@@ -118,6 +118,49 @@ pub fn group_turn_runs(messages: &[Message]) -> Vec<Range<usize>> {
     runs
 }
 
+/// While a turn is still in flight, the trailing empty assistant `Text`
+/// placeholder — the dashed "Considering…" bubble the stream writes into —
+/// belongs to the live block as its last row, not beside it as a second
+/// bubble. Extends the final run over those trailing placeholders so
+/// `message_list` renders one block and no stray single.
+///
+/// Only [`Slot::Transparent`] tails are absorbed: a placeholder that already
+/// carries a thinking summary is an [`Slot::Anchor`] and is in the run
+/// already, and any real text after the run is a [`Slot::Break`] that must
+/// stay a bubble of its own.
+pub fn absorb_live_placeholder(messages: &[Message], runs: &mut [Range<usize>]) {
+    let Some(last) = runs.last_mut() else {
+        return;
+    };
+    if last.end >= messages.len() {
+        return;
+    }
+    if messages[last.end..]
+        .iter()
+        .all(|m| slot_of(m) == Slot::Transparent)
+    {
+        last.end = messages.len();
+    }
+}
+
+/// Is this the empty assistant `Text` a live turn streams into?
+fn is_empty_placeholder(message: &Message) -> bool {
+    matches!(
+        &message.content,
+        MessageContent::Text { content, .. }
+            if content.trim().is_empty() && message.attachments.is_empty()
+    )
+}
+
+/// Label for the live tail row — the same words the dashed placeholder bubble
+/// showed before the block absorbed it.
+pub fn live_placeholder_label(thought_summary: Option<&str>) -> String {
+    match thought_summary.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => first_sentence(t, 200),
+        None => "Considering…".to_string(),
+    }
+}
+
 /// Classify a tool call for its row icon and phrasing.
 pub fn step_kind(tc: &ToolCall) -> StepKind {
     if tc.status == ToolCallStatus::Error {
@@ -316,11 +359,41 @@ pub struct StepRow {
 /// Flatten a run of messages into rows, pinning permission requests to the top
 /// (a prompt waiting on the user is the only thing in the block that needs an
 /// answer, so it must not be buried mid-list).
-pub fn build_rows(messages: &[Message], turn_start: chrono::DateTime<chrono::Utc>) -> Vec<StepRow> {
+/// `live_now` is `Some(now)` only while the block is live; it turns a trailing
+/// empty placeholder into the block's pulsing last row (offset measured from
+/// `now`, no duration) instead of leaving it to render as a second bubble.
+pub fn build_rows(
+    messages: &[Message],
+    turn_start: chrono::DateTime<chrono::Utc>,
+    live_now: Option<chrono::DateTime<chrono::Utc>>,
+) -> Vec<StepRow> {
     let mut pinned = Vec::new();
     let mut rows = Vec::new();
-    for m in messages {
+    // The tail placeholder, if this block is live and ends on one.
+    let live_tail = live_now
+        .and_then(|_| messages.len().checked_sub(1))
+        .filter(|i| is_empty_placeholder(&messages[*i]));
+    for (i, m) in messages.iter().enumerate() {
         let offset = (m.created_at - turn_start).num_seconds();
+        if live_tail == Some(i) {
+            let summary = match &m.content {
+                MessageContent::Text { thought_summary, .. } => thought_summary.clone(),
+                _ => None,
+            };
+            let now = live_now.unwrap_or(m.created_at);
+            rows.push(StepRow {
+                message_id: m.id,
+                key: format!("{}:live", m.id),
+                kind: StepKind::Thinking,
+                label: live_placeholder_label(summary.as_deref()),
+                offset_secs: (now - turn_start).num_seconds(),
+                duration_secs: None,
+                running: true,
+                tool_call: None,
+                usage: None,
+            });
+            continue;
+        }
         match &m.content {
             MessageContent::PermissionRequest(tc) => pinned.push(StepRow {
                 message_id: m.id,
@@ -502,13 +575,14 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
     let turn_start = messages[0].created_at;
     let block_key = format!("activity:{}", messages[0].id);
 
-    let rows = build_rows(&messages, turn_start);
-    let (steps, commands, todos, failed) = row_counts(&rows);
-    let (cost, tokens) = run_usage(&messages);
-
     // Read the tick so the live header/rows re-render every second.
     let _ = tick.read();
     let now = chrono::Utc::now();
+
+    let rows = build_rows(&messages, turn_start, props.is_live.then_some(now));
+    let (steps, commands, todos, failed) = row_counts(&rows);
+    let (cost, tokens) = run_usage(&messages);
+
     let last_activity = messages
         .iter()
         .map(|m| match &m.content {
@@ -543,9 +617,12 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
         "border-faint"
     };
 
+    // The absorbed live placeholder is a *thinking* row, not work in flight —
+    // the header says plain "thinking" in that state rather than echoing the
+    // row's label.
     let running_label = rows
         .iter()
-        .find(|r| r.running)
+        .find(|r| r.running && r.kind != StepKind::Thinking)
         .map(|r| r.label.clone())
         .unwrap_or_else(|| "thinking".to_string());
 
@@ -964,6 +1041,137 @@ mod tests {
 
     // ---- group_turn_runs ----
 
+    /// While the turn is live, the dashed "Considering…" placeholder bubble is
+    /// the block's last row rather than a second bubble under it — and once
+    /// prose lands in it, it leaves the run again (covered below).
+    #[test]
+    fn live_run_absorbs_the_trailing_streaming_placeholder() {
+        let t0 = Utc::now();
+        let mut user = text("User", "go", None);
+        user.created_at = t0;
+        let mut call = tool_msg(tool(
+            "hobbes-terminal",
+            TERMINAL_EXEC_TOOL,
+            r#"{"command":"date"}"#,
+            ToolCallStatus::Completed,
+        ));
+        call.created_at = t0 + Duration::seconds(1);
+        // The continuation's placeholder: empty, still being streamed into.
+        let mut placeholder = text("Hobbes", "", None);
+        placeholder.created_at = t0 + Duration::seconds(2);
+        let placeholder_id = placeholder.id;
+        let messages = vec![user, call, placeholder];
+
+        let mut runs = group_turn_runs(&messages);
+        assert_eq!(runs, vec![1..2], "a bare placeholder is not an anchor");
+        absorb_live_placeholder(&messages, &mut runs);
+        assert_eq!(runs, vec![1..3], "the live block swallows the placeholder");
+        // Nothing is left over for message_list to render as a Single.
+        assert_eq!(runs[0].end, messages.len());
+
+        let run = &messages[runs[0].clone()];
+        let now = t0 + Duration::seconds(5);
+        let rows = build_rows(run, run[0].created_at, Some(now));
+        let last = rows.last().expect("the placeholder row");
+        assert_eq!(last.message_id, placeholder_id);
+        assert_eq!(last.kind, StepKind::Thinking);
+        assert_eq!(last.label, "Considering…");
+        assert!(last.running, "the row pulses while the turn thinks");
+        assert_eq!(last.duration_secs, None);
+        assert_eq!(last.offset_secs, 4, "offset is measured from now");
+        // It is a live-only row: a finished block never grows it.
+        assert_eq!(build_rows(run, run[0].created_at, None).len(), rows.len() - 1);
+        // Steps counts ignore thinking, so the header still reads one step.
+        assert_eq!(row_counts(&rows).0, 1);
+    }
+
+    /// Once real prose streams into the placeholder it is a `Break` again, so
+    /// it stays out of the run and renders as the normal bubble below it.
+    #[test]
+    fn a_placeholder_with_prose_is_not_absorbed() {
+        let messages = vec![
+            text("User", "go", None),
+            tool_msg(tool("srv", "A", "{}", ToolCallStatus::Completed)),
+            text("Hobbes", "here you go", None),
+        ];
+        let mut runs = group_turn_runs(&messages);
+        absorb_live_placeholder(&messages, &mut runs);
+        assert_eq!(runs, vec![1..2], "prose ends the run, it never joins it");
+    }
+
+    /// The absorbed row shows what the bubble showed: the thinking summary's
+    /// first sentence once there is one, "Considering…" until then.
+    #[test]
+    fn live_placeholder_label_follows_the_thinking_summary() {
+        assert_eq!(live_placeholder_label(None), "Considering…");
+        assert_eq!(live_placeholder_label(Some("  ")), "Considering…");
+        assert_eq!(
+            live_placeholder_label(Some("**Checking** the calendar. Then the todos.")),
+            "Checking the calendar."
+        );
+    }
+
+    /// Regression: the activity block used to render BELOW the reply it
+    /// produced. A turn whose stream emits prose *and* a tool call leaves the
+    /// reply in the placeholder pushed at turn start, so the tool call (minted
+    /// later) sorts after it. Finalization now moves the finished reply past
+    /// the turn's calls, and the run must group ahead of it.
+    #[test]
+    fn reply_finalized_after_tool_calls_renders_below_the_run() {
+        let t0 = Utc::now();
+        let mut user = text("User", "what's on today?", None);
+        user.created_at = t0;
+        // Pushed at turn start, still empty while the stream runs.
+        let mut placeholder = text("Hobbes", "", None);
+        placeholder.created_at = t0 + Duration::seconds(1);
+        let placeholder_id = placeholder.id;
+        // Minted when the stream emitted the call — after the placeholder.
+        let mut call = tool_msg(tool(
+            "hobbes-terminal",
+            TERMINAL_EXEC_TOOL,
+            r#"{"command":"date"}"#,
+            ToolCallStatus::Completed,
+        ));
+        call.created_at = t0 + Duration::seconds(3);
+        let call_id = call.id;
+
+        let mut messages = vec![user, placeholder, call];
+        // The prose that finalization writes into the placeholder.
+        if let MessageContent::Text { content, .. } = &mut messages[1].content {
+            *content = "You have three things today.".to_string();
+        }
+
+        // Before the fix: the reply sits at index 1, so the run is index 2 —
+        // the block renders under the answer.
+        assert_eq!(group_turn_runs(&messages), vec![2..3]);
+
+        // Finalization moves the reply past the turn's tool calls.
+        crate::session::move_message_to_end(
+            &mut messages,
+            &placeholder_id,
+            t0 + Duration::seconds(4),
+        )
+        .expect("placeholder is in the vec");
+
+        // message_list sorts by created_at before grouping; vec order and
+        // timestamps agree, so the sort is a no-op here.
+        let mut sorted = messages.clone();
+        sorted.sort_by_key(|m| m.created_at);
+        assert_eq!(
+            sorted.iter().map(|m| m.id).collect::<Vec<_>>(),
+            messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            "vec order must already be created_at order"
+        );
+        assert_eq!(sorted[1].id, call_id);
+        assert_eq!(sorted[2].id, placeholder_id);
+        assert_eq!(group_turn_runs(&sorted), vec![1..2]);
+
+        // And the rows built for that run measure from the call itself.
+        let rows = build_rows(&sorted[1..2], sorted[1].created_at, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].offset_secs, 0);
+    }
+
     #[test]
     fn run_between_two_user_messages_is_grouped() {
         let messages = vec![
@@ -1149,7 +1357,7 @@ mod tests {
             MessageContent::PermissionRequest(tool("srv", "P", "{}", ToolCallStatus::Running)),
         );
         p.created_at = start + Duration::seconds(5);
-        let rows = build_rows(&[a, p], start);
+        let rows = build_rows(&[a, p], start, None);
         assert_eq!(rows[0].kind, StepKind::NeedsYou);
         assert_eq!(rows[1].kind, StepKind::Tool);
         assert_eq!(rows[0].offset_secs, 5);
@@ -1162,7 +1370,7 @@ mod tests {
         tc.completed_at = Some(start + Duration::seconds(12));
         let mut m = tool_msg(tc);
         m.created_at = start;
-        let rows = build_rows(&[m], start);
+        let rows = build_rows(&[m], start, None);
         assert_eq!(rows[0].duration_secs, Some(12));
         assert!(!rows[0].running);
     }
@@ -1174,7 +1382,7 @@ mod tests {
         tc.thought_summary = Some("I should list the files. Then read them.".to_string());
         let mut m = tool_msg(tc);
         m.created_at = start;
-        let rows = build_rows(&[m], start);
+        let rows = build_rows(&[m], start, None);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind, StepKind::Thinking);
         assert_eq!(rows[0].label, "I should list the files.");
@@ -1199,7 +1407,7 @@ mod tests {
             tool_msg(tool("gmail", "SEND", "{}", ToolCallStatus::Error)),
             text("Hobbes", "", Some("hmm")),
         ];
-        let rows = build_rows(&messages, start);
+        let rows = build_rows(&messages, start, None);
         assert_eq!(row_counts(&rows), (3, 1, 1, 1));
     }
 

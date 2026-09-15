@@ -82,8 +82,13 @@ pub fn TabBar(props: TabBarProps) -> Element {
                 }
 
                 if show_app_menu() {
+                    // `fixed` (not `absolute`) so the menu escapes the tab
+                    // strip's own `overflow-hidden` — that clipping stays on
+                    // the root to keep the tab row contained, and `fixed`
+                    // positions relative to the viewport instead of this
+                    // (clipped) ancestor.
                     div {
-                        class: "absolute top-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                        class: "fixed top-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
                         AppMenuRow {
                             icon: fi_icons::FiCheckSquare,
                             label: "Planner",
@@ -97,7 +102,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
                         AppMenuRow {
                             icon: crate::components::pixel_icons::HobbesTiger,
                             label: "Fleet",
-                            hotkey: String::new(),
+                            hotkey: settings.read().hotkeys.toggle_fleet.clone(),
                             visible: ui_state.read().show_fleet_icon,
                             onclick: move |_| {
                                 chat_command.set(Some(ChatCommand::ToggleFleet));

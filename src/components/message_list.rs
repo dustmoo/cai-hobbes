@@ -4,7 +4,9 @@ use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::components::activity_stream::{group_turn_runs, run_header_provenance, ActivityStream};
+use crate::components::activity_stream::{
+    absorb_live_placeholder, group_turn_runs, run_header_provenance, ActivityStream,
+};
 use crate::components::tool_call_display::{PermissionPrompt, ToolCallDisplay};
 
 use super::chat::{MessageBubble, WelcomeMessage};
@@ -187,7 +189,13 @@ pub fn MessageList(
                         // Group each turn's machinery into one activity block, then
                         // apply the visible-window skip at slot level so a block is
                         // never half-rendered.
-                        let runs = group_turn_runs(&sorted_messages);
+                        let mut runs = group_turn_runs(&sorted_messages);
+                        let is_streaming = stream_manager.is_session_streaming(&session_id.read());
+                        // While the turn is live the dashed "Considering…"
+                        // placeholder is part of the block, not a bubble under it.
+                        if is_streaming {
+                            absorb_live_placeholder(&sorted_messages, &mut runs);
+                        }
                         let skip = total_messages.saturating_sub(*visible_message_count.read());
                         let items: Vec<RenderItem> = {
                             let mut items = Vec::new();
@@ -212,7 +220,6 @@ pub fn MessageList(
                                 })
                                 .collect()
                         };
-                        let is_streaming = stream_manager.is_session_streaming(&session_id.read());
                         let last_run_start = runs.last().map(|r| r.start);
 
                         if session.messages.is_empty() {

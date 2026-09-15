@@ -561,6 +561,59 @@ mod tests {
 
     // ── Projector ───────────────────────────────────────────────────────────
 
+    /// A turn that streamed prose *and* a tool call: the reply's placeholder
+    /// is pushed at turn start but finalization moves it past the call (vec
+    /// order and `created_at` together). Replay must reproduce that order —
+    /// the live vec and a projected one both feed the prompt builder, so a
+    /// divergence here is a real bug, not a cosmetic one.
+    #[test]
+    fn project_reproduces_reply_moved_after_its_turn_s_tool_calls() {
+        let user = text_message("User", "what's on today?", 0);
+        // Minted when the stream emitted it — after the placeholder was pushed.
+        let mut call = tool_call_message(ToolCallStatus::Running, 3);
+        let call_done = {
+            if let MessageContent::ToolCall(tc) = &mut call.content {
+                tc.status = ToolCallStatus::Completed;
+                tc.response = "Mon 15 Sep".to_string();
+                tc.completed_at = Some(base_ts() + Duration::seconds(4));
+            }
+            call.clone()
+        };
+        // The placeholder, finalized with prose and restamped past the call.
+        let reply = text_message("Hobbes", "You have three things today.", 5);
+
+        // Live vec order, as stream_manager leaves it.
+        let live: Vec<uuid::Uuid> = vec![user.id, call.id, reply.id];
+
+        let events = loaded(vec![
+            SessionEvent::SessionCreated { id: "s1".into(), name: "Turn".into() },
+            SessionEvent::UserMessage { message: user.clone() },
+            SessionEvent::ToolCall { message: call.clone() },
+            SessionEvent::ToolResult { message: call_done.clone() },
+            SessionEvent::AssistantMessage { message: reply.clone() },
+        ]);
+
+        let s = project(None, &events);
+        assert_eq!(
+            s.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            live,
+            "replay must reproduce the live order"
+        );
+        let stamps: Vec<_> = s.messages.iter().map(|m| m.created_at).collect();
+        assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+        match &s.messages[1].content {
+            MessageContent::ToolCall(tc) => {
+                assert_eq!(tc.status, ToolCallStatus::Completed);
+                assert_eq!(
+                    (tc.completed_at.unwrap() - s.messages[1].created_at).num_seconds(),
+                    1,
+                    "duration survives the round trip"
+                );
+            }
+            other => panic!("expected the tool call, got {other:?}"),
+        }
+    }
+
     /// Birth-to-current replay of a scripted session reproduces every field
     /// the journal covers.
     #[test]

@@ -400,6 +400,18 @@ pub fn ChatWindow(
 
                 // 2. Execute tools
                 for (msg_id, tool_call) in tools_to_run {
+                    // The step's clock starts when the approved call actually
+                    // runs, not when the prompt was raised — `created_at` is what
+                    // the activity stream measures a step's offset and duration
+                    // from, and the wait for a human is not work the tool did.
+                    // `restamp_message` clamps to the neighbouring messages, so a
+                    // prompt answered out of order can't reshuffle the vec.
+                    {
+                        let mut state = session_state.write();
+                        if let Some(session) = state.sessions.get_mut(&owning_id) {
+                            session.restamp_message(&msg_id, chrono::Utc::now());
+                        }
+                    }
                     let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                         .unwrap_or(serde_json::Value::Null);
 
@@ -1703,7 +1715,14 @@ pub fn MessageBubble(
             // If it's a streaming Hobbes message, it takes the stream and updates its local state.
             use_effect(move || {
                 let _stream_activity = stream_manager.stream_activity;
-                if !is_user && stream_manager.is_streaming(&message.id) {
+                // Only a bubble that mounts EMPTY may claim the channel. A live
+                // activity block absorbs the empty placeholder, so this bubble
+                // first mounts once prose is already in session_state — draining
+                // the channel from the top would then duplicate that text. Such a
+                // late mount falls through to the session_state mirror effect
+                // below, exactly like a bubble re-mounted after a tab switch.
+                let mounted_empty = content.peek().trim().is_empty();
+                if !is_user && mounted_empty && stream_manager.is_streaming(&message.id) {
                     // We mounted while the live channel is still available, so we're the
                     // consumer. Claim ownership synchronously (before the async take) so the
                     // session_state-mirror effect never fights this channel loop.

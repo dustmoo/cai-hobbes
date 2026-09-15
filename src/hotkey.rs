@@ -102,6 +102,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 "toggle_history" => chat_command.set(Some(ChatCommand::ToggleHistory)),
                 "toggle_mcp" => chat_command.set(Some(ChatCommand::ToggleMcp)),
                 "toggle_planner" => chat_command.set(Some(ChatCommand::TogglePlanner)),
+                "toggle_fleet" => chat_command.set(Some(ChatCommand::ToggleFleet)),
                 "toggle_profile" => chat_command.set(Some(ChatCommand::ToggleProfile)),
                 "toggle_provider" => chat_command.set(Some(ChatCommand::ToggleProviderSelector)),
                 "open_attachments" => chat_command.set(Some(ChatCommand::OpenAttachments)),
@@ -220,6 +221,7 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                         else if (check(config.toggle_history, event)) action = "toggle_history";
                         else if (check(config.toggle_mcp, event)) action = "toggle_mcp";
                         else if (check(config.toggle_planner, event)) action = "toggle_planner";
+                        else if (check(config.toggle_fleet, event)) action = "toggle_fleet";
                         else if (check(config.toggle_profile, event)) action = "toggle_profile";
                         else if (check(config.toggle_provider, event)) action = "toggle_provider";
                         else if (check(config.toggle_attachments, event)) action = "open_attachments";

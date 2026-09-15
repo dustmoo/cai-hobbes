@@ -77,6 +77,8 @@ pub struct HotkeySettings {
     pub toggle_mcp: String,
     #[serde(default = "default_toggle_planner")]
     pub toggle_planner: String,
+    #[serde(default = "default_toggle_fleet")]
+    pub toggle_fleet: String,
     #[serde(default = "default_toggle_profile")]
     pub toggle_profile: String,
     #[serde(default = "default_toggle_provider")]
@@ -124,6 +126,7 @@ impl Default for HotkeySettings {
             toggle_history: default_toggle_history(),
             toggle_mcp: default_toggle_mcp(),
             toggle_planner: default_toggle_planner(),
+            toggle_fleet: default_toggle_fleet(),
             toggle_profile: default_toggle_profile(),
             toggle_provider: default_toggle_provider(),
             toggle_attachments: default_toggle_attachments(),
@@ -159,6 +162,11 @@ fn default_toggle_mcp() -> String {
 // Shift+P is taken by the profile selector; T ("tasks") is free.
 fn default_toggle_planner() -> String {
     "CmdOrCtrl+Shift+T".to_string()
+}
+// Shift+E ("exocortex") is used instead of F if F is ever claimed elsewhere;
+// F ("fleet") is free today.
+fn default_toggle_fleet() -> String {
+    "CmdOrCtrl+Shift+F".to_string()
 }
 fn default_toggle_profile() -> String {
     "CmdOrCtrl+Shift+P".to_string()
@@ -2802,5 +2810,43 @@ mod tests {
         let restored: crate::session::Session = serde_json::from_value(value).unwrap();
         assert_eq!(restored.llm_connector_id, None);
         assert_eq!(restored.llm_provider, Some(LlmProvider::Claude));
+    }
+
+    #[test]
+    fn hotkey_settings_default_has_fleet_toggle() {
+        assert!(!HotkeySettings::default().toggle_fleet.is_empty());
+    }
+
+    #[test]
+    fn hotkey_settings_legacy_json_without_fleet_field_uses_default() {
+        // A hotkeys blob persisted before `toggle_fleet` existed must still
+        // deserialize, falling back to the default combo.
+        let legacy = serde_json::json!({
+            "toggle_settings": "CmdOrCtrl+,",
+            "toggle_history": "CmdOrCtrl+Shift+H",
+            "toggle_mcp": "CmdOrCtrl+Shift+M",
+            "toggle_planner": "CmdOrCtrl+Shift+T",
+            "toggle_profile": "CmdOrCtrl+Shift+P",
+            "toggle_provider": "CmdOrCtrl+Shift+L",
+            "toggle_attachments": "CmdOrCtrl+Shift+A",
+            "toggle_tray": "CmdOrCtrl+Shift+Space",
+            "toggle_new_chat": "CmdOrCtrl+Shift+N",
+            "toggle_new_chat_with_memory": "CmdOrCtrl+Alt+N",
+            "toggle_scroll_to_bottom": "CmdOrCtrl+Shift+ArrowDown",
+            "toggle_focus_chat": "CmdOrCtrl+/",
+            "submit_chat": "CmdOrCtrl+Enter",
+            "cancel_generation": "CmdOrCtrl+.",
+            "switch_tab_1": "CmdOrCtrl+Shift+1",
+            "switch_tab_2": "CmdOrCtrl+Shift+2",
+            "switch_tab_3": "CmdOrCtrl+Shift+3",
+            "switch_tab_4": "CmdOrCtrl+Shift+4",
+            "switch_tab_5": "CmdOrCtrl+Shift+5",
+            "switch_tab_6": "CmdOrCtrl+Shift+6",
+            "switch_tab_7": "CmdOrCtrl+Shift+7",
+            "switch_tab_8": "CmdOrCtrl+Shift+8",
+            "switch_tab_9": "CmdOrCtrl+Shift+9",
+        });
+        let restored: HotkeySettings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.toggle_fleet, default_toggle_fleet());
     }
 }

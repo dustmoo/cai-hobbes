@@ -183,7 +183,89 @@ pub struct Session {
     pub tool_call_history: Vec<crate::components::shared::ToolCallRecord>,
 }
 
+/// Stamp `created_at` on a message that is already in `messages`, without
+/// breaking the vec's `created_at`-monotonic ordering.
+///
+/// Ordering is load-bearing in two places that must agree: the prompt builder
+/// walks `session.messages` in vec order, while the journal projector reinserts
+/// messages at their `created_at`-sorted position
+/// (`session_events::upsert_message`). A vec whose order disagrees with its
+/// own timestamps therefore renders and replays differently — so a restamp is
+/// clamped into the window its neighbours leave open, and skipped entirely
+/// when they leave none (legacy rows that are already out of order).
+///
+/// Returns the stamp actually applied, or `None` when the message isn't there.
+pub fn restamp_message(
+    messages: &mut [crate::components::chat::Message],
+    message_id: &uuid::Uuid,
+    ts: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let idx = messages.iter().position(|m| m.id == *message_id)?;
+    let lower = idx.checked_sub(1).map(|i| messages[i].created_at);
+    let upper = messages.get(idx + 1).map(|m| m.created_at);
+    if let (Some(lo), Some(hi)) = (lower, upper) {
+        if lo > hi {
+            return Some(messages[idx].created_at);
+        }
+    }
+    let mut ts = ts;
+    if let Some(lo) = lower {
+        ts = ts.max(lo);
+    }
+    if let Some(hi) = upper {
+        ts = ts.min(hi);
+    }
+    messages[idx].created_at = ts;
+    Some(ts)
+}
+
+/// Move a message to the end of `messages` and stamp it at `ts` (never earlier
+/// than the message it now follows), returning the moved message.
+///
+/// Used when a turn's prose reply is finalized *after* the tool calls it
+/// follows: the reply's placeholder is pushed at turn start, so leaving it in
+/// place renders the turn's work BELOW the answer that work produced. Moving
+/// the message rather than only restamping it keeps the vec order and the
+/// timestamps in agreement, which is what makes `session_events::project`
+/// replay the same layout the live session renders.
+pub fn move_message_to_end(
+    messages: &mut Vec<crate::components::chat::Message>,
+    message_id: &uuid::Uuid,
+    ts: DateTime<Utc>,
+) -> Option<crate::components::chat::Message> {
+    let idx = messages.iter().position(|m| m.id == *message_id)?;
+    if idx + 1 == messages.len() {
+        restamp_message(messages, message_id, ts);
+        return messages.last().cloned();
+    }
+    let mut msg = messages.remove(idx);
+    msg.created_at = match messages.last() {
+        Some(last) => ts.max(last.created_at),
+        None => ts,
+    };
+    messages.push(msg.clone());
+    Some(msg)
+}
+
 impl Session {
+    /// See [`restamp_message`].
+    pub fn restamp_message(
+        &mut self,
+        message_id: &uuid::Uuid,
+        ts: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        restamp_message(&mut self.messages, message_id, ts)
+    }
+
+    /// See [`move_message_to_end`].
+    pub fn move_message_to_end(
+        &mut self,
+        message_id: &uuid::Uuid,
+        ts: DateTime<Utc>,
+    ) -> Option<crate::components::chat::Message> {
+        move_message_to_end(&mut self.messages, message_id, ts)
+    }
+
     pub fn increment_turn_count(&mut self) {
         self.current_ai_turn_count += 1;
     }
@@ -1544,6 +1626,103 @@ impl Default for SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both ordering helpers exist to keep one invariant: the vec's order and
+    /// its `created_at` stamps agree, because the journal projector reinserts
+    /// by timestamp while the prompt builder walks the vec.
+    mod message_order {
+        use super::*;
+
+        fn msg(at_secs: i64) -> crate::components::chat::Message {
+            crate::components::chat::Message {
+                id: uuid::Uuid::new_v4(),
+                author: "Hobbes".to_string(),
+                content: crate::components::shared::MessageContent::Text {
+                    content: String::new(),
+                    thought_signature: None,
+                    thought_summary: None,
+                    signature_provider: None,
+                },
+                attachments: Vec::new(),
+                comments: Vec::new(),
+                created_at: Utc::now() + chrono::Duration::seconds(at_secs),
+                usage: None,
+            }
+        }
+
+        #[test]
+        fn restamp_of_the_tail_takes_the_new_stamp() {
+            let mut messages = vec![msg(0), msg(1)];
+            let id = messages[1].id;
+            let ts = messages[1].created_at + chrono::Duration::seconds(10);
+            assert_eq!(restamp_message(&mut messages, &id, ts), Some(ts));
+            assert_eq!(messages[1].created_at, ts);
+        }
+
+        #[test]
+        fn restamp_is_clamped_by_its_neighbours() {
+            let mut messages = vec![msg(0), msg(5), msg(6)];
+            let id = messages[1].id;
+            let upper = messages[2].created_at;
+            // Way past the next message: clamped, so the vec stays sorted.
+            let ts = upper + chrono::Duration::seconds(60);
+            assert_eq!(restamp_message(&mut messages, &id, ts), Some(upper));
+            let stamps: Vec<_> = messages.iter().map(|m| m.created_at).collect();
+            assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+        }
+
+        #[test]
+        fn restamp_leaves_already_unordered_neighbours_alone() {
+            let mut messages = vec![msg(9), msg(5), msg(0)];
+            let id = messages[1].id;
+            let before = messages[1].created_at;
+            let ts = Utc::now();
+            assert_eq!(restamp_message(&mut messages, &id, ts), Some(before));
+            assert_eq!(messages[1].created_at, before);
+        }
+
+        #[test]
+        fn restamp_of_a_missing_message_is_none() {
+            let mut messages = vec![msg(0)];
+            assert!(restamp_message(&mut messages, &uuid::Uuid::new_v4(), Utc::now()).is_none());
+        }
+
+        #[test]
+        fn move_to_end_reorders_and_stamps_last() {
+            let mut messages = vec![msg(0), msg(1), msg(2)];
+            let id = messages[1].id;
+            let ts = messages[2].created_at + chrono::Duration::seconds(1);
+            let moved = move_message_to_end(&mut messages, &id, ts).expect("present");
+            assert_eq!(moved.id, id);
+            assert_eq!(messages.last().unwrap().id, id);
+            assert_eq!(messages.len(), 3);
+            let stamps: Vec<_> = messages.iter().map(|m| m.created_at).collect();
+            assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+        }
+
+        #[test]
+        fn move_to_end_never_stamps_before_the_message_it_follows() {
+            let mut messages = vec![msg(0), msg(60)];
+            let id = messages[0].id;
+            // A stamp earlier than the tail would break the invariant.
+            let moved = move_message_to_end(&mut messages, &id, Utc::now()).expect("present");
+            assert_eq!(moved.created_at, messages[0].created_at);
+            assert_eq!(messages.last().unwrap().id, id);
+            let stamps: Vec<_> = messages.iter().map(|m| m.created_at).collect();
+            assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+        }
+
+        #[test]
+        fn move_to_end_of_the_tail_only_restamps() {
+            let mut messages = vec![msg(0), msg(1)];
+            let id = messages[1].id;
+            let ts = messages[1].created_at + chrono::Duration::seconds(5);
+            let moved = move_message_to_end(&mut messages, &id, ts).expect("present");
+            assert_eq!(moved.created_at, ts);
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[1].id, id);
+        }
+    }
 
     // === Migration Tests ===
 
