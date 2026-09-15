@@ -1,11 +1,13 @@
-//! The chat bar's project chip: quiet session metadata, not a button
-//! competing with the icon cluster. Tagged → the project title in a faint
-//! pill; untagged → a dim "+ project" invitation. Click opens a picker
-//! mirroring the connector-selector popover idiom; any manual choice
-//! (including "No project") sets `project_tag_user_set`, which the
-//! auto-tagger permanently respects.
+//! The composer's project pill: quiet session metadata, not a button
+//! competing with the identity rail. Tagged → the planner mark plus the
+//! project title in a faint pill; untagged → a bare 28x28 planner-mark icon
+//! button, so an untagged chat spends no horizontal room on an invitation.
+//! Click opens a picker mirroring the connector-selector popover idiom; any
+//! manual choice (including "No project") sets `project_tag_user_set`, which
+//! the auto-tagger permanently respects.
 
 use dioxus::prelude::*;
+use dioxus_free_icons::{icons::fi_icons, Icon};
 
 use crate::session::SessionState;
 use crate::session_events::{log_event, SessionEvent};
@@ -84,26 +86,41 @@ pub fn ProjectChip() -> Element {
             class: "relative",
             if let Some(title) = &label {
                 button {
-                    class: "max-w-44 flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-faint text-xs text-fg-muted cursor-pointer hover:text-fg hover:border-primary-500 hover:bg-card transition-colors select-none",
+                    class: "max-w-44 h-7 flex items-center gap-1.5 px-2.5 rounded-full border border-faint text-xs text-fg-muted cursor-pointer hover:text-fg hover:border-primary-500 hover:bg-card transition-colors select-none",
                     title: "Project: {title} — click to change",
                     onclick: move |_| {
                         let v = !*open.peek();
                         open.set(v);
                     },
+                    Icon {
+                        icon: fi_icons::FiCheckSquare,
+                        width: 12,
+                        height: 12,
+                        class: "shrink-0",
+                    }
                     span { class: "truncate", "{title}" }
                     // The caret is the "this opens something" signal — a
                     // label without it reads as static metadata.
-                    span { class: "text-[9px] opacity-60 shrink-0", "▾" }
+                    Icon {
+                        icon: fi_icons::FiChevronDown,
+                        width: 12,
+                        height: 12,
+                        class: "shrink-0 opacity-60",
+                    }
                 }
             } else {
                 button {
-                    class: "flex items-center gap-1 px-2.5 py-1 rounded-full border border-dashed border-faint text-xs text-fg-muted/70 cursor-pointer hover:text-fg hover:border-subtle hover:bg-card transition-colors select-none",
-                    title: "Tag this chat to a project",
+                    class: "w-7 h-7 flex items-center justify-center rounded-md text-fg-muted cursor-pointer hover:text-fg hover:bg-card transition-colors select-none",
+                    title: "Tag a project",
                     onclick: move |_| {
                         let v = !*open.peek();
                         open.set(v);
                     },
-                    span { "+ project" }
+                    Icon {
+                        icon: fi_icons::FiCheckSquare,
+                        width: 16,
+                        height: 16,
+                    }
                 }
             }
 

@@ -90,6 +90,7 @@ mod tests {
                     signature_provider: None,
                     cached_image_path: None,
                     result_summary: None,
+                    completed_at: None,
                 },
                 result: ToolResult {
                     status: ToolCallStatus::Completed,
@@ -152,6 +153,7 @@ mod tests {
                 signature_provider: None,
                 cached_image_path: None,
                 result_summary: None,
+                completed_at: None,
             },
             result: ToolResult {
                 status: ToolCallStatus::Completed,

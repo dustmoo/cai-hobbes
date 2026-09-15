@@ -4,12 +4,21 @@ use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
+use crate::components::activity_stream::{group_turn_runs, ActivityStream};
 use crate::components::tool_call_display::{PermissionPrompt, ToolCallDisplay};
 
 use super::chat::{MessageBubble, WelcomeMessage};
 use super::shared::{MessageContent, SessionIdContext};
 
 const INITIAL_MESSAGES_TO_SHOW: usize = 20;
+
+/// What occupies one slot in the rendered list: either a plain message, or a
+/// whole turn's worth of tool calls / permission prompts / thinking collapsed
+/// into a single [`ActivityStream`] block rendered where its first message sat.
+enum RenderItem {
+    Single(usize),
+    Run(std::ops::Range<usize>),
+}
 
 #[component]
 pub fn MessageList(
@@ -20,6 +29,9 @@ pub fn MessageList(
     on_edit_save: EventHandler<(Uuid, String)>,
     on_edit_resend: EventHandler<(Uuid, String)>,
     on_comment: EventHandler<()>,
+    /// Stops the in-flight turn. Routed through to the activity block's header
+    /// Stop button; ChatWindow owns the actual cancel path (`cancel_message`).
+    on_stop: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let ui_state = consume_context::<Signal<crate::settings::UiState>>();
@@ -44,6 +56,34 @@ pub fn MessageList(
         crate::components::shared::resolve_profile_color(session_profile, &settings_read)
             .unwrap_or_default()
     };
+
+    // Header provenance for activity blocks. Captured at render time; see the
+    // TODO on ActivityStreamProps about recording it at turn start instead.
+    let (profile_name, connector_label) = {
+        let state = session_state.read();
+        let settings_read = settings.read();
+        match state.sessions.get(&*session_id.read()) {
+            Some(session) => {
+                let profile_name = session
+                    .composio_profile
+                    .as_ref()
+                    .and_then(|id| settings_read.composio_profiles.iter().find(|p| &p.id == id))
+                    .or_else(|| settings_read.get_active_profile())
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "default".to_string());
+                let connector = settings_read
+                    .connector_for_session(session)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "no connector".to_string());
+                let model = settings_read.chat_model_for_session(session);
+                (profile_name, format!("{connector} {model}"))
+            }
+            None => ("default".to_string(), String::new()),
+        }
+    };
+
+    let stream_manager =
+        consume_context::<crate::components::stream_manager::StreamManagerContext>();
 
     use_effect(move || {
         if let Some(cmd) = chat_command.read().clone() {
@@ -141,7 +181,36 @@ pub fn MessageList(
                         let mut sorted_messages = session.messages.clone();
                         sorted_messages.sort_by_key(|m| m.created_at);
 
-                        let messages_to_render = sorted_messages.iter().skip(total_messages.saturating_sub(*visible_message_count.read())).collect::<Vec<_>>();
+                        // Group each turn's machinery into one activity block, then
+                        // apply the visible-window skip at slot level so a block is
+                        // never half-rendered.
+                        let runs = group_turn_runs(&sorted_messages);
+                        let skip = total_messages.saturating_sub(*visible_message_count.read());
+                        let items: Vec<RenderItem> = {
+                            let mut items = Vec::new();
+                            let mut i = 0usize;
+                            while i < total_messages {
+                                match runs.iter().find(|r| r.start == i) {
+                                    Some(r) => {
+                                        items.push(RenderItem::Run(r.clone()));
+                                        i = r.end;
+                                    }
+                                    None => {
+                                        items.push(RenderItem::Single(i));
+                                        i += 1;
+                                    }
+                                }
+                            }
+                            items
+                                .into_iter()
+                                .filter(|it| match it {
+                                    RenderItem::Single(i) => *i >= skip,
+                                    RenderItem::Run(r) => r.end > skip,
+                                })
+                                .collect()
+                        };
+                        let is_streaming = stream_manager.is_session_streaming(&session_id.read());
+                        let last_run_start = runs.last().map(|r| r.start);
 
                         if session.messages.is_empty() {
                             rsx! { WelcomeMessage {} }
@@ -160,9 +229,37 @@ pub fn MessageList(
                                         }
                                     }
                                 }
-                                for message in messages_to_render {
+                                for item in items {
                                     {
                                         let session_id = session_id.read().clone();
+                                        match item {
+                                        RenderItem::Run(run) => {
+                                            let run_msgs = sorted_messages[run.clone()].to_vec();
+                                            // Live only while this session streams, for the
+                                            // newest run, and only until the assistant's prose
+                                            // reply lands after it.
+                                            let is_live = is_streaming
+                                                && last_run_start == Some(run.start)
+                                                && !sorted_messages[run.end..].iter().any(|m| matches!(
+                                                    &m.content,
+                                                    MessageContent::Text { content, .. } if !content.trim().is_empty()
+                                                ));
+                                            let block_key = run_msgs[0].id;
+                                            rsx! {
+                                                ActivityStream {
+                                                    key: "{block_key}",
+                                                    messages: run_msgs,
+                                                    session_id: session_id.clone(),
+                                                    is_live: is_live,
+                                                    profile_color: profile_color.clone(),
+                                                    profile_name: profile_name.clone(),
+                                                    connector_label: connector_label.clone(),
+                                                    on_stop: move |_| on_stop.call(()),
+                                                }
+                                            }
+                                        }
+                                        RenderItem::Single(idx) => {
+                                        let message = &sorted_messages[idx];
                                         rsx! {
                                             match &message.content {
                                                 MessageContent::Text { content: text, thought_signature: _, thought_summary: _, signature_provider: _ } => {
@@ -456,6 +553,8 @@ pub fn MessageList(
                                                     }
                                                 }
                                             }
+                                        }
+                                        }
                                         }
                                     }
                                 }

@@ -474,6 +474,7 @@ pub fn ChatWindow(
                             {
                                 tc.status = status;
                                 tc.response = response_str.clone();
+                                tc.completed_at = Some(chrono::Utc::now());
                                 result_snapshot = Some(msg.clone());
                             }
                         }
@@ -1204,6 +1205,7 @@ pub fn ChatWindow(
                         let sid = current_target_id.read().clone();
                         has_new_comments.write().insert(sid);
                     },
+                    on_stop: move |_| cancel_message(),
                 },
                 ChatInput {
                     is_sending: is_sending,

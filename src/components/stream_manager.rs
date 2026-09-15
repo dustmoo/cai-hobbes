@@ -682,6 +682,7 @@ impl StreamManagerContext {
                                             if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
                                                 tc.status = status;
                                                 tc.response = response.clone();
+                                                tc.completed_at = Some(chrono::Utc::now());
                                             }
                                             result_snapshot = Some(msg.clone());
                                         }
@@ -926,6 +927,7 @@ impl StreamManagerContext {
                                 {
                                     tc.status = status;
                                     tc.response = response_str.clone();
+                                    tc.completed_at = Some(chrono::Utc::now());
                                     // Store image path for prompt_builder vision injection
                                     if image_path.is_some() {
                                         tc.cached_image_path = image_path.clone();

@@ -312,6 +312,7 @@ fn tool_call_msg(tool_name: &str, response: String, result_summary: Option<Strin
             signature_provider: None,
             cached_image_path: None,
             result_summary,
+            completed_at: None,
         }),
         attachments: vec![],
         comments: vec![],

@@ -142,6 +142,13 @@ pub struct ToolCall {
     /// always retained for pagination/re-budgeting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_summary: Option<String>,
+    /// When the result was written back onto this call. Set by every site that
+    /// stamps `status`/`response` (the streaming path in `stream_manager` and
+    /// the approval-resume path in `chat.rs`). Paired with the owning
+    /// `Message::created_at` it yields the step's duration for the activity
+    /// stream. `None` on legacy rows and on calls still in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub enum StreamMessage {
@@ -192,6 +199,7 @@ impl ToolCall {
             signature_provider: None,
             cached_image_path: None,
             result_summary: None,
+            completed_at: None,
         }
     }
 

@@ -19,7 +19,7 @@ use hobbes_core::models::Attachment;
 
 use crate::components::chat_queue::{self, QueuedMessage, CHAT_QUEUE};
 use crate::components::focus_context::FocusContext;
-use crate::components::shared::{ChatBarIconButton, DraftContext, SessionIdContext};
+use crate::components::shared::{DraftContext, SessionIdContext};
 use crate::components::skill_autocomplete::SkillAutocomplete;
 use crate::components::stream_manager::StreamManagerContext;
 use crate::hotkey::matches_hotkey;
@@ -105,6 +105,27 @@ fn display_name_for_provider(provider: &LlmProvider, model_slug: &str) -> String
             crate::llm::claude_models::ClaudeModel::from_slug(model_slug).display_name()
         }
         _ => model_slug.to_string(),
+    }
+}
+
+/// Derive the matching Tailwind *border* class for a Composio profile's
+/// stored `color` (which is a Tailwind *background* class, e.g.
+/// `bg-purple-600`). Anything that isn't a recognisable `bg-` class falls
+/// back to the neutral composer border.
+///
+/// Tailwind's content scanner only emits classes that appear literally in the
+/// source, and this function builds its output at runtime — so every border
+/// class the profile palette can produce is listed here verbatim to keep them
+/// in the generated stylesheet. The palette lives in `settings_panel.rs`'s
+/// profile colour swatches (`default_profile_color` in `settings.rs` is
+/// `bg-blue-600`):
+///
+/// border-blue-600 border-purple-600 border-green-600 border-red-600
+/// border-orange-600 border-pink-600 border-teal-600 border-input
+fn profile_border_class(bg_class: &str) -> String {
+    match bg_class.trim().strip_prefix("bg-") {
+        Some(rest) if !rest.is_empty() => format!("border-{}", rest),
+        _ => "border-faint".to_string(),
     }
 }
 
@@ -916,75 +937,703 @@ pub fn ChatInput(
                     });
                 }
             },
+            // COMPOSER — the identity rail. One container carries the
+            // background, border and focus ring; the textarea inside it is
+            // transparent and chrome-free so the whole box reads as one field.
             div {
-                class: "flex items-center space-x-3",
-                ChatBarIconButton {
-                    icon: fi_icons::FiSettings,
-                    onclick: move |_| chat_command.set(Some(ChatCommand::ToggleSettings)),
-                    title: "Settings"
-                }
-                ChatBarIconButton {
-                    icon: fi_icons::FiClock,
-                    onclick: move |_| chat_command.set(Some(ChatCommand::ToggleHistory)),
-                    visible: ui_state.read().show_history_icon,
-                    title: "History"
-                }
-                ChatBarIconButton {
-                    icon: fi_icons::FiPackage,
-                    onclick: move |_| chat_command.set(Some(ChatCommand::ToggleMcp)),
-                    visible: ui_state.read().show_mcp_icon,
-                    title: "MCP Tools"
-                }
-                ChatBarIconButton {
-                    icon: fi_icons::FiCheckSquare,
-                    onclick: move |_| chat_command.set(Some(ChatCommand::TogglePlanner)),
-                    visible: ui_state.read().show_planner_icon,
-                    title: "Planner"
-                }
-                ChatBarIconButton {
-                    icon: crate::components::pixel_icons::HobbesTiger,
-                    onclick: move |_| chat_command.set(Some(ChatCommand::ToggleFleet)),
-                    visible: ui_state.read().show_fleet_icon,
-                    title: "Fleet"
-                }
-                SessionCostIcon {}
-                crate::components::project_chip::ProjectChip {}
+                class: "w-full bg-input border border-subtle rounded-xl focus-within:ring-2 focus-within:ring-primary-500 transition-shadow",
 
-                // LLM Connector Selector (session-scoped, mirrors the profile picker)
-                { if ui_state.read().show_provider_selector {
-                    {
-                        // The session's resolved connector (pin → legacy kind → global active)
-                        let active_instance = {
+                // Row 1 — the message field, full width.
+                div {
+                    class: "relative",
+                    textarea {
+                        id: "chat-textarea",
+                        // Chrome-free: the composer container owns the background, border
+                        // and focus ring, so the field itself is just text.
+                        class: "w-full min-h-[44px] px-4 pt-3 pb-1.5 bg-transparent border-0 text-fg placeholder-gray-500 focus:outline-none focus:ring-0 resize-none overflow-y-auto",
+                        style: "max-height: 50vh;",
+                        rows: "1",
+                        placeholder: "Type your message...",
+                        // UNCONTROLLED on purpose: a controlled `value` binding races
+                        // the IPC round-trip and snaps the caret to the end mid-typing.
+                        // Programmatic writes go through shared::set_chat_draft, which
+                        // updates the DOM explicitly.
+                        initial_value: "{draft}",
+                        onmounted: move |evt| {
+                            textarea_mounted.set(Some(evt.data()));
+                        },
+                        oninput: move |event| {
+                            scheduler.send(SchedulerSignal::Activity);
+
+                            // Auto-resize the textarea to fit its content.
+                            // This eval is necessary because we need to measure the
+                            // DOM element's scrollHeight, which is not accessible
+                            // through Dioxus's virtual DOM.
+                            let _ = document::eval(r#"
+                                const el = document.getElementById('chat-textarea');
+                                if (el) {
+                                    el.style.height = 'auto';
+                                    el.style.height = (el.scrollHeight) + 'px';
+                                }
+                            "#);
+
+                            draft.set(event.value());
+
+                            // Skill Autocomplete Detection
+                            let val = event.value();
+                            if let Some(unload_query) = val.strip_prefix("/unload ") {
+                                // Autocomplete for /unload — source from session.loaded_skills
+                                autocomplete_mode.set(AutocompleteMode::Unload);
+                                let state = session_state.read();
+                                if let Some(session) = state.get_active_session() {
+                                    let matches: Vec<Skill> = session.loaded_skills.keys()
+                                        .filter(|name| {
+                                            unload_query.is_empty() || name.to_lowercase().contains(&unload_query.to_lowercase())
+                                        })
+                                        .map(|name| {
+                                            // Build a lightweight Skill for the autocomplete UI
+                                            Skill {
+                                                metadata: crate::skills::parser::SkillMetadata {
+                                                    name: name.clone(),
+                                                    description: "Loaded skill".to_string(),
+                                                    disable_model_invocation: false,
+                                                    user_invocable: true,
+                                                    allowed_tools: None,
+                                                    argument_hint: None,
+                                                },
+                                                instructions: String::new(),
+                                                path: std::path::PathBuf::new(),
+                                                root_path: std::path::PathBuf::new(),
+                                                scripts: Vec::new(),
+                                                resources: Vec::new(),
+                                            }
+                                        })
+                                        .collect();
+                                    filtered_skills.set(matches);
+                                    skill_autocomplete_index.set(0);
+                                    show_skill_autocomplete.set(true);
+                                }
+                            } else {
+                                // Cursor-aware skill autocomplete: trigger on a
+                                // /token at the caret, anywhere in the draft. The
+                                // caret position lives only in the DOM, so fetch it
+                                // via eval before running the pure token scan.
+                                spawn(async move {
+                                    let mut eval = document::eval(r#"
+                                        const el = document.getElementById('chat-textarea');
+                                        dioxus.send(el ? el.selectionStart : -1);
+                                    "#);
+                                    let cursor: i64 = eval.recv().await.unwrap_or(-1);
+                                    let query_opt = if cursor >= 0 {
+                                        crate::skills::invocation::autocomplete_query_at(
+                                            &val,
+                                            cursor as usize,
+                                        )
+                                    } else {
+                                        None
+                                    };
+                                    match query_opt {
+                                        Some(q) => {
+                                            autocomplete_mode.set(AutocompleteMode::Skill);
+                                            let matches: Vec<Skill> = {
+                                                let registry = skill_registry.read();
+                                                registry
+                                                    .list_skills()
+                                                    .into_iter()
+                                                    .filter(|s| {
+                                                        q.query.is_empty()
+                                                            || s.metadata
+                                                                .name
+                                                                .to_lowercase()
+                                                                .contains(&q.query.to_lowercase())
+                                                    })
+                                                    .collect()
+                                            };
+                                            autocomplete_token.set(Some(q.token_range));
+                                            filtered_skills.set(matches);
+                                            skill_autocomplete_index.set(0);
+                                            show_skill_autocomplete.set(true);
+                                        }
+                                        None => {
+                                            // No /skill token — offer fleet
+                                            // @-mentions when the fleet is armed.
+                                            let fleet_q = if crate::fleet::bridge::enabled() && cursor >= 0 {
+                                                crate::fleet::mention::mention_query_at(&val, cursor as usize)
+                                            } else {
+                                                None
+                                            };
+                                            match fleet_q {
+                                                Some(q) => {
+                                                    autocomplete_mode.set(AutocompleteMode::Fleet);
+                                                    let live = crate::fleet::shared().snapshot();
+                                                    let today = chrono::Local::now().date_naive();
+                                                    let now_utc = chrono::Utc::now();
+                                                    // Unique handle per WINDOW (name~id when a repo
+                                                    // has several sessions) — never dedupe windows.
+                                                    let mut rows: Vec<(String, &crate::fleet::FleetSession)> = live
+                                                        .sessions
+                                                        .values()
+                                                        .map(|s| (crate::fleet::mention::mention_handle(s, &live), s))
+                                                        .filter(|(h, s)| {
+                                                            q.query.is_empty()
+                                                                || h.to_lowercase().contains(&q.query.to_lowercase())
+                                                                || s.session_title
+                                                                    .as_deref()
+                                                                    .is_some_and(|t| t.to_lowercase().contains(&q.query.to_lowercase()))
+                                                        })
+                                                        .collect();
+                                                    rows.sort_by(|a, b| a.0.cmp(&b.0));
+                                                    let matches: Vec<Skill> = rows
+                                                        .into_iter()
+                                                        .map(|(handle, s)| Skill {
+                                                            metadata: crate::skills::parser::SkillMetadata {
+                                                                name: handle,
+                                                                description: {
+                                                                    let mut d = String::new();
+                                                                    if let Some(t) = &s.session_title {
+                                                                        d.push_str(&crate::fleet::truncate_summary(t, 60));
+                                                                        d.push_str(" · ");
+                                                                    }
+                                                                    d.push_str(&format!(
+                                                                        "{} today",
+                                                                        crate::todo::model::format_minutes(
+                                                                            s.minutes_on(today, now_utc),
+                                                                        )
+                                                                    ));
+                                                                    if let Some(b) = &s.brief {
+                                                                        d.push_str(" — ");
+                                                                        d.push_str(&crate::fleet::truncate_summary(
+                                                                            &b.headline,
+                                                                            60,
+                                                                        ));
+                                                                    }
+                                                                    d
+                                                                },
+                                                                disable_model_invocation: false,
+                                                                user_invocable: true,
+                                                                allowed_tools: None,
+                                                                argument_hint: None,
+                                                            },
+                                                            instructions: String::new(),
+                                                            path: std::path::PathBuf::new(),
+                                                            root_path: std::path::PathBuf::new(),
+                                                            scripts: Vec::new(),
+                                                            resources: Vec::new(),
+                                                        })
+                                                        .collect();
+                                                    autocomplete_token.set(Some(q.token_range));
+                                                    filtered_skills.set(matches);
+                                                    skill_autocomplete_index.set(0);
+                                                    show_skill_autocomplete.set(true);
+                                                }
+                                                None => {
+                                                    show_skill_autocomplete.set(false);
+                                                    filtered_skills.set(Vec::new());
+                                                    autocomplete_token.set(None);
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        },
+                        onkeydown: move |event| {
+                            tracing::debug!("ChatInput::onkeydown - Key: {:?}, Modifiers: {:?}, Context: {:?}", event.key(), event.data.modifiers(), *focus_context.read());
+                            // If a modal owns focus, don't handle keyboard events
+                            if *focus_context.read() != FocusContext::ChatInput {
+                                tracing::debug!("ChatInput ignoring event - Focus owns: {:?}", *focus_context.read());
+                                return;
+                            }
+
+                            scheduler.send(SchedulerSignal::Activity);
+                            let modifiers = event.data.modifiers();
+                            let hotkeys = settings.read().hotkeys.clone();
+
+                            // 1. Check Configurable Hotkeys
+                            if matches_hotkey(&event, &hotkeys.cancel_generation) {
+                                if *is_sending.read() {
+                                    event.prevent_default();
+                                    on_cancel.call(());
+                                }
+                                return;
+                            }
+
+                            let is_force_submit = matches_hotkey(&event, &hotkeys.submit_chat);
+
+                            // 2. Filter Global Modifiers
+                            // Allow if it matches our force submit (e.g. Cmd+Enter), otherwise let browser/OS handle Cmd+X, Cmd+R, etc.
+                            let has_cmd_opt_ctrl = modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::ALT);
+                            if has_cmd_opt_ctrl && !is_force_submit {
+                                return;
+                            }
+
+                            // 3. Tab Handling (Indentation)
+                            if event.key() == Key::Tab {
+                                event.prevent_default();
+                                let script = if modifiers.contains(Modifiers::SHIFT) {
+                                    r#"
+                                    const el = document.getElementById('chat-textarea');
+                                    if (el) {
+                                        const start = el.selectionStart;
+                                        const value = el.value;
+                                        let line_start = value.lastIndexOf('\n', start - 1) + 1;
+                                        if (value.substring(line_start, line_start + 1) === '\t') {
+                                            el.value = value.substring(0, line_start) + value.substring(line_start + 1);
+                                            el.selectionStart = el.selectionEnd = Math.max(start - 1, line_start);
+                                        }
+                                    }
+                                    "#
+                                } else {
+                                    r#"
+                                    const el = document.getElementById('chat-textarea');
+                                    if (el) {
+                                        const start = el.selectionStart;
+                                        const end = el.selectionEnd;
+                                        el.value = el.value.substring(0, start) + '\t' + el.value.substring(end);
+                                        el.selectionStart = el.selectionEnd = start + 1;
+                                    }
+                                    "#
+                                };
+                                let _ = document::eval(script);
+                                let _ = document::eval(r#"
+                                    const el = document.getElementById('chat-textarea');
+                                    if (el) {
+                                        var event = new Event('input', { bubbles: true, cancelable: true });
+                                        el.dispatchEvent(event);
+                                    }
+                                "#);
+                                return;
+                            }
+
+                            // 4. Skill Autocomplete Navigation
+                            if *show_skill_autocomplete.read() {
+                                let skills = filtered_skills.read();
+                                let current_idx = *skill_autocomplete_index.read();
+
+                                match event.key() {
+                                    Key::ArrowDown => {
+                                        event.prevent_default();
+                                        if current_idx < skills.len().saturating_sub(1) {
+                                            skill_autocomplete_index.set(current_idx + 1);
+                                        }
+                                        return;
+                                    }
+                                    Key::ArrowUp => {
+                                        event.prevent_default();
+                                        if current_idx > 0 {
+                                            skill_autocomplete_index.set(current_idx - 1);
+                                        }
+                                        return;
+                                    }
+                                    Key::Escape => {
+                                        event.prevent_default();
+                                        show_skill_autocomplete.set(false);
+                                        return;
+                                    }
+                                    Key::Enter | Key::Tab => {
+                                        if !skills.is_empty() {
+                                            event.prevent_default();
+                                            let selected = skills.get(current_idx).cloned();
+                                            drop(skills); // Release borrow before mutating
+                                            if let Some(skill) = selected {
+                                                let current_draft = draft.read().clone();
+
+                                                match *autocomplete_mode.read() {
+                                                    AutocompleteMode::Unload => {
+                                                        // For unload, always fill the full command
+                                                        let skill_command = format!("/unload {}", skill.metadata.name);
+                                                        tracing::info!("Populated draft with skill command: {}", skill_command);
+                                                        crate::components::shared::set_chat_draft(draft, skill_command, None, true);
+                                                    }
+                                                    mode @ (AutocompleteMode::Skill | AutocompleteMode::Fleet) => {
+                                                        // Splice the completed /name (or @name) into the
+                                                        // in-progress token's range, preserving text.
+                                                        let token_range: Option<(usize, usize)> =
+                                                            *autocomplete_token.read();
+                                                        // The stored range comes from an async cursor eval and can be
+                                                        // stale against the current draft — a non-boundary index would
+                                                        // panic on slicing, so validate char boundaries too.
+                                                        let (start, end) = token_range
+                                                            .filter(|(s, e)| {
+                                                                *s <= *e
+                                                                    && *e <= current_draft.len()
+                                                                    && current_draft.is_char_boundary(*s)
+                                                                    && current_draft.is_char_boundary(*e)
+                                                            })
+                                                            .unwrap_or((0, current_draft.len().min(
+                                                                current_draft.find(' ').unwrap_or(current_draft.len()),
+                                                            )));
+                                                        let completed = if mode == AutocompleteMode::Fleet {
+                                                            format!("@{} ", skill.metadata.name)
+                                                        } else {
+                                                            format!("/{} ", skill.metadata.name)
+                                                        };
+                                                        let mut new_draft = String::with_capacity(
+                                                            current_draft.len() + completed.len(),
+                                                        );
+                                                        new_draft.push_str(&current_draft[..start]);
+                                                        new_draft.push_str(&completed);
+                                                        let cursor_byte = new_draft.len();
+                                                        new_draft.push_str(current_draft[end..].trim_start());
+                                                        // Restore the caret just after the inserted command
+                                                        let cursor_utf16 =
+                                                            crate::skills::invocation::byte_to_utf16_offset(
+                                                                &new_draft,
+                                                                cursor_byte,
+                                                            );
+                                                        tracing::info!("Spliced skill command into draft: {}", new_draft);
+                                                        crate::components::shared::set_chat_draft(
+                                                            draft,
+                                                            new_draft,
+                                                            Some(cursor_utf16),
+                                                            true,
+                                                        );
+                                                    }
+                                                }
+                                                autocomplete_token.set(None);
+                                                show_skill_autocomplete.set(false);
+                                                on_interaction.call(());
+                                            }
+                                            return;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            // 5. Submit Handling
+                            let is_standard_submit = event.key() == Key::Enter && !modifiers.contains(Modifiers::SHIFT);
+
+                            // Submit if standard Enter (no shift) OR Force Submit matches
+                            if is_standard_submit || is_force_submit {
+                                event.prevent_default();
+                                on_interaction.call(());
+                                send_message();
+                            }
+                        },
+                        onpaste: move |_| {
+                            // All clipboard operations must happen on the main thread.
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                if let Ok(image) = clipboard.get_image() {
+                                    // Only spawn a task if there's an image to process.
+                                    spawn(async move {
+                                        is_processing_attachments.set(true);
+                                        let image_data = arboard::ImageData {
+                                            width: image.width,
+                                            height: image.height,
+                                            bytes: image.bytes,
+                                        };
+                                        if let Some(attachment) = process_clipboard_image(image_data).await {
+                                            attachments.write().push(attachment);
+                                        }
+                                        is_processing_attachments.set(false);
+                                    });
+                                }
+                            }
+                        },
+                    }
+
+
+                    // Skill Autocomplete Component
+                    if *show_skill_autocomplete.read() {
+                        SkillAutocomplete {
+                            skills: filtered_skills.read().clone(),
+                            selected_index: *skill_autocomplete_index.read(),
+                            on_select: move |skill: Skill| {
+                                match *autocomplete_mode.read() {
+                                    AutocompleteMode::Unload => {
+                                        crate::components::shared::set_chat_draft(
+                                            draft,
+                                            format!("/unload {}", skill.metadata.name),
+                                            None,
+                                            true,
+                                        );
+                                    }
+                                    mode @ (AutocompleteMode::Skill | AutocompleteMode::Fleet) => {
+                                        // Splice into the in-progress token, preserving context
+                                        let current_draft = draft.read().clone();
+                                        let token_range: Option<(usize, usize)> = *autocomplete_token.read();
+                                        // Same as the keyboard path: the range may be stale against the
+                                        // current draft, so reject non-char-boundary indices before slicing.
+                                        let (start, end) = token_range
+                                            .filter(|(s, e)| {
+                                                *s <= *e
+                                                    && *e <= current_draft.len()
+                                                    && current_draft.is_char_boundary(*s)
+                                                    && current_draft.is_char_boundary(*e)
+                                            })
+                                            .unwrap_or((0, current_draft.len()));
+                                        let completed = if mode == AutocompleteMode::Fleet {
+                                            format!("@{} ", skill.metadata.name)
+                                        } else {
+                                            format!("/{} ", skill.metadata.name)
+                                        };
+                                        let mut new_draft = String::with_capacity(current_draft.len() + completed.len());
+                                        new_draft.push_str(&current_draft[..start]);
+                                        new_draft.push_str(&completed);
+                                        let cursor_utf16 = crate::skills::invocation::byte_to_utf16_offset(&new_draft, new_draft.len());
+                                        new_draft.push_str(current_draft[end..].trim_start());
+                                        crate::components::shared::set_chat_draft(
+                                            draft,
+                                            new_draft,
+                                            Some(cursor_utf16),
+                                            true,
+                                        );
+                                    }
+                                }
+                                autocomplete_token.set(None);
+                                show_skill_autocomplete.set(false);
+                                on_interaction.call(());
+                                tracing::info!("Selected skill from autocomplete: {}", skill.metadata.name);
+                            }
+                        }
+                    }
+                }
+
+                // Row 2 — the identity footer: who is answering, with what,
+                // about what, then the actions.
+                div {
+                    class: "flex items-center gap-2 px-2.5 pb-2.5 pl-3",
+
+                    // 1. PROFILE PILL — this tab's Composio identity.
+                    { if ui_state.read().show_profile_selector {
+                        {
                             let settings_read = settings.read();
-                            session_state.read().get_active_session()
-                                .and_then(|s| settings_read.connector_for_session(s).cloned())
-                                .or_else(|| settings_read.active_connector().cloned())
-                        };
-                        let active_id = active_instance.as_ref().map(|c| c.id.clone());
-                        // Every connector, in canonical order — the index drives the
-                        // ⇧⌥⌘{n} hotkey hint. The session's current connector is shown
-                        // highlighted rather than hidden.
-                        let all_connectors: Vec<(usize, crate::settings::ProviderInstance)> = settings
-                            .read()
-                            .llm_connectors
-                            .iter()
-                            .cloned()
-                            .enumerate()
-                            .collect();
+                            let profiles = &settings_read.composio_profiles;
 
-                        if let (Some(active), true) = (active_instance, all_connectors.len() > 1) {
-                            let active_provider = active.provider();
+                            if profiles.is_empty() {
+                                rsx!({})
+                            } else {
+                                // session.composio_profile stores ID (matching settings.active_composio_profile)
+                                let active_profile = session_state.read().get_active_session()
+                                    .and_then(|s| s.composio_profile.as_ref())
+                                    .and_then(|id| profiles.iter().find(|p| &p.id == id))  // Match by ID
+                                    .or_else(|| settings_read.get_active_profile())
+                                    .cloned()
+                                    .unwrap_or_else(|| profiles[0].clone());
+
+                                let active_initial = active_profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
+                                let active_name = active_profile.name.clone();
+                                let active_color = active_profile.color.clone();
+                                // The pill borrows the profile's colour for its border so the
+                                // tab's identity is legible without opening anything.
+                                let pill_class = format!(
+                                    "h-7 rounded-full border {} text-xs flex items-center gap-1.5 pl-1 pr-2.5 select-none shrink-0",
+                                    profile_border_class(&active_color),
+                                );
+                                let avatar_class = format!(
+                                    "w-5 h-5 rounded-full {} flex items-center justify-center text-[10px] font-bold text-fg shrink-0",
+                                    active_color,
+                                );
+                                // A single profile is still shown — it is identity, not a
+                                // control — but there is nothing to pick, so no chevron.
+                                let interactive = profiles.len() > 1;
+
+                                rsx! {
+                                    div {
+                                        class: "relative shrink-0",
+                                        if interactive {
+                                            button {
+                                                class: "{pill_class} cursor-pointer hover:brightness-110 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600",
+                                                title: "Profile: {active_name}",
+                                                onclick: move |_| show_profile_selector.set(!show_profile_selector()),
+                                                span { class: "{avatar_class}", "{active_initial}" }
+                                                span { class: "text-fg truncate max-w-28", "{active_name}" }
+                                                Icon { width: 12, height: 12, icon: fi_icons::FiChevronDown, class: "text-fg-muted shrink-0" }
+                                            }
+                                        } else {
+                                            div {
+                                                class: "{pill_class}",
+                                                title: "Profile: {active_name}",
+                                                span { class: "{avatar_class}", "{active_initial}" }
+                                                span { class: "text-fg truncate max-w-28", "{active_name}" }
+                                            }
+                                        }
+
+                                        if show_profile_selector() {
+                                            div {
+                                                class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                                                for (index, profile) in profiles.iter().enumerate() {
+                                                    {
+                                                        let profile_name = profile.name.clone();
+                                                        let profile_color = profile.color.clone();
+                                                        let profile_initial = profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
+
+                                                        if profile.name != active_profile.name {
+                                                            rsx! {
+                                                                button {
+                                                                    class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
+                                                                    onclick: move |_| {
+                                                                        // Route through the global command so the session
+                                                                        // pin is PERSISTED (save_async) and the profile
+                                                                        // change is journaled (ComposioProfileSet in the
+                                                                        // SwitchProfile handler) — writing the signals
+                                                                        // directly here would lose both.
+                                                                        chat_command.set(Some(ChatCommand::SwitchProfile(index)));
+
+                                                                        // Trigger summary refresh
+                                                                        scheduler.send(SchedulerSignal::ForceRefresh);
+                                                                        show_profile_selector.set(false);
+                                                                    },
+                                                                    div {
+                                                                        class: "flex items-center space-x-2",
+                                                                        span {
+                                                                            class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm", profile_color),
+                                                                            "{profile_initial}"
+                                                                        }
+                                                                        span { class: "truncate", "{profile_name}" }
+                                                                    }
+                                                                    // Hotkey hint (1-indexed). Profile switching is
+                                                                    // the RESERVED Cmd+Option+N combo (hotkey.rs) —
+                                                                    // plain Cmd+N is tab switching, so a bare ⌘ hint
+                                                                    // advertised a binding this popup doesn't own.
+                                                                    if index < 9 {
+                                                                        span {
+                                                                            class: "text-xs text-fg-muted font-mono",
+                                                                            "⌥⌘{index + 1}"
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else {
+                                                            rsx! {{}}
+                                                        }
+                                                    }
+                                                }
+                                                // The profile owns which Composio toolkits are live, so a
+                                                // switch is not free — say so before it is taken.
+                                                p {
+                                                    class: "mt-1 px-4 pt-1.5 pb-1 text-[11px] text-fg-muted border-t border-faint",
+                                                    "Tools in this tab reload for the chosen profile."
+                                                }
+                                            }
+                                        }
+                                        // Click outside handler to close dropdown
+                                        if show_profile_selector() {
+                                            div {
+                                                class: "fixed inset-0 z-40",
+                                                onclick: move |_| show_profile_selector.set(false)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else { rsx!({}) } }
+
+                    // 2. CONNECTOR · MODEL — one segmented pill. Both halves are
+                    // session-scoped (pin → legacy kind → global active) and each
+                    // half opens its own unchanged popover.
+                    {
+                        let show_conn = ui_state.read().show_provider_selector;
+                        let show_model_sel = ui_state.read().show_model_selector;
+                        if !show_conn && !show_model_sel {
+                            rsx!({})
+                        } else {
+                            // The session's resolved connector (pin → legacy kind → global active)
+                            let active_instance = {
+                                let settings_read = settings.read();
+                                session_state.read().get_active_session()
+                                    .and_then(|s| settings_read.connector_for_session(s).cloned())
+                                    .or_else(|| settings_read.active_connector().cloned())
+                            };
+                            let active_id = active_instance.as_ref().map(|c| c.id.clone());
+                            // Every connector, in canonical order — the index drives the
+                            // ⇧⌥⌘{n} hotkey hint. The session's current connector is shown
+                            // highlighted rather than hidden.
+                            let all_connectors: Vec<(usize, crate::settings::ProviderInstance)> = settings
+                                .read()
+                                .llm_connectors
+                                .iter()
+                                .cloned()
+                                .enumerate()
+                                .collect();
+                            // One connector is identity, not a choice: the segment renders
+                            // but never opens a picker.
+                            let multi_connector = all_connectors.len() > 1;
+                            let conn_ready = show_conn && active_instance.is_some();
+                            let (conn_avatar_class, conn_initial, conn_name, conn_title) = match &active_instance {
+                                Some(a) => {
+                                    let provider = a.provider();
+                                    (
+                                        format!("w-5 h-5 rounded-full {} flex items-center justify-center text-[10px] font-bold text-fg shrink-0", provider.color_class()),
+                                        a.initial().to_string(),
+                                        a.name.clone(),
+                                        format!("Connector: {} ({})", a.name, provider.display_name()),
+                                    )
+                                }
+                                None => (String::new(), String::new(), String::new(), String::new()),
+                            };
+
+                            let (session_provider, current_model, slots) = {
+                                let settings_read = settings.read();
+                                let state = session_state.read();
+                                let session = state.get_active_session();
+                                let instance = session
+                                    .and_then(|s| settings_read.connector_for_session(s))
+                                    .or_else(|| settings_read.active_connector());
+                                let provider = instance
+                                    .map(|i| i.provider())
+                                    .unwrap_or(settings_read.active_llm);
+                                let current_model = match session {
+                                    Some(s) => settings_read.chat_model_for_session(s),
+                                    None => settings_read.active_chat_model(),
+                                };
+                                let slots = instance
+                                    .map(|i| i.config.model_slots().clone())
+                                    .unwrap_or_default();
+                                (provider, current_model, slots)
+                            };
+                            let user_icons = settings.read().model_icons.clone();
+                            // Icon priority: user-set icon > slot position icon > default
+                            let current_slot_idx = slots.iter().position(|s| s == &current_model);
+                            let model_icon = user_icons.get(&current_model).cloned()
+                                .or_else(|| current_slot_idx.map(get_slot_icon))
+                                .unwrap_or_else(|| get_default_model_icon(&current_model));
+                            let model_name = display_name_for_provider(&session_provider, &current_model);
+
                             rsx! {
                                 div {
-                                    class: "relative",
-                                    button {
-                                        class: format!("w-8 h-8 rounded-full {} border border-subtle flex items-center justify-center text-xs font-bold text-fg hover:brightness-110 hover:border-primary-500 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600 shadow-md", active_provider.color_class()),
-                                        title: "Connector: {active.name} ({active_provider.display_name()})",
-                                        onclick: move |_| show_provider_selector.set(!show_provider_selector()),
-                                        "{active.initial()}"
+                                    class: "relative shrink-0",
+                                    div {
+                                        class: "h-7 rounded-full border border-faint text-xs flex items-center overflow-hidden",
+                                        if conn_ready {
+                                            if multi_connector {
+                                                button {
+                                                    class: "h-full flex items-center gap-1.5 pl-1 pr-2.5 cursor-pointer hover:bg-card transition-colors focus:outline-none",
+                                                    title: "{conn_title}",
+                                                    onclick: move |_| show_provider_selector.set(!show_provider_selector()),
+                                                    span { class: "{conn_avatar_class}", "{conn_initial}" }
+                                                    span { class: "text-fg truncate max-w-28", "{conn_name}" }
+                                                }
+                                            } else {
+                                                div {
+                                                    class: "h-full flex items-center gap-1.5 pl-1 pr-2.5 select-none",
+                                                    title: "{conn_title}",
+                                                    span { class: "{conn_avatar_class}", "{conn_initial}" }
+                                                    span { class: "text-fg truncate max-w-28", "{conn_name}" }
+                                                }
+                                            }
+                                        }
+                                        if conn_ready && show_model_sel {
+                                            div {
+                                                class: "w-px self-stretch shrink-0",
+                                                style: "background-color: var(--color-border-muted);",
+                                            }
+                                        }
+                                        if show_model_sel {
+                                            button {
+                                                class: "h-full flex items-center gap-1.5 px-2.5 cursor-pointer hover:bg-card transition-colors focus:outline-none",
+                                                title: "{model_name}",
+                                                onclick: move |_| show_model_selector.set(!show_model_selector()),
+                                                span { class: "text-[11px] leading-none", "{model_icon}" }
+                                                span { class: "font-mono text-[11px] text-fg truncate max-w-32", "{model_name}" }
+                                                Icon { width: 12, height: 12, icon: fi_icons::FiChevronDown, class: "text-fg-muted shrink-0" }
+                                            }
+                                        }
                                     }
 
-                                    if show_provider_selector() {
+                                    if show_provider_selector() && multi_connector {
                                         div {
                                             class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
                                             for (index, instance) in all_connectors.into_iter() {
@@ -1039,704 +1688,140 @@ pub fn ChatInput(
                                             }
                                         }
                                     }
-                                    // Click outside handler to close dropdown
+
+                                    if show_model_selector() && !slots.is_empty() {
+                                        div {
+                                            class: "absolute bottom-10 left-0 w-64 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1 max-h-80 overflow-y-auto",
+                                            for (index, model_slug) in slots.iter().enumerate() {
+                                                if !model_slug.is_empty() {
+                                                {
+                                                    let is_active = *model_slug == current_model;
+                                                    // Icon priority: user-set > slot position > default
+                                                    let icon = user_icons.get(model_slug).cloned()
+                                                        .unwrap_or_else(|| get_slot_icon(index));
+                                                    // Display name: strip common prefixes for readability
+                                                    let display_name = display_name_for_provider(&session_provider, model_slug);
+
+                                                    rsx! {
+                                                        button {
+                                                            class: if is_active {
+                                                                "w-full text-left px-4 py-2 text-sm text-fg bg-primary-900/50 flex items-center justify-between"
+                                                            } else {
+                                                                "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between"
+                                                            },
+                                                            onclick: {
+                                                                move |_| {
+                                                                    chat_command.set(Some(ChatCommand::SwitchModel(index)));
+                                                                    show_model_selector.set(false);
+                                                                }
+                                                            },
+                                                            div {
+                                                                class: "flex items-center space-x-2 min-w-0",
+                                                                span {
+                                                                    class: "w-6 h-6 rounded-full bg-section border border-faint flex items-center justify-center text-xs shrink-0",
+                                                                    "{icon}"
+                                                                }
+                                                                span { class: "truncate", "{display_name}" }
+                                                            }
+                                                            // Hotkey hint (1-indexed, Control+N)
+                                                            if index < 9 {
+                                                                span {
+                                                                    class: "text-xs text-fg-muted font-mono shrink-0 ml-2",
+                                                                    "^{index + 1}"
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Click outside handlers to close the dropdowns
                                     if show_provider_selector() {
                                         div {
                                             class: "fixed inset-0 z-40",
                                             onclick: move |_| show_provider_selector.set(false)
                                         }
                                     }
-                                }
-                            }
-                        } else {
-                            rsx!({})
-                        }
-                    }
-                } else { rsx!({}) } }
-
-                // Model Selector Dropdown (session-scoped: slots/model follow the
-                // session's effective connector, falling back to the global active one)
-                { if ui_state.read().show_model_selector {
-                    let (session_provider, current_model, slots) = {
-                        let settings_read = settings.read();
-                        let state = session_state.read();
-                        let session = state.get_active_session();
-                        let instance = session
-                            .and_then(|s| settings_read.connector_for_session(s))
-                            .or_else(|| settings_read.active_connector());
-                        let provider = instance
-                            .map(|i| i.provider())
-                            .unwrap_or(settings_read.active_llm);
-                        let current_model = match session {
-                            Some(s) => settings_read.chat_model_for_session(s),
-                            None => settings_read.active_chat_model(),
-                        };
-                        let slots = instance
-                            .map(|i| i.config.model_slots().clone())
-                            .unwrap_or_default();
-                        (provider, current_model, slots)
-                    };
-                    let user_icons = settings.read().model_icons.clone();
-                    // Icon priority: user-set icon > slot position icon > default
-                    let current_slot_idx = slots.iter().position(|s| s == &current_model);
-                    let model_icon = user_icons.get(&current_model).cloned()
-                        .or_else(|| current_slot_idx.map(get_slot_icon))
-                        .unwrap_or_else(|| get_default_model_icon(&current_model));
-
-                    rsx! {
-                        div {
-                            class: "relative",
-                            button {
-                                class: "w-8 h-8 rounded-full bg-section border border-subtle flex items-center justify-center text-sm hover:border-primary-500 transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-primary-600",
-                                title: "{display_name_for_provider(&session_provider, &current_model)}",
-                                onclick: move |_| show_model_selector.set(!show_model_selector()),
-                                "{model_icon}"
-                            }
-
-                            if show_model_selector() && !slots.is_empty() {
-                                div {
-                                    class: "absolute bottom-10 left-0 w-64 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1 max-h-80 overflow-y-auto",
-                                    for (index, model_slug) in slots.iter().enumerate() {
-                                        if !model_slug.is_empty() {
-                                        {
-                                            let is_active = *model_slug == current_model;
-                                            // Icon priority: user-set > slot position > default
-                                            let icon = user_icons.get(model_slug).cloned()
-                                                .unwrap_or_else(|| get_slot_icon(index));
-                                            // Display name: strip common prefixes for readability
-                                            let display_name = display_name_for_provider(&session_provider, model_slug);
-
-                                            rsx! {
-                                                button {
-                                                    class: if is_active {
-                                                        "w-full text-left px-4 py-2 text-sm text-fg bg-primary-900/50 flex items-center justify-between"
-                                                    } else {
-                                                        "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between"
-                                                    },
-                                                    onclick: {
-                                                        move |_| {
-                                                            chat_command.set(Some(ChatCommand::SwitchModel(index)));
-                                                            show_model_selector.set(false);
-                                                        }
-                                                    },
-                                                    div {
-                                                        class: "flex items-center space-x-2 min-w-0",
-                                                        span {
-                                                            class: "w-6 h-6 rounded-full bg-section border border-faint flex items-center justify-center text-xs shrink-0",
-                                                            "{icon}"
-                                                        }
-                                                        span { class: "truncate", "{display_name}" }
-                                                    }
-                                                    // Hotkey hint (1-indexed, Control+N)
-                                                    if index < 9 {
-                                                        span {
-                                                            class: "text-xs text-fg-muted font-mono shrink-0 ml-2",
-                                                            "^{index + 1}"
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        }
-                                    }
-                                }
-                            }
-                            // Click outside handler to close dropdown
-                            if show_model_selector() {
-                                div {
-                                    class: "fixed inset-0 z-40",
-                                    onclick: move |_| show_model_selector.set(false)
-                                }
-                            }
-                        }
-                    }
-                } else { rsx!({}) } }
-
-                // Composio Profile Selector
-                { if ui_state.read().show_profile_selector {
-                    {
-                        let settings_read = settings.read();
-                        let profiles = &settings_read.composio_profiles;
-
-                        if profiles.len() > 1 {
-                            // session.composio_profile stores ID (matching settings.active_composio_profile)
-                            let active_profile = session_state.read().get_active_session()
-                                .and_then(|s| s.composio_profile.as_ref())
-                                .and_then(|id| profiles.iter().find(|p| &p.id == id))  // Match by ID
-                                .or_else(|| settings_read.get_active_profile())
-                                .cloned()
-                                .unwrap_or_else(|| profiles[0].clone());
-
-                            let active_initial = active_profile.name.chars().next().unwrap_or('?').to_uppercase();
-
-                            rsx! {
-                                div {
-                                    class: "relative",
-                                    button {
-                                        class: format!("w-8 h-8 rounded-full {} border border-subtle flex items-center justify-center text-xs font-bold text-fg hover:brightness-110 hover:border-primary-500 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600 shadow-md", active_profile.color),
-                                        onclick: move |_| show_profile_selector.set(!show_profile_selector()),
-                                        "{active_initial}"
-                                    }
-
-                                    if show_profile_selector() {
-                                        div {
-                                            class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
-                                            for (index, profile) in profiles.iter().enumerate() {
-                                                {
-                                                    let profile_name = profile.name.clone();
-                                                    let profile_color = profile.color.clone();
-                                                    let profile_initial = profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
-
-                                                    if profile.name != active_profile.name {
-                                                        rsx! {
-                                                            button {
-                                                                class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
-                                                                onclick: move |_| {
-                                                                    // Route through the global command so the session
-                                                                    // pin is PERSISTED (save_async) and the profile
-                                                                    // change is journaled (ComposioProfileSet in the
-                                                                    // SwitchProfile handler) — writing the signals
-                                                                    // directly here would lose both.
-                                                                    chat_command.set(Some(ChatCommand::SwitchProfile(index)));
-
-                                                                    // Trigger summary refresh
-                                                                    scheduler.send(SchedulerSignal::ForceRefresh);
-                                                                    show_profile_selector.set(false);
-                                                                },
-                                                                div {
-                                                                    class: "flex items-center space-x-2",
-                                                                    span {
-                                                                        class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm", profile_color),
-                                                                        "{profile_initial}"
-                                                                    }
-                                                                    span { class: "truncate", "{profile_name}" }
-                                                                }
-                                                                // Hotkey hint (1-indexed). Profile switching is
-                                                                // the RESERVED Cmd+Option+N combo (hotkey.rs) —
-                                                                // plain Cmd+N is tab switching, so a bare ⌘ hint
-                                                                // advertised a binding this popup doesn't own.
-                                                                if index < 9 {
-                                                                    span {
-                                                                        class: "text-xs text-fg-muted font-mono",
-                                                                        "⌥⌘{index + 1}"
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    } else {
-                                                        rsx! {{}}
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Click outside handler to close dropdown
-                                    if show_profile_selector() {
+                                    if show_model_selector() {
                                         div {
                                             class: "fixed inset-0 z-40",
-                                            onclick: move |_| show_profile_selector.set(false)
+                                            onclick: move |_| show_model_selector.set(false)
                                         }
                                     }
                                 }
                             }
-                        } else {
-                            rsx!({})
                         }
                     }
-                } else { rsx!({}) } }
-                ChatBarIconButton {
-                    icon: fi_icons::FiPaperclip,
-                    visible: ui_state.read().show_attachments_icon,
-                    title: "Attachments",
-                    onclick: move |_| {
-                        let mut attachments = attachments;
-                        spawn(async move {
-                            is_processing_attachments.set(true);
-                            if let Some(files) = FileDialog::new()
-                                .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
-                                .pick_files()
-                            {
-                                for file_path in files {
-                                    if let Ok(file_data) = tokio::fs::read(&file_path).await {
-                                        let file_name = file_path
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .to_string();
-                                        let extension = file_path
-                                            .extension()
-                                            .and_then(std::ffi::OsStr::to_str)
-                                            .unwrap_or("");
-                                        if let Some(mime_type) = get_mime_type(extension) {
-                                            if let Some(attachment) = process_image_data(
-                                                file_name,
-                                                mime_type.to_string(),
-                                                file_data,
-                                            )
-                                            .await
-                                            {
-                                                attachments.write().push(attachment);
-                                            }
-                                        } else {
-                                            tracing::warn!(
-                                                "Unsupported file type selected: {:?}",
-                                                file_path
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            is_processing_attachments.set(false);
-                        });
-                    }
-                }
-                textarea {
-                    id: "chat-textarea",
-                    class: "flex-1 py-2 px-4 rounded-xl bg-input border border-subtle text-fg placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 resize-none overflow-y-auto",
-                    style: "max-height: 50vh;",
-                    rows: "1",
-                    placeholder: "Type your message...",
-                    // UNCONTROLLED on purpose: a controlled `value` binding races
-                    // the IPC round-trip and snaps the caret to the end mid-typing.
-                    // Programmatic writes go through shared::set_chat_draft, which
-                    // updates the DOM explicitly.
-                    initial_value: "{draft}",
-                    onmounted: move |evt| {
-                        textarea_mounted.set(Some(evt.data()));
-                    },
-                    oninput: move |event| {
-                        scheduler.send(SchedulerSignal::Activity);
 
-                        // Auto-resize the textarea to fit its content.
-                        // This eval is necessary because we need to measure the
-                        // DOM element's scrollHeight, which is not accessible
-                        // through Dioxus's virtual DOM.
-                        let _ = document::eval(r#"
-                            const el = document.getElementById('chat-textarea');
-                            if (el) {
-                                el.style.height = 'auto';
-                                el.style.height = (el.scrollHeight) + 'px';
-                            }
-                        "#);
+                    // 3. PROJECT PILL
+                    crate::components::project_chip::ProjectChip {}
 
-                        draft.set(event.value());
-
-                        // Skill Autocomplete Detection
-                        let val = event.value();
-                        if let Some(unload_query) = val.strip_prefix("/unload ") {
-                            // Autocomplete for /unload — source from session.loaded_skills
-                            autocomplete_mode.set(AutocompleteMode::Unload);
-                            let state = session_state.read();
-                            if let Some(session) = state.get_active_session() {
-                                let matches: Vec<Skill> = session.loaded_skills.keys()
-                                    .filter(|name| {
-                                        unload_query.is_empty() || name.to_lowercase().contains(&unload_query.to_lowercase())
-                                    })
-                                    .map(|name| {
-                                        // Build a lightweight Skill for the autocomplete UI
-                                        Skill {
-                                            metadata: crate::skills::parser::SkillMetadata {
-                                                name: name.clone(),
-                                                description: "Loaded skill".to_string(),
-                                                disable_model_invocation: false,
-                                                user_invocable: true,
-                                                allowed_tools: None,
-                                                argument_hint: None,
-                                            },
-                                            instructions: String::new(),
-                                            path: std::path::PathBuf::new(),
-                                            root_path: std::path::PathBuf::new(),
-                                            scripts: Vec::new(),
-                                            resources: Vec::new(),
-                                        }
-                                    })
-                                    .collect();
-                                filtered_skills.set(matches);
-                                skill_autocomplete_index.set(0);
-                                show_skill_autocomplete.set(true);
-                            }
-                        } else {
-                            // Cursor-aware skill autocomplete: trigger on a
-                            // /token at the caret, anywhere in the draft. The
-                            // caret position lives only in the DOM, so fetch it
-                            // via eval before running the pure token scan.
-                            spawn(async move {
-                                let mut eval = document::eval(r#"
-                                    const el = document.getElementById('chat-textarea');
-                                    dioxus.send(el ? el.selectionStart : -1);
-                                "#);
-                                let cursor: i64 = eval.recv().await.unwrap_or(-1);
-                                let query_opt = if cursor >= 0 {
-                                    crate::skills::invocation::autocomplete_query_at(
-                                        &val,
-                                        cursor as usize,
-                                    )
-                                } else {
-                                    None
-                                };
-                                match query_opt {
-                                    Some(q) => {
-                                        autocomplete_mode.set(AutocompleteMode::Skill);
-                                        let matches: Vec<Skill> = {
-                                            let registry = skill_registry.read();
-                                            registry
-                                                .list_skills()
-                                                .into_iter()
-                                                .filter(|s| {
-                                                    q.query.is_empty()
-                                                        || s.metadata
-                                                            .name
-                                                            .to_lowercase()
-                                                            .contains(&q.query.to_lowercase())
-                                                })
-                                                .collect()
-                                        };
-                                        autocomplete_token.set(Some(q.token_range));
-                                        filtered_skills.set(matches);
-                                        skill_autocomplete_index.set(0);
-                                        show_skill_autocomplete.set(true);
-                                    }
-                                    None => {
-                                        // No /skill token — offer fleet
-                                        // @-mentions when the fleet is armed.
-                                        let fleet_q = if crate::fleet::bridge::enabled() && cursor >= 0 {
-                                            crate::fleet::mention::mention_query_at(&val, cursor as usize)
-                                        } else {
-                                            None
-                                        };
-                                        match fleet_q {
-                                            Some(q) => {
-                                                autocomplete_mode.set(AutocompleteMode::Fleet);
-                                                let live = crate::fleet::shared().snapshot();
-                                                let today = chrono::Local::now().date_naive();
-                                                let now_utc = chrono::Utc::now();
-                                                // Unique handle per WINDOW (name~id when a repo
-                                                // has several sessions) — never dedupe windows.
-                                                let mut rows: Vec<(String, &crate::fleet::FleetSession)> = live
-                                                    .sessions
-                                                    .values()
-                                                    .map(|s| (crate::fleet::mention::mention_handle(s, &live), s))
-                                                    .filter(|(h, s)| {
-                                                        q.query.is_empty()
-                                                            || h.to_lowercase().contains(&q.query.to_lowercase())
-                                                            || s.session_title
-                                                                .as_deref()
-                                                                .is_some_and(|t| t.to_lowercase().contains(&q.query.to_lowercase()))
-                                                    })
-                                                    .collect();
-                                                rows.sort_by(|a, b| a.0.cmp(&b.0));
-                                                let matches: Vec<Skill> = rows
-                                                    .into_iter()
-                                                    .map(|(handle, s)| Skill {
-                                                        metadata: crate::skills::parser::SkillMetadata {
-                                                            name: handle,
-                                                            description: {
-                                                                let mut d = String::new();
-                                                                if let Some(t) = &s.session_title {
-                                                                    d.push_str(&crate::fleet::truncate_summary(t, 60));
-                                                                    d.push_str(" · ");
-                                                                }
-                                                                d.push_str(&format!(
-                                                                    "{} today",
-                                                                    crate::todo::model::format_minutes(
-                                                                        s.minutes_on(today, now_utc),
-                                                                    )
-                                                                ));
-                                                                if let Some(b) = &s.brief {
-                                                                    d.push_str(" — ");
-                                                                    d.push_str(&crate::fleet::truncate_summary(
-                                                                        &b.headline,
-                                                                        60,
-                                                                    ));
-                                                                }
-                                                                d
-                                                            },
-                                                            disable_model_invocation: false,
-                                                            user_invocable: true,
-                                                            allowed_tools: None,
-                                                            argument_hint: None,
-                                                        },
-                                                        instructions: String::new(),
-                                                        path: std::path::PathBuf::new(),
-                                                        root_path: std::path::PathBuf::new(),
-                                                        scripts: Vec::new(),
-                                                        resources: Vec::new(),
-                                                    })
-                                                    .collect();
-                                                autocomplete_token.set(Some(q.token_range));
-                                                filtered_skills.set(matches);
-                                                skill_autocomplete_index.set(0);
-                                                show_skill_autocomplete.set(true);
-                                            }
-                                            None => {
-                                                show_skill_autocomplete.set(false);
-                                                filtered_skills.set(Vec::new());
-                                                autocomplete_token.set(None);
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    },
-                    onkeydown: move |event| {
-                        tracing::debug!("ChatInput::onkeydown - Key: {:?}, Modifiers: {:?}, Context: {:?}", event.key(), event.data.modifiers(), *focus_context.read());
-                        // If a modal owns focus, don't handle keyboard events
-                        if *focus_context.read() != FocusContext::ChatInput {
-                            tracing::debug!("ChatInput ignoring event - Focus owns: {:?}", *focus_context.read());
-                            return;
-                        }
-
-                        scheduler.send(SchedulerSignal::Activity);
-                        let modifiers = event.data.modifiers();
-                        let hotkeys = settings.read().hotkeys.clone();
-
-                        // 1. Check Configurable Hotkeys
-                        if matches_hotkey(&event, &hotkeys.cancel_generation) {
-                            if *is_sending.read() {
-                                event.prevent_default();
-                                on_cancel.call(());
-                            }
-                            return;
-                        }
-
-                        let is_force_submit = matches_hotkey(&event, &hotkeys.submit_chat);
-
-                        // 2. Filter Global Modifiers
-                        // Allow if it matches our force submit (e.g. Cmd+Enter), otherwise let browser/OS handle Cmd+X, Cmd+R, etc.
-                        let has_cmd_opt_ctrl = modifiers.contains(Modifiers::SUPER) || modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::ALT);
-                        if has_cmd_opt_ctrl && !is_force_submit {
-                            return;
-                        }
-
-                        // 3. Tab Handling (Indentation)
-                        if event.key() == Key::Tab {
-                            event.prevent_default();
-                            let script = if modifiers.contains(Modifiers::SHIFT) {
-                                r#"
-                                const el = document.getElementById('chat-textarea');
-                                if (el) {
-                                    const start = el.selectionStart;
-                                    const value = el.value;
-                                    let line_start = value.lastIndexOf('\n', start - 1) + 1;
-                                    if (value.substring(line_start, line_start + 1) === '\t') {
-                                        el.value = value.substring(0, line_start) + value.substring(line_start + 1);
-                                        el.selectionStart = el.selectionEnd = Math.max(start - 1, line_start);
-                                    }
-                                }
-                                "#
-                            } else {
-                                r#"
-                                const el = document.getElementById('chat-textarea');
-                                if (el) {
-                                    const start = el.selectionStart;
-                                    const end = el.selectionEnd;
-                                    el.value = el.value.substring(0, start) + '\t' + el.value.substring(end);
-                                    el.selectionStart = el.selectionEnd = start + 1;
-                                }
-                                "#
-                            };
-                            let _ = document::eval(script);
-                            let _ = document::eval(r#"
-                                const el = document.getElementById('chat-textarea');
-                                if (el) {
-                                    var event = new Event('input', { bubbles: true, cancelable: true });
-                                    el.dispatchEvent(event);
-                                }
-                            "#);
-                            return;
-                        }
-
-                        // 4. Skill Autocomplete Navigation
-                        if *show_skill_autocomplete.read() {
-                            let skills = filtered_skills.read();
-                            let current_idx = *skill_autocomplete_index.read();
-
-                            match event.key() {
-                                Key::ArrowDown => {
-                                    event.prevent_default();
-                                    if current_idx < skills.len().saturating_sub(1) {
-                                        skill_autocomplete_index.set(current_idx + 1);
-                                    }
-                                    return;
-                                }
-                                Key::ArrowUp => {
-                                    event.prevent_default();
-                                    if current_idx > 0 {
-                                        skill_autocomplete_index.set(current_idx - 1);
-                                    }
-                                    return;
-                                }
-                                Key::Escape => {
-                                    event.prevent_default();
-                                    show_skill_autocomplete.set(false);
-                                    return;
-                                }
-                                Key::Enter | Key::Tab => {
-                                    if !skills.is_empty() {
-                                        event.prevent_default();
-                                        let selected = skills.get(current_idx).cloned();
-                                        drop(skills); // Release borrow before mutating
-                                        if let Some(skill) = selected {
-                                            let current_draft = draft.read().clone();
-
-                                            match *autocomplete_mode.read() {
-                                                AutocompleteMode::Unload => {
-                                                    // For unload, always fill the full command
-                                                    let skill_command = format!("/unload {}", skill.metadata.name);
-                                                    tracing::info!("Populated draft with skill command: {}", skill_command);
-                                                    crate::components::shared::set_chat_draft(draft, skill_command, None, true);
-                                                }
-                                                mode @ (AutocompleteMode::Skill | AutocompleteMode::Fleet) => {
-                                                    // Splice the completed /name (or @name) into the
-                                                    // in-progress token's range, preserving text.
-                                                    let token_range: Option<(usize, usize)> =
-                                                        *autocomplete_token.read();
-                                                    // The stored range comes from an async cursor eval and can be
-                                                    // stale against the current draft — a non-boundary index would
-                                                    // panic on slicing, so validate char boundaries too.
-                                                    let (start, end) = token_range
-                                                        .filter(|(s, e)| {
-                                                            *s <= *e
-                                                                && *e <= current_draft.len()
-                                                                && current_draft.is_char_boundary(*s)
-                                                                && current_draft.is_char_boundary(*e)
-                                                        })
-                                                        .unwrap_or((0, current_draft.len().min(
-                                                            current_draft.find(' ').unwrap_or(current_draft.len()),
-                                                        )));
-                                                    let completed = if mode == AutocompleteMode::Fleet {
-                                                        format!("@{} ", skill.metadata.name)
-                                                    } else {
-                                                        format!("/{} ", skill.metadata.name)
-                                                    };
-                                                    let mut new_draft = String::with_capacity(
-                                                        current_draft.len() + completed.len(),
-                                                    );
-                                                    new_draft.push_str(&current_draft[..start]);
-                                                    new_draft.push_str(&completed);
-                                                    let cursor_byte = new_draft.len();
-                                                    new_draft.push_str(current_draft[end..].trim_start());
-                                                    // Restore the caret just after the inserted command
-                                                    let cursor_utf16 =
-                                                        crate::skills::invocation::byte_to_utf16_offset(
-                                                            &new_draft,
-                                                            cursor_byte,
-                                                        );
-                                                    tracing::info!("Spliced skill command into draft: {}", new_draft);
-                                                    crate::components::shared::set_chat_draft(
-                                                        draft,
-                                                        new_draft,
-                                                        Some(cursor_utf16),
-                                                        true,
-                                                    );
-                                                }
-                                            }
-                                            autocomplete_token.set(None);
-                                            show_skill_autocomplete.set(false);
-                                            on_interaction.call(());
-                                        }
-                                        return;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        // 5. Submit Handling
-                        let is_standard_submit = event.key() == Key::Enter && !modifiers.contains(Modifiers::SHIFT);
-
-                        // Submit if standard Enter (no shift) OR Force Submit matches
-                        if is_standard_submit || is_force_submit {
-                            event.prevent_default();
-                            on_interaction.call(());
-                            send_message();
-                        }
-                    },
-                    onpaste: move |_| {
-                        // All clipboard operations must happen on the main thread.
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                            if let Ok(image) = clipboard.get_image() {
-                                // Only spawn a task if there's an image to process.
+                    // 4. ATTACH
+                    if ui_state.read().show_attachments_icon {
+                        button {
+                            class: "w-7 h-7 shrink-0 flex items-center justify-center rounded-md text-fg-muted hover:text-fg hover:bg-card transition-colors focus:outline-none",
+                            title: "Attachments",
+                            onclick: move |_| {
+                                let mut attachments = attachments;
                                 spawn(async move {
                                     is_processing_attachments.set(true);
-                                    let image_data = arboard::ImageData {
-                                        width: image.width,
-                                        height: image.height,
-                                        bytes: image.bytes,
-                                    };
-                                    if let Some(attachment) = process_clipboard_image(image_data).await {
-                                        attachments.write().push(attachment);
+                                    if let Some(files) = FileDialog::new()
+                                        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
+                                        .pick_files()
+                                    {
+                                        for file_path in files {
+                                            if let Ok(file_data) = tokio::fs::read(&file_path).await {
+                                                let file_name = file_path
+                                                    .file_name()
+                                                    .unwrap_or_default()
+                                                    .to_string_lossy()
+                                                    .to_string();
+                                                let extension = file_path
+                                                    .extension()
+                                                    .and_then(std::ffi::OsStr::to_str)
+                                                    .unwrap_or("");
+                                                if let Some(mime_type) = get_mime_type(extension) {
+                                                    if let Some(attachment) = process_image_data(
+                                                        file_name,
+                                                        mime_type.to_string(),
+                                                        file_data,
+                                                    )
+                                                    .await
+                                                    {
+                                                        attachments.write().push(attachment);
+                                                    }
+                                                } else {
+                                                    tracing::warn!(
+                                                        "Unsupported file type selected: {:?}",
+                                                        file_path
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                     is_processing_attachments.set(false);
                                 });
-                            }
-                        }
-                    },
-                }
-
-                // Skill Autocomplete Component
-                if *show_skill_autocomplete.read() {
-                    SkillAutocomplete {
-                        skills: filtered_skills.read().clone(),
-                        selected_index: *skill_autocomplete_index.read(),
-                        on_select: move |skill: Skill| {
-                            match *autocomplete_mode.read() {
-                                AutocompleteMode::Unload => {
-                                    crate::components::shared::set_chat_draft(
-                                        draft,
-                                        format!("/unload {}", skill.metadata.name),
-                                        None,
-                                        true,
-                                    );
-                                }
-                                mode @ (AutocompleteMode::Skill | AutocompleteMode::Fleet) => {
-                                    // Splice into the in-progress token, preserving context
-                                    let current_draft = draft.read().clone();
-                                    let token_range: Option<(usize, usize)> = *autocomplete_token.read();
-                                    // Same as the keyboard path: the range may be stale against the
-                                    // current draft, so reject non-char-boundary indices before slicing.
-                                    let (start, end) = token_range
-                                        .filter(|(s, e)| {
-                                            *s <= *e
-                                                && *e <= current_draft.len()
-                                                && current_draft.is_char_boundary(*s)
-                                                && current_draft.is_char_boundary(*e)
-                                        })
-                                        .unwrap_or((0, current_draft.len()));
-                                    let completed = if mode == AutocompleteMode::Fleet {
-                                        format!("@{} ", skill.metadata.name)
-                                    } else {
-                                        format!("/{} ", skill.metadata.name)
-                                    };
-                                    let mut new_draft = String::with_capacity(current_draft.len() + completed.len());
-                                    new_draft.push_str(&current_draft[..start]);
-                                    new_draft.push_str(&completed);
-                                    let cursor_utf16 = crate::skills::invocation::byte_to_utf16_offset(&new_draft, new_draft.len());
-                                    new_draft.push_str(current_draft[end..].trim_start());
-                                    crate::components::shared::set_chat_draft(
-                                        draft,
-                                        new_draft,
-                                        Some(cursor_utf16),
-                                        true,
-                                    );
-                                }
-                            }
-                            autocomplete_token.set(None);
-                            show_skill_autocomplete.set(false);
-                            on_interaction.call(());
-                            tracing::info!("Selected skill from autocomplete: {}", skill.metadata.name);
+                            },
+                            Icon { width: 16, height: 16, icon: fi_icons::FiPaperclip }
                         }
                     }
-                }
-                div {
-                    class: "flex items-center space-x-3",
+
+                    // 5. spacer — everything after this hugs the right edge.
+                    div { class: "flex-1" }
+
+                    // 6. COST
+                    SessionCostIcon {}
+
                     {
                         cfg_if::cfg_if! {
                             if #[cfg(debug_assertions)] {
                                 rsx! {
                                     button {
-                                        class: "p-2 rounded-full text-fg-muted hover:bg-card hover:text-fg focus:outline-none focus:ring-2 focus:ring-gray-600",
+                                        class: "w-7 h-7 shrink-0 flex items-center justify-center rounded-md text-fg-muted hover:text-fg hover:bg-card transition-colors focus:outline-none",
+                                        title: "Dump prompt (debug)",
                                         onclick: move |_| {
                                             spawn(async move {
                                                 let mcp_context = {
@@ -1783,8 +1868,8 @@ pub fn ChatInput(
                                             });
                                         },
                                         Icon {
-                                            width: 20,
-                                            height: 20,
+                                            width: 16,
+                                            height: 16,
                                             icon: fi_icons::FiCpu
                                         }
                                     }
@@ -1792,16 +1877,17 @@ pub fn ChatInput(
                             }
                         }
                     }
-                    // New Chat Menu (Popup)
+                    // New Chat Menu (Popup) — an action ("New Chat" / "New Chat
+                    // with Memory"), so it stays in the footer, icon-sized.
                     div {
-                        class: "relative",
+                        class: "relative shrink-0",
                         button {
-                            class: "p-2 rounded-full text-fg-muted hover:bg-card hover:text-fg focus:outline-none focus:ring-2 focus:ring-gray-600",
+                            class: "w-7 h-7 flex items-center justify-center rounded-md text-fg-muted hover:text-fg hover:bg-card transition-colors focus:outline-none",
                             title: "New Chat",
                             onclick: move |_| show_new_chat_menu.set(!show_new_chat_menu()),
                             Icon {
-                                width: 20,
-                                height: 20,
+                                width: 16,
+                                height: 16,
                                 icon: fi_icons::FiPlus
                             }
                         }
@@ -1863,9 +1949,12 @@ pub fn ChatInput(
                             }
                         }
                     }
+                    // 7. SEND — while this session's turn is in flight the
+                    // primary action queues instead, and Stop keeps its own
+                    // red affordance beside it.
                     if !*is_sending.read() {
                         button {
-                            class: "px-5 py-2 bg-btn-primary rounded-full text-fg font-semibold hover:bg-btn-primary-hover focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors disabled:bg-gray-500",
+                            class: "h-8 px-[1.125rem] shrink-0 bg-btn-primary rounded-full text-fg text-[13px] font-semibold hover:bg-btn-primary-hover focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors disabled:bg-gray-500",
                             disabled: *is_processing_attachments.read(),
                             onclick: move |_| {
                                 on_interaction.call(());
@@ -1880,14 +1969,24 @@ pub fn ChatInput(
                         }
                     } else {
                         button {
-                            class: "px-4 py-2 bg-red-600 rounded-full text-fg font-semibold hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-opacity-50 transition-colors flex items-center space-x-2",
+                            class: "h-8 px-[1.125rem] shrink-0 bg-primary-500 rounded-full text-fg text-[13px] font-semibold hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors disabled:bg-gray-500",
+                            disabled: *is_processing_attachments.read(),
+                            title: "Queue for the next turn",
+                            onclick: move |_| {
+                                on_interaction.call(());
+                                send_message();
+                            },
+                            "Queue"
+                        }
+                        button {
+                            class: "w-8 h-8 shrink-0 flex items-center justify-center bg-red-600 rounded-full text-fg hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-opacity-50 transition-colors",
+                            title: "Stop",
                             onclick: move |_| on_cancel.call(()),
                             Icon {
-                                width: 20,
-                                height: 20,
+                                width: 14,
+                                height: 14,
                                 icon: fi_icons::FiSquare
-                            },
-                            span { "Stop" }
+                            }
                         }
                     }
                 }
@@ -2121,37 +2220,34 @@ fn SessionCostIcon() -> Element {
         }
     });
 
+    // Mono, muted and small: in the composer footer the cost is a readout the
+    // eye can skip, not a button competing with Send.
     let cost_class = if *cost_animating.read() {
-        "text-xs font-mono font-medium cost-tick"
+        "font-mono text-[11px] text-fg-muted cost-tick"
     } else {
-        "text-xs font-mono font-medium"
+        "font-mono text-[11px] text-fg-muted"
     };
 
     rsx! {
         div {
             class: "relative",
             button {
-                class: "p-2 rounded-full text-fg-muted hover:bg-card hover:text-green-400 focus:outline-none focus:ring-2 focus:ring-gray-600 flex items-center space-x-1 transition-colors",
+                class: "h-7 px-1.5 rounded-md hover:bg-card hover:text-green-400 focus:outline-none flex items-center transition-colors shrink-0",
                 onclick: move |_| {
                     let current = *show_popover.read();
                     show_popover.set(!current);
                 },
                 title: "Session Cost",
-                Icon {
-                    width: 16,
-                    height: 16,
-                    icon: fi_icons::FiDollarSign
-                }
                 span {
                     id: "session-cost-display",
                     class: cost_class,
-                    {format!("{:.2}", total_cost)}
+                    {format!("${:.2}", total_cost)}
                 }
             }
 
             if *show_popover.read() {
                 div {
-                    class: "absolute bottom-full left-0 mb-2 w-64 bg-card border border-faint rounded-lg shadow-xl p-3 z-50",
+                    class: "absolute bottom-full right-0 mb-2 w-64 bg-card border border-faint rounded-lg shadow-xl p-3 z-50",
 
                     div { class: "text-sm font-semibold text-gray-200 mb-2 border-b border-faint pb-1", "Session Usage" }
 
@@ -2314,5 +2410,78 @@ mod tests {
     #[test]
     fn resolve_seed_target_parked_when_swap_not_caught_up() {
         assert_eq!(resolve_seed_target("s2", "s1"), SeedApplication::Parked);
+    }
+}
+
+#[cfg(test)]
+mod chat_input_tests {
+    use super::*;
+
+    /// A profile's stored colour is a Tailwind *background* class; the pill
+    /// needs the matching *border* class.
+    #[test]
+    fn profile_border_class_swaps_the_bg_prefix() {
+        assert_eq!(profile_border_class("bg-purple-600"), "border-purple-600");
+        assert_eq!(profile_border_class("bg-blue-600"), "border-blue-600");
+        // The palette's odd one out: a semantic token, not a scale colour.
+        assert_eq!(profile_border_class("bg-input"), "border-input");
+    }
+
+    /// Every colour the settings panel offers must produce a border class that
+    /// is listed literally in `profile_border_class`'s doc comment, otherwise
+    /// Tailwind's content scan drops it from the stylesheet.
+    #[test]
+    fn profile_border_class_covers_the_whole_palette() {
+        let palette = [
+            "bg-blue-600",
+            "bg-purple-600",
+            "bg-green-600",
+            "bg-red-600",
+            "bg-orange-600",
+            "bg-pink-600",
+            "bg-teal-600",
+            "bg-input",
+        ];
+        let source = include_str!("chat_input.rs");
+        for bg in palette {
+            let border = profile_border_class(bg);
+            assert!(border.starts_with("border-"), "{bg} -> {border}");
+            assert!(
+                source.contains(&border),
+                "{border} must appear literally in this file for Tailwind to emit it"
+            );
+        }
+    }
+
+    /// Anything that isn't a `bg-` class falls back to the neutral border.
+    #[test]
+    fn profile_border_class_falls_back_when_unrecognised() {
+        assert_eq!(profile_border_class(""), "border-faint");
+        assert_eq!(profile_border_class("purple-600"), "border-faint");
+        assert_eq!(profile_border_class("bg-"), "border-faint");
+        assert_eq!(profile_border_class("text-red-500"), "border-faint");
+    }
+
+    /// The composer footer shows the model name through
+    /// `display_name_for_provider`; pin its current per-provider behaviour.
+    #[test]
+    fn display_name_for_provider_pins_current_outputs() {
+        // Gemini and Claude go through curated display-name tables.
+        let gemini = display_name_for_provider(&LlmProvider::Gemini, "gemini-2.5-pro");
+        assert!(!gemini.is_empty());
+        assert_eq!(
+            gemini,
+            GeminiModel::from_slug("gemini-2.5-pro").display_name()
+        );
+        let claude = display_name_for_provider(&LlmProvider::Claude, "claude-sonnet-4-5");
+        assert_eq!(
+            claude,
+            crate::llm::claude_models::ClaudeModel::from_slug("claude-sonnet-4-5").display_name()
+        );
+        // Everything else is already human-readable: the slug passes through.
+        assert_eq!(
+            display_name_for_provider(&LlmProvider::OpenAiCompat, "gpt-4o-mini"),
+            "gpt-4o-mini"
+        );
     }
 }

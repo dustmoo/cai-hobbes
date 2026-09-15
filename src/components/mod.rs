@@ -1,3 +1,4 @@
+pub mod activity_stream;
 pub mod chat;
 pub mod chat_input;
 pub mod chat_queue;

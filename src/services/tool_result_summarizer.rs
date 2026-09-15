@@ -123,6 +123,7 @@ mod tests {
                 signature_provider: None,
                 cached_image_path: None,
                 result_summary: summary,
+                completed_at: None,
             }),
             attachments: vec![],
             comments: vec![],

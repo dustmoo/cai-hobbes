@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 # Development (hot-reload UI)
 dx serve --platform desktop
+npm run build:css   # after adding Tailwind classes
 
 # Run all tests
 cargo test --release
@@ -28,7 +29,7 @@ dx build --release
 ./scripts/build_windows.ps1 -Release
 ```
 
-The build system runs Tailwind CSS at compile time via `build.rs` — `npm ci` must be run once before building, and `node_modules/` must be present.
+Tailwind classes are compiled by `npm run build:css` (input `tailwind.css` → `assets/tailwind.css`, which `main.rs` inlines). The Tailwind step in `build.rs` writes an unused `assets/output.css`, so a plain `cargo build` does NOT pick up new utility classes — run `npm run build:css` after adding classes to any `rsx!`. `npm ci` must be run once so `node_modules/` exists.
 
 ### CI Workflows
 
@@ -37,6 +38,10 @@ The build system runs Tailwind CSS at compile time via `build.rs` — `npm ci` m
 - **Release** (`.github/workflows/release.yml`) — triggers on `v*` tags; builds signed macOS DMG and signed Windows installer.
 
 To release: merge to `main`, push a `vX.Y.Z` tag.
+
+## Working Style
+
+**Right-size the model to the task.** When orchestrating sub-agents, use the smallest model that can do the job well and work as a team: Opus only for work that spans several interacting components or needs subtle correctness reasoning (reactivity rules, concurrency, cross-provider behaviour); Sonnet for contained refactors, layout changes, and features with a clear spec; Haiku for mechanical nits, comment and doc updates, test scaffolding from an explicit spec, and verification passes. Partition files between concurrent agents so no two edit the same file, and run the full `cargo test --release` + `cargo clippy --release` once on the combined tree rather than per agent.
 
 ---
 

@@ -6,6 +6,67 @@ use crate::settings::UiState;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
+/// A chevron-headed disclosure. Extracted from `ToolCallDisplay`'s
+/// Arguments/Response sections so the activity stream's inline row expansion
+/// shows arguments with exactly the same affordance instead of a lookalike.
+#[derive(Props, Clone, PartialEq)]
+pub struct CollapsibleProps {
+    pub label: String,
+    /// Initial state only — the disclosure owns its open/closed signal after
+    /// the first render, matching the old per-card behaviour.
+    #[props(default)]
+    pub open_default: bool,
+    pub children: Element,
+}
+
+#[component]
+pub fn Collapsible(props: CollapsibleProps) -> Element {
+    let mut open = use_signal(|| props.open_default);
+    rsx! {
+        div {
+            class: "flex flex-col",
+            button {
+                class: "flex items-center gap-1 text-sm font-semibold text-fg-muted hover:text-fg",
+                onclick: move |_| open.toggle(),
+                if *open.read() {
+                    Icon { width: 16, height: 16, icon: fi_icons::FiChevronDown }
+                } else {
+                    Icon { width: 16, height: 16, icon: fi_icons::FiChevronRight }
+                }
+                "{props.label}"
+            }
+            if *open.read() {
+                {props.children}
+            }
+        }
+    }
+}
+
+/// The "connect your account" panel shown when a tool comes back
+/// `AuthRequired`. Shared so the activity stream can surface the same call to
+/// action without re-deriving the yellow idiom.
+#[component]
+pub fn AuthRequiredPanel(url: String) -> Element {
+    rsx! {
+        div {
+            class: "flex flex-col gap-3 p-3 bg-app rounded mt-2 border border-yellow-700/50",
+            div {
+                class: "flex items-center gap-2 text-yellow-500",
+                Icon { width: 18, height: 18, icon: fi_icons::FiLock }
+                span { class: "font-medium", "Authentication Required" }
+            }
+            p { class: "text-sm text-fg-muted", "Please connect your account to proceed with this tool." }
+            a {
+                class: "px-4 py-2 bg-yellow-600 text-fg rounded hover:bg-yellow-500 text-center text-sm font-medium transition-colors w-fit flex items-center gap-2",
+                href: "{url}",
+                target: "_blank",
+                "Connect Account"
+                Icon { width: 14, height: 14, icon: fi_icons::FiExternalLink }
+            }
+        }
+    }
+}
+
 #[derive(Props, Clone, PartialEq)]
 pub struct ToolCallDisplayProps {
     pub tool_call: ToolCall,
@@ -21,9 +82,9 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
     let ui_state = consume_context::<Signal<UiState>>();
 
     // Local signals initialized from global defaults - these are NOT synced back
-    let mut show_arguments = use_signal(|| ui_state.read().default_tool_arguments_open);
+    let show_arguments = use_signal(|| ui_state.read().default_tool_arguments_open);
     // Auto-expand response section for auth-required tools so user sees the connect button
-    let mut show_response = use_signal(|| {
+    let show_response = use_signal(|| {
         if props.tool_call.status == ToolCallStatus::AuthRequired {
             true
         } else {
@@ -112,91 +173,30 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                 }
 
                 // Arguments collapsible section
-                div {
-                    class: "flex flex-col",
-                    button {
-                        class: "flex items-center gap-1 text-sm font-semibold text-fg-muted hover:text-fg",
-                        onclick: move |_| show_arguments.toggle(),
-                        if *show_arguments.read() {
-                            Icon {
-                                width: 16,
-                                height: 16,
-                                icon: fi_icons::FiChevronDown
-                            }
-                        } else {
-                            Icon {
-                                width: 16,
-                                height: 16,
-                                icon: fi_icons::FiChevronRight
-                            }
-                        }
-                        "Arguments"
-                    }
-                    if *show_arguments.read() {
-                        div {
-                            class: "overflow-x-auto max-w-full", // Prevent horizontal overflow
-                            CodeBlock {
-                                code: props.tool_call.arguments.clone(),
-                                lang: "json".to_string()
-                            }
+                Collapsible {
+                    label: "Arguments".to_string(),
+                    open_default: *show_arguments.read(),
+                    div {
+                        class: "overflow-x-auto max-w-full", // Prevent horizontal overflow
+                        CodeBlock {
+                            code: props.tool_call.arguments.clone(),
+                            lang: "json".to_string()
                         }
                     }
                 }
 
                 // Response collapsible section
-                div {
-                    class: "flex flex-col",
-                    button {
-                        class: "flex items-center gap-1 text-sm font-semibold text-fg-muted hover:text-fg",
-                        onclick: move |_| show_response.toggle(),
-                        if *show_response.read() {
-                            Icon {
-                                width: 16,
-                                height: 16,
-                                icon: fi_icons::FiChevronDown
-                            }
-                        } else {
-                            Icon {
-                                width: 16,
-                                height: 16,
-                                icon: fi_icons::FiChevronRight
-                            }
-                        }
-                        "Response"
-                    }
-                    if *show_response.read() {
-                         if status == ToolCallStatus::AuthRequired {
-                            div {
-                                class: "flex flex-col gap-3 p-3 bg-app rounded mt-2 border border-yellow-700/50",
-                                div {
-                                    class: "flex items-center gap-2 text-yellow-500",
-                                    Icon {
-                                        width: 18,
-                                        height: 18,
-                                        icon: fi_icons::FiLock
-                                    }
-                                    span { class: "font-medium", "Authentication Required" }
-                                }
-                                p { class: "text-sm text-fg-muted", "Please connect your account to proceed with this tool." }
-                                a {
-                                    class: "px-4 py-2 bg-yellow-600 text-fg rounded hover:bg-yellow-500 text-center text-sm font-medium transition-colors w-fit flex items-center gap-2",
-                                    href: "{response}",
-                                    target: "_blank",
-                                    "Connect Account"
-                                    Icon {
-                                        width: 14,
-                                        height: 14,
-                                        icon: fi_icons::FiExternalLink
-                                    }
-                                }
-                            }
-                        } else if !response.is_empty() {
-                            div {
-                                class: "overflow-x-auto max-w-full",
-                                CodeBlock {
-                                    code: response,
-                                    lang: "json".to_string()
-                                }
+                Collapsible {
+                    label: "Response".to_string(),
+                    open_default: *show_response.read(),
+                    if status == ToolCallStatus::AuthRequired {
+                        AuthRequiredPanel { url: response.clone() }
+                    } else if !response.is_empty() {
+                        div {
+                            class: "overflow-x-auto max-w-full",
+                            CodeBlock {
+                                code: response.clone(),
+                                lang: "json".to_string()
                             }
                         }
                     }
