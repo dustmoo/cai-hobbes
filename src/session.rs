@@ -18,7 +18,11 @@ where
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct ConversationSummaryEntities {
-    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "null_to_empty"
+    )]
     pub user_name: String,
     #[serde(flatten)]
     pub other_entities: HashMap<String, Value>,
@@ -26,15 +30,27 @@ pub struct ConversationSummaryEntities {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct ConversationSummary {
-    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "null_to_empty"
+    )]
     pub summary: String,
-    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "null_to_empty"
+    )]
     pub sentiment: String,
     /// The active task or goal the user is currently pursuing.
     /// Populated automatically by the summarizer on each turn — no model tool call needed.
     /// Injected as part of `conversation_summary` in the system context (Tier 3).
     /// For small-context models this acts as a goal anchor so the task survives history scrolling.
-    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "null_to_empty"
+    )]
     pub current_task: String,
     #[serde(default)]
     pub entities: ConversationSummaryEntities,
@@ -259,7 +275,8 @@ impl Session {
     /// Includes `accumulated_cost` from deleted messages so the counter
     /// never drops when the user prunes conversation history.
     pub fn total_cost(&self) -> f64 {
-        let message_cost: f64 = self.messages
+        let message_cost: f64 = self
+            .messages
             .iter()
             .filter_map(|m| m.usage.as_ref())
             .filter_map(|u| u.cost)
@@ -271,7 +288,8 @@ impl Session {
     /// Includes `accumulated_tokens` from deleted messages so the counter
     /// never drops when the user prunes conversation history.
     pub fn total_tokens(&self) -> i32 {
-        let message_tokens: i32 = self.messages
+        let message_tokens: i32 = self
+            .messages
             .iter()
             .filter_map(|m| m.usage.as_ref())
             .map(|u| u.total_tokens)
@@ -441,8 +459,7 @@ impl SessionState {
 
         // Re-insert if there's remaining content
         if !entry.remaining_content.is_empty() {
-            self.page_queue
-                .insert(tool_call_id.to_string(), entry);
+            self.page_queue.insert(tool_call_id.to_string(), entry);
         }
 
         Some((page, tool_name, remaining_estimate))
@@ -493,7 +510,9 @@ impl SessionState {
                 };
                 tracing::info!(
                     "HOBBES_PAGE_RESULT: Delivered page for '{}' (tool_call_id={}, remaining=~{})",
-                    tool_name, tool_call_id, remaining
+                    tool_name,
+                    tool_call_id,
+                    remaining
                 );
                 (
                     crate::components::shared::ToolCallStatus::Completed,
@@ -573,14 +592,21 @@ impl SessionState {
             );
             tracing::info!(
                 "HOBBES_UPDATE_SCRATCHPAD: Scratchpad updated ({} chars, limit {})",
-                char_count, max_scratchpad_chars
+                char_count,
+                max_scratchpad_chars
             );
             (
                 crate::components::shared::ToolCallStatus::Completed,
-                format!("Scratchpad updated ({} chars). Content is now persistent for this session.", char_count),
+                format!(
+                    "Scratchpad updated ({} chars). Content is now persistent for this session.",
+                    char_count
+                ),
             )
         } else {
-            tracing::warn!("HOBBES_UPDATE_SCRATCHPAD: Session '{}' not found", session_id);
+            tracing::warn!(
+                "HOBBES_UPDATE_SCRATCHPAD: Session '{}' not found",
+                session_id
+            );
             (
                 crate::components::shared::ToolCallStatus::Error,
                 format!("Session '{}' not found", session_id),
@@ -610,16 +636,15 @@ impl SessionState {
                     .and_then(|v| v.as_str())
                     .and_then(parse_duration_secs)
             });
-        let delay_secs = match delay_secs {
-            Some(n) => n,
-            None => {
-                return (
+        let delay_secs =
+            match delay_secs {
+                Some(n) => n,
+                None => return (
                     ToolCallStatus::Error,
                     "Provide 'delay_secs' (integer seconds) or 'delay' (e.g. \"10m\", \"1h30m\")."
                         .to_string(),
-                )
-            }
-        };
+                ),
+            };
         if delay_secs < MIN_DELAY_SECS {
             return (
                 ToolCallStatus::Error,
@@ -652,9 +677,7 @@ impl SessionState {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        if mode == TimerMode::Prompt
-            && prompt.as_deref().map(str::trim).unwrap_or("").is_empty()
-        {
+        if mode == TimerMode::Prompt && prompt.as_deref().map(str::trim).unwrap_or("").is_empty() {
             return (
                 ToolCallStatus::Error,
                 "mode 'prompt' requires a non-empty 'prompt' to run when the timer fires."
@@ -751,7 +774,8 @@ impl SessionState {
         if timer_id.is_empty() {
             return (
                 ToolCallStatus::Error,
-                "Missing 'timer_id' (from the timer's confirmation or HOBBES_LIST_TIMERS).".to_string(),
+                "Missing 'timer_id' (from the timer's confirmation or HOBBES_LIST_TIMERS)."
+                    .to_string(),
             );
         }
 
@@ -800,13 +824,15 @@ impl SessionState {
     /// always see page 1 again instead of the next page.
     pub fn store_pages(&mut self, pages: Vec<(String, PagedResult)>) {
         let mut inserted_ids = std::collections::HashSet::new();
-        
+
         for (id, paged) in pages {
             if self.page_queue.contains_key(&id) {
                 tracing::debug!(
                     "Skipping page queue entry (already exists): id={} (remaining={} bytes)",
                     id,
-                    self.page_queue.get(&id).map_or(0, |p| p.remaining_content.len())
+                    self.page_queue
+                        .get(&id)
+                        .map_or(0, |p| p.remaining_content.len())
                 );
             } else {
                 tracing::debug!("Storing page queue entry: id={}", id);
@@ -819,14 +845,16 @@ impl SessionState {
         const MAX_PAGE_QUEUE_SIZE: usize = 50;
         if self.page_queue.len() > MAX_PAGE_QUEUE_SIZE {
             let excess = self.page_queue.len() - MAX_PAGE_QUEUE_SIZE;
-            
+
             // Collect oldest/random keys EXCEPT those we just inserted
-            let keys_to_remove: Vec<String> = self.page_queue.keys()
+            let keys_to_remove: Vec<String> = self
+                .page_queue
+                .keys()
                 .filter(|k| !inserted_ids.contains(*k))
                 .take(excess)
                 .cloned()
                 .collect();
-                
+
             for key in keys_to_remove {
                 self.page_queue.remove(&key);
                 tracing::debug!("Pruned expired page queue entry to save memory: {}", key);
@@ -856,8 +884,7 @@ impl SessionState {
         let schema_version = store::meta_get(store::META_SCHEMA_VERSION)
             .and_then(|v| v.parse().ok())
             .unwrap_or(CURRENT_SESSION_SCHEMA_VERSION);
-        let mut active_session_id =
-            store::meta_get(store::META_ACTIVE_SESSION).unwrap_or_default();
+        let mut active_session_id = store::meta_get(store::META_ACTIVE_SESSION).unwrap_or_default();
         let default = SessionState::default();
         let window_width = store::meta_get(store::META_WINDOW_WIDTH)
             .and_then(|v| v.parse().ok())
@@ -1155,8 +1182,7 @@ impl SessionState {
         let rows = store::collect_dirty_rows(&self.sessions)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let meta = self.collect_meta_kv();
-        store::write_rows_and_meta(&rows, &meta)
-            .map_err(std::io::Error::other)?;
+        store::write_rows_and_meta(&rows, &meta).map_err(std::io::Error::other)?;
         store::mark_rows_saved(&rows);
         Ok(())
     }
@@ -1168,12 +1194,36 @@ impl SessionState {
     fn collect_meta_kv(&self) -> Vec<(String, String, i64)> {
         use crate::session_store as store;
         vec![
-            (store::META_SCHEMA_VERSION.to_string(), self.schema_version.to_string(), store::next_seq()),
-            (store::META_ACTIVE_SESSION.to_string(), self.active_session_id.clone(), store::next_seq()),
-            (store::META_WINDOW_WIDTH.to_string(), self.window_width.to_string(), store::next_seq()),
-            (store::META_WINDOW_HEIGHT.to_string(), self.window_height.to_string(), store::next_seq()),
-            (store::META_LIFETIME_COST.to_string(), self.lifetime_cost.to_string(), store::next_seq()),
-            (store::META_LIFETIME_TOKENS.to_string(), self.lifetime_tokens.to_string(), store::next_seq()),
+            (
+                store::META_SCHEMA_VERSION.to_string(),
+                self.schema_version.to_string(),
+                store::next_seq(),
+            ),
+            (
+                store::META_ACTIVE_SESSION.to_string(),
+                self.active_session_id.clone(),
+                store::next_seq(),
+            ),
+            (
+                store::META_WINDOW_WIDTH.to_string(),
+                self.window_width.to_string(),
+                store::next_seq(),
+            ),
+            (
+                store::META_WINDOW_HEIGHT.to_string(),
+                self.window_height.to_string(),
+                store::next_seq(),
+            ),
+            (
+                store::META_LIFETIME_COST.to_string(),
+                self.lifetime_cost.to_string(),
+                store::next_seq(),
+            ),
+            (
+                store::META_LIFETIME_TOKENS.to_string(),
+                self.lifetime_tokens.to_string(),
+                store::next_seq(),
+            ),
         ]
     }
 
@@ -1230,11 +1280,7 @@ impl SessionState {
     ///
     /// Only journal-complete sources (journal starts with `SessionCreated`)
     /// can be forked — pre-journal sessions return a clear error.
-    pub fn fork_session(
-        &mut self,
-        source_id: &str,
-        at_seq: Option<i64>,
-    ) -> Result<String, String> {
+    pub fn fork_session(&mut self, source_id: &str, at_seq: Option<i64>) -> Result<String, String> {
         let source_name = self
             .sessions
             .get(source_id)
@@ -1248,8 +1294,7 @@ impl SessionState {
 
         let new_id = uuid::Uuid::new_v4().to_string();
         let new_name = format!("Fork of {source_name}");
-        let events =
-            crate::session_store::fork_events(source_id, at_seq, &new_id, &new_name)?;
+        let events = crate::session_store::fork_events(source_id, at_seq, &new_id, &new_name)?;
         let session = crate::session_events::project(None, &events);
         self.sessions.insert(new_id.clone(), session);
         self.active_session_id = new_id.clone();
@@ -1851,9 +1896,7 @@ mod tests {
         }
 
         // Verify session cost before deletion
-        assert!(
-            (state.sessions.get(&session_id).unwrap().total_cost() - 0.0042).abs() < 0.00001
-        );
+        assert!((state.sessions.get(&session_id).unwrap().total_cost() - 0.0042).abs() < 0.00001);
         assert_eq!(state.lifetime_cost, 0.0);
         assert_eq!(state.lifetime_tokens, 0);
 
@@ -1944,16 +1987,22 @@ mod tests {
         let mut state = SessionState::default();
 
         // Store initial content: ID "page-A" with ~45 chars of remaining content
-        let initial_pages = vec![
-            ("page-A".to_string(), PagedResult {
+        let initial_pages = vec![(
+            "page-A".to_string(),
+            PagedResult {
                 remaining_content: "Page 1 content\nPage 2 content\nPage 3 content".to_string(),
                 tool_name: "test_tool".to_string(),
-            }),
-        ];
+            },
+        )];
         state.store_pages(initial_pages);
         assert_eq!(
-            state.page_queue.get("page-A").unwrap().remaining_content.len(),
-            45 - 1  // "Page 1 content\nPage 2 content\nPage 3 content" = 44 chars
+            state
+                .page_queue
+                .get("page-A")
+                .unwrap()
+                .remaining_content
+                .len(),
+            45 - 1 // "Page 1 content\nPage 2 content\nPage 3 content" = 44 chars
         );
 
         // Consume one page via fetch_next_page with a 15-char budget
@@ -1964,23 +2013,31 @@ mod tests {
         assert!(remaining > 0, "Should have remaining pages");
 
         // Record how much content remains after consuming one page
-        let remaining_after_first = state.page_queue.get("page-A")
+        let remaining_after_first = state
+            .page_queue
+            .get("page-A")
             .unwrap()
             .remaining_content
             .len();
 
         // Simulate continuation turn: store_pages called again with same ID but fresh content
-        let re_generated = vec![
-            ("page-A".to_string(), PagedResult {
+        let re_generated = vec![(
+            "page-A".to_string(),
+            PagedResult {
                 remaining_content: "Page 1 content\nPage 2 content\nPage 3 content".to_string(),
                 tool_name: "test_tool".to_string(),
-            }),
-        ];
+            },
+        )];
         state.store_pages(re_generated);
 
         // CRITICAL: the queue should still have the partially-consumed content (not reset)
         assert_eq!(
-            state.page_queue.get("page-A").unwrap().remaining_content.len(),
+            state
+                .page_queue
+                .get("page-A")
+                .unwrap()
+                .remaining_content
+                .len(),
             remaining_after_first,
             "store_pages must NOT overwrite partially-consumed entries"
         );
@@ -1988,7 +2045,10 @@ mod tests {
         // Verify we get the next portion of content (not starting over)
         let (content2, _, _remaining2) = state.fetch_next_page("page-A", 15).unwrap();
         assert!(!content2.is_empty(), "Should return next page content");
-        assert!(content2.len() <= 15, "Second page should also respect budget");
+        assert!(
+            content2.len() <= 15,
+            "Second page should also respect budget"
+        );
     }
 
     /// Test: fetch_next_page dynamically sizes pages based on page_budget.
@@ -2000,22 +2060,33 @@ mod tests {
 
         // Store content (~100 chars)
         let content = "Line one of the result.\nLine two of the result.\nLine three of the result.\nLine four of the result.";
-        state.store_pages(vec![
-            ("page-dynamic".to_string(), PagedResult {
+        state.store_pages(vec![(
+            "page-dynamic".to_string(),
+            PagedResult {
                 remaining_content: content.to_string(),
                 tool_name: "dynamic_tool".to_string(),
-            }),
-        ]);
+            },
+        )]);
 
         // Fetch with a small budget (30 chars)
         let (page1, _, remaining1) = state.fetch_next_page("page-dynamic", 30).unwrap();
-        assert!(page1.len() <= 30, "Small budget: page should be ≤30 chars, got {}", page1.len());
+        assert!(
+            page1.len() <= 30,
+            "Small budget: page should be ≤30 chars, got {}",
+            page1.len()
+        );
         assert!(remaining1 > 0, "Should have remaining content");
 
         // Fetch with a large budget (remaining content should fit in one page)
         let (page2, _, remaining2) = state.fetch_next_page("page-dynamic", 10000).unwrap();
-        assert!(page2.len() > 30, "Large budget: page should be larger than small-budget page");
-        assert_eq!(remaining2, 0, "Large budget should consume all remaining content");
+        assert!(
+            page2.len() > 30,
+            "Large budget: page should be larger than small-budget page"
+        );
+        assert_eq!(
+            remaining2, 0,
+            "Large budget should consume all remaining content"
+        );
 
         // All content consumed — entry should be cleaned up
         assert!(
@@ -2025,7 +2096,10 @@ mod tests {
 
         // Concatenated pages should reproduce original content
         let reconstructed = format!("{}{}", page1, page2);
-        assert_eq!(reconstructed, content, "Pages must reconstruct original content");
+        assert_eq!(
+            reconstructed, content,
+            "Pages must reconstruct original content"
+        );
     }
 
     /// Test that delete_message_and_after cleans up stale tool_snapshot entries
@@ -2163,20 +2237,34 @@ mod tests {
         );
 
         assert_eq!(session.active_context.extra.len(), 3);
-        assert!(!session.active_context.conversation_summary.summary.is_empty());
+        assert!(!session
+            .active_context
+            .conversation_summary
+            .summary
+            .is_empty());
 
         // Undo: delete msg2 and everything after (msg2, msg3, msg4)
         let deleted = session.delete_message_and_after(&msg2_id.to_string());
         assert_eq!(deleted, 3, "Should have deleted 3 messages");
-        assert_eq!(session.messages.len(), 1, "Only first message should remain");
+        assert_eq!(
+            session.messages.len(),
+            1,
+            "Only first message should remain"
+        );
 
         // Tool snapshots for the deleted tool calls should be gone
         assert!(
-            !session.active_context.extra.contains_key(&format!("tool_snapshot_{}", exec_id_1)),
+            !session
+                .active_context
+                .extra
+                .contains_key(&format!("tool_snapshot_{}", exec_id_1)),
             "tool_snapshot for exec_id_1 should be removed"
         );
         assert!(
-            !session.active_context.extra.contains_key(&format!("tool_snapshot_{}", exec_id_2)),
+            !session
+                .active_context
+                .extra
+                .contains_key(&format!("tool_snapshot_{}", exec_id_2)),
             "tool_snapshot for exec_id_2 should be removed"
         );
 
@@ -2188,7 +2276,11 @@ mod tests {
 
         // Conversation summary should be reset
         assert!(
-            session.active_context.conversation_summary.summary.is_empty(),
+            session
+                .active_context
+                .conversation_summary
+                .summary
+                .is_empty(),
             "Conversation summary should be cleared after undo"
         );
     }
@@ -2331,8 +2423,12 @@ mod tests {
     #[ignore]
     fn real_data_import() {
         use crate::session_store::test_support as ts;
-        let json = std::env::var("HOBBES_IMPORT_TEST_JSON").ok().map(std::path::PathBuf::from);
-        let archive = std::env::var("HOBBES_IMPORT_TEST_ARCHIVE").ok().map(std::path::PathBuf::from);
+        let json = std::env::var("HOBBES_IMPORT_TEST_JSON")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let archive = std::env::var("HOBBES_IMPORT_TEST_ARCHIVE")
+            .ok()
+            .map(std::path::PathBuf::from);
         if json.is_none() && archive.is_none() {
             eprintln!("real_data_import: no env vars set, skipping");
             return;
@@ -2356,14 +2452,16 @@ mod tests {
     /// raw-JSON migration fallback.
     #[test]
     fn test_legacy_session_import_fallback() {
-        let old_format = make_old_session_json(r#"{
+        let old_format = make_old_session_json(
+            r#"{
             "id": "0b0e9e2e-49e2-4a4d-bd58-9d1b4a55b573",
             "author": "User",
             "content": { "Text": "hello from the past" },
             "attachments": [],
             "comments": [],
             "created_at": "2026-01-01T00:00:00Z"
-        }"#);
+        }"#,
+        );
         let state = SessionState::migrate_from_raw_json(&old_format).unwrap();
         let session = state.sessions.get("test-session-1").unwrap();
         assert_eq!(session.messages.len(), 1);

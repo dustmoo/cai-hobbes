@@ -52,7 +52,8 @@ pub fn TabBar(props: TabBarProps) -> Element {
         let _activity = stream_manager.stream_activity.read();
         // Also directly subscribe to streaming_sessions for immediate updates
         let _sessions = stream_manager.streaming_sessions.read();
-        let states: Vec<bool> = open_tabs_for_memo.iter()
+        let states: Vec<bool> = open_tabs_for_memo
+            .iter()
             .map(|id| stream_manager.is_session_streaming(id))
             .collect();
         states

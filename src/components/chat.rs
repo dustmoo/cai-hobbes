@@ -19,12 +19,12 @@ use crate::session_events::{log_event, SessionEvent};
 use crate::settings::Settings;
 use dioxus::html::geometry::euclid::Rect;
 use dioxus::prelude::*;
-use std::collections::HashMap;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use feature_clipboard::copy_to_clipboard;
 use hobbes_core::models::Attachment;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 use syntect::easy::HighlightLines;
@@ -332,7 +332,10 @@ pub fn ChatWindow(
                 let mut tools_to_run = Vec::new();
 
                 // Indicate activity immediately
-                stream_manager.streaming_sessions.write().insert(owning_id.clone());
+                stream_manager
+                    .streaming_sessions
+                    .write()
+                    .insert(owning_id.clone());
                 *stream_manager.stream_activity.write() += 1;
                 // Approval given: the fleet row stops waiting right away
                 // (continuation would report too, but only after the tools run).
@@ -389,7 +392,9 @@ pub fn ChatWindow(
                     *stream_manager.stream_activity.write() += 1;
                     // Clear this session's in-flight guard before re-triggering
                     continuation_controller.write().clear_in_flight(&owning_id);
-                    continuation_controller.write().trigger_continuation(owning_id.clone());
+                    continuation_controller
+                        .write()
+                        .trigger_continuation(owning_id.clone());
                     return;
                 }
 
@@ -421,7 +426,7 @@ pub fn ChatWindow(
                     let (status, response_str, persist) = match builtin {
                         Some(outcome) => (outcome.status, outcome.response, outcome.persist),
                         None => {
-            // Normal MCP tool dispatch
+                            // Normal MCP tool dispatch
                             let manager = mcp_manager.read().clone();
                             // Approval resume rebuilds the session context —
                             // the approving chat owns the tool call. Built
@@ -453,14 +458,16 @@ pub fn ChatWindow(
 
                             let (s, r, _) = match result_receiver {
                                 Ok(receiver) => {
-                                    crate::mcp::manager::McpManager::process_tool_output(receiver).await
+                                    crate::mcp::manager::McpManager::process_tool_output(receiver)
+                                        .await
                                 }
-                                Err(e) => (crate::components::shared::ToolCallStatus::Error, e, false),
+                                Err(e) => {
+                                    (crate::components::shared::ToolCallStatus::Error, e, false)
+                                }
                             };
                             (s, r, false)
                         }
                     };
-
 
                     // Update session state with result
                     {
@@ -513,7 +520,9 @@ pub fn ChatWindow(
                 }
 
                 // 3. Trigger continuation to send results back to LLM
-                continuation_controller.write().trigger_continuation(owning_id.clone());
+                continuation_controller
+                    .write()
+                    .trigger_continuation(owning_id.clone());
             });
         }
     });
@@ -535,7 +544,9 @@ pub fn ChatWindow(
                     move || {
                         // Clear the session-scoped continuation guard so the next
                         // trigger_continuation() for THIS session can proceed.
-                        continuation_controller.write().clear_in_flight(&session_id_for_cleanup);
+                        continuation_controller
+                            .write()
+                            .clear_in_flight(&session_id_for_cleanup);
                         let _ = tx.send(());
                     }
                 };
@@ -590,15 +601,18 @@ pub fn ChatWindow(
                     }
 
                     // Check if the last message was the turn limit warning.
-                    let last_message_was_warning = session_state.read().sessions.get(&target_id)
-                .and_then(|s| s.messages.last())
-                .is_some_and(|m| {
-                    if let MessageContent::Text { content: text, .. } = &m.content {
-                        text.starts_with("Pardon, I have reached the 'Max Turn Limit'")
-                    } else {
-                        false
-                    }
-                });
+                    let last_message_was_warning = session_state
+                        .read()
+                        .sessions
+                        .get(&target_id)
+                        .and_then(|s| s.messages.last())
+                        .is_some_and(|m| {
+                            if let MessageContent::Text { content: text, .. } = &m.content {
+                                text.starts_with("Pardon, I have reached the 'Max Turn Limit'")
+                            } else {
+                                false
+                            }
+                        });
 
                     if last_message_was_warning {
                         if let Some(session) = session_state.write().sessions.get_mut(&target_id) {
@@ -639,15 +653,14 @@ pub fn ChatWindow(
                             let (prompt_data, pages) = {
                                 let state = session_state.read();
                                 if let Some(session) = state.sessions.get(&target_id) {
-                                    let builder =
-                                        PromptBuilder::new(session, &settings_read)
-                                            .with_planner_today(
-                                                crate::todo::handlers::planner_today_context(
-                                                    &planner_state.read(),
-                                                    &settings_read,
-                                                    chrono::Local::now().date_naive(),
-                                                ),
-                                            );
+                                    let builder = PromptBuilder::new(session, &settings_read)
+                                        .with_planner_today(
+                                            crate::todo::handlers::planner_today_context(
+                                                &planner_state.read(),
+                                                &settings_read,
+                                                chrono::Local::now().date_naive(),
+                                            ),
+                                        );
                                     let result = builder.build_prompt("".to_string());
                                     (result.prompt, result.pages_to_store)
                                 } else {
@@ -676,9 +689,16 @@ pub fn ChatWindow(
 
                     has_new_comments.write().remove(&target_id);
 
-                    let turn_count = session_state.read().sessions.get(&target_id)
-                        .map(|s| s.current_ai_turn_count).unwrap_or(0);
-                    if permission_manager.read().is_turn_limit_reached_for(turn_count) {
+                    let turn_count = session_state
+                        .read()
+                        .sessions
+                        .get(&target_id)
+                        .map(|s| s.current_ai_turn_count)
+                        .unwrap_or(0);
+                    if permission_manager
+                        .read()
+                        .is_turn_limit_reached_for(turn_count)
+                    {
                         let user_msg = Message {
                             id: Uuid::new_v4(),
                             author: "User".to_string(),
@@ -713,7 +733,9 @@ pub fn ChatWindow(
                             &target_id,
                             vec![
                                 SessionEvent::UserMessage { message: user_msg },
-                                SessionEvent::AssistantMessage { message: warning_msg },
+                                SessionEvent::AssistantMessage {
+                                    message: warning_msg,
+                                },
                             ],
                         );
                         return;
@@ -830,7 +852,10 @@ pub fn ChatWindow(
 
     let continue_prompt_flow = {
         Rc::new(move |target_id: String| {
-            tracing::debug!("continue_prompt_flow callback INVOKED for session '{}'", target_id);
+            tracing::debug!(
+                "continue_prompt_flow callback INVOKED for session '{}'",
+                target_id
+            );
             spawn(async move {
                 tracing::debug!(session_id = %target_id, "continue_prompt_flow task SPAWNED.");
                 let mut session_state = session_state;
@@ -865,12 +890,13 @@ pub fn ChatWindow(
                 let (prompt_data, pages) = {
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&target_id) {
-                        let builder = PromptBuilder::new(session, &settings)
-                            .with_planner_today(crate::todo::handlers::planner_today_context(
+                        let builder = PromptBuilder::new(session, &settings).with_planner_today(
+                            crate::todo::handlers::planner_today_context(
                                 &planner_state.read(),
                                 &settings,
                                 chrono::Local::now().date_naive(),
-                            ));
+                            ),
+                        );
                         let result = builder.build_prompt("".to_string());
                         (result.prompt, result.pages_to_store)
                     } else {
@@ -878,7 +904,11 @@ pub fn ChatWindow(
                             "Active session lost during continuation flow - aborting prompt build"
                         );
                         // Clean up stale streaming entry if session was deleted mid-execution
-                        if stream_manager.streaming_sessions.read().contains(&target_id) {
+                        if stream_manager
+                            .streaming_sessions
+                            .read()
+                            .contains(&target_id)
+                        {
                             stream_manager.streaming_sessions.write().remove(&target_id);
                             *stream_manager.stream_activity.write() += 1;
                         }
@@ -921,12 +951,16 @@ pub fn ChatWindow(
         let mut local_cmd = chat_command;
         let (text_content, msg_attachments) = {
             let state = session_state.read();
-            state.sessions.get(&*current_target_id.read())
+            state
+                .sessions
+                .get(&*current_target_id.read())
                 .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
-                .map(|msg| (
-                    msg.content.get_text_content().unwrap_or_default(),
-                    msg.attachments.clone(),
-                ))
+                .map(|msg| {
+                    (
+                        msg.content.get_text_content().unwrap_or_default(),
+                        msg.attachments.clone(),
+                    )
+                })
                 .unwrap_or_default()
         };
         local_cmd.set(Some(super::chat_input::ChatCommand::RestoreToDraft(
@@ -996,7 +1030,10 @@ pub fn ChatWindow(
         if applied {
             log_event(
                 &session_id,
-                SessionEvent::MessageEdited { message_id, content: new_text },
+                SessionEvent::MessageEdited {
+                    message_id,
+                    content: new_text,
+                },
             );
             stream_update_trigger.set(stream_update_trigger() + 1);
             crate::session::SessionState::save_async(&session_state.read(), None);
@@ -1022,7 +1059,10 @@ pub fn ChatWindow(
                 .unwrap_or_default();
             crate::session_events::log_event_sync(
                 &session_id,
-                SessionEvent::MessageEdited { message_id, content: new_text.clone() },
+                SessionEvent::MessageEdited {
+                    message_id,
+                    content: new_text.clone(),
+                },
             );
             {
                 let mut state = session_state.write();
@@ -1045,21 +1085,23 @@ pub fn ChatWindow(
     let fork_from_message = move |message_id: Uuid| {
         let mut fork_save_error = fork_save_error;
         let session_id = current_target_id.read().clone();
-        let anchor = crate::session_store::first_event_seq_for_message(
-            &session_id,
-            &message_id.to_string(),
-        );
+        let anchor =
+            crate::session_store::first_event_seq_for_message(&session_id, &message_id.to_string());
         let Some(at_seq) = anchor.filter(|&s| s > 0) else {
             fork_save_error.set(Some(
                 "This message predates the session journal — fork unavailable.".to_string(),
             ));
             return;
         };
-        let result = session_state.write().fork_session(&session_id, Some(at_seq));
+        let result = session_state
+            .write()
+            .fork_session(&session_id, Some(at_seq));
         match result {
             Ok(new_id) => {
                 crate::session::SessionState::save_async(&session_state.read(), None);
-                chat_command.set(Some(super::chat_input::ChatCommand::SwitchToSession(new_id)));
+                chat_command.set(Some(super::chat_input::ChatCommand::SwitchToSession(
+                    new_id,
+                )));
             }
             Err(e) => {
                 tracing::warn!("fork_from_message failed: {e}");
@@ -1112,8 +1154,12 @@ pub fn ChatWindow(
                 crate::session_events::log_events(
                     &current_target_id.read().clone(),
                     vec![
-                        SessionEvent::MemoryOptimized { summary: summary.clone() },
-                        SessionEvent::AssistantMessage { message: notice_msg },
+                        SessionEvent::MemoryOptimized {
+                            summary: summary.clone(),
+                        },
+                        SessionEvent::AssistantMessage {
+                            message: notice_msg,
+                        },
                     ],
                 );
                 crate::session::SessionState::save_async(&session_state.read(), None);
@@ -1634,7 +1680,9 @@ pub fn MessageBubble(
                     while let Ok(msg) = eval.recv().await {
                         if let Ok(data) = serde_json::from_value::<SelectionData>(msg) {
                             if data.hide {
-                                if !*is_mouse_over_toolbar.read() && *selection_mode.read() == SelectionMode::Toolbar {
+                                if !*is_mouse_over_toolbar.read()
+                                    && *selection_mode.read() == SelectionMode::Toolbar
+                                {
                                     selection_mode.set(SelectionMode::None);
                                 }
                             } else if !data.text.trim().is_empty() {

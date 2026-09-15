@@ -69,11 +69,7 @@ pub fn collect_pending(session: &Session, threshold_chars: usize) -> Vec<Pending
 
 /// Write a generated summary back onto the owning tool call. Returns true if the
 /// target message was found and updated.
-pub fn apply_summary(
-    session: &mut Session,
-    message_id: uuid::Uuid,
-    summary: String,
-) -> bool {
+pub fn apply_summary(session: &mut Session, message_id: uuid::Uuid, summary: String) -> bool {
     if let Some(msg) = session.messages.iter_mut().find(|m| m.id == message_id) {
         if let MessageContent::ToolCall(tc) = &mut msg.content {
             tc.result_summary = Some(summary);
@@ -154,7 +150,7 @@ mod tests {
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
-        tool_call_history: Vec::new(),
+            tool_call_history: Vec::new(),
         }
     }
 
@@ -168,12 +164,16 @@ mod tests {
             tool_msg(big.clone(), None),
             // Current turn.
             user_msg(),
-            tool_msg(big.clone(), None),          // collected
-            tool_msg(small, None),                // too small
+            tool_msg(big.clone(), None),                // collected
+            tool_msg(small, None),                      // too small
             tool_msg(big.clone(), Some("done".into())), // already summarized
         ]);
         let pending = collect_pending(&session, SUMMARY_THRESHOLD_CHARS);
-        assert_eq!(pending.len(), 1, "only the large, unsummarized current-turn result");
+        assert_eq!(
+            pending.len(),
+            1,
+            "only the large, unsummarized current-turn result"
+        );
     }
 
     #[test]

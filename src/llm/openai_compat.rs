@@ -53,27 +53,37 @@ impl LlmConnector for OpenAiCompatConnector {
         // Protected window of 6 messages ensures recent context is always preserved.
         if let Some(max_tokens) = self.config.max_context_tokens {
             // Use the per-provider chars_per_token ratio for accurate estimation
-            let chars_per_token = self.config.context_tuning.chars_per_token
+            let chars_per_token = self
+                .config
+                .context_tuning
+                .chars_per_token
                 .unwrap_or(crate::context::token_estimator::DEFAULT_CHARS_PER_TOKEN);
 
             // Log token budget breakdown for diagnostics
-            let system_tokens = prompt_data
-                .system
-                .as_ref()
-                .map_or(0, |s| crate::context::token_estimator::estimate_tokens_with_ratio(s, chars_per_token));
+            let system_tokens = prompt_data.system.as_ref().map_or(0, |s| {
+                crate::context::token_estimator::estimate_tokens_with_ratio(s, chars_per_token)
+            });
             let message_tokens: usize = prompt_data
                 .messages
                 .iter()
-                .map(|m| crate::context::token_estimator::estimate_message_tokens_with_ratio(m, chars_per_token))
+                .map(|m| {
+                    crate::context::token_estimator::estimate_message_tokens_with_ratio(
+                        m,
+                        chars_per_token,
+                    )
+                })
                 .sum();
             let json_ratio = chars_per_token.min(2.5);
             let tool_tokens: usize = prompt_data
                 .tools
                 .iter()
                 .map(|t| {
-                    crate::context::token_estimator::estimate_tokens_with_ratio(&t.name, chars_per_token)
-                        + (t.description.chars().count() as f64 / json_ratio).ceil() as usize
-                        + (t.parameters.to_string().chars().count() as f64 / json_ratio).ceil() as usize
+                    crate::context::token_estimator::estimate_tokens_with_ratio(
+                        &t.name,
+                        chars_per_token,
+                    ) + (t.description.chars().count() as f64 / json_ratio).ceil() as usize
+                        + (t.parameters.to_string().chars().count() as f64 / json_ratio).ceil()
+                            as usize
                         + 10
                 })
                 .sum();
@@ -117,9 +127,8 @@ impl LlmConnector for OpenAiCompatConnector {
             .expect("Failed to serialize OpenAI request body");
 
         // Type alias for the unified stream used by both raw TCP and reqwest paths.
-        type SseStream = std::pin::Pin<
-            Box<dyn futures_util::Stream<Item = Result<Vec<u8>, String>> + Send>,
-        >;
+        type SseStream =
+            std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Vec<u8>, String>> + Send>>;
 
         // Autorecovery: retry once on transient stream decode errors (HTTPS path only).
         // For plain HTTP / raw TCP the connection RST is handled as a clean stream end; no retry needed.
@@ -173,7 +182,9 @@ impl LlmConnector for OpenAiCompatConnector {
                     request_builder =
                         request_builder.header("Authorization", format!("Bearer {}", api_key));
                 } else {
-                    tracing::warn!("OpenAI Compat: No API key configured — request will be unauthenticated");
+                    tracing::warn!(
+                        "OpenAI Compat: No API key configured — request will be unauthenticated"
+                    );
                 }
 
                 let response = match request_builder.send().await {
@@ -315,11 +326,14 @@ impl LlmConnector for OpenAiCompatConnector {
                                     loop {
                                         if inside_tool_call {
                                             // We're accumulating a tool call — look for </tool_call>
-                                            if let Some(end_pos) = text_to_process.find("</tool_call>")
+                                            if let Some(end_pos) =
+                                                text_to_process.find("</tool_call>")
                                             {
                                                 // Complete the tool call buffer
-                                                tool_call_buffer.push_str(&text_to_process[..end_pos]);
-                                                let after = text_to_process[end_pos + 12..].to_string(); // skip "</tool_call>"
+                                                tool_call_buffer
+                                                    .push_str(&text_to_process[..end_pos]);
+                                                let after =
+                                                    text_to_process[end_pos + 12..].to_string(); // skip "</tool_call>"
 
                                                 // Parse the buffered JSON and emit as tool call
                                                 Self::parse_inline_tool_call(
@@ -342,10 +356,12 @@ impl LlmConnector for OpenAiCompatConnector {
                                             }
                                         } else {
                                             // Not inside a tool call — look for <tool_call>
-                                            if let Some(start_pos) = text_to_process.find("<tool_call>")
+                                            if let Some(start_pos) =
+                                                text_to_process.find("<tool_call>")
                                             {
                                                 // Emit text before the tag
-                                                remaining_text.push_str(&text_to_process[..start_pos]);
+                                                remaining_text
+                                                    .push_str(&text_to_process[..start_pos]);
                                                 inside_tool_call = true;
                                                 text_to_process =
                                                     text_to_process[start_pos + 11..].to_string(); // skip "<tool_call>"
@@ -371,13 +387,17 @@ impl LlmConnector for OpenAiCompatConnector {
                                             &mut inside_channel_think,
                                         );
 
-                                        for (is_channel_thinking, segment_text) in channel_segments {
+                                        for (is_channel_thinking, segment_text) in channel_segments
+                                        {
                                             if is_channel_thinking {
                                                 // Route to thinking display
-                                                if let Some(ref mut summary) = accumulated_thought_summary {
+                                                if let Some(ref mut summary) =
+                                                    accumulated_thought_summary
+                                                {
                                                     summary.push_str(&segment_text);
                                                 } else {
-                                                    accumulated_thought_summary = Some(segment_text.clone());
+                                                    accumulated_thought_summary =
+                                                        Some(segment_text.clone());
                                                 }
                                                 let _ = tx.send(StreamMessage::Text {
                                                     content: String::new(),
@@ -408,7 +428,8 @@ impl LlmConnector for OpenAiCompatConnector {
                                                             {
                                                                 summary.push_str(&text);
                                                             } else {
-                                                                accumulated_thought_summary = Some(text.clone());
+                                                                accumulated_thought_summary =
+                                                                    Some(text.clone());
                                                             }
                                                             let _ = tx.send(StreamMessage::Text {
                                                                 content: String::new(),
@@ -430,9 +451,7 @@ impl LlmConnector for OpenAiCompatConnector {
                                     }
                                 }
                                 StreamEvent::ToolCall {
-                                    name,
-                                    arguments,
-                                    ..
+                                    name, arguments, ..
                                 } => {
                                     // OpenAI streams tool calls incrementally:
                                     //   Chunk 1: id + name (arguments empty)
@@ -551,7 +570,7 @@ impl LlmConnector for OpenAiCompatConnector {
                 self.config.summary_model, self.config.model
             );
             return Err(Box::new(std::io::Error::other(
-                "No model configured for summarization. Please select a model in OpenAI settings."
+                "No model configured for summarization. Please select a model in OpenAI settings.",
             )) as Box<dyn std::error::Error + Send + Sync>);
         }
 
@@ -625,8 +644,14 @@ You MUST respond with valid JSON containing exactly these fields:
                         request_builder.header("Authorization", format!("Bearer {}", api_key));
                 }
                 match request_builder.send().await {
-                    Ok(r) => { result = Some(r); break; }
-                    Err(e) if attempt < MAX_SUMMARIZER_RETRIES && (e.is_connect() || e.is_timeout()) => {
+                    Ok(r) => {
+                        result = Some(r);
+                        break;
+                    }
+                    Err(e)
+                        if attempt < MAX_SUMMARIZER_RETRIES
+                            && (e.is_connect() || e.is_timeout()) =>
+                    {
                         tracing::warn!(
                             "OpenAI Compat summarizer: connection error on attempt {} — retrying in 2s: {}",
                             attempt + 1, e
@@ -640,7 +665,10 @@ You MUST respond with valid JSON containing exactly these fields:
                     }
                 }
             }
-            result.ok_or_else(|| last_err.unwrap_or_else(|| Box::new(std::io::Error::other("summarizer send failed"))))?
+            result.ok_or_else(|| {
+                last_err
+                    .unwrap_or_else(|| Box::new(std::io::Error::other("summarizer send failed")))
+            })?
         };
 
         if !response.status().is_success() {
@@ -748,7 +776,8 @@ You MUST respond with valid JSON containing exactly these fields:
             .header("Content-Type", "application/json")
             .json(&request_body);
         if let Some(api_key) = &self.config.api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+            request_builder =
+                request_builder.header("Authorization", format!("Bearer {}", api_key));
         }
 
         let response = request_builder.send().await.map_err(|e| e.to_string())?;
@@ -944,8 +973,8 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                     && messages[i - 1].get("role").and_then(|r| r.as_str()) == Some("assistant")
                     && messages[i - 1].get("tool_calls").is_some();
                 // Also allow consecutive tool results (multiple tools in one turn)
-                let follows_another_tool = i > 0
-                    && messages[i - 1].get("role").and_then(|r| r.as_str()) == Some("tool");
+                let follows_another_tool =
+                    i > 0 && messages[i - 1].get("role").and_then(|r| r.as_str()) == Some("tool");
 
                 if !has_preceding_tool_calls && !follows_another_tool {
                     tracing::warn!(
@@ -1059,114 +1088,114 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                 }
 
                 match serde_json::from_str::<Value>(json_str) {
-                Ok(val) => {
-                    if let Some(choices) = val["choices"].as_array() {
-                        if let Some(choice) = choices.first() {
-                            // Text delta
-                            if let Some(content) = choice["delta"]["content"].as_str() {
-                                events.push(StreamEvent::Text {
-                                    content: content.to_string(),
-                                });
-                            }
+                    Ok(val) => {
+                        if let Some(choices) = val["choices"].as_array() {
+                            if let Some(choice) = choices.first() {
+                                // Text delta
+                                if let Some(content) = choice["delta"]["content"].as_str() {
+                                    events.push(StreamEvent::Text {
+                                        content: content.to_string(),
+                                    });
+                                }
 
-                            // Tool calls delta — OpenAI streams these incrementally:
-                            //   First chunk:  {"index": 0, "id": "call_xxx", "function": {"name": "fn_name", "arguments": ""}}
-                            //   Later chunks: {"index": 0, "function": {"arguments": "{\"key\": "}}
-                            //   More chunks:  {"index": 0, "function": {"arguments": "\"value\"}"}}
-                            // We emit each delta as a StreamEvent::ToolCall.
-                            // The accumulation happens in generate_content_stream.
-                            if let Some(tool_calls) = choice["delta"]["tool_calls"].as_array() {
-                                for tc in tool_calls {
-                                    let id = tc
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    let name_raw = tc
-                                        .get("function")
-                                        .and_then(|f| f.get("name"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default();
-                                    let args_fragment = tc
-                                        .get("function")
-                                        .and_then(|f| f.get("arguments"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
+                                // Tool calls delta — OpenAI streams these incrementally:
+                                //   First chunk:  {"index": 0, "id": "call_xxx", "function": {"name": "fn_name", "arguments": ""}}
+                                //   Later chunks: {"index": 0, "function": {"arguments": "{\"key\": "}}
+                                //   More chunks:  {"index": 0, "function": {"arguments": "\"value\"}"}}
+                                // We emit each delta as a StreamEvent::ToolCall.
+                                // The accumulation happens in generate_content_stream.
+                                if let Some(tool_calls) = choice["delta"]["tool_calls"].as_array() {
+                                    for tc in tool_calls {
+                                        let id = tc
+                                            .get("id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let name_raw = tc
+                                            .get("function")
+                                            .and_then(|f| f.get("name"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default();
+                                        let args_fragment = tc
+                                            .get("function")
+                                            .and_then(|f| f.get("arguments"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
 
-                                    if !name_raw.is_empty() {
-                                        // Pass raw name through — resolution happens in
-                                        // generate_content_stream using the tool_name_map.
-                                        events.push(StreamEvent::ToolCall {
-                                            id,
-                                            name: name_raw.to_string(),
-                                            server_name: None,
-                                            arguments: json!(args_fragment),
-                                            signature: None,
-                                        });
-                                    } else {
-                                        // Continuation chunk — just argument fragments
-                                        events.push(StreamEvent::ToolCall {
-                                            id,
-                                            name: String::new(), // empty = continuation
-                                            server_name: None,
-                                            arguments: json!(args_fragment),
+                                        if !name_raw.is_empty() {
+                                            // Pass raw name through — resolution happens in
+                                            // generate_content_stream using the tool_name_map.
+                                            events.push(StreamEvent::ToolCall {
+                                                id,
+                                                name: name_raw.to_string(),
+                                                server_name: None,
+                                                arguments: json!(args_fragment),
+                                                signature: None,
+                                            });
+                                        } else {
+                                            // Continuation chunk — just argument fragments
+                                            events.push(StreamEvent::ToolCall {
+                                                id,
+                                                name: String::new(), // empty = continuation
+                                                server_name: None,
+                                                arguments: json!(args_fragment),
+                                                signature: None,
+                                            });
+                                        }
+                                    }
+                                }
+
+                                // Native reasoning content (multiple field names across providers):
+                                // - "reasoning_content": DeepSeek API
+                                // - "reasoning": vLLM with Qwen 3.5 (--enable-reasoning)
+                                let reasoning = choice["delta"]["reasoning_content"]
+                                    .as_str()
+                                    .or_else(|| choice["delta"]["reasoning"].as_str());
+                                if let Some(reasoning) = reasoning {
+                                    if !reasoning.is_empty() {
+                                        events.push(StreamEvent::Thinking {
+                                            text: reasoning.to_string(),
                                             signature: None,
                                         });
                                     }
                                 }
                             }
+                        }
 
-                            // Native reasoning content (multiple field names across providers):
-                            // - "reasoning_content": DeepSeek API
-                            // - "reasoning": vLLM with Qwen 3.5 (--enable-reasoning)
-                            let reasoning = choice["delta"]["reasoning_content"]
-                                .as_str()
-                                .or_else(|| choice["delta"]["reasoning"].as_str());
-                            if let Some(reasoning) = reasoning {
-                                if !reasoning.is_empty() {
-                                    events.push(StreamEvent::Thinking {
-                                        text: reasoning.to_string(),
-                                        signature: None,
-                                    });
-                                }
+                        // Usage
+                        if let Some(usage) = val.get("usage") {
+                            // Optional usage parsing
+                            if let (Some(p), Some(c), Some(t)) = (
+                                usage["prompt_tokens"].as_u64(),
+                                usage["completion_tokens"].as_u64(),
+                                usage["total_tokens"].as_u64(),
+                            ) {
+                                events.push(StreamEvent::Usage(UsageData {
+                                    prompt_tokens: p as i32,
+                                    completion_tokens: c as i32,
+                                    total_tokens: t as i32,
+                                    cached_content_tokens: None,
+                                    thoughts_tokens: None,
+                                    // Billed only for the real OpenAI API with a key;
+                                    // local/keyless endpoints are free (Some(0.0)).
+                                    cost: crate::llm::openai_pricing::turn_cost(
+                                        &self.config.endpoint,
+                                        self.config.api_key.is_some(),
+                                        &self.config.model,
+                                        p as i64,
+                                        c as i64,
+                                    ),
+                                }));
                             }
                         }
                     }
-
-                    // Usage
-                    if let Some(usage) = val.get("usage") {
-                        // Optional usage parsing
-                        if let (Some(p), Some(c), Some(t)) = (
-                            usage["prompt_tokens"].as_u64(),
-                            usage["completion_tokens"].as_u64(),
-                            usage["total_tokens"].as_u64(),
-                        ) {
-                            events.push(StreamEvent::Usage(UsageData {
-                                prompt_tokens: p as i32,
-                                completion_tokens: c as i32,
-                                total_tokens: t as i32,
-                                cached_content_tokens: None,
-                                thoughts_tokens: None,
-                                // Billed only for the real OpenAI API with a key;
-                                // local/keyless endpoints are free (Some(0.0)).
-                                cost: crate::llm::openai_pricing::turn_cost(
-                                    &self.config.endpoint,
-                                    self.config.api_key.is_some(),
-                                    &self.config.model,
-                                    p as i64,
-                                    c as i64,
-                                ),
-                            }));
-                        }
+                    Err(e) => {
+                        tracing::debug!(
+                            "SSE parse: dropped non-JSON line ({}): {:?}",
+                            e,
+                            &json_str[..json_str.len().min(120)]
+                        );
                     }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        "SSE parse: dropped non-JSON line ({}): {:?}",
-                        e,
-                        &json_str[..json_str.len().min(120)]
-                    );
-                }
                 }
             }
         }
@@ -1384,9 +1413,12 @@ impl OpenAiCompatConnector {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
         // Parse http://host:port/path
-        let without_scheme = endpoint
-            .strip_prefix("http://")
-            .ok_or_else(|| format!("raw_tcp_stream: endpoint must start with http://, got: {}", endpoint))?;
+        let without_scheme = endpoint.strip_prefix("http://").ok_or_else(|| {
+            format!(
+                "raw_tcp_stream: endpoint must start with http://, got: {}",
+                endpoint
+            )
+        })?;
 
         let (host_port, path) = if let Some(slash_pos) = without_scheme.find('/') {
             (&without_scheme[..slash_pos], &without_scheme[slash_pos..])
@@ -1480,8 +1512,7 @@ impl OpenAiCompatConnector {
 
         // 200 OK: spawn a task that reads the body and feeds chunks into an mpsc channel.
         // When the connection closes (RST or EOF) the task simply returns — clean end.
-        let (chunk_tx, chunk_rx) =
-            tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(64);
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(64);
 
         tokio::spawn(async move {
             if is_chunked {
@@ -1493,12 +1524,7 @@ impl OpenAiCompatConnector {
                         Ok(_) => {}
                     }
                     // Strip chunk extensions (e.g. "a;ext=val")
-                    let hex_str = size_line
-                        .trim()
-                        .split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim();
+                    let hex_str = size_line.trim().split(';').next().unwrap_or("").trim();
                     let chunk_size = match usize::from_str_radix(hex_str, 16) {
                         Ok(n) => n,
                         Err(_) => {
@@ -1621,4 +1647,3 @@ impl OpenAiCompatConnector {
         )
     }
 }
-

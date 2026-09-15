@@ -159,19 +159,19 @@ impl LlmConnector for ClaudeConnector {
             arguments: String,
         }
 
-        let flush_tool_calls = |pending: &mut Vec<PendingToolCall>,
-                                tx: &mpsc::UnboundedSender<StreamMessage>| {
-            for tc in pending.drain(..) {
-                let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
-                let tool_call = ToolCall::new(tc.server_name, tc.name, args, None, None);
-                tracing::debug!(
-                    "Claude: Sending tool call '{}' on server '{}'",
-                    tool_call.tool_name,
-                    tool_call.server_name
-                );
-                let _ = tx.send(StreamMessage::ToolCall(tool_call));
-            }
-        };
+        let flush_tool_calls =
+            |pending: &mut Vec<PendingToolCall>, tx: &mpsc::UnboundedSender<StreamMessage>| {
+                for tc in pending.drain(..) {
+                    let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+                    let tool_call = ToolCall::new(tc.server_name, tc.name, args, None, None);
+                    tracing::debug!(
+                        "Claude: Sending tool call '{}' on server '{}'",
+                        tool_call.tool_name,
+                        tool_call.server_name
+                    );
+                    let _ = tx.send(StreamMessage::ToolCall(tool_call));
+                }
+            };
 
         let emit_usage = |prompt: i32,
                           completion: i32,
@@ -370,7 +370,9 @@ impl LlmConnector for ClaudeConnector {
                                     });
                                 }
                             }
-                            StreamEvent::ToolCall { name, arguments, .. } => {
+                            StreamEvent::ToolCall {
+                                name, arguments, ..
+                            } => {
                                 if !name.is_empty() {
                                     // New tool_use block — resolve server/tool.
                                     let (server, tool) = tool_name_map
@@ -677,7 +679,9 @@ impl LlmFormatConverter for ClaudeConnector {
                         }));
                     }
                     ContentBlock::ToolResult {
-                        call_id, content: c, ..
+                        call_id,
+                        content: c,
+                        ..
                     } => {
                         let result_str = if c.is_string() {
                             c.as_str().unwrap_or("").to_string()
@@ -877,7 +881,9 @@ impl LlmFormatConverter for ClaudeConnector {
                 }
                 Some("message_stop") => events.push(StreamEvent::Done),
                 Some("error") => {
-                    let msg = val["error"]["message"].as_str().unwrap_or("Unknown Claude error");
+                    let msg = val["error"]["message"]
+                        .as_str()
+                        .unwrap_or("Unknown Claude error");
                     events.push(StreamEvent::Error {
                         message: format!("Claude API error: {}", msg),
                     });
@@ -1023,7 +1029,9 @@ mod tests {
 
         let delta_events = connector().parse_stream_chunk(delta);
         match &delta_events[0] {
-            StreamEvent::ToolCall { name, arguments, .. } => {
+            StreamEvent::ToolCall {
+                name, arguments, ..
+            } => {
                 assert!(name.is_empty(), "continuation has empty name");
                 assert_eq!(arguments.as_str().unwrap(), "{\"path\":\".\"}");
             }
@@ -1088,7 +1096,9 @@ mod tests {
                         text: "reasoning".into(),
                         signature: Some("sig-abc".into()),
                     },
-                    ContentBlock::Text { text: "answer".into() },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                    },
                 ],
             }],
             tools: vec![],
@@ -1111,7 +1121,9 @@ mod tests {
                         text: "reasoning".into(),
                         signature: None,
                     },
-                    ContentBlock::Text { text: "answer".into() },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                    },
                 ],
             }],
             tools: vec![],
@@ -1151,7 +1163,9 @@ mod tests {
 
         // Case-insensitive.
         let body_upper = r#"{"type":"error","error":{"type":"INVALID_REQUEST_ERROR","message":"Thinking block SIGNATURE is invalid."}}"#;
-        assert!(crate::llm::is_claude_thought_signature_error(400, body_upper));
+        assert!(crate::llm::is_claude_thought_signature_error(
+            400, body_upper
+        ));
     }
 
     #[test]
@@ -1184,7 +1198,9 @@ mod tests {
                         arguments: json!({"q": "x"}),
                         signature: Some("gemini-minted-sig-2".into()),
                     },
-                    ContentBlock::Text { text: "answer".into() },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                    },
                 ],
             },
             ChatMessage {
@@ -1207,13 +1223,20 @@ mod tests {
             other => panic!("expected Thinking, got {:?}", other),
         }
         match &messages[0].content[1] {
-            ContentBlock::ToolCall { signature, name, .. } => {
+            ContentBlock::ToolCall {
+                signature, name, ..
+            } => {
                 assert!(signature.is_none());
                 assert_eq!(name, "search"); // other fields untouched
             }
             other => panic!("expected ToolCall, got {:?}", other),
         }
-        assert_eq!(messages[0].content[2], ContentBlock::Text { text: "answer".into() });
+        assert_eq!(
+            messages[0].content[2],
+            ContentBlock::Text {
+                text: "answer".into()
+            }
+        );
         // ToolResult (no signature field at all) is untouched.
         assert_eq!(
             messages[1].content[0],

@@ -96,13 +96,14 @@ pub fn group_turn_runs(messages: &[Message]) -> Vec<Range<usize>> {
     let mut runs = Vec::new();
     let mut start: Option<usize> = None;
     let mut last_anchor: Option<usize> = None;
-    let flush = |start: &mut Option<usize>, last: &mut Option<usize>, runs: &mut Vec<Range<usize>>| {
-        if let (Some(s), Some(l)) = (start.take(), last.take()) {
-            runs.push(s..l + 1);
-        }
-        *start = None;
-        *last = None;
-    };
+    let flush =
+        |start: &mut Option<usize>, last: &mut Option<usize>, runs: &mut Vec<Range<usize>>| {
+            if let (Some(s), Some(l)) = (start.take(), last.take()) {
+                runs.push(s..l + 1);
+            }
+            *start = None;
+            *last = None;
+        };
     for (i, message) in messages.iter().enumerate() {
         match slot_of(message) {
             Slot::Anchor => {
@@ -165,12 +166,12 @@ pub fn command_tail(response: &str, n: usize) -> String {
 
 /// Cost (USD) and total tokens summed across a run's messages.
 pub fn run_usage(messages: &[Message]) -> (f64, i32) {
-    messages.iter().fold((0.0, 0), |(cost, tokens), m| {
-        match &m.usage {
+    messages
+        .iter()
+        .fold((0.0, 0), |(cost, tokens), m| match &m.usage {
             Some(u) => (cost + u.cost.unwrap_or(0.0), tokens + u.total_tokens),
             None => (cost, tokens),
-        }
-    })
+        })
 }
 
 /// Best-effort exit code out of a terminal response (JSON field or a trailing
@@ -300,7 +301,8 @@ pub fn build_rows(messages: &[Message], turn_start: chrono::DateTime<chrono::Utc
                 usage: m.usage.clone(),
             }),
             MessageContent::ToolCall(tc) => {
-                if let Some(thought) = tc.thought_summary.as_ref().filter(|t| !t.trim().is_empty()) {
+                if let Some(thought) = tc.thought_summary.as_ref().filter(|t| !t.trim().is_empty())
+                {
                     rows.push(thinking_row(m.id, "tc", thought, offset));
                 }
                 let duration = tc
@@ -776,10 +778,7 @@ fn step_icon(kind: StepKind, running: bool) -> Element {
 #[component]
 fn RowDetail(tool_call: ToolCall, usage: Option<UsageData>) -> Element {
     let meta = {
-        let mut parts = vec![
-            tool_call.server_name.clone(),
-            tool_call.tool_name.clone(),
-        ];
+        let mut parts = vec![tool_call.server_name.clone(), tool_call.tool_name.clone()];
         if let Some(cwd) = arg_str(&tool_call.arguments, "cwd") {
             parts.push(cwd);
         }
@@ -953,10 +952,7 @@ mod tests {
 
     #[test]
     fn a_prose_only_turn_produces_no_block() {
-        let messages = vec![
-            text("User", "hi", None),
-            text("Hobbes", "", None),
-        ];
+        let messages = vec![text("User", "hi", None), text("Hobbes", "", None)];
         assert!(group_turn_runs(&messages).is_empty());
     }
 
@@ -1136,12 +1132,20 @@ mod tests {
             r#"{"title":"Ship the stream"}"#,
             ToolCallStatus::Completed,
         );
-        assert_eq!(step_label(&tc), "hobbes-planner · HOBBES_TODO_CREATE \"Ship the stream\"");
+        assert_eq!(
+            step_label(&tc),
+            "hobbes-planner · HOBBES_TODO_CREATE \"Ship the stream\""
+        );
     }
 
     #[test]
     fn tool_label_uses_the_first_string_argument() {
-        let tc = tool("gmail", "SEND", r#"{"to":"a@b.c"}"#, ToolCallStatus::Completed);
+        let tc = tool(
+            "gmail",
+            "SEND",
+            r#"{"to":"a@b.c"}"#,
+            ToolCallStatus::Completed,
+        );
         assert_eq!(step_label(&tc), "gmail · SEND — a@b.c");
     }
 

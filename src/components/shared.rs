@@ -407,7 +407,8 @@ mod signature_provider_tests {
             "response": "ok",
             "thought_signature": "abc123",
         });
-        let tc: ToolCall = serde_json::from_value(legacy_json).expect("legacy ToolCall should deserialize");
+        let tc: ToolCall =
+            serde_json::from_value(legacy_json).expect("legacy ToolCall should deserialize");
         assert_eq!(tc.signature_provider, None);
         assert_eq!(tc.thought_signature.as_deref(), Some("abc123"));
     }
@@ -441,10 +442,14 @@ mod signature_provider_tests {
                 "thought_summary": "summary"
             }
         });
-        let content: MessageContent =
-            serde_json::from_value(legacy_json).expect("legacy MessageContent::Text should deserialize");
+        let content: MessageContent = serde_json::from_value(legacy_json)
+            .expect("legacy MessageContent::Text should deserialize");
         match content {
-            MessageContent::Text { signature_provider, thought_signature, .. } => {
+            MessageContent::Text {
+                signature_provider,
+                thought_signature,
+                ..
+            } => {
                 assert_eq!(signature_provider, None);
                 assert_eq!(thought_signature.as_deref(), Some("sig"));
             }
@@ -464,7 +469,9 @@ mod signature_provider_tests {
         let json = serde_json::to_value(&content).expect("serialize");
         let round_tripped: MessageContent = serde_json::from_value(json).expect("deserialize");
         match round_tripped {
-            MessageContent::Text { signature_provider, .. } => {
+            MessageContent::Text {
+                signature_provider, ..
+            } => {
                 assert_eq!(signature_provider, Some(LlmProvider::Claude));
             }
             other => panic!("expected Text variant, got {:?}", other),

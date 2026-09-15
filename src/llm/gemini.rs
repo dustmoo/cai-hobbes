@@ -284,8 +284,7 @@ impl GeminiModel {
             // Gemini 3.7 (GA 2026-08-13) & 3.6 (GA 2026-07-21) Flash:
             // intro $0.75/$3.75 through 2026-12-31, then $1.50/$7.50
             GeminiModel::Gemini3_7Flash | GeminiModel::Gemini3_6Flash => {
-                let promo_end =
-                    chrono::NaiveDate::from_ymd_opt(2026, 12, 31).expect("valid date");
+                let promo_end = chrono::NaiveDate::from_ymd_opt(2026, 12, 31).expect("valid date");
                 if today <= promo_end {
                     (0.75, 3.75)
                 } else {
@@ -1284,7 +1283,8 @@ impl LlmConnector for GeminiConnector {
         if self.config.context_caching_enabled {
             if let Some(ref sess_id) = session_id {
                 if request_body.contents.len() > 1 {
-                    let prefix_contents = &request_body.contents[0 .. request_body.contents.len() - 1];
+                    let prefix_contents =
+                        &request_body.contents[0..request_body.contents.len() - 1];
                     let prefix_hash = crate::llm::gemini_cache::compute_prefix_hash(
                         request_body.system_instruction.as_ref(),
                         request_body.tools.as_deref(),
@@ -1298,15 +1298,41 @@ impl LlmConnector for GeminiConnector {
                     {
                         cache_entry_opt = Some(entry.clone());
                     } else {
-                        let chars_per_token = self.config.context_tuning.chars_per_token
-                            .unwrap_or(crate::context::token_estimator::DEFAULT_CHARS_PER_TOKEN);
-                        
-                        let system_tokens = prompt_data.system.as_ref().map_or(0, |s| crate::context::token_estimator::estimate_tokens_with_ratio(s, chars_per_token));
-                        let tool_tokens: usize = prompt_data.tools.iter().map(|t| crate::context::token_estimator::estimate_tool_definition_tokens(t, chars_per_token)).sum();
-                        let prefix_messages_tokens: usize = prompt_data.messages.iter().take(prompt_data.messages.len().saturating_sub(1))
-                            .map(|m| crate::context::token_estimator::estimate_message_tokens_with_ratio(m, chars_per_token)).sum();
+                        let chars_per_token =
+                            self.config.context_tuning.chars_per_token.unwrap_or(
+                                crate::context::token_estimator::DEFAULT_CHARS_PER_TOKEN,
+                            );
 
-                        let estimated_prefix_tokens = system_tokens + tool_tokens + prefix_messages_tokens;
+                        let system_tokens = prompt_data.system.as_ref().map_or(0, |s| {
+                            crate::context::token_estimator::estimate_tokens_with_ratio(
+                                s,
+                                chars_per_token,
+                            )
+                        });
+                        let tool_tokens: usize = prompt_data
+                            .tools
+                            .iter()
+                            .map(|t| {
+                                crate::context::token_estimator::estimate_tool_definition_tokens(
+                                    t,
+                                    chars_per_token,
+                                )
+                            })
+                            .sum();
+                        let prefix_messages_tokens: usize = prompt_data
+                            .messages
+                            .iter()
+                            .take(prompt_data.messages.len().saturating_sub(1))
+                            .map(|m| {
+                                crate::context::token_estimator::estimate_message_tokens_with_ratio(
+                                    m,
+                                    chars_per_token,
+                                )
+                            })
+                            .sum();
+
+                        let estimated_prefix_tokens =
+                            system_tokens + tool_tokens + prefix_messages_tokens;
 
                         if estimated_prefix_tokens >= 4096 {
                             let system_instr = request_body.system_instruction.clone();
@@ -1327,7 +1353,9 @@ impl LlmConnector for GeminiConnector {
                                 self.config.cache_ttl_seconds,
                                 prefix_hash,
                                 key_fp,
-                            ).await {
+                            )
+                            .await
+                            {
                                 Ok(new_entry) => {
                                     let mut store_lock = self.cache_store.lock().await;
                                     store_lock.insert_entry(sess_id.clone(), new_entry.clone());
@@ -1351,7 +1379,11 @@ impl LlmConnector for GeminiConnector {
             if request_body.contents.len() >= entry.cached_message_count {
                 request_body.contents.drain(0..entry.cached_message_count);
             }
-            tracing::info!("Using Gemini explicit context cache: id={}, cached messages count={}", entry.cache_id, entry.cached_message_count);
+            tracing::info!(
+                "Using Gemini explicit context cache: id={}, cached messages count={}",
+                entry.cache_id,
+                entry.cached_message_count
+            );
         }
 
         // --- Logging Block ---
@@ -1493,10 +1525,11 @@ impl LlmConnector for GeminiConnector {
                                     StreamEvent::Text { content } => {
                                         if !content.is_empty() {
                                             // Strip leaked <|channel>thought tokens before display
-                                            let channel_segments = super::convert::strip_channel_tokens(
-                                                &content,
-                                                &mut inside_channel_think,
-                                            );
+                                            let channel_segments =
+                                                super::convert::strip_channel_tokens(
+                                                    &content,
+                                                    &mut inside_channel_think,
+                                                );
                                             for (is_thinking, seg_text) in channel_segments {
                                                 if is_thinking {
                                                     current_attempt_parts.push(Part::Text {
@@ -1687,14 +1720,15 @@ impl LlmConnector for GeminiConnector {
                                     StreamEvent::Usage(usage) => {
                                         // Buffer — emit only the final authoritative values
                                         // after the stream completes (see pending_usage flush below).
-                                        pending_usage = Some(crate::components::shared::UsageData {
-                                            prompt_tokens: usage.prompt_tokens,
-                                            completion_tokens: usage.completion_tokens,
-                                            total_tokens: usage.total_tokens,
-                                            cost: usage.cost,
-                                            cached_content_tokens: usage.cached_content_tokens,
-                                            thoughts_tokens: usage.thoughts_tokens,
-                                        });
+                                        pending_usage =
+                                            Some(crate::components::shared::UsageData {
+                                                prompt_tokens: usage.prompt_tokens,
+                                                completion_tokens: usage.completion_tokens,
+                                                total_tokens: usage.total_tokens,
+                                                cost: usage.cost,
+                                                cached_content_tokens: usage.cached_content_tokens,
+                                                thoughts_tokens: usage.thoughts_tokens,
+                                            });
                                     }
                                     StreamEvent::Error { message } => {
                                         let _ = tx.send(StreamMessage::Error { message });
@@ -1979,8 +2013,16 @@ Recent Messages:
                 let base_url = self.base_url.clone();
                 let cache_id = entry.cache_id.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = crate::llm::gemini_cache::api_delete_cache(&client, &base_url, &api_key, &cache_id).await {
-                        tracing::warn!("Failed to delete Gemini cache {} upon invalidation: {}", cache_id, e);
+                    if let Err(e) = crate::llm::gemini_cache::api_delete_cache(
+                        &client, &base_url, &api_key, &cache_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to delete Gemini cache {} upon invalidation: {}",
+                            cache_id,
+                            e
+                        );
                     }
                 });
             }
@@ -2744,7 +2786,9 @@ mod tests {
 
         // Case-insensitive.
         let body_upper = r#"{"error":{"message":"THOUGHT SIGNATURE is invalid or expired","status":"INVALID_ARGUMENT"}}"#;
-        assert!(crate::llm::is_gemini_thought_signature_error(400, body_upper));
+        assert!(crate::llm::is_gemini_thought_signature_error(
+            400, body_upper
+        ));
     }
 
     #[test]

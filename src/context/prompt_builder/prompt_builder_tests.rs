@@ -1,8 +1,8 @@
 use super::*;
-use crate::str_utils::floor_char_boundary;
 use crate::session::ActiveContext;
 use crate::session::Session;
 use crate::settings::Settings;
+use crate::str_utils::floor_char_boundary;
 use chrono::Utc;
 
 // Obsolete tests removed. Schema sanitization is now handled in `src/gemini/convert.rs`.
@@ -59,7 +59,10 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
     let prompt = builder.build_prompt("Hello".to_string());
 
     // Extract the system instruction text
-    let full_text = prompt.prompt.system.expect("Should have system instruction");
+    let full_text = prompt
+        .prompt
+        .system
+        .expect("Should have system instruction");
 
     // Assert: Composio context should be present
     assert!(
@@ -95,7 +98,10 @@ fn test_composio_context_not_injected_when_profile_missing_api_key() {
     let builder = PromptBuilder::new(&session, &settings);
     let prompt = builder.build_prompt("Hello".to_string());
 
-    let full_text = prompt.prompt.system.expect("Should have system instruction");
+    let full_text = prompt
+        .prompt
+        .system
+        .expect("Should have system instruction");
 
     // Assert: Composio context should NOT be present
     assert!(
@@ -123,7 +129,10 @@ fn test_composio_context_not_injected_when_profile_missing_user_id() {
     let builder = PromptBuilder::new(&session, &settings);
     let prompt = builder.build_prompt("Hello".to_string());
 
-    let full_text = prompt.prompt.system.expect("Should have system instruction");
+    let full_text = prompt
+        .prompt
+        .system
+        .expect("Should have system instruction");
 
     // Assert: Composio context should NOT be present
     assert!(
@@ -163,7 +172,10 @@ fn test_oversized_entities_stripped_from_system_context() {
     let builder = PromptBuilder::new(&session, &settings);
     let prompt = builder.build_prompt("Hello".to_string());
 
-    let full_text = prompt.prompt.system.expect("Should have system instruction");
+    let full_text = prompt
+        .prompt
+        .system
+        .expect("Should have system instruction");
 
     // user_name should be preserved (explicitly exempted from size check)
     assert!(
@@ -226,11 +238,7 @@ fn test_segment_into_pages_multibyte_no_panic() {
     // 2. All pages must be valid UTF-8 (they are Strings, so this is guaranteed by Rust's type system)
     // 3. No page should exceed page_size (with small tolerance for the fallback path)
     for (i, page) in pages.iter().enumerate() {
-        assert!(
-            !page.is_empty(),
-            "Page {} should not be empty",
-            i
-        );
+        assert!(!page.is_empty(), "Page {} should not be empty", i);
     }
 
     // 4. Concatenation must reproduce the original content
@@ -345,7 +353,12 @@ fn tool_result_text(prompt: &crate::context::prompt_builder::PromptBuildResult) 
         if m.role == ChatRole::Tool {
             for b in &m.content {
                 if let ContentBlock::ToolResult { content, .. } = b {
-                    out.push_str(&content.as_str().map(|s| s.to_string()).unwrap_or_else(|| content.to_string()));
+                    out.push_str(
+                        &content
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| content.to_string()),
+                    );
                     out.push('\n');
                 }
             }
@@ -520,9 +533,16 @@ fn test_available_skills_gated_by_running_skill() {
     let session = session_with_core_tools();
     let prompt = PromptBuilder::new(&session, &settings).build_prompt("Hi".to_string());
     let system = prompt.prompt.system.clone().unwrap();
-    assert!(system.contains("available_skills"), "idle: skills advertised");
     assert!(
-        prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_INVOKE_SKILL"),
+        system.contains("available_skills"),
+        "idle: skills advertised"
+    );
+    assert!(
+        prompt
+            .prompt
+            .tools
+            .iter()
+            .any(|t| t.name == "HOBBES_INVOKE_SKILL"),
         "idle: loader tool advertised"
     );
 
@@ -543,26 +563,40 @@ fn test_available_skills_gated_by_running_skill() {
         "running: no other skills advertised"
     );
     assert!(
-        !prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_INVOKE_SKILL"),
+        !prompt
+            .prompt
+            .tools
+            .iter()
+            .any(|t| t.name == "HOBBES_INVOKE_SKILL"),
         "running: loader tool withheld"
     );
 
     // 3. Model just loaded a skill (last message is the loader tool call) → gated
     let mut session = session_with_core_tools();
-    session
-        .loaded_skills
-        .insert("news".to_string(), loaded_skill_payload("news", "unrelated"));
+    session.loaded_skills.insert(
+        "news".to_string(),
+        loaded_skill_payload("news", "unrelated"),
+    );
     session.messages = vec![
         user_text_msg("check the news"),
         tool_call_msg("HOBBES_INVOKE_SKILL", "manual...".to_string(), None),
     ];
     let prompt = PromptBuilder::new(&session, &settings).build_prompt(String::new());
     assert!(
-        !prompt.prompt.system.clone().unwrap().contains("available_skills"),
+        !prompt
+            .prompt
+            .system
+            .clone()
+            .unwrap()
+            .contains("available_skills"),
         "just-loaded: no other skills advertised"
     );
     assert!(
-        !prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_INVOKE_SKILL"),
+        !prompt
+            .prompt
+            .tools
+            .iter()
+            .any(|t| t.name == "HOBBES_INVOKE_SKILL"),
         "just-loaded: loader tool withheld"
     );
 
@@ -571,11 +605,20 @@ fn test_available_skills_gated_by_running_skill() {
     let session = session_with_core_tools();
     let prompt = PromptBuilder::new(&session, &settings).build_prompt("Hi".to_string());
     assert!(
-        !prompt.prompt.system.clone().unwrap().contains("available_skills"),
+        !prompt
+            .prompt
+            .system
+            .clone()
+            .unwrap()
+            .contains("available_skills"),
         "no skills: nothing advertised"
     );
     assert!(
-        !prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_INVOKE_SKILL"),
+        !prompt
+            .prompt
+            .tools
+            .iter()
+            .any(|t| t.name == "HOBBES_INVOKE_SKILL"),
         "no skills: loader tool withheld"
     );
 }
@@ -614,7 +657,10 @@ fn planner_today_block_is_injected_when_attached() {
         .build_prompt("Hi".to_string());
     let system = prompt.prompt.system.unwrap();
     assert!(system.contains("planner_today"));
-    assert!(system.contains("HOBBES_PLAN_DAY"), "instruction names the tools");
+    assert!(
+        system.contains("HOBBES_PLAN_DAY"),
+        "instruction names the tools"
+    );
 
     // Without the attachment (the default) nothing is injected.
     let prompt = PromptBuilder::new(&session, &settings).build_prompt("Hi".to_string());
@@ -628,7 +674,11 @@ fn planner_tools_are_withheld_when_the_planner_is_disabled() {
     let enabled = Settings::default();
     let prompt = PromptBuilder::new(&session, &enabled).build_prompt("Hi".to_string());
     assert!(
-        prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_TODO_CREATE"),
+        prompt
+            .prompt
+            .tools
+            .iter()
+            .any(|t| t.name == "HOBBES_TODO_CREATE"),
         "enabled: planner tools advertised"
     );
 

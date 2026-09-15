@@ -122,7 +122,10 @@ impl StreamManagerContext {
             return true;
         }
         // Fallback: check map of active stream handles to catch continuations
-        self.stream_session_map.read().values().any(|v| v == session_id)
+        self.stream_session_map
+            .read()
+            .values()
+            .any(|v| v == session_id)
     }
 
     /// Find the active message_id for a given session (for cancel).
@@ -164,16 +167,15 @@ impl StreamManagerContext {
     /// feature: gate on the session's resolved connector config, not the
     /// global one.
     fn watch_word_config(&self, session_id: &str) -> Option<crate::settings::OpenAiCompatConfig> {
-        self.effective_connector(session_id).and_then(|inst| {
-            match inst.config {
+        self.effective_connector(session_id)
+            .and_then(|inst| match inst.config {
                 crate::settings::ProviderInstanceConfig::OpenAiCompat(c)
                     if c.watch_words_enabled =>
                 {
                     Some(c)
                 }
                 _ => None,
-            }
-        })
+            })
     }
 
     /// The chat model a session resolves to (session override → provider default).
@@ -236,7 +238,9 @@ impl StreamManagerContext {
         profile_id: Option<String>,
     ) {
         self.streaming_sessions.write().insert(session_id.clone());
-        self.stream_session_map.write().insert(message_id, session_id.clone());
+        self.stream_session_map
+            .write()
+            .insert(message_id, session_id.clone());
         self.fleet_report(&session_id, crate::fleet::bridge::HobbesSignal::TurnStarted);
         tracing::info!(message_id = %message_id, session_id = %session_id, "'start_stream' entered.");
         // Create a channel for the MessageBubble to receive chunks.
@@ -328,8 +332,9 @@ impl StreamManagerContext {
                         // its receiver — stream_tx.send() returns Err. We must NOT break
                         // the loop here; the background LLM stream must continue running
                         // and writing to session_state so the data is preserved.
-                        let has_renderable_content =
-                            !content.is_empty() || thought_signature.is_some() || thought_summary.is_some();
+                        let has_renderable_content = !content.is_empty()
+                            || thought_signature.is_some()
+                            || thought_summary.is_some();
                         if has_renderable_content && !ui_disconnected {
                             if stream_tx
                                 .send(StreamMessage::Text {
@@ -405,9 +410,9 @@ impl StreamManagerContext {
                                     .map(|s| settings.chat_model_for_session(s))
                                     .unwrap_or_else(|| settings.active_chat_model());
                                 let scope = match instance.as_ref().map(|i| &i.config) {
-                                    Some(crate::settings::ProviderInstanceConfig::OpenAiCompat(
-                                        c,
-                                    )) => c.endpoint.clone(),
+                                    Some(
+                                        crate::settings::ProviderInstanceConfig::OpenAiCompat(c),
+                                    ) => c.endpoint.clone(),
                                     Some(crate::settings::ProviderInstanceConfig::Claude(_)) => {
                                         "claude".to_string()
                                     }
@@ -494,9 +499,10 @@ impl StreamManagerContext {
                                         let message = crate::components::chat::Message {
                                             id: new_id,
                                             author: "Hobbes".to_string(),
-                                            content: crate::components::shared::MessageContent::Error {
-                                                message: error_msg.clone(),
-                                            },
+                                            content:
+                                                crate::components::shared::MessageContent::Error {
+                                                    message: error_msg.clone(),
+                                                },
                                             attachments: Vec::new(),
                                             comments: Vec::new(),
                                             created_at: chrono::Utc::now(),
@@ -593,7 +599,9 @@ impl StreamManagerContext {
                             // Message Upgrading: Only the FIRST tool call upgrades the
                             // placeholder.  Subsequent parallel tool calls always get their
                             // own message so every invocation is visible to the user.
-                            if !first_tool_call_placed && (is_first_message || final_text_for_this_turn.is_empty()) {
+                            if !first_tool_call_placed
+                                && (is_first_message || final_text_for_this_turn.is_empty())
+                            {
                                 first_tool_call_placed = true;
                                 if let Some(msg) =
                                     state.get_message_mut_in_session(&session_id, &message_id)
@@ -628,7 +636,10 @@ impl StreamManagerContext {
                         };
                         // Notify the scroll effect: a tool-call card just appeared.
                         *self.stream_activity.write() += 1;
-                        self.fleet_report(&session_id, crate::fleet::bridge::HobbesSignal::Activity);
+                        self.fleet_report(
+                            &session_id,
+                            crate::fleet::bridge::HobbesSignal::Activity,
+                        );
                         if let Some(message) = tool_call_snapshot {
                             log_event(&session_id, SessionEvent::ToolCall { message });
                         }
@@ -675,10 +686,15 @@ impl StreamManagerContext {
                                 } = outcome;
 
                                 {
-                                    let mut result_snapshot: Option<crate::components::chat::Message> = None;
+                                    let mut result_snapshot: Option<
+                                        crate::components::chat::Message,
+                                    > = None;
                                     {
                                         let mut state = session_state.write();
-                                        if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
+                                        if let Some(msg) = state.get_message_mut_in_session(
+                                            &session_id_inner,
+                                            &tool_call_message_id,
+                                        ) {
                                             if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
                                                 tc.status = status;
                                                 tc.response = response.clone();
@@ -689,13 +705,19 @@ impl StreamManagerContext {
                                         state.touch_session(&session_id_inner);
                                     }
                                     if let Some(message) = result_snapshot {
-                                        log_event(&session_id_inner, SessionEvent::ToolResult { message });
+                                        log_event(
+                                            &session_id_inner,
+                                            SessionEvent::ToolResult { message },
+                                        );
                                     }
                                 }
                                 // Notify the scroll effect: the card's status/response changed size.
                                 *self.stream_activity.write() += 1;
                                 if persist {
-                                    crate::session::SessionState::save_async(&session_state.read(), None);
+                                    crate::session::SessionState::save_async(
+                                        &session_state.read(),
+                                        None,
+                                    );
                                 }
 
                                 let record = crate::components::shared::ToolCallRecord {
@@ -786,7 +808,12 @@ impl StreamManagerContext {
                                                 {
                                                     Ok(url) => {
                                                         tracing::info!("Successfully initiated Composio auth flow. URL: {}", url);
-                                                        (ToolCallStatus::AuthRequired, url, false, None)
+                                                        (
+                                                            ToolCallStatus::AuthRequired,
+                                                            url,
+                                                            false,
+                                                            None,
+                                                        )
                                                     }
                                                     Err(e) => {
                                                         tracing::error!("Failed to initiate Composio auth flow: {}", e);
@@ -836,22 +863,31 @@ impl StreamManagerContext {
 
                                                     // MCP image content: {"type":"image","data":"<b64>","mimeType":"image/png"}
                                                     // Also handle nested {"blob":"<b64>"} from EmbeddedResource.
-                                                    let b64_candidate = json_val.get("data")
+                                                    let b64_candidate = json_val
+                                                        .get("data")
                                                         .or_else(|| json_val.get("blob"))
                                                         .and_then(|v| v.as_str());
 
                                                     if let Some(b64) = b64_candidate {
-                                                        let mime = json_val.get("mimeType")
+                                                        let mime = json_val
+                                                            .get("mimeType")
                                                             .or_else(|| json_val.get("mime_type"))
                                                             .and_then(|m| m.as_str())
                                                             .unwrap_or("image/png");
                                                         // Only save actual image types, not arbitrary blobs
                                                         if mime.starts_with("image/") {
-                                                            if let Some(path) = save_tool_image(b64, mime).await {
-                                                                let path_str = format!("file://{}", path.display());
+                                                            if let Some(path) =
+                                                                save_tool_image(b64, mime).await
+                                                            {
+                                                                let path_str = format!(
+                                                                    "file://{}",
+                                                                    path.display()
+                                                                );
                                                                 // Keep only the most recent image per tool loop
-                                                                captured_image_path = Some(path_str.clone());
-                                                                let file_name = path.file_name()
+                                                                captured_image_path =
+                                                                    Some(path_str.clone());
+                                                                let file_name = path
+                                                                    .file_name()
                                                                     .unwrap_or_default()
                                                                     .to_string_lossy();
                                                                 text_parts.push(format!(
@@ -863,7 +899,9 @@ impl StreamManagerContext {
                                                                     path.display(), b64.len()
                                                                 );
                                                             } else {
-                                                                tracing::warn!("Failed to cache tool image");
+                                                                tracing::warn!(
+                                                                    "Failed to cache tool image"
+                                                                );
                                                                 text_parts.push("[Screenshot captured but failed to save]".to_string());
                                                             }
                                                             continue; // don't also serialize as text
@@ -871,11 +909,15 @@ impl StreamManagerContext {
                                                     }
 
                                                     // Text content
-                                                    if let Some(text) = json_val.get("text").and_then(|t| t.as_str()) {
+                                                    if let Some(text) = json_val
+                                                        .get("text")
+                                                        .and_then(|t| t.as_str())
+                                                    {
                                                         text_parts.push(text.to_string());
                                                     } else {
                                                         // Fallback: compact JSON for non-image, non-text blobs
-                                                        let s = serde_json::to_string(&json_val).unwrap_or_default();
+                                                        let s = serde_json::to_string(&json_val)
+                                                            .unwrap_or_default();
                                                         if !s.is_empty() && s != "null" {
                                                             text_parts.push(s);
                                                         }
@@ -888,7 +930,12 @@ impl StreamManagerContext {
                                                     text_parts.join("\n")
                                                 };
 
-                                                (final_status, text_response, false, captured_image_path)
+                                                (
+                                                    final_status,
+                                                    text_response,
+                                                    false,
+                                                    captured_image_path,
+                                                )
                                             }
                                         }
                                     }
@@ -908,7 +955,8 @@ impl StreamManagerContext {
 
                             let mut state = session_state.write();
 
-                            let mut result_snapshot: Option<crate::components::chat::Message> = None;
+                            let mut result_snapshot: Option<crate::components::chat::Message> =
+                                None;
                             if let Some(msg) = state.get_message_mut_in_session(
                                 &session_id_inner,
                                 &tool_call_message_id,
@@ -1164,8 +1212,11 @@ impl StreamManagerContext {
                 // Without this, turns chain too fast for the 5s idle timer to fire,
                 // causing the model to lose context on long tool loops.
                 {
-                    let msg_count = self.session_state.read()
-                        .sessions.get(&session_id)
+                    let msg_count = self
+                        .session_state
+                        .read()
+                        .sessions
+                        .get(&session_id)
                         .map(|s| s.messages.len())
                         .unwrap_or(0);
                     let (tuning, context_tokens, enable_summarization) = {
@@ -1214,32 +1265,42 @@ impl StreamManagerContext {
                             );
                         } else {
                             tracing::info!(
-                                session_id, msg_count, effective_limit, threshold,
+                                session_id,
+                                msg_count,
+                                effective_limit,
+                                threshold,
                                 "Proactive summarization: messages approaching history limit"
                             );
-                            let session_snapshot = self.session_state.read()
-                                .sessions.get(&session_id).cloned();
+                            let session_snapshot =
+                                self.session_state.read().sessions.get(&session_id).cloned();
                             let settings_snapshot = self.settings.read().clone();
                             if let Some(active_session) = session_snapshot {
                                 let connector = self.connector_for_session(&session_id);
                                 let prev_summary = serde_json::to_string(
-                                    &active_session.active_context.conversation_summary
-                                ).unwrap_or_else(|_| "{}".to_string());
+                                    &active_session.active_context.conversation_summary,
+                                )
+                                .unwrap_or_else(|_| "{}".to_string());
 
                                 // Format last 5 messages for the summarizer
-                                let messages_text: Vec<String> = active_session.messages.iter()
-                                    .rev().take(5).rev()
-                                    .map(|m| format!("{}: {}", m.author, m.content.display_summary()))
+                                let messages_text: Vec<String> = active_session
+                                    .messages
+                                    .iter()
+                                    .rev()
+                                    .take(5)
+                                    .rev()
+                                    .map(|m| {
+                                        format!("{}: {}", m.author, m.content.display_summary())
+                                    })
                                     .collect();
 
                                 let active_profile_name = settings_snapshot
-                                    .active_composio_profile.as_deref()
+                                    .active_composio_profile
+                                    .as_deref()
                                     .and_then(|id| settings_snapshot.profile_name_for_id(id))
                                     .unwrap_or("None")
                                     .to_string();
-                                let system_note = format!(
-                                    "[System: Active Profile '{}']", active_profile_name
-                                );
+                                let system_note =
+                                    format!("[System: Active Profile '{}']", active_profile_name);
                                 let recent = std::iter::once(system_note)
                                     .chain(messages_text)
                                     .collect::<Vec<_>>()
@@ -1250,11 +1311,12 @@ impl StreamManagerContext {
                                     self.summarizing_sessions.write().insert(session_id.clone());
                                     let mut summarizing_sessions = self.summarizing_sessions;
                                     let session_id_clone = session_id.clone();
-                                    
+
                                     // Timeout safety net: blindly clear the flag after 30 seconds
                                     let sid = session_id.clone();
                                     dioxus::prelude::spawn(async move {
-                                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                        tokio::time::sleep(std::time::Duration::from_secs(30))
+                                            .await;
                                         if summarizing_sessions.peek().contains(&sid) {
                                             tracing::warn!(session_id = %sid, "Proactive summarization timed out, forcibly resetting flag.");
                                             summarizing_sessions.write().remove(&sid);
@@ -1265,21 +1327,36 @@ impl StreamManagerContext {
                                     let mut session_state = self.session_state;
                                     let planner_state = self.planner_state;
                                     dioxus::prelude::spawn(async move {
-                                        match connector.summarize_conversation(prev_summary, recent).await {
+                                        match connector
+                                            .summarize_conversation(prev_summary, recent)
+                                            .await
+                                        {
                                             Ok(summary_json) => {
-                                                if let Ok(summary) = serde_json::from_value::<crate::session::ConversationSummary>(summary_json) {
+                                                if let Ok(summary) = serde_json::from_value::<
+                                                    crate::session::ConversationSummary,
+                                                >(
+                                                    summary_json
+                                                ) {
                                                     tracing::info!(session_id = %session_id_clone, "Proactive summary updated (background)");
-                                                    let summary_value = serde_json::to_value(&summary)
-                                                        .unwrap_or(serde_json::Value::Null);
+                                                    let summary_value =
+                                                        serde_json::to_value(&summary)
+                                                            .unwrap_or(serde_json::Value::Null);
                                                     {
                                                         let mut state = session_state.write();
-                                                        if let Some(session) = state.sessions.get_mut(&session_id_clone) {
-                                                            session.active_context.conversation_summary = summary;
+                                                        if let Some(session) = state
+                                                            .sessions
+                                                            .get_mut(&session_id_clone)
+                                                        {
+                                                            session
+                                                                .active_context
+                                                                .conversation_summary = summary;
                                                         }
                                                     }
                                                     log_event(
                                                         &session_id_clone,
-                                                        SessionEvent::SummaryComputed { summary: summary_value },
+                                                        SessionEvent::SummaryComputed {
+                                                            summary: summary_value,
+                                                        },
                                                     );
                                                     // Fresh summary → maybe auto-tag the
                                                     // session to a planner project.
@@ -1290,7 +1367,9 @@ impl StreamManagerContext {
                                                     );
                                                 }
                                             }
-                                            Err(e) => tracing::warn!(session_id = %session_id_clone, "Proactive summarization failed: {}", e),
+                                            Err(e) => {
+                                                tracing::warn!(session_id = %session_id_clone, "Proactive summarization failed: {}", e)
+                                            }
                                         }
                                         summarizing_sessions.write().remove(&session_id_clone);
                                     });
@@ -1304,11 +1383,24 @@ impl StreamManagerContext {
 
                 // Check turn limit BEFORE triggering continuation.
                 // Without this gate the AI continuation loop runs indefinitely.
-                let turn_count = self.session_state.read().sessions.get(&session_id)
-                    .map(|s| s.current_ai_turn_count).unwrap_or(0);
-                if self.permission_manager.read().is_turn_limit_reached_for(turn_count) {
+                let turn_count = self
+                    .session_state
+                    .read()
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.current_ai_turn_count)
+                    .unwrap_or(0);
+                if self
+                    .permission_manager
+                    .read()
+                    .is_turn_limit_reached_for(turn_count)
+                {
                     let max_turns = self.settings.read().permission_settings.max_ai_turns;
-                    tracing::info!(session_id, "Turn limit reached ({} turns). Halting continuation.", max_turns);
+                    tracing::info!(
+                        session_id,
+                        "Turn limit reached ({} turns). Halting continuation.",
+                        max_turns
+                    );
                     let warning_msg = format!(
                         "Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.",
                         max_turns
@@ -1333,18 +1425,28 @@ impl StreamManagerContext {
                             session.messages.push(warning_message.clone());
                         }
                     }
-                    log_event(&session_id, SessionEvent::AssistantMessage { message: warning_message });
+                    log_event(
+                        &session_id,
+                        SessionEvent::AssistantMessage {
+                            message: warning_message,
+                        },
+                    );
                     return; // Stop — user must send a message to reset and continue.
                 }
 
-                self.continuation_controller.write().trigger_continuation(session_id.clone());
+                self.continuation_controller
+                    .write()
+                    .trigger_continuation(session_id.clone());
                 return; // End this stream task. The continuation will start a new one.
             }
 
             // If we reach here, it means tool_call_count was 0.
             // Before finalizing the turn, check for watch word matches
             // that indicate the model stalled mid-response (OpenAI-compat only).
-            if self.check_watch_word_recovery(&session_id, &final_text_for_this_turn, &message_id).await {
+            if self
+                .check_watch_word_recovery(&session_id, &final_text_for_this_turn, &message_id)
+                .await
+            {
                 return; // Watch word recovery triggered continuation — end this stream task.
             }
 
@@ -1355,8 +1457,13 @@ impl StreamManagerContext {
                 if let Some(recovery_config) = self.watch_word_config(&session_id) {
                     let max_recoveries = recovery_config.max_watch_word_recoveries;
 
-                    let recovery_count = self.session_state.read().sessions.get(&session_id)
-                        .map(|s| s.watch_word_recovery_count).unwrap_or(0);
+                    let recovery_count = self
+                        .session_state
+                        .read()
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| s.watch_word_recovery_count)
+                        .unwrap_or(0);
 
                     if recovery_count < max_recoveries {
                         tracing::info!(
@@ -1393,25 +1500,47 @@ impl StreamManagerContext {
                                     session.increment_turn_count();
                                 }
                             }
-                            log_event(&session_id, SessionEvent::UserMessage { message: recovery_message });
+                            log_event(
+                                &session_id,
+                                SessionEvent::UserMessage {
+                                    message: recovery_message,
+                                },
+                            );
                         }
 
                         // Check turn limit before triggering continuation
-                        let turn_count = self.session_state.read().sessions.get(&session_id)
-                            .map(|s| s.current_ai_turn_count).unwrap_or(0);
-                        if self.permission_manager.read().is_turn_limit_reached_for(turn_count) {
-                            tracing::info!(session_id, "Stream error recovery halted: turn limit reached.");
+                        let turn_count = self
+                            .session_state
+                            .read()
+                            .sessions
+                            .get(&session_id)
+                            .map(|s| s.current_ai_turn_count)
+                            .unwrap_or(0);
+                        if self
+                            .permission_manager
+                            .read()
+                            .is_turn_limit_reached_for(turn_count)
+                        {
+                            tracing::info!(
+                                session_id,
+                                "Stream error recovery halted: turn limit reached."
+                            );
                         } else {
                             // Clean up current stream state before triggering retry.
                             self.active_stream_handles.write().remove(&message_id);
                             self.content_generated.write().remove(&message_id);
                             self.stream_session_map.write().remove(&message_id);
-                            crate::session::SessionState::save_async(&self.session_state.read(), None);
+                            crate::session::SessionState::save_async(
+                                &self.session_state.read(),
+                                None,
+                            );
                             on_complete();
                             self.streaming_sessions.write().remove(&session_id);
                             *self.stream_activity.write() += 1;
 
-                            self.continuation_controller.write().trigger_continuation(session_id.clone());
+                            self.continuation_controller
+                                .write()
+                                .trigger_continuation(session_id.clone());
                             return; // End this stream task. Continuation will retry.
                         }
                     } else {
@@ -1432,22 +1561,26 @@ impl StreamManagerContext {
             // double-counting that would occur if we recorded on every SSE chunk.
             {
                 let state = self.session_state.read();
-                if let Some(msg) = state.sessions.get(&session_id)
+                if let Some(msg) = state
+                    .sessions
+                    .get(&session_id)
                     .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
                 {
                     if let Some(usage) = &msg.usage {
                         let model = self.effective_model(&session_id);
-                        self.usage_log.write().record(crate::usage_log::UsageLogEntry {
-                            timestamp: chrono::Utc::now(),
-                            session_id: session_id.clone(),
-                            model,
-                            prompt_tokens: usage.prompt_tokens,
-                            completion_tokens: usage.completion_tokens,
-                            total_tokens: usage.total_tokens,
-                            thoughts_tokens: usage.thoughts_tokens,
-                            cached_content_tokens: usage.cached_content_tokens,
-                            cost: usage.cost,
-                        });
+                        self.usage_log
+                            .write()
+                            .record(crate::usage_log::UsageLogEntry {
+                                timestamp: chrono::Utc::now(),
+                                session_id: session_id.clone(),
+                                model,
+                                prompt_tokens: usage.prompt_tokens,
+                                completion_tokens: usage.completion_tokens,
+                                total_tokens: usage.total_tokens,
+                                thoughts_tokens: usage.thoughts_tokens,
+                                cached_content_tokens: usage.cached_content_tokens,
+                                cost: usage.cost,
+                            });
                     }
                 }
             }
@@ -1478,7 +1611,10 @@ impl StreamManagerContext {
             self.streaming_sessions.write().remove(&session_id);
             *self.stream_activity.write() += 1; // Notify TabBar: stream ended
             self.scheduler.send(SchedulerSignal::Activity);
-            self.fleet_report(&session_id, crate::fleet::bridge::HobbesSignal::TurnCompleted);
+            self.fleet_report(
+                &session_id,
+                crate::fleet::bridge::HobbesSignal::TurnCompleted,
+            );
             tracing::info!(message_id = %message_id, "Completion signal SENT.");
 
             // Remove the handle from the map upon completion
@@ -1500,11 +1636,7 @@ impl StreamManagerContext {
     /// the facts in context. The size threshold is the provider's historical
     /// per-result budget, so on a large window (where results stay full anyway)
     /// few or no summaries are generated and no tokens are wasted.
-    fn spawn_tool_result_summaries(
-        &self,
-        session_id: &str,
-        settings: &crate::settings::Settings,
-    ) {
+    fn spawn_tool_result_summaries(&self, session_id: &str, settings: &crate::settings::Settings) {
         let pending = {
             let state = self.session_state.read();
             let Some(session) = state.sessions.get(session_id) else {
@@ -1613,8 +1745,13 @@ impl StreamManagerContext {
             return false;
         }
 
-        let recovery_count = self.session_state.read().sessions.get(session_id)
-            .map(|s| s.watch_word_recovery_count).unwrap_or(0);
+        let recovery_count = self
+            .session_state
+            .read()
+            .sessions
+            .get(session_id)
+            .map(|s| s.watch_word_recovery_count)
+            .unwrap_or(0);
 
         if recovery_count >= max_recoveries {
             if watch_words.iter().any(|ww| ww.matches(final_text)) {
@@ -1684,10 +1821,22 @@ impl StreamManagerContext {
         }
 
         // Check turn limit before triggering continuation
-        let turn_count = self.session_state.read().sessions.get(session_id)
-            .map(|s| s.current_ai_turn_count).unwrap_or(0);
-        if self.permission_manager.read().is_turn_limit_reached_for(turn_count) {
-            tracing::info!(session_id, "Watch word recovery halted: turn limit reached.");
+        let turn_count = self
+            .session_state
+            .read()
+            .sessions
+            .get(session_id)
+            .map(|s| s.current_ai_turn_count)
+            .unwrap_or(0);
+        if self
+            .permission_manager
+            .read()
+            .is_turn_limit_reached_for(turn_count)
+        {
+            tracing::info!(
+                session_id,
+                "Watch word recovery halted: turn limit reached."
+            );
             return false;
         }
 
@@ -1699,7 +1848,9 @@ impl StreamManagerContext {
         self.streaming_sessions.write().remove(session_id);
         *self.stream_activity.write() += 1;
 
-        self.continuation_controller.write().trigger_continuation(session_id.to_string());
+        self.continuation_controller
+            .write()
+            .trigger_continuation(session_id.to_string());
         true
     }
 
@@ -1723,10 +1874,14 @@ impl StreamManagerContext {
             let mut state = self.session_state.write();
 
             // Check if the AI message has any content worth preserving.
-            let has_content = state.sessions.get(session_id)
+            let has_content = state
+                .sessions
+                .get(session_id)
                 .and_then(|s| s.messages.iter().find(|m| m.id == *message_id))
                 .map(|msg| {
-                    if let crate::components::shared::MessageContent::Text { content, .. } = &msg.content {
+                    if let crate::components::shared::MessageContent::Text { content, .. } =
+                        &msg.content
+                    {
                         !content.trim().is_empty()
                     } else {
                         false
@@ -1795,7 +1950,10 @@ impl StreamManagerContext {
         if partial_message.is_some() || !removed_message_ids.is_empty() {
             log_event(
                 session_id,
-                SessionEvent::StreamCancelled { partial_message, removed_message_ids },
+                SessionEvent::StreamCancelled {
+                    partial_message,
+                    removed_message_ids,
+                },
             );
         }
 
@@ -1809,7 +1967,10 @@ impl StreamManagerContext {
         self.streaming_sessions.write().remove(session_id);
         *self.stream_activity.write() += 1; // Notify TabBar: stream cancelled
         self.stream_session_map.write().remove(message_id);
-        self.fleet_report(session_id, crate::fleet::bridge::HobbesSignal::TurnCompleted);
+        self.fleet_report(
+            session_id,
+            crate::fleet::bridge::HobbesSignal::TurnCompleted,
+        );
         tracing::info!(message_id = %message_id, "Stream cancellation process complete.");
     }
 
@@ -1852,7 +2013,8 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         skill_registry: consume_context::<Signal<crate::skills::SkillRegistry>>(),
         mcp_context: consume_context::<Signal<crate::mcp::manager::McpContext>>(),
         planner_state: consume_context::<Signal<crate::todo::PlannerState>>(),
-        chat_command: consume_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>(),
+        chat_command: consume_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>(
+        ),
         stream_activity: Signal::new(0),
         streaming_sessions: Signal::new(HashSet::new()),
         stream_session_map: Signal::new(HashMap::new()),
