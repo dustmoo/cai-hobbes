@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::components::activity_stream::{group_turn_runs, ActivityStream};
+use crate::components::activity_stream::{group_turn_runs, run_header_provenance, ActivityStream};
 use crate::components::tool_call_display::{PermissionPrompt, ToolCallDisplay};
 
 use super::chat::{MessageBubble, WelcomeMessage};
@@ -57,8 +57,11 @@ pub fn MessageList(
             .unwrap_or_default()
     };
 
-    // Header provenance for activity blocks. Captured at render time; see the
-    // TODO on ActivityStreamProps about recording it at turn start instead.
+    // Fallback header provenance for activity blocks: the session's CURRENT
+    // pins. Used only for legacy runs whose messages predate turn-time
+    // stamping (see `run_header_provenance`, which prefers each run's own
+    // stamped tool calls so a later profile/connector switch doesn't
+    // relabel finished turns).
     let (profile_name, connector_label) = {
         let state = session_state.read();
         let settings_read = settings.read();
@@ -245,15 +248,23 @@ pub fn MessageList(
                                                     MessageContent::Text { content, .. } if !content.trim().is_empty()
                                                 ));
                                             let block_key = run_msgs[0].id;
+                                            let (run_profile_name, run_profile_color, run_connector_label) =
+                                                run_header_provenance(
+                                                    &run_msgs,
+                                                    &settings.read(),
+                                                    &profile_name,
+                                                    &profile_color,
+                                                    &connector_label,
+                                                );
                                             rsx! {
                                                 ActivityStream {
                                                     key: "{block_key}",
                                                     messages: run_msgs,
                                                     session_id: session_id.clone(),
                                                     is_live: is_live,
-                                                    profile_color: profile_color.clone(),
-                                                    profile_name: profile_name.clone(),
-                                                    connector_label: connector_label.clone(),
+                                                    profile_color: run_profile_color,
+                                                    profile_name: run_profile_name,
+                                                    connector_label: run_connector_label,
                                                     on_stop: move |_| on_stop.call(()),
                                                 }
                                             }

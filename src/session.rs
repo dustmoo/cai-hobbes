@@ -312,11 +312,7 @@ impl Session {
             .filter(|m| m.author == "Hobbes")
             .count() as f64;
 
-        if turns > 0.0 {
-            tokens / turns
-        } else {
-            0.0
-        }
+        if turns > 0.0 { tokens / turns } else { 0.0 }
     }
 }
 
@@ -622,8 +618,8 @@ impl SessionState {
     ) -> (crate::components::shared::ToolCallStatus, String) {
         use crate::components::shared::ToolCallStatus;
         use crate::timers::{
-            parse_duration_secs, ScheduledTimer, TimerMode, TimerStatus, MAX_DELAY_SECS,
-            MIN_DELAY_SECS,
+            MAX_DELAY_SECS, MIN_DELAY_SECS, ScheduledTimer, TimerMode, TimerStatus,
+            parse_duration_secs,
         };
 
         // Delay accepts either `delay_secs` (integer) or `delay` ("10m", "1h30m").
@@ -665,7 +661,7 @@ impl SessionState {
                 return (
                     ToolCallStatus::Error,
                     format!("Unknown mode '{}'. Use 'notify' or 'prompt'.", other),
-                )
+                );
             }
         };
         let prompt = args_json
@@ -2164,6 +2160,9 @@ mod tests {
                         cached_image_path: None,
                         result_summary: None,
                         completed_at: None,
+                        profile_id: None,
+                        connector_name: None,
+                        model: None,
                     }),
                     attachments: vec![],
                     comments: vec![],
@@ -2186,6 +2185,9 @@ mod tests {
                         cached_image_path: None,
                         result_summary: None,
                         completed_at: None,
+                        profile_id: None,
+                        connector_name: None,
+                        model: None,
                     }),
                     attachments: vec![],
                     comments: vec![],
@@ -2237,11 +2239,13 @@ mod tests {
         );
 
         assert_eq!(session.active_context.extra.len(), 3);
-        assert!(!session
-            .active_context
-            .conversation_summary
-            .summary
-            .is_empty());
+        assert!(
+            !session
+                .active_context
+                .conversation_summary
+                .summary
+                .is_empty()
+        );
 
         // Undo: delete msg2 and everything after (msg2, msg3, msg4)
         let deleted = session.delete_message_and_after(&msg2_id.to_string());

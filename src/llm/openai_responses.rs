@@ -534,7 +534,7 @@ impl LlmConnector for OpenAiResponsesConnector {
                 if !pc.call_id.is_empty() {
                     call.execution_id = pc.call_id;
                 }
-                let _ = tx.send(StreamMessage::ToolCall(call));
+                let _ = tx.send(StreamMessage::ToolCall(Box::new(call)));
             }
         };
 

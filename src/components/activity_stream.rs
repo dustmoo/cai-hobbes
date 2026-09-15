@@ -217,13 +217,46 @@ pub fn first_string_arg(arguments: &str, max_chars: usize) -> Option<String> {
 }
 
 /// First sentence of a thinking summary, for a one-line thinking row.
+/// Markdown is stripped first (see [`plain_text`]) so a summary opening with
+/// bold/heading/list markup doesn't leave literal `**`/`#`/`- ` in the row.
 pub fn first_sentence(text: &str, max_chars: usize) -> String {
+    let text = plain_text(text);
     let text = text.trim();
     let end = text
         .find(['.', '!', '?', '\n'])
         .map(|i| i + 1)
         .unwrap_or(text.len());
     truncate_chars(text[..end].trim(), max_chars)
+}
+
+/// Strip lightweight markdown that would otherwise show up as literal
+/// punctuation in a one-line label: `**bold**`/`__bold__`/`` `code` ``
+/// wrappers around words, leading/trailing `*`/`_`/`#`/backtick runs, and a
+/// leading list marker (`- `, `* `, `1. `). Applied to thinking labels only —
+/// tool labels are already rendered in a mono font and don't carry markdown.
+pub fn plain_text(s: &str) -> String {
+    let mut s = s.trim();
+
+    // Leading list marker: "- ", "* ", or "1. " / "12. " etc.
+    if let Some(rest) = s.strip_prefix("- ").or_else(|| s.strip_prefix("* ")) {
+        s = rest;
+    } else if let Some(dot) = s.find(". ") {
+        if !s[..dot].is_empty() && s[..dot].chars().all(|c| c.is_ascii_digit()) {
+            s = &s[dot + 2..];
+        }
+    }
+
+    // Leading heading markers ("## Heading").
+    let s = s.trim_start_matches('#').trim_start();
+
+    // Bold/emphasis wrappers can appear anywhere in the (already
+    // first-sentence-trimmed) text, not just wrapping the whole string — so
+    // strip the marker pairs globally rather than only at the edges.
+    let s = s.replace("**", "").replace("__", "").replace('`', "");
+
+    s.trim()
+        .trim_matches(|c: char| matches!(c, '*' | '_' | '#'))
+        .to_string()
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -368,6 +401,59 @@ pub fn row_counts(rows: &[StepRow]) -> (usize, usize, usize, usize) {
     (steps, commands, todos, failed)
 }
 
+/// Header provenance for a run: profile name, profile colour class, and the
+/// `"{connector} {model}"` label — resolved from the FIRST tool-call or
+/// permission-request message in the run that carries turn-time stamps (see
+/// `ToolCall::with_turn_provenance`). This is what keeps a finished turn's
+/// label stable across a later profile/connector switch: the block reads
+/// what it actually ran under, not the session's current pins.
+///
+/// Falls back to the session's *current* pins (`fallback_*`) for legacy runs
+/// that predate stamping, where nothing in the run carries provenance.
+pub fn run_header_provenance(
+    messages: &[Message],
+    settings: &crate::settings::Settings,
+    fallback_profile_name: &str,
+    fallback_profile_color: &str,
+    fallback_connector_label: &str,
+) -> (String, String, String) {
+    let stamped = messages.iter().find_map(|m| {
+        let tc = match &m.content {
+            MessageContent::ToolCall(tc) | MessageContent::PermissionRequest(tc) => Some(tc),
+            _ => None,
+        }?;
+        (tc.profile_id.is_some() || tc.connector_name.is_some() || tc.model.is_some()).then(|| {
+            (
+                tc.profile_id.clone(),
+                tc.connector_name.clone(),
+                tc.model.clone(),
+            )
+        })
+    });
+
+    match stamped {
+        Some((profile_id, connector_name, model)) => {
+            let profile = profile_id
+                .as_ref()
+                .and_then(|id| settings.composio_profiles.iter().find(|p| &p.id == id));
+            let name = profile
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| fallback_profile_name.to_string());
+            let color = profile
+                .map(|p| p.color.clone())
+                .unwrap_or_else(|| fallback_profile_color.to_string());
+            let connector = connector_name.unwrap_or_else(|| "no connector".to_string());
+            let model = model.unwrap_or_default();
+            (name, color, format!("{connector} {model}"))
+        }
+        None => (
+            fallback_profile_name.to_string(),
+            fallback_profile_color.to_string(),
+            fallback_connector_label.to_string(),
+        ),
+    }
+}
+
 // ============================================================================
 // Component
 // ============================================================================
@@ -387,12 +473,15 @@ pub struct ActivityStreamProps {
     pub session_id: String,
     /// The turn is still in flight: header ticks, block stays expanded.
     pub is_live: bool,
-    /// Tailwind bg class of the session's Composio profile, painted as the
+    /// Tailwind bg class of this run's provenance profile, painted as the
     /// block's 3px left edge (border-color utilities don't exist for it).
+    /// Resolved by the caller via [`run_header_provenance`], so it reflects
+    /// the profile pinned when the turn actually ran, not the session's
+    /// current pins.
     pub profile_color: String,
-    /// Header provenance, captured at render time.
-    // TODO: record the profile/connector/model at turn *start* so a mid-session
-    // switch doesn't relabel finished turns.
+    /// Header provenance for this run, resolved by the caller via
+    /// [`run_header_provenance`] from the run's own stamped tool calls
+    /// (falling back to the session's current pins for legacy history).
     pub profile_name: String,
     pub connector_label: String,
     pub on_stop: EventHandler<()>,
@@ -863,6 +952,9 @@ mod tests {
             cached_image_path: None,
             result_summary: None,
             completed_at: None,
+            profile_id: None,
+            connector_name: None,
+            model: None,
         }
     }
 
@@ -1160,5 +1252,132 @@ mod tests {
     fn first_sentence_stops_at_punctuation() {
         assert_eq!(first_sentence("One. Two. Three.", 200), "One.");
         assert_eq!(first_sentence("no punctuation", 200), "no punctuation");
+    }
+
+    // ---- plain_text (markdown stripping for thinking labels) ----
+
+    #[test]
+    fn plain_text_strips_bold_and_inline_code() {
+        assert_eq!(plain_text("**Data** is `here`"), "Data is here");
+    }
+
+    #[test]
+    fn plain_text_strips_leading_list_marker() {
+        assert_eq!(plain_text("- do the thing"), "do the thing");
+    }
+
+    #[test]
+    fn plain_text_strips_leading_heading() {
+        assert_eq!(plain_text("## Heading"), "Heading");
+    }
+
+    #[test]
+    fn plain_text_leaves_plain_prose_unchanged() {
+        assert_eq!(
+            plain_text("Just a normal sentence."),
+            "Just a normal sentence."
+        );
+    }
+
+    #[test]
+    fn first_sentence_strips_markdown_before_truncating() {
+        // Regression: a thinking summary opening with markdown bold used to
+        // render the literal "**" in the row (seen as "**Da…").
+        assert_eq!(
+            first_sentence("**Data** looks stale. Refetching.", 200),
+            "Data looks stale."
+        );
+    }
+
+    // ---- run_header_provenance ----
+
+    fn tool_with_provenance(
+        profile_id: Option<&str>,
+        connector_name: Option<&str>,
+        model: Option<&str>,
+    ) -> ToolCall {
+        let mut tc = tool("srv", "A", "{}", ToolCallStatus::Completed);
+        tc.profile_id = profile_id.map(str::to_string);
+        tc.connector_name = connector_name.map(str::to_string);
+        tc.model = model.map(str::to_string);
+        tc
+    }
+
+    fn settings_with_profile(id: &str, name: &str, color: &str) -> crate::settings::Settings {
+        let mut settings = crate::settings::Settings::default();
+        settings
+            .composio_profiles
+            .push(crate::settings::ComposioProfile {
+                id: id.to_string(),
+                name: name.to_string(),
+                base_url: None,
+                entity_id: None,
+                user_id: None,
+                api_key: None,
+                toolkit_configs: vec![],
+                color: color.to_string(),
+                chrome_profile_directory: None,
+                retained_curation: Default::default(),
+            });
+        settings
+    }
+
+    #[test]
+    fn stamped_run_uses_its_own_provenance_over_the_session_pin() {
+        let settings = settings_with_profile("p2", "Work", "bg-orange-600");
+        let messages = vec![tool_msg(tool_with_provenance(
+            Some("p2"),
+            Some("Claude work"),
+            Some("claude-fable-5-1"),
+        ))];
+        let (name, color, label) = run_header_provenance(
+            &messages,
+            &settings,
+            "Personal",
+            "bg-blue-600",
+            "Gemini work gemini-3-pro",
+        );
+        assert_eq!(name, "Work");
+        assert_eq!(color, "bg-orange-600");
+        assert_eq!(label, "Claude work claude-fable-5-1");
+    }
+
+    #[test]
+    fn unstamped_legacy_run_falls_back_to_the_session_pin() {
+        let settings = crate::settings::Settings::default();
+        let messages = vec![tool_msg(tool("srv", "A", "{}", ToolCallStatus::Completed))];
+        let (name, color, label) = run_header_provenance(
+            &messages,
+            &settings,
+            "Personal",
+            "bg-blue-600",
+            "Gemini work gemini-3-pro",
+        );
+        assert_eq!(name, "Personal");
+        assert_eq!(color, "bg-blue-600");
+        assert_eq!(label, "Gemini work gemini-3-pro");
+    }
+
+    #[test]
+    fn run_uses_the_later_stamp_when_the_first_message_is_unstamped() {
+        let settings = settings_with_profile("p2", "Work", "bg-orange-600");
+        let messages = vec![
+            tool_msg(tool("srv", "A", "{}", ToolCallStatus::Completed)),
+            tool_msg(tool_with_provenance(
+                Some("p2"),
+                Some("Claude work"),
+                Some("claude-fable-5-1"),
+            )),
+        ];
+        let (name, color, label) = run_header_provenance(
+            &messages,
+            &settings,
+            "Personal",
+            "bg-blue-600",
+            "Gemini work gemini-3-pro",
+        );
+        assert_eq!(name, "Work");
+        assert_eq!(color, "bg-orange-600");
+        assert_eq!(label, "Claude work claude-fable-5-1");
     }
 }

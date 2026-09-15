@@ -149,6 +149,21 @@ pub struct ToolCall {
     /// stream. `None` on legacy rows and on calls still in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The session's pinned Composio profile id at the moment this call was
+    /// minted. Paired with `connector_name`/`model` below, this is what lets
+    /// the activity stream label a finished turn with the provenance it
+    /// actually ran under, instead of the session's *current* pins (which may
+    /// have since changed). `None` on legacy rows and when no profile was
+    /// pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// The resolved connector instance's display name at turn time (see
+    /// `StreamManagerContext::effective_connector`). `None` on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_name: Option<String>,
+    /// The effective chat model at turn time. `None` on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 pub enum StreamMessage {
@@ -157,7 +172,10 @@ pub enum StreamMessage {
         thought_signature: Option<String>,
         thought_summary: Option<String>,
     },
-    ToolCall(ToolCall),
+    // Boxed: `ToolCall` carries several inline `String`/`Option<String>`
+    // fields (provenance stamps included) and is far larger than the other
+    // variants — boxing keeps `StreamMessage` itself small to pass around.
+    ToolCall(Box<ToolCall>),
     Error {
         message: String,
     },
@@ -200,6 +218,9 @@ impl ToolCall {
             cached_image_path: None,
             result_summary: None,
             completed_at: None,
+            profile_id: None,
+            connector_name: None,
+            model: None,
         }
     }
 
@@ -213,6 +234,22 @@ impl ToolCall {
     /// connector) chain this on afterwards.
     pub fn with_signature_provider(mut self, provider: crate::settings::LlmProvider) -> Self {
         self.signature_provider = self.thought_signature.is_some().then_some(provider);
+        self
+    }
+
+    /// Stamp turn-time provenance (profile / connector / model) onto a tool
+    /// call as it's minted, so the activity stream can label a finished turn
+    /// with what it actually ran under rather than the session's current
+    /// pins. Called alongside `with_signature_provider` in `stream_manager`.
+    pub fn with_turn_provenance(
+        mut self,
+        profile_id: Option<String>,
+        connector_name: Option<String>,
+        model: Option<String>,
+    ) -> Self {
+        self.profile_id = profile_id;
+        self.connector_name = connector_name;
+        self.model = model;
         self
     }
 }
@@ -429,6 +466,48 @@ mod signature_provider_tests {
         let json = serde_json::to_value(&tc).expect("serialize");
         let round_tripped: ToolCall = serde_json::from_value(json).expect("deserialize");
         assert_eq!(round_tripped.signature_provider, Some(LlmProvider::Claude));
+    }
+
+    /// A legacy `ToolCall` JSON row (predates `profile_id`/`connector_name`/
+    /// `model`) must still deserialize, with all three defaulting to `None`.
+    #[test]
+    fn legacy_tool_call_json_deserializes_with_none_provenance() {
+        let legacy_json = serde_json::json!({
+            "execution_id": "exec-1",
+            "server_name": "srv",
+            "tool_name": "tool",
+            "arguments": "{}",
+            "status": "Completed",
+            "response": "ok",
+        });
+        let tc: ToolCall =
+            serde_json::from_value(legacy_json).expect("legacy ToolCall should deserialize");
+        assert_eq!(tc.profile_id, None);
+        assert_eq!(tc.connector_name, None);
+        assert_eq!(tc.model, None);
+    }
+
+    /// A stamped `ToolCall` round-trips its turn provenance through serde.
+    #[test]
+    fn stamped_tool_call_round_trips_turn_provenance() {
+        let tc = ToolCall::new(
+            "srv".to_string(),
+            "tool".to_string(),
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .with_turn_provenance(
+            Some("p2".to_string()),
+            Some("Claude work".to_string()),
+            Some("claude-fable-5-1".to_string()),
+        );
+
+        let json = serde_json::to_value(&tc).expect("serialize");
+        let round_tripped: ToolCall = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped.profile_id.as_deref(), Some("p2"));
+        assert_eq!(round_tripped.connector_name.as_deref(), Some("Claude work"));
+        assert_eq!(round_tripped.model.as_deref(), Some("claude-fable-5-1"));
     }
 
     /// A legacy `MessageContent::Text` JSON row (predates `signature_provider`)

@@ -169,7 +169,7 @@ impl LlmConnector for ClaudeConnector {
                         tool_call.tool_name,
                         tool_call.server_name
                     );
-                    let _ = tx.send(StreamMessage::ToolCall(tool_call));
+                    let _ = tx.send(StreamMessage::ToolCall(Box::new(tool_call)));
                 }
             };
 

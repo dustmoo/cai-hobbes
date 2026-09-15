@@ -92,6 +92,9 @@ mod tests {
                     cached_image_path: None,
                     result_summary: None,
                     completed_at: None,
+                    profile_id: None,
+                    connector_name: None,
+                    model: None,
                 },
                 result: ToolResult {
                     status: ToolCallStatus::Completed,
@@ -126,18 +129,22 @@ mod tests {
 
         // First 10 should be evicted: "tool_snapshot_exec_0" through "tool_snapshot_exec_9" should NOT exist.
         for i in 0..10 {
-            assert!(!session_ref
-                .active_context
-                .extra
-                .contains_key(&format!("tool_snapshot_exec_{}", i)));
+            assert!(
+                !session_ref
+                    .active_context
+                    .extra
+                    .contains_key(&format!("tool_snapshot_exec_{}", i))
+            );
         }
 
         // Latest 20 should survive: "tool_snapshot_exec_10" through "tool_snapshot_exec_29" should exist.
         for i in 10..30 {
-            assert!(session_ref
-                .active_context
-                .extra
-                .contains_key(&format!("tool_snapshot_exec_{}", i)));
+            assert!(
+                session_ref
+                    .active_context
+                    .extra
+                    .contains_key(&format!("tool_snapshot_exec_{}", i))
+            );
         }
     }
 
@@ -165,6 +172,9 @@ mod tests {
                 cached_image_path: None,
                 result_summary: None,
                 completed_at: None,
+                profile_id: None,
+                connector_name: None,
+                model: None,
             },
             result: ToolResult {
                 status: ToolCallStatus::Completed,
@@ -192,20 +202,26 @@ mod tests {
             .await;
 
         // A drained into snapshots; B untouched and still in flight.
-        assert!(session_state.sessions[&session_a]
-            .tool_call_history
-            .is_empty());
-        assert!(session_state.sessions[&session_a]
-            .active_context
-            .extra
-            .contains_key("tool_snapshot_exec_a_tool"));
+        assert!(
+            session_state.sessions[&session_a]
+                .tool_call_history
+                .is_empty()
+        );
+        assert!(
+            session_state.sessions[&session_a]
+                .active_context
+                .extra
+                .contains_key("tool_snapshot_exec_a_tool")
+        );
         assert_eq!(
             session_state.sessions[&session_b].tool_call_history.len(),
             1
         );
-        assert!(!session_state.sessions[&session_b]
-            .active_context
-            .extra
-            .contains_key("tool_snapshot_exec_b_tool"));
+        assert!(
+            !session_state.sessions[&session_b]
+                .active_context
+                .extra
+                .contains_key("tool_snapshot_exec_b_tool")
+        );
     }
 }

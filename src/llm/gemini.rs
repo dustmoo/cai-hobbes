@@ -1691,7 +1691,9 @@ impl LlmConnector for GeminiConnector {
                                                     signature.clone(),
                                                     None,
                                                 );
-                                                let _ = tx.send(StreamMessage::ToolCall(tool_call));
+                                                let _ = tx.send(StreamMessage::ToolCall(Box::new(
+                                                    tool_call,
+                                                )));
                                             }
                                         } else {
                                             // Tool not found in mcp_context - send user-friendly error

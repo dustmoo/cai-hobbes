@@ -254,6 +254,12 @@ impl StreamManagerContext {
         // assembled messages/tool calls below can be stamped with provenance
         // (see `signature_provider` on MessageContent::Text / ToolCall).
         let stream_provider = self.resolved_provider(&session_id);
+        // Resolve the connector name / model this turn is actually running
+        // under, so minted tool calls can be stamped with turn-time
+        // provenance (see `ToolCall::with_turn_provenance`) — history that a
+        // later profile/connector switch must not relabel.
+        let stream_connector_name = self.effective_connector(&session_id).map(|inst| inst.name);
+        let stream_model = self.effective_model(&session_id);
 
         // Spawn a master task to manage the LLM call and state updates.
         let master_task_handle = spawn(async move {
@@ -527,7 +533,12 @@ impl StreamManagerContext {
                         stream_error_occurred = true;
                         break;
                     }
-                    StreamMessage::ToolCall(mut tool_call) => {
+                    StreamMessage::ToolCall(tool_call_box) => {
+                        // Unbox immediately: `StreamMessage::ToolCall` boxes its
+                        // payload only to keep the enum itself small in transit;
+                        // everything downstream here still works with an owned
+                        // `ToolCall`.
+                        let mut tool_call = *tool_call_box;
                         // Mark as generated since we got a tool call
                         self.content_generated.write().insert(message_id);
 
@@ -591,6 +602,11 @@ impl StreamManagerContext {
                         // or propagated above), so a later mid-chat provider switch
                         // never replays it to an incompatible provider.
                         tool_call = tool_call.with_signature_provider(stream_provider);
+                        tool_call = tool_call.with_turn_provenance(
+                            profile_id.clone(),
+                            stream_connector_name.clone(),
+                            Some(stream_model.clone()),
+                        );
 
                         tool_call_count += 1;
                         let mut tool_call_snapshot: Option<crate::components::chat::Message> = None;
