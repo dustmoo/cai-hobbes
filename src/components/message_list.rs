@@ -308,7 +308,23 @@ pub fn MessageList(
                                                             }
                                                         }
                                                     } else {
-                                                        rsx! {}
+                                                        // Still needs a key: this iteration's root
+                                                        // must stay keyed like every sibling in the
+                                                        // list (Run blocks are keyed via
+                                                        // ActivityStream, other Single branches via
+                                                        // their own root element/component). Mixing
+                                                        // a keyed and unkeyed sibling makes Dioxus's
+                                                        // list diff treat the WHOLE list as unkeyed
+                                                        // (new_is_keyed is decided from item 0 only —
+                                                        // dioxus-core-0.6.3 src/diff/iterator.rs
+                                                        // diff_non_empty_fragment), which falls back
+                                                        // to diff_non_keyed_children's positional zip
+                                                        // and can hand a stale DOM slot to whatever
+                                                        // is live. `Fragment { key }` keeps the slot
+                                                        // keyed without adding a DOM node (so
+                                                        // `space-y-4` spacing on the list is
+                                                        // unaffected).
+                                                        rsx! { Fragment { key: "{message.id}" } }
                                                     }
                                                 },
                                                 MessageContent::ToolCall(tool_call) => {
