@@ -843,9 +843,6 @@ fn TodoRow(
     let session_state = use_context::<Signal<crate::session::SessionState>>();
     let mut chat_command =
         use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
-    // The same dependency bundle the model's built-in tools get, so the row's
-    // "Dispatch to a background agent" runs HOBBES_DISPATCH's own code path.
-    let builtin_ctx = crate::components::builtin_tools::builtin_ctx_from_tree();
     let mut editing = use_signal(|| false);
     let mut edit_buffer = use_signal(String::new);
     // U1.5: first click arms, second click deletes; leaving the row disarms.
@@ -1377,20 +1374,16 @@ fn TodoRow(
                                             move |evt: MouseEvent| {
                                                 evt.stop_propagation();
                                                 menu.set(None);
-                                                match crate::components::builtin_tools::dispatch_todo_to_background(
-                                                    builtin_ctx, &id, None,
-                                                ) {
-                                                    Ok(msg) => tracing::info!("planner: {msg}"),
-                                                    Err(e) => {
-                                                        tracing::error!("planner: dispatch failed: {e}");
-                                                        // Surface it where the
-                                                        // user is looking: the
-                                                        // todo's progress line.
-                                                        mutate_todo(planner, &id, |t| {
-                                                            t.latest_progress = Some(format!("Dispatch failed: {e}"))
-                                                        });
-                                                    }
-                                                }
+                                                // Routed through ChatCommand (handled in
+                                                // main.rs) rather than calling
+                                                // dispatch_todo_to_background directly: a
+                                                // row dispatch now gets a review chat tab
+                                                // first, which main.rs owns creating.
+                                                chat_command.set(Some(
+                                                    crate::components::chat_input::ChatCommand::DispatchTodoToAgent(
+                                                        id.clone(),
+                                                    ),
+                                                ));
                                             }
                                         },
                                         span { "Dispatch to a background agent" }

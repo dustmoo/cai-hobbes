@@ -102,6 +102,28 @@ fn drain_cancel_stream_requests() -> Vec<String> {
         .collect()
 }
 
+/// Parent session ids a landed dispatch continuation wants reopened in the
+/// tab strip. Written by the fleet drain loop's continuation block (a plain
+/// `spawn`ed task, which runs *before* `open_tabs` is declared later in
+/// `app()` and so cannot reference it directly — same reach problem as
+/// `STREAMING_SESSIONS`/`CANCEL_STREAM_REQUEST` above, same fix: a
+/// root-reachable `GlobalSignal`). Drained by the `ChatCommand` handler,
+/// which does have `open_tabs` in scope.
+static PENDING_TAB_REOPEN: GlobalSignal<std::collections::HashSet<String>> =
+    Signal::global(std::collections::HashSet::new);
+
+/// Drain `PENDING_TAB_REOPEN`, subscribing the caller to it. Same idiom as
+/// `drain_cancel_stream_requests`: the read (not the write) is what makes a
+/// later insert re-run the subscribed effect.
+fn drain_pending_tab_reopens() -> Vec<String> {
+    if PENDING_TAB_REOPEN.read().is_empty() {
+        return Vec::new();
+    }
+    std::mem::take(&mut *PENDING_TAB_REOPEN.write())
+        .into_iter()
+        .collect()
+}
+
 /// Show a timer toast and auto-clear it after a few seconds (unless a newer
 /// toast replaced it in the meantime). Avoids the reminder lingering forever.
 fn flash_timer_toast(msg: String) {
@@ -510,7 +532,24 @@ fn app() -> Element {
                         crate::components::chat_queue::QueuedMessage::new(text, Vec::new()),
                     );
                     crate::components::chat_queue::request_drain();
-                    flash_timer_toast(format!("🛰 {} finished — continuing the chat", todo_title));
+                    // The parent's tab may have been closed while the run was
+                    // in flight (or was never opened for a `claude_code`
+                    // dispatch from a planner row) — the resumed turn needs a
+                    // visible tab to show its activity in. `open_tabs` isn't
+                    // reachable from this task (see `PENDING_TAB_REOPEN`), so
+                    // park the id for the ChatCommand handler to reopen.
+                    PENDING_TAB_REOPEN
+                        .write()
+                        .insert(c.parent_session_id.clone());
+                    let parent_tab_name = session_state
+                        .peek()
+                        .sessions
+                        .get(&c.parent_session_id)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| c.session_name.clone());
+                    flash_timer_toast(format!(
+                        "🛰 {todo_title} finished — continuing the chat in \"{parent_tab_name}\""
+                    ));
                 }
             }
         });
@@ -2160,6 +2199,27 @@ fn app() -> Element {
     // Listens for global commands from hotkeys, menu, or child components
     use_effect(move || {
         let cmd_opt = chat_command.read().clone();
+
+        // Reopen tabs for continuations that landed while the parent was
+        // closed (or never opened, for a `claude_code` dispatch fired from
+        // a planner row) — see `PENDING_TAB_REOPEN`. Unconditional so this
+        // effect also re-runs whenever the global gains a new id, not only
+        // when `chat_command` itself changes.
+        let reopen_ids = drain_pending_tab_reopens();
+        if !reopen_ids.is_empty() {
+            let mut tabs = open_tabs.read().clone();
+            let mut changed = false;
+            for id in reopen_ids {
+                if !tabs.contains(&id) {
+                    tabs.push(id);
+                    changed = true;
+                }
+            }
+            if changed {
+                open_tabs.set(tabs);
+            }
+        }
+
         if let Some(cmd) = cmd_opt {
             tracing::debug!("App handling global ChatCommand: {:?}", cmd);
 
@@ -2388,6 +2448,126 @@ fn app() -> Element {
                     // clear ran first.
                     new_tab_fn();
                     pending_chat_seed.set(Some(text));
+                }
+                ChatCommand::DispatchTodoToAgent(todo_id) => {
+                    // A row dispatch gets a review chat: mirrors
+                    // StartTodoInChat/new_tab_fn's tab creation, but with no
+                    // seeded draft — Hobbes announces the hand-off itself —
+                    // and named/tagged after the todo before it's shown.
+                    let todo_snapshot = planner_state.peek().todo(&todo_id).cloned();
+                    if let Some(todo) = todo_snapshot {
+                        let title = todo.title.clone();
+
+                        planner_active.set(false);
+                        fleet_active.set(false);
+                        let new_id = session_state.write().create_session(active_profile_id());
+
+                        let session_name = crate::fleet::truncate_summary(&title, 60);
+                        session_state
+                            .write()
+                            .update_session_name(&new_id, session_name);
+
+                        {
+                            let mut state = session_state.write();
+                            if let Some(s) = state.sessions.get_mut(&new_id) {
+                                s.project_id = todo.project_id.clone();
+                                s.project_tag_user_set = true;
+                            }
+                        }
+                        crate::session_events::log_event(
+                            &new_id,
+                            crate::session_events::SessionEvent::ProjectTagged {
+                                project_id: todo.project_id.clone(),
+                                user_set: true,
+                            },
+                        );
+
+                        let intro_msg = crate::components::chat::Message {
+                            id: uuid::Uuid::new_v4(),
+                            author: "Hobbes".to_string(),
+                            content: crate::components::shared::MessageContent::Text {
+                                content: crate::fleet::dispatch_intro_text(&title),
+                                thought_signature: None,
+                                thought_summary: None,
+                                signature_provider: None,
+                            },
+                            attachments: Vec::new(),
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        {
+                            let mut state = session_state.write();
+                            if let Some(s) = state.sessions.get_mut(&new_id) {
+                                s.messages.push(intro_msg.clone());
+                            }
+                        }
+                        crate::session_events::log_event(
+                            &new_id,
+                            crate::session_events::SessionEvent::AssistantMessage {
+                                message: intro_msg,
+                            },
+                        );
+
+                        // Open + focus the tab (new_tab_fn's own sequence).
+                        let mut tabs = open_tabs.read().clone();
+                        tabs.push(new_id.clone());
+                        open_tabs.set(tabs.clone());
+                        active_tab_index.set(tabs.len() - 1);
+                        session_state.write().active_session_id = new_id.clone();
+                        current_session_id.set(new_id.clone());
+
+                        let dispatch_ctx = crate::components::builtin_tools::BuiltinToolCtx {
+                            session_state,
+                            settings,
+                            skill_registry,
+                            permission_manager,
+                            mcp_context,
+                            planner: planner_state,
+                            chat_command,
+                        };
+                        match crate::components::builtin_tools::dispatch_todo_to_background(
+                            dispatch_ctx,
+                            &todo_id,
+                            None,
+                            Some(new_id.clone()),
+                        ) {
+                            Ok(msg) => tracing::info!("dispatch: {msg}"),
+                            Err(e) => {
+                                tracing::error!("dispatch: dispatch_todo_to_background failed: {e}");
+                                let err_msg = crate::components::chat::Message {
+                                    id: uuid::Uuid::new_v4(),
+                                    author: "Hobbes".to_string(),
+                                    content: crate::components::shared::MessageContent::Error {
+                                        message: e,
+                                    },
+                                    attachments: Vec::new(),
+                                    comments: Vec::new(),
+                                    created_at: chrono::Utc::now(),
+                                    usage: None,
+                                };
+                                {
+                                    let mut state = session_state.write();
+                                    if let Some(s) = state.sessions.get_mut(&new_id) {
+                                        s.messages.push(err_msg.clone());
+                                    }
+                                }
+                                crate::session_events::log_event(
+                                    &new_id,
+                                    crate::session_events::SessionEvent::AssistantMessage {
+                                        message: err_msg,
+                                    },
+                                );
+                                // Leave the tab open — the error is visible
+                                // right there rather than only in the log.
+                            }
+                        }
+                        crate::session::SessionState::save_signal(&session_state, None);
+                    } else {
+                        tracing::warn!(
+                            "DispatchTodoToAgent: unknown todo id {todo_id}; nothing dispatched"
+                        );
+                    }
                 }
                 ChatCommand::TogglePlanner => {
                     // First invocation opens the tab and focuses it; afterwards

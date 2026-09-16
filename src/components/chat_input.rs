@@ -51,6 +51,12 @@ pub enum ChatCommand {
     /// effect; ChatInput's pending-seed consumer then fills the draft and
     /// lands the caret after the render that unhid the chat.
     StartTodoInChat(String),
+    /// "Dispatch to a background agent" from a planner row. Handled entirely
+    /// in main.rs: it opens a fresh review chat tab (named after the todo,
+    /// project-tagged, seeded with a Hobbes intro — no user draft), then
+    /// runs `dispatch_todo_to_background` with that tab as the parent so the
+    /// run's result continues the conversation when it finishes.
+    DispatchTodoToAgent(String),
     TriggerAiAnalysis,
     SwitchToSettingsTab(crate::settings::SettingsTab, Option<String>),
     SwitchTab(usize),
@@ -305,6 +311,7 @@ pub fn ChatInput(
                 | ChatCommand::TogglePlanner
                 | ChatCommand::ToggleFleet
                 | ChatCommand::StartTodoInChat(_)
+                | ChatCommand::DispatchTodoToAgent(_)
                 | ChatCommand::SwitchToSettingsTab(_, _)
                 | ChatCommand::SwitchTab(_)
                 | ChatCommand::SwitchToSession(_)

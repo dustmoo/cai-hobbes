@@ -137,6 +137,13 @@ pub struct BuiltinToolCtx {
 /// drive the same built-in code paths the model does (P-015: one dispatch
 /// path, never a second hand-rolled copy at a call site). Hook-shaped — call
 /// it unconditionally at the top of a component body.
+///
+/// Currently unused: the planner row's dispatch handler moved to routing
+/// through `ChatCommand::DispatchTodoToAgent` (handled in main.rs, which
+/// assembles its own `BuiltinToolCtx` from root-scope signals rather than
+/// `use_context`, since the root isn't a descendant of anything). Kept for
+/// the next component-tree call site rather than deleted.
+#[allow(dead_code)]
 pub(crate) fn builtin_ctx_from_tree() -> BuiltinToolCtx {
     BuiltinToolCtx {
         session_state: use_context(),
@@ -152,21 +159,25 @@ pub(crate) fn builtin_ctx_from_tree() -> BuiltinToolCtx {
 /// Hand a planner todo to a headless Claude Code run — the exact code path
 /// `HOBBES_DISPATCH { target: "claude_code" }` takes, so the planner's
 /// "Dispatch to a background agent" and the model's tool call cannot drift.
+///
+/// `parent_session_id` is the review chat (if any) that gets the result
+/// handed back when the run finishes — `None` when there is no conversation
+/// to resume (e.g. a bare planner-row dispatch with no chat opened for it).
 pub(crate) fn dispatch_todo_to_background(
     deps: BuiltinToolCtx,
     todo_id: &str,
     model: Option<String>,
+    parent_session_id: Option<String>,
 ) -> Result<String, String> {
     let mut args = serde_json::json!({ "todo_id": todo_id, "target": "claude_code" });
     if let Some(m) = model {
         args["model"] = serde_json::Value::String(m);
     }
-    // No parent chat: a planner-row dispatch has no conversation to resume.
     crate::todo::dispatch::handle_dispatch(
         deps,
         &args,
         &crate::todo::dispatch::RealClaudeSpawner,
-        None,
+        parent_session_id.as_deref(),
     )
 }
 

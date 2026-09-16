@@ -942,6 +942,16 @@ pub fn continuation_text(todo_title: &str, session_name: &str, progress: Option<
     )
 }
 
+/// The Hobbes-authored intro dropped into a row-dispatch's fresh review
+/// chat: it explains why the tab opened with no user message in it and
+/// points at the Fleet board for the live run.
+pub fn dispatch_intro_text(todo_title: &str) -> String {
+    format!(
+        "Dispatched a background agent for \"{todo_title}\". I'll pick up here when it \
+         finishes — you can watch it on the Fleet board meanwhile."
+    )
+}
+
 /// What one continuation sweep produced: the messages to deliver, plus the
 /// rows whose `continuation_sent` latch was set (live rows get persisted
 /// wholesale; ended rows are merged in the store, since the sweep's copy of
@@ -1540,6 +1550,14 @@ mod tests {
             true,
         );
         assert!(again.is_empty());
+    }
+
+    #[test]
+    fn dispatch_intro_text_names_the_todo_and_points_at_fleet() {
+        let text = dispatch_intro_text("Ship CSV export");
+        assert!(text.contains("\"Ship CSV export\""));
+        assert!(text.contains("Fleet board"));
+        assert!(text.starts_with("Dispatched a background agent"));
     }
 
     #[test]

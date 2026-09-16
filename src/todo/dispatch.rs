@@ -375,6 +375,56 @@ mod tests {
             .unwrap_err();
             assert!(err.contains("carrier_pigeon"));
             assert!(spawner.0.lock().unwrap().is_empty(), "nothing spawned on errors");
+
+            // A dispatch carrying a parent chat records `dispatched_from` on
+            // the precreated fleet row, so the run's continuation later knows
+            // which chat to hand the result back to.
+            let mut planner_with_project = crate::todo::PlannerState::default();
+            let mut project = Project {
+                id: "proj-1".into(),
+                title: "Puget Bench".into(),
+                notes: String::new(),
+                area_id: None,
+                status: TodoStatus::Open,
+                deadline: None,
+                sort_order: 0.0,
+                path: Some(std::env::temp_dir().to_string_lossy().to_string()),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            project.path = Some(std::env::temp_dir().to_string_lossy().to_string());
+            let mut linked_todo = Todo::new("Ship CSV export", 1.0);
+            linked_todo.project_id = Some(project.id.clone());
+            let linked_todo_id = linked_todo.id.clone();
+            planner_with_project.projects.push(project);
+            planner_with_project.todos.push(linked_todo);
+
+            let ok = handle_dispatch(
+                test_ctx(planner_with_project),
+                &serde_json::json!({"todo_id": linked_todo_id, "target": "claude_code"}),
+                &spawner,
+                Some("parent-chat-1"),
+            )
+            .unwrap();
+            let req = spawner
+                .0
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("claude_code dispatch spawns a run");
+            assert!(ok.contains(&req.session_id));
+            let shared = crate::fleet::shared();
+            let row = shared
+                .state
+                .lock()
+                .expect("fleet state lock poisoned")
+                .sessions
+                .get(&req.session_id)
+                .cloned()
+                .expect("precreate_dispatched_session inserts the row");
+            assert_eq!(row.dispatched_from.as_deref(), Some("parent-chat-1"));
+
             dioxus::prelude::rsx! { div {} }
         });
         dom.rebuild_in_place();
