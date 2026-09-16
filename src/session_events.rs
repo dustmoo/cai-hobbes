@@ -73,8 +73,20 @@ pub enum SessionEvent {
         provider: Option<String>,
         model: Option<String>,
     },
-    /// The session was renamed.
+    /// The session was renamed by the user. A user rename wins forever —
+    /// replay also flips `name_user_set` so the summarizer never overwrites
+    /// `name`/`tab_title` again for this session.
     SessionRenamed { name: String },
+    /// The AI-derived tab emoji/topic changed (rolling summarizer), or a tab
+    /// was named programmatically (e.g. a dispatch review tab: 🐯 + the todo
+    /// title). Does NOT set `name_user_set` — only an explicit
+    /// `SessionRenamed` does that.
+    TabTitled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     /// The session's planner-project tag changed (`None` = cleared).
     /// `user_set` marks a manual decision the auto-tagger must respect.
     ProjectTagged {
@@ -144,6 +156,7 @@ impl SessionEvent {
             SessionEvent::TimerFired { .. } => "TimerFired",
             SessionEvent::ConnectorPinned { .. } => "ConnectorPinned",
             SessionEvent::SessionRenamed { .. } => "SessionRenamed",
+            SessionEvent::TabTitled { .. } => "TabTitled",
             SessionEvent::ProjectTagged { .. } => "ProjectTagged",
             SessionEvent::RewoundTo { .. } => "RewoundTo",
             SessionEvent::StreamCancelled { .. } => "StreamCancelled",
@@ -207,6 +220,9 @@ fn blank_session() -> Session {
         watch_word_recovery_count: 0,
         scheduled_timers: Vec::new(),
         tool_call_history: Vec::new(),
+        tab_emoji: None,
+        tab_title: None,
+        name_user_set: false,
     }
 }
 
@@ -296,7 +312,18 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
                 serde_json::from_value(serde_json::Value::String(p.clone())).ok()
             });
         }
-        E::SessionRenamed { name } => session.name = name.clone(),
+        E::SessionRenamed { name } => {
+            session.name = name.clone();
+            session.name_user_set = true;
+        }
+        E::TabTitled { emoji, title } => {
+            if emoji.is_some() {
+                session.tab_emoji = emoji.clone();
+            }
+            if title.is_some() {
+                session.tab_title = title.clone();
+            }
+        }
         E::ProjectTagged {
             project_id,
             user_set,
@@ -1152,6 +1179,52 @@ mod tests {
             assert_eq!(s.messages.len(), 1);
             assert_eq!(s.messages[0].content.get_text_content().as_deref(), Some("edited"));
         });
+    }
+
+    /// `TabTitled` round-trips through the store and folds without touching
+    /// `name_user_set` — only an explicit `SessionRenamed` sets that.
+    #[test]
+    fn tab_titled_round_trips_through_store_and_does_not_set_name_user_set() {
+        use crate::session_store::test_support as ts;
+        ts::with_test_db(|conn| {
+            let titled = SessionEvent::TabTitled {
+                emoji: Some("🐯".to_string()),
+                title: Some("Ship the release".to_string()),
+            };
+            ts::append_events_conn(
+                conn,
+                "s1",
+                &[
+                    SessionEvent::SessionCreated { id: "s1".into(), name: "Sep 16 - 03:45 PM".into() },
+                    titled.clone(),
+                ],
+            );
+            let events = ts::load_events_for_test(conn, "s1", 0);
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1].event, titled);
+            assert_eq!(events[1].event.kind(), "TabTitled");
+            let s = project(None, &events);
+            assert_eq!(s.tab_emoji.as_deref(), Some("🐯"));
+            assert_eq!(s.tab_title.as_deref(), Some("Ship the release"));
+            assert!(!s.name_user_set);
+        });
+    }
+
+    /// A `SessionRenamed` replay flips `name_user_set` — the rename wins
+    /// forever, even after the whole journal is rebuilt from scratch.
+    #[test]
+    fn session_renamed_sets_name_user_set_on_replay() {
+        let events = loaded(vec![
+            SessionEvent::SessionCreated { id: "s1".into(), name: "Sep 16 - 03:45 PM".into() },
+            SessionEvent::TabTitled { emoji: Some("⭐".into()), title: Some("AI Topic".into()) },
+            SessionEvent::SessionRenamed { name: "My Chat".into() },
+        ]);
+        let s = project(None, &events);
+        assert_eq!(s.name, "My Chat");
+        assert!(s.name_user_set);
+        // The emoji survives the rename (only the topic is replaced, by
+        // `Session::tab_topic` reading `name` once `name_user_set` is true).
+        assert_eq!(s.tab_emoji.as_deref(), Some("⭐"));
     }
 
     /// Scripted Save flow on a journal-complete session: the live in-place

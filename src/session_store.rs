@@ -667,6 +667,40 @@ pub struct SessionMeta {
     pub last_updated: String,
     pub message_count: i64,
     pub summary: String,
+    /// Tab identity, read out of the row's `data` JSON blob (least invasive:
+    /// no new columns/migration — `name`/`tab_title`/`tab_emoji`/
+    /// `name_user_set` already live in every session's serialized JSON).
+    pub tab_title: Option<String>,
+    pub tab_emoji: Option<String>,
+    pub name_user_set: bool,
+}
+
+impl SessionMeta {
+    /// Mirrors `Session::display_title` for a non-hydrated row.
+    pub fn display_title(&self) -> String {
+        if self.name_user_set {
+            self.name.clone()
+        } else if let Some(title) = &self.tab_title {
+            title.clone()
+        } else {
+            self.name.clone()
+        }
+    }
+
+    fn from_row(id: String, name: String, last_updated: String, message_count: i64, summary: String, data: Option<String>) -> Self {
+        let (tab_title, tab_emoji, name_user_set) = data
+            .as_deref()
+            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .map(|v| {
+                (
+                    v.get("tab_title").and_then(|x| x.as_str()).map(str::to_string),
+                    v.get("tab_emoji").and_then(|x| x.as_str()).map(str::to_string),
+                    v.get("name_user_set").and_then(|x| x.as_bool()).unwrap_or(false),
+                )
+            })
+            .unwrap_or((None, None, false));
+        Self { id, name, last_updated, message_count, summary, tab_title, tab_emoji, name_user_set }
+    }
 }
 
 /// Paginated, newest-first metadata listing. `query` (lowercased substring)
@@ -688,18 +722,19 @@ pub fn list_metadata(query: Option<&str>, offset: i64, limit: i64) -> (Vec<Sessi
 
         let count_sql = format!("SELECT COUNT(*) FROM sessions {where_clause}");
         let list_sql = format!(
-            "SELECT id, name, last_updated, message_count, summary FROM sessions {where_clause} \
+            "SELECT id, name, last_updated, message_count, summary, data FROM sessions {where_clause} \
              ORDER BY last_updated DESC LIMIT {limit} OFFSET {offset}"
         );
 
         let map_row = |r: &rusqlite::Row| -> rusqlite::Result<SessionMeta> {
-            Ok(SessionMeta {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                last_updated: r.get(2)?,
-                message_count: r.get(3)?,
-                summary: r.get(4)?,
-            })
+            Ok(SessionMeta::from_row(
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         };
 
         if pattern.is_empty() {
@@ -738,20 +773,21 @@ pub fn all_name_summaries() -> Vec<(String, String, String)> {
 pub fn metadata_by_ids(ids: &[String]) -> Vec<SessionMeta> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, last_updated, message_count, summary FROM sessions WHERE id = ?1",
+            "SELECT id, name, last_updated, message_count, summary, data FROM sessions WHERE id = ?1",
         )?;
         let mut out = Vec::new();
         for id in ids {
             use rusqlite::OptionalExtension;
             if let Some(m) = stmt
                 .query_row(params![id], |r| {
-                    Ok(SessionMeta {
-                        id: r.get(0)?,
-                        name: r.get(1)?,
-                        last_updated: r.get(2)?,
-                        message_count: r.get(3)?,
-                        summary: r.get(4)?,
-                    })
+                    Ok(SessionMeta::from_row(
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
                 })
                 .optional()?
             {
@@ -1330,6 +1366,10 @@ mod event_tests {
                 model: Some("gemini-pro".to_string()),
             },
             SessionEvent::SessionRenamed { name: "New Name".to_string() },
+            SessionEvent::TabTitled {
+                emoji: Some("🐯".to_string()),
+                title: Some("Ship the release".to_string()),
+            },
             SessionEvent::RewoundTo { seq: 7, message_id: "abc".to_string() },
         ];
 

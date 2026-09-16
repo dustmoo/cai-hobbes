@@ -2463,9 +2463,11 @@ fn app() -> Element {
                         let new_id = session_state.write().create_session(active_profile_id());
 
                         let session_name = crate::fleet::truncate_summary(&title, 60);
-                        session_state
-                            .write()
-                            .update_session_name(&new_id, session_name);
+                        session_state.write().set_session_title_programmatic(
+                            &new_id,
+                            Some(session_name),
+                            Some("🐯".to_string()),
+                        );
 
                         {
                             let mut state = session_state.write();
@@ -2887,8 +2889,26 @@ fn app() -> Element {
                                             open_tabs: tabs.clone(),
                                             tab_names: tabs.iter().map(|id| {
                                                 state.sessions.get(id)
-                                                    .map(|s| s.name.clone())
+                                                    .map(|s| s.display_title())
                                                     .unwrap_or_else(|| "New Session".to_string())
+                                            }).collect(),
+                                            tab_emoji: tabs.iter().map(|id| {
+                                                state.sessions.get(id).and_then(|s| s.tab_emoji.clone())
+                                            }).collect(),
+                                            tab_date: tabs.iter().map(|id| {
+                                                state.sessions.get(id)
+                                                    .map(|s| s.short_date())
+                                                    .unwrap_or_default()
+                                            }).collect(),
+                                            tab_topic: tabs.iter().map(|id| {
+                                                state.sessions.get(id).and_then(|s| s.tab_topic())
+                                            }).collect(),
+                                            tab_profile: tabs.iter().map(|id| {
+                                                state.sessions.get(id).and_then(|s| {
+                                                    settings.read().resolve_session_profile_display_name(
+                                                        s.composio_profile.as_deref(),
+                                                    )
+                                                })
                                             }).collect(),
                                             active_tab_index: *active_tab_index.read(),
                                             on_select_tab: switch_tab_fn,

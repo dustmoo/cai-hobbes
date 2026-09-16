@@ -598,7 +598,9 @@ You MUST respond with valid JSON containing exactly these fields:
   - "key_topics": Main topics discussed (array of short strings).
   - "key_decisions": Important decisions made (array of short strings).
   - "active_profile": The active Composio profile name if mentioned.
-  - "blockers": Current blockers or open issues (array of short strings)."#;
+  - "blockers": Current blockers or open issues (array of short strings).
+- "tab_title": A 2-4 word topic for this chat's browser-tab-style label (e.g. "Fix login bug"). Empty string if unclear.
+- "tab_emoji": A single emoji that best represents this chat's topic (e.g. "🐛")."#;
 
         let user_message = format!(
             "Previous Summary:\n---\n{}\n---\n\nRecent Messages:\n---\n{}\n---",

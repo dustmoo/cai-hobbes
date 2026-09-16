@@ -6,10 +6,56 @@ use crate::settings::{Settings, UiState};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
+/// How much room the tab strip has to spend on each chat tab's identity
+/// layers (emoji · date · topic). Chosen purely from the number of open chat
+/// tabs — see [`tab_density`] — never from pixel measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Density {
+    /// emoji · date · topic all shown.
+    Roomy,
+    /// emoji · date shown; topic dropped.
+    Medium,
+    /// emoji only.
+    Crowded,
+}
+
+/// Open-chat-tab count at/under which the strip stays [`Density::Roomy`].
+pub const DENSITY_ROOMY_MAX: usize = 6;
+/// Open-chat-tab count at/under which the strip stays [`Density::Medium`]
+/// (above [`DENSITY_ROOMY_MAX`]); beyond this it's [`Density::Crowded`].
+pub const DENSITY_MEDIUM_MAX: usize = 10;
+
+/// Pure density selector — the ACTIVE tab always renders all three layers
+/// regardless of what this returns (see the render loop).
+pub fn tab_density(open_chat_tabs: usize) -> Density {
+    if open_chat_tabs <= DENSITY_ROOMY_MAX {
+        Density::Roomy
+    } else if open_chat_tabs <= DENSITY_MEDIUM_MAX {
+        Density::Medium
+    } else {
+        Density::Crowded
+    }
+}
+
 #[derive(Props, PartialEq, Clone)]
 pub struct TabBarProps {
     pub open_tabs: Vec<String>,
+    /// Full label per tab (`Session::display_title`) — used as the rename
+    /// editing seed and as the fallback label when a tab has no emoji/topic
+    /// yet (a chat with no summary shows only the date, but the tooltip and
+    /// edit box still want the full display title).
     pub tab_names: Vec<String>,
+    /// AI-derived (or programmatic) tab emoji, `None` until a summary lands.
+    pub tab_emoji: Vec<Option<String>>,
+    /// Short creation date ("Sep 16"), always present.
+    pub tab_date: Vec<String>,
+    /// AI-derived topic, or the user's rename once one has happened
+    /// (`Session::tab_topic`) — `None` until a summary lands (and the user
+    /// hasn't renamed yet).
+    pub tab_topic: Vec<Option<String>>,
+    /// The session's resolved Composio profile display name, for the
+    /// collapsed-tab tooltip only (`settings.resolve_session_profile_display_name`).
+    pub tab_profile: Vec<Option<String>>,
     pub active_tab_index: usize,
     pub on_select_tab: EventHandler<usize>,
     pub on_close_tab: EventHandler<usize>,
@@ -149,9 +195,14 @@ pub fn TabBar(props: TabBarProps) -> Element {
                 }
             }
 
-            // Tab items
-            for (idx, session_id) in props.open_tabs.iter().enumerate() {
-                {
+            // Tab items — density from open-chat-tab count decides how many
+            // identity layers (emoji · date · topic) each non-active tab
+            // gets; the active tab always shows all three (see `tab_density`).
+            {
+                let density = tab_density(props.open_tabs.len());
+                rsx! {
+                    for (idx, session_id) in props.open_tabs.iter().enumerate() {
+                        {
                     // A session tab is never shown active while the planner tab
                     // is — the session stays *selected* underneath, but exactly
                     // one tab may carry the active styling.
@@ -161,6 +212,26 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     let session_name = props.tab_names.get(idx)
                         .cloned()
                         .unwrap_or_else(|| "Unknown Session".to_string());
+                    let emoji = props.tab_emoji.get(idx).cloned().flatten();
+                    let date = props.tab_date.get(idx).cloned().unwrap_or_default();
+                    let topic = props.tab_topic.get(idx).cloned().flatten();
+                    let profile = props.tab_profile.get(idx).cloned().flatten();
+                    let has_summary = emoji.is_some() || topic.is_some();
+                    let show_emoji = emoji.is_some();
+                    let show_date = is_active || !has_summary || matches!(density, Density::Roomy | Density::Medium);
+                    let show_topic = has_summary && topic.is_some() && (is_active || matches!(density, Density::Roomy));
+                    // Collapsed tabs keep the full identity in the tooltip,
+                    // regardless of what the collapsed layers show.
+                    let tooltip = {
+                        let mut parts: Vec<String> = Vec::new();
+                        if let Some(e) = &emoji { parts.push(e.clone()); }
+                        if let Some(t) = topic.as_ref().or(has_summary.then_some(&session_name)) {
+                            parts.push(t.clone());
+                        }
+                        parts.push(date.clone());
+                        if let Some(p) = &profile { parts.push(p.clone()); }
+                        parts.join(" · ")
+                    };
                     let is_streaming = streaming_states.read().get(idx).cloned().unwrap_or(false);
                     let session_id_key = session_id.clone();
                     let id_edit = session_id.clone();
@@ -179,6 +250,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
                             } else {
                                 "group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink select-none hover:bg-card"
                             },
+                            title: "{tooltip}",
                             onclick: move |_| {
                                 if !is_editing {
                                     on_select.call(idx);
@@ -262,8 +334,8 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                         class: "w-2 h-2 rounded-full bg-primary-400 animate-pulse mr-1.5 shrink-0",
                                     }
                                 }
-                                span {
-                                    class: if is_active { "flex-1 truncate text-xs text-fg font-medium" } else { "flex-1 truncate text-xs text-fg-muted" },
+                                div {
+                                    class: "flex-1 min-w-0 flex items-center gap-1.5",
                                     onclick: move |evt| {
                                         if is_active {
                                             evt.stop_propagation();
@@ -271,7 +343,32 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                             editing_tab_id.set(Some(id_edit.clone()));
                                         }
                                     },
-                                    "{session_name}"
+                                    if show_emoji {
+                                        span {
+                                            class: "text-[13px] leading-none shrink-0",
+                                            "{emoji.clone().unwrap_or_default()}"
+                                        }
+                                    }
+                                    if !has_summary {
+                                        // No summary yet: the date is the whole label, as before.
+                                        span {
+                                            class: if is_active { "flex-1 truncate text-xs text-fg font-medium" } else { "flex-1 truncate text-xs text-fg-muted" },
+                                            "{date}"
+                                        }
+                                    } else {
+                                        if show_date {
+                                            span {
+                                                class: "font-mono text-[11px] text-fg-muted tabular-nums shrink-0",
+                                                "{date}"
+                                            }
+                                        }
+                                        if show_topic {
+                                            span {
+                                                class: if is_active { "truncate text-xs text-fg font-medium" } else { "truncate text-xs text-fg-muted" },
+                                                "{topic.clone().unwrap_or_default()}"
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -293,6 +390,8 @@ pub fn TabBar(props: TabBarProps) -> Element {
                         }
                     }
                 }
+                }
+            }
             }
 
             // Planner tab — a pinned app view, not a session: no rename, and
@@ -464,5 +563,29 @@ fn TabBarIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq +
                 icon: icon,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tab_density_tests {
+    use super::*;
+
+    #[test]
+    fn roomy_at_and_under_the_threshold() {
+        assert_eq!(tab_density(0), Density::Roomy);
+        assert_eq!(tab_density(1), Density::Roomy);
+        assert_eq!(tab_density(DENSITY_ROOMY_MAX), Density::Roomy);
+    }
+
+    #[test]
+    fn medium_just_above_roomy_and_at_its_own_threshold() {
+        assert_eq!(tab_density(DENSITY_ROOMY_MAX + 1), Density::Medium);
+        assert_eq!(tab_density(DENSITY_MEDIUM_MAX), Density::Medium);
+    }
+
+    #[test]
+    fn crowded_above_the_medium_threshold() {
+        assert_eq!(tab_density(DENSITY_MEDIUM_MAX + 1), Density::Crowded);
+        assert_eq!(tab_density(50), Density::Crowded);
     }
 }

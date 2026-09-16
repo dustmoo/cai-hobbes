@@ -938,7 +938,7 @@ fn TodoRow(
                     .read()
                     .sessions
                     .get(cid)
-                    .map(|s| s.name.clone())
+                    .map(|s| s.display_title())
             })
     });
     let carrier_minutes = working_minutes(fleet.as_ref(), focus_session.as_ref(), now);

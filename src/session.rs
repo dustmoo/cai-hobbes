@@ -54,6 +54,16 @@ pub struct ConversationSummary {
     pub current_task: String,
     #[serde(default)]
     pub entities: ConversationSummaryEntities,
+    /// AI-proposed 2-4 word tab topic, alongside the rolling summary.
+    /// Validated/normalized (`normalize_tab_title`) before being applied to
+    /// `Session.tab_title` — never applied raw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_title: Option<String>,
+    /// AI-proposed single-emoji tab icon, alongside the rolling summary.
+    /// Validated/normalized (`normalize_tab_emoji`) before being applied to
+    /// `Session.tab_emoji` — never applied raw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_emoji: Option<String>,
 }
 
 impl ConversationSummary {
@@ -67,6 +77,55 @@ impl ConversationSummary {
             self.summary.truncate(truncated_len);
             self.summary.push_str("... [truncated]");
         }
+    }
+}
+
+/// Fallback tab emoji used whenever the summarizer's proposal is missing or
+/// fails validation.
+pub const FALLBACK_TAB_EMOJI: &str = "⭐";
+
+/// Validate an AI-proposed tab emoji: exactly one extended grapheme cluster
+/// (so multi-codepoint sequences like `🏗️` — base + variation selector —
+/// still count as one "emoji"), short, and not plain ASCII text. Falls back
+/// to [`FALLBACK_TAB_EMOJI`] on anything else (missing, empty, multiple
+/// clusters, or ASCII).
+pub fn normalize_tab_emoji(raw: Option<&str>) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return FALLBACK_TAB_EMOJI.to_string();
+    };
+    let mut graphemes = raw.graphemes(true);
+    let Some(first) = graphemes.next() else {
+        return FALLBACK_TAB_EMOJI.to_string();
+    };
+    if graphemes.next().is_some() {
+        return FALLBACK_TAB_EMOJI.to_string(); // more than one grapheme cluster
+    }
+    if first.len() > 8 || first.is_ascii() {
+        return FALLBACK_TAB_EMOJI.to_string();
+    }
+    first.to_string()
+}
+
+/// Normalize an AI-proposed tab topic: trim, strip wrapping quotes, cap at
+/// 40 chars. Returns `None` for a missing/empty/quotes-only proposal.
+pub fn normalize_tab_title(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let stripped = raw
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '\u{201c}' | '\u{201d}'))
+        .trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    let truncated: String = stripped.chars().take(40).collect();
+    let truncated = truncated.trim_end().to_string();
+    if truncated.is_empty() {
+        None
+    } else {
+        Some(truncated)
     }
 }
 
@@ -181,6 +240,21 @@ pub struct Session {
     /// `ToolCallSummarizer` at turn end.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_call_history: Vec<crate::components::shared::ToolCallRecord>,
+    /// AI-derived one-emoji "icon" for this chat's tab, set by the rolling
+    /// summarizer (or programmatically for dispatch review tabs). `None`
+    /// until the first summary lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_emoji: Option<String>,
+    /// AI-derived 2-4 word topic for this chat's tab. Overridden forever by
+    /// a user rename (see `name_user_set`); `None` until the first summary
+    /// lands (or set programmatically for dispatch review tabs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_title: Option<String>,
+    /// True once the user has explicitly renamed this tab (from the tab bar
+    /// or History). A user rename wins forever: the summarizer never
+    /// overwrites `name`/`tab_title` again once this is set.
+    #[serde(default)]
+    pub name_user_set: bool,
 }
 
 /// Stamp `created_at` on a message that is already in `messages`, without
@@ -248,6 +322,42 @@ pub fn move_message_to_end(
 }
 
 impl Session {
+    /// The tab's headline label: the user's own name wins forever, then the
+    /// AI-derived topic, then the creation-date placeholder (`name`, before
+    /// any rename or summary).
+    pub fn display_title(&self) -> String {
+        if self.name_user_set {
+            self.name.clone()
+        } else if let Some(title) = &self.tab_title {
+            title.clone()
+        } else {
+            self.name.clone()
+        }
+    }
+
+    /// The AI-derived topic layer for the tab strip — `None` until the first
+    /// summary lands. A user rename replaces it forever (keeping the emoji).
+    pub fn tab_topic(&self) -> Option<String> {
+        if self.name_user_set {
+            Some(self.name.clone())
+        } else {
+            self.tab_title.clone()
+        }
+    }
+
+    /// Short creation date ("Sep 16") for the tab strip. `Session` has no
+    /// dedicated `created_at` field, so this parses it out of `name`, which
+    /// is stamped as `"%b %d - %I:%M %p"` at creation (`create_session_raw`)
+    /// and is never touched again except by a user rename. Once renamed,
+    /// that original stamp is gone, so this falls back to `last_updated`
+    /// (the closest thing to a creation date this struct still carries).
+    pub fn short_date(&self) -> String {
+        match self.name.split_once(" - ") {
+            Some((date_part, _)) => date_part.to_string(),
+            None => self.last_updated.format("%b %d").to_string(),
+        }
+    }
+
     /// See [`restamp_message`].
     pub fn restamp_message(
         &mut self,
@@ -1330,6 +1440,9 @@ impl SessionState {
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
             tool_call_history: Vec::new(),
+            tab_emoji: None,
+            tab_title: None,
+            name_user_set: false,
         };
         // Birth event: a journal that starts with SessionCreated is
         // "journal-complete" and can be rebuilt from nothing via project().
@@ -1549,6 +1662,9 @@ impl SessionState {
         Self::save_async(&signal.read(), error_signal);
     }
 
+    /// A rename from the tab bar or History — a user act. Wins forever: sets
+    /// `name_user_set` so the summarizer never overwrites `name`/`tab_title`
+    /// for this session again.
     pub fn update_session_name_raw(&mut self, id: &str, new_name: String) {
         crate::session_events::log_event(
             id,
@@ -1558,6 +1674,7 @@ impl SessionState {
         );
         if let Some(session) = self.sessions.get_mut(id) {
             session.name = new_name;
+            session.name_user_set = true;
         } else {
             // Not hydrated (renamed from History) — update the stored row directly.
             crate::session_store::rename_session(id, &new_name);
@@ -1567,6 +1684,32 @@ impl SessionState {
     pub fn update_session_name(&mut self, id: &str, new_name: String) {
         self.update_session_name_raw(id, new_name);
         Self::save_async(self, None);
+    }
+
+    /// Programmatic tab naming (e.g. a dispatch review tab: 🐯 + the todo
+    /// title) — NOT a user act, so `name_user_set` is left untouched and the
+    /// summarizer may still overwrite this later.
+    pub fn set_session_title_programmatic(
+        &mut self,
+        id: &str,
+        title: Option<String>,
+        emoji: Option<String>,
+    ) {
+        crate::session_events::log_event(
+            id,
+            crate::session_events::SessionEvent::TabTitled {
+                emoji: emoji.clone(),
+                title: title.clone(),
+            },
+        );
+        if let Some(session) = self.sessions.get_mut(id) {
+            if emoji.is_some() {
+                session.tab_emoji = emoji;
+            }
+            if title.is_some() {
+                session.tab_title = title;
+            }
+        }
     }
     pub fn get_message_mut(
         &mut self,
@@ -1626,6 +1769,117 @@ impl Default for SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod tab_identity {
+        use super::*;
+
+        fn session_with(name: &str, name_user_set: bool, tab_title: Option<&str>) -> Session {
+            let mut s = create_test_session();
+            s.name = name.to_string();
+            s.name_user_set = name_user_set;
+            s.tab_title = tab_title.map(str::to_string);
+            s
+        }
+
+        fn create_test_session() -> Session {
+            Session {
+                id: "s1".to_string(),
+                name: "Sep 16 - 03:45 PM".to_string(),
+                messages: Vec::new(),
+                active_context: ActiveContext::default(),
+                last_updated: Utc::now(),
+                accumulated_cost: 0.0,
+                accumulated_tokens: 0,
+                accumulated_turns: 0,
+                memory_optimization_summary: None,
+                composio_profile: None,
+                llm_connector_id: None,
+                llm_provider: None,
+                chat_model: None,
+                project_id: None,
+                project_tag_user_set: false,
+                loaded_skills: HashMap::new(),
+                scratchpad: String::new(),
+                current_ai_turn_count: 0,
+                watch_word_recovery_count: 0,
+                scheduled_timers: Vec::new(),
+                tool_call_history: Vec::new(),
+                tab_emoji: None,
+                tab_title: None,
+                name_user_set: false,
+            }
+        }
+
+        #[test]
+        fn display_title_prefers_user_name_over_tab_title_over_date() {
+            let user_named = session_with("My Renamed Chat", true, Some("AI Topic"));
+            assert_eq!(user_named.display_title(), "My Renamed Chat");
+
+            let ai_titled = session_with("Sep 16 - 03:45 PM", false, Some("AI Topic"));
+            assert_eq!(ai_titled.display_title(), "AI Topic");
+
+            let bare = session_with("Sep 16 - 03:45 PM", false, None);
+            assert_eq!(bare.display_title(), "Sep 16 - 03:45 PM");
+        }
+
+        #[test]
+        fn tab_topic_user_rename_replaces_ai_topic_forever() {
+            let renamed = session_with("Renamed", true, Some("Old AI Topic"));
+            assert_eq!(renamed.tab_topic().as_deref(), Some("Renamed"));
+
+            let untouched = session_with("Sep 16 - 03:45 PM", false, Some("AI Topic"));
+            assert_eq!(untouched.tab_topic().as_deref(), Some("AI Topic"));
+
+            let no_summary_yet = session_with("Sep 16 - 03:45 PM", false, None);
+            assert_eq!(no_summary_yet.tab_topic(), None);
+        }
+
+        #[test]
+        fn short_date_parses_the_creation_stamp() {
+            let s = session_with("Sep 16 - 03:45 PM", false, None);
+            assert_eq!(s.short_date(), "Sep 16");
+        }
+
+        #[test]
+        fn short_date_falls_back_to_last_updated_once_renamed() {
+            let mut s = session_with("My Renamed Chat", true, None);
+            s.last_updated =
+                chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+            assert_eq!(s.short_date(), "Mar 01");
+        }
+
+        #[test]
+        fn emoji_validation_accepts_single_emoji_clusters() {
+            assert_eq!(normalize_tab_emoji(Some("✅")), "✅");
+            assert_eq!(normalize_tab_emoji(Some("🏗️")), "🏗️"); // base + VS16
+            assert_eq!(normalize_tab_emoji(Some("🐯")), "🐯");
+        }
+
+        #[test]
+        fn emoji_validation_falls_back_on_invalid_input() {
+            assert_eq!(normalize_tab_emoji(Some("ab")), FALLBACK_TAB_EMOJI);
+            assert_eq!(normalize_tab_emoji(Some("")), FALLBACK_TAB_EMOJI);
+            assert_eq!(normalize_tab_emoji(None), FALLBACK_TAB_EMOJI);
+            assert_eq!(normalize_tab_emoji(Some("😀😁")), FALLBACK_TAB_EMOJI);
+        }
+
+        #[test]
+        fn title_normalization_trims_quotes_and_caps_length() {
+            assert_eq!(
+                normalize_tab_title(Some("  \"Ship the release\"  ")),
+                Some("Ship the release".to_string())
+            );
+            let long = "a".repeat(60);
+            assert_eq!(
+                normalize_tab_title(Some(&long)).map(|s| s.len()),
+                Some(40)
+            );
+            assert_eq!(normalize_tab_title(Some("   ")), None);
+            assert_eq!(normalize_tab_title(None), None);
+        }
+    }
 
     /// Both ordering helpers exist to keep one invariant: the vec's order and
     /// its `created_at` stamps agree, because the journal projector reinserts
@@ -2294,6 +2548,9 @@ mod tests {
         let mut session = Session {
             id: "test-session".to_string(),
             name: "Test".to_string(),
+            tab_emoji: None,
+            tab_title: None,
+            name_user_set: false,
             messages: vec![
                 Message {
                     id: msg1_id,
@@ -2380,6 +2637,8 @@ mod tests {
                     sentiment: "neutral".to_string(),
                     current_task: String::new(),
                     entities: ConversationSummaryEntities::default(),
+                    tab_title: None,
+                    tab_emoji: None,
                 },
                 ..Default::default()
             },

@@ -71,6 +71,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "tray-icon",
+ "unicode-segmentation",
  "url",
  "urlencoding",
  "uuid",

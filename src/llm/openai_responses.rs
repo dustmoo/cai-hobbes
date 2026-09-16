@@ -685,7 +685,9 @@ You MUST respond with valid JSON containing exactly these fields:
 - "summary": A concise, updated summary of the entire conversation so far.
 - "sentiment": A brief string describing the user's current mood.
 - "current_task": A one-sentence description of the task the user is CURRENTLY working on (empty string if none).
-- "entities": An object with "user_name", "project_name", "key_topics" (array), "key_decisions" (array), "active_profile", "blockers" (array)."#;
+- "entities": An object with "user_name", "project_name", "key_topics" (array), "key_decisions" (array), "active_profile", "blockers" (array).
+- "tab_title": A 2-4 word topic for this chat's browser-tab-style label. Empty string if unclear.
+- "tab_emoji": A single emoji that best represents this chat's topic."#;
 
         let user_message = format!(
             "Previous Summary:\n---\n{}\n---\n\nRecent Messages:\n---\n{}\n---",
