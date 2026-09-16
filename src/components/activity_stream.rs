@@ -17,16 +17,25 @@ use std::ops::Range;
 
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
+use feature_clipboard::copy_to_clipboard;
 use uuid::Uuid;
 
 use crate::components::chat::{ExpansionStateContext, Message};
 use crate::components::shared::{MessageContent, ToolCall, ToolCallStatus, UsageData};
-use crate::components::tool_call_display::{Collapsible, PermissionPrompt};
+use crate::components::tool_call_display::{AuthRequiredPanel, Collapsible, PermissionPrompt};
 
 /// The planner virtual server; its calls read as "todo" work, not generic tools.
 const PLANNER_SERVER: &str = "hobbes-planner";
 /// The terminal exec tool; its calls read as shell commands.
 const TERMINAL_EXEC_TOOL: &str = "HOBBES_TERMINAL_EXEC";
+/// `HOBBES_TERMINAL_EXEC`'s own default `timeout_secs` (see
+/// `mcp/terminal_client.rs::DEFAULT_EXEC_TIMEOUT_SECS`) — the meta line only
+/// calls out a timeout when the command overrode it.
+const DEFAULT_EXEC_TIMEOUT_SECS: i64 = 30;
+/// How many lines of a command's output show before "Show all N lines".
+const COMMAND_TAIL_LINES: usize = 40;
+/// How many JSONL records render before "Show all N records".
+const JSONL_RECORD_CAP: usize = 20;
 
 // ============================================================================
 // Pure helpers (unit-tested below)
@@ -275,6 +284,179 @@ pub fn parse_exit_code(response: &str) -> Option<i64> {
         .trim_end_matches(['.', ','])
         .parse::<i64>()
         .ok()
+}
+
+/// Trailing `\n(exit code: N)` marker `HOBBES_TERMINAL_EXEC` appends to its
+/// response (see `mcp/terminal_client.rs::exec`) — the exit code already
+/// surfaces in the row's meta line, so the output pane strips it rather than
+/// showing it twice.
+fn strip_exit_marker(response: &str) -> &str {
+    let trimmed = response.trim_end();
+    if let Some(idx) = trimmed.rfind("\n(exit code:") {
+        let tail = trimmed[idx..].trim_end();
+        if tail.ends_with(')') {
+            return trimmed[..idx].trim_end();
+        }
+    }
+    trimmed
+}
+
+/// Replace a leading `home`-prefixed path with `~`, for a compact cwd in the
+/// command meta line. Pure (takes `home` explicitly) so it's testable without
+/// depending on the process environment.
+pub fn shorten_home(path: &str, home: &str) -> String {
+    if home.is_empty() {
+        return path.to_string();
+    }
+    match path.strip_prefix(home) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// The last `n` lines of `text` and the total line count, for a "Show all N
+/// lines" affordance under a long output pane.
+pub fn tail_lines(text: &str, n: usize) -> (String, usize) {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let start = total.saturating_sub(n);
+    (lines[start..].join("\n"), total)
+}
+
+/// The shape a tool result's raw text should render as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultShape {
+    /// A single JSON object or array.
+    Json,
+    /// Every non-empty line parses as its own JSON value.
+    Jsonl,
+    /// Neither — markdown-ish or plain text.
+    Text,
+}
+
+/// Classify a tool result for the "Result" pane. JSON wins over JSONL (a
+/// single-line object is valid JSON *and* trivially "every line parses", so
+/// the whole-document parse is tried first); JSONL requires at least two
+/// non-empty lines that each parse on their own.
+pub fn detect_result_shape(text: &str) -> ResultShape {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return ResultShape::Text;
+    }
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return ResultShape::Json;
+    }
+    let lines: Vec<&str> = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() > 1
+        && lines
+            .iter()
+            .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
+    {
+        return ResultShape::Jsonl;
+    }
+    ResultShape::Text
+}
+
+/// Pretty-print each record of a JSONL blob. Only meaningful once
+/// [`detect_result_shape`] has already said [`ResultShape::Jsonl`]; a line
+/// that somehow fails to parse here is silently dropped rather than shown
+/// raw, since a mixed pane reads worse than a short one.
+pub fn pretty_jsonl(text: &str) -> Vec<String> {
+    text.trim()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        })
+        .collect()
+}
+
+/// What a [`json_spans`] token is, for the pane's colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsonSpan {
+    /// An object key — the quoted string immediately before a `:`.
+    Key,
+    /// A string value.
+    Str,
+    /// A number.
+    Num,
+    /// Everything else: punctuation, whitespace, `true`/`false`/`null`.
+    Other,
+}
+
+/// A cheap, line-agnostic tokenisation of a `serde_json::to_string_pretty`
+/// render, for inline key/string/number colouring without pulling in the
+/// full syntax highlighter (built for fenced code blocks, not a hover-fast
+/// scan of a small object). Not a JSON parser: it never fails, it just walks
+/// character runs, so malformed input degrades to a single [`JsonSpan::Other`]
+/// run rather than an error.
+pub fn json_spans(pretty: &str) -> Vec<(JsonSpan, String)> {
+    let chars: Vec<char> = pretty.chars().collect();
+    let n = chars.len();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if c == '"' {
+            let start = i;
+            i += 1;
+            while i < n {
+                if chars[i] == '\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            let mut j = i;
+            while j < n && chars[j].is_whitespace() {
+                j += 1;
+            }
+            let kind = if j < n && chars[j] == ':' {
+                JsonSpan::Key
+            } else {
+                JsonSpan::Str
+            };
+            spans.push((kind, s));
+        } else if c.is_ascii_digit() || (c == '-' && i + 1 < n && chars[i + 1].is_ascii_digit()) {
+            let start = i;
+            i += 1;
+            while i < n && (chars[i].is_ascii_digit() || matches!(chars[i], '.' | 'e' | 'E' | '+' | '-'))
+            {
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            spans.push((JsonSpan::Num, s));
+        } else {
+            let start = i;
+            while i < n
+                && chars[i] != '"'
+                && !chars[i].is_ascii_digit()
+                && !(chars[i] == '-' && i + 1 < n && chars[i + 1].is_ascii_digit())
+            {
+                i += 1;
+            }
+            if i == start {
+                // Never happens given the branches above, but guarantees
+                // forward progress if it somehow did.
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            spans.push((JsonSpan::Other, s));
+        }
+    }
+    spans
 }
 
 /// A named string argument out of a tool call's JSON arguments.
@@ -958,13 +1140,19 @@ fn ActivityRow(props: ActivityRowProps) -> Element {
             }
             if props.open {
                 if let Some(tc) = row.tool_call.clone() {
-                    RowDetail { tool_call: tc, usage: row.usage.clone() }
+                    RowDetail {
+                        tool_call: tc,
+                        usage: row.usage.clone(),
+                        kind: row.kind,
+                        duration_secs: row.duration_secs,
+                        running: row.running,
+                    }
                 } else if row.kind == StepKind::Thinking {
                     if let Some(full) = row.full_text.clone().filter(|t| !t.trim().is_empty()) {
                         div {
                             class: "px-3 pb-2",
-                            pre {
-                                class: "px-2 py-1 rounded bg-app font-mono text-[11px] text-fg-muted whitespace-pre-wrap break-all",
+                            blockquote {
+                                class: "border-l-2 border-l-faint pl-3 text-xs text-fg-muted italic whitespace-pre-wrap",
                                 "{full}"
                             }
                         }
@@ -1011,58 +1199,361 @@ fn step_icon(kind: StepKind, running: bool) -> Element {
     }
 }
 
-/// The inline expansion under a clicked row: a meta line, the full response,
-/// and the arguments behind the same disclosure the old card used.
-#[component]
-fn RowDetail(tool_call: ToolCall, usage: Option<UsageData>) -> Element {
-    let ui_state = consume_context::<Signal<crate::settings::UiState>>();
-    let token_mode = ui_state.read().token_display_mode.clone();
-    let show_response_default = ui_state.read().default_tool_response_open;
-    let show_arguments_default = ui_state.read().default_tool_arguments_open;
+/// Meta line for a COMMAND row: `server · exit N · duration · cwd … · timeout
+/// …s · cost/tokens`, with the cwd and timeout parts only present when the
+/// arguments carry them (and the timeout only when it isn't the tool's own
+/// default).
+fn command_meta_line(
+    tool_call: &ToolCall,
+    usage: Option<&UsageData>,
+    duration_secs: Option<i64>,
+    token_mode: &str,
+) -> String {
+    let mut parts = vec![tool_call.server_name.clone()];
+    if let Some(code) = parse_exit_code(&tool_call.response) {
+        parts.push(format!("exit {code}"));
+    }
+    if let Some(d) = duration_secs {
+        parts.push(format_worked(d));
+    }
+    if let Some(cwd) = arg_str(&tool_call.arguments, "cwd") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        parts.push(format!("cwd {}", shorten_home(&cwd, &home)));
+    }
+    if let Some(timeout) = arg_i64(&tool_call.arguments, "timeout_secs") {
+        if timeout != DEFAULT_EXEC_TIMEOUT_SECS {
+            parts.push(format!("timeout {timeout}s"));
+        }
+    }
+    push_usage_parts(&mut parts, usage, token_mode);
+    parts.join(" · ")
+}
 
-    let meta = {
-        let mut parts = vec![tool_call.server_name.clone(), tool_call.tool_name.clone()];
-        if let Some(cwd) = arg_str(&tool_call.arguments, "cwd") {
-            parts.push(cwd);
+/// Meta line for a TOOL/planner row: `server · TOOL_NAME · duration ·
+/// cost/tokens`.
+fn tool_meta_line(
+    tool_call: &ToolCall,
+    usage: Option<&UsageData>,
+    duration_secs: Option<i64>,
+    token_mode: &str,
+) -> String {
+    let mut parts = vec![tool_call.server_name.clone(), tool_call.tool_name.clone()];
+    if let Some(d) = duration_secs {
+        parts.push(format_elapsed(d));
+    }
+    push_usage_parts(&mut parts, usage, token_mode);
+    parts.join(" · ")
+}
+
+fn push_usage_parts(parts: &mut Vec<String>, usage: Option<&UsageData>, token_mode: &str) {
+    let Some(u) = usage else { return };
+    if show_cost_for_mode(token_mode) {
+        if let Some(c) = u.cost {
+            parts.push(format!("${c:.4}"));
         }
-        if let Some(code) = parse_exit_code(&tool_call.response) {
-            parts.push(format!("exit {code}"));
+    }
+    if show_tokens_for_mode(token_mode) {
+        parts.push(format!("{:.1}k tok", u.total_tokens as f64 / 1000.0));
+    }
+}
+
+/// A named integer argument out of a tool call's JSON arguments.
+fn arg_i64(arguments: &str, key: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get(key)?
+        .as_i64()
+}
+
+fn json_span_class(kind: JsonSpan) -> &'static str {
+    match kind {
+        JsonSpan::Key => "text-primary-300",
+        JsonSpan::Str => "text-fg",
+        JsonSpan::Num => "text-accent-300",
+        JsonSpan::Other => "text-fg-muted",
+    }
+}
+
+/// A `bg-app` pane rendering pretty-printed JSON with cheap key/string/number
+/// colouring (see [`json_spans`]).
+#[component]
+fn JsonPane(pretty: String) -> Element {
+    rsx! {
+        div {
+            class: "bg-app border border-faint rounded-md p-2.5 font-mono text-[11px] leading-[1.55] whitespace-pre-wrap break-words max-h-[320px] overflow-auto",
+            for (kind, text) in json_spans(&pretty) {
+                span { class: json_span_class(kind), "{text}" }
+            }
         }
-        if let Some(u) = &usage {
-            if show_cost_for_mode(&token_mode) {
-                if let Some(c) = u.cost {
-                    parts.push(format!("${c:.6}"));
+    }
+}
+
+/// The "Result" pane for a TOOL row, shaped by [`detect_result_shape`]: a
+/// JSON object/array pretty-prints as one [`JsonPane`]; JSONL pretty-prints
+/// each record with a thin rule between them, capped at
+/// [`JSONL_RECORD_CAP`] with a "Show all N records" expander; anything else
+/// renders as plain pre-wrapped text.
+#[component]
+fn ResultPane(response: String) -> Element {
+    let mut show_all = use_signal(|| false);
+    match detect_result_shape(&response) {
+        ResultShape::Json => {
+            let pretty = serde_json::from_str::<serde_json::Value>(response.trim())
+                .ok()
+                .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                .unwrap_or_else(|| response.clone());
+            rsx! { JsonPane { pretty } }
+        }
+        ResultShape::Jsonl => {
+            let records = pretty_jsonl(&response);
+            let total = records.len();
+            let show_now = *show_all.read();
+            let visible: Vec<String> = if show_now {
+                records
+            } else {
+                records.into_iter().take(JSONL_RECORD_CAP).collect()
+            };
+            rsx! {
+                div {
+                    class: "bg-app border border-faint rounded-md font-mono text-[11px] leading-[1.55] text-fg max-h-[320px] overflow-auto",
+                    if total > JSONL_RECORD_CAP && !show_now {
+                        button {
+                            class: "block text-[11px] text-primary-300 hover:text-fg px-2 pt-2",
+                            onclick: move |_| show_all.set(true),
+                            "Show all {total} records"
+                        }
+                    }
+                    for (i, record) in visible.iter().enumerate() {
+                        div {
+                            key: "{i}",
+                            class: if i > 0 { "px-2 py-1.5 border-t border-faint" } else { "px-2 py-1.5" },
+                            for (kind, text) in json_spans(record) {
+                                span { class: json_span_class(kind), "{text}" }
+                            }
+                        }
+                    }
                 }
             }
-            if show_tokens_for_mode(&token_mode) {
-                parts.push(format!("{} tok", u.total_tokens));
-            }
         }
-        parts.join(" · ")
+        ResultShape::Text => rsx! {
+            div {
+                class: "bg-app border border-faint rounded-md p-2.5 font-mono text-[11px] leading-[1.55] whitespace-pre-wrap break-words max-h-[320px] overflow-auto text-fg",
+                "{response}"
+            }
+        },
+    }
+}
+
+/// COMMAND row detail: meta line + copy buttons, then a single terminal-style
+/// output pane (no separate Arguments block — the row's label already is the
+/// command).
+#[component]
+fn CommandRowDetail(
+    tool_call: ToolCall,
+    usage: Option<UsageData>,
+    duration_secs: Option<i64>,
+    running: bool,
+) -> Element {
+    let ui_state = consume_context::<Signal<crate::settings::UiState>>();
+    let token_mode = ui_state.read().token_display_mode.clone();
+    let mut show_all = use_signal(|| false);
+
+    let meta = command_meta_line(&tool_call, usage.as_ref(), duration_secs, &token_mode);
+    let output = strip_exit_marker(&tool_call.response).to_string();
+    let is_error = parse_exit_code(&tool_call.response).is_some_and(|c| c != 0);
+    let border_extra = if running {
+        "border-l-2 border-l-accent-500"
+    } else if is_error {
+        "border-l-2 border-l-red-500"
+    } else {
+        ""
     };
+
+    let (tail, total_lines) = tail_lines(&output, COMMAND_TAIL_LINES);
+    let show_now = *show_all.read();
+    let shown = if show_now || total_lines <= COMMAND_TAIL_LINES {
+        output.clone()
+    } else {
+        tail
+    };
+
+    let command = arg_str(&tool_call.arguments, "command").unwrap_or_default();
+    let command_for_copy = command.clone();
+    let output_for_copy = output.clone();
 
     rsx! {
         div {
             class: "px-3 pb-2 flex flex-col gap-1",
-            div { class: "text-[11px] text-fg-muted font-mono truncate", "{meta}" }
-            if !tool_call.response.is_empty() {
-                Collapsible {
-                    label: "Response".to_string(),
-                    open_default: show_response_default,
-                    pre {
-                        class: "px-2 py-1 rounded bg-app font-mono text-[11px] text-fg max-h-[140px] overflow-auto whitespace-pre-wrap break-all",
-                        "{tool_call.response}"
+            div {
+                class: "flex items-center gap-2",
+                div { class: "text-[11px] text-fg-muted font-mono truncate flex-1", "{meta}" }
+                if !output.trim().is_empty() {
+                    button {
+                        class: "text-[11px] text-primary-300 hover:text-fg shrink-0",
+                        onclick: move |_| { let _ = copy_to_clipboard(&output_for_copy); },
+                        "Copy output"
                     }
+                }
+                if !command.trim().is_empty() {
+                    button {
+                        class: "text-[11px] text-primary-300 hover:text-fg shrink-0",
+                        onclick: move |_| { let _ = copy_to_clipboard(&command_for_copy); },
+                        "Copy command"
+                    }
+                }
+            }
+            div {
+                class: "bg-app border border-faint rounded-md p-2.5 font-mono text-[11px] leading-[1.55] whitespace-pre-wrap break-words max-h-[320px] overflow-auto text-fg {border_extra}",
+                if output.trim().is_empty() {
+                    span { class: "text-fg-muted", "(no output)" }
+                } else {
+                    if total_lines > COMMAND_TAIL_LINES && !show_now {
+                        button {
+                            class: "block text-[11px] text-primary-300 hover:text-fg mb-1",
+                            onclick: move |_| show_all.set(true),
+                            "Show all {total_lines} lines"
+                        }
+                    }
+                    "{shown}"
+                }
+            }
+        }
+    }
+}
+
+/// TOOL/planner row detail: meta line + copy, the result (summary first when
+/// one exists, raw result tucked under a closed toggle), then Arguments
+/// collapsed by default — except for planner rows, opened by default since
+/// "what did it set" is the question there.
+#[component]
+fn ToolRowDetail(
+    tool_call: ToolCall,
+    usage: Option<UsageData>,
+    duration_secs: Option<i64>,
+    is_planner: bool,
+    arguments_open_default: bool,
+    token_mode: String,
+) -> Element {
+    let meta = tool_meta_line(&tool_call, usage.as_ref(), duration_secs, &token_mode);
+    let response = tool_call.response.clone();
+    let response_for_copy = response.clone();
+    let has_summary = tool_call
+        .result_summary
+        .as_ref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let summary_text = tool_call.result_summary.clone().unwrap_or_default();
+    let pretty_args = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| tool_call.arguments.clone());
+    let arguments_open = arguments_open_default || is_planner;
+
+    rsx! {
+        div {
+            class: "px-3 pb-2 flex flex-col gap-1.5",
+            div {
+                class: "flex items-center gap-2",
+                div { class: "text-[11px] text-fg-muted font-mono truncate flex-1", "{meta}" }
+                if !response.trim().is_empty() {
+                    button {
+                        class: "text-[11px] text-primary-300 hover:text-fg shrink-0",
+                        onclick: move |_| { let _ = copy_to_clipboard(&response_for_copy); },
+                        "Copy result"
+                    }
+                }
+            }
+            if has_summary {
+                div {
+                    class: "flex flex-col gap-1",
+                    span { class: "text-[10px] uppercase tracking-[0.08em] text-fg-muted", "Summary" }
+                    p { class: "text-xs text-fg", "{summary_text}" }
+                }
+                if !response.trim().is_empty() {
+                    Collapsible {
+                        label: "Raw result".to_string(),
+                        open_default: false,
+                        ResultPane { response: response.clone() }
+                    }
+                }
+            } else if !response.trim().is_empty() {
+                div {
+                    class: "flex flex-col gap-1",
+                    span { class: "text-[10px] uppercase tracking-[0.08em] text-fg-muted", "Result" }
+                    ResultPane { response: response.clone() }
                 }
             }
             Collapsible {
                 label: "Arguments".to_string(),
-                open_default: show_arguments_default,
-                crate::components::chat::CodeBlock {
-                    code: tool_call.arguments.clone(),
-                    lang: "json".to_string(),
+                open_default: arguments_open,
+                JsonPane { pretty: pretty_args }
+            }
+        }
+    }
+}
+
+/// The inline expansion under a clicked row, shaped by [`StepKind`]: a
+/// command shows its terminal output (no separate Arguments — the row label
+/// already is the command); a tool/planner call shows its result first,
+/// arguments tucked away; an errored or auth-required call gets the same red
+/// framing regardless of kind.
+#[component]
+fn RowDetail(
+    tool_call: ToolCall,
+    usage: Option<UsageData>,
+    kind: StepKind,
+    duration_secs: Option<i64>,
+    running: bool,
+) -> Element {
+    let ui_state = consume_context::<Signal<crate::settings::UiState>>();
+    let token_mode = ui_state.read().token_display_mode.clone();
+    let show_arguments_default = ui_state.read().default_tool_arguments_open;
+
+    if tool_call.status == ToolCallStatus::AuthRequired {
+        let meta = tool_meta_line(&tool_call, usage.as_ref(), duration_secs, &token_mode);
+        return rsx! {
+            div {
+                class: "px-3 pb-2 flex flex-col gap-1",
+                div { class: "text-[11px] text-red-400 font-mono truncate", "{meta}" }
+                AuthRequiredPanel { url: tool_call.response.clone() }
+            }
+        };
+    }
+
+    if tool_call.status == ToolCallStatus::Error {
+        let meta = if kind == StepKind::Command {
+            command_meta_line(&tool_call, usage.as_ref(), duration_secs, &token_mode)
+        } else {
+            tool_meta_line(&tool_call, usage.as_ref(), duration_secs, &token_mode)
+        };
+        let text = strip_exit_marker(&tool_call.response).to_string();
+        return rsx! {
+            div {
+                class: "px-3 pb-2 flex flex-col gap-1",
+                div { class: "text-[11px] text-red-400 font-mono truncate", "{meta}" }
+                if !text.trim().is_empty() {
+                    div {
+                        class: "bg-app border border-faint border-l-2 border-l-red-500 rounded-md p-2.5 font-mono text-[11px] leading-[1.55] whitespace-pre-wrap break-words max-h-[320px] overflow-auto text-fg",
+                        "{text}"
+                    }
                 }
             }
+        };
+    }
+
+    if kind == StepKind::Command {
+        return rsx! {
+            CommandRowDetail { tool_call, usage, duration_secs, running }
+        };
+    }
+
+    rsx! {
+        ToolRowDetail {
+            tool_call,
+            usage,
+            duration_secs,
+            is_planner: kind == StepKind::Todo,
+            arguments_open_default: show_arguments_default,
+            token_mode,
         }
     }
 }
@@ -1736,5 +2227,164 @@ mod tests {
         assert_eq!(name, "Work");
         assert_eq!(color, "bg-orange-600");
         assert_eq!(label, "Claude work claude-fable-5-1");
+    }
+
+    // ---- detect_result_shape ----
+
+    #[test]
+    fn detects_a_json_object() {
+        assert_eq!(
+            detect_result_shape(r#"{"a": 1, "b": [1,2]}"#),
+            ResultShape::Json
+        );
+    }
+
+    #[test]
+    fn detects_a_json_array() {
+        assert_eq!(detect_result_shape("[1, 2, 3]"), ResultShape::Json);
+    }
+
+    #[test]
+    fn detects_jsonl_when_every_line_parses() {
+        let text = "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n";
+        assert_eq!(detect_result_shape(text), ResultShape::Jsonl);
+    }
+
+    #[test]
+    fn a_single_line_is_json_not_jsonl() {
+        // One line is unambiguous: the whole-document JSON parse wins.
+        assert_eq!(detect_result_shape("{\"id\":1}"), ResultShape::Json);
+    }
+
+    #[test]
+    fn plain_prose_is_text() {
+        assert_eq!(
+            detect_result_shape("Sent the email to a@b.c."),
+            ResultShape::Text
+        );
+    }
+
+    #[test]
+    fn a_mixed_blob_where_only_some_lines_parse_is_text() {
+        let text = "{\"id\":1}\nnot json\n{\"id\":3}";
+        assert_eq!(detect_result_shape(text), ResultShape::Text);
+    }
+
+    #[test]
+    fn empty_result_is_text() {
+        assert_eq!(detect_result_shape(""), ResultShape::Text);
+        assert_eq!(detect_result_shape("   "), ResultShape::Text);
+    }
+
+    // ---- pretty_jsonl ----
+
+    #[test]
+    fn pretty_jsonl_splits_and_pretty_prints_each_record() {
+        let text = "{\"id\":1}\n{\"id\":2}";
+        let records = pretty_jsonl(text);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], "{\n  \"id\": 1\n}");
+        assert_eq!(records[1], "{\n  \"id\": 2\n}");
+    }
+
+    #[test]
+    fn pretty_jsonl_skips_blank_lines() {
+        let text = "{\"id\":1}\n\n\n{\"id\":2}\n";
+        assert_eq!(pretty_jsonl(text).len(), 2);
+    }
+
+    // ---- tail_lines ----
+
+    #[test]
+    fn tail_lines_keeps_the_last_n_and_reports_the_total() {
+        let text = (1..=50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (shown, total) = tail_lines(&text, 40);
+        assert_eq!(total, 50);
+        assert_eq!(shown.lines().count(), 40);
+        assert_eq!(shown.lines().next(), Some("line 11"));
+        assert_eq!(shown.lines().last(), Some("line 50"));
+    }
+
+    #[test]
+    fn tail_lines_returns_everything_when_under_the_cap() {
+        let (shown, total) = tail_lines("one\ntwo", 40);
+        assert_eq!(total, 2);
+        assert_eq!(shown, "one\ntwo");
+    }
+
+    // ---- shorten_home ----
+
+    #[test]
+    fn shorten_home_replaces_the_home_prefix() {
+        assert_eq!(
+            shorten_home("/Users/dustmoo/Sites/cai-hobbes", "/Users/dustmoo"),
+            "~/Sites/cai-hobbes"
+        );
+    }
+
+    #[test]
+    fn shorten_home_leaves_unrelated_paths_alone() {
+        assert_eq!(shorten_home("/tmp/foo", "/Users/dustmoo"), "/tmp/foo");
+    }
+
+    #[test]
+    fn shorten_home_does_not_shorten_a_sibling_directory_sharing_the_prefix() {
+        // "/Users/dustmoons" must not be treated as under "/Users/dustmoo".
+        assert_eq!(
+            shorten_home("/Users/dustmoons/x", "/Users/dustmoo"),
+            "/Users/dustmoons/x"
+        );
+    }
+
+    #[test]
+    fn shorten_home_handles_the_bare_home_dir() {
+        assert_eq!(shorten_home("/Users/dustmoo", "/Users/dustmoo"), "~");
+    }
+
+    // ---- json_spans ----
+
+    #[test]
+    fn json_spans_tokenises_keys_strings_and_numbers() {
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({
+            "name": "hobbes",
+            "count": 3
+        }))
+        .unwrap();
+        let spans = json_spans(&pretty);
+        let keys: Vec<&str> = spans
+            .iter()
+            .filter(|(k, _)| *k == JsonSpan::Key)
+            .map(|(_, s)| s.as_str())
+            .collect();
+        assert_eq!(keys, vec!["\"name\"", "\"count\""]);
+
+        let strings: Vec<&str> = spans
+            .iter()
+            .filter(|(k, _)| *k == JsonSpan::Str)
+            .map(|(_, s)| s.as_str())
+            .collect();
+        assert_eq!(strings, vec!["\"hobbes\""]);
+
+        let numbers: Vec<&str> = spans
+            .iter()
+            .filter(|(k, _)| *k == JsonSpan::Num)
+            .map(|(_, s)| s.as_str())
+            .collect();
+        assert_eq!(numbers, vec!["3"]);
+
+        // Reassembling every span's text reproduces the source exactly.
+        let reassembled: String = spans.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(reassembled, pretty);
+    }
+
+    #[test]
+    fn json_spans_handles_a_negative_number() {
+        let spans = json_spans(r#"{"delta": -12.5}"#);
+        assert!(spans
+            .iter()
+            .any(|(k, s)| *k == JsonSpan::Num && s == "-12.5"));
     }
 }
