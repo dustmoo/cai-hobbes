@@ -22,6 +22,18 @@ enum RenderItem {
     Run(std::ops::Range<usize>),
 }
 
+/// The key for one rendered list slot: the id of the first message in a
+/// `Run`, or the id of the single message. Every iteration of the keyed
+/// list wraps its content in one plain `div` carrying this key, so the
+/// list diff always sees the same root shape (see the `for item in items`
+/// loop in `MessageList`).
+fn item_key(item: &RenderItem, sorted_messages: &[crate::components::chat::Message]) -> String {
+    match item {
+        RenderItem::Run(run) => sorted_messages[run.start].id.to_string(),
+        RenderItem::Single(idx) => sorted_messages[*idx].id.to_string(),
+    }
+}
+
 #[component]
 pub fn MessageList(
     stream_update_trigger: Signal<i32>,
@@ -240,9 +252,11 @@ pub fn MessageList(
                                     }
                                 }
                                 for item in items {
-                                    {
+                                    div {
+                                        key: "{item_key(&item, &sorted_messages)}",
+                                        {
                                         let session_id = session_id.read().clone();
-                                        match item {
+                                        match &item {
                                         RenderItem::Run(run) => {
                                             let run_msgs = sorted_messages[run.clone()].to_vec();
                                             // Live only while this session streams, for the
@@ -254,7 +268,6 @@ pub fn MessageList(
                                                     &m.content,
                                                     MessageContent::Text { content, .. } if !content.trim().is_empty()
                                                 ));
-                                            let block_key = run_msgs[0].id;
                                             let (run_profile_name, run_profile_color, run_connector_label) =
                                                 run_header_provenance(
                                                     &run_msgs,
@@ -265,7 +278,6 @@ pub fn MessageList(
                                                 );
                                             rsx! {
                                                 ActivityStream {
-                                                    key: "{block_key}",
                                                     messages: run_msgs,
                                                     session_id: session_id.clone(),
                                                     is_live: is_live,
@@ -277,7 +289,7 @@ pub fn MessageList(
                                             }
                                         }
                                         RenderItem::Single(idx) => {
-                                        let message = &sorted_messages[idx];
+                                        let message = &sorted_messages[*idx];
                                         rsx! {
                                             match &message.content {
                                                 MessageContent::Text { content: text, thought_signature: _, thought_summary: _, signature_provider: _ } => {
@@ -291,7 +303,6 @@ pub fn MessageList(
                                                     if should_render {
                                                         rsx! {
                                                             MessageBubble {
-                                                                key: "{message.id}",
                                                                 message: message.clone(),
                                                                 on_content_update: move |_| stream_update_trigger += 1,
                                                                 on_selection: move |data| tracing::debug!("Selection event: {:?}", data),
@@ -315,23 +326,12 @@ pub fn MessageList(
                                                             }
                                                         }
                                                     } else {
-                                                        // Still needs a key: this iteration's root
-                                                        // must stay keyed like every sibling in the
-                                                        // list (Run blocks are keyed via
-                                                        // ActivityStream, other Single branches via
-                                                        // their own root element/component). Mixing
-                                                        // a keyed and unkeyed sibling makes Dioxus's
-                                                        // list diff treat the WHOLE list as unkeyed
-                                                        // (new_is_keyed is decided from item 0 only —
-                                                        // dioxus-core-0.6.3 src/diff/iterator.rs
-                                                        // diff_non_empty_fragment), which falls back
-                                                        // to diff_non_keyed_children's positional zip
-                                                        // and can hand a stale DOM slot to whatever
-                                                        // is live. `Fragment { key }` keeps the slot
-                                                        // keyed without adding a DOM node (so
-                                                        // `space-y-4` spacing on the list is
-                                                        // unaffected).
-                                                        rsx! { Fragment { key: "{message.id}" } }
+                                                        // The list key now lives on the wrapper `div`
+                                                        // this whole match is rendered inside of (see
+                                                        // the `for item in items` loop), so every
+                                                        // iteration's root shape is identical and this
+                                                        // arm doesn't need its own key.
+                                                        rsx! {}
                                                     }
                                                 },
                                                 MessageContent::ToolCall(tool_call) => {
@@ -343,7 +343,6 @@ pub fn MessageList(
                                                     );
                                                     rsx! {
                                                         div {
-                                                            key: "{message.id}",
                                                             class: "{container_classes} w-full",
                                                             div {
                                                                 class: "flex flex-col max-w-full min-w-0",
@@ -368,7 +367,6 @@ pub fn MessageList(
                                                     let author_classes = "text-xs text-fg-muted mt-1 px-2 text-left";
                                                     rsx! {
                                                         div {
-                                                            key: "{message.id}",
                                                             class: "{container_classes} w-full",
                                                             div {
                                                                 class: "flex flex-col max-w-full min-w-0",
@@ -387,7 +385,6 @@ pub fn MessageList(
                                                 MessageContent::Error { .. } => {
                                                     rsx! {
                                                         MessageBubble {
-                                                            key: "{message.id}",
                                                             message: message.clone(),
                                                             on_content_update: move |_| stream_update_trigger += 1,
                                                             on_selection: move |data| tracing::debug!("Selection event: {:?}", data),
@@ -408,7 +405,6 @@ pub fn MessageList(
                                                     let author_classes = "text-xs text-fg-muted mt-1 px-2 text-right";
                                                     rsx! {
                                                         div {
-                                                            key: "{message.id}",
                                                             class: "{container_classes} w-full",
                                                             div {
                                                                 class: "flex flex-col max-w-full min-w-0",
@@ -444,7 +440,6 @@ pub fn MessageList(
                                                     let message_id = message.id;
                                                     rsx! {
                                                         div {
-                                                            key: "{message.id}",
                                                             class: "{container_classes} w-full",
                                                             div {
                                                                 class: "flex flex-col max-w-full min-w-0",
@@ -593,6 +588,7 @@ pub fn MessageList(
                                     }
                                 }
                             }
+                        }
                         }
                     } else {
                         rsx! { WelcomeMessage {} }

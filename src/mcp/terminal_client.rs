@@ -58,6 +58,12 @@ pub struct TerminalCtx {
 struct RunningCmd {
     sentinel: String,
     command: String,
+    /// The exact command text written to the pty (post cwd-wrap) — needed at
+    /// TAIL time to strip an echoed copy from the front of the output.
+    wrapped: String,
+    /// The exact `printf '...sentinel... %d\n' $?` line written to the pty —
+    /// same reason as `wrapped`.
+    sentinel_line: String,
     /// Output already drained from the ring when a read timed out — seeds the
     /// next TAIL's accumulator so partial output isn't silently dropped.
     carry: Vec<u8>,
@@ -113,6 +119,17 @@ fn shape_output(output: &str, was_trimmed: bool) -> String {
     } else {
         cleaned
     }
+}
+
+/// Full response-shaping pipeline: strip an echoed copy of the input, strip
+/// stray continuation prompts, then the existing ANSI-strip/cap/truncate
+/// shaping. Shared by EXEC's and TAIL's `Done` arms — echoed input always
+/// lands at the very front of the accumulation regardless of which call
+/// finalizes it.
+fn finalize_output(output: &str, wrapped: &str, sentinel_line: &str, was_trimmed: bool) -> String {
+    let de_echoed = strip_echoed_input(output, wrapped, sentinel_line);
+    let de_prompted = strip_continuation_prompts(&de_echoed);
+    shape_output(&de_prompted, was_trimmed)
 }
 
 impl Drop for PtySession {
@@ -176,6 +193,81 @@ pub(crate) fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', r"'\''"))
 }
 
+/// Strip an echoed copy of what we TYPED from the front of the captured
+/// output. `stty -echo` is sent on shell spawn but cannot be relied upon (the
+/// setting may not have taken effect yet, or the pty may re-enable it), so a
+/// tty in echo mode reproduces every line we wrote — the wrapped command
+/// (which may itself span multiple lines) followed by the sentinel `printf`
+/// line — before any real output appears.
+///
+/// Compares line-by-line, in order, against the lines we know we sent
+/// (`wrapped_command`'s lines, then `sentinel_line`), stopping at the first
+/// output line that doesn't match. This bounds how much can ever be
+/// stripped to exactly the number of lines we sent, so real command output
+/// that happens to start with the same text as the command itself is never
+/// over-stripped.
+pub(crate) fn strip_echoed_input(output: &str, wrapped_command: &str, sentinel_line: &str) -> String {
+    let mut expected = wrapped_command.lines().collect::<Vec<_>>();
+    expected.push(sentinel_line);
+
+    let mut rest = output;
+    for exp in expected {
+        let exp = exp.trim_end_matches('\r');
+        match rest.find('\n') {
+            Some(nl) => {
+                let line = rest[..nl].trim_end_matches('\r');
+                if line != exp {
+                    break;
+                }
+                rest = &rest[nl + 1..];
+            }
+            None => {
+                // Last (partial) line in the buffer with no trailing newline
+                // yet — only consume it if it exactly matches; otherwise it
+                // is real (still-buffering) output, not an echo.
+                if rest.trim_end_matches('\r') == exp {
+                    rest = "";
+                }
+                break;
+            }
+        }
+    }
+    rest.to_string()
+}
+
+/// zsh continuation-prompt tokens (`PS2`/`PS3`/`PS4` variants) that leak into
+/// the capture when a multi-line command isn't read as a single unit by the
+/// shell (an unterminated quote, a `for`/`while`/`if` split across lines,
+/// etc). Strips leading runs of `token> ` at the START of each line only —
+/// text elsewhere in a line (e.g. legitimate output containing "dquote> ")
+/// is left untouched.
+const CONTINUATION_TOKENS: &[&str] = &[
+    "cmdand", "dquote", "quote", "cmdsubst", "heredoc", "pipe", "then", "else", "for", "while",
+    "if", "braceparam", "bquote",
+];
+
+pub(crate) fn strip_continuation_prompts(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let mut rest = line;
+        loop {
+            let stripped = CONTINUATION_TOKENS.iter().find_map(|tok| {
+                let prefix = format!("{tok}> ");
+                rest.strip_prefix(prefix.as_str())
+            });
+            match stripped {
+                Some(next) => rest = next,
+                None => break,
+            }
+        }
+        out.push_str(rest);
+    }
+    out
+}
+
 /// session.project_id → planner Project.path → Settings.project_folder →
 /// $HOME. Each step must exist on disk to win.
 pub fn resolve_session_cwd(
@@ -198,7 +290,7 @@ pub fn resolve_session_cwd(
 
 // ── Shell lifecycle ─────────────────────────────────────────────────────────
 
-fn spawn_shell(cwd: &str) -> Result<PtySession, String> {
+fn spawn_shell(cwd: &str, init_sentinel: &str) -> Result<PtySession, String> {
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -277,13 +369,23 @@ fn spawn_shell(cwd: &str) -> Result<PtySession, String> {
     };
 
     // Neuter prompts/echo so the sentinel protocol sees clean output, then
-    // recover the login PATH the -f flag skipped.
-    session.write_line(
+    // recover the login PATH the -f flag skipped. PS2/PS3/PS4 must also be
+    // cleared — otherwise a multi-line command (an unterminated quote spread
+    // across lines, a for/while split up) prints zsh's secondary/select/xtrace
+    // prompt (`cmdand> `, `dquote> `, ...) into the capture on every
+    // continuation line. Echo (`stty -echo`) is not guaranteed to have taken
+    // effect for everything that follows, so the init line ends with its own
+    // sentinel: `session_for` waits (bounded) for it and discards everything
+    // up to and including it, so init residue (and its own echo, if any)
+    // never reaches a response.
+    session.write_line(&format!(
         "unsetopt ZLE PROMPT_SP PROMPT_CR 2>/dev/null; PS1=''; PROMPT=''; RPROMPT=''; \
+         PS2=''; PS3=''; PS4=''; \
          stty -echo 2>/dev/null; export TERM=dumb; \
          [ -f /etc/zprofile ] && source /etc/zprofile >/dev/null 2>&1; \
-         [ -f \"$HOME/.zprofile\" ] && source \"$HOME/.zprofile\" >/dev/null 2>&1; true",
-    )?;
+         [ -f \"$HOME/.zprofile\" ] && source \"$HOME/.zprofile\" >/dev/null 2>&1; \
+         printf '\\n{init_sentinel} %d\\n' $?"
+    ))?;
     Ok(session)
 }
 
@@ -328,10 +430,18 @@ impl TerminalClient {
             }
             map.remove(&ctx.session_id);
         }
-        let fresh = Arc::new(spawn_shell(&ctx.cwd)?);
-        // Drain the init sentinel-less output briefly on first exec instead —
-        // the sentinel protocol makes any residue harmless.
+        let init_nonce = uuid::Uuid::new_v4().simple().to_string();
+        let init_sentinel = format!("__HOBBES_INIT_{init_nonce}__");
+        let fresh = Arc::new(spawn_shell(&ctx.cwd, &init_sentinel)?);
         map.insert(ctx.session_id.clone(), fresh.clone());
+        // Wait (bounded) for the init line's own sentinel and discard
+        // everything up to and including it — init output (zprofile sourcing,
+        // any stray echo before `stty -echo` takes effect) must never reach a
+        // response. Best-effort: if the shell is unusually slow, or dies, the
+        // normal EXEC path below will surface the problem.
+        let _ = self
+            .read_until_sentinel(&fresh, &init_sentinel, 2, Vec::new(), false)
+            .await;
         Ok(fresh)
     }
 
@@ -397,19 +507,23 @@ impl TerminalClient {
             }
             _ => command.to_string(),
         };
-        session.write_line(&format!("{wrapped}\nprintf '\\n{sentinel} %d\\n' $?"))?;
+        let sentinel_line = format!("printf '\\n{sentinel} %d\\n' $?");
+        session.write_line(&format!("{wrapped}\n{sentinel_line}"))?;
 
         match self
             .read_until_sentinel(&session, &sentinel, timeout_secs, Vec::new(), false)
             .await?
         {
-            ReadOutcome::Done(output, code, trimmed) => {
-                Ok(format!("{}\n(exit code: {code})", shape_output(&output, trimmed)))
-            }
+            ReadOutcome::Done(output, code, trimmed) => Ok(format!(
+                "{}\n(exit code: {code})",
+                finalize_output(&output, &wrapped, &sentinel_line, trimmed)
+            )),
             ReadOutcome::Pending(carry, carry_trimmed) => {
                 *session.running.lock().map_err(|_| "state poisoned")? = Some(RunningCmd {
                     sentinel,
                     command: command.to_string(),
+                    wrapped,
+                    sentinel_line,
                     carry,
                     carry_trimmed,
                 });
@@ -443,11 +557,13 @@ impl TerminalClient {
             .map(|r| {
                 (
                     r.sentinel.clone(),
+                    r.wrapped.clone(),
+                    r.sentinel_line.clone(),
                     std::mem::take(&mut r.carry),
                     r.carry_trimmed,
                 )
             });
-        let Some((sentinel, carry, carry_trimmed)) = taken else {
+        let Some((sentinel, wrapped, sentinel_line, carry, carry_trimmed)) = taken else {
             return Ok("No command is running; nothing new to read.".to_string());
         };
         match self
@@ -458,7 +574,7 @@ impl TerminalClient {
                 *session.running.lock().map_err(|_| "state poisoned")? = None;
                 Ok(format!(
                     "{}\n(command finished — exit code: {code})",
-                    shape_output(&output, trimmed)
+                    finalize_output(&output, &wrapped, &sentinel_line, trimmed)
                 ))
             }
             ReadOutcome::Pending(carry, carry_trimmed) => {
@@ -648,6 +764,82 @@ mod tests {
         assert_eq!(shell_quote("/tmp/it's here"), r"'/tmp/it'\''s here'");
     }
 
+    #[test]
+    fn strip_echoed_input_removes_full_echo() {
+        let wrapped = "echo hi";
+        let sentinel_line = "printf '\\n__HOBBES_DONE_x__ %d\\n' $?";
+        let output = format!("{wrapped}\r\n{sentinel_line}\r\nhi\n\n");
+        assert_eq!(strip_echoed_input(&output, wrapped, sentinel_line), "hi\n\n");
+    }
+
+    #[test]
+    fn strip_echoed_input_multiline_command_echo() {
+        let wrapped = "python3 -c \"\nprint(1)\nprint(2)\n\"";
+        let sentinel_line = "printf '\\n__HOBBES_DONE_y__ %d\\n' $?";
+        let output = format!("{wrapped}\n{sentinel_line}\n1\n2\n");
+        assert_eq!(strip_echoed_input(&output, wrapped, sentinel_line), "1\n2\n");
+    }
+
+    #[test]
+    fn strip_echoed_input_no_echo_is_noop() {
+        let wrapped = "echo hi";
+        let sentinel_line = "printf '\\n__HOBBES_DONE_z__ %d\\n' $?";
+        let output = "hi\n\n";
+        assert_eq!(strip_echoed_input(output, wrapped, sentinel_line), output);
+    }
+
+    #[test]
+    fn strip_echoed_input_partial_echo_stops_at_mismatch() {
+        // Only the command line echoed (e.g. echo was disabled mid-write, or
+        // the printf sentinel line was never echoed because -echo landed by
+        // then) — must stop cleanly at the first non-matching line rather
+        // than eating real output.
+        let wrapped = "echo hi";
+        let sentinel_line = "printf '\\n__HOBBES_DONE_w__ %d\\n' $?";
+        let output = format!("{wrapped}\nhi\n\n");
+        assert_eq!(strip_echoed_input(&output, wrapped, sentinel_line), "hi\n\n");
+    }
+
+    #[test]
+    fn strip_echoed_input_never_over_strips_legitimate_output() {
+        // A line of genuine output that happens to coincide with a line we
+        // sent is indistinguishable from an echo by construction, so it is
+        // still eligible to match — but the very next expected line
+        // (sentinel_line) does NOT match here, so stripping must stop right
+        // there: exactly one line consumed, everything after (including a
+        // second "more" line that has nothing to do with what we sent) must
+        // survive untouched.
+        let wrapped = "echo 'echo hi'";
+        let sentinel_line = "printf '\\n__HOBBES_DONE_v__ %d\\n' $?";
+        let output = format!("{wrapped}\nmore\n");
+        assert_eq!(
+            strip_echoed_input(&output, wrapped, sentinel_line),
+            "more\n",
+            "only the single coincidentally-matching line may be stripped, never beyond it"
+        );
+    }
+
+    #[test]
+    fn strip_continuation_prompts_removes_leading_tokens_only() {
+        let s = "dquote> print(1)\ncmdand> print(2)\nnormal line\nnested: dquote> not at start";
+        assert_eq!(
+            strip_continuation_prompts(s),
+            "print(1)\nprint(2)\nnormal line\nnested: dquote> not at start"
+        );
+    }
+
+    #[test]
+    fn strip_continuation_prompts_strips_multiple_stacked_tokens() {
+        let s = "heredoc> dquote> stacked line";
+        assert_eq!(strip_continuation_prompts(s), "stacked line");
+    }
+
+    #[test]
+    fn strip_continuation_prompts_leaves_clean_text_alone() {
+        let s = "just some\nnormal output\nno prompts here";
+        assert_eq!(strip_continuation_prompts(s), s);
+    }
+
     #[tokio::test]
     async fn exec_round_trip_persistence_and_reset() {
         let client = TerminalClient::new();
@@ -723,6 +915,38 @@ mod tests {
         );
         assert!(out.contains("slow-done"), "got: {out}");
         assert!(out.contains("exit code: 0"));
+        client.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn multiline_command_produces_clean_output() {
+        // A real PTY exercise of items (a)-(c): a multi-line command (an
+        // unterminated-looking `python3 -c "..."` spanning several lines)
+        // must not leak zsh's PS2 continuation prompt or an echoed copy of
+        // the command into the captured output.
+        let client = TerminalClient::new();
+        let ctx = TerminalCtx {
+            session_id: "t4".into(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            project_id: None,
+        };
+        let command = "python3 -c \"\nprint('line-one')\nprint('line-two')\n\"";
+        let out = client
+            .exec(&ctx, &serde_json::json!({"command": command, "timeout_secs": 20}))
+            .await
+            .unwrap_or_else(|e| panic!("exec failed: {e}"));
+
+        assert!(out.contains("line-one"), "got: {out}");
+        assert!(out.contains("line-two"), "got: {out}");
+        assert!(out.contains("(exit code: 0)"), "got: {out}");
+        assert!(
+            !out.contains("python3 -c"),
+            "echoed command text leaked into output: {out}"
+        );
+        assert!(
+            !out.contains("dquote>") && !out.contains("cmdand>"),
+            "zsh continuation prompt leaked into output: {out}"
+        );
         client.shutdown_all().await;
     }
 
