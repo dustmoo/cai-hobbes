@@ -1649,6 +1649,8 @@ mod tests {
             stopped_prompts: Vec::new(),
             attention_at: None,
             dispatched_todo: None,
+            dispatched_from: None,
+            continuation_sent: false,
         };
         s.working_since = matches!(
             s.status,

@@ -164,7 +164,16 @@ pub fn report_with_brief(
 /// overwrite cwd/name when non-empty. Not gated on the bridge arm: dispatch
 /// is explicit user-driven action, and the row must exist for the fleet to
 /// attribute the run.
-pub fn precreate_dispatched_session(session_id: &str, cwd: &str, title: &str, todo_id: &str) {
+/// `parent_session_id` is the chat that issued the dispatch, when there was
+/// one — it is what lets the run's result flow back into that conversation
+/// (see `fleet::sweep_dispatch_continuations`).
+pub fn precreate_dispatched_session(
+    session_id: &str,
+    cwd: &str,
+    title: &str,
+    todo_id: &str,
+    parent_session_id: Option<&str>,
+) {
     let now = Utc::now();
     let shared = super::shared();
     let row = {
@@ -175,6 +184,9 @@ pub fn precreate_dispatched_session(session_id: &str, cwd: &str, title: &str, to
             .or_insert_with(|| super::FleetSession::new(session_id, cwd, now));
         session.session_title = Some(title.to_string());
         session.dispatched_todo = Some(todo_id.to_string());
+        if let Some(parent) = parent_session_id.filter(|p| !p.is_empty()) {
+            session.dispatched_from = Some(parent.to_string());
+        }
         session.clone()
     };
     store::persist_sessions(std::slice::from_ref(&row));

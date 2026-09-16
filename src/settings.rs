@@ -391,6 +391,10 @@ pub struct Settings {
     /// time). Clamped to 15–1440 at use.
     #[serde(default = "default_fleet_retire_minutes")]
     pub fleet_retire_minutes: u32,
+    /// When a background agent dispatched from a chat finishes, hand its
+    /// result back to that chat and let the conversation continue on its own.
+    #[serde(default = "default_true")]
+    pub dispatch_auto_continue: bool,
 
     // ── Terminal ────────────────────────────────────────────────────────────
     /// Register the native `hobbes-terminal` MCP server (persistent per-chat
@@ -832,6 +836,7 @@ impl Default for Settings {
             fleet_enabled: false,
             fleet_briefs_enabled: true,
             fleet_retire_minutes: default_fleet_retire_minutes(),
+            dispatch_auto_continue: true,
             terminal_enabled: false,
         }
     }

@@ -116,10 +116,13 @@ pub fn build_assignment_prompt(
 
 /// The HOBBES_DISPATCH handler. Returns (status-ok?, response) like the
 /// other planner handlers; the dispatch layer persists on success.
+/// `parent_session_id` is the chat session the tool call came from — the
+/// conversation that gets handed the result when the run finishes.
 pub fn handle_dispatch(
     mut deps: BuiltinToolCtx,
     args: &serde_json::Value,
     spawner: &dyn ClaudeSpawner,
+    parent_session_id: Option<&str>,
 ) -> Result<String, String> {
     let todo_id = args
         .get("todo_id")
@@ -236,6 +239,7 @@ pub fn handle_dispatch(
                 &path,
                 &todo.title,
                 todo_id,
+                parent_session_id,
             );
 
             let launch_rx = spawner.spawn(SpawnRequest {
@@ -346,6 +350,7 @@ mod tests {
                 test_ctx(planner.clone()),
                 &serde_json::json!({"todo_id": "nope", "target": "claude_code"}),
                 &spawner,
+                None,
             )
             .unwrap_err();
             assert!(err.contains("unknown todo"));
@@ -355,6 +360,7 @@ mod tests {
                 test_ctx(planner.clone()),
                 &serde_json::json!({"todo_id": todo_id, "target": "claude_code"}),
                 &spawner,
+                None,
             )
             .unwrap_err();
             assert!(err.contains("no project"), "got: {err}");
@@ -364,6 +370,7 @@ mod tests {
                 test_ctx(planner),
                 &serde_json::json!({"todo_id": todo_id, "target": "carrier_pigeon"}),
                 &spawner,
+                None,
             )
             .unwrap_err();
             assert!(err.contains("carrier_pigeon"));

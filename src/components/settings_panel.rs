@@ -6201,6 +6201,23 @@ fn FleetSection() -> Element {
                                 span { class: "text-xs text-fg-muted", "min" }
                             }
                         }
+                        label {
+                            class: "mt-3 flex items-center gap-2 text-sm text-fg-muted cursor-pointer select-none",
+                            input {
+                                r#type: "checkbox",
+                                class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                checked: "{settings.read().dispatch_auto_continue}",
+                                onchange: move |e| {
+                                    settings.write().dispatch_auto_continue = e.value() == "true";
+                                    persist();
+                                }
+                            }
+                            "Continue the chat when a dispatched agent finishes"
+                        }
+                        p {
+                            class: "text-xs text-fg-muted mt-1 ml-6",
+                            "The chat that dispatched a background agent is handed the run's closing brief and picks the thread back up on its own. Off: the run still reports into the Fleet, but nothing is sent back to the conversation."
+                        }
                     }
                     if let Some(err) = fleet_error() {
                         p { class: "text-sm text-red-400 mt-2", "{err}" }

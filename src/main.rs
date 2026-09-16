@@ -462,6 +462,56 @@ fn app() -> Element {
                     }
                 }
                 fleet_state.set(snapshot);
+
+                // Dispatched runs that finished hand their result back to the
+                // chat that launched them. The fleet sweep (a plain tokio
+                // task) can't touch Signals, so it parks the continuations on
+                // FleetShared and pokes us; this is the only side that writes
+                // the chat queue.
+                for c in shared.take_continuations() {
+                    let todo_title = c
+                        .todo_id
+                        .as_deref()
+                        .and_then(|id| planner_state.peek().todo(id).map(|t| t.title.clone()))
+                        .unwrap_or_else(|| c.session_name.clone());
+                    let fallback = c.todo_id.as_deref().and_then(|id| {
+                        planner_state.peek().todo(id).and_then(|t| t.latest_progress.clone())
+                    });
+                    let text = fleet::continuation_text(
+                        &todo_title,
+                        &c.session_name,
+                        c.progress.as_deref().or(fallback.as_deref()),
+                    );
+                    // The drain refuses to pop for a session that isn't in
+                    // state (it would eat the message), so a parent whose tab
+                    // was closed is hydrated back into memory first. Focus is
+                    // never stolen — the turn runs in the background and the
+                    // toast is the only interruption.
+                    if !session_state.peek().sessions.contains_key(&c.parent_session_id) {
+                        match crate::session_store::load_session(&c.parent_session_id) {
+                            Some(session) => {
+                                session_state
+                                    .write()
+                                    .sessions
+                                    .insert(c.parent_session_id.clone(), session);
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "dispatch continuation: parent session {} is gone; dropping",
+                                    c.parent_session_id
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    crate::components::chat_queue::queue_push(
+                        &mut crate::components::chat_queue::CHAT_QUEUE.write(),
+                        &c.parent_session_id,
+                        crate::components::chat_queue::QueuedMessage::new(text, Vec::new()),
+                    );
+                    crate::components::chat_queue::request_drain();
+                    flash_timer_toast(format!("🛰 {} finished — continuing the chat", todo_title));
+                }
             }
         });
 
@@ -481,6 +531,7 @@ fn app() -> Element {
                 // sweep running whenever Hobbes rows are live).
                 fleet::bridge::set_enabled(want);
                 fleet::set_retire_minutes(settings.peek().fleet_retire_minutes);
+                fleet::set_dispatch_auto_continue(settings.peek().dispatch_auto_continue);
                 if want && server.is_none() {
                     if !hydrated {
                         // Sessions left live by a previous process re-enter

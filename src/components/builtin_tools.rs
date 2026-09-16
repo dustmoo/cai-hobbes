@@ -161,7 +161,13 @@ pub(crate) fn dispatch_todo_to_background(
     if let Some(m) = model {
         args["model"] = serde_json::Value::String(m);
     }
-    crate::todo::dispatch::handle_dispatch(deps, &args, &crate::todo::dispatch::RealClaudeSpawner)
+    // No parent chat: a planner-row dispatch has no conversation to resume.
+    crate::todo::dispatch::handle_dispatch(
+        deps,
+        &args,
+        &crate::todo::dispatch::RealClaudeSpawner,
+        None,
+    )
 }
 
 pub struct BuiltinOutcome {
@@ -369,6 +375,7 @@ fn run_planner_tool(
                 deps,
                 args_json,
                 &crate::todo::dispatch::RealClaudeSpawner,
+                Some(session_id),
             ) {
                 Ok(msg) => (ToolCallStatus::Completed, msg),
                 Err(e) => (ToolCallStatus::Error, e),

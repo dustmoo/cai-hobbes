@@ -234,6 +234,15 @@ pub struct FleetSession {
     /// are).
     #[serde(default)]
     pub dispatched_todo: Option<String>,
+    /// The Hobbes chat session that issued the HOBBES_DISPATCH. When set, the
+    /// parent chat is continued automatically once this run finishes (see
+    /// [`sweep_dispatch_continuations`]).
+    #[serde(default)]
+    pub dispatched_from: Option<String>,
+    /// Latch: the parent chat has already been handed this run's result.
+    /// Persisted, so a restart mid-run never double-fires the continuation.
+    #[serde(default)]
+    pub continuation_sent: bool,
 }
 
 impl FleetSession {
@@ -259,6 +268,8 @@ impl FleetSession {
             stopped_prompts: Vec::new(),
             attention_at: None,
             dispatched_todo: None,
+            dispatched_from: None,
+            continuation_sent: false,
         }
     }
 
@@ -852,6 +863,167 @@ pub fn dismiss_in_state(state: &mut FleetState, session_id: &str) -> Option<Flee
     Some(s)
 }
 
+// ── Dispatch continuations ──────────────────────────────────────────────────
+//
+// A HOBBES_DISPATCH'd run carries the id of the chat that issued it
+// (`dispatched_from`). When the run finishes, the parent chat is handed the
+// result and continues on its own — the "check in in 15 minutes?" round trip
+// disappears. Detection is a pure sweep over the live map plus today's ended
+// rows; delivery is the chat queue, reached through [`FleetShared`] because
+// the sweep runs on a plain tokio task with no Signal access.
+
+/// How long a finished dispatched run waits for its closing brief before the
+/// continuation fires anyway. The brief supervisor debounces on
+/// [`briefs::BRIEF_QUIET_SECS`]; the extra margin covers the LLM call itself.
+pub const DISPATCH_CONTINUE_GRACE_SECS: i64 = briefs::BRIEF_QUIET_SECS + 30;
+
+/// Supervisor mirror of `settings.dispatch_auto_continue` (the sweep has no
+/// Settings access — same pattern as [`set_retire_minutes`]).
+static DISPATCH_AUTO_CONTINUE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_dispatch_auto_continue(on: bool) {
+    DISPATCH_AUTO_CONTINUE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn dispatch_auto_continue() -> bool {
+    DISPATCH_AUTO_CONTINUE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One finished dispatched run, ready to be handed back to its parent chat.
+/// The todo *title* is resolved on the Dioxus side (the planner lives in a
+/// Signal); the sweep carries only the id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingContinuation {
+    /// The chat session that issued the dispatch.
+    pub parent_session_id: String,
+    /// The fleet session that just finished.
+    pub run_session_id: String,
+    pub todo_id: Option<String>,
+    /// The run's display name (session title, else cwd-derived).
+    pub session_name: String,
+    /// The closing brief's progress line, when a brief landed.
+    pub progress: Option<String>,
+}
+
+/// When did this dispatched run finish, if it did and still owes its parent a
+/// continuation? `None` for rows that were never dispatched from a chat, have
+/// already fired, are still working, or are waiting on the user — a
+/// NeedsAttention run (a permission gate) is deliberately *not* done: the
+/// Fleet badge already surfaces it and the parent must not be told it
+/// finished.
+fn dispatch_done_at(s: &FleetSession) -> Option<DateTime<Utc>> {
+    if s.dispatched_from.is_none() || s.continuation_sent {
+        return None;
+    }
+    if let Some(ended) = s.ended_at {
+        return Some(ended);
+    }
+    if s.status != FleetStatus::Idle || s.working_since.is_some() {
+        return None;
+    }
+    // A pre-created row that never ran is Idle too. `brief_dirty_at` (set by
+    // every Stop/SessionEnd) or an existing brief is the proof that a turn
+    // actually completed.
+    s.brief_dirty_at
+        .or_else(|| s.brief.as_ref().map(|b| b.generated_at))
+}
+
+/// The message the parent chat receives. First person to Hobbes, so the
+/// resumed turn reads as the user handing the result back.
+pub fn continuation_text(todo_title: &str, session_name: &str, progress: Option<&str>) -> String {
+    let progress = progress
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("No closing brief was generated — check the run's Fleet card for its output.");
+    format!(
+        "The background agent you dispatched for \"{todo_title}\" ({session_name}) has \
+         finished.\n\n{progress}\n\nReview the result and continue from where we left off."
+    )
+}
+
+/// What one continuation sweep produced: the messages to deliver, plus the
+/// rows whose `continuation_sent` latch was set (live rows get persisted
+/// wholesale; ended rows are merged in the store, since the sweep's copy of
+/// them may be behind a concurrently-generated brief).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ContinuationSweep {
+    pub continuations: Vec<PendingContinuation>,
+    pub live_rows: Vec<FleetSession>,
+    pub ended_ids: Vec<String>,
+}
+
+impl ContinuationSweep {
+    pub fn is_empty(&self) -> bool {
+        self.continuations.is_empty()
+    }
+}
+
+/// Collect the dispatched runs whose parents are owed a continuation, and
+/// latch them so a second sweep yields nothing.
+///
+/// `ended_rows` are store rows (SessionEnd removes a session from the live
+/// map); rows already present live win. Nothing fires while `enabled` is
+/// false — the latch stays open, so switching the setting back on hands over
+/// any run that finished in the meantime.
+pub fn sweep_dispatch_continuations(
+    state: &mut FleetState,
+    ended_rows: &[FleetSession],
+    now: DateTime<Utc>,
+    enabled: bool,
+) -> ContinuationSweep {
+    let mut out = ContinuationSweep::default();
+    if !enabled {
+        return out;
+    }
+
+    // `(row, done_at)` pairs, live first so an ended row that is still in the
+    // live map is never handled twice.
+    let mut ready: Vec<(String, PendingContinuation, bool)> = Vec::new();
+    let consider = |s: &FleetSession| -> Option<PendingContinuation> {
+        let done_at = dispatch_done_at(s)?;
+        // Wait for the closing brief; fall back once the grace window passes.
+        let brief = s.brief.as_ref().filter(|b| b.generated_at >= done_at);
+        if brief.is_none() && (now - done_at).num_seconds() < DISPATCH_CONTINUE_GRACE_SECS {
+            return None;
+        }
+        Some(PendingContinuation {
+            parent_session_id: s.dispatched_from.clone()?,
+            run_session_id: s.id.clone(),
+            todo_id: s.dispatched_todo.clone(),
+            session_name: s.display_name().to_string(),
+            progress: brief.map(briefs::progress_line),
+        })
+    };
+
+    for s in state.sessions.values() {
+        if let Some(c) = consider(s) {
+            ready.push((s.id.clone(), c, true));
+        }
+    }
+    for r in ended_rows {
+        if state.sessions.contains_key(&r.id) {
+            continue;
+        }
+        if let Some(c) = consider(r) {
+            ready.push((r.id.clone(), c, false));
+        }
+    }
+
+    for (id, continuation, is_live) in ready {
+        if is_live {
+            if let Some(s) = state.sessions.get_mut(&id) {
+                s.continuation_sent = true;
+                out.live_rows.push(s.clone());
+            }
+        } else {
+            out.ended_ids.push(id);
+        }
+        out.continuations.push(continuation);
+    }
+    out
+}
+
 // ── Day aggregation ─────────────────────────────────────────────────────────
 
 /// Fleet minutes on a local day from the live map only.
@@ -985,6 +1157,10 @@ pub struct FleetShared {
     gates: Mutex<HashMap<String, tokio::sync::oneshot::Sender<GateOutcome>>>,
     /// Bumped after every state change; the UI drain loop subscribes.
     notify: tokio::sync::watch::Sender<u64>,
+    /// Finished dispatched runs whose parent chats are owed a continuation.
+    /// Filled by the server's sweep (a plain tokio task), taken by the UI
+    /// drain loop in `main.rs` — the one place that may touch the chat queue.
+    continuations: Mutex<Vec<PendingContinuation>>,
 }
 
 impl Default for FleetShared {
@@ -999,6 +1175,7 @@ impl FleetShared {
             state: Mutex::new(FleetState::default()),
             gates: Mutex::new(HashMap::new()),
             notify: tokio::sync::watch::channel(0).0,
+            continuations: Mutex::new(Vec::new()),
         }
     }
 
@@ -1012,6 +1189,33 @@ impl FleetShared {
 
     pub fn snapshot(&self) -> FleetState {
         self.state.lock().expect("fleet state lock poisoned").clone()
+    }
+
+    /// Hand the UI side a batch of finished dispatched runs. Deduped by run
+    /// id so a poke race can't enqueue the same continuation twice.
+    pub fn push_continuations(&self, batch: Vec<PendingContinuation>) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut q = self
+            .continuations
+            .lock()
+            .expect("fleet continuations lock poisoned");
+        for c in batch {
+            if !q.iter().any(|e| e.run_session_id == c.run_session_id) {
+                q.push(c);
+            }
+        }
+    }
+
+    /// Drain the queue (UI side only).
+    pub fn take_continuations(&self) -> Vec<PendingContinuation> {
+        std::mem::take(
+            &mut *self
+                .continuations
+                .lock()
+                .expect("fleet continuations lock poisoned"),
+        )
     }
 
     pub(crate) fn register_gate(
@@ -1267,6 +1471,218 @@ mod tests {
             cwd: "/Users/x/dev/hobbes".into(),
             background_tasks: 0,
         }
+    }
+
+    // ── Dispatch continuations ─────────────────────────────────────────────
+
+    fn brief_at(t: DateTime<Utc>, headline: &str) -> SessionBrief {
+        SessionBrief {
+            headline: headline.to_string(),
+            bullets: vec![],
+            blocked_on: None,
+            generated_at: t,
+            final_brief: true,
+        }
+    }
+
+    /// A dispatched run, started and stopped, with `parent` as its origin.
+    fn dispatched_state(parent: Option<&str>) -> (FleetState, DateTime<Utc>) {
+        let t0 = utc("2026-09-16T10:00:00Z");
+        let mut state = FleetState::default();
+        reduce(&mut state, &start("run1"), t0);
+        {
+            let s = state.sessions.get_mut("run1").unwrap();
+            s.dispatched_todo = Some("todo-1".into());
+            s.dispatched_from = parent.map(str::to_string);
+            s.session_title = Some("CSV export".into());
+        }
+        let t1 = t0 + chrono::Duration::seconds(120);
+        reduce(&mut state, &stop("run1"), t1);
+        note_transcript_and_dirty(&mut state, &mut Vec::new(), &stop("run1"), Some("/t.jsonl"), t1);
+        (state, t1)
+    }
+
+    #[test]
+    fn finished_dispatched_run_continues_its_parent_once() {
+        let (mut state, stopped) = dispatched_state(Some("parent"));
+        // Stopped, but the closing brief hasn't landed: nothing yet — the
+        // parent is worth waiting a moment to give a real answer to.
+        let sweep = sweep_dispatch_continuations(&mut state, &[], stopped, true);
+        assert!(sweep.is_empty());
+
+        let landed = stopped + chrono::Duration::seconds(50);
+        state.sessions.get_mut("run1").unwrap().brief =
+            Some(brief_at(landed, "Shipped the CSV export behind a flag."));
+        let sweep = sweep_dispatch_continuations(&mut state, &[], landed, true);
+        assert_eq!(sweep.continuations.len(), 1);
+        let c = &sweep.continuations[0];
+        assert_eq!(c.parent_session_id, "parent");
+        assert_eq!(c.run_session_id, "run1");
+        assert_eq!(c.todo_id.as_deref(), Some("todo-1"));
+        assert_eq!(
+            c.progress.as_deref(),
+            Some("Shipped the CSV export behind a flag.")
+        );
+        assert_eq!(sweep.live_rows.len(), 1);
+        assert!(sweep.live_rows[0].continuation_sent);
+        assert!(sweep.ended_ids.is_empty());
+
+        let text = continuation_text("Ship CSV export", &c.session_name, c.progress.as_deref());
+        assert!(text.contains("dispatched for \"Ship CSV export\" (CSV export) has finished"));
+        assert!(text.contains("Shipped the CSV export behind a flag."));
+        assert!(text.contains("continue from where we left off"));
+
+        // The latch is what keeps the parent from being told twice.
+        let again = sweep_dispatch_continuations(
+            &mut state,
+            &[],
+            landed + chrono::Duration::hours(1),
+            true,
+        );
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn ended_run_without_a_brief_continues_after_the_grace_window() {
+        let (mut state, _) = dispatched_state(Some("parent"));
+        let ended_at = utc("2026-09-16T10:05:00Z");
+        let mut changed = reduce(
+            &mut state,
+            &FleetEvent::SessionEnd {
+                session_id: "run1".into(),
+                cwd: String::new(),
+                reason: "exit".into(),
+            },
+            ended_at,
+        );
+        assert!(!state.sessions.contains_key("run1"), "ended rows leave the map");
+        let row = changed.pop().unwrap();
+
+        // Inside the window we still hope for a final brief.
+        let sweep = sweep_dispatch_continuations(
+            &mut state,
+            std::slice::from_ref(&row),
+            ended_at + chrono::Duration::seconds(DISPATCH_CONTINUE_GRACE_SECS - 1),
+            true,
+        );
+        assert!(sweep.is_empty());
+
+        let late = ended_at + chrono::Duration::seconds(DISPATCH_CONTINUE_GRACE_SECS);
+        let sweep = sweep_dispatch_continuations(&mut state, std::slice::from_ref(&row), late, true);
+        assert_eq!(sweep.continuations.len(), 1);
+        let c = &sweep.continuations[0];
+        assert_eq!(c.parent_session_id, "parent");
+        assert!(c.progress.is_none(), "no brief landed");
+        // Ended rows are merged in the store, never re-persisted wholesale.
+        assert_eq!(sweep.ended_ids, vec!["run1".to_string()]);
+        assert!(sweep.live_rows.is_empty());
+
+        let text = continuation_text("Ship CSV export", &c.session_name, None);
+        assert!(text.contains("has finished"));
+        assert!(text.contains("No closing brief was generated"));
+    }
+
+    #[test]
+    fn undispatched_and_gated_runs_never_continue_anything() {
+        // No parent → nothing to continue.
+        let (mut state, t) = dispatched_state(None);
+        state.sessions.get_mut("run1").unwrap().brief = Some(brief_at(t, "done"));
+        assert!(sweep_dispatch_continuations(
+            &mut state,
+            &[],
+            t + chrono::Duration::hours(1),
+            true
+        )
+        .is_empty());
+
+        // A run holding a permission gate is not finished, however long it waits.
+        let (mut state, t) = dispatched_state(Some("parent"));
+        reduce(
+            &mut state,
+            &FleetEvent::PermissionRequest {
+                session_id: "run1".into(),
+                cwd: String::new(),
+                request_id: "r1".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::json!({}),
+            },
+            t + chrono::Duration::seconds(1),
+        );
+        assert!(state.sessions["run1"].status.needs_attention());
+        assert!(sweep_dispatch_continuations(
+            &mut state,
+            &[],
+            t + chrono::Duration::hours(1),
+            true
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_precreated_run_that_never_started_continues_nothing() {
+        let now = utc("2026-09-16T10:00:00Z");
+        let mut state = FleetState::default();
+        let mut row = FleetSession::new("run1", "/Users/x/dev/hobbes", now);
+        row.dispatched_todo = Some("todo-1".into());
+        row.dispatched_from = Some("parent".into());
+        state.sessions.insert(row.id.clone(), row);
+        // Idle from birth, but no Stop ever marked it dirty and no brief exists.
+        assert!(sweep_dispatch_continuations(
+            &mut state,
+            &[],
+            now + chrono::Duration::hours(2),
+            true
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_setting_off_continues_nothing_and_keeps_the_latch_open() {
+        let (mut state, stopped) = dispatched_state(Some("parent"));
+        let landed = stopped + chrono::Duration::seconds(50);
+        state.sessions.get_mut("run1").unwrap().brief = Some(brief_at(landed, "Done."));
+
+        assert!(sweep_dispatch_continuations(&mut state, &[], landed, false).is_empty());
+        assert!(!state.sessions["run1"].continuation_sent);
+        // Switching it back on hands over the run that finished meanwhile.
+        assert_eq!(
+            sweep_dispatch_continuations(&mut state, &[], landed, true)
+                .continuations
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_rows_load_without_the_continuation_fields() {
+        let legacy = r#"{"id":"x","cwd":"/a","name":"a","status":"Idle",
+            "last_event_at":"2026-08-25T10:00:00Z","working_since":null,
+            "dispatched_todo":"todo-1"}"#;
+        let s: FleetSession = serde_json::from_str(legacy).unwrap();
+        assert_eq!(s.dispatched_todo.as_deref(), Some("todo-1"));
+        assert!(s.dispatched_from.is_none());
+        assert!(!s.continuation_sent);
+        // And they round-trip through the store's `data` JSON column.
+        let round: FleetSession =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(round, s);
+    }
+
+    #[test]
+    fn the_shared_continuation_queue_dedupes_and_drains_once() {
+        let shared = FleetShared::new();
+        let c = |run: &str| PendingContinuation {
+            parent_session_id: "parent".into(),
+            run_session_id: run.into(),
+            todo_id: None,
+            session_name: "run".into(),
+            progress: None,
+        };
+        shared.push_continuations(vec![c("run1"), c("run2")]);
+        shared.push_continuations(vec![c("run1")]);
+        let taken = shared.take_continuations();
+        assert_eq!(taken.len(), 2);
+        assert!(shared.take_continuations().is_empty());
     }
 
     #[test]

@@ -132,6 +132,31 @@ pub async fn start(shared: Arc<FleetShared>, cfg: FleetServerConfig) -> Result<F
                             store::persist_sessions(&changed);
                             shared.poke();
                         }
+
+                        // Dispatched runs that finished: hand their result
+                        // back to the chat that launched them. Ended rows
+                        // have left the live map, so today's store rows come
+                        // along — a run that finished before the last local
+                        // midnight is stale news and deliberately drops.
+                        let now = chrono::Utc::now();
+                        let ended = store::sessions_active_on(chrono::Local::now().date_naive());
+                        let sweep = {
+                            let mut state = shared.state.lock().expect("fleet state lock poisoned");
+                            crate::fleet::sweep_dispatch_continuations(
+                                &mut state,
+                                &ended,
+                                now,
+                                crate::fleet::dispatch_auto_continue(),
+                            )
+                        };
+                        if !sweep.is_empty() {
+                            store::persist_sessions(&sweep.live_rows);
+                            for id in &sweep.ended_ids {
+                                store::merge_session(id, |row| row.continuation_sent = true);
+                            }
+                            shared.push_continuations(sweep.continuations);
+                            shared.poke();
+                        }
                         // Truth-on-disk reconciliation: catches events lost
                         // while Hobbes wasn't running (file IO off the lock).
                         let shared_for_reconcile = shared.clone();
