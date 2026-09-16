@@ -205,6 +205,41 @@ pub fn McpMarketplace() -> Element {
     let mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let settings = use_context::<Signal<Settings>>();
 
+    // Lightweight header meta: total configured servers + how many need auth.
+    // Read-only display data — does not affect the Status tab's own resource.
+    let header_statuses = use_resource(move || {
+        let _context = mcp_context.read();
+        let mcp_manager = mcp_manager;
+        async move { mcp_manager.read().get_all_server_statuses().await }
+    });
+    let (header_server_count, header_needs_auth_count) =
+        match header_statuses.read().as_ref() {
+            Some(statuses) => (
+                statuses.len(),
+                statuses
+                    .iter()
+                    .filter(|s| s.status == ServerStatus::NeedsAuth)
+                    .count(),
+            ),
+            None => (0, 0),
+        };
+    let header_count_label = if header_needs_auth_count > 0 {
+        format!(
+            "{} server{} · {} need{} auth",
+            header_server_count,
+            if header_server_count == 1 { "" } else { "s" },
+            header_needs_auth_count,
+            if header_needs_auth_count == 1 { "s" } else { "" }
+        )
+    } else {
+        format!(
+            "{} server{}",
+            header_server_count,
+            if header_server_count == 1 { "" } else { "s" }
+        )
+    };
+    let mcp_hotkey_label = crate::hotkey::display_combo(&settings.read().hotkeys.toggle_mcp);
+
     let filter_verified = use_signal(|| true);
     let filter_deployed = use_signal(|| false);
     let sort_by = use_signal(|| "usage".to_string());
@@ -689,50 +724,49 @@ pub fn McpMarketplace() -> Element {
         div {
             class: "flex flex-col h-full bg-app text-fg",
             div {
-                class: "p-4 border-b border-faint",
-                div {
-                    class: "flex items-center justify-between mb-2",
-                    h2 { class: "text-xl font-bold", "MCP Servers" }
-                    if *active_tab.read() == ActiveTab::Marketplace {
-                        div {
-                            class: "text-xs px-2 py-1 rounded bg-input text-fg-muted",
-                            if is_loading {
-                                "Loading..."
-                            } else {
-                                "Source: {data_source}"
-                            }
+                class: "h-11 flex items-baseline gap-2.5 px-4 border-b border-subtle shrink-0",
+                span { class: "text-base font-semibold", "MCP Tools" }
+                span { class: "font-mono text-[11px] text-fg-muted", "{header_count_label}" }
+                if *active_tab.read() == ActiveTab::Marketplace {
+                    span {
+                        class: "font-mono text-[11px] text-fg-muted",
+                        if is_loading {
+                            "Loading..."
+                        } else {
+                            "Source: {data_source}"
                         }
                     }
                 }
-                div {
-                    class: "flex space-x-4",
-                    button {
-                        class: if *active_tab.read() == ActiveTab::Status {
-                            "px-3 py-1 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
-                        } else {
-                            "px-3 py-1 text-sm font-medium text-fg-muted hover:text-fg"
-                        },
-                        onclick: move |_| active_tab.set(ActiveTab::Status),
-                        "Status"
-                    }
-                    button {
-                        class: if *active_tab.read() == ActiveTab::Marketplace {
-                            "px-3 py-1 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
-                        } else {
-                            "px-3 py-1 text-sm font-medium text-fg-muted hover:text-fg"
-                        },
-                        onclick: move |_| active_tab.set(ActiveTab::Marketplace),
-                        "Marketplace"
-                    }
-                    button {
-                        class: if *active_tab.read() == ActiveTab::Installed {
-                            "px-3 py-1 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
-                        } else {
-                            "px-3 py-1 text-sm font-medium text-fg-muted hover:text-fg"
-                        },
-                        onclick: move |_| active_tab.set(ActiveTab::Installed),
-                        "Installed / Config"
-                    }
+                span { class: "ml-auto font-mono text-[11px] text-fg-muted", "{mcp_hotkey_label}" }
+            }
+            div {
+                class: "flex space-x-4 px-4 border-b border-faint",
+                button {
+                    class: if *active_tab.read() == ActiveTab::Status {
+                        "px-3 py-1.5 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
+                    } else {
+                        "px-3 py-1.5 text-sm font-medium text-fg-muted hover:text-fg"
+                    },
+                    onclick: move |_| active_tab.set(ActiveTab::Status),
+                    "Status"
+                }
+                button {
+                    class: if *active_tab.read() == ActiveTab::Marketplace {
+                        "px-3 py-1.5 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
+                    } else {
+                        "px-3 py-1.5 text-sm font-medium text-fg-muted hover:text-fg"
+                    },
+                    onclick: move |_| active_tab.set(ActiveTab::Marketplace),
+                    "Marketplace"
+                }
+                button {
+                    class: if *active_tab.read() == ActiveTab::Installed {
+                        "px-3 py-1.5 text-sm font-medium text-primary-400 border-b-2 border-primary-400"
+                    } else {
+                        "px-3 py-1.5 text-sm font-medium text-fg-muted hover:text-fg"
+                    },
+                    onclick: move |_| active_tab.set(ActiveTab::Installed),
+                    "Installed / Config"
                 }
             }
 
@@ -770,11 +804,11 @@ pub fn McpMarketplace() -> Element {
                                 class: "flex flex-col items-center justify-center py-12 text-center",
                                 if is_error {
                                     div {
-                                        class: "text-sm text-fg-muted mb-4 max-w-md",
+                                        class: "text-sm text-fg-muted px-2 py-8 max-w-md",
                                         "{error_display}"
                                     }
                                 } else {
-                                    p { class: "text-sm text-fg-muted mb-4", "No tools found." }
+                                    p { class: "text-sm text-fg-muted px-2 py-8", "No tools found." }
                                 }
                                 button {
                                     class: "px-4 py-2 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors",
@@ -791,8 +825,9 @@ pub fn McpMarketplace() -> Element {
                                 }
                             }
                         } else {
+                            span { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium px-2", "Available" }
                             div {
-                                class: "grid grid-cols-1 gap-4",
+                                class: "grid grid-cols-1 gap-4 mt-1",
                                 for mcp in filtered_mcps {
                                     McpServerCard {
                                         key: "{mcp.name}",
@@ -1063,12 +1098,13 @@ fn StatusView(trigger_search: Signal<i32>) -> Element {
                 Some(statuses) => rsx! {
                     if statuses.is_empty() {
                         div {
-                            class: "text-center text-fg-muted py-8",
+                            class: "text-sm text-fg-muted px-2 py-8",
                             "No MCP servers configured. Add servers from the Marketplace tab."
                         }
                     } else {
+                        span { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium px-2", "Installed" }
                         div {
-                            class: "grid grid-cols-1 gap-3",
+                            class: "grid grid-cols-1 gap-3 mt-1",
                             for status in statuses {
                                 StatusCard {
                                     status: status.clone(),
@@ -1079,7 +1115,7 @@ fn StatusView(trigger_search: Signal<i32>) -> Element {
                     }
                 },
                 None => rsx! {
-                    div { class: "text-center text-fg-muted py-8", "Loading server status..." }
+                    div { class: "text-sm text-fg-muted px-2 py-8", "Loading server status..." }
                 }
             }
         }
@@ -1219,6 +1255,14 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
         ServerStatus::NeedsAuth => ("bg-yellow-500", "Needs Auth", "bg-yellow-900/20"),
         ServerStatus::NotConfigured => ("bg-blue-500", "Not Configured", "bg-blue-900/20"),
     };
+    let status_chip_class = match status.status {
+        ServerStatus::Loaded => "h-[22px] px-2 rounded-full border text-[11px] border-green-800 text-green-300",
+        ServerStatus::NeedsAuth => "h-[22px] px-2 rounded-full border text-[11px] border-yellow-700 text-yellow-300",
+        ServerStatus::Error => "h-[22px] px-2 rounded-full border text-[11px] border-red-700 text-red-400",
+        ServerStatus::Disabled | ServerStatus::NotConfigured => {
+            "h-[22px] px-2 rounded-full border text-[11px] border-faint text-fg-muted"
+        }
+    };
 
     let status_clone = status.clone();
     let retry_server = move |_| {
@@ -1287,7 +1331,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                             class: "flex items-center gap-x-2 flex-wrap",
                             h3 { class: "font-bold text-fg", "{status.name}" }
                             span {
-                                class: "text-xs px-2 py-0.5 rounded {status_color} bg-opacity-20 text-fg",
+                                class: "inline-flex items-center {status_chip_class}",
                                 "{status_text}"
                             }
                             // Tool count badge for loaded servers
@@ -2327,18 +2371,21 @@ fn McpServerCard(
 
     // Source-aware status display
     let is_composio_tool = mcp.command.is_empty();
-    let (status_class, _status_text) = match install_status.read().as_ref() {
+    let (status_chip_class, status_text) = match install_status.read().as_ref() {
         Some((true, false)) => (
-            "h-2 w-2 rounded-full bg-green-500",
+            "h-[22px] px-2 rounded-full border text-[11px] border-green-800 text-green-300",
             if is_composio_tool {
                 "Connected"
             } else {
                 "Loaded"
             },
         ),
-        Some((true, true)) => ("h-2 w-2 rounded-full bg-red-500", "Error"),
+        Some((true, true)) => (
+            "h-[22px] px-2 rounded-full border text-[11px] border-red-700 text-red-400",
+            "Error",
+        ),
         _ => (
-            "h-2 w-2 rounded-full bg-gray-500",
+            "h-[22px] px-2 rounded-full border text-[11px] border-faint text-fg-muted",
             if is_composio_tool {
                 "Not Connected"
             } else {
@@ -2369,13 +2416,16 @@ fn McpServerCard(
                 class: "flex justify-between items-start",
                 div {
                     class: "flex items-center gap-x-3",
-                    span { class: "{status_class}" },
                     h3 { class: "font-bold text-lg", "{mcp.display_name}" }
+                    span {
+                        class: "inline-flex items-center {status_chip_class}",
+                        "{status_text}"
+                    }
                 }
                 if *is_connecting.read() {
                     // Step 4 Priority: Show "Authenticating..." or "Connecting..." even if registry thinks it's installed
                     button {
-                        class: "px-3 py-1 bg-input rounded text-sm font-medium cursor-wait flex items-center gap-2",
+                        class: "border border-faint rounded px-2.5 py-1 text-xs hover:bg-card cursor-wait flex items-center gap-2",
                         disabled: true,
                         span { class: "inline-block animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full" }
                         "{connection_status.read()}"
@@ -2383,7 +2433,7 @@ fn McpServerCard(
                 } else if let Some((installed, _)) = install_status.read().as_ref() {
                     if *installed {
                         button {
-                            class: "px-3 py-1 bg-input rounded text-sm font-medium cursor-not-allowed",
+                            class: "border border-faint rounded px-2.5 py-1 text-xs hover:bg-card",
                             disabled: true,
                             if is_composio_tool { "Connected" } else { "Installed" }
                         }
@@ -2394,7 +2444,7 @@ fn McpServerCard(
                                 class: "flex flex-col items-end gap-1",
                                 if show_setup_credentials {
                                     button {
-                                        class: "px-3 py-1 bg-amber-600 hover:bg-amber-500 rounded text-sm font-medium transition-colors flex items-center gap-1",
+                                        class: "bg-amber-600 hover:bg-amber-500 rounded px-2.5 py-1 text-xs text-fg flex items-center gap-1",
                                         title: "This tool requires your own API Key/Secret. Click to setup in Settings.",
                                         onclick: move |_| {
                                             tracing::info!("Redirecting to BYOA setup for toolkit: {}", mcp.name);
@@ -2408,7 +2458,7 @@ fn McpServerCard(
                                     }
                                 } else {
                                     button {
-                                        class: "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors",
+                                        class: "bg-btn-primary hover:bg-btn-primary-hover rounded px-2.5 py-1 text-xs text-fg",
                                         onclick: {
                                             if mcp.name == "news_api" {
                                                 tracing::trace!("Rendering Connect button for news_api. Auth: {:?}, Managed: {}", mcp.auth_scheme, mcp.use_managed_auth);
@@ -2483,7 +2533,7 @@ fn McpServerCard(
                             } // end div
                         } else {
                             button {
-                                class: "px-3 py-1 bg-btn-primary hover:bg-btn-primary-hover rounded text-sm font-medium transition-colors",
+                                class: "bg-btn-primary hover:bg-btn-primary-hover rounded px-2.5 py-1 text-xs text-fg",
                                 onclick: move |_| add_mcp.call(mcp_clone_for_add.clone()),
                                 "Add"
                             }
@@ -2491,7 +2541,7 @@ fn McpServerCard(
                     } // end if *installed else
                 } else {
                     button {
-                        class: "px-3 py-1 bg-input rounded text-sm font-medium cursor-not-allowed",
+                        class: "border border-faint rounded px-2.5 py-1 text-xs hover:bg-card",
                         disabled: true,
                         "Loading..."
                     }
@@ -2499,7 +2549,7 @@ fn McpServerCard(
             }
             div {
                 class: "flex-grow mt-2",
-                p { class: "text-sm text-fg-muted", "{mcp.description}" }
+                p { class: "text-xs text-fg-muted", "{mcp.description}" }
             }
             if !mcp.homepage.is_empty() {
                 div {

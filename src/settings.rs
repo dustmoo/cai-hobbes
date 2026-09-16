@@ -2562,6 +2562,9 @@ mod tests {
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
         tool_call_history: Vec::new(),
+        tab_emoji: None,
+        tab_title: None,
+        name_user_set: false,
         }
     }
 

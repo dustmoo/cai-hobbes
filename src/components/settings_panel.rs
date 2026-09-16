@@ -16,6 +16,36 @@ use rfd;
 use std::io::Write;
 use zip::write::{FileOptions, ZipWriter};
 
+/// Shared class string for text/number inputs and selects across the
+/// Settings drawer. Route every such control through this constant instead
+/// of hand-rolled class strings so the drawer's input styling can't drift.
+pub(crate) const INPUT: &str = "h-8 bg-app border border-faint rounded px-2.5 text-sm text-fg focus:outline-none focus:ring-2 focus:ring-primary-500 w-full";
+
+/// A 34x18 on/off switch rendered from a plain checkbox, so existing
+/// `bool` signals and `onchange` handlers keep working unchanged while the
+/// visual is consistent across the whole panel.
+#[component]
+pub(crate) fn Toggle(checked: bool, onchange: EventHandler<bool>) -> Element {
+    rsx! {
+        label {
+            class: "relative inline-flex items-center cursor-pointer shrink-0",
+            input {
+                r#type: "checkbox",
+                class: "sr-only peer",
+                checked,
+                onchange: move |evt| onchange.call(evt.checked()),
+            }
+            span {
+                class: if checked {
+                    "w-[34px] h-[18px] rounded-full bg-primary-500 transition-colors relative after:content-[''] after:absolute after:top-[2px] after:left-[18px] after:w-[14px] after:h-[14px] after:rounded-full after:bg-white after:transition-all"
+                } else {
+                    "w-[34px] h-[18px] rounded-full bg-card border border-faint transition-colors relative after:content-[''] after:absolute after:top-[1px] after:left-[1px] after:w-[14px] after:h-[14px] after:rounded-full after:bg-fg-muted after:transition-all"
+                },
+            }
+        }
+    }
+}
+
 /// Copy a connector's config into the matching legacy singleton slot so the
 /// per-provider editing blocks (bound to `gemini_config` / `openai_compat_config`
 /// / `claude_config`) edit it in place. Also points `active_llm` at its kind so
@@ -451,7 +481,7 @@ pub fn SettingsPanel() -> Element {
                         }
                         div { class: "flex gap-3 justify-end",
                             button {
-                                class: "px-4 py-2 rounded-md text-fg-muted hover:text-fg",
+                                class: "border border-faint text-fg rounded px-3 py-1.5 text-sm hover:bg-card",
                                 onclick: move |_| {
                                     pending_keychain_mode.set(None);
                                     show_keychain_mode_confirm.set(false);
@@ -459,7 +489,7 @@ pub fn SettingsPanel() -> Element {
                                 "Cancel"
                             }
                             button {
-                                class: "px-4 py-2 bg-red-600 hover:bg-red-700 text-fg rounded-md font-semibold",
+                                class: "border border-red-700/50 text-red-400 rounded px-3 py-1.5 text-sm",
                                 onclick: move |_| {
                                     if let Some(new_mode) = pending_keychain_mode.read().clone() {
                                         // Clear all keychain secrets
@@ -668,10 +698,17 @@ pub fn SettingsPanel() -> Element {
             // Sidebar (shrink-0 to not affect content width)
             div {
                 class: "w-48 shrink-0 flex flex-col border-r border-subtle bg-section",
-                h2 { class: "text-lg font-bold p-4 border-b border-subtle", "Settings" }
+                div {
+                    class: "h-11 flex items-baseline gap-2.5 px-4 border-b border-subtle shrink-0",
+                    span { class: "text-base font-semibold text-fg", "Settings" }
+                    span { class: "font-mono text-[11px] text-fg-muted", "{app_version}" }
+                    span { class: "font-mono text-[11px] text-fg-muted ml-auto", "{crate::hotkey::display_combo(&settings.read().hotkeys.toggle_settings)}" }
+                }
                 // Tabs
+                div {
+                    class: "flex flex-col gap-0.5 p-2",
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::General { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::General { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::General;
                         let state = (*ui_state.read()).clone();
@@ -682,7 +719,7 @@ pub fn SettingsPanel() -> Element {
                     "General"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Mcp { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Mcp { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Mcp;
                         let state = (*ui_state.read()).clone();
@@ -693,7 +730,7 @@ pub fn SettingsPanel() -> Element {
                     "MCP Tools"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Behavior { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Behavior { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Behavior;
                         let state = (*ui_state.read()).clone();
@@ -704,7 +741,7 @@ pub fn SettingsPanel() -> Element {
                     "Behavior"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Planner { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Planner { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Planner;
                         let state = (*ui_state.read()).clone();
@@ -715,7 +752,7 @@ pub fn SettingsPanel() -> Element {
                     "Planner"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Data { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Data { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Data;
                         let state = (*ui_state.read()).clone();
@@ -726,7 +763,7 @@ pub fn SettingsPanel() -> Element {
                     "Data"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Permissions { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Permissions { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Permissions;
                         let state = (*ui_state.read()).clone();
@@ -737,7 +774,7 @@ pub fn SettingsPanel() -> Element {
                     "Permissions"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Hotkeys { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Hotkeys { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Hotkeys;
                         let state = (*ui_state.read()).clone();
@@ -748,7 +785,7 @@ pub fn SettingsPanel() -> Element {
                     "Hotkeys"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Credentials { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Credentials { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Credentials;
                         let state = (*ui_state.read()).clone();
@@ -759,7 +796,7 @@ pub fn SettingsPanel() -> Element {
                     "Credentials"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Skills { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Skills { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::Skills;
                         let state = (*ui_state.read()).clone();
@@ -770,7 +807,7 @@ pub fn SettingsPanel() -> Element {
                     "Skills"
                 }
                 button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::About { "flex items-center gap-3 p-3 bg-primary-700/50 text-fg border-l-4 border-primary-500" } else { "flex items-center gap-3 p-3 text-fg-muted hover:bg-white/5 hover:text-fg border-l-4 border-transparent" },
+                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::About { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
                     onclick: move |_| {
                         ui_state.write().active_settings_tab = crate::settings::SettingsTab::About;
                         let state = (*ui_state.read()).clone();
@@ -779,6 +816,7 @@ pub fn SettingsPanel() -> Element {
                     },
                     Icon { width: 18, height: 18, icon: fi_icons::FiInfo }
                     "About"
+                }
                 }
             }
 
@@ -793,7 +831,7 @@ pub fn SettingsPanel() -> Element {
                                 class: "border border-subtle rounded-lg mb-4",
                                 div {
                                     class: "p-4 bg-section rounded-lg",
-                                    h3 { class: "text-md font-semibold mb-3", "Planner" }
+                                    h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-3", "Planner" }
                                     p { class: "text-sm text-fg-muted mb-4",
                                         "The built-in to-do list and daily planner, shared between you and Hobbes."
                                     }
@@ -934,7 +972,7 @@ pub fn SettingsPanel() -> Element {
                                 class: "border border-subtle rounded-lg mb-4",
                                 div {
                                     class: "p-4 bg-section rounded-lg",
-                                    h3 { class: "text-md font-semibold mb-3", "Quick-Add Syntax" }
+                                    h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-3", "Quick-Add Syntax" }
                                     p { class: "text-sm text-fg-muted mb-2",
                                         "Tokens anywhere in the quick-add input; anything that doesn't parse stays in the title."
                                     }
@@ -960,7 +998,7 @@ pub fn SettingsPanel() -> Element {
                     div {
                         class: "flex justify-between items-center p-4 cursor-pointer bg-section rounded-t-lg",
                         onclick: toggle_llm_collapsed,
-                        h3 { class: "text-md font-semibold", "LLM Configuration" }
+                        h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium", "LLM Configuration" }
                         span { if ui_state.read().llm_config_collapsed { "▶" } else { "▼" } }
                     }
                     if !ui_state.read().llm_config_collapsed {
@@ -1160,7 +1198,7 @@ pub fn SettingsPanel() -> Element {
                                             div {
                                                 class: "flex gap-2",
                                                 div {
-                                                    class: "flex-1 px-3 py-2 rounded-md text-sm font-medium bg-btn-primary text-fg text-center",
+                                                    class: "flex-1 bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm text-center",
                                                     "🔑 Local Keychain"
                                                 }
                                             }
@@ -2004,7 +2042,7 @@ pub fn SettingsPanel() -> Element {
                                             onclick: move |_| {
                                                 // Toggle inline — no extra state needed, use a simple detail/summary approach via class
                                             },
-                                            h4 { class: "text-sm font-medium text-fg-muted", "Context Tuning (Override Defaults)" }
+                                            h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2", "Context Tuning (Override Defaults)" }
                                         }
                                         div {
                                             class: "px-3 pb-3 space-y-2",
@@ -2802,7 +2840,7 @@ pub fn SettingsPanel() -> Element {
                                             class: "flex justify-between items-center mb-3",
                                             label { class: "block text-sm font-medium text-fg-muted", "Composio Profiles" }
                                             button {
-                                                class: "px-3 py-1 bg-btn-primary rounded-md text-fg text-sm font-medium hover:bg-btn-primary-hover",
+                                                class: "bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm",
                                                 onclick: move |_| {
                                                     let new_profile = crate::settings::ComposioProfile::default();
                                                     local_settings.write().add_profile(new_profile);
@@ -2882,7 +2920,7 @@ pub fn SettingsPanel() -> Element {
                                         } {
                                             div {
                                                 class: "border border-subtle rounded-lg p-3",
-                                                h4 { class: "text-sm font-medium text-fg-muted mb-3", "Edit Profile: {active_display_name}" }
+                                                h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2 mb-3", "Edit Profile: {active_display_name}" }
 
                                                 // Profile Name
                                                 div {
@@ -3160,8 +3198,8 @@ pub fn SettingsPanel() -> Element {
                     div {
                         class: "flex justify-between items-center p-4 cursor-pointer bg-section rounded-t-lg",
                         onclick: move |_| app_behavior_collapsed.set(!app_behavior_collapsed()),
-                        h3 { class: "text-md font-semibold", "Application Behavior" }
-                        span { if *app_behavior_collapsed.read() { "▶" } else { "▼" } }
+                        h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium", "Application Behavior" }
+                        span { class: "text-fg-muted text-xs", if *app_behavior_collapsed.read() { "▶" } else { "▼" } }
                     }
                     if !app_behavior_collapsed() {
                         div {
@@ -3169,13 +3207,15 @@ pub fn SettingsPanel() -> Element {
 
                             // 0. Appearance
                             div {
-                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Appearance" }
+                                h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2 mb-3", "Appearance" }
                                 div {
-                                    class: "flex flex-col gap-1",
-                                    label { class: "text-sm font-medium text-fg-muted", "Theme" }
-                                    p { class: "text-xs text-fg-muted", "Choose application color theme" }
+                                    class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5",
+                                    div {
+                                        label { class: "text-sm text-fg", "Theme" }
+                                        p { class: "text-xs text-fg-muted", "Choose application color theme" }
+                                    }
                                     select {
-                                        class: "bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                        class: "{INPUT} justify-self-end",
                                         onchange: move |e| {
                                             let theme = match e.value().as_str() {
                                                 "Light" => crate::settings::Theme::Light,
@@ -3193,18 +3233,19 @@ pub fn SettingsPanel() -> Element {
 
                             // 1. Context & History (Global Defaults)
                             div {
-                                h4 { class: "text-sm font-semibold text-fg-muted mb-1", "Context & History (Global Defaults)" }
+                                h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2 mb-1", "Context & History (Global Defaults)" }
                                 p { class: "text-xs text-fg-muted mb-3 opacity-70", "These apply unless overridden per-provider in LLM Configuration above." }
                                 div {
-                                    class: "space-y-3",
                                     // Chat History Length
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Chat History Length" }
-                                        p { class: "text-xs text-fg-muted", "Max past messages included in context (dynamically capped to fit the model's window)" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Chat History Length" }
+                                            p { class: "text-xs text-fg-muted", "Max past messages included in context (dynamically capped to fit the model's window)" }
+                                        }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            class: "{INPUT} justify-self-end",
                                             value: "{local_settings.read().chat_history_length}",
                                             oninput: move |e| {
                                                 if let Ok(value) = e.value().parse::<usize>() {
@@ -3216,12 +3257,14 @@ pub fn SettingsPanel() -> Element {
 
                                     // Max Tool Output Length
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Max Tool Output Length" }
-                                        p { class: "text-xs text-fg-muted", "Maximum characters displayed in tool outputs (0 for unlimited)" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Max Tool Output Length" }
+                                            p { class: "text-xs text-fg-muted", "Maximum characters displayed in tool outputs (0 for unlimited)" }
+                                        }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            class: "{INPUT} justify-self-end",
                                             value: "{local_settings.read().max_tool_output_length}",
                                             oninput: move |e| {
                                                 if let Ok(value) = e.value().parse::<usize>() {
@@ -3233,12 +3276,14 @@ pub fn SettingsPanel() -> Element {
 
                                     // Max Active Tool Output Length
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Max Active Tool Output Length" }
-                                        p { class: "text-xs text-fg-muted", "Maximum characters persisted for tool context" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Max Active Tool Output Length" }
+                                            p { class: "text-xs text-fg-muted", "Maximum characters persisted for tool context" }
+                                        }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            class: "{INPUT} justify-self-end",
                                             value: "{local_settings.read().max_active_tool_output_length}",
                                             oninput: move |e| {
                                                 if let Ok(value) = e.value().parse::<usize>() {
@@ -3250,12 +3295,14 @@ pub fn SettingsPanel() -> Element {
 
                                     // Max Memory Summary Length
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Max Memory Summary Length" }
-                                        p { class: "text-xs text-fg-muted", "Character limit for conversation summary (~4 chars = 1 token)" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Max Memory Summary Length" }
+                                            p { class: "text-xs text-fg-muted", "Character limit for conversation summary (~4 chars = 1 token)" }
+                                        }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            class: "{INPUT} justify-self-end",
                                             value: "{local_settings.read().max_summary_chars}",
                                             oninput: move |e| {
                                                 if let Ok(value) = e.value().parse::<usize>() {
@@ -3267,12 +3314,14 @@ pub fn SettingsPanel() -> Element {
 
                                     // Max Stored Entities
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Max Stored Entities" }
-                                        p { class: "text-xs text-fg-muted", "Maximum entities retained in memory (topics, facts, goals)" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Max Stored Entities" }
+                                            p { class: "text-xs text-fg-muted", "Maximum entities retained in memory (topics, facts, goals)" }
+                                        }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            class: "{INPUT} justify-self-end",
                                             value: "{local_settings.read().max_entity_count}",
                                             oninput: move |e| {
                                                 if let Ok(value) = e.value().parse::<usize>() {
@@ -3284,12 +3333,14 @@ pub fn SettingsPanel() -> Element {
 
                                     // Tool Result Budget Ratio
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Tool Result Budget %" }
-                                        p { class: "text-xs text-fg-muted", "Percentage of context window reserved for active tool results (5–95%)" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Tool Result Budget %" }
+                                            p { class: "text-xs text-fg-muted", "Percentage of context window reserved for active tool results (5–95%)" }
+                                        }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            class: "{INPUT} justify-self-end",
                                             min: "5",
                                             max: "95",
                                             step: "5",
@@ -3301,15 +3352,17 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
-                                    
+
                                     // Active Result Budget Ratio
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Active Result Share %" }
-                                        p { class: "text-xs text-fg-muted", "Fraction of remaining context allocated to the active tool result (5–95%)" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Active Result Share %" }
+                                            p { class: "text-xs text-fg-muted", "Fraction of remaining context allocated to the active tool result (5–95%)" }
+                                        }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            class: "{INPUT} justify-self-end",
                                             min: "5",
                                             max: "95",
                                             step: "5",
@@ -3324,12 +3377,14 @@ pub fn SettingsPanel() -> Element {
 
                                     // Context Safety Margin
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Context Safety Margin %" }
-                                        p { class: "text-xs text-fg-muted", "Reserved fraction of context window to prevent overflow (5–95%)" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Context Safety Margin %" }
+                                            p { class: "text-xs text-fg-muted", "Reserved fraction of context window to prevent overflow (5–95%)" }
+                                        }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            class: "{INPUT} justify-self-end",
                                             min: "5",
                                             max: "95",
                                             step: "5",
@@ -3344,12 +3399,14 @@ pub fn SettingsPanel() -> Element {
 
                                     // System Prompt Budget Ratio
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "System Prompt Budget %" }
-                                        p { class: "text-xs text-fg-muted", "Maximum fraction of context window for system instructions (5–95%)" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5",
+                                        div {
+                                            label { class: "text-sm text-fg", "System Prompt Budget %" }
+                                            p { class: "text-xs text-fg-muted", "Maximum fraction of context window for system instructions (5–95%)" }
+                                        }
                                         input {
                                             r#type: "number",
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            class: "{INPUT} justify-self-end",
                                             min: "5",
                                             max: "95",
                                             step: "5",
@@ -3367,169 +3424,176 @@ pub fn SettingsPanel() -> Element {
                             // 2. Chat Bar Icons
                             div {
                                 class: "pt-4 border-t border-subtle",
-                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Toolbar & Composer Controls" }
+                                h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2 mb-3", "Toolbar & Composer Controls" }
                                 p { class: "text-xs text-fg-muted mb-3", "History, MCP, Planner and Fleet live in the tab strip and tiger app menu now; Session Cost, Profile, Provider, Attachments and Model are pills in the composer footer." }
                                 div {
-                                    class: "grid grid-cols-2 gap-3",
-
                                     // History Icon
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Show History Icon" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().show_history_icon}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.show_history_icon = e.value() == "true";
-                                                let state_clone = (*state).clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Show History Icon" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().show_history_icon,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.show_history_icon = v;
+                                                    let state_clone = (*state).clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
 
                                     // MCP Tools Icon
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Show MCP Tools Icon" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().show_mcp_icon}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.show_mcp_icon = e.value() == "true";
-                                                let state_clone = (*state).clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Show MCP Tools Icon" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().show_mcp_icon,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.show_mcp_icon = v;
+                                                    let state_clone = (*state).clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
 
                                     // Planner Icon
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Show Planner Icon" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().show_planner_icon}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.show_planner_icon = e.value() == "true";
-                                                let state_clone = (*state).clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Show Planner Icon" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().show_planner_icon,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.show_planner_icon = v;
+                                                    let state_clone = (*state).clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
 
                                     // Fleet Icon
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Show Fleet Icon" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().show_fleet_icon}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.show_fleet_icon = e.value() == "true";
-                                                let state_clone = (*state).clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Show Fleet Icon" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().show_fleet_icon,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.show_fleet_icon = v;
+                                                    let state_clone = (*state).clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
 
                                     // Session Cost Icon
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Show Session Cost" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().show_session_cost_icon}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.show_session_cost_icon = e.value() == "true";
-                                                let state_clone = (*state).clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Show Session Cost" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().show_session_cost_icon,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.show_session_cost_icon = v;
+                                                    let state_clone = (*state).clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
 
                                     // Profile Selector
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Show Profile Selector" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().show_profile_selector}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.show_profile_selector = e.value() == "true";
-                                                let state_clone = (*state).clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Show Profile Selector" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().show_profile_selector,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.show_profile_selector = v;
+                                                    let state_clone = (*state).clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
 
                                     // Provider Selector
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Show Provider Selector" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().show_provider_selector}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.show_provider_selector = e.value() == "true";
-                                                let state_clone = (*state).clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Show Provider Selector" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().show_provider_selector,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.show_provider_selector = v;
+                                                    let state_clone = (*state).clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
 
                                     // Attachments Icon
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Show Attachments Icon" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().show_attachments_icon}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.show_attachments_icon = e.value() == "true";
-                                                let state_clone = (*state).clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Show Attachments Icon" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().show_attachments_icon,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.show_attachments_icon = v;
+                                                    let state_clone = (*state).clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
 
                                     // Model Selector
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Show Model Selector" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().show_model_selector}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.show_model_selector = e.value() == "true";
-                                                let state_clone = (*state).clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5",
+                                        label { class: "text-sm text-fg", "Show Model Selector" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().show_model_selector,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.show_model_selector = v;
+                                                    let state_clone = (*state).clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
@@ -3539,84 +3603,76 @@ pub fn SettingsPanel() -> Element {
                             // 3. Confirmation Dialogs
                             div {
                                 class: "pt-4 border-t border-subtle",
-                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Confirmation Dialogs" }
+                                h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2 mb-3", "Confirmation Dialogs" }
                                 div {
-                                    class: "space-y-3",
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Confirm before deleting sessions" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().confirm_on_delete}",
-                                            onchange: move |e| {
-                                                local_settings.write().confirm_on_delete = e.value() == "true";
-                                            }
-                                        }
-                                    }
-                                    div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Confirm before saving settings" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().confirm_on_save}",
-                                            onchange: move |e| {
-                                                local_settings.write().confirm_on_save = e.value() == "true";
-                                            }
-                                        }
-                                    }
-                                    div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Confirm before editing messages" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().confirm_on_message_edit}",
-                                            onchange: move |e| {
-                                                local_settings.write().confirm_on_message_edit = e.value() == "true";
-                                            }
-                                        }
-                                    }
-                                    div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Confirm before optimizing memory" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().confirm_forget_memory}",
-                                            onchange: move |e| {
-                                                local_settings.write().confirm_forget_memory = e.value() == "true";
-                                            }
-                                        }
-                                    }
-                                    div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Show System Tray Icon" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().show_tray_icon}",
-                                            onchange: move |e| {
-                                                local_settings.write().show_tray_icon = e.value() == "true";
-                                            }
-                                        }
-                                    }
-                                    div {
-                                        class: "flex flex-col gap-1",
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Confirm before deleting sessions" }
                                         div {
-                                            class: "flex items-center justify-between",
-                                            label { class: "text-sm text-fg-muted", "Focus window when a timer fires" }
-                                            input {
-                                                r#type: "checkbox",
-                                                class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                                checked: "{local_settings.read().timer_focus_window}",
-                                                onchange: move |e| {
-                                                    local_settings.write().timer_focus_window = e.value() == "true";
-                                                }
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: local_settings.read().confirm_on_delete,
+                                                onchange: move |v| local_settings.write().confirm_on_delete = v,
                                             }
                                         }
-                                        p { class: "text-xs text-fg-muted/70", "When off, a fired timer shows a reminder without pulling the window to the front." }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Confirm before saving settings" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: local_settings.read().confirm_on_save,
+                                                onchange: move |v| local_settings.write().confirm_on_save = v,
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Confirm before editing messages" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: local_settings.read().confirm_on_message_edit,
+                                                onchange: move |v| local_settings.write().confirm_on_message_edit = v,
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Confirm before optimizing memory" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: local_settings.read().confirm_forget_memory,
+                                                onchange: move |v| local_settings.write().confirm_forget_memory = v,
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Show System Tray Icon" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: local_settings.read().show_tray_icon,
+                                                onchange: move |v| local_settings.write().show_tray_icon = v,
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5",
+                                        div {
+                                            label { class: "text-sm text-fg", "Focus window when a timer fires" }
+                                            p { class: "text-xs text-fg-muted", "When off, a fired timer shows a reminder without pulling the window to the front." }
+                                        }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: local_settings.read().timer_focus_window,
+                                                onchange: move |v| local_settings.write().timer_focus_window = v,
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3624,56 +3680,58 @@ pub fn SettingsPanel() -> Element {
                             // 4. Tool Display Defaults
                             div {
                                 class: "pt-4 border-t border-subtle",
-                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Tool Display Defaults" }
+                                h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2 mb-3", "Tool Display Defaults" }
                                 p { class: "text-xs text-fg-muted mb-3", "Set initial state for the Arguments/Response disclosures and thinking rows inside a turn's activity block." }
 
                                 div {
-                                    class: "space-y-3",
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Expand Arguments by Default" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().default_tool_arguments_open}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.default_tool_arguments_open = e.value() == "true";
-                                                let state_clone = state.clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Expand Arguments by Default" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().default_tool_arguments_open,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.default_tool_arguments_open = v;
+                                                    let state_clone = state.clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Expand Response by Default" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().default_tool_response_open}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.default_tool_response_open = e.value() == "true";
-                                                let state_clone = state.clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Expand Response by Default" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().default_tool_response_open,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.default_tool_response_open = v;
+                                                    let state_clone = state.clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Expand Thinking Process by Default" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().default_tool_thought_open}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.default_tool_thought_open = e.value() == "true";
-                                                let state_clone = state.clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5",
+                                        label { class: "text-sm text-fg", "Expand Thinking Process by Default" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().default_tool_thought_open,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.default_tool_thought_open = v;
+                                                    let state_clone = state.clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
@@ -3683,56 +3741,58 @@ pub fn SettingsPanel() -> Element {
                             // 4b. Skill Display Defaults
                             div {
                                 class: "pt-4 border-t border-subtle",
-                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Skill Display Defaults" }
+                                h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2 mb-3", "Skill Display Defaults" }
                                 p { class: "text-xs text-fg-muted mb-3", "Set initial state for collapsible sections in skill call bubbles." }
 
                                 div {
-                                    class: "space-y-3",
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Expand Arguments by Default" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().default_skill_arguments_open}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.default_skill_arguments_open = e.value() == "true";
-                                                let state_clone = state.clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Expand Arguments by Default" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().default_skill_arguments_open,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.default_skill_arguments_open = v;
+                                                    let state_clone = state.clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Expand Output / Payload by Default" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().default_skill_response_open}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.default_skill_response_open = e.value() == "true";
-                                                let state_clone = state.clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Expand Output / Payload by Default" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().default_skill_response_open,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.default_skill_response_open = v;
+                                                    let state_clone = state.clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
                                     div {
-                                        class: "flex items-center justify-between",
-                                        label { class: "text-sm text-fg-muted", "Expand Instructions by Default" }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{ui_state.read().default_skill_instructions_open}",
-                                            onchange: move |e| {
-                                                let mut state = ui_state.write();
-                                                state.default_skill_instructions_open = e.value() == "true";
-                                                let state_clone = state.clone();
-                                                let manager = ui_state_manager.read().clone();
-                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5",
+                                        label { class: "text-sm text-fg", "Expand Instructions by Default" }
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: ui_state.read().default_skill_instructions_open,
+                                                onchange: move |v| {
+                                                    let mut state = ui_state.write();
+                                                    state.default_skill_instructions_open = v;
+                                                    let state_clone = state.clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
                                             }
                                         }
                                     }
@@ -3742,16 +3802,17 @@ pub fn SettingsPanel() -> Element {
                             // 5. AI Behavior
                             div {
                                 class: "pt-4 border-t border-subtle",
-                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "AI Behavior" }
+                                h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2 mb-3", "AI Behavior" }
                                 div {
-                                    class: "space-y-3",
                                     // Max AI Turns
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Max AI Turns" }
-                                        p { class: "text-xs text-fg-muted", "Maximum consecutive responses allowed" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Max AI Turns" }
+                                            p { class: "text-xs text-fg-muted", "Maximum consecutive responses allowed" }
+                                        }
                                         select {
-                                            class: "bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            class: "{INPUT} justify-self-end",
                                             onchange: move |e| {
                                                 if let Ok(value) = e.value().parse::<u32>() {
                                                     local_settings.write().permission_settings.max_ai_turns = value;
@@ -3767,11 +3828,11 @@ pub fn SettingsPanel() -> Element {
 
                                     // User Name
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "What should Hobbes call you?" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "What should Hobbes call you?" }
                                         input {
                                             r#type: "text",
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                            class: "{INPUT} justify-self-end",
                                             placeholder: "Dr. Calvin",
                                             value: "{local_settings.read().user_name.clone().unwrap_or_default()}",
                                             oninput: move |e| {
@@ -3783,34 +3844,32 @@ pub fn SettingsPanel() -> Element {
 
                                     // Background Summarization
                                     div {
-                                        class: "flex items-center justify-between",
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
                                         div {
-                                            label { class: "text-sm font-medium text-fg-muted", "Background Summarization" }
+                                            label { class: "text-sm text-fg", "Background Summarization" }
                                             p { class: "text-xs text-fg-muted", "Automatically summarize conversation context during idle periods and tool loops" }
                                         }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().enable_summarization}",
-                                            onchange: move |e| {
-                                                local_settings.write().enable_summarization = e.value() == "true";
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: local_settings.read().enable_summarization,
+                                                onchange: move |v| local_settings.write().enable_summarization = v,
                                             }
                                         }
                                     }
 
                                     // Compact Tool Results
                                     div {
-                                        class: "flex items-center justify-between",
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5",
                                         div {
-                                            label { class: "text-sm font-medium text-fg-muted", "Compact Tool Results (TOON)" }
+                                            label { class: "text-sm text-fg", "Compact Tool Results (TOON)" }
                                             p { class: "text-xs text-fg-muted", "Convert tool results to a compact tabular format before sending to the AI. Reduces token usage by ~30–50%. Can be overridden per-provider in Context Tuning." }
                                         }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().compact_tool_results}",
-                                            onchange: move |e| {
-                                                local_settings.write().compact_tool_results = e.value() == "true";
+                                        div {
+                                            class: "justify-self-end",
+                                            Toggle {
+                                                checked: local_settings.read().compact_tool_results,
+                                                onchange: move |v| local_settings.write().compact_tool_results = v,
                                             }
                                         }
                                     }
@@ -3820,15 +3879,14 @@ pub fn SettingsPanel() -> Element {
                             // 6. Persona & Instructions
                             div {
                                 class: "pt-4 border-t border-subtle",
-                                h4 { class: "text-sm font-semibold text-fg-muted mb-3", "Persona & Instructions" }
+                                h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2 mb-3", "Persona & Instructions" }
                                 div {
-                                    class: "space-y-3",
                                     // Persona
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Persona" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-start py-2.5 border-b border-faint",
+                                        label { class: "text-sm text-fg", "Persona" }
                                         textarea {
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg h-24 focus:border-blue-500 focus:outline-none",
+                                            class: "col-span-2 bg-app border border-faint rounded px-2.5 py-2 text-sm text-fg h-24 focus:outline-none focus:ring-2 focus:ring-primary-500 w-full",
                                             value: "{local_settings.read().persona}",
                                             oninput: move |e| local_settings.write().persona = e.value()
                                         }
@@ -3836,11 +3894,13 @@ pub fn SettingsPanel() -> Element {
 
                                     // Force Tool Use Instruction
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Force Tool Use Instruction" }
-                                        p { class: "text-xs text-fg-muted", "Appended to system prompt to encourage specific behaviors" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-start py-2.5 border-b border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Force Tool Use Instruction" }
+                                            p { class: "text-xs text-fg-muted", "Appended to system prompt to encourage specific behaviors" }
+                                        }
                                         textarea {
-                                            class: "w-full bg-app border border-faint rounded p-2 text-fg h-24 focus:border-blue-500 focus:outline-none",
+                                            class: "col-span-2 bg-app border border-faint rounded px-2.5 py-2 text-sm text-fg h-24 focus:outline-none focus:ring-2 focus:ring-primary-500 w-full",
                                             value: "{local_settings.read().force_tool_use_instruction.clone().unwrap_or_default()}",
                                             oninput: move |e| local_settings.write().force_tool_use_instruction = Some(e.value())
                                         }
@@ -3848,13 +3908,13 @@ pub fn SettingsPanel() -> Element {
 
                                     // Project Folder
                                     div {
-                                        class: "flex flex-col gap-1",
-                                        label { class: "text-sm font-medium text-fg-muted", "Project Folder" }
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-start py-2.5",
+                                        label { class: "text-sm text-fg", "Project Folder" }
                                         div {
-                                            class: "flex gap-2",
+                                            class: "col-span-2 flex gap-2",
                                             input {
                                                 r#type: "text",
-                                                class: "flex-1 bg-app border border-faint rounded p-2 text-fg focus:border-blue-500 focus:outline-none",
+                                                class: "flex-1 {INPUT}",
                                                 value: "{local_settings.read().project_folder.clone().unwrap_or_default()}",
                                                 readonly: true,
                                             }
@@ -3893,16 +3953,17 @@ pub fn SettingsPanel() -> Element {
                     div {
                         class: "flex justify-between items-center p-4 cursor-pointer bg-section rounded-t-lg",
                         onclick: move |_| data_management_collapsed.set(!data_management_collapsed()),
-                        h3 { class: "text-md font-semibold", "Data Management" }
-                        span { if *data_management_collapsed.read() { "▶" } else { "▼" } }
+                        h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium", "Data Management" }
+                        span { class: "text-fg-muted text-xs", if *data_management_collapsed.read() { "▶" } else { "▼" } }
                     }
                     if !data_management_collapsed() {
                         div {
-                            class: "p-4",
+                            class: "p-4 flex flex-col gap-3",
+                            p { class: "text-sm text-fg-muted -mt-1", "Move your settings and chat history between machines, or wipe stored credentials." }
                             div {
                                 class: "flex space-x-2",
                                 button {
-                                    class: "px-4 py-2 bg-btn-primary rounded-md text-fg font-semibold hover:bg-btn-primary-hover",
+                                    class: "bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_settings.zip").save_file().await {
@@ -3923,7 +3984,7 @@ pub fn SettingsPanel() -> Element {
                                     "Export Settings"
                                 }
                                 button {
-                                    class: "px-4 py-2 bg-btn-primary rounded-md text-fg font-semibold hover:bg-btn-primary-hover",
+                                    class: "bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_settings.zip").pick_file().await {
@@ -3981,7 +4042,7 @@ pub fn SettingsPanel() -> Element {
                             div {
                                 class: "flex space-x-2 mt-2",
                                 button {
-                                    class: "px-4 py-2 bg-secondary-500 rounded-md text-fg font-semibold hover:bg-secondary-600",
+                                    class: "border border-faint text-fg rounded px-3 py-1.5 text-sm hover:bg-card",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_history.zip").save_file().await {
@@ -4044,7 +4105,7 @@ pub fn SettingsPanel() -> Element {
                                     "Export History"
                                 }
                                 button {
-                                    class: "px-4 py-2 bg-secondary-500 rounded-md text-fg font-semibold hover:bg-secondary-600",
+                                    class: "border border-faint text-fg rounded px-3 py-1.5 text-sm hover:bg-card",
                                     onclick: move |_| {
                                         spawn(async move {
                                             if let Some(path) = rfd::AsyncFileDialog::new().set_file_name("hobbes_history.zip").pick_file().await {
@@ -4109,13 +4170,13 @@ pub fn SettingsPanel() -> Element {
                             // Keychain Management
                             div {
                                 class: "mt-4 pt-4 border-t border-subtle",
-                                h4 { class: "text-sm font-medium text-fg-muted mb-2", "Keychain Management" }
+                                h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2 mb-2", "Keychain Management" }
                                 p {
                                     class: "text-xs text-fg-muted mb-3",
                                     "Manually reset all stored API keys. You'll need to re-enter them after resetting."
                                 }
                                 button {
-                                    class: "px-4 py-2 bg-red-600 rounded-md text-fg font-semibold hover:bg-red-700",
+                                    class: "border border-red-700/50 text-red-400 rounded px-3 py-1.5 text-sm",
                                     onclick: move |_| {
                                         // Delete all keychain items
                                         let deleted_keys = secret_manager.write().delete_all();
@@ -4149,8 +4210,8 @@ pub fn SettingsPanel() -> Element {
                     div {
                         class: "flex justify-between items-center p-4 cursor-pointer bg-section rounded-t-lg",
                         onclick: move |_| permissions_collapsed.set(!permissions_collapsed()),
-                        h3 { class: "text-md font-semibold", "Permissions" }
-                        span { if *permissions_collapsed.read() { "▶" } else { "▼" } }
+                        h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium", "Permissions" }
+                        span { class: "text-fg-muted text-xs", if *permissions_collapsed.read() { "▶" } else { "▼" } }
                     }
                     if !permissions_collapsed() {
                         div {
@@ -4198,7 +4259,7 @@ pub fn SettingsPanel() -> Element {
                                     if local_settings.read().permission_settings.granular_permissions.get(&ToolCategory::Mcp).copied().unwrap_or(false) {
                                         div {
                                             class: "mt-2 pl-4 border-l border-faint space-y-2",
-                                            h4 { class: "text-xs font-semibold text-fg-muted uppercase tracking-wider mb-2", "Granular MCP Permissions" }
+                                            h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2 mb-2", "Granular MCP Permissions" }
                                             for server in _mcp_context.read().servers.iter() {
                                                 {
                                                     let server_name = server.name.clone();
@@ -4252,7 +4313,7 @@ pub fn SettingsPanel() -> Element {
                 class: "border border-subtle rounded-lg mb-4",
                 div {
                     class: "p-4 bg-section rounded-lg",
-                    h3 { class: "text-md font-semibold mb-4", "Skill Permissions" }
+                    h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-4", "Skill Permissions" }
                     p { class: "text-xs text-fg-muted mb-4",
                         "Manage auto-approval for specific skills. When enabled, these skills will execute without prompting."
                     }
@@ -4350,7 +4411,7 @@ pub fn SettingsPanel() -> Element {
                             class: "border border-subtle rounded-lg mb-4",
                             div {
                                 class: "p-4 bg-section rounded-lg",
-                                h3 { class: "text-md font-semibold mb-4", "Keyboard Shortcuts" }
+                                h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-4", "Keyboard Shortcuts" }
                                 p { class: "text-xs text-fg-muted mb-4",
                                     "Customize global shortcuts using the format: "
                                     code { class: "bg-black/30 px-1 rounded", "CmdOrCtrl+Shift+Key" }
@@ -4499,7 +4560,7 @@ pub fn SettingsPanel() -> Element {
                                         }
                                     }
 
-                                    div { class: "pt-2 pb-1", h4 { class: "text-xs font-bold text-fg-muted uppercase tracking-wider", "Session Tabs" } }
+                                    div { class: "pt-2 pb-1", h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2", "Session Tabs" } }
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
@@ -4608,7 +4669,7 @@ pub fn SettingsPanel() -> Element {
                             class: "border border-subtle rounded-lg mb-4",
                             div {
                                 class: "p-4 bg-section rounded-lg",
-                                h3 { class: "text-md font-semibold mb-3", "Skills" }
+                                h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-3", "Skills" }
                                 p { class: "text-sm text-fg-muted mb-4",
                                     "Skills are instruction sets that teach Hobbes how to perform specific tasks using available tools."
                                 }
@@ -4617,7 +4678,7 @@ pub fn SettingsPanel() -> Element {
                                 div {
                                     class: "mb-4 flex items-center gap-2",
                                     button {
-                                        class: "px-3 py-1.5 bg-btn-primary hover:bg-btn-primary-hover text-white text-sm rounded-md transition-colors",
+                                        class: "bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm",
                                         onclick: move |_| editing_skill.set(Some(None)),
                                         "+ New Skill"
                                     }
@@ -4815,13 +4876,14 @@ pub fn SettingsPanel() -> Element {
                     class: "border border-subtle rounded-lg mb-4",
                     div {
                         class: "p-4 bg-section rounded-lg",
-                        h3 { class: "text-md font-semibold mb-3", "About & Legal" }
+                        h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium", "About & Legal" }
+                        p { class: "text-sm text-fg-muted mb-3", "What Hobbes is, and where the license and legal terms live." }
 
                         // Version and app name
                         div {
                             class: "flex items-center gap-2 mb-3",
                             span { class: "text-sm text-fg-muted", "{app_name}" }
-                            span { class: "text-xs text-fg-muted", "{app_version}" }
+                            span { class: "font-mono text-[11px] text-fg-muted", "{app_version}" }
                         }
 
                         // Privacy statement
@@ -4840,7 +4902,7 @@ pub fn SettingsPanel() -> Element {
                         div {
                             class: "flex gap-4",
                             button {
-                                class: "text-sm text-primary-400 hover:text-primary-300 underline cursor-pointer bg-transparent border-none p-0",
+                                class: "border border-faint text-fg rounded px-3 py-1.5 text-sm hover:bg-card",
                                 onclick: move |_| show_tos_modal.set(true),
                                 "Terms of Service"
                             }
@@ -4883,7 +4945,7 @@ pub fn SettingsPanel() -> Element {
                                     div {
                                         class: "p-4 border-t border-subtle",
                                         button {
-                                            class: "w-full py-2 px-4 bg-btn-primary hover:bg-btn-primary-hover rounded-md font-bold transition-colors",
+                                            class: "w-full bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm",
                                             onclick: move |_| show_tos_modal.set(false),
                                             "Close"
                                         }
@@ -4909,9 +4971,9 @@ pub fn SettingsPanel() -> Element {
                     class: "p-4 border-t border-subtle bg-section",
                     button {
                 class: if has_unsaved_changes() {
-                    "mt-4 px-4 py-2 bg-btn-primary rounded-md text-fg font-semibold hover:bg-btn-primary-hover focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-opacity-50 transition-colors"
+                    "bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
                 } else {
-                    "mt-4 px-4 py-2 bg-input rounded-md text-fg font-semibold cursor-not-allowed"
+                    "bg-input text-fg-muted rounded px-3 py-1.5 text-sm cursor-not-allowed"
                 },
                 disabled: !has_unsaved_changes(),
                 onclick: move |_| {
@@ -5427,7 +5489,7 @@ fn CalendarSubscriptionsSection() -> Element {
                 class: "p-4 bg-section rounded-lg",
                 div {
                     class: "mb-3 flex items-center justify-between",
-                    h3 { class: "text-md font-semibold", "Calendar Subscriptions" }
+                    h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium", "Calendar Subscriptions" }
                     button {
                         class: "rounded border border-subtle px-2 py-1 text-xs text-fg-muted hover:bg-white/5 hover:text-fg",
                         title: "Fetch every enabled subscription now",
@@ -5521,7 +5583,7 @@ fn CalendarSubscriptionsSection() -> Element {
                                 "Cancel"
                             }
                             button {
-                                class: "rounded bg-btn-primary px-3 py-1 text-xs font-semibold text-fg hover:bg-btn-primary-hover",
+                                class: "bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm",
                                 onclick: move |_| {
                                     let url = ics_url.peek().trim().to_string();
                                     if let Err(e) = validate_ics_url(&url) {
@@ -5653,7 +5715,7 @@ fn CalendarSubscriptionsSection() -> Element {
                             }
                             if has_profiles {
                                 button {
-                                    class: "rounded bg-btn-primary px-3 py-1 text-xs font-semibold text-fg hover:bg-btn-primary-hover disabled:opacity-50",
+                                    class: "bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm disabled:opacity-50",
                                     disabled: gcal_profile_id.read().is_none(),
                                     onclick: move |_| {
                                         let Some(profile_id) = gcal_profile_id.peek().clone() else {
@@ -5788,7 +5850,8 @@ fn LicenseSection() -> Element {
             class: "border border-subtle rounded-lg mb-4",
             div {
                 class: "p-4 bg-section rounded-lg",
-                h3 { class: "text-md font-semibold mb-3", "License" }
+                h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium", "License" }
+                p { class: "text-sm text-fg-muted mb-3", "Unlock Fleet and other Pro features with a license key." }
 
                 if let Some(info) = current {
                     div {
@@ -5797,18 +5860,14 @@ fn LicenseSection() -> Element {
                         span { class: "text-sm text-fg-muted", "— licensed to {info.email}" }
                     }
                     button {
-                        class: "text-sm text-red-400 hover:text-red-300 underline cursor-pointer bg-transparent border-none p-0",
+                        class: "border border-red-700/50 text-red-400 rounded px-3 py-1.5 text-sm",
                         onclick: on_remove,
                         "Remove license key"
                     }
                 } else {
-                    p {
-                        class: "text-sm text-fg-muted mb-3",
-                        "Free — paste a license key to unlock Pro features."
-                    }
-                    label { class: "block text-sm font-medium text-fg-muted", "License Key" }
+                    label { class: "block text-sm text-fg mb-1", "License Key" }
                     input {
-                        class: "mt-1 block w-full px-3 py-2 bg-input border border-primary-600 rounded-md text-sm shadow-sm",
+                        class: INPUT,
                         r#type: "password",
                         placeholder: "HOBBES-PRO.…",
                         value: "{key_input}",
@@ -5823,7 +5882,7 @@ fn LicenseSection() -> Element {
                         p { class: "text-sm text-red-400 mt-2", "{err}" }
                     }
                     button {
-                        class: "mt-3 py-2 px-4 bg-btn-primary hover:bg-btn-primary-hover rounded-md text-sm font-bold transition-colors",
+                        class: "mt-3 bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm",
                         onclick: on_activate,
                         "Activate"
                     }
@@ -5856,7 +5915,7 @@ fn TrustRulesSection() -> Element {
             div {
                 class: "p-4 bg-section rounded-lg",
                 onmouseleave: move |_| armed_delete.set(None),
-                h3 { class: "text-md font-semibold mb-1", "Trust Rules" }
+                h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-1", "Trust Rules" }
                 p { class: "text-xs text-fg-muted mb-3",
                     "Tools these rules match run without a permission prompt. Rules are created from permission prompts (\"Always allow…\") — remove any you no longer trust."
                 }
@@ -5949,32 +6008,32 @@ fn TerminalSection() -> Element {
             class: "border border-subtle rounded-lg mb-4",
             div {
                 class: "p-4 bg-section rounded-lg",
-                h3 { class: "text-md font-semibold mb-1", "Terminal" }
+                h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-1", "Terminal" }
                 p {
                     class: "text-xs text-fg-muted mb-3",
                     "A persistent shell per chat the AI can run commands in — every command goes through the tool-approval prompt, and the working directory follows the chat's tagged project."
                 }
                 div {
-                    class: "flex items-center justify-between",
+                    class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5",
                     div {
-                        label { class: "text-sm font-medium text-fg-muted", "Enable Terminal" }
+                        div { class: "text-sm text-fg", "Enable Terminal" }
                         p { class: "text-xs text-fg-muted", "AI can run shell commands (with your approval). Takes effect at next launch; turning it off kills any running shells now." }
                     }
-                    input {
-                        r#type: "checkbox",
-                        class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                        checked: "{enabled}",
-                        onchange: move |e| {
-                            let on = e.value() == "true";
-                            settings.write().terminal_enabled = on;
-                            settings_manager
-                                .peek()
-                                .save_async(settings.peek().clone(), Some(save_error));
-                            if !on {
-                                let mgr = mcp_manager.peek().clone();
-                                spawn(async move {
-                                    mgr.shutdown_terminal().await;
-                                });
+                    div {
+                        class: "justify-self-end",
+                        Toggle {
+                            checked: enabled,
+                            onchange: move |on: bool| {
+                                settings.write().terminal_enabled = on;
+                                settings_manager
+                                    .peek()
+                                    .save_async(settings.peek().clone(), Some(save_error));
+                                if !on {
+                                    let mgr = mcp_manager.peek().clone();
+                                    spawn(async move {
+                                        mgr.shutdown_terminal().await;
+                                    });
+                                }
                             }
                         }
                     }
@@ -6116,7 +6175,7 @@ fn FleetSection() -> Element {
             class: "border border-subtle rounded-lg mb-4",
             div {
                 class: "p-4 bg-section rounded-lg",
-                h3 { class: "text-md font-semibold mb-1", "Fleet" }
+                h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-1", "Fleet" }
                 p {
                     class: "text-xs text-fg-muted mb-3",
                     "Watch every Claude Code session on this machine — status, attention requests, and approval gates — from inside Hobbes."
@@ -6142,14 +6201,14 @@ fn FleetSection() -> Element {
                         class: "flex gap-2",
                         if !hooks_registered || dot_color == "#f59e0b" {
                             button {
-                                class: "py-2 px-4 bg-btn-primary hover:bg-btn-primary-hover rounded-md text-sm font-bold transition-colors",
+                                class: "bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm",
                                 onclick: on_connect,
                                 "Connect Claude Code"
                             }
                         }
                         if hooks_registered {
                             button {
-                                class: "py-2 px-4 bg-card hover:bg-input rounded-md text-sm border border-faint transition-colors",
+                                class: "border border-faint text-fg rounded px-3 py-1.5 text-sm hover:bg-card",
                                 onclick: on_disconnect,
                                 "Disconnect"
                             }
@@ -6160,36 +6219,34 @@ fn FleetSection() -> Element {
                         "Connecting starts a localhost-only listener and merges eight hook entries into ~/.claude/settings.json (a timestamped backup is written first). Disconnect removes exactly those entries and stops observation."
                     }
                     if hooks_registered {
-                        label {
-                            class: "mt-3 flex items-center gap-2 text-sm text-fg-muted cursor-pointer select-none",
-                            input {
-                                r#type: "checkbox",
-                                class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                checked: "{settings.read().fleet_briefs_enabled}",
-                                onchange: move |e| {
-                                    settings.write().fleet_briefs_enabled = e.value() == "true";
+                        div {
+                            class: "mt-3 flex items-center gap-2.5",
+                            Toggle {
+                                checked: settings.read().fleet_briefs_enabled,
+                                onchange: move |on: bool| {
+                                    settings.write().fleet_briefs_enabled = on;
                                     persist();
                                 }
                             }
-                            "Summarize sessions into re-entry briefs (uses your LLM's summary model)"
+                            span { class: "text-sm text-fg", "Summarize sessions into re-entry briefs (uses your LLM's summary model)" }
                         }
                         p {
-                            class: "text-xs text-fg-muted mt-1 ml-6",
+                            class: "text-xs text-fg-muted mt-1 ml-[42px]",
                             "Transcript excerpts are sent only to your own configured provider; briefs are stored locally."
                         }
                         div {
-                            class: "mt-3 flex items-center justify-between",
+                            class: "mt-3 grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center",
                             div {
-                                label { class: "text-sm text-fg-muted", "Retire idle sessions after" }
+                                div { class: "text-sm text-fg", "Retire idle sessions after" }
                                 p { class: "text-xs text-fg-muted", "Minutes of silence before a card moves to \"Earlier today\" (any new activity brings it back, time intact). 15–1440." }
                             }
                             div {
-                                class: "flex items-center gap-1 shrink-0",
+                                class: "flex items-center gap-1 shrink-0 justify-self-end",
                                 input {
                                     r#type: "number",
                                     min: "15",
                                     max: "1440",
-                                    class: "w-20 bg-input border border-faint rounded p-1 text-sm text-fg text-right focus:border-blue-500 focus:outline-none",
+                                    class: "w-20 h-8 bg-app border border-faint rounded px-2.5 text-sm text-fg text-right focus:outline-none focus:ring-2 focus:ring-primary-500",
                                     value: "{settings.read().fleet_retire_minutes}",
                                     onchange: move |e| {
                                         if let Ok(v) = e.value().parse::<u32>() {
@@ -6201,21 +6258,19 @@ fn FleetSection() -> Element {
                                 span { class: "text-xs text-fg-muted", "min" }
                             }
                         }
-                        label {
-                            class: "mt-3 flex items-center gap-2 text-sm text-fg-muted cursor-pointer select-none",
-                            input {
-                                r#type: "checkbox",
-                                class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                checked: "{settings.read().dispatch_auto_continue}",
-                                onchange: move |e| {
-                                    settings.write().dispatch_auto_continue = e.value() == "true";
+                        div {
+                            class: "mt-3 flex items-center gap-2.5",
+                            Toggle {
+                                checked: settings.read().dispatch_auto_continue,
+                                onchange: move |on: bool| {
+                                    settings.write().dispatch_auto_continue = on;
                                     persist();
                                 }
                             }
-                            "Continue the chat when a dispatched agent finishes"
+                            span { class: "text-sm text-fg", "Continue the chat when a dispatched agent finishes" }
                         }
                         p {
-                            class: "text-xs text-fg-muted mt-1 ml-6",
+                            class: "text-xs text-fg-muted mt-1 ml-[42px]",
                             "The chat that dispatched a background agent is handed the run's closing brief and picks the thread back up on its own. Off: the run still reports into the Fleet, but nothing is sent back to the conversation."
                         }
                     }

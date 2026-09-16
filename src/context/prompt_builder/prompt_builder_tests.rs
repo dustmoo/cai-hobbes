@@ -34,6 +34,9 @@ fn create_test_session() -> Session {
         watch_word_recovery_count: 0,
         scheduled_timers: Vec::new(),
         tool_call_history: Vec::new(),
+        tab_emoji: None,
+        tab_title: None,
+        name_user_set: false,
     }
 }
 
@@ -167,6 +170,8 @@ fn test_oversized_entities_stripped_from_system_context() {
             user_name: "Dustin".to_string(),
             other_entities,
         },
+        tab_title: None,
+        tab_emoji: None,
     };
 
     let builder = PromptBuilder::new(&session, &settings);
