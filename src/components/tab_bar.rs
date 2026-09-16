@@ -388,11 +388,6 @@ pub fn TabBar(props: TabBarProps) -> Element {
                 title: "MCP Tools",
                 onclick: move |_| chat_command.set(Some(ChatCommand::ToggleMcp)),
             }
-            TabBarIconButton {
-                icon: fi_icons::FiSettings,
-                title: "Settings",
-                onclick: move |_| chat_command.set(Some(ChatCommand::ToggleSettings)),
-            }
 
             // New tab button
             button {

@@ -2774,6 +2774,108 @@ fn app() -> Element {
                                 // When the user releases the mouse, save the last known size.
 
 
+                            // Session Manager Sidebar
+                            if *show_session_manager.read() {
+                                div {
+                                    class: "flex flex-row h-full shrink-0",
+                                    // Session Manager Panel
+                                    div {
+                                        id: "session-manager-panel",
+                                        style: "width: {settings_panel_width}px;",
+                                        class: "bg-section text-fg h-full",
+                                        components::session_manager::SessionManager {}
+                                    }
+                                    // Draggable Divider
+                                    div {
+                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
+                                        onmousedown: move |event| {
+                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
+                                            is_dragging.set(true);
+                                        },
+                                    }
+                                }
+                            }
+
+                            // Settings Panel Sidebar
+                            if *show_settings_panel.read() {
+                                div {
+                                    class: "flex flex-row h-full shrink-0",
+                                    // Settings Panel
+                                    div {
+                                        id: "settings-panel",
+                                        style: "width: {settings_panel_width}px;",
+                                        class: "bg-section text-fg h-full",
+                                        // This is the correct location for the settings panel component
+                                        components::settings_panel::SettingsPanel {}
+                                    }
+                                    // Draggable Divider
+                                    div {
+                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
+                                        onmousedown: move |event| {
+                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
+                                            is_dragging.set(true);
+                                        },
+                                    }
+                                }
+                            }
+
+                            // MCP Manager Sidebar
+                            if *show_mcp_manager.read() {
+                                div {
+                                    class: "flex flex-row h-full shrink-0",
+                                    // MCP Manager Panel
+                                    div {
+                                        id: "mcp-manager-panel",
+                                        style: "width: {settings_panel_width}px;",
+                                        class: "bg-section text-fg h-full",
+                                        components::mcp_marketplace::McpMarketplace {}
+                                    }
+                                    // Draggable Divider
+                                    div {
+                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
+                                        onmousedown: move |event| {
+                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
+                                            is_dragging.set(true);
+                                        },
+                                    }
+                                }
+                            }
+
+                            // Mouse move handler for resizing
+                            if *is_dragging.read() {
+                                div {
+                                    class: "fixed inset-0 z-50", // Covers the whole screen to capture mouse events
+                                    onmousemove: move |event| {
+                                        if *is_dragging.read() {
+                                            let (start_x, start_width) = drag_start_info();
+                                            let delta_x = event.data.screen_coordinates().x - start_x;
+                                            let new_width = start_width + delta_x;
+                                            if new_width > 200.0 && new_width < 800.0 {
+                                                let panel_id = if *show_settings_panel.read() {
+                                                    "settings-panel"
+                                                } else if *show_mcp_manager.read() {
+                                                    "mcp-manager-panel"
+                                                } else {
+                                                    "session-manager-panel"
+                                                };
+                                                let js = format!("document.getElementById('{}').style.width = '{}px';", panel_id, new_width);
+                                                let _ = document::eval(&js);
+                                                final_width_on_drag_end.set(new_width);
+                                            }
+                                        }
+                                    },
+                                    onmouseup: move |_| {
+                                        is_dragging.set(false);
+                                    },
+                                    onmouseleave: move |_| {
+                                        // If mouse leaves the overlay, stop dragging
+                                        if *is_dragging.read() {
+                                            is_dragging.set(false);
+                                        }
+                                    }
+                                }
+                            }
+
                             // Main Chat Window
                             div {
                                 class: "flex-1 flex flex-col min-h-0 min-w-0 border-t border-primary-700/50",
@@ -2837,121 +2939,6 @@ fn app() -> Element {
                                     div {
                                         class: "flex-1 min-h-0 min-w-0 flex flex-col",
                                         components::fleet_view::FleetView {}
-                                    }
-                                }
-                            }
-
-                            // Session Manager Sidebar — right edge (shares the drawer
-                            // slot with Settings/MCP; their triggers all live at the
-                            // right end of the tab bar).
-                            if *show_session_manager.read() {
-                                div {
-                                    class: "flex flex-row h-full shrink-0",
-                                    // Draggable Divider — sits on the panel's left edge
-                                    // now that the panel is on the right.
-                                    div {
-                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                        onmousedown: move |event| {
-                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                            is_dragging.set(true);
-                                        },
-                                    }
-                                    // Session Manager Panel
-                                    div {
-                                        id: "session-manager-panel",
-                                        style: "width: {settings_panel_width}px;",
-                                        class: "bg-section text-fg h-full",
-                                        components::session_manager::SessionManager {}
-                                    }
-                                }
-                            }
-
-                            // Settings Panel Sidebar — right edge (shares the drawer
-                            // slot with History/MCP; all three triggers live at the
-                            // right end of the tab bar).
-                            if *show_settings_panel.read() {
-                                div {
-                                    class: "flex flex-row h-full shrink-0",
-                                    // Draggable Divider — sits on the panel's left edge
-                                    // now that the panel is on the right.
-                                    div {
-                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                        onmousedown: move |event| {
-                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                            is_dragging.set(true);
-                                        },
-                                    }
-                                    // Settings Panel
-                                    div {
-                                        id: "settings-panel",
-                                        style: "width: {settings_panel_width}px;",
-                                        class: "bg-section text-fg h-full",
-                                        // This is the correct location for the settings panel component
-                                        components::settings_panel::SettingsPanel {}
-                                    }
-                                }
-                            }
-
-                            // MCP Manager Sidebar — right edge (shares the drawer slot
-                            // with Settings/History; all three triggers live at the
-                            // right end of the tab bar).
-                            if *show_mcp_manager.read() {
-                                div {
-                                    class: "flex flex-row h-full shrink-0",
-                                    // Draggable Divider — sits on the panel's left edge
-                                    // now that the panel is on the right.
-                                    div {
-                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                        onmousedown: move |event| {
-                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                            is_dragging.set(true);
-                                        },
-                                    }
-                                    // MCP Manager Panel
-                                    div {
-                                        id: "mcp-manager-panel",
-                                        style: "width: {settings_panel_width}px;",
-                                        class: "bg-section text-fg h-full",
-                                        components::mcp_marketplace::McpMarketplace {}
-                                    }
-                                }
-                            }
-
-                            // Mouse move handler for resizing. The panel now sits on
-                            // the right with its fixed edge at the window's right
-                            // side, so dragging the divider LEFT grows the panel and
-                            // dragging RIGHT shrinks it — the inverse of the old
-                            // left-side math.
-                            if *is_dragging.read() {
-                                div {
-                                    class: "fixed inset-0 z-50", // Covers the whole screen to capture mouse events
-                                    onmousemove: move |event| {
-                                        if *is_dragging.read() {
-                                            let (start_x, start_width) = drag_start_info();
-                                            let delta_x = event.data.screen_coordinates().x - start_x;
-                                            let new_width = start_width - delta_x;
-                                            if new_width > 200.0 && new_width < 800.0 {
-                                                let panel_id = if *show_settings_panel.read() {
-                                                    "settings-panel"
-                                                } else if *show_mcp_manager.read() {
-                                                    "mcp-manager-panel"
-                                                } else {
-                                                    "session-manager-panel"
-                                                };
-                                                let js = format!("document.getElementById('{}').style.width = '{}px';", panel_id, new_width);
-                                                let _ = document::eval(&js);
-                                                final_width_on_drag_end.set(new_width);
-                                            }
-                                        }
-                                    },
-                                    onmouseup: move |_| {
-                                        is_dragging.set(false);
-                                    },
-                                    onmouseleave: move |_| {
-                                        // If mouse leaves the overlay, stop dragging
-                                        if *is_dragging.read() {
-                                            is_dragging.set(false);
-                                        }
                                     }
                                 }
                             }
