@@ -18,7 +18,11 @@ cargo test --release <test_name>
 # Lint
 cargo clippy --release
 
-# Production build (macOS .app bundle)
+# Hand Dustin a testable build (the Pro build: signed + notarized, no keychain prompts)
+cargo test --release && cargo clippy --release && ./scripts/build_pro.sh && ./scripts/notarize.sh
+# App output: target/dx/Hobbes/release/macos/pro/Hobbes.app  (open -n it)
+
+# Unsigned production build — only when you need the app's own logs to debug
 dx build --release
 # App output: target/dx/Hobbes/release/macos/Hobbes.app
 
@@ -28,6 +32,8 @@ dx build --release
 # Full Windows release
 ./scripts/build_windows.ps1 -Release
 ```
+
+**Handing over a build.** Do not `cargo build`/`dx build` as the verification step. Run tests and clippy, then `./scripts/build_pro.sh && ./scripts/notarize.sh` and open the Pro app. The unsigned `dx build` app prompts for keychain credentials on every launch; the Pro build doesn't. Use `dx build` only when the app's logs are needed to debug.
 
 Tailwind classes are compiled by `npm run build:css` (input `tailwind.css` → `assets/tailwind.css`, which `main.rs` inlines). The Tailwind step in `build.rs` writes an unused `assets/output.css`, so a plain `cargo build` does NOT pick up new utility classes — run `npm run build:css` after adding classes to any `rsx!`. `npm ci` must be run once so `node_modules/` exists.
 
