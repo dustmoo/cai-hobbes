@@ -383,17 +383,132 @@ fn overlap_column_style_scaled(col: usize, count: usize, avail: f64) -> String {
 /// person keeps the left ~66%; fleet spans get the right third.
 const AGENT_LANE_SPLIT: f64 = 0.66;
 
-/// Inline geometry for one agent span in the right-hand sub-column.
-fn agent_span_style(top: f64, height: f64, background: bool) -> String {
-    let mut style = format!(
-        "top: {top}px; height: {height}px; left: calc(44px + (100% - 48px) * {AGENT_LANE_SPLIT:.4}); right: 4px;"
-    );
+/// Inline geometry for one agent span, split into `count` equal sub-columns
+/// with a 2px gutter within the lane's right-hand region (`col` of `count`,
+/// 0-indexed). `(0, 1)` — the common case — keeps the classic full-lane
+/// footprint.
+fn agent_span_style(top: f64, height: f64, background: bool, col: usize, count: usize) -> String {
+    let count = count.max(1);
+    let col = col.min(count.saturating_sub(1));
+    let sub = 1.0 / count as f64;
+    let start_frac = AGENT_LANE_SPLIT + (1.0 - AGENT_LANE_SPLIT) * sub * col as f64;
+    let mut style = if count <= 1 {
+        format!(
+            "top: {top}px; height: {height}px; left: calc(44px + (100% - 48px) * {start_frac:.4}); right: 4px;"
+        )
+    } else {
+        let width_frac = (1.0 - AGENT_LANE_SPLIT) * sub;
+        format!(
+            "top: {top}px; height: {height}px; left: calc(44px + (100% - 48px) * {start_frac:.4}); width: calc((100% - 48px) * {width_frac:.4} - 2px);"
+        )
+    };
     if background {
         // A background phase is real work the user isn't driving — present,
         // but never as loud as a turn they are in.
         style.push_str(" opacity: 0.65;");
     }
     style
+}
+
+/// One positioned block for the agent lane — either a single session's span
+/// or a merged "{n} agents" band standing in for an over-busy cluster.
+struct AgentLaneBlock {
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+    background: bool,
+    col: usize,
+    count: usize,
+    key: String,
+    title: String,
+    label: String,
+}
+
+/// How many concurrent sub-columns the agent lane draws before giving up on
+/// slivers and collapsing the cluster into one merged band.
+const MAX_AGENT_LANE_COLUMNS: usize = 3;
+
+/// Lay out the agent lane: assign side-by-side sub-columns to transitively
+/// overlapping external spans (mirrors [`assign_overlap_columns`]'s greedy
+/// interval-coloring sweep, capped at [`MAX_AGENT_LANE_COLUMNS`]), except
+/// that a cluster whose *true* concurrency exceeds the cap doesn't share a
+/// column — it collapses into one merged band spanning the cluster's time
+/// range, labelled "{n} agents", so the lane never draws unreadable slivers.
+/// `spans` must already be sorted by start (both [`merge_agent_spans`] and
+/// the memo that names it produce that order).
+fn agent_lane_layout(spans: &[(crate::fleet::replay::DaySpan, String)]) -> Vec<AgentLaneBlock> {
+    let mut sorted: Vec<&(crate::fleet::replay::DaySpan, String)> = spans.iter().collect();
+    sorted.sort_by_key(|(s, _)| (s.start, s.end));
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let mut cluster_end = sorted[i].0.end;
+        let mut j = i + 1;
+        while j < sorted.len() && sorted[j].0.start < cluster_end {
+            cluster_end = cluster_end.max(sorted[j].0.end);
+            j += 1;
+        }
+        let cluster = &sorted[i..j];
+
+        // Greedy earliest-fit column assignment — for an interval graph the
+        // number of columns it settles on is exactly the cluster's true max
+        // concurrency, not just an upper bound.
+        let mut column_ends: Vec<chrono::DateTime<Utc>> = Vec::new();
+        let mut cols: Vec<usize> = Vec::with_capacity(cluster.len());
+        for (span, _) in cluster {
+            let col = match column_ends.iter().position(|end| *end <= span.start) {
+                Some(col) => {
+                    column_ends[col] = span.end;
+                    col
+                }
+                None => {
+                    column_ends.push(span.end);
+                    column_ends.len() - 1
+                }
+            };
+            cols.push(col);
+        }
+        let concurrency = column_ends.len();
+
+        if concurrency > MAX_AGENT_LANE_COLUMNS {
+            let start = cluster.iter().map(|(s, _)| s.start).min().unwrap();
+            let end = cluster.iter().map(|(s, _)| s.end).max().unwrap();
+            let mut names: Vec<&str> = cluster.iter().map(|(_, n)| n.as_str()).collect();
+            names.sort_unstable();
+            out.push(AgentLaneBlock {
+                start,
+                end,
+                background: false,
+                col: 0,
+                count: 1,
+                key: format!("agent-band-{}-{}", start.timestamp(), end.timestamp()),
+                title: names.join(", "),
+                label: format!("{} agents", cluster.len()),
+            });
+        } else {
+            let count = concurrency.min(MAX_AGENT_LANE_COLUMNS);
+            for ((span, name), col) in cluster.iter().zip(cols.into_iter()) {
+                let range = format!(
+                    "{}\u{2013}{} \u{b7} {}",
+                    span.start.with_timezone(&Local).format("%H:%M"),
+                    span.end.with_timezone(&Local).format("%H:%M"),
+                    name,
+                );
+                out.push(AgentLaneBlock {
+                    start: span.start,
+                    end: span.end,
+                    background: span.background,
+                    col: col.min(MAX_AGENT_LANE_COLUMNS - 1),
+                    count,
+                    key: format!("agent-{}-{}", span.session_id, span.start.timestamp()),
+                    title: range,
+                    label: name.clone(),
+                });
+            }
+        }
+        i = j;
+    }
+    out
 }
 
 /// A local wall-clock minute on `date`, as UTC. Clamped to the day; DST
@@ -480,6 +595,23 @@ const FREE_GAP_MIN_MINUTES: u32 = 30;
 /// How many sessions the agent sub-column will draw before it stops. Past
 /// this the lane is noise, not information.
 const MAX_AGENT_LANE_SESSIONS: usize = 12;
+
+/// Keep only spans for sessions that resolve to an external Claude Code
+/// session (`FleetOrigin::External`). The lane is meant for background
+/// agents, not the user's own Hobbes chat tabs, which report through the
+/// same event log (`FleetOrigin::Hobbes`) and would otherwise show up as a
+/// pile of blocks named after the day. A session that can't be resolved to a
+/// row at all (deleted, or a gap in the lookup) is dropped rather than
+/// guessed at.
+fn filter_external_spans(
+    spans: Vec<crate::fleet::replay::DaySpan>,
+    origins: &std::collections::HashMap<String, crate::fleet::FleetOrigin>,
+) -> Vec<crate::fleet::replay::DaySpan> {
+    spans
+        .into_iter()
+        .filter(|s| origins.get(&s.session_id) == Some(&crate::fleet::FleetOrigin::External))
+        .collect()
+}
 
 /// Collapse a day's replayed fleet spans into what the lane should draw.
 ///
@@ -1011,19 +1143,23 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
             &crate::fleet::store::events_on(day),
             bound,
         );
+        // Names + origin: the day's ended rows first, then the live map
+        // (freshest title/origin) for sessions still open.
+        let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut origins: std::collections::HashMap<String, crate::fleet::FleetOrigin> =
+            std::collections::HashMap::new();
+        for r in crate::fleet::store::sessions_active_on(day) {
+            origins.insert(r.id.clone(), r.origin);
+            names.insert(r.id.clone(), r.display_name().to_string());
+        }
+        for s in live.sessions.values() {
+            origins.insert(s.id.clone(), s.origin);
+            names.insert(s.id.clone(), s.display_name().to_string());
+        }
+        let spans = filter_external_spans(spans, &origins);
         let merged = merge_agent_spans(&spans, MAX_AGENT_LANE_SESSIONS);
         if merged.is_empty() {
             return Vec::new();
-        }
-        // Names: the live map first (it carries the freshest title), then the
-        // day's ended rows for sessions that have since closed.
-        let mut names: std::collections::HashMap<String, String> =
-            crate::fleet::store::sessions_active_on(day)
-                .into_iter()
-                .map(|r| (r.id.clone(), r.display_name().to_string()))
-                .collect();
-        for s in live.sessions.values() {
-            names.insert(s.id.clone(), s.display_name().to_string());
         }
         merged
             .into_iter()
@@ -1037,6 +1173,7 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
             .collect::<Vec<_>>()
     });
     let agent_spans: Vec<(crate::fleet::replay::DaySpan, String)> = agent_spans_memo.read().clone();
+    let agent_lane_items = agent_lane_layout(&agent_spans);
 
     // The day's cached rollup, shared with the Fleet review band (same meta
     // key, same generator) — a day has one narrative, not two.
@@ -1341,31 +1478,27 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
                         }
                     }
                 }
-                // Agent lane: fleet working time, in its own right-hand
-                // sub-column. Read-only and pointer-transparent — it never
-                // joins the overlap columns and never eats a create click.
-                for (span, name) in agent_spans.iter() {
+                // Agent lane: external fleet working time, in its own
+                // right-hand sub-column, sub-divided when sessions overlap.
+                // Read-only and pointer-transparent — it never joins the
+                // overlap columns and never eats a create click.
+                for item in agent_lane_items.iter() {
                     if let Some((top, height)) = block_geometry(
-                        minutes_in_local_day(&span.start),
-                        minutes_in_local_day(&span.end),
+                        minutes_in_local_day(&item.start),
+                        minutes_in_local_day(&item.end),
                         day_start,
                         day_end,
                     ) {
                         {
-                            let style = agent_span_style(top, height, span.background);
-                            let range = format!(
-                                "{}\u{2013}{} \u{b7} {}",
-                                span.start.with_timezone(&Local).format("%H:%M"),
-                                span.end.with_timezone(&Local).format("%H:%M"),
-                                name,
-                            );
+                            let style =
+                                agent_span_style(top, height, item.background, item.col, item.count);
                             rsx! {
                                 div {
-                                    key: "agent-{span.session_id}-{span.start.timestamp()}",
+                                    key: "{item.key}",
                                     class: "pointer-events-none absolute overflow-hidden rounded-r border-l-[3px] border-accent-500 bg-accent-500/15 px-1 py-0.5 text-[11px] text-accent-300",
                                     style: "{style}",
-                                    title: "{range}",
-                                    span { class: "block truncate leading-4", "{name}" }
+                                    title: "{item.title}",
+                                    span { class: "block truncate leading-4", "{item.label}" }
                                 }
                             }
                         }
@@ -2595,11 +2728,11 @@ mod tests {
 
     #[test]
     fn agent_lane_geometry_sits_in_the_right_sub_column() {
-        let style = agent_span_style(24.0, 48.0, false);
+        let style = agent_span_style(24.0, 48.0, false, 0, 1);
         assert!(style.contains("left: calc(44px + (100% - 48px) * 0.6600)"), "{style}");
         assert!(style.contains("right: 4px"), "{style}");
         assert!(!style.contains("opacity"), "a driven span is not dimmed");
-        assert!(agent_span_style(0.0, 10.0, true).contains("opacity: 0.65"));
+        assert!(agent_span_style(0.0, 10.0, true, 0, 1).contains("opacity: 0.65"));
 
         // A person's block yields the sub-column only when the lane exists.
         assert_eq!(overlap_column_style_scaled(0, 1, 1.0), overlap_column_style(0, 1));
@@ -2608,6 +2741,85 @@ mod tests {
         // Overlap columns split the narrowed width, not the full one.
         let col1 = overlap_column_style_scaled(1, 2, AGENT_LANE_SPLIT);
         assert!(col1.contains("* 0.3300)"), "{col1}");
+
+        // Two sub-columns within the lane split its right-hand region, not
+        // the whole block area.
+        let sub0 = agent_span_style(0.0, 10.0, false, 0, 2);
+        assert!(sub0.contains("left: calc(44px + (100% - 48px) * 0.6600)"), "{sub0}");
+        assert!(sub0.contains("width: calc((100% - 48px) * 0.1700 - 2px)"), "{sub0}");
+        let sub1 = agent_span_style(0.0, 10.0, false, 1, 2);
+        assert!(sub1.contains("left: calc(44px + (100% - 48px) * 0.8300)"), "{sub1}");
+    }
+
+    fn fleet_origin_map(
+        pairs: &[(&str, crate::fleet::FleetOrigin)],
+    ) -> std::collections::HashMap<String, crate::fleet::FleetOrigin> {
+        pairs.iter().map(|(id, o)| (id.to_string(), *o)).collect()
+    }
+
+    #[test]
+    fn filter_external_spans_drops_hobbes_tabs_and_unresolved_sessions() {
+        let day: NaiveDate = "2026-09-16".parse().unwrap();
+        let spans = vec![
+            span("ext", day, 540, 600, false),
+            span("hobbes-tab", day, 540, 600, false),
+            span("unknown", day, 540, 600, false),
+        ];
+        let origins = fleet_origin_map(&[
+            ("ext", crate::fleet::FleetOrigin::External),
+            ("hobbes-tab", crate::fleet::FleetOrigin::Hobbes),
+            // "unknown" deliberately absent: no row resolves for it.
+        ]);
+        let kept = filter_external_spans(spans, &origins);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].session_id, "ext");
+    }
+
+    #[test]
+    fn agent_lane_layout_gives_two_concurrent_spans_distinct_sub_columns() {
+        let day: NaiveDate = "2026-09-16".parse().unwrap();
+        let spans = vec![
+            (span("a", day, 540, 600, false), "alpha".to_string()),
+            (span("b", day, 550, 610, false), "beta".to_string()),
+        ];
+        let items = agent_lane_layout(&spans);
+        assert_eq!(items.len(), 2);
+        let cols: std::collections::HashSet<usize> = items.iter().map(|i| i.col).collect();
+        assert_eq!(cols, std::collections::HashSet::from([0, 1]));
+        assert!(items.iter().all(|i| i.count == 2));
+    }
+
+    #[test]
+    fn agent_lane_layout_collapses_four_concurrent_spans_into_a_band() {
+        let day: NaiveDate = "2026-09-16".parse().unwrap();
+        let spans = vec![
+            (span("a", day, 540, 600, false), "alpha".to_string()),
+            (span("b", day, 545, 605, false), "beta".to_string()),
+            (span("c", day, 550, 610, false), "gamma".to_string()),
+            (span("d", day, 555, 615, false), "delta".to_string()),
+        ];
+        let items = agent_lane_layout(&spans);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(items.len(), 1, "{labels:?}");
+        assert_eq!(items[0].label, "4 agents");
+        assert_eq!(items[0].start, local_minutes_to_utc(day, 540));
+        assert_eq!(items[0].end, local_minutes_to_utc(day, 615));
+        assert_eq!(items[0].col, 0);
+        assert_eq!(items[0].count, 1);
+        assert!(items[0].title.contains("alpha"));
+        assert!(items[0].title.contains("delta"));
+    }
+
+    #[test]
+    fn agent_lane_layout_keeps_full_width_when_nothing_overlaps() {
+        let day: NaiveDate = "2026-09-16".parse().unwrap();
+        let spans = vec![
+            (span("a", day, 540, 600, false), "alpha".to_string()),
+            (span("b", day, 600, 660, false), "beta".to_string()), // touches, doesn't overlap
+        ];
+        let items = agent_lane_layout(&spans);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| i.col == 0 && i.count == 1));
     }
 
     // ── Capacity readout ────────────────────────────────────────────────
