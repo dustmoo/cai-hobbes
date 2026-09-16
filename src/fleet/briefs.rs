@@ -386,6 +386,72 @@ pub fn rollup_framing(date: NaiveDate, lines: &[String], total_minutes: u32) -> 
     )
 }
 
+/// Read a cached day rollup out of the `meta` table. The single reader for
+/// every surface that shows one (the Fleet review band, the planner's End the
+/// day card) — the cache key lives next to its writer.
+pub fn load_rollup(date: NaiveDate) -> Option<DayRollup> {
+    crate::session_store::meta_get(&rollup_meta_key(date))
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// Generate (and cache) the day rollup for `date` with the same connector
+/// call the Fleet review band makes.
+///
+/// Extracted here so the planner's End-the-day card generates *the same*
+/// narrative, cached under the same key, instead of a second parallel
+/// notion of "the day in review". Callers own the in-flight guard and the
+/// error surface; this function is one shot.
+pub async fn generate_day_rollup(
+    settings: &crate::settings::Settings,
+    date: NaiveDate,
+) -> Result<DayRollup, String> {
+    let instance = settings
+        .active_connector()
+        .filter(|i| settings.is_connector_configured(i))
+        .or_else(|| {
+            settings
+                .llm_connectors
+                .iter()
+                .find(|i| settings.is_connector_configured(i))
+        })
+        .cloned()
+        .ok_or_else(|| "No configured LLM connector.".to_string())?;
+    let now = Utc::now();
+    let state = super::shared().snapshot();
+    // Ended rows first, then the live map — the store query and the live map
+    // overlap while a session is running, so the live copy wins.
+    let mut rows: Vec<FleetSession> = super::store::sessions_active_on(date)
+        .into_iter()
+        .filter(|r| !state.sessions.contains_key(&r.id))
+        .collect();
+    rows.extend(state.sessions.values().cloned());
+    if rows.is_empty() {
+        return Err("No sessions to roll up.".to_string());
+    }
+    let total = super::fleet_agent_minutes_on(&state, date, now);
+    let lines = rollup_lines(&rows, date, now, 12);
+    let framed = rollup_framing(date, &lines, total);
+    let connector = crate::llm::build_connector_for_instance(&instance, None);
+    let narrative = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        connector.generate_fleet_rollup(framed),
+    )
+    .await
+    .map_err(|_| "Rollup timed out.".to_string())?
+    .map_err(|e| e.to_string())?;
+    let rollup = DayRollup {
+        date,
+        narrative,
+        generated_at: now,
+        session_count: rows.len(),
+        total_minutes: total,
+    };
+    if let Ok(json) = serde_json::to_string(&rollup) {
+        let _ = crate::session_store::meta_set(&rollup_meta_key(date), &json);
+    }
+    Ok(rollup)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

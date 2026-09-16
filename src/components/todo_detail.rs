@@ -11,9 +11,9 @@ use chrono::{Local, NaiveDate};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
+use crate::components::planner_rows::{set_schedule, ScheduleChoice};
 use crate::components::planner_view::{mutate_todo, persist_block};
 use crate::todo::model::{self, ChecklistItem, TimeOfDay, TodoOrigin, TodoStatus};
-use crate::todo::store;
 use crate::todo::views;
 use crate::todo::PlannerState;
 
@@ -123,28 +123,23 @@ fn DetailCardInner(todo_id: String) -> Element {
 
     // Date changes mirror the row's schedule menu exactly: mutate, then prune
     // the blocks left on days that no longer match (deleting their store rows).
+    // One owner for the three-step schedule mutation (patch, prune, delete the
+    // orphaned block rows) — shared with the row's date popover so the card
+    // and the list can't drift apart.
     let set_scheduled = {
         let id = id.clone();
         move |date: Option<NaiveDate>| {
-            mutate_todo(planner, &id, |t| {
-                t.scheduled_for = date;
-                if date.is_none() {
-                    // Same rule as the row's "Clear date": an undated todo has
-                    // no day for a time-of-day group to belong to.
-                    t.time_of_day = None;
-                }
-            });
-            let keep = planner.peek().todo(&id).and_then(|t| t.scheduled_for);
-            let pruned = planner.write().prune_blocks_for_todo(&id, keep);
-            for b in &pruned {
-                if let Err(e) = store::delete_block(&b.id) {
-                    tracing::error!("planner: failed to delete rescheduled block {}: {}", b.id, e);
-                }
-            }
+            let choice = match date {
+                Some(d) => ScheduleChoice::On(d),
+                // An undated todo has no day for a time-of-day group to
+                // belong to; the bucket is deliberately left alone.
+                None => ScheduleChoice::ClearDate,
+            };
+            set_schedule(planner, &id, choice, crate::components::planner_view::today());
         }
     };
-    let mut set_scheduled_clear = set_scheduled.clone();
-    let mut set_scheduled_input = set_scheduled;
+    let set_scheduled_clear = set_scheduled.clone();
+    let set_scheduled_input = set_scheduled;
 
     let commit_estimate = {
         let id = id.clone();

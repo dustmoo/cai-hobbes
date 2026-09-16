@@ -133,6 +133,37 @@ pub struct BuiltinToolCtx {
     pub chat_command: Signal<Option<crate::components::chat_input::ChatCommand>>,
 }
 
+/// Assemble [`BuiltinToolCtx`] from the component tree, so UI surfaces can
+/// drive the same built-in code paths the model does (P-015: one dispatch
+/// path, never a second hand-rolled copy at a call site). Hook-shaped — call
+/// it unconditionally at the top of a component body.
+pub(crate) fn builtin_ctx_from_tree() -> BuiltinToolCtx {
+    BuiltinToolCtx {
+        session_state: use_context(),
+        settings: use_context(),
+        skill_registry: use_context(),
+        permission_manager: use_context(),
+        mcp_context: use_context(),
+        planner: use_context(),
+        chat_command: use_context(),
+    }
+}
+
+/// Hand a planner todo to a headless Claude Code run — the exact code path
+/// `HOBBES_DISPATCH { target: "claude_code" }` takes, so the planner's
+/// "Dispatch to a background agent" and the model's tool call cannot drift.
+pub(crate) fn dispatch_todo_to_background(
+    deps: BuiltinToolCtx,
+    todo_id: &str,
+    model: Option<String>,
+) -> Result<String, String> {
+    let mut args = serde_json::json!({ "todo_id": todo_id, "target": "claude_code" });
+    if let Some(m) = model {
+        args["model"] = serde_json::Value::String(m);
+    }
+    crate::todo::dispatch::handle_dispatch(deps, &args, &crate::todo::dispatch::RealClaudeSpawner)
+}
+
 pub struct BuiltinOutcome {
     pub status: ToolCallStatus,
     pub response: String,

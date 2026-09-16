@@ -353,15 +353,47 @@ fn assign_overlap_columns(
 /// blocks split the usable width evenly with a small gutter between columns.
 /// Inline style, composed with the vertical geometry — Tailwind purges
 /// computed class names.
+#[cfg(test)]
 fn overlap_column_style(col: usize, count: usize) -> String {
+    overlap_column_style_scaled(col, count, 1.0)
+}
+
+/// [`overlap_column_style`] over a *fraction* of the usable width.
+///
+/// `avail` is how much of the block area the person's own work may use:
+/// `1.0` normally, [`AGENT_LANE_SPLIT`] on a day where the agent sub-column
+/// is drawn, so a block's right edge stops at the lane boundary instead of
+/// sliding under it. Inline style — Tailwind purges computed class names.
+fn overlap_column_style_scaled(col: usize, count: usize, avail: f64) -> String {
+    let avail = avail.clamp(0.05, 1.0);
     if count <= 1 {
-        return " left: 44px; right: 4px;".to_string();
+        if avail >= 1.0 {
+            return " left: 44px; right: 4px;".to_string();
+        }
+        return format!(" left: 44px; width: calc((100% - 48px) * {avail:.4} - 3px);");
     }
-    let frac = 1.0 / count as f64;
+    let frac = avail / count as f64;
     let left_frac = frac * col as f64;
     format!(
         " left: calc(44px + (100% - 48px) * {left_frac:.4}); width: calc((100% - 48px) * {frac:.4} - 3px);"
     )
+}
+
+/// Where the agent sub-column starts, as a fraction of the block area. The
+/// person keeps the left ~66%; fleet spans get the right third.
+const AGENT_LANE_SPLIT: f64 = 0.66;
+
+/// Inline geometry for one agent span in the right-hand sub-column.
+fn agent_span_style(top: f64, height: f64, background: bool) -> String {
+    let mut style = format!(
+        "top: {top}px; height: {height}px; left: calc(44px + (100% - 48px) * {AGENT_LANE_SPLIT:.4}); right: 4px;"
+    );
+    if background {
+        // A background phase is real work the user isn't driving — present,
+        // but never as loud as a turn they are in.
+        style.push_str(" opacity: 0.65;");
+    }
+    style
 }
 
 /// A local wall-clock minute on `date`, as UTC. Clamped to the day; DST
@@ -384,10 +416,237 @@ fn minutes_in_local_day(dt: &chrono::DateTime<Utc>) -> i64 {
     (local.time().num_seconds_from_midnight() / 60) as i64
 }
 
+// ── Day navigation, free gaps, agent lane, shutdown (pure) ──────────────────
+
+/// What to call the day the rail is showing. Named days for the three the
+/// user actually lives in; everything else is its weekday (the exact date
+/// rides alongside in its own muted span, so the label never has to repeat
+/// it).
+fn day_label(viewing: NaiveDate, today: NaiveDate) -> String {
+    if viewing == today {
+        "Today".to_string()
+    } else if today.succ_opt() == Some(viewing) {
+        "Tomorrow".to_string()
+    } else if today.pred_opt() == Some(viewing) {
+        "Yesterday".to_string()
+    } else {
+        viewing.format("%A").to_string()
+    }
+}
+
+/// The muted date beside the day label: `"Tue 16 Sep"`.
+fn day_date_label(viewing: NaiveDate) -> String {
+    viewing.format("%a %-d %b").to_string()
+}
+
+/// Usable free stretches inside `[day_start, day_end)`: every gap of at least
+/// `min_len` minutes not covered by a busy interval.
+///
+/// Pure and total — busy intervals may overlap, nest, run backwards, or spill
+/// past either edge; they are clipped to the window and merged first. Callers
+/// that only want the future (today) pass a raised `day_start`.
+fn free_gaps(busy: &[(u32, u32)], day_start: u32, day_end: u32, min_len: u32) -> Vec<(u32, u32)> {
+    if day_end <= day_start || min_len == 0 {
+        return Vec::new();
+    }
+    let mut spans: Vec<(u32, u32)> = busy
+        .iter()
+        .filter_map(|(s, e)| {
+            let s = (*s).max(day_start);
+            let e = (*e).min(day_end);
+            (e > s).then_some((s, e))
+        })
+        .collect();
+    spans.sort_unstable();
+
+    let mut out = Vec::new();
+    let mut cursor = day_start;
+    for (s, e) in spans {
+        if s > cursor && s - cursor >= min_len {
+            out.push((cursor, s));
+        }
+        cursor = cursor.max(e);
+    }
+    if day_end > cursor && day_end - cursor >= min_len {
+        out.push((cursor, day_end));
+    }
+    out
+}
+
+/// Free slots are worth offering from 30 minutes up — anything shorter is
+/// changeover, not a slot you'd plan into.
+const FREE_GAP_MIN_MINUTES: u32 = 30;
+
+/// How many sessions the agent sub-column will draw before it stops. Past
+/// this the lane is noise, not information.
+const MAX_AGENT_LANE_SESSIONS: usize = 12;
+
+/// Collapse a day's replayed fleet spans into what the lane should draw.
+///
+/// Spans of the *same* session that touch or overlap merge into one stretch
+/// (the replay closes and re-opens a span at every turn boundary — drawing
+/// each one paints a barcode, not a working block). A merged stretch counts
+/// as background only when every part of it was. Sessions are then capped at
+/// `max_sessions`, keeping the busiest; the result is chronological.
+fn merge_agent_spans(
+    spans: &[crate::fleet::replay::DaySpan],
+    max_sessions: usize,
+) -> Vec<crate::fleet::replay::DaySpan> {
+    use std::collections::HashMap;
+
+    let mut by_session: HashMap<&str, Vec<&crate::fleet::replay::DaySpan>> = HashMap::new();
+    for span in spans.iter().filter(|s| s.end > s.start) {
+        by_session
+            .entry(span.session_id.as_str())
+            .or_default()
+            .push(span);
+    }
+
+    let mut merged_by_session: Vec<(i64, Vec<crate::fleet::replay::DaySpan>)> = by_session
+        .into_values()
+        .map(|mut group| {
+            group.sort_by_key(|s| s.start);
+            let mut merged: Vec<crate::fleet::replay::DaySpan> = Vec::new();
+            for span in group {
+                match merged.last_mut() {
+                    Some(prev) if span.start <= prev.end => {
+                        prev.end = prev.end.max(span.end);
+                        prev.background = prev.background && span.background;
+                    }
+                    _ => merged.push((*span).clone()),
+                }
+            }
+            let total: i64 = merged.iter().map(|s| (s.end - s.start).num_seconds()).sum();
+            (total, merged)
+        })
+        .collect();
+
+    // Busiest sessions win the lane; ties break on the session id so the cap
+    // is deterministic across renders.
+    merged_by_session.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| {
+            a.1.first()
+                .map(|s| s.session_id.as_str())
+                .cmp(&b.1.first().map(|s| s.session_id.as_str()))
+        })
+    });
+    merged_by_session.truncate(max_sessions);
+
+    let mut out: Vec<crate::fleet::replay::DaySpan> =
+        merged_by_session.into_iter().flat_map(|(_, s)| s).collect();
+    out.sort_by_key(|s| s.start);
+    out
+}
+
+/// Left half of the capacity readout: what's behind you and what's left.
+fn capacity_done_label(done: u32, planned: u32) -> String {
+    format!(
+        "{} done · {} to go",
+        model::format_minutes(done),
+        model::format_minutes(planned.saturating_sub(done))
+    )
+}
+
+/// Right half of the capacity readout, and whether it's the alarming kind.
+fn capacity_balance_label(cap: &model::Capacity) -> (String, bool) {
+    if cap.is_overcommitted() {
+        (
+            format!("over by {}", model::format_minutes(cap.over_by())),
+            true,
+        )
+    } else {
+        (
+            format!("{} free", model::format_minutes(cap.remaining())),
+            false,
+        )
+    }
+}
+
+/// `150` → `"2.5h"`. The shutdown card's register: round numbers for a day
+/// you're closing, not the minute-exact `format_minutes` of one you're
+/// still planning.
+fn fmt_hours(minutes: u32) -> String {
+    let hours = minutes as f64 / 60.0;
+    let rounded = (hours * 10.0).round() / 10.0;
+    if (rounded - rounded.round()).abs() < f64::EPSILON {
+        format!("{}h", rounded.round() as i64)
+    } else {
+        format!("{rounded:.1}h")
+    }
+}
+
+/// The headline counts on the End-the-day card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EndOfDaySummary {
+    /// Todos closed on the day.
+    done: usize,
+    /// Todos still open on the day — the carry-over candidates.
+    carried: usize,
+    /// Person focus minutes on the day.
+    you_minutes: u32,
+    /// Agent minutes on the day (in-app focus + fleet).
+    agent_minutes: u32,
+}
+
+/// Count the day for its shutdown card. `done` is work *closed on that day*
+/// (a todo completed today but scheduled last week still counts as today's
+/// win); `carried` is what's still open on the day's plate.
+fn end_of_day_summary(
+    todos: &[Todo],
+    sessions: &[model::FocusSession],
+    day: NaiveDate,
+    agent_minutes: u32,
+) -> EndOfDaySummary {
+    let done = todos
+        .iter()
+        .filter(|t| {
+            t.status.is_closed()
+                && t.completed_at
+                    .is_some_and(|c| c.with_timezone(&Local).date_naive() == day)
+        })
+        .count();
+    EndOfDaySummary {
+        done,
+        carried: carry_over_candidates(todos, day).len(),
+        you_minutes: model::person_minutes_on(sessions, day),
+        agent_minutes,
+    }
+}
+
+/// The day's open todos, in list order — the carry-over chips, every one of
+/// them pre-checked (the default is that unfinished work follows you).
+fn carry_over_candidates(todos: &[Todo], day: NaiveDate) -> Vec<(String, String)> {
+    todos
+        .iter()
+        .filter(|t| !t.status.is_closed() && t.scheduled_for == Some(day))
+        .map(|t| (t.id.clone(), t.title.clone()))
+        .collect()
+}
+
+/// The collapsed line a closed day leaves behind: `Closed at 17:42 · "…"`.
+fn closed_day_line(shutdown_at: chrono::DateTime<Utc>, reflection: &str) -> String {
+    let at = shutdown_at.with_timezone(&Local).format("%H:%M");
+    let reflection = reflection.trim();
+    if reflection.is_empty() {
+        format!("Closed at {at}")
+    } else {
+        format!("Closed at {at} · \u{201c}{}\u{201d}", crate::fleet::truncate_summary(reflection, 60))
+    }
+}
+
 // ── Right rail: capacity + timeline (Today only) ────────────────────────────
 
 #[component]
-fn CapacityBar(planned: u32, done: u32, capacity: u32, agent: u32, summary: String) -> Element {
+fn CapacityBar(
+    planned: u32,
+    done: u32,
+    capacity: u32,
+    agent: u32,
+    done_label: String,
+    balance_label: String,
+    over: bool,
+    caveat: Option<String>,
+) -> Element {
     // The bar's full width represents whichever is larger, so overcommitment
     // shows as a red tail instead of silently clipping at 100%. `planned`
     // includes `done`: finished work fills from the left with its own tint so
@@ -437,17 +696,50 @@ fn CapacityBar(planned: u32, done: u32, capacity: u32, agent: u32, summary: Stri
                     }
                 }
             }
-            p { class: "text-xs text-fg-muted", "{summary}" }
+            // The readout the bar can't draw: what's behind you and what's
+            // left on the left, the day's balance on the right — mono and
+            // tabular so the digits don't dance as the day moves.
+            div {
+                class: "flex items-baseline justify-between gap-2",
+                span {
+                    class: "font-mono text-[11px] tabular-nums text-fg-muted",
+                    "{done_label}"
+                }
+                span {
+                    class: if over {
+                        "font-mono text-[11px] tabular-nums text-red-300"
+                    } else {
+                        "font-mono text-[11px] tabular-nums text-fg-muted"
+                    },
+                    "{balance_label}"
+                }
+            }
+            if let Some(caveat) = caveat {
+                p { class: "font-mono text-[11px] tabular-nums text-fg-muted", "{caveat}" }
+            }
         }
     }
 }
 
 #[component]
-pub(crate) fn TodayRail() -> Element {
+pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let settings = use_context::<Signal<Settings>>();
     let fleet_state = use_context::<Signal<crate::fleet::FleetState>>();
     let mut selected_block = use_context::<SelectedBlockContext>().0;
+    let mut chat_command =
+        use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+
+    // The End-the-day card takes over the foot of the rail when open.
+    let mut end_day_open = use_signal(|| false);
+    let mut reflection = use_signal(String::new);
+    // Carry-over is opt-OUT: unfinished work follows you unless you say
+    // otherwise, so the signal holds what was *unchecked*, and a day change
+    // needs no resync.
+    let mut carry_unchecked = use_signal(std::collections::HashSet::<String>::new);
+    let mut rollup_bump = use_signal(|| 0u64);
+    let mut rollup_running = use_signal(|| false);
+    let mut rollup_error = use_signal(|| Option::<String>::None);
 
     // Current-time indicator: a once-a-minute tick is enough for a line that
     // moves ~0.8 px/min; subscribing to it re-renders the rail so the line
@@ -461,7 +753,12 @@ pub(crate) fn TodayRail() -> Element {
     });
     let _subscribe_now = *now_tick.read();
 
-    let day = today();
+    // The rail is a window onto ONE day, not a hard-wired "today": every read
+    // below (blocks, capacity, pool, all-day events, click-to-create, Place)
+    // takes `day`, and only the now-line checks it against the real today.
+    let real_today = today();
+    let day = viewing();
+    let is_today = day == real_today;
     let settings_read = settings.read();
     let (day_start, day_end) = workday_bounds(
         &settings_read.planner_workday_start,
@@ -489,7 +786,7 @@ pub(crate) fn TodayRail() -> Element {
             tracing::error!("planner: failed to load calendar cache: {}", e);
             Vec::new()
         });
-        all_day_events_for(&events, &enabled, today())
+        all_day_events_for(&events, &enabled, viewing())
     });
     let all_day_events: Vec<model::CalendarEvent> = all_day_memo.read().clone();
 
@@ -567,7 +864,20 @@ pub(crate) fn TodayRail() -> Element {
             ))
         })
         .collect();
+    // End-the-day inputs, gathered while the state borrow is live.
+    let carry_candidates = carry_over_candidates(&state.todos, day);
+    let eod_core = end_of_day_summary(&state.todos, &state.focus_sessions, day, 0);
+    let day_closed: Option<(chrono::DateTime<Utc>, String)> = state
+        .day_plans
+        .iter()
+        .find(|p| p.date == day)
+        .and_then(|p| p.shutdown_at.map(|t| (t, p.reflection.clone())));
     drop(state);
+
+    let eod = EndOfDaySummary {
+        agent_minutes: capacity.agent_minutes,
+        ..eod_core
+    };
 
     // Blocks the ruler culls (fully outside the workday window) still exist
     // and still count — first-fit overflow is deliberately honest — so they
@@ -608,7 +918,9 @@ pub(crate) fn TodayRail() -> Element {
     let outside_label = fmt_outside_counts(external_earlier, external_later);
 
     let timeline_height = (day_end - day_start) as f64 / 60.0 * PX_PER_HOUR;
-    let now_line_top = now_line_offset(minutes_in_local_day(&Utc::now()), day_start, day_end);
+    let now_line_top = is_today
+        .then(|| now_line_offset(minutes_in_local_day(&Utc::now()), day_start, day_end))
+        .flatten();
     let hours: Vec<u32> = (day_start / 60..=day_end / 60)
         .filter(|h| h * 60 >= day_start && h * 60 <= day_end)
         .collect();
@@ -678,6 +990,78 @@ pub(crate) fn TodayRail() -> Element {
             .collect::<Vec<_>>(),
     );
 
+    // The agent lane: fleet working time on the viewed day, reconstructed
+    // from the stored event log. Read through a memo because it costs two
+    // SQLite queries — it re-runs when the day changes, when the live session
+    // set changes, or on the minute tick (an open span grows with the clock).
+    let agent_spans_memo = use_memo(move || {
+        let day = viewing();
+        let _tick = *now_tick.read();
+        let live = fleet_state.read();
+        let _live_count = live.sessions.len();
+        if !crate::entitlement::pro_active() {
+            return Vec::new();
+        }
+        let bound = if day == today() {
+            Utc::now()
+        } else {
+            crate::fleet::local_day_bounds_utc(day).1
+        };
+        let spans = crate::fleet::replay::replay_day_spans(
+            &crate::fleet::store::events_on(day),
+            bound,
+        );
+        let merged = merge_agent_spans(&spans, MAX_AGENT_LANE_SESSIONS);
+        if merged.is_empty() {
+            return Vec::new();
+        }
+        // Names: the live map first (it carries the freshest title), then the
+        // day's ended rows for sessions that have since closed.
+        let mut names: std::collections::HashMap<String, String> =
+            crate::fleet::store::sessions_active_on(day)
+                .into_iter()
+                .map(|r| (r.id.clone(), r.display_name().to_string()))
+                .collect();
+        for s in live.sessions.values() {
+            names.insert(s.id.clone(), s.display_name().to_string());
+        }
+        merged
+            .into_iter()
+            .map(|span| {
+                let name = names
+                    .get(&span.session_id)
+                    .cloned()
+                    .unwrap_or_else(|| "agent".to_string());
+                (span, name)
+            })
+            .collect::<Vec<_>>()
+    });
+    let agent_spans: Vec<(crate::fleet::replay::DaySpan, String)> = agent_spans_memo.read().clone();
+
+    // The day's cached rollup, shared with the Fleet review band (same meta
+    // key, same generator) — a day has one narrative, not two.
+    let rollup_memo = use_memo(move || {
+        let _bump = *rollup_bump.read();
+        crate::fleet::briefs::load_rollup(viewing())
+    });
+    let rollup = rollup_memo.read().clone();
+    // The person's blocks give up the right sub-column only while there is
+    // something to put there.
+    let lane_avail = if agent_spans.is_empty() {
+        1.0
+    } else {
+        AGENT_LANE_SPLIT
+    };
+
+    // Free slots worth offering: gaps in the busy set, and on today only the
+    // ones still ahead of you — the morning you already spent is not a slot.
+    let gap_floor = if is_today {
+        day_start.max((minutes_in_local_day(&Utc::now()).max(0) as u32).div_ceil(15) * 15)
+    } else {
+        day_start
+    };
+    let gaps = free_gaps(&busy, gap_floor, day_end, FREE_GAP_MIN_MINUTES);
+
     // Timeline drag: (block id, mode, anchor screen-y, orig start, orig end).
     // The preview holds the snapped (start, end) under the cursor; because it
     // only changes when the drag crosses a quarter-hour boundary, re-renders
@@ -740,15 +1124,97 @@ pub(crate) fn TodayRail() -> Element {
         .as_ref()
         .and_then(|(id, _, _, _, _)| (*drag_preview.read()).map(|(s, e)| (id.clone(), s, e)));
 
+    let (balance_label, over) = capacity_balance_label(&capacity);
+    let done_label = capacity_done_label(capacity.done_minutes, capacity.planned_minutes);
+    let caveat = (capacity.unestimated > 0).then(|| {
+        format!(
+            "{} unestimated \u{2014} the real total is higher",
+            capacity.unestimated
+        )
+    });
+    let nav_label = day_label(day, real_today);
+    let nav_date = day_date_label(day);
+
     rsx! {
         div {
-            class: "h-full w-full flex flex-col gap-4 overflow-y-auto border-l border-subtle bg-section p-4",
+            class: "h-full w-full flex flex-col gap-4 overflow-y-auto border-l border-subtle bg-section p-4 outline-none",
+            tabindex: "0",
+            // `[` / `]` walk the day while the rail has focus (clicking
+            // anywhere in it gives focus). Arrow keys are left alone — the
+            // rail scrolls.
+            onkeydown: move |evt| {
+                let step = match evt.data.key() {
+                    Key::Character(ref c) if c == "[" => -1,
+                    Key::Character(ref c) if c == "]" => 1,
+                    _ => return,
+                };
+                let d = *viewing.peek();
+                let next = if step < 0 { d.pred_opt() } else { d.succ_opt() };
+                if let Some(next) = next {
+                    evt.prevent_default();
+                    viewing.set(next);
+                }
+            },
+            // Day navigation. The rail is a window onto one day; `Today` is
+            // just the day it opens on.
+            div {
+                class: "flex items-center gap-2",
+                button {
+                    class: "h-6 w-6 shrink-0 rounded border border-faint text-[11px] text-fg hover:bg-input",
+                    title: "Previous day",
+                    onclick: move |_| {
+                        let d = *viewing.peek();
+                        if let Some(prev) = d.pred_opt() {
+                            viewing.set(prev);
+                        }
+                    },
+                    "\u{2039}"
+                }
+                button {
+                    class: "min-w-0 truncate text-sm font-semibold text-fg",
+                    title: "Back to today",
+                    onclick: move |_| viewing.set(today()),
+                    "{nav_label}"
+                }
+                span { class: "shrink-0 font-mono text-[11px] tabular-nums text-fg-muted", "{nav_date}" }
+                button {
+                    class: "h-6 w-6 shrink-0 rounded border border-faint text-[11px] text-fg hover:bg-input",
+                    title: "Next day",
+                    onclick: move |_| {
+                        let d = *viewing.peek();
+                        if let Some(next) = d.succ_opt() {
+                            viewing.set(next);
+                        }
+                    },
+                    "\u{203a}"
+                }
+                div { class: "flex-1" }
+                button {
+                    class: "shrink-0 rounded border border-faint px-2 py-0.5 text-[11px] text-fg hover:bg-input",
+                    title: "Ask the assistant to plan this day",
+                    onclick: move |_| {
+                        let d = *viewing.peek();
+                        let seed = if d == today() {
+                            "Plan my day".to_string()
+                        } else {
+                            format!("Plan my day for {}", d.format("%A %-d %B"))
+                        };
+                        chat_command.set(Some(
+                            crate::components::chat_input::ChatCommand::StartTodoInChat(seed),
+                        ));
+                    },
+                    "Plan my day"
+                }
+            }
             CapacityBar {
                 planned: capacity.planned_minutes,
                 done: capacity.done_minutes,
                 capacity: capacity.capacity_minutes,
                 agent: capacity.agent_minutes,
-                summary: capacity.summary(),
+                done_label,
+                balance_label,
+                over,
+                caveat,
             }
             // Strategic-time readout v1 (Pro): person vs agent focus totals
             // and the usable gaps between person sittings in the workday.
@@ -850,6 +1316,61 @@ pub(crate) fn TodayRail() -> Element {
                         }
                     }
                 }
+                // Free slots: the day's honest empty space, offered rather
+                // than left blank. Clicking one creates a block at its start,
+                // exactly as clicking bare ruler does.
+                for (gs, ge) in gaps.iter().copied() {
+                    if let Some((top, height)) = block_geometry(gs as i64, ge as i64, day_start, day_end) {
+                        {
+                            let mut style = format!("top: {top}px; height: {height}px;");
+                            style.push_str(&overlap_column_style_scaled(0, 1, lane_avail));
+                            let label = format!("free \u{b7} {}", model::format_minutes(ge - gs));
+                            rsx! {
+                                div {
+                                    key: "gap-{gs}",
+                                    class: "absolute flex items-center justify-center overflow-hidden rounded-md border border-dashed border-faint text-[11px] text-fg-muted hover:bg-input",
+                                    style: "{style}",
+                                    title: "{fmt_hhmm(gs)}\u{2013}{fmt_hhmm(ge)} \u{2014} click to plan something here",
+                                    onclick: move |evt| {
+                                        evt.stop_propagation();
+                                        create_block_at(gs);
+                                    },
+                                    span { class: "truncate px-1", "{label}" }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Agent lane: fleet working time, in its own right-hand
+                // sub-column. Read-only and pointer-transparent — it never
+                // joins the overlap columns and never eats a create click.
+                for (span, name) in agent_spans.iter() {
+                    if let Some((top, height)) = block_geometry(
+                        minutes_in_local_day(&span.start),
+                        minutes_in_local_day(&span.end),
+                        day_start,
+                        day_end,
+                    ) {
+                        {
+                            let style = agent_span_style(top, height, span.background);
+                            let range = format!(
+                                "{}\u{2013}{} \u{b7} {}",
+                                span.start.with_timezone(&Local).format("%H:%M"),
+                                span.end.with_timezone(&Local).format("%H:%M"),
+                                name,
+                            );
+                            rsx! {
+                                div {
+                                    key: "agent-{span.session_id}-{span.start.timestamp()}",
+                                    class: "pointer-events-none absolute overflow-hidden rounded-r border-l-[3px] border-accent-500 bg-accent-500/15 px-1 py-0.5 text-[11px] text-accent-300",
+                                    style: "{style}",
+                                    title: "{range}",
+                                    span { class: "block truncate leading-4", "{name}" }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Blocks fully outside the workday window are filtered before
                 // rsx so the loop body positions unconditionally. External
                 // blocks carry clamp flags for the dashed-edge cue; manual and
@@ -899,7 +1420,7 @@ pub(crate) fn TodayRail() -> Element {
                             .get(&block.id)
                             .copied()
                             .unwrap_or((0, 1));
-                        block_style.push_str(&overlap_column_style(col, count));
+                        block_style.push_str(&overlap_column_style_scaled(col, count, lane_avail));
                         let is_selected = selected_block.read().as_deref() == Some(block.id.as_str());
                         let is_dragging_this = preview_for.as_ref().is_some_and(|(pid, _, _)| *pid == block.id);
                         let (display_title, is_done, is_focus_block) = linked_info
@@ -1160,10 +1681,10 @@ pub(crate) fn TodayRail() -> Element {
             }
             p { class: "text-[11px] text-fg-muted", "Click an empty slot for a new block · drag a block to move it · drag its bottom edge to resize." }
 
-            if !unblocked.is_empty() {
+            if !unblocked.is_empty() && !*end_day_open.read() {
                 div {
                     class: "flex flex-col gap-1",
-                    h3 { class: "text-xs font-medium uppercase tracking-wide text-fg-muted", "Not on the timeline" }
+                    h3 { class: "text-[10px] uppercase tracking-[0.08em] text-fg-muted", "Not on the timeline" }
                     for todo in unblocked {
                         {
                             let todo_id = todo.id.clone();
@@ -1199,7 +1720,7 @@ pub(crate) fn TodayRail() -> Element {
                                             let search_from = placement_search_start(
                                                 day_start,
                                                 now_min,
-                                                day == today(),
+                                                is_today,
                                             );
                                             let start_min = first_free_slot(&busy, search_from, duration);
                                             let block = TimeBlock {
@@ -1244,6 +1765,192 @@ pub(crate) fn TodayRail() -> Element {
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // ── End the day ────────────────────────────────────────────
+            div { class: "flex-1" }
+            if let Some((at, said)) = day_closed.clone() {
+                div {
+                    class: "flex h-8 shrink-0 items-center rounded border border-faint px-2",
+                    span {
+                        class: "min-w-0 truncate font-mono text-[11px] tabular-nums text-fg-muted",
+                        "{closed_day_line(at, &said)}"
+                    }
+                }
+            } else if *end_day_open.read() {
+                div {
+                    class: "flex shrink-0 flex-col gap-2 rounded border border-subtle bg-card p-3",
+                    div {
+                        class: "flex items-baseline justify-between gap-2",
+                        span { class: "text-sm font-semibold text-fg", "{nav_label}, {nav_date}" }
+                    }
+                    span {
+                        class: "font-mono text-[11px] tabular-nums text-fg-muted",
+                        {
+                            format!(
+                                "{} done \u{b7} {} carried \u{b7} {} you \u{b7} {} agents",
+                                eod.done,
+                                eod.carried,
+                                fmt_hours(eod.you_minutes),
+                                fmt_hours(eod.agent_minutes),
+                            )
+                        }
+                    }
+
+                    p { class: "text-[10px] uppercase tracking-[0.08em] text-fg-muted", "Rollup" }
+                    if let Some(r) = rollup.clone() {
+                        p { class: "text-xs leading-relaxed text-fg", "{r.narrative}" }
+                    } else {
+                        div {
+                            class: "flex items-center gap-2",
+                            button {
+                                class: "shrink-0 rounded border border-faint px-2 py-0.5 text-[11px] text-fg hover:bg-input disabled:opacity-50",
+                                disabled: *rollup_running.read(),
+                                onclick: move |_| {
+                                    if *rollup_running.peek() {
+                                        return;
+                                    }
+                                    rollup_running.set(true);
+                                    rollup_error.set(None);
+                                    let s = settings.peek().clone();
+                                    let d = *viewing.peek();
+                                    spawn(async move {
+                                        match crate::fleet::briefs::generate_day_rollup(&s, d).await {
+                                            Ok(_) => rollup_bump += 1,
+                                            Err(e) => rollup_error.set(Some(e)),
+                                        }
+                                        rollup_running.set(false);
+                                    });
+                                },
+                                if *rollup_running.read() { "Rolling up\u{2026}" } else { "Roll up" }
+                            }
+                            span {
+                                class: "min-w-0 flex-1 truncate text-[11px] text-fg-muted",
+                                "A short review of what every session got done."
+                            }
+                        }
+                    }
+                    if let Some(err) = rollup_error.read().clone() {
+                        p { class: "text-[11px] text-red-300", "{err}" }
+                    }
+
+                    if !carry_candidates.is_empty() {
+                        p { class: "text-[10px] uppercase tracking-[0.08em] text-fg-muted", "Carry over" }
+                        div {
+                            class: "flex flex-wrap gap-1",
+                            for (id, title) in carry_candidates.clone() {
+                                {
+                                    let checked = !carry_unchecked.read().contains(&id);
+                                    let toggle_id = id.clone();
+                                    rsx! {
+                                        button {
+                                            key: "carry-{id}",
+                                            class: if checked {
+                                                "max-w-full rounded-full border border-faint bg-input px-2 py-0.5 text-[11px] text-fg"
+                                            } else {
+                                                "max-w-full rounded-full border border-faint px-2 py-0.5 text-[11px] text-fg-muted line-through"
+                                            },
+                                            onclick: move |_| {
+                                                let mut set = carry_unchecked.write();
+                                                if !set.remove(&toggle_id) {
+                                                    set.insert(toggle_id.clone());
+                                                }
+                                            },
+                                            span { class: "truncate", if checked { "\u{2713} " } else { "" } "{title}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    input {
+                        class: "w-full rounded border border-faint bg-input px-2 py-1 text-xs text-fg outline-none",
+                        placeholder: "One line about the day\u{2026}",
+                        value: "{reflection}",
+                        oninput: move |e| reflection.set(e.value()),
+                    }
+                    div {
+                        class: "flex items-center gap-2",
+                        div { class: "flex-1" }
+                        button {
+                            class: "rounded border border-faint px-2 py-0.5 text-[11px] text-fg hover:bg-input",
+                            onclick: move |_| end_day_open.set(false),
+                            "Not yet"
+                        }
+                        button {
+                            class: "rounded bg-btn-primary px-2 py-0.5 text-[11px] text-fg hover:bg-btn-primary-hover",
+                            onclick: move |_| {
+                                let now = Utc::now();
+                                let said = reflection.peek().trim().to_string();
+                                // The day plan carries the shutdown: one row
+                                // per day, created on the spot if the day was
+                                // never explicitly planned.
+                                let plan = {
+                                    let mut state = planner.write();
+                                    let capacity = state.capacity_for(day, default_capacity);
+                                    match state.day_plans.iter_mut().find(|p| p.date == day) {
+                                        Some(plan) => {
+                                            plan.shutdown_at = Some(now);
+                                            plan.reflection = said.clone();
+                                            plan.clone()
+                                        }
+                                        None => {
+                                            let mut plan = model::DayPlan::new(day, capacity);
+                                            plan.shutdown_at = Some(now);
+                                            plan.reflection = said.clone();
+                                            state.day_plans.push(plan.clone());
+                                            plan
+                                        }
+                                    }
+                                };
+                                if let Err(e) = store::save_day_plan(&plan) {
+                                    tracing::error!("planner: failed to save day plan {}: {}", day, e);
+                                }
+                                // Carry-over: checked work moves to the next
+                                // day, and its timebox follows the schedule
+                                // (same rule the rows use).
+                                if let Some(next) = day.succ_opt() {
+                                    let unchecked = carry_unchecked.peek().clone();
+                                    for (id, _) in carry_candidates.iter() {
+                                        if unchecked.contains(id) {
+                                            continue;
+                                        }
+                                        mutate_todo(planner, id, |t| t.scheduled_for = Some(next));
+                                        let pruned =
+                                            planner.write().prune_blocks_for_todo(id, Some(next));
+                                        for b in &pruned {
+                                            if let Err(e) = store::delete_block(&b.id) {
+                                                tracing::error!(
+                                                    "planner: failed to delete carried block {}: {}",
+                                                    b.id, e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                tracing::info!(
+                                    "planner: closed {} \u{2014} {} done, {} carried",
+                                    day, eod.done, eod.carried
+                                );
+                                carry_unchecked.write().clear();
+                                reflection.set(String::new());
+                                end_day_open.set(false);
+                            },
+                            "Close the day"
+                        }
+                    }
+                }
+            } else {
+                button {
+                    class: "flex h-8 shrink-0 items-center gap-2 rounded border border-faint px-2 text-left hover:bg-input",
+                    onclick: move |_| end_day_open.set(true),
+                    span { class: "shrink-0 text-[11px] text-fg", "End the day" }
+                    span {
+                        class: "min-w-0 flex-1 truncate font-mono text-[11px] tabular-nums text-fg-muted",
+                        { format!("roll up \u{b7} reflect \u{b7} carry over {}", eod.carried) }
                     }
                 }
             }
@@ -1775,4 +2482,231 @@ mod tests {
         assert_eq!(minutes_in_local_day(&clamped), 23 * 60 + 59);
     }
 
+    // ── Day navigation ──────────────────────────────────────────────────
+
+    #[test]
+    fn day_label_names_the_days_you_live_in() {
+        let today: NaiveDate = "2026-09-16".parse().unwrap();
+        assert_eq!(day_label(today, today), "Today");
+        assert_eq!(day_label("2026-09-17".parse().unwrap(), today), "Tomorrow");
+        assert_eq!(day_label("2026-09-15".parse().unwrap(), today), "Yesterday");
+        // Anything further out is just its weekday — the exact date rides in
+        // its own span beside the label.
+        assert_eq!(day_label("2026-09-18".parse().unwrap(), today), "Friday");
+        assert_eq!(day_label("2026-09-14".parse().unwrap(), today), "Monday");
+        assert_eq!(day_date_label(today), "Wed 16 Sep");
+    }
+
+    // ── Free gaps ───────────────────────────────────────────────────────
+
+    #[test]
+    fn free_gaps_finds_usable_space_between_busy_items() {
+        // 09:00–17:00 with 10:00–11:00 and 13:00–13:30 busy.
+        let busy = [(600, 660), (780, 810)];
+        assert_eq!(
+            free_gaps(&busy, 540, 1020, 30),
+            vec![(540, 600), (660, 780), (810, 1020)]
+        );
+    }
+
+    #[test]
+    fn free_gaps_skips_short_slots_and_merges_overlaps() {
+        // 09:00–09:20 free is changeover, not a slot.
+        let busy = [(560, 660)];
+        assert_eq!(free_gaps(&busy, 540, 1020, 30), vec![(660, 1020)]);
+
+        // Overlapping and nested busy intervals collapse to one stretch.
+        let busy = [(600, 720), (630, 660), (660, 780)];
+        assert_eq!(free_gaps(&busy, 540, 1020, 30), vec![(540, 600), (780, 1020)]);
+    }
+
+    #[test]
+    fn free_gaps_clips_to_the_window_and_is_total() {
+        // Busy spilling past both edges leaves nothing.
+        assert!(free_gaps(&[(0, 1440)], 540, 1020, 30).is_empty());
+        // An empty day is one long gap.
+        assert_eq!(free_gaps(&[], 540, 1020, 30), vec![(540, 1020)]);
+        // Degenerate inputs never panic and never invent a slot.
+        assert!(free_gaps(&[], 1020, 540, 30).is_empty());
+        assert!(free_gaps(&[], 540, 1020, 0).is_empty());
+        assert!(free_gaps(&[(700, 600)], 540, 1020, 1000).is_empty());
+        // Raising the floor (today: no slots behind you) drops the morning.
+        assert_eq!(free_gaps(&[], 840, 1020, 30), vec![(840, 1020)]);
+    }
+
+    // ── Agent lane ──────────────────────────────────────────────────────
+
+    fn span(id: &str, day: NaiveDate, from: u32, to: u32, background: bool) -> crate::fleet::replay::DaySpan {
+        crate::fleet::replay::DaySpan {
+            session_id: id.into(),
+            start: local_minutes_to_utc(day, from),
+            end: local_minutes_to_utc(day, to),
+            background,
+        }
+    }
+
+    #[test]
+    fn merge_agent_spans_joins_touching_spans_of_one_session() {
+        let day: NaiveDate = "2026-09-16".parse().unwrap();
+        let spans = vec![
+            span("a", day, 540, 600, false),
+            span("a", day, 600, 660, true), // touches: one stretch
+            span("b", day, 570, 600, false),
+        ];
+        let merged = merge_agent_spans(&spans, 12);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        // Chronological, and the merged stretch spans both parts.
+        assert_eq!(merged[0].session_id, "a");
+        assert_eq!(merged[0].start, local_minutes_to_utc(day, 540));
+        assert_eq!(merged[0].end, local_minutes_to_utc(day, 660));
+        // A stretch containing driven work is not a background stretch.
+        assert!(!merged[0].background);
+        assert_eq!(merged[1].session_id, "b");
+    }
+
+    #[test]
+    fn merge_agent_spans_keeps_gaps_and_all_background_stays_background() {
+        let day: NaiveDate = "2026-09-16".parse().unwrap();
+        let spans = vec![
+            span("a", day, 540, 600, true),
+            span("a", day, 660, 720, true), // an hour apart: two stretches
+        ];
+        let merged = merge_agent_spans(&spans, 12);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|s| s.background));
+    }
+
+    #[test]
+    fn merge_agent_spans_caps_sessions_keeping_the_busiest() {
+        let day: NaiveDate = "2026-09-16".parse().unwrap();
+        let spans: Vec<_> = (0..20)
+            .map(|i| span(&format!("s{i:02}"), day, 540 + i, 540 + i + i + 1, false))
+            .collect();
+        let merged = merge_agent_spans(&spans, 12);
+        let sessions: std::collections::HashSet<&str> =
+            merged.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(sessions.len(), 12, "capped at the lane's limit");
+        // The busiest survive: s19 (39 min) in, s00 (1 min) out.
+        assert!(sessions.contains("s19"));
+        assert!(!sessions.contains("s00"));
+        // Zero-length spans never reach the lane.
+        assert!(merge_agent_spans(&[span("z", day, 600, 600, false)], 12).is_empty());
+    }
+
+    #[test]
+    fn agent_lane_geometry_sits_in_the_right_sub_column() {
+        let style = agent_span_style(24.0, 48.0, false);
+        assert!(style.contains("left: calc(44px + (100% - 48px) * 0.6600)"), "{style}");
+        assert!(style.contains("right: 4px"), "{style}");
+        assert!(!style.contains("opacity"), "a driven span is not dimmed");
+        assert!(agent_span_style(0.0, 10.0, true).contains("opacity: 0.65"));
+
+        // A person's block yields the sub-column only when the lane exists.
+        assert_eq!(overlap_column_style_scaled(0, 1, 1.0), overlap_column_style(0, 1));
+        let narrowed = overlap_column_style_scaled(0, 1, AGENT_LANE_SPLIT);
+        assert!(narrowed.contains("width: calc((100% - 48px) * 0.6600 - 3px)"), "{narrowed}");
+        // Overlap columns split the narrowed width, not the full one.
+        let col1 = overlap_column_style_scaled(1, 2, AGENT_LANE_SPLIT);
+        assert!(col1.contains("* 0.3300)"), "{col1}");
+    }
+
+    // ── Capacity readout ────────────────────────────────────────────────
+
+    fn capacity(planned: u32, done: u32, cap: u32) -> model::Capacity {
+        model::Capacity {
+            planned_minutes: planned,
+            done_minutes: done,
+            capacity_minutes: cap,
+            unestimated: 0,
+            agent_minutes: 0,
+        }
+    }
+
+    #[test]
+    fn capacity_labels_read_as_two_halves() {
+        assert_eq!(capacity_done_label(45, 260), "45m done · 3h 35m to go");
+        let (label, over) = capacity_balance_label(&capacity(180, 0, 255));
+        assert_eq!((label.as_str(), over), ("1h 15m free", false));
+        let (label, over) = capacity_balance_label(&capacity(270, 0, 240));
+        assert_eq!((label.as_str(), over), ("over by 30m", true));
+        // A finished day reads "all done", never a negative remainder.
+        assert_eq!(capacity_done_label(120, 120), "2h done · 0m to go");
+    }
+
+    // ── End the day ─────────────────────────────────────────────────────
+
+    fn todo_on(id: &str, day: Option<NaiveDate>, closed_on: Option<NaiveDate>) -> Todo {
+        let mut t = Todo::new(id, 0.0);
+        t.id = id.to_string();
+        t.scheduled_for = day;
+        if let Some(d) = closed_on {
+            t.status = TodoStatus::Completed;
+            t.completed_at = Some(local_minutes_to_utc(d, 600));
+        }
+        t
+    }
+
+    #[test]
+    fn carry_over_defaults_to_the_days_open_todos() {
+        let day: NaiveDate = "2026-09-16".parse().unwrap();
+        let other: NaiveDate = "2026-09-17".parse().unwrap();
+        let todos = vec![
+            todo_on("open-today", Some(day), None),
+            todo_on("done-today", Some(day), Some(day)),
+            todo_on("open-tomorrow", Some(other), None),
+            todo_on("unscheduled", None, None),
+        ];
+        let carried: Vec<String> = carry_over_candidates(&todos, day)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(carried, vec!["open-today"], "only open work on the day");
+    }
+
+    #[test]
+    fn end_of_day_summary_counts_the_day() {
+        let day: NaiveDate = "2026-09-16".parse().unwrap();
+        let other: NaiveDate = "2026-09-15".parse().unwrap();
+        let todos = vec![
+            todo_on("a", Some(day), None),
+            todo_on("b", Some(day), None),
+            todo_on("c", Some(day), Some(day)),
+            // Closed today but scheduled last week: still today's win.
+            todo_on("d", Some(other), Some(day)),
+            // Closed on another day: not today's.
+            todo_on("e", Some(other), Some(other)),
+        ];
+        let closed = |id: &str, todo: &str, from: u32, to: u32, actor: model::FocusActor| {
+            let mut s = model::FocusSession::open(todo, local_minutes_to_utc(day, from), actor);
+            s.id = id.to_string();
+            s.ended_at = Some(local_minutes_to_utc(day, to));
+            s.minutes = to - from;
+            s
+        };
+        let sessions = vec![
+            closed("f1", "a", 540, 630, model::FocusActor::Person),
+            closed("f2", "b", 660, 690, model::FocusActor::Agent { session_id: None }),
+        ];
+        let s = end_of_day_summary(&todos, &sessions, day, 150);
+        assert_eq!(s.done, 2, "c and d closed on the day");
+        assert_eq!(s.carried, 2, "a and b are still open on the day");
+        assert_eq!(s.you_minutes, 90, "agent sittings are not your hours");
+        assert_eq!(s.agent_minutes, 150, "agent total is passed in, not derived");
+    }
+
+    #[test]
+    fn shutdown_line_and_hours_round_for_a_day_you_are_closing() {
+        assert_eq!(fmt_hours(0), "0h");
+        assert_eq!(fmt_hours(90), "1.5h");
+        assert_eq!(fmt_hours(120), "2h");
+        assert_eq!(fmt_hours(115), "1.9h");
+
+        let day: NaiveDate = "2026-09-16".parse().unwrap();
+        let at = local_minutes_to_utc(day, 17 * 60 + 42);
+        assert_eq!(closed_day_line(at, "   "), "Closed at 17:42");
+        assert_eq!(
+            closed_day_line(at, "good day"),
+            "Closed at 17:42 · \u{201c}good day\u{201d}"
+        );
+    }
 }

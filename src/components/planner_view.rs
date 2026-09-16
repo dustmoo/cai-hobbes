@@ -88,18 +88,33 @@ pub(crate) fn mutate_todo(mut planner: Signal<PlannerState>, id: &str, f: impl F
 
 // ── Focus bar ───────────────────────────────────────────────────────────────
 
+/// `elapsed seconds` → `"7:04"` / `"1:02:30"`. The focus bar counts in
+/// seconds because a sitting you just started should visibly be running —
+/// a minutes-only readout sits on "0m" for a full minute and reads as broken.
+fn fmt_elapsed_clock(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
 /// Sunsama-style focus strip: visible whenever one todo is in progress, with
 /// a live elapsed-vs-estimate readout and the two exits (done / stop).
 #[component]
 fn FocusBar() -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
+    let fleet_state = use_context::<Signal<crate::fleet::FleetState>>();
 
-    // Elapsed is wall-clock; a ~20s ticker keeps the readout honest without
-    // meaningful re-render cost (the bar is a single strip).
+    // A one-second tick while the bar is mounted: the elapsed clock shows
+    // seconds, so anything slower would stutter. The bar is one strip, and it
+    // only exists while something is actually in progress.
     let mut tick = use_signal(|| 0u64);
     use_future(move || async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             tick += 1;
         }
     });
@@ -116,37 +131,78 @@ fn FocusBar() -> Element {
         .unwrap_or(false);
     let now = Utc::now();
     let elapsed = focus.elapsed_minutes(now);
-    let readout = match focus.estimate_minutes {
-        Some(est) => format!(
-            "{} of {}",
-            model::format_minutes(elapsed),
-            model::format_minutes(est)
-        ),
-        None => model::format_minutes(elapsed),
+    // Seconds resolution for the clock: banked minutes plus the live tail.
+    let elapsed_secs = i64::from(focus.actual_minutes) * 60
+        + focus
+            .started_at
+            .map(|s| (now - s).num_seconds().max(0))
+            .unwrap_or(0);
+    let clock = fmt_elapsed_clock(elapsed_secs);
+    let of_label = match focus.estimate_minutes {
+        Some(est) => format!("of {} \u{b7} {}", model::format_minutes(est), focus.title),
+        None => focus.title.clone(),
     };
     let over = focus.estimate_minutes.is_some_and(|est| elapsed > est);
     let focus_id = focus.id.clone();
     let done_id = focus.id.clone();
 
+    // Who else is working while you are: the fleet's live count and today's
+    // agent minutes, stated plainly beside your own clock.
+    let alongside = {
+        let fleet = fleet_state.read();
+        let working = fleet
+            .sessions
+            .values()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    crate::fleet::FleetStatus::Working
+                        | crate::fleet::FleetStatus::WorkingBackground
+                )
+            })
+            .count();
+        (working > 0).then(|| {
+            format!(
+                "{working} agents alongside \u{b7} {}",
+                model::format_minutes(crate::fleet::fleet_agent_minutes_on(
+                    &fleet,
+                    today(),
+                    now
+                ))
+            )
+        })
+    };
+
     rsx! {
         div {
-            class: "flex items-center gap-3 border-b border-subtle bg-primary-700/30 px-4 py-2",
-            span { class: "h-2 w-2 shrink-0 rounded-full bg-primary-400 animate-pulse" }
-            span { class: "min-w-0 truncate text-sm font-medium text-fg", "{focus.title}" }
+            class: "h-9 flex items-center gap-2.5 px-4 bg-section border-b border-subtle border-l-[3px] border-l-primary-500 text-xs",
+            span { class: "h-2 w-2 shrink-0 rounded-full bg-primary-300 animate-pulse" }
+            span { class: "shrink-0 font-medium text-fg", "Focusing" }
+            span {
+                class: if over {
+                    "shrink-0 font-mono text-[11px] tabular-nums text-red-300"
+                } else {
+                    "shrink-0 font-mono text-[11px] tabular-nums text-primary-300"
+                },
+                "{clock}"
+            }
+            span { class: "min-w-0 truncate text-fg-muted", "{of_label}" }
             if agent_driven {
                 span {
-                    class: "shrink-0 rounded-full border border-subtle px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-fg-muted",
+                    class: "shrink-0 rounded-full border border-faint px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-fg-muted",
                     title: "This focus session was started by the assistant",
-                    "◇ agent"
+                    "\u{25c7} agent"
                 }
             }
-            span {
-                class: if over { "shrink-0 text-xs text-red-400" } else { "shrink-0 text-xs text-fg-muted" },
-                "{readout}"
-            }
             div { class: "flex-1" }
+            if let Some(alongside) = alongside {
+                span {
+                    class: "shrink-0 font-mono text-[11px] tabular-nums text-fg-muted",
+                    "{alongside}"
+                }
+            }
             button {
-                class: "shrink-0 rounded bg-btn-primary px-2 py-1 text-xs font-medium text-fg hover:bg-btn-primary-hover",
+                class: "shrink-0 rounded bg-btn-primary px-2 py-0.5 text-[11px] text-fg hover:bg-btn-primary-hover",
                 onclick: move |_| {
                     // State-level complete: also closes the live focus-session
                     // row as 'completed'.
@@ -158,7 +214,7 @@ fn FocusBar() -> Element {
                 "Done"
             }
             button {
-                class: "shrink-0 rounded px-2 py-1 text-xs text-fg-muted hover:bg-input hover:text-fg",
+                class: "shrink-0 rounded border border-faint px-2 py-0.5 text-[11px] text-fg hover:bg-input",
                 title: "Pause — elapsed time is kept",
                 onclick: move |_| {
                     let _ = &focus_id;
@@ -191,6 +247,10 @@ pub fn PlannerView() -> Element {
     let selected_block = use_signal(|| Option::<String>::None);
     use_context_provider(|| SelectedBlockContext(selected_block));
 
+    // Which day the right rail is showing. Owned here (not in `TodayRail`) so
+    // it survives the rail unmounting when the centre column leaves Today.
+    let mut viewing_day = use_signal(today);
+
     // Menu-bar timer → planner reveal: the tray click handler (main.rs) parks
     // the focused todo's id in this global because selection/detail state is
     // local to this component and it may not even be mounted yet. Drain it:
@@ -206,6 +266,7 @@ pub fn PlannerView() -> Element {
             let pending = crate::focus_tray::PLANNER_REVEAL_TODO.read().clone();
             let Some(id) = pending else { return };
             selection.set(PlannerSelection::View(TodoView::Today));
+            viewing_day.set(today());
             let block_id = planner
                 .peek()
                 .blocks_on(today())
@@ -328,7 +389,7 @@ pub fn PlannerView() -> Element {
                     id: "planner-today-rail",
                     class: "shrink-0 h-full min-h-0",
                     style: "width: {today_width}px;",
-                    TodayRail {}
+                    TodayRail { viewing: viewing_day }
                 }
             }
 
