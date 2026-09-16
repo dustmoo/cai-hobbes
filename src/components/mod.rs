@@ -33,6 +33,8 @@ pub mod pixel_icons;
 pub mod project_chip;
 pub mod onboarding;
 pub mod planner_view;
+pub mod planner_rows;
+pub mod planner_timeline;
 pub mod todo_detail;
 pub mod quick_fix;
 pub mod shared;
