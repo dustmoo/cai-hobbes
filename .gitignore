@@ -42,6 +42,11 @@ RooFlow_temp_*archive/
 node_modules/
 npm-debug.log
 
+# Generated: build.rs copies this from node_modules/mermaid/dist at compile
+# time (see sync_mermaid_bundle() in build.rs). Regenerate by hand with
+# `npm run sync:mermaid` if you need it outside a cargo build.
+assets/mermaid.min.js
+
 # Temporary Debugging Artifacts
 check_output*.json
 *_payload*.json

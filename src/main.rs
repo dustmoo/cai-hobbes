@@ -244,6 +244,12 @@ fn main() {
                     + r#"<style>html, body { height: 100%; margin: 0; padding: 0; font-family: 'Inter', system-ui, sans-serif; }</style>"#
                     + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"#
                     + r#"<style>"# + include_str!("../assets/main.css") + r#"</style>"#
+                    // Mermaid diagrams: the 5MB+ bundle is NOT parsed here.
+                    // It's loaded on demand from Rust (see
+                    // `components::mermaid::ensure_mermaid_loaded`) the first
+                    // time a chat actually contains a diagram, so it costs
+                    // nothing at startup for the (common) case where it
+                    // never renders.
                     // Windows/Linux WebView renders classic, always-visible
                     // scrollbars (with arrow buttons) where macOS uses hidden
                     // overlay scrollbars. Style them down to a thin, button-less

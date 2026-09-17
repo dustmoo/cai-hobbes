@@ -6,6 +6,7 @@ pub mod comment_modal;
 pub mod conflict_modal;
 pub mod inline_comment_popover;
 pub mod markdown_renderer;
+pub mod mermaid;
 pub mod message_list;
 pub mod new_chat_memory_modal;
 pub mod selection_toolbar;

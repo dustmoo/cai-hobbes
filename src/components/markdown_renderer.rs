@@ -286,7 +286,7 @@ fn process_inlines(
 ) -> Vec<RenderNode> {
     fn convert(inline: MdInline) -> RenderNode {
         match inline {
-            MdInline::Text(s) => RenderNode::Text(s),
+            MdInline::Text(s) => RenderNode::Text(crate::formatters::latex::render_latex_symbols(&s)),
             MdInline::Code(s) => RenderNode::Code(s),
             MdInline::Link { href, text } => RenderNode::Link { href, text },
             MdInline::Image { src, alt } => RenderNode::Image { src, alt },
@@ -518,9 +518,17 @@ fn render_block(
                 }
             }
         }
-        MdBlock::CodeBlock { lang, code } => rsx! {
-            CodeBlock { lang, code }
-        },
+        MdBlock::CodeBlock { lang, code } => {
+            if lang.trim().eq_ignore_ascii_case("mermaid") {
+                rsx! {
+                    crate::components::mermaid::MermaidDiagram { code }
+                }
+            } else {
+                rsx! {
+                    CodeBlock { lang, code }
+                }
+            }
+        }
         MdBlock::Table {
             headers,
             rows,
@@ -1232,7 +1240,7 @@ pub fn ThinkingMarkdownRenderer(
                         code_buffer.push_str(&text);
                     } else {
                         let target = active_target!(inline_stack, current_inlines);
-                        target.push(Inline::Text(text.to_string()));
+                        target.push(Inline::Text(crate::formatters::latex::render_latex_symbols(&text)));
                     }
                 }
                 pulldown_cmark::Event::Code(text) => {

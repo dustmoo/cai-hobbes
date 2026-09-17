@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Development (hot-reload UI)
 dx serve --platform desktop
 npm run build:css   # after adding Tailwind classes
+npm run sync:mermaid   # manual refresh of assets/mermaid.min.js; build.rs does this automatically on every build, so you only need this by hand (e.g. to inspect the pinned copy without building)
 
 # Run all tests
 cargo test --release
