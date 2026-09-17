@@ -29,15 +29,32 @@ async fn ensure_mermaid_loaded() -> Result<(), String> {
                 error: Option<String>,
             }
 
-            // `typeof window.mermaid !== 'undefined'` guards against
-            // injecting twice even if this ever races ahead of the Rust-side
-            // OnceCell (e.g. a future reload of the window).
+            // The bundle is a CLASSIC SCRIPT and only works as one. Its first
+            // line declares `var __esbuild_esm_mermaid_nm` and its last reads
+            // that name back off `globalThis` — which only lines up when the
+            // `var` lands at script top level. `document::eval` runs its
+            // script inside a function wrapper, where the same `var` is a
+            // local, so the bundle throws on its own last line
+            // ("undefined is not an object"). Injecting a <script> element
+            // with `textContent` runs the source synchronously at top level,
+            // exactly as the old <script> tag in the webview head did, and
+            // keeps working if mermaid changes its prologue.
+            //
+            // The `typeof window.mermaid` guards make this idempotent even if
+            // it ever races ahead of the Rust-side OnceCell (a window reload).
             let script = format!(
                 r#"
                 (function() {{
                     try {{
                         if (typeof window.mermaid === 'undefined') {{
-                            {lib}
+                            const s = document.createElement('script');
+                            s.textContent = {lib_literal};
+                            document.head.appendChild(s);
+                        }}
+                        if (typeof window.mermaid === 'undefined') {{
+                            throw new Error('bundle ran but did not define window.mermaid');
+                        }}
+                        if (!window.__hobbesMermaidInit) {{
                             window.mermaid.initialize({{
                                 startOnLoad: false,
                                 securityLevel: 'strict',
@@ -56,6 +73,7 @@ async fn ensure_mermaid_loaded() -> Result<(), String> {
                                     edgeLabelBackground: '#1A1A1A'
                                 }}
                             }});
+                            window.__hobbesMermaidInit = true;
                         }}
                         dioxus.send({{ ok: true }});
                     }} catch (e) {{
@@ -63,7 +81,10 @@ async fn ensure_mermaid_loaded() -> Result<(), String> {
                     }}
                 }})();
                 "#,
-                lib = MERMAID_LIB_JS,
+                // JSON-encoded so the source travels as a string literal, not
+                // as code spliced into this wrapper's scope.
+                lib_literal = serde_json::to_string(MERMAID_LIB_JS)
+                    .unwrap_or_else(|_| "''".to_string()),
             );
 
             let mut eval = document::eval(&script);
