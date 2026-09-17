@@ -53,6 +53,20 @@ pub fn MessageList(
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let mut chat_command =
         use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    // Session-scoped, not the bare `ChatCommand::TriggerAiAnalysis` signal —
+    // that command carries no session id and routes to whichever tab happens
+    // to be ACTIVE when it's processed. A skill's permission approval runs an
+    // async execution (skills/execute_skill) that can outlive the click: if
+    // the user switches tabs before it resolves, TriggerAiAnalysis would
+    // trigger a continuation on the now-active tab instead of the one that
+    // actually ran the skill — an empty-user-message continuation against a
+    // session whose last message is already a finished assistant reply,
+    // which Claude rejects ("conversation must end with a user message").
+    // Writing directly into the owning session's slot in this set (the same
+    // primitive the tool-call approval path already uses) makes the
+    // continuation land on the right tab regardless of what's active later.
+    let mut has_pending_approvals =
+        use_context::<Signal<std::collections::HashSet<String>>>();
     let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     let _ = stream_update_trigger.read();
 
@@ -517,8 +531,10 @@ pub fn MessageList(
                                                                                                 }
                                                                                                 drop(state);
                                                                                                 crate::session_events::log_events(&session_id, skill_events);
-                                                                                                // Trigger continuation so LLM responds to skill output
-                                                                                                chat_command.set(Some(crate::components::chat_input::ChatCommand::TriggerAiAnalysis));
+                                                                                                // Trigger continuation on the session that actually ran the
+                                                                                                // skill, not whichever tab is active right now (see the
+                                                                                                // has_pending_approvals doc comment above).
+                                                                                                has_pending_approvals.write().insert(session_id.clone());
                                                                                             }
                                                                                             Err(e) => {
                                                                                                 tracing::error!("Skill execution failed: {}", e);
