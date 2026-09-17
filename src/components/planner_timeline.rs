@@ -1405,8 +1405,16 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
 
             // Hour-ruled timeline. All geometry is inline style — Tailwind
             // purges computed class names, so pixels never ride in classes.
+            //
+            // `shrink-0` is load-bearing: the rail is a flex column, so without
+            // it flexbox compresses this div below the `height` set here once
+            // the rail's content outgrows the pane. Every hour label and block
+            // inside is absolutely positioned off that height, so they keep
+            // their offsets while the box shrinks and spill over the sections
+            // below. Holding the height makes the rail scroll instead, which
+            // is what its `overflow-y-auto` is for.
             div {
-                class: "relative rounded border border-faint bg-app",
+                class: "relative shrink-0 rounded border border-faint bg-app",
                 style: "height: {timeline_height}px;",
                 onclick: move |evt| {
                     let y = evt.data.element_coordinates().y;
