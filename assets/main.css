@@ -305,3 +305,49 @@ body {
         animation: none;
     }
 }
+
+/* Stop-control mascot (src/components/chat_input.rs): the tiger "prowls"
+ * with a slow sway + breathe while a turn streams, then does a one-shot
+ * "pounce" when Stop is clicked. Both are transforms only (no layout cost)
+ * and share a fixed transform-origin so the sway reads as weight shifting
+ * on all fours rather than the icon spinning in place. */
+@keyframes tiger-prowl-anim {
+    0%, 100% {
+        transform: rotate(-4deg) scale(1);
+    }
+    50% {
+        transform: rotate(4deg) scale(1.06);
+    }
+}
+.tiger-prowl {
+    display: inline-flex;
+    transform-origin: 50% 85%;
+    animation: tiger-prowl-anim 2.4s ease-in-out infinite;
+}
+
+@keyframes tiger-pounce-anim {
+    0% {
+        transform: scale(1);
+    }
+    35% {
+        transform: scale(0.78, 1.18) translateY(2px);
+    }
+    65% {
+        transform: scale(1.12, 0.9) translateY(-1px);
+    }
+    100% {
+        transform: scale(1);
+    }
+}
+.tiger-pounce {
+    display: inline-flex;
+    transform-origin: 50% 85%;
+    animation: tiger-pounce-anim 320ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .tiger-prowl,
+    .tiger-pounce {
+        animation: none;
+    }
+}

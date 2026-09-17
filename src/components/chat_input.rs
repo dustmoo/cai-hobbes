@@ -170,6 +170,10 @@ pub fn ChatInput(
     let mut show_model_selector = use_signal(|| false);
     let mut show_provider_selector = use_signal(|| false);
     let mut show_new_chat_menu = use_signal(|| false);
+    // Brief one-shot "pounce" on the mascot when Stop is clicked, distinct
+    // from the continuous prowl animation it runs while streaming (see the
+    // stop control below). Timer-reset, same pattern as `cost_animating`.
+    let mut stop_pouncing = use_signal(|| false);
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
     let focus_context = use_context::<Signal<FocusContext>>();
     let mut textarea_mounted =
@@ -1992,14 +1996,34 @@ pub fn ChatInput(
                             },
                             "Queue"
                         }
-                        button {
-                            class: "w-8 h-8 shrink-0 flex items-center justify-center bg-red-600 rounded-full text-fg hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-opacity-50 transition-colors",
-                            title: "Stop",
-                            onclick: move |_| on_cancel.call(()),
-                            Icon {
-                                width: 14,
-                                height: 14,
-                                icon: fi_icons::FiSquare
+                        div {
+                            class: "flex items-center gap-1 shrink-0",
+                            // The mascot "prowls" (a slow sway + breathe) the
+                            // whole time a turn is in flight, then "pounces"
+                            // once on click — the stop affordance itself
+                            // stays the plain red text beside it so the
+                            // control reads unambiguously as Stop regardless
+                            // of what the tiger is doing.
+                            div {
+                                class: if *stop_pouncing.read() { "tiger-pounce" } else { "tiger-prowl" },
+                                Icon {
+                                    width: 20,
+                                    height: 20,
+                                    icon: crate::components::pixel_icons::HobbesTiger
+                                }
+                            }
+                            button {
+                                class: "h-8 px-1.5 shrink-0 text-[13px] font-semibold text-red-500 hover:text-red-400 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-opacity-50 rounded transition-colors",
+                                title: "Stop",
+                                onclick: move |_| {
+                                    stop_pouncing.set(true);
+                                    on_cancel.call(());
+                                    spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(320)).await;
+                                        stop_pouncing.set(false);
+                                    });
+                                },
+                                "Stop"
                             }
                         }
                     }
