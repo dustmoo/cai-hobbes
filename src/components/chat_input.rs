@@ -170,9 +170,9 @@ pub fn ChatInput(
     let mut show_model_selector = use_signal(|| false);
     let mut show_provider_selector = use_signal(|| false);
     let mut show_new_chat_menu = use_signal(|| false);
-    // Brief one-shot "pounce" on the mascot when Stop is clicked, distinct
-    // from the continuous prowl animation it runs while streaming (see the
-    // stop control below). Timer-reset, same pattern as `cost_animating`.
+    // Brief one-shot "pounce" on the mascot when Stop is clicked, overriding
+    // its idle sprite loop (see `TigerStopMascot` below). Timer-reset, same
+    // pattern as `cost_animating`.
     let mut stop_pouncing = use_signal(|| false);
     let scheduler = use_context::<Coroutine<SchedulerSignal>>();
     let focus_context = use_context::<Signal<FocusContext>>();
@@ -1998,20 +1998,13 @@ pub fn ChatInput(
                         }
                         div {
                             class: "flex items-center gap-1 shrink-0",
-                            // The mascot "prowls" (a slow sway + breathe) the
-                            // whole time a turn is in flight, then "pounces"
-                            // once on click — the stop affordance itself
-                            // stays the plain red text beside it so the
-                            // control reads unambiguously as Stop regardless
-                            // of what the tiger is doing.
-                            div {
-                                class: if *stop_pouncing.read() { "tiger-pounce" } else { "tiger-prowl" },
-                                Icon {
-                                    width: 20,
-                                    height: 20,
-                                    icon: crate::components::pixel_icons::HobbesTiger
-                                }
-                            }
+                            // The mascot is alive here — a small idle sprite
+                            // loop (blink, ear-perk) the whole time a turn is
+                            // in flight, pouncing once on click — while the
+                            // clickable affordance stays the plain red text
+                            // beside it so Stop reads unambiguously
+                            // regardless of what the tiger is doing.
+                            TigerStopMascot { pouncing: stop_pouncing }
                             button {
                                 class: "h-8 px-1.5 shrink-0 text-[13px] font-semibold text-red-500 hover:text-red-400 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-opacity-50 rounded transition-colors",
                                 title: "Stop",
@@ -2028,6 +2021,69 @@ pub fn ChatInput(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The mascot beside the stop control (see `ChatInput` above). Idles
+/// through a small sprite loop — blink, ear-perk — while a turn is
+/// streaming, as real frame swaps between [`TIGER_GRID`]-family grids
+/// (`crate::components::pixel_icons`) rather than a transform on one fixed
+/// icon; `pouncing` (set briefly by the Stop button's click handler)
+/// overrides the loop with a one-shot squash-and-settle reaction.
+///
+/// Mounted only for the lifetime of an in-flight turn (the caller only
+/// renders it while `is_sending` is true), so the idle loop below starts and
+/// stops for free with the component's own mount/unmount — no manual
+/// `is_sending` check needed inside it.
+#[component]
+fn TigerStopMascot(pouncing: Signal<bool>) -> Element {
+    use crate::components::pixel_icons::{HobbesTigerFrame, TIGER_GRID, TIGER_GRID_BLINK, TIGER_GRID_EARS_UP};
+
+    #[derive(Copy, Clone, PartialEq)]
+    enum Frame {
+        Idle,
+        Blink,
+        EarsUp,
+    }
+    impl Frame {
+        fn grid(self) -> &'static [&'static str; 16] {
+            match self {
+                Frame::Idle => &TIGER_GRID,
+                Frame::Blink => &TIGER_GRID_BLINK,
+                Frame::EarsUp => &TIGER_GRID_EARS_UP,
+            }
+        }
+    }
+
+    let mut frame = use_signal(|| Frame::Idle);
+
+    use_effect(move || {
+        spawn(async move {
+            // An irregular idle beat (blink sooner, ear-perk further out, a
+            // held return to Idle in between) reads as attentive rather than
+            // a metronome — real mascots don't blink on a fixed tempo.
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1700)).await;
+                frame.set(Frame::Blink);
+                tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+                frame.set(Frame::Idle);
+                tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+                frame.set(Frame::EarsUp);
+                tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+                frame.set(Frame::Idle);
+            }
+        });
+    });
+
+    rsx! {
+        div {
+            class: if *pouncing.read() { "tiger-pounce" } else { "tiger-idle" },
+            Icon {
+                width: 20,
+                height: 20,
+                icon: HobbesTigerFrame(if *pouncing.read() { &TIGER_GRID_EARS_UP } else { frame.read().grid() })
             }
         }
     }

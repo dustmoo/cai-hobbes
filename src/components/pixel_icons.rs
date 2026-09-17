@@ -102,14 +102,68 @@ impl TigerCell {
     }
 }
 
-/// Walk [`TIGER_GRID`] as `(x, y, cell)`, skipping empty cells.
-fn tiger_cells() -> impl Iterator<Item = (usize, usize, TigerCell)> {
-    TIGER_GRID.iter().enumerate().flat_map(|(y, row)| {
+/// Eyes closed: the stop-control mascot's blink frame (see
+/// [`crate::components::chat_input`]'s animated tiger). Differs from
+/// [`TIGER_GRID`] only in the two eye rows — lids down (`o`, fur) over a
+/// thin closed line (`s`) — everything else, including the array's shape,
+/// stays byte-identical so a diff against `TIGER_GRID` shows exactly the
+/// change that matters.
+pub const TIGER_GRID_BLINK: [&str; 16] = [
+    "................",
+    "..oo........oo..",
+    ".osoo......ooso.",
+    ".oooooooooooooo.",
+    ".ossoooooooosso.",
+    ".oooooooooooooo.",
+    ".ooossoooossooo.",
+    ".ossoccssccosso.",
+    ".ooocccsscccooo.",
+    ".ossccsccsccsso.",
+    "...ooccccccoo...",
+    "................",
+    "...bb..bb..bb...",
+    "...bbbbbbbbbb...",
+    "...bb..bb..bb...",
+    "................",
+];
+
+/// Ears perked: the stop-control mascot's alert frame. Adds a stripe accent
+/// flanking each ear tip (row 1) — everything else matches [`TIGER_GRID`].
+pub const TIGER_GRID_EARS_UP: [&str; 16] = [
+    "................",
+    ".soo........oos.",
+    ".osoo......ooso.",
+    ".oooooooooooooo.",
+    ".ossoooooooosso.",
+    ".oooeeooooeeooo.",
+    ".oooeeooooeeooo.",
+    ".ossoccssccosso.",
+    ".ooocccsscccooo.",
+    ".ossccsccsccsso.",
+    "...ooccccccoo...",
+    "................",
+    "...bb..bb..bb...",
+    "...bbbbbbbbbb...",
+    "...bb..bb..bb...",
+    "................",
+];
+
+/// Walk a 16×16 grid as `(x, y, cell)`, skipping empty cells. Generic over
+/// the grid so [`HobbesTiger`]/[`HobbesTigerStencil`] (fixed to
+/// [`TIGER_GRID`]) and [`HobbesTigerFrame`] (any grid, for the animated
+/// mascot) share one walk instead of duplicating it per frame.
+fn cells_of(grid: &'static [&'static str; 16]) -> impl Iterator<Item = (usize, usize, TigerCell)> {
+    grid.iter().enumerate().flat_map(|(y, row)| {
         row.chars()
             .enumerate()
             .map(move |(x, c)| (x, y, TigerCell::from_char(c)))
             .filter(|(_, _, cell)| *cell != TigerCell::Empty)
     })
+}
+
+/// [`TIGER_GRID`] walked as `(x, y, cell)`, skipping empty cells.
+fn tiger_cells() -> impl Iterator<Item = (usize, usize, TigerCell)> {
+    cells_of(&TIGER_GRID)
 }
 
 /// The colour mascot: every non-empty cell as a 1×1 rect carrying its own
@@ -179,6 +233,39 @@ impl IconShape for HobbesTigerStencil {
     }
 }
 
+/// The colour mascot rendered from an arbitrary grid — the same drawing as
+/// [`HobbesTiger`], generalised so the stop-control mascot can cycle between
+/// [`TIGER_GRID`], [`TIGER_GRID_BLINK`] and [`TIGER_GRID_EARS_UP`] as real
+/// sprite-frame swaps rather than a CSS transform on one fixed icon.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct HobbesTigerFrame(pub &'static [&'static str; 16]);
+
+impl IconShape for HobbesTigerFrame {
+    fn view_box(&self) -> &str {
+        "0 0 16 16"
+    }
+    fn xmlns(&self) -> &str {
+        "http://www.w3.org/2000/svg"
+    }
+    fn fill_and_stroke<'a>(&self, user_color: &'a str) -> (&'a str, &'a str, &'a str) {
+        (user_color, "none", "0")
+    }
+    fn child_elements(&self) -> Element {
+        rsx! {
+            for (x, y, cell) in cells_of(self.0) {
+                rect {
+                    key: "{x}-{y}",
+                    x: "{x}",
+                    y: "{y}",
+                    width: "1",
+                    height: "1",
+                    fill: "{cell.hex().unwrap_or(\"none\")}",
+                }
+            }
+        }
+    }
+}
+
 /// Cells of air on each side of the 16×16 grid inside the raster canvas.
 const TIGER_MARGIN_CELLS: u32 = 1;
 /// Canvas edge in cells: the 16×16 mark plus one cell of air per side, so the
@@ -240,6 +327,16 @@ mod tests {
         assert_eq!(TIGER_GRID.len(), 16);
         for row in TIGER_GRID {
             assert_eq!(row.chars().count(), 16, "row {row:?}");
+        }
+    }
+
+    #[test]
+    fn frame_grids_are_16x16() {
+        for grid in [&TIGER_GRID, &TIGER_GRID_BLINK, &TIGER_GRID_EARS_UP] {
+            assert_eq!(grid.len(), 16);
+            for row in grid {
+                assert_eq!(row.chars().count(), 16, "row {row:?}");
+            }
         }
     }
 
