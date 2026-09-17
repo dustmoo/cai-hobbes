@@ -15,6 +15,10 @@ use crate::session::Session;
 use crate::settings::Settings;
 
 
+/// Stands in for the user's silence when a continuation would otherwise leave
+/// the request ending on an assistant turn. See `ensure_ends_with_user_turn`.
+const CONTINUATION_NUDGE: &str = "[Continue. The user has not replied yet.]";
+
 /// Builds a structured `LlmPrompt` object for the LLM.
 pub struct PromptBuilder<'a> {
     pub(crate) session: &'a Session,
@@ -103,6 +107,11 @@ impl<'a> PromptBuilder<'a> {
             });
         }
 
+        // 3b. A request asking for a new completion must not end on an
+        // assistant turn. Appending here (at the tail) keeps every
+        // `tool_result_positions` index from Pass 1 valid.
+        Self::ensure_ends_with_user_turn(&mut linearised.messages);
+
         // Phase 3: Apply Pass 2 budget & pagination
         self.apply_pass2_budget(
             &mut linearised.messages,
@@ -134,6 +143,42 @@ impl<'a> PromptBuilder<'a> {
                 tools: ctx.tools,
             },
             pages_to_store: linearised.pages_to_store,
+        }
+    }
+
+    /// Guarantee the outgoing message list never ends on an assistant turn.
+    ///
+    /// Claude refuses such a request outright on models without prefill
+    /// support — "This model does not support assistant message prefill. The
+    /// conversation must end with a user message" — and every other provider
+    /// needs a user turn to answer as well.
+    ///
+    /// This used to hold by accident. A turn's last stored message was its
+    /// tool call, and a tool call always linearises into an assistant
+    /// `tool_use` *plus* its `tool_result`, which rides on a user turn. Once a
+    /// finished reply started being ordered after the tool calls it follows
+    /// (so the transcript reads thinking → commands → answer), the assistant's
+    /// own prose became the last message of the turn and the invariant broke:
+    /// a continuation — which carries no new user text — then built a request
+    /// ending on that prose.
+    ///
+    /// A continuation has nothing from the conversation left to append, so the
+    /// nudge below stands in for the user's silence. It exists only in the
+    /// outgoing request: it is never stored on the session, journaled, or
+    /// shown in the transcript. The system prompt already carries the fuller
+    /// instruction for this case (see `build_system_context`'s
+    /// TOOL COMPLETION / CONTINUATION instructions), so this stays terse.
+    fn ensure_ends_with_user_turn(messages: &mut Vec<ChatMessage>) {
+        if messages
+            .last()
+            .is_some_and(|m| m.role == ChatRole::Assistant)
+        {
+            messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: vec![ContentBlock::Text {
+                    text: CONTINUATION_NUDGE.to_string(),
+                }],
+            });
         }
     }
 

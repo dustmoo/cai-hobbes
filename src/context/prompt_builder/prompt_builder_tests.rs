@@ -953,3 +953,92 @@ fn test_signature_for_provider_none_signature_stays_none() {
         None
     );
 }
+
+/// A Hobbes-authored prose message, the shape a finished reply takes once the
+/// turn-ordering pass moves it after the tool calls it follows.
+fn assistant_text_msg(text: &str) -> Message {
+    Message {
+        id: uuid::Uuid::new_v4(),
+        author: "Hobbes".to_string(),
+        content: MessageContent::Text {
+            content: text.to_string(),
+            thought_signature: None,
+            thought_summary: None,
+            signature_provider: None,
+        },
+        attachments: vec![],
+        comments: vec![],
+        created_at: Utc::now(),
+        usage: None,
+    }
+}
+
+/// Regression: a continuation whose turn ends on the assistant's own prose —
+/// the order a turn takes once its reply is moved past its tool calls — must
+/// not build a request that ends on an assistant turn. Claude rejects that
+/// with "This model does not support assistant message prefill".
+#[test]
+fn continuation_after_a_reply_still_ends_on_a_user_turn() {
+    let mut session = create_test_session();
+    session.messages = vec![
+        user_text_msg("plan my day"),
+        tool_call_msg("HOBBES_TERMINAL_EXEC", "ok".to_string(), None),
+        assistant_text_msg("Let me look at how your skills are structured."),
+    ];
+
+    let settings = Settings::default();
+    // Empty user message = the continuation path.
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+
+    let last = prompt.prompt.messages.last().expect("messages built");
+    assert_eq!(
+        last.role,
+        ChatRole::User,
+        "a continuation must not leave the request ending on an assistant turn"
+    );
+    assert!(
+        matches!(&last.content[0], ContentBlock::Text { text } if text.contains("Continue")),
+        "the trailing turn is the continuation nudge"
+    );
+}
+
+/// The nudge is only for the broken shape: a turn that ends on its tool call
+/// already supplies a user turn (the tool result), and must be left alone.
+#[test]
+fn continuation_after_a_tool_call_needs_no_nudge() {
+    let mut session = create_test_session();
+    session.messages = vec![
+        user_text_msg("plan my day"),
+        tool_call_msg("HOBBES_TERMINAL_EXEC", "ok".to_string(), None),
+    ];
+
+    let settings = Settings::default();
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+
+    let last = prompt.prompt.messages.last().expect("messages built");
+    assert_eq!(last.role, ChatRole::Tool, "the tool result is the last turn");
+    assert!(
+        !prompt.prompt.messages.iter().any(|m| m
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("Continue.")))),
+        "no nudge is appended when the turn already ends on a user-role turn"
+    );
+}
+
+/// A live send carries its own user message, so nothing is appended.
+#[test]
+fn a_live_send_ends_on_the_users_own_message() {
+    let mut session = create_test_session();
+    session.messages = vec![assistant_text_msg("Anything else?")];
+
+    let settings = Settings::default();
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt("next thing".to_string());
+
+    let last = prompt.prompt.messages.last().expect("messages built");
+    assert_eq!(last.role, ChatRole::User);
+    assert!(
+        matches!(&last.content[0], ContentBlock::Text { text } if text == "next thing"),
+        "the user's own message is the final turn, not a nudge"
+    );
+}
