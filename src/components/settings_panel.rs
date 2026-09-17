@@ -4508,6 +4508,24 @@ pub fn SettingsPanel() -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Next Tab" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.next_tab.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.next_tab = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Previous Tab" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.prev_tab.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.prev_tab = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
                                         label { class: "text-sm text-fg-muted", "Open Profile Selector" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_profile.clone(),

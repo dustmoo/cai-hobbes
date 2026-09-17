@@ -124,6 +124,92 @@ fn drain_pending_tab_reopens() -> Vec<String> {
         .collect()
 }
 
+/// One entry in the visible tab strip, in `tab_bar.rs`'s left-to-right render
+/// order: open chat tabs (by index into `open_tabs`), then Planner, then
+/// Fleet — the latter two only present when their `_tab_open` flag is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StripItem {
+    Chat(usize),
+    Planner,
+    Fleet,
+}
+
+/// Builds the ordered strip for `NextTab`/`PrevTab` cycling. Pure so it's
+/// testable without Dioxus context; mirrors `TabBar`'s render order (chat
+/// tabs loop, then the `planner_tab_open` block, then `fleet_tab_open`).
+fn build_tab_strip(open_tabs_len: usize, planner_tab_open: bool, fleet_tab_open: bool) -> Vec<StripItem> {
+    let mut strip: Vec<StripItem> = (0..open_tabs_len).map(StripItem::Chat).collect();
+    if planner_tab_open {
+        strip.push(StripItem::Planner);
+    }
+    if fleet_tab_open {
+        strip.push(StripItem::Fleet);
+    }
+    strip
+}
+
+/// Next/previous index into a slice of length `len`, wrapping at both ends.
+/// Callers must guard `len == 0` themselves (undefined here).
+fn cycle_index(current: usize, len: usize, forward: bool) -> usize {
+    if forward {
+        (current + 1) % len
+    } else {
+        (current + len - 1) % len
+    }
+}
+
+#[cfg(test)]
+mod tab_cycle_tests {
+    use super::*;
+
+    #[test]
+    fn cycle_index_wraps_forward() {
+        assert_eq!(cycle_index(0, 3, true), 1);
+        assert_eq!(cycle_index(2, 3, true), 0);
+    }
+
+    #[test]
+    fn cycle_index_wraps_backward() {
+        assert_eq!(cycle_index(0, 3, false), 2);
+        assert_eq!(cycle_index(1, 3, false), 0);
+    }
+
+    #[test]
+    fn cycle_index_single_item_is_noop_position() {
+        // Callers guard len<=1 before calling, but the arithmetic itself
+        // still holds for len==1 (stays at 0).
+        assert_eq!(cycle_index(0, 1, true), 0);
+        assert_eq!(cycle_index(0, 1, false), 0);
+    }
+
+    #[test]
+    fn build_tab_strip_orders_chat_then_planner_then_fleet() {
+        let strip = build_tab_strip(2, true, true);
+        assert_eq!(
+            strip,
+            vec![
+                StripItem::Chat(0),
+                StripItem::Chat(1),
+                StripItem::Planner,
+                StripItem::Fleet,
+            ]
+        );
+    }
+
+    #[test]
+    fn build_tab_strip_omits_closed_tabs() {
+        assert_eq!(build_tab_strip(1, false, false), vec![StripItem::Chat(0)]);
+        assert_eq!(build_tab_strip(0, true, false), vec![StripItem::Planner]);
+        assert_eq!(build_tab_strip(0, false, true), vec![StripItem::Fleet]);
+    }
+
+    #[test]
+    fn build_tab_strip_len_le_1_is_the_noop_case() {
+        assert!(build_tab_strip(1, false, false).len() <= 1);
+        assert!(build_tab_strip(0, false, false).len() <= 1);
+    }
+}
+
 /// Show a timer toast and auto-clear it after a few seconds (unless a newer
 /// toast replaced it in the meantime). Avoids the reminder lingering forever.
 fn flash_timer_toast(msg: String) {
@@ -1792,6 +1878,43 @@ fn app() -> Element {
         }
     };
 
+    // Next/Prev Tab cycling: builds the visible tab strip in tab_bar.rs's
+    // left-to-right render order (chat tabs, then Planner, then Fleet),
+    // finds where we currently are in it, and moves with wraparound. Landing
+    // on a chat item reuses `switch_tab_fn` rather than only poking
+    // `active_tab_index`, so it gets whatever else that path does.
+    let mut cycle_tab_fn = move |forward: bool| {
+        let strip = build_tab_strip(
+            open_tabs.peek().len(),
+            *planner_tab_open.peek(),
+            *fleet_tab_open.peek(),
+        );
+        if strip.len() <= 1 {
+            return;
+        }
+        let current = if *planner_active.peek() {
+            strip.iter().position(|i| *i == StripItem::Planner)
+        } else if *fleet_active.peek() {
+            strip.iter().position(|i| *i == StripItem::Fleet)
+        } else {
+            let idx = *active_tab_index.peek();
+            strip.iter().position(|i| *i == StripItem::Chat(idx))
+        }
+        .unwrap_or(0);
+        let next = cycle_index(current, strip.len(), forward);
+        match strip[next] {
+            StripItem::Chat(idx) => switch_tab_fn(idx),
+            StripItem::Planner => {
+                planner_active.set(true);
+                fleet_active.set(false);
+            }
+            StripItem::Fleet => {
+                fleet_active.set(true);
+                planner_active.set(false);
+            }
+        }
+    };
+
     let mut delete_session_fn = move |id_to_delete: String| {
         // A stream still writing to this session would otherwise keep
         // burning tokens/API calls for output that's about to be discarded
@@ -2606,6 +2729,12 @@ fn app() -> Element {
                     if *fleet_active.peek() {
                         planner_active.set(false);
                     }
+                }
+                ChatCommand::NextTab => {
+                    cycle_tab_fn(true);
+                }
+                ChatCommand::PrevTab => {
+                    cycle_tab_fn(false);
                 }
                 ChatCommand::DeleteSession(target_id) => {
                     if !target_id.is_empty() {

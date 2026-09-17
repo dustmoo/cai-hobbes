@@ -117,6 +117,13 @@ pub struct HotkeySettings {
     pub switch_tab_8: String,
     #[serde(default = "default_switch_tab_9")]
     pub switch_tab_9: String,
+    /// Cycle to the next tab in the visible strip (chat tabs, then Planner,
+    /// then Fleet — see `tab_bar.rs`'s render order), wrapping at the end.
+    #[serde(default = "default_next_tab")]
+    pub next_tab: String,
+    /// Cycle to the previous tab in the visible strip, wrapping at the start.
+    #[serde(default = "default_prev_tab")]
+    pub prev_tab: String,
 }
 
 impl Default for HotkeySettings {
@@ -146,6 +153,8 @@ impl Default for HotkeySettings {
             switch_tab_7: default_switch_tab_7(),
             switch_tab_8: default_switch_tab_8(),
             switch_tab_9: default_switch_tab_9(),
+            next_tab: default_next_tab(),
+            prev_tab: default_prev_tab(),
         }
     }
 }
@@ -222,6 +231,16 @@ default_switch_tab! {
     7 => default_switch_tab_7,
     8 => default_switch_tab_8,
     9 => default_switch_tab_9,
+}
+
+// Matches VS Code / browser-devtools tab-cycling convention, and this app's
+// existing Shift-prefixed tab-strip shortcuts (toggle_planner is Shift+T,
+// toggle_fleet is Shift+F).
+fn default_next_tab() -> String {
+    "CmdOrCtrl+Shift+]".to_string()
+}
+fn default_prev_tab() -> String {
+    "CmdOrCtrl+Shift+[".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

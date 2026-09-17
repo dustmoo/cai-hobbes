@@ -74,6 +74,11 @@ pub enum ChatCommand {
     /// Toggle the provider selector dropdown in the chat bar.
     ToggleProviderSelector,
     CloseTab,
+    /// Cycle to the next tab in the visible strip (chat tabs, then Planner,
+    /// then Fleet), wrapping at the end.
+    NextTab,
+    /// Cycle to the previous tab in the visible strip, wrapping at the start.
+    PrevTab,
 }
 
 /// Distinguishes which autocomplete context is active in the chat input.
@@ -320,7 +325,9 @@ pub fn ChatInput(
                 | ChatCommand::SwitchProfile(_)
                 | ChatCommand::SwitchModel(_)
                 | ChatCommand::SwitchConnector(_)
-                | ChatCommand::CloseTab => {
+                | ChatCommand::CloseTab
+                | ChatCommand::NextTab
+                | ChatCommand::PrevTab => {
                     // Handled globally in main.rs
                 }
                 ChatCommand::NewChatWithMemory => {

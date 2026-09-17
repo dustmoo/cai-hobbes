@@ -119,6 +119,8 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 }
                 "cancel_generation" => chat_command.set(Some(ChatCommand::CancelGeneration)),
                 "close_tab" => chat_command.set(Some(ChatCommand::CloseTab)),
+                "next_tab" => chat_command.set(Some(ChatCommand::NextTab)),
+                "prev_tab" => chat_command.set(Some(ChatCommand::PrevTab)),
                 // Profile switching (session-local)
                 s if s.starts_with("switch_profile_") => {
                     if let Ok(idx) = s.replace("switch_profile_", "").parse::<usize>() {
@@ -206,6 +208,12 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                             if (lastPart === '.') return e.key === '.';
                             if (lastPart === 'space') return e.code === 'Space';
                             if (lastPart === 'arrowdown') return e.key === 'ArrowDown' || e.code === 'ArrowDown';
+                            // Bracket keys: match by physical code, not e.key. On a US
+                            // layout Shift+[ types as e.key curly-brace (not the bracket
+                            // itself), so a Shift binding like CmdOrCtrl+Shift+[ would
+                            // never match on e.key.
+                            if (lastPart === '[') return e.code === 'BracketLeft';
+                            if (lastPart === ']') return e.code === 'BracketRight';
                             
                             // Standard check for character keys
                             if (e.key.toLowerCase() === lastPart) return true;
@@ -230,7 +238,9 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                         else if (check(config.toggle_focus_chat, event)) action = "focus_chat";
                         else if (check(config.toggle_scroll_to_bottom, event)) action = "scroll_bottom";
                         else if (check(config.cancel_generation, event)) action = "cancel_generation";
-                        
+                        else if (check(config.next_tab, event)) action = "next_tab";
+                        else if (check(config.prev_tab, event)) action = "prev_tab";
+
                         // Delete Session (Cmd+Backspace or Cmd+Delete) — only when NOT focused on an input.
                         // When focused, Cmd+Backspace is macOS "delete to beginning of line" and must pass through.
                         else if (!isInput && (event.metaKey || event.ctrlKey) && (event.key === 'Backspace' || event.key === 'Delete')) {{
@@ -554,6 +564,15 @@ mod tests {
     #[test]
     fn test_display_combo_mac_comma() {
         assert_eq!(display_combo_internal("CmdOrCtrl+,", true), "⌘,");
+    }
+
+    #[test]
+    fn test_display_combo_mac_bracket() {
+        // Bracket keys fall through display_key_symbol's generic single-char
+        // branch (like comma/period already do) and render as the literal
+        // bracket, not a placeholder.
+        assert_eq!(display_combo_internal("CmdOrCtrl+Shift+[", true), "⇧⌘[");
+        assert_eq!(display_combo_internal("CmdOrCtrl+Shift+]", true), "⇧⌘]");
     }
 
     #[test]
