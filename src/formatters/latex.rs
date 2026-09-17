@@ -59,12 +59,22 @@ const MACROS: &[(&str, &str)] = &[
     (r"\cdots", "\u{22EF}"),  // ⋯
 ];
 
-fn sorted_macros() -> Vec<(&'static str, &'static str)> {
-    let mut v: Vec<(&'static str, &'static str)> = MACROS.to_vec();
-    // Longest macro name first, so a shorter macro that happens to be a
-    // prefix of a longer one never wins the match.
-    v.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-    v
+/// Sorted once and cached: this runs per text run on every markdown
+/// re-render, and streaming re-renders the whole document on every chunk, so
+/// resorting the table from scratch on each call (as this used to) turned
+/// into thousands of redundant sorts on a long message — enough to peg the
+/// UI thread and stall painting while the stream kept running in the
+/// background.
+fn sorted_macros() -> &'static [(&'static str, &'static str)] {
+    static SORTED: std::sync::OnceLock<Vec<(&'static str, &'static str)>> =
+        std::sync::OnceLock::new();
+    SORTED.get_or_init(|| {
+        let mut v: Vec<(&'static str, &'static str)> = MACROS.to_vec();
+        // Longest macro name first, so a shorter macro that happens to be a
+        // prefix of a longer one never wins the match.
+        v.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        v
+    })
 }
 
 /// Tries to match a macro at the very start of `s`. Returns the byte length
@@ -165,7 +175,7 @@ pub fn render_latex_symbols(s: &str) -> String {
             if let Some(rel) = s[i + 1..].find('$') {
                 let close = i + 1 + rel;
                 let inner = &s[i + 1..close];
-                let (substituted, residual) = substitute_plain(inner, &macros);
+                let (substituted, residual) = substitute_plain(inner, macros);
                 if residual {
                     out.push_str(&s[i..=close]);
                 } else {
@@ -182,7 +192,7 @@ pub fn render_latex_symbols(s: &str) -> String {
             if let Some(rel) = s[i + 2..].find("\\)") {
                 let close = i + 2 + rel;
                 let inner = &s[i + 2..close];
-                let (substituted, residual) = substitute_plain(inner, &macros);
+                let (substituted, residual) = substitute_plain(inner, macros);
                 if residual {
                     out.push_str(&s[i..close + 2]);
                 } else {
@@ -201,7 +211,7 @@ pub fn render_latex_symbols(s: &str) -> String {
             continue;
         }
         if s.as_bytes()[i] == b'\\' {
-            if let Some((len, rep)) = match_macro_at(&s[i..], &macros) {
+            if let Some((len, rep)) = match_macro_at(&s[i..], macros) {
                 out.push_str(rep);
                 i += len;
                 continue;
