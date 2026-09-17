@@ -129,6 +129,14 @@ pub fn MermaidDiagram(code: String) -> Element {
         )
     });
     let mut view_mode = use_signal(|| ViewMode::Diagram);
+    // Gates rendering on the block having scrolled near the viewport (see
+    // the observer effect below). Without this, every diagram in the
+    // currently-loaded message window renders the instant its tab mounts —
+    // in DOM order, so a long history with several diagrams pops them in
+    // one after another regardless of which one the user can actually see,
+    // each swap reflowing everything below it. Most of that work is for
+    // diagrams the user isn't looking at.
+    let mut is_visible = use_signal(|| false);
     // Last successfully rendered SVG (kept across failed re-renders so a
     // mid-stream invalid chunk never blanks a previously good diagram).
     let mut last_good_svg = use_signal(|| Option::<String>::None);
@@ -145,13 +153,68 @@ pub fn MermaidDiagram(code: String) -> Element {
         code_signal.set(code.clone());
     }
 
-    // Re-render whenever `code_signal` changes.
+    // Watch for the block scrolling near the viewport, once, at mount. This
+    // effect reads no signal, so — per Dioxus 0.6 semantics (an effect only
+    // re-runs when a Signal read *inside its closure* changes value) — it
+    // runs exactly once per component instance, not on every re-render.
+    // `document::eval`'s channel is a genuine multi-message stream (backed
+    // by an unbounded receiver, not a single resolved Promise — confirmed
+    // against dioxus-document-0.6.3's `Eval::recv`/`poll_recv`), so the
+    // observer callback firing later, asynchronously, correctly delivers
+    // its one message to this `recv()` even though the eval's own script
+    // body returns immediately after registering the observer.
+    use_effect({
+        let id = unique_id.clone();
+        move || {
+            let id = id.clone();
+            spawn(async move {
+                let id_json = match serde_json::to_string(&id) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                // A generous rootMargin renders a diagram slightly before it
+                // scrolls into view, so it's already there by the time the
+                // user's eye reaches it rather than popping in mid-scroll.
+                let script = format!(
+                    r#"
+                    const el = document.getElementById({id});
+                    if (!el) {{
+                        dioxus.send({{}});
+                    }} else {{
+                        const io = new IntersectionObserver((entries) => {{
+                            if (entries.some((e) => e.isIntersecting)) {{
+                                io.disconnect();
+                                dioxus.send({{}});
+                            }}
+                        }}, {{ rootMargin: '600px 0px' }});
+                        io.observe(el);
+                    }}
+                    "#,
+                    id = id_json,
+                );
+                let mut eval = document::eval(&script);
+                let _ = eval.recv::<serde_json::Value>().await;
+                is_visible.set(true);
+            });
+        }
+    });
+
+    // Re-render whenever `code_signal` changes, or once the block becomes
+    // visible (a historical diagram's code is set once at mount and never
+    // changes again, so without also gating on `is_visible` here this
+    // effect would fire — and render — once at mount regardless of scroll
+    // position; reading `is_visible()` makes it re-run the moment the
+    // observer above resolves).
     use_effect({
         let id = unique_id.clone();
         move || {
             let code = code_signal();
+            let visible = is_visible();
             let id = id.clone();
             spawn(async move {
+                if !visible {
+                    return;
+                }
                 let trimmed = code.trim();
                 if trimmed.is_empty() {
                     return;
@@ -234,6 +297,12 @@ pub fn MermaidDiagram(code: String) -> Element {
 
     rsx! {
         div {
+            // The IntersectionObserver effect above targets this id from the
+            // moment the component mounts — it must exist before any
+            // rendering happens, not just once mermaid.render() hands back
+            // an SVG (which mermaid would id itself, on a *different*,
+            // not-yet-existing element).
+            id: "{unique_id}",
             class: "mermaid-block my-2",
             div {
                 class: "flex items-center gap-1.5 mb-1.5",
@@ -252,7 +321,12 @@ pub fn MermaidDiagram(code: String) -> Element {
                 CodeBlock { lang: "mermaid".to_string(), code: code.clone() }
             } else if has_svg {
                 div {
-                    class: "mermaid-svg-wrapper bg-section rounded-lg p-4 overflow-x-auto",
+                    // Plain opacity fade on first reveal: compositor-only, so
+                    // it costs no extra layout, and reads as an intentional
+                    // arrival rather than a jarring snap into place — the
+                    // actual height jump from the CodeBlock placeholder is a
+                    // one-time cost, but it no longer *looks* accidental.
+                    class: "mermaid-svg-wrapper bg-section rounded-lg p-4 overflow-x-auto mermaid-reveal",
                     dangerous_inner_html: "{last_good_svg.read().clone().unwrap_or_default()}"
                 }
                 if let Some(err) = &error {
