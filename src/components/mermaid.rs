@@ -128,6 +128,13 @@ pub fn MermaidDiagram(code: String) -> Element {
             uuid::Uuid::new_v4().to_string().replace('-', "")
         )
     });
+    // A *separate* id from `unique_id` for the wrapper div the visibility
+    // observer below targets. `unique_id` is also passed to
+    // `mermaid.render(id, code)` as the id mermaid assigns its own
+    // internally-generated SVG/container — giving our permanent wrapper the
+    // same id collided with that, silently breaking the render (mermaid
+    // treating the persistent element as its own scratch node it manages).
+    let observer_id = use_hook(|| format!("{unique_id}-anchor"));
     let mut view_mode = use_signal(|| ViewMode::Diagram);
     // Gates rendering on the block having scrolled near the viewport (see
     // the observer effect below). Without this, every diagram in the
@@ -164,7 +171,7 @@ pub fn MermaidDiagram(code: String) -> Element {
     // its one message to this `recv()` even though the eval's own script
     // body returns immediately after registering the observer.
     use_effect({
-        let id = unique_id.clone();
+        let id = observer_id.clone();
         move || {
             let id = id.clone();
             spawn(async move {
@@ -298,11 +305,11 @@ pub fn MermaidDiagram(code: String) -> Element {
     rsx! {
         div {
             // The IntersectionObserver effect above targets this id from the
-            // moment the component mounts — it must exist before any
-            // rendering happens, not just once mermaid.render() hands back
-            // an SVG (which mermaid would id itself, on a *different*,
-            // not-yet-existing element).
-            id: "{unique_id}",
+            // moment the component mounts. Deliberately `observer_id`, not
+            // `unique_id` — the latter is mermaid's own render id (see its
+            // doc comment); giving this permanent wrapper the same id
+            // collided with mermaid's internal use of it.
+            id: "{observer_id}",
             class: "mermaid-block my-2",
             div {
                 class: "flex items-center gap-1.5 mb-1.5",
