@@ -30,12 +30,18 @@ use crate::mcp::manager::McpContext;
 
 // ── Routing ──────────────────────────────────────────────────────────────────
 
-/// True if the model belongs to OpenAI's Responses-first family (gpt-5 / o-series).
-/// The Responses API works for *all* current OpenAI models, but only this family
-/// *requires* it (Chat Completions rejects them), so Auto routes the family here.
+/// True if the model belongs to OpenAI's Responses-first family (gpt-6 / gpt-5 /
+/// o-series). The Responses API works for *all* current OpenAI models, but only
+/// this family *requires* it (Chat Completions rejects them), so Auto routes the
+/// family here. `gpt-5.6-*` and `gpt-5.5-*` already match the `gpt-5` prefix;
+/// `gpt-6-astra` needs its own prefix since it doesn't start with `gpt-5`.
 pub fn is_responses_family(model: &str) -> bool {
     let m = model.trim();
-    m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+    m.starts_with("gpt-6")
+        || m.starts_with("gpt-5")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
 }
 
 fn endpoint_is_openai(endpoint: &str) -> bool {
@@ -899,6 +905,11 @@ mod tests {
         for m in [
             "gpt-5",
             "gpt-5-mini",
+            "gpt-5.5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
             "o1",
             "o1-pro",
             "o3",

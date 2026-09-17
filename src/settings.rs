@@ -847,10 +847,23 @@ pub fn get_default_model_icon(model_slug: &str) -> String {
     let slug = model_slug.to_lowercase();
     // Match specific variants first for visual distinction
 
+    // --- Claude family (checked first: no branch existed for it at all —
+    // every Claude model silently fell through to the generic "pro"/"flash"/
+    // 🤖 fallbacks below, which happened to look plausible enough that the
+    // gap went unnoticed) ---
+    if slug.contains("fable") {
+        "🎭".to_string()
+    } else if slug.contains("opus") {
+        "🧠".to_string()
+    } else if slug.contains("sonnet") {
+        "🎻".to_string()
+    } else if slug.contains("haiku") {
+        "🍃".to_string()
     // --- Gemini family ---
-    if slug.contains("experimental") {
+    } else if slug.contains("experimental") {
         "🧪".to_string()
-    } else if slug.contains("gemini-3.7")
+    } else if slug.contains("gemini-3.8")
+        || slug.contains("gemini-3.7")
         || slug.contains("gemini-3.6")
         || slug.contains("gemini-3.5")
     {
@@ -2332,6 +2345,20 @@ pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
 mod tests {
     use super::*;
 
+    /// Every Claude model slug used to fall through `get_default_model_icon`'s
+    /// generic fallbacks with no dedicated branch at all — silently plausible
+    /// (a Sonnet slug matching "pro" never occurs, so it landed on the bare
+    /// 🤖 default) rather than loudly broken, which is why it went unnoticed.
+    #[test]
+    fn claude_models_get_a_dedicated_icon_not_the_generic_fallback() {
+        assert_eq!(get_default_model_icon("claude-fable-5-1"), "🎭");
+        assert_eq!(get_default_model_icon("claude-opus-5"), "🧠");
+        assert_eq!(get_default_model_icon("claude-sonnet-5"), "🎻");
+        assert_eq!(get_default_model_icon("claude-haiku-4-5"), "🍃");
+        // The legacy 4.x ladder must resolve the same way.
+        assert_eq!(get_default_model_icon("claude-opus-4-8"), "🧠");
+    }
+
     #[test]
     fn remove_toolkit_config_drops_matching_slug_case_insensitively() {
         let mut profile = ComposioProfile::default();
@@ -2388,7 +2415,11 @@ mod tests {
         s.claude_config.model_slots = vec![]; // simulate a persisted empty vec
         s.seed_default_claude_slots_if_empty();
         assert_eq!(s.claude_config.model_slots.len(), 10);
-        assert_eq!(s.claude_config.model_slots[0], "claude-opus-4-8");
+        // Mirrors `ClaudeModel::DEFAULT_CHAT_SLUG` via
+        // `default_claude_model_slots()` — kept as a literal here (rather
+        // than importing the constant) precisely so a slug change is a
+        // visible, reviewed diff in this test, not a silent pass-through.
+        assert_eq!(s.claude_config.model_slots[0], "claude-opus-5");
     }
 
     #[test]

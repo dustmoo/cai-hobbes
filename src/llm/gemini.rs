@@ -155,6 +155,7 @@ pub struct UsageMetadata {
 /// Supported Gemini Models for Pricing
 #[derive(Debug, PartialEq, Clone)]
 pub enum GeminiModel {
+    Gemini3_8Flash,
     Gemini3_7Flash,
     Gemini3_6Flash,
     Gemini3_5Pro,
@@ -185,7 +186,10 @@ impl GeminiModel {
         let s = slug.strip_prefix("models/").unwrap_or(slug);
 
         match s {
-            // Gemini 3.7 Series - HIGHEST PRIORITY (GA 2026-08-13)
+            // Gemini 3.8 Series - HIGHEST PRIORITY (GA 2026-09-02)
+            _ if s.starts_with("gemini-3.8-flash") => GeminiModel::Gemini3_8Flash,
+
+            // Gemini 3.7 Series (GA 2026-08-13)
             _ if s.starts_with("gemini-3.7-flash") => GeminiModel::Gemini3_7Flash,
 
             // Gemini 3.6 Series (GA 2026-07-21)
@@ -259,7 +263,7 @@ impl GeminiModel {
             _ if s.contains("nano") => GeminiModel::NanoBanana,
             _ if s.contains("gemma") => GeminiModel::Gemma3,
             _ if s.contains("flash-lite") => GeminiModel::Gemini3_5FlashLite, // 3.5 is current lite gen
-            _ if s.contains("flash") => GeminiModel::Gemini3_7Flash,          // assume latest gen
+            _ if s.contains("flash") => GeminiModel::Gemini3_8Flash,          // assume latest gen
             // May 2026: default pro fallback to 3.5 Pro (upcoming June 2026)
             _ if s.contains("pro") => GeminiModel::Gemini3_5Pro,
 
@@ -272,18 +276,24 @@ impl GeminiModel {
 
     /// Per-1M-token (input, output) USD rates. Manually maintained and subject
     /// to drift — re-verify against ai.google.dev/gemini-api/docs/pricing
-    /// (see SYSTEM_PATTERNS P-013). Last verified: 2026-08-14.
+    /// (see SYSTEM_PATTERNS P-013). Last verified: 2026-09-17 — added Gemini
+    /// 3.8 Flash (GA 2026-09-02, same intro/standard tiering as 3.7/3.6
+    /// Flash); confirmed 3.7 Flash, 3.6 Flash, 3.1 Pro, and 3.1 Flash-Lite
+    /// pricing unchanged from prior verification.
     pub fn get_rates(&self, prompt_tokens: i32) -> (f64, f64) {
         self.get_rates_at(prompt_tokens, chrono::Utc::now().date_naive())
     }
 
-    /// Date-aware rate lookup: 3.7/3.6 Flash carry introductory pricing
+    /// Date-aware rate lookup: 3.8/3.7/3.6 Flash carry introductory pricing
     /// through 2026-12-31 that doubles on 2027-01-01.
     fn get_rates_at(&self, prompt_tokens: i32, today: chrono::NaiveDate) -> (f64, f64) {
         match self {
-            // Gemini 3.7 (GA 2026-08-13) & 3.6 (GA 2026-07-21) Flash:
-            // intro $0.75/$3.75 through 2026-12-31, then $1.50/$7.50
-            GeminiModel::Gemini3_7Flash | GeminiModel::Gemini3_6Flash => {
+            // Gemini 3.8 (GA 2026-09-02), 3.7 (GA 2026-08-13) & 3.6
+            // (GA 2026-07-21) Flash: intro $0.75/$3.75 through 2026-12-31,
+            // then $1.50/$7.50
+            GeminiModel::Gemini3_8Flash
+            | GeminiModel::Gemini3_7Flash
+            | GeminiModel::Gemini3_6Flash => {
                 let promo_end = chrono::NaiveDate::from_ymd_opt(2026, 12, 31).expect("valid date");
                 if today <= promo_end {
                     (0.75, 3.75)
@@ -863,7 +873,8 @@ impl GeminiModel {
             GeminiModel::Gemini3_5Pro
             | GeminiModel::Gemini3_1ProPreview
             | GeminiModel::Gemini3_0ProPreview => ThinkingConfigStyle::LevelPro,
-            GeminiModel::Gemini3_7Flash
+            GeminiModel::Gemini3_8Flash
+            | GeminiModel::Gemini3_7Flash
             | GeminiModel::Gemini3_6Flash
             | GeminiModel::Gemini3_5Flash
             | GeminiModel::Gemini3_5FlashLite
@@ -882,6 +893,7 @@ impl GeminiModel {
     /// Returns the official human-readable name for this model
     pub fn display_name(&self) -> String {
         match self {
+            GeminiModel::Gemini3_8Flash => "Gemini 3.8 Flash".to_string(),
             GeminiModel::Gemini3_7Flash => "Gemini 3.7 Flash".to_string(),
             GeminiModel::Gemini3_6Flash => "Gemini 3.6 Flash".to_string(),
             GeminiModel::Gemini3_5Pro => "Gemini 3.5 Pro".to_string(),
@@ -938,6 +950,7 @@ impl GeminiModel {
     /// This is the authoritative source for model identifiers sent to the API.
     pub fn canonical_slug(&self) -> &str {
         match self {
+            GeminiModel::Gemini3_8Flash => "gemini-3.8-flash",
             GeminiModel::Gemini3_7Flash => "gemini-3.7-flash",
             GeminiModel::Gemini3_6Flash => "gemini-3.6-flash",
             GeminiModel::Gemini3_5Pro => "gemini-3.5-pro",
@@ -966,8 +979,9 @@ impl GeminiModel {
     /// Source: https://ai.google.dev/gemini-api/docs/models
     pub fn context_window_tokens(&self) -> usize {
         match self {
-            // Gemini 3.5/3.6/3.7: 1M context
-            GeminiModel::Gemini3_7Flash
+            // Gemini 3.5/3.6/3.7/3.8: 1M context
+            GeminiModel::Gemini3_8Flash
+            | GeminiModel::Gemini3_7Flash
             | GeminiModel::Gemini3_6Flash
             | GeminiModel::Gemini3_5Pro
             | GeminiModel::Gemini3_5Flash
@@ -2529,7 +2543,11 @@ mod tests {
         let last_promo_day = chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
         let first_standard_day = chrono::NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
 
-        for model in [GeminiModel::Gemini3_7Flash, GeminiModel::Gemini3_6Flash] {
+        for model in [
+            GeminiModel::Gemini3_8Flash,
+            GeminiModel::Gemini3_7Flash,
+            GeminiModel::Gemini3_6Flash,
+        ] {
             assert_eq!(
                 model.get_rates_at(0, last_promo_day),
                 (0.75, 3.75),
@@ -2575,6 +2593,7 @@ mod tests {
 
     #[test]
     fn test_supports_thinking() {
+        assert!(GeminiModel::Gemini3_8Flash.supports_thinking());
         assert!(GeminiModel::Gemini3_5Pro.supports_thinking());
         assert!(GeminiModel::Gemini3_5Flash.supports_thinking());
         assert!(GeminiModel::Gemini3_1ProPreview.supports_thinking());
@@ -2712,9 +2731,110 @@ mod tests {
     }
 
     #[test]
+    fn test_from_slug_gemini_3_8_flash() {
+        // Exact slug, and prefixed variants, resolve to the new model —
+        // and are not swallowed by the shorter "gemini-3." prefix checks
+        // that run after it in from_slug's match arm.
+        assert_eq!(
+            GeminiModel::from_slug("gemini-3.8-flash"),
+            GeminiModel::Gemini3_8Flash
+        );
+        assert_eq!(
+            GeminiModel::from_slug("models/gemini-3.8-flash"),
+            GeminiModel::Gemini3_8Flash
+        );
+        assert_eq!(
+            GeminiModel::from_slug("gemini-3.8-flash-preview"),
+            GeminiModel::Gemini3_8Flash
+        );
+
+        // 3.7 Flash must still resolve correctly and not be shadowed by the
+        // new 3.8 arm (ordering discipline).
+        assert_eq!(
+            GeminiModel::from_slug("gemini-3.7-flash"),
+            GeminiModel::Gemini3_7Flash
+        );
+
+        let model = GeminiModel::Gemini3_8Flash;
+        assert_eq!(model.canonical_slug(), "gemini-3.8-flash");
+        assert_eq!(model.display_name(), "Gemini 3.8 Flash");
+        assert_eq!(model.context_window_tokens(), 1_000_000);
+        assert!(model.supports_thinking());
+        assert_eq!(
+            model.thinking_config_style(),
+            ThinkingConfigStyle::LevelFlash
+        );
+        assert_eq!(
+            model.valid_thinking_levels(),
+            &["minimal", "low", "medium", "high"]
+        );
+
+        // Unrecognized "flash" slugs now fall back to the newest generation.
+        assert_eq!(
+            GeminiModel::from_slug("some-new-flash-model"),
+            GeminiModel::Gemini3_8Flash
+        );
+    }
+
+    #[test]
+    fn test_gemini_3_8_flash_pricing() {
+        // Introductory pricing matches 3.7/3.6 Flash: $0.75/$3.75 through
+        // 2026-12-31, then $1.50/$7.50 from 2027-01-01.
+        let last_promo_day = chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        let first_standard_day = chrono::NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+
+        assert_eq!(
+            GeminiModel::Gemini3_8Flash.get_rates_at(0, last_promo_day),
+            (0.75, 3.75)
+        );
+        assert_eq!(
+            GeminiModel::Gemini3_8Flash.get_rates_at(0, first_standard_day),
+            (1.50, 7.50)
+        );
+
+        let usage = UsageMetadata {
+            prompt_token_count: 1_000_000,
+            candidates_token_count: Some(0),
+            total_token_count: 1_000_000,
+            thoughts_token_count: None,
+            cached_content_token_count: None,
+        };
+        let cost = calculate_cost("gemini-3.8-flash", &usage);
+        let (expected_in, _) = GeminiModel::Gemini3_8Flash.get_rates(0);
+        assert!(
+            (cost - expected_in).abs() < 1e-6,
+            "Gemini 3.8 Flash Input: Expected ${}, got {}",
+            expected_in,
+            cost
+        );
+    }
+
+    #[test]
+    fn test_gemini_3_1_pro_context_length_tiering() {
+        // Gemini 3.1 Pro: $2.00/$12.00 <= 200K tokens, $4.00/$18.00 above.
+        assert_eq!(
+            GeminiModel::Gemini3_1ProPreview.get_rates(200_000),
+            (2.00, 12.00)
+        );
+        assert_eq!(
+            GeminiModel::Gemini3_1ProPreview.get_rates(200_001),
+            (4.00, 18.00)
+        );
+    }
+
+    #[test]
+    fn test_gemini_3_1_flash_lite_pricing() {
+        assert_eq!(
+            GeminiModel::Gemini3_1FlashLitePreview.get_rates(0),
+            (0.25, 1.50)
+        );
+    }
+
+    #[test]
     fn test_canonical_slug_round_trip() {
         // Ensure canonical slugs resolve back to the correct model
         let models = [
+            GeminiModel::Gemini3_8Flash,
             GeminiModel::Gemini3_7Flash,
             GeminiModel::Gemini3_6Flash,
             GeminiModel::Gemini3_5Pro,

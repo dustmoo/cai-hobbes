@@ -91,13 +91,17 @@ fn default_empty_model_slots() -> Vec<String> {
     vec!["".to_string(); 10]
 }
 
-/// Default Claude quick-switch slots: current models first, remaining slots empty.
+/// Default Claude quick-switch slots: current models first, remaining slots
+/// empty. Slot 0 mirrors `ClaudeModel::DEFAULT_CHAT_SLUG` rather than naming
+/// a model directly, so the two can't drift out of sync the way they did
+/// when the Claude 5 family shipped and this stayed pinned to the old 4.x
+/// flagship (`claude-opus-4-8`) after `DEFAULT_CHAT_SLUG` moved on.
 pub fn default_claude_model_slots() -> Vec<String> {
     let mut slots: Vec<String> = vec![
-        ClaudeModel::Opus4_8.canonical_slug().to_string(),
-        ClaudeModel::Sonnet4_6.canonical_slug().to_string(),
+        ClaudeModel::DEFAULT_CHAT_SLUG.to_string(),
+        ClaudeModel::Sonnet5.canonical_slug().to_string(),
         ClaudeModel::Haiku4_5.canonical_slug().to_string(),
-        ClaudeModel::Opus4_7.canonical_slug().to_string(),
+        ClaudeModel::Opus4_8.canonical_slug().to_string(),
     ];
     slots.resize(10, String::new());
     slots
@@ -452,14 +456,14 @@ mod tests {
         let config = ClaudeConfig::default();
         assert_eq!(config.model_slots.len(), 10);
         // First slots are pre-filled with current Claude models.
-        assert_eq!(config.model_slots[0], "claude-opus-4-8");
+        assert_eq!(config.model_slots[0], "claude-opus-5");
         assert!(config.model_slots[1].contains("claude"));
         // Trailing slots remain empty.
         for i in 4..10 {
             assert!(config.model_slots[i].is_empty(), "Claude slot {} should be empty", i);
         }
         // Sensible non-empty default model + required max_tokens.
-        assert_eq!(config.model, "claude-opus-4-8");
+        assert_eq!(config.model, "claude-opus-5");
         assert!(config.max_tokens.is_some());
     }
 
