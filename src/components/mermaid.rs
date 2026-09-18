@@ -54,6 +54,30 @@ async fn ensure_mermaid_loaded() -> Result<(), String> {
                         if (typeof window.mermaid === 'undefined') {{
                             throw new Error('bundle ran but did not define window.mermaid');
                         }}
+                        // Mermaid needs a real DOM element to measure text
+                        // into while rendering, and when `render()` isn't
+                        // given one it creates its own scratch node directly
+                        // under document.body. On a failed render (e.g. the
+                        // known gantt `raw.startTime.type` parser bug) that
+                        // scratch node is where mermaid's own hardcoded
+                        // error graphic (bomb icon, "Syntax error in text")
+                        // lands — and without our own container to contain
+                        // it, that graphic surfaces as an unstyled overlay
+                        // instead of staying invisible. A single persistent,
+                        // off-screen sandbox we control (and every render
+                        // call explicitly targets) means mermaid never has
+                        // reason to touch document.body itself, so whatever
+                        // it draws — success or its own error UI — stays
+                        // contained. Our own try/catch below still reports
+                        // failures through the styled "Diagram may be out of
+                        // date" message; this only stops mermaid's *own*
+                        // fallback UI from ever becoming visible.
+                        if (!document.getElementById('hobbes-mermaid-sandbox')) {{
+                            const sandbox = document.createElement('div');
+                            sandbox.id = 'hobbes-mermaid-sandbox';
+                            sandbox.style.cssText = 'position:fixed;top:-99999px;left:-99999px;width:1px;height:1px;overflow:hidden;pointer-events:none;';
+                            document.body.appendChild(sandbox);
+                        }}
                         if (!window.__hobbesMermaidInit) {{
                             window.mermaid.initialize({{
                                 startOnLoad: false,
@@ -250,7 +274,8 @@ pub fn MermaidDiagram(code: String) -> Element {
                     r#"
                     try {{
                         await window.mermaid.parse({code});
-                        const {{ svg }} = await window.mermaid.render({id}, {code});
+                        const sandbox = document.getElementById('hobbes-mermaid-sandbox');
+                        const {{ svg }} = await window.mermaid.render({id}, {code}, sandbox);
                         dioxus.send({{ ok: true, svg: svg }});
                     }} catch (e) {{
                         dioxus.send({{ ok: false, error: String(e && e.message ? e.message : e) }});
@@ -337,11 +362,24 @@ pub fn MermaidDiagram(code: String) -> Element {
                     dangerous_inner_html: "{last_good_svg.read().clone().unwrap_or_default()}"
                 }
                 if let Some(err) = &error {
-                    p { class: "text-xs text-fg-muted mt-1", "Diagram may be out of date: {err}" }
+                    // The raw JS exception (e.g. mermaid's gantt-parser
+                    // `raw.startTime.type` bug) is real diagnostic detail,
+                    // but reads as an internal stack trace to anyone who
+                    // isn't debugging mermaid itself — keep it on hover
+                    // rather than inline.
+                    p {
+                        class: "text-xs text-fg-muted mt-1",
+                        title: "{err}",
+                        "This diagram may be out of date — the source may have changed since it last rendered cleanly."
+                    }
                 }
             } else if let Some(err) = &error {
                 CodeBlock { lang: "mermaid".to_string(), code: code.clone() }
-                p { class: "text-xs text-fg-muted mt-1", "Mermaid error: {err}" }
+                p {
+                    class: "text-xs text-fg-muted mt-1",
+                    title: "{err}",
+                    "This diagram couldn't render — showing the source above."
+                }
             } else {
                 // Still streaming / not yet validated — show source, no JS
                 // error and no empty box.
