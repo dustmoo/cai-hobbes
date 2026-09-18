@@ -307,6 +307,64 @@ pub fn tiger_rgba(cell_px: u32, colour: bool) -> (Vec<u8>, u32, u32) {
     (buf, edge, edge)
 }
 
+/// The mascot, alive: idles through a small sprite loop — blink, ear-perk —
+/// as real frame swaps between [`TIGER_GRID`]/[`TIGER_GRID_BLINK`]/
+/// [`TIGER_GRID_EARS_UP`] rather than a transform on one fixed icon. Always
+/// looping for as long as this component stays mounted (the app-menu button
+/// it lives in is permanent, so that's the app's lifetime); `pouncing` (set
+/// briefly by the caller's click handler) overrides the loop with a one-shot
+/// squash-and-settle reaction — see the `.tiger-idle`/`.tiger-pounce`
+/// keyframes in `assets/main.css`.
+#[component]
+pub fn AnimatedTiger(pouncing: Signal<bool>, width: u32, height: u32) -> Element {
+    #[derive(Copy, Clone, PartialEq)]
+    enum Frame {
+        Idle,
+        Blink,
+        EarsUp,
+    }
+    impl Frame {
+        fn grid(self) -> &'static [&'static str; 16] {
+            match self {
+                Frame::Idle => &TIGER_GRID,
+                Frame::Blink => &TIGER_GRID_BLINK,
+                Frame::EarsUp => &TIGER_GRID_EARS_UP,
+            }
+        }
+    }
+
+    let mut frame = use_signal(|| Frame::Idle);
+
+    use_effect(move || {
+        spawn(async move {
+            // An irregular idle beat (blink sooner, ear-perk further out, a
+            // held return to Idle in between) reads as attentive rather than
+            // a metronome — real mascots don't blink on a fixed tempo.
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1700)).await;
+                frame.set(Frame::Blink);
+                tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+                frame.set(Frame::Idle);
+                tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+                frame.set(Frame::EarsUp);
+                tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+                frame.set(Frame::Idle);
+            }
+        });
+    });
+
+    rsx! {
+        div {
+            class: if *pouncing.read() { "tiger-pounce" } else { "tiger-idle" },
+            dioxus_free_icons::Icon {
+                width,
+                height,
+                icon: HobbesTigerFrame(if *pouncing.read() { &TIGER_GRID_EARS_UP } else { frame.read().grid() })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

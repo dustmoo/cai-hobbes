@@ -90,6 +90,9 @@ pub fn TabBar(props: TabBarProps) -> Element {
     let mut editing_tab_id = use_signal(|| None::<String>);
     let mut temp_name = use_signal(String::new);
     let mut show_app_menu = use_signal(|| false);
+    // One-shot "pounce" reaction on the app-menu mascot when it's clicked;
+    // its idle sprite loop otherwise runs continuously (see `AnimatedTiger`).
+    let mut tiger_pouncing = use_signal(|| false);
 
     // Use a memo to create a proper reactive subscription to the streaming state.
     // This ensures the component re-renders when stream_activity changes,
@@ -119,9 +122,20 @@ pub fn TabBar(props: TabBarProps) -> Element {
                 button {
                     class: "flex items-center justify-center w-11 h-full text-fg-muted hover:bg-card hover:text-fg focus:outline-none transition-colors",
                     title: "Hobbes menu",
-                    onclick: move |_| show_app_menu.set(!show_app_menu()),
-                    Icon {
-                        icon: crate::components::pixel_icons::HobbesTiger,
+                    onclick: move |_| {
+                        show_app_menu.set(!show_app_menu());
+                        // The mascot pounces to confirm the click, same
+                        // reaction it used to give on the chat bar's Stop
+                        // button — here it's just opening/closing the menu
+                        // instead of cancelling a turn.
+                        tiger_pouncing.set(true);
+                        spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(320)).await;
+                            tiger_pouncing.set(false);
+                        });
+                    },
+                    crate::components::pixel_icons::AnimatedTiger {
+                        pouncing: tiger_pouncing,
                         width: 18,
                         height: 18,
                     }
