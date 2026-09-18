@@ -61,19 +61,34 @@ pub fn use_summarization_scheduler() {
                         {
                             let summary_value =
                                 serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
-                            // Write the new summary back to the session
-                            session_state
-                                .write()
-                                .get_active_session_mut()
-                                .unwrap()
-                                .active_context
-                                .conversation_summary = summary;
+                            // Write the new summary back to the session, and
+                            // apply any tab emoji/topic it carries (see
+                            // `apply_tab_identity_from_summary`'s doc comment
+                            // — this call site used to silently drop it).
+                            let tab_titled = {
+                                let mut state = session_state.write();
+                                let session = state.get_active_session_mut().unwrap();
+                                let titled = crate::session::apply_tab_identity_from_summary(
+                                    session, &summary,
+                                );
+                                session.active_context.conversation_summary = summary;
+                                titled
+                            };
                             crate::session_events::log_event(
                                 &active_session.id,
                                 crate::session_events::SessionEvent::SummaryComputed {
                                     summary: summary_value,
                                 },
                             );
+                            if let Some((emoji, title)) = tab_titled {
+                                crate::session_events::log_event(
+                                    &active_session.id,
+                                    crate::session_events::SessionEvent::TabTitled {
+                                        emoji,
+                                        title,
+                                    },
+                                );
+                            }
                             last_summarized_message_count = current_message_count;
                             crate::services::project_tagger::maybe_auto_tag(
                                 &active_session.id,
@@ -110,19 +125,37 @@ pub fn use_summarization_scheduler() {
                             {
                                 let summary_value = serde_json::to_value(&summary)
                                     .unwrap_or(serde_json::Value::Null);
-                                // Write the new summary back to the session
-                                session_state
-                                    .write()
-                                    .get_active_session_mut()
-                                    .unwrap()
-                                    .active_context
-                                    .conversation_summary = summary;
+                                // Write the new summary back to the session,
+                                // and apply any tab emoji/topic it carries —
+                                // this is the path an ordinary new tab (no
+                                // tool calls) actually goes through first;
+                                // see `apply_tab_identity_from_summary`'s doc
+                                // comment for why this used to be silently
+                                // dropped here.
+                                let tab_titled = {
+                                    let mut state = session_state.write();
+                                    let session = state.get_active_session_mut().unwrap();
+                                    let titled = crate::session::apply_tab_identity_from_summary(
+                                        session, &summary,
+                                    );
+                                    session.active_context.conversation_summary = summary;
+                                    titled
+                                };
                                 crate::session_events::log_event(
                                     &active_session.id,
                                     crate::session_events::SessionEvent::SummaryComputed {
                                         summary: summary_value,
                                     },
                                 );
+                                if let Some((emoji, title)) = tab_titled {
+                                    crate::session_events::log_event(
+                                        &active_session.id,
+                                        crate::session_events::SessionEvent::TabTitled {
+                                            emoji,
+                                            title,
+                                        },
+                                    );
+                                }
                                 last_summarized_message_count = current_message_count;
                                 crate::services::project_tagger::maybe_auto_tag(
                                     &active_session.id,

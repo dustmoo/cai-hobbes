@@ -1437,52 +1437,25 @@ impl StreamManagerContext {
                                                             .unwrap_or(serde_json::Value::Null);
                                                     // Tab identity (emoji/topic) rides the same
                                                     // background summary — no extra LLM call.
-                                                    // A user rename wins forever: never
-                                                    // overwrite once `name_user_set` is set.
-                                                    let mut tab_titled: Option<(
-                                                        Option<String>,
-                                                        Option<String>,
-                                                    )> = None;
-                                                    {
+                                                    // See `apply_tab_identity_from_summary`'s
+                                                    // doc comment: every caller that computes a
+                                                    // ConversationSummary must call this, or a
+                                                    // tab's emoji/topic silently never gets set.
+                                                    let tab_titled = {
                                                         let mut state = session_state.write();
-                                                        if let Some(session) = state
+                                                        state
                                                             .sessions
                                                             .get_mut(&session_id_clone)
-                                                        {
-                                                            let name_user_set =
-                                                                session.name_user_set;
-                                                            let raw_title =
-                                                                summary.tab_title.clone();
-                                                            let raw_emoji =
-                                                                summary.tab_emoji.clone();
-                                                            session
-                                                                .active_context
-                                                                .conversation_summary = summary;
-                                                            let attempted_tab_identity =
-                                                                raw_title.is_some()
-                                                                    || raw_emoji.is_some();
-                                                            if !name_user_set
-                                                                && attempted_tab_identity
-                                                            {
-                                                                let title =
-                                                                    crate::session::normalize_tab_title(
-                                                                        raw_title.as_deref(),
-                                                                    );
-                                                                let emoji =
-                                                                    crate::session::normalize_tab_emoji(
-                                                                        raw_emoji.as_deref(),
-                                                                    );
-                                                                if let Some(title) = &title {
-                                                                    session.tab_title =
-                                                                        Some(title.clone());
-                                                                }
-                                                                session.tab_emoji =
-                                                                    Some(emoji.clone());
-                                                                tab_titled =
-                                                                    Some((Some(emoji), title));
-                                                            }
-                                                        }
-                                                    }
+                                                            .and_then(|session| {
+                                                                let titled = crate::session::apply_tab_identity_from_summary(
+                                                                    session, &summary,
+                                                                );
+                                                                session
+                                                                    .active_context
+                                                                    .conversation_summary = summary;
+                                                                titled
+                                                            })
+                                                    };
                                                     log_event(
                                                         &session_id_clone,
                                                         SessionEvent::SummaryComputed {

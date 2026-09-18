@@ -129,6 +129,45 @@ pub fn normalize_tab_title(raw: Option<&str>) -> Option<String> {
     }
 }
 
+/// Applies an AI-proposed tab emoji/topic from a freshly computed
+/// [`ConversationSummary`] to `session.tab_title`/`tab_emoji`, normalizing
+/// both first (never applied raw) and honoring the `name_user_set` guard — a
+/// user rename always wins, forever.
+///
+/// Every caller that computes a `ConversationSummary` (the proactive
+/// tool-call-turn summarizer in `stream_manager.rs`, and the idle-inactivity
+/// scheduler in `summarization_scheduler.rs`) must call this, or a tab's
+/// emoji/topic silently never gets set — this was missed on the scheduler's
+/// two call sites when the feature first shipped (2026-09-16): they wrote
+/// `session.active_context.conversation_summary` but never read
+/// `summary.tab_title`/`tab_emoji` off of it, so ordinary new tabs (no tool
+/// calls, first summarized via the idle path) never got titled at all.
+///
+/// Returns `Some((emoji, title))` when it actually wrote something, for the
+/// caller to journal as `SessionEvent::TabTitled`; `None` when the summary
+/// carried no proposal or the session's name was already claimed by the
+/// user.
+pub fn apply_tab_identity_from_summary(
+    session: &mut Session,
+    summary: &ConversationSummary,
+) -> Option<(Option<String>, Option<String>)> {
+    if session.name_user_set {
+        return None;
+    }
+    let raw_title = summary.tab_title.as_deref();
+    let raw_emoji = summary.tab_emoji.as_deref();
+    if raw_title.is_none() && raw_emoji.is_none() {
+        return None;
+    }
+    let title = normalize_tab_title(raw_title);
+    let emoji = normalize_tab_emoji(raw_emoji);
+    if let Some(title) = &title {
+        session.tab_title = Some(title.clone());
+    }
+    session.tab_emoji = Some(emoji.clone());
+    Some((Some(emoji), title))
+}
+
 impl ConversationSummaryEntities {
     /// Prune entities to max_count
     pub fn prune_entities(&mut self, max_count: usize) {
@@ -1878,6 +1917,47 @@ mod tests {
             );
             assert_eq!(normalize_tab_title(Some("   ")), None);
             assert_eq!(normalize_tab_title(None), None);
+        }
+
+        #[test]
+        fn apply_tab_identity_writes_normalized_title_and_emoji() {
+            let mut session = session_with("Sep 16 - 03:45 PM", false, None);
+            let summary = ConversationSummary {
+                tab_title: Some("  \"Trust dispatch\"  ".to_string()),
+                tab_emoji: Some("🎯".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &summary);
+            assert_eq!(
+                result,
+                Some((Some("🎯".to_string()), Some("Trust dispatch".to_string())))
+            );
+            assert_eq!(session.tab_title, Some("Trust dispatch".to_string()));
+            assert_eq!(session.tab_emoji, Some("🎯".to_string()));
+        }
+
+        #[test]
+        fn apply_tab_identity_never_overwrites_a_user_rename() {
+            let mut session = session_with("My renamed tab", true, None);
+            let summary = ConversationSummary {
+                tab_title: Some("Trust dispatch".to_string()),
+                tab_emoji: Some("🎯".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &summary);
+            assert_eq!(result, None);
+            assert_eq!(session.tab_title, None);
+            assert_eq!(session.tab_emoji, None);
+        }
+
+        #[test]
+        fn apply_tab_identity_is_a_noop_when_summary_carries_no_proposal() {
+            let mut session = session_with("Sep 16 - 03:45 PM", false, None);
+            let summary = ConversationSummary::default();
+            let result = apply_tab_identity_from_summary(&mut session, &summary);
+            assert_eq!(result, None);
+            assert_eq!(session.tab_title, None);
+            assert_eq!(session.tab_emoji, None);
         }
     }
 
