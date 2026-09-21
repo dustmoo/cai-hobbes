@@ -260,9 +260,9 @@ pub fn TabBar(props: TabBarProps) -> Element {
                         div {
                             key: "{session_id_key}",
                             class: if is_active {
-                                "group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink select-none bg-card border-b-2 border-b-primary-500"
+                                "group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink overflow-hidden select-none bg-card border-b-2 border-b-primary-500"
                             } else {
-                                "group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink select-none hover:bg-card"
+                                "group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink overflow-hidden select-none hover:bg-card"
                             },
                             title: "{tooltip}",
                             onclick: move |_| {
