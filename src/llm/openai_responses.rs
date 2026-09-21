@@ -693,7 +693,7 @@ You MUST respond with valid JSON containing exactly these fields:
 - "current_task": A one-sentence description of the task the user is CURRENTLY working on (empty string if none).
 - "entities": An object with "user_name", "project_name", "key_topics" (array), "key_decisions" (array), "active_profile", "blockers" (array).
 - "tab_title": A 2-4 word topic for this chat's browser-tab-style label. Empty string if unclear.
-- "tab_emoji": A single emoji that best represents this chat's topic."#;
+- "tab_emoji": A single emoji that specifically captures this chat's topic — reach for the most precise, least-generic match to the actual subject matter (a tool, domain, object, or action mentioned), not a default like 💬, 🤖, 📝, ✅, or 🚀. Vary your choice across different chats rather than reusing a small favorite set. Examples of specific picks: "🐛" for a bug hunt, "🧮" for a math problem, "🗺️" for trip planning, "🔐" for auth work, "🍞" for a baking recipe."#;
 
         let user_message = format!(
             "Previous Summary:\n---\n{}\n---\n\nRecent Messages:\n---\n{}\n---",

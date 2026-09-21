@@ -65,14 +65,25 @@ pub fn use_summarization_scheduler() {
                             // apply any tab emoji/topic it carries (see
                             // `apply_tab_identity_from_summary`'s doc comment
                             // — this call site used to silently drop it).
+                            // Look this up by the id we actually summarized
+                            // (`active_session.id`, captured before the
+                            // `.await` above), NOT via
+                            // `get_active_session_mut()` — the user may have
+                            // switched tabs (or opened a brand new one)
+                            // while the LLM call was in flight, and
+                            // `get_active_session_mut()` would silently
+                            // apply this summary/tab_title/tab_emoji to
+                            // whatever tab is active *now* instead of the
+                            // one it was actually generated for.
                             let tab_titled = {
                                 let mut state = session_state.write();
-                                let session = state.get_active_session_mut().unwrap();
-                                let titled = crate::session::apply_tab_identity_from_summary(
-                                    session, &summary,
-                                );
-                                session.active_context.conversation_summary = summary;
-                                titled
+                                state.sessions.get_mut(&active_session.id).and_then(|session| {
+                                    let titled = crate::session::apply_tab_identity_from_summary(
+                                        session, &summary,
+                                    );
+                                    session.active_context.conversation_summary = summary;
+                                    titled
+                                })
                             };
                             crate::session_events::log_event(
                                 &active_session.id,
@@ -132,14 +143,25 @@ pub fn use_summarization_scheduler() {
                                 // see `apply_tab_identity_from_summary`'s doc
                                 // comment for why this used to be silently
                                 // dropped here.
+                                //
+                                // Look up by `active_session.id` (captured
+                                // before the `.await` above), not via
+                                // `get_active_session_mut()` — the user may
+                                // have switched to (or created) a different
+                                // tab while this LLM call was in flight, and
+                                // `get_active_session_mut()` would silently
+                                // apply this session's summary/tab_title/
+                                // tab_emoji onto whatever tab is active now
+                                // instead of the one it was generated for.
                                 let tab_titled = {
                                     let mut state = session_state.write();
-                                    let session = state.get_active_session_mut().unwrap();
-                                    let titled = crate::session::apply_tab_identity_from_summary(
-                                        session, &summary,
-                                    );
-                                    session.active_context.conversation_summary = summary;
-                                    titled
+                                    state.sessions.get_mut(&active_session.id).and_then(|session| {
+                                        let titled = crate::session::apply_tab_identity_from_summary(
+                                            session, &summary,
+                                        );
+                                        session.active_context.conversation_summary = summary;
+                                        titled
+                                    })
                                 };
                                 crate::session_events::log_event(
                                     &active_session.id,

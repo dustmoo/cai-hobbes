@@ -1893,7 +1893,7 @@ Populate the JSON response with:
   - "active_profile": The active Composio profile name if mentioned.
   - "blockers": Current blockers or open issues (array of short strings).
 - "tab_title": A 2-4 word topic for this chat's browser-tab-style label (e.g. "Fix login bug"). Empty string if unclear.
-- "tab_emoji": A single emoji that best represents this chat's topic (e.g. "🐛").
+- "tab_emoji": A single emoji that specifically captures this chat's topic — reach for the most precise, least-generic match to the actual subject matter (a tool, domain, object, or action mentioned), not a default like 💬, 🤖, 📝, ✅, or 🚀. Vary your choice across different chats rather than reusing a small favorite set. Examples of specific picks: "🐛" for a bug hunt, "🧮" for a math problem, "🗺️" for trip planning, "🔐" for auth work, "🍞" for a baking recipe.
 
 Previous Summary:
 ---
@@ -1927,7 +1927,7 @@ Recent Messages:
                     }
                 },
                 "tab_title": { "type": "STRING", "description": "2-4 word topic for this chat's tab label. Empty if unclear." },
-                "tab_emoji": { "type": "STRING", "description": "A single emoji representing this chat's topic" }
+                "tab_emoji": { "type": "STRING", "description": "A single emoji specifically representing this chat's topic — precise and varied, not a generic default like 💬/🤖/📝/✅/🚀" }
             },
             "required": ["summary", "sentiment", "entities"]
         });

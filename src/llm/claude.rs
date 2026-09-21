@@ -464,7 +464,7 @@ You MUST respond with ONLY valid JSON (no prose, no markdown fences) containing 
   - "active_profile": The active Composio profile name if mentioned.
   - "blockers": Current blockers or open issues (array of short strings).
 - "tab_title": A 2-4 word topic for this chat's browser-tab-style label (e.g. "Fix login bug"). Empty string if unclear.
-- "tab_emoji": A single emoji that best represents this chat's topic (e.g. "🐛")."#;
+- "tab_emoji": A single emoji that specifically captures this chat's topic — reach for the most precise, least-generic match to the actual subject matter (a tool, domain, object, or action mentioned), not a default like 💬, 🤖, 📝, ✅, or 🚀. Vary your choice across different chats rather than reusing a small favorite set. Examples of specific picks: "🐛" for a bug hunt, "🧮" for a math problem, "🗺️" for trip planning, "🔐" for auth work, "🍞" for a baking recipe."#;
 
         let user_message = format!(
             "Previous Summary:\n---\n{}\n---\n\nRecent Messages:\n---\n{}\n---",
