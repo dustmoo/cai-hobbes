@@ -360,25 +360,73 @@ body {
  * that tab's own rendered width — the same idea Chrome/Safari use for their
  * own tab strips — instead of a single global tier computed from how many
  * tabs happen to be open. `container-type: inline-size` turns the tab's own
- * flex-item box into a size query context its own children (.tab-date,
- * .tab-topic) can react to; as flex-shrink narrows one tab because a
- * neighbor opened, only that tab's own layers drop out, gradually, instead
- * of every open tab losing its date/topic in the same frame the moment a
- * fixed tab-count threshold was crossed (the previous behavior — see the
- * removed `Density`/`tab_density` in tab_bar.rs). The active tab (see
- * tab_bar.rs) never wears .tab-date/.tab-topic at all, so it's exempt from
- * this and always shows every layer regardless of width.
+ * flex-item box into a size query context its own children (.tab-date) can
+ * react to; as flex-shrink narrows one tab because a neighbor opened, only
+ * that tab's own layers drop out, gradually, instead of every open tab
+ * losing its date/topic in the same frame the moment a fixed tab-count
+ * threshold was crossed (the previous behavior — see the removed
+ * `Density`/`tab_density` in tab_bar.rs). The active tab (see tab_bar.rs)
+ * never wears .tab-date at all, so it's exempt from this and always shows
+ * every layer regardless of width.
+ *
+ * The topic itself is never hidden outright (unlike the date) — it always
+ * renders, truncating with an ellipsis via `.tab-topic-track` as its tab
+ * narrows, and the hover marquee below lets a truncated one be read without
+ * needing the tab any wider.
  */
 .tab-item {
     container-type: inline-size;
 }
-@container (max-width: 199px) {
-    .tab-item .tab-topic {
-        display: none;
-    }
-}
 @container (max-width: 84px) {
     .tab-item .tab-date {
         display: none;
+    }
+}
+
+/*
+ * Hover marquee for a truncated tab topic. `--tab-topic-shift` is set
+ * per-tab, inline, from the topic's own character count (tab_bar.rs) — a
+ * cheap Rust-side estimate rather than a live DOM measurement, so this stays
+ * pure CSS/no document::eval per this codebase's animation convention (see
+ * the tiger sprite animations above). Overshooting the estimate just means a
+ * short-topic tab pauses briefly at the fully-scrolled position before
+ * resetting; undershooting would clip real content, so the estimate in
+ * tab_bar.rs is deliberately generous.
+ *
+ * `.tab-topic-track` clips and ellipsizes normally; on hover (after a short
+ * delay via `animation-delay`, so a passing hover doesn't trigger it) the
+ * ellipsis turns off and the inner `.tab-topic-text` slides to reveal the
+ * rest, then resets.
+ */
+.tab-topic-track {
+    display: block;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    min-width: 0;
+}
+.tab-item:hover .tab-topic-track {
+    text-overflow: clip;
+}
+.tab-topic-text {
+    display: inline-block;
+    white-space: nowrap;
+}
+@keyframes tab-topic-marquee {
+    0%,
+    12% {
+        transform: translateX(0);
+    }
+    88%,
+    100% {
+        transform: translateX(var(--tab-topic-shift, 0px));
+    }
+}
+.tab-item:hover .tab-topic-text {
+    animation: tab-topic-marquee 3.2s ease-in-out 650ms 1 both;
+}
+@media (prefers-reduced-motion: reduce) {
+    .tab-item:hover .tab-topic-text {
+        animation: none;
     }
 }

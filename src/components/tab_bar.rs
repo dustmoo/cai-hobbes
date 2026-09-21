@@ -6,6 +6,18 @@ use crate::settings::{Settings, UiState};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
+/// How far (in negative px) the hover marquee should slide a truncated tab
+/// topic — see `.tab-topic-track`/`.tab-topic-text` in main.css. A cheap
+/// character-count estimate rather than a live DOM measurement (that would
+/// need `document::eval`, which this codebase's animation convention avoids
+/// for CSS-driven motion — see the tiger sprite animations). Deliberately
+/// generous: overshooting just means a short topic pauses briefly at the
+/// fully-scrolled position before resetting, while undershooting would clip
+/// real content the user is trying to read.
+fn topic_marquee_shift_px(topic: &str) -> i32 {
+    -(((topic.chars().count() as i32) * 7) + 24)
+}
+
 #[derive(Props, PartialEq, Clone)]
 pub struct TabBarProps {
     pub open_tabs: Vec<String>,
@@ -366,27 +378,40 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                         }
                                     } else {
                                         span {
-                                            // The container-query classes
-                                            // (tab-date/tab-topic, defined in
-                                            // main.css against the ".tab-item"
-                                            // wrapper above) only take effect
-                                            // when actually present in the
-                                            // class list — the active tab
-                                            // omits them so it's exempt from
-                                            // width-based hiding, same
-                                            // guarantee the old density
-                                            // system gave it explicitly.
+                                            // The .tab-date container-query
+                                            // class (defined in main.css
+                                            // against the ".tab-item" wrapper
+                                            // above) only takes effect when
+                                            // actually present in the class
+                                            // list — the active tab omits it
+                                            // so it's exempt from width-based
+                                            // hiding, same guarantee the old
+                                            // density system gave it
+                                            // explicitly. The topic (below)
+                                            // is never hidden this way — it
+                                            // always renders, truncated.
                                             class: if is_active { "font-mono text-[11px] text-fg-muted tabular-nums shrink-0" } else { "tab-date font-mono text-[11px] text-fg-muted tabular-nums shrink-0" },
                                             "{date}"
                                         }
-                                        if topic.is_some() {
+                                        if let Some(topic_text) = topic.clone() {
                                             span {
-                                                class: if is_active {
-                                                    "truncate text-xs text-fg font-medium"
-                                                } else {
-                                                    "tab-topic truncate text-xs text-fg-muted"
-                                                },
-                                                "{topic.clone().unwrap_or_default()}"
+                                                // `.tab-topic-track` (main.css)
+                                                // truncates with an ellipsis
+                                                // normally; on hover (after a
+                                                // short delay) it marquees to
+                                                // reveal the rest instead of
+                                                // needing the tab any wider.
+                                                // `--tab-topic-shift` is a
+                                                // cheap character-count
+                                                // estimate of how far it needs
+                                                // to slide — see
+                                                // `topic_marquee_shift_px`.
+                                                class: "flex-1 min-w-0 tab-topic-track",
+                                                style: "--tab-topic-shift: {topic_marquee_shift_px(&topic_text)}px;",
+                                                span {
+                                                    class: if is_active { "tab-topic-text text-xs text-fg font-medium" } else { "tab-topic-text text-xs text-fg-muted" },
+                                                    "{topic_text}"
+                                                }
                                             }
                                         }
                                     }
@@ -584,5 +609,27 @@ fn TabBarIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq +
                 icon: icon,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod topic_marquee_tests {
+    use super::*;
+
+    #[test]
+    fn shift_is_always_negative_and_nonzero_even_for_empty_topic() {
+        // Zero would leave the marquee's translateX(var(--tab-topic-shift))
+        // as a no-op, which is fine for a genuinely empty topic (there's
+        // nothing to reveal) — but the fixed 24px pad means it's still
+        // negative, matching the "always slide a little" behavior for any
+        // real (non-empty) topic.
+        assert!(topic_marquee_shift_px("") < 0);
+    }
+
+    #[test]
+    fn longer_topics_get_a_larger_shift() {
+        let short = topic_marquee_shift_px("Short");
+        let long = topic_marquee_shift_px("A considerably longer chat topic");
+        assert!(long < short, "longer topic should shift further: {long} vs {short}");
     }
 }
