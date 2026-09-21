@@ -241,10 +241,23 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     rsx! {
                         div {
                             key: "{session_id_key}",
+                            // basis-64 (not min-w-0/auto): `.tab-item` below
+                            // carries `container-type: inline-size` for the
+                            // per-tab width-based degrading (see the
+                            // container-query doc comment above), and size
+                            // containment means this box's size can no
+                            // longer depend on ITS OWN content — an
+                            // auto/content flex-basis resolves to ~0 under
+                            // containment, which collapsed every tab to its
+                            // floor width regardless of how much room the
+                            // strip actually had. An explicit basis sidesteps
+                            // that entirely, and `grow` lets tabs fill real
+                            // spare width instead of leaving it empty next to
+                            // Planner/Fleet when few tabs are open.
                             class: if is_active {
-                                "tab-item group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink overflow-hidden select-none bg-card border-b-2 border-b-primary-500"
+                                "tab-item group relative flex items-center h-full px-3 cursor-pointer basis-64 grow shrink min-w-10 max-w-64 overflow-hidden select-none bg-card border-b-2 border-b-primary-500"
                             } else {
-                                "tab-item group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink overflow-hidden select-none hover:bg-card"
+                                "tab-item group relative flex items-center h-full px-3 cursor-pointer basis-64 grow shrink min-w-10 max-w-64 overflow-hidden select-none hover:bg-card"
                             },
                             title: "{tooltip}",
                             onclick: move |_| {

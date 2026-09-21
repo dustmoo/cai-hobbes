@@ -2061,6 +2061,10 @@ video {
   min-width: 0px;
 }
 
+.min-w-10 {
+  min-width: 2.5rem;
+}
+
 .min-w-\[16px\] {
   min-width: 16px;
 }
@@ -2184,6 +2188,10 @@ video {
 
 .grow {
   flex-grow: 1;
+}
+
+.basis-64 {
+  flex-basis: 16rem;
 }
 
 .table-auto {
