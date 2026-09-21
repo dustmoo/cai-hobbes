@@ -1265,7 +1265,7 @@ fn TodoRow(
                 // Carrier session pill — the assignment's door.
                 if let Some(label) = carrier_label.clone() {
                     button {
-                        class: "{carrier_pill_class} max-w-44 hover:brightness-110",
+                        class: "{carrier_pill_class} max-w-44 overflow-hidden hover:brightness-110",
                         title: if is_chat_carrier { "Carried by this chat — click to open" } else { "Carried by this agent session — click to open the Fleet" },
                         onclick: {
                             let carrier_session_id = carrier_session_id.clone();
@@ -1292,7 +1292,18 @@ fn TodoRow(
                         }
                         span { class: "truncate", "{label}" }
                         if let Some(m) = carrier_minutes {
-                            span { class: "font-mono tabular-nums opacity-80", "· working {model::format_minutes(m)}" }
+                            // shrink-0 + whitespace-nowrap: without an
+                            // overflow value of its own this span's
+                            // automatic min-width is its full text, so once
+                            // the pill's max-w-44 got tight this text wrapped
+                            // onto a second line instead of shrinking — and
+                            // since the pill has a fixed h-[22px], that
+                            // second line spilled out below it instead of
+                            // being clipped. Keeping it on one line (and
+                            // never shrinking it) means the label span above
+                            // — which already handles this correctly via
+                            // `truncate` — is the only thing that gives.
+                            span { class: "shrink-0 whitespace-nowrap font-mono tabular-nums opacity-80", "· working {model::format_minutes(m)}" }
                         }
                     }
                 }
