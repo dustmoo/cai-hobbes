@@ -134,6 +134,15 @@ pub fn normalize_tab_title(raw: Option<&str>) -> Option<String> {
 /// both first (never applied raw) and honoring the `name_user_set` guard — a
 /// user rename always wins, forever.
 ///
+/// This only ever writes ONCE per tab: as soon as `tab_title`/`tab_emoji`
+/// have a value (from an earlier call here), later calls are a no-op even
+/// though `name_user_set` is still false. Without this, every subsequent
+/// summary (each idle pause, each tool-call turn) would keep re-proposing a
+/// title/emoji as the conversation's topic drifts — a tab you'd already
+/// learned to recognize would relabel itself out from under you while
+/// switching between a handful of tabs, which is more disorienting than a
+/// once-picked title going slightly stale.
+///
 /// Every caller that computes a `ConversationSummary` (the proactive
 /// tool-call-turn summarizer in `stream_manager.rs`, and the idle-inactivity
 /// scheduler in `summarization_scheduler.rs`) must call this, or a tab's
@@ -145,13 +154,16 @@ pub fn normalize_tab_title(raw: Option<&str>) -> Option<String> {
 ///
 /// Returns `Some((emoji, title))` when it actually wrote something, for the
 /// caller to journal as `SessionEvent::TabTitled`; `None` when the summary
-/// carried no proposal or the session's name was already claimed by the
-/// user.
+/// carried no proposal, the tab already has an identity (user-set or
+/// AI-proposed), or was renamed by the user.
 pub fn apply_tab_identity_from_summary(
     session: &mut Session,
     summary: &ConversationSummary,
 ) -> Option<(Option<String>, Option<String>)> {
     if session.name_user_set {
+        return None;
+    }
+    if session.tab_title.is_some() || session.tab_emoji.is_some() {
         return None;
     }
     let raw_title = summary.tab_title.as_deref();
@@ -1958,6 +1970,33 @@ mod tests {
             assert_eq!(result, None);
             assert_eq!(session.tab_title, None);
             assert_eq!(session.tab_emoji, None);
+        }
+
+        #[test]
+        fn apply_tab_identity_locks_after_the_first_write_and_never_relabels_again() {
+            let mut session = session_with("Sep 16 - 03:45 PM", false, None);
+            let first = ConversationSummary {
+                tab_title: Some("Trust dispatch".to_string()),
+                tab_emoji: Some("🎯".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &first);
+            assert!(result.is_some());
+            assert_eq!(session.tab_title, Some("Trust dispatch".to_string()));
+            assert_eq!(session.tab_emoji, Some("🎯".to_string()));
+
+            // A later summary reflecting where the conversation drifted to
+            // must NOT relabel a tab the user has already learned to
+            // recognize.
+            let later = ConversationSummary {
+                tab_title: Some("Totally different topic".to_string()),
+                tab_emoji: Some("🐛".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &later);
+            assert_eq!(result, None);
+            assert_eq!(session.tab_title, Some("Trust dispatch".to_string()));
+            assert_eq!(session.tab_emoji, Some("🎯".to_string()));
         }
     }
 
