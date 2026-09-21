@@ -384,19 +384,26 @@ body {
 }
 
 /*
- * Hover marquee for a truncated tab topic. `--tab-topic-shift` is set
- * per-tab, inline, from the topic's own character count (tab_bar.rs) — a
- * cheap Rust-side estimate rather than a live DOM measurement, so this stays
- * pure CSS/no document::eval per this codebase's animation convention (see
- * the tiger sprite animations above). Overshooting the estimate just means a
- * short-topic tab pauses briefly at the fully-scrolled position before
+ * Hover marquee for a tab's date + topic text — they slide as ONE unit
+ * (rather than the topic moving while the date sits frozen next to it).
+ * `--tab-topic-shift` is set per-tab, inline, from the combined text's
+ * character count (tab_bar.rs's `tab_text_marquee_shift_px`) — a cheap
+ * Rust-side estimate rather than a live DOM measurement, so this stays pure
+ * CSS/no document::eval per this codebase's animation convention (see the
+ * tiger sprite animations above). Overshooting the estimate just means a
+ * short label pauses briefly at the fully-scrolled position before
  * resetting; undershooting would clip real content, so the estimate in
  * tab_bar.rs is deliberately generous.
  *
  * `.tab-topic-track` clips and ellipsizes normally; on hover (after a short
  * delay via `animation-delay`, so a passing hover doesn't trigger it) the
- * ellipsis turns off and the inner `.tab-topic-text` slides to reveal the
- * rest, then resets.
+ * ellipsis turns off and the inner `.tab-topic-text` (the date+topic row)
+ * slides to reveal the rest, then resets. `.tab-topic-text`'s display is set
+ * here rather than left to its Tailwind `inline-flex` class in tab_bar.rs —
+ * main.css loads after tailwind.css (see main.rs), so a same-specificity
+ * Tailwind utility would otherwise lose to a conflicting rule here; setting
+ * it explicitly keeps this file the single source of truth for the
+ * animated element's box type.
  */
 .tab-topic-track {
     display: block;
@@ -409,7 +416,8 @@ body {
     text-overflow: clip;
 }
 .tab-topic-text {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
     white-space: nowrap;
 }
 @keyframes tab-topic-marquee {

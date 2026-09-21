@@ -134,14 +134,26 @@ pub fn normalize_tab_title(raw: Option<&str>) -> Option<String> {
 /// both first (never applied raw) and honoring the `name_user_set` guard — a
 /// user rename always wins, forever.
 ///
-/// This only ever writes ONCE per tab: as soon as `tab_title`/`tab_emoji`
-/// have a value (from an earlier call here), later calls are a no-op even
-/// though `name_user_set` is still false. Without this, every subsequent
-/// summary (each idle pause, each tool-call turn) would keep re-proposing a
+/// This only ever writes the TITLE once per tab: as soon as `tab_title` has
+/// a value (from an earlier call here), later calls are a no-op even though
+/// `name_user_set` is still false. Without this, every subsequent summary
+/// (each idle pause, each tool-call turn) would keep re-proposing a
 /// title/emoji as the conversation's topic drifts — a tab you'd already
 /// learned to recognize would relabel itself out from under you while
 /// switching between a handful of tabs, which is more disorienting than a
 /// once-picked title going slightly stale.
+///
+/// The lock is keyed on `tab_title` specifically, NOT `tab_emoji` —
+/// `normalize_tab_emoji` always returns a fallback glyph even when the raw
+/// proposal was empty/invalid (it never produces `None`), so an early,
+/// low-quality summary (e.g. seconds after a brand new tab opens, before
+/// there's enough conversation for a real topic) reliably writes SOME emoji
+/// while leaving `tab_title` empty. Locking on emoji too would freeze that
+/// tab on a bare fallback emoji + date forever, with the real title that a
+/// later, more mature summary would have proposed never getting a chance to
+/// land. Emoji may keep refreshing (harmlessly re-picking the same fallback,
+/// or a better one once the model has more to go on) until a real title
+/// finally arrives, at which point both lock together.
 ///
 /// Every caller that computes a `ConversationSummary` (the proactive
 /// tool-call-turn summarizer in `stream_manager.rs`, and the idle-inactivity
@@ -163,7 +175,7 @@ pub fn apply_tab_identity_from_summary(
     if session.name_user_set {
         return None;
     }
-    if session.tab_title.is_some() || session.tab_emoji.is_some() {
+    if session.tab_title.is_some() {
         return None;
     }
     let raw_title = summary.tab_title.as_deref();
@@ -1995,6 +2007,36 @@ mod tests {
             };
             let result = apply_tab_identity_from_summary(&mut session, &later);
             assert_eq!(result, None);
+            assert_eq!(session.tab_title, Some("Trust dispatch".to_string()));
+            assert_eq!(session.tab_emoji, Some("🎯".to_string()));
+        }
+
+        #[test]
+        fn an_emoji_only_proposal_does_not_lock_out_a_later_real_title() {
+            // normalize_tab_emoji always falls back to SOME emoji even for
+            // empty/invalid input — it never produces None — so an early,
+            // low-quality summary (e.g. seconds after a brand new tab opens)
+            // reliably sets tab_emoji while leaving no title. That must not
+            // permanently block the real title a later, more mature summary
+            // proposes; only a title landing should lock the tab.
+            let mut session = session_with("Sep 16 - 03:45 PM", false, None);
+            let early = ConversationSummary {
+                tab_title: Some("".to_string()),
+                tab_emoji: Some("".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &early);
+            assert!(result.is_some());
+            assert_eq!(session.tab_title, None);
+            assert_eq!(session.tab_emoji, Some(FALLBACK_TAB_EMOJI.to_string()));
+
+            let later = ConversationSummary {
+                tab_title: Some("Trust dispatch".to_string()),
+                tab_emoji: Some("🎯".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &later);
+            assert!(result.is_some());
             assert_eq!(session.tab_title, Some("Trust dispatch".to_string()));
             assert_eq!(session.tab_emoji, Some("🎯".to_string()));
         }

@@ -6,16 +6,18 @@ use crate::settings::{Settings, UiState};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
-/// How far (in negative px) the hover marquee should slide a truncated tab
-/// topic — see `.tab-topic-track`/`.tab-topic-text` in main.css. A cheap
-/// character-count estimate rather than a live DOM measurement (that would
-/// need `document::eval`, which this codebase's animation convention avoids
-/// for CSS-driven motion — see the tiger sprite animations). Deliberately
-/// generous: overshooting just means a short topic pauses briefly at the
-/// fully-scrolled position before resetting, while undershooting would clip
-/// real content the user is trying to read.
-fn topic_marquee_shift_px(topic: &str) -> i32 {
-    -(((topic.chars().count() as i32) * 7) + 24)
+/// How far (in negative px) the hover marquee should slide a tab's date +
+/// topic text — see `.tab-topic-track`/`.tab-topic-text` in main.css. Takes
+/// the full displayed string (date and topic together — they scroll as one
+/// unit so the date doesn't sit frozen while only the topic moves) and
+/// returns a cheap character-count estimate rather than a live DOM
+/// measurement (that would need `document::eval`, which this codebase's
+/// animation convention avoids for CSS-driven motion — see the tiger sprite
+/// animations). Deliberately generous: overshooting just means a short label
+/// pauses briefly at the fully-scrolled position before resetting, while
+/// undershooting would clip real content the user is trying to read.
+fn tab_text_marquee_shift_px(displayed_text: &str) -> i32 {
+    -(((displayed_text.chars().count() as i32) * 7) + 24)
 }
 
 #[derive(Props, PartialEq, Clone)]
@@ -377,40 +379,71 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                             "{date}"
                                         }
                                     } else {
-                                        span {
-                                            // The .tab-date container-query
-                                            // class (defined in main.css
-                                            // against the ".tab-item" wrapper
-                                            // above) only takes effect when
-                                            // actually present in the class
-                                            // list — the active tab omits it
-                                            // so it's exempt from width-based
-                                            // hiding, same guarantee the old
-                                            // density system gave it
-                                            // explicitly. The topic (below)
-                                            // is never hidden this way — it
-                                            // always renders, truncated.
-                                            class: if is_active { "font-mono text-[11px] text-fg-muted tabular-nums shrink-0" } else { "tab-date font-mono text-[11px] text-fg-muted tabular-nums shrink-0" },
-                                            "{date}"
-                                        }
-                                        if let Some(topic_text) = topic.clone() {
-                                            span {
-                                                // `.tab-topic-track` (main.css)
-                                                // truncates with an ellipsis
-                                                // normally; on hover (after a
-                                                // short delay) it marquees to
-                                                // reveal the rest instead of
-                                                // needing the tab any wider.
-                                                // `--tab-topic-shift` is a
-                                                // cheap character-count
-                                                // estimate of how far it needs
-                                                // to slide — see
-                                                // `topic_marquee_shift_px`.
-                                                class: "flex-1 min-w-0 tab-topic-track",
-                                                style: "--tab-topic-shift: {topic_marquee_shift_px(&topic_text)}px;",
+                                        {
+                                            let topic_text = topic.clone();
+                                            let marquee_source = match &topic_text {
+                                                Some(t) => format!("{date} {t}"),
+                                                None => date.clone(),
+                                            };
+                                            rsx! {
                                                 span {
-                                                    class: if is_active { "tab-topic-text text-xs text-fg font-medium" } else { "tab-topic-text text-xs text-fg-muted" },
-                                                    "{topic_text}"
+                                                    // `.tab-topic-track`
+                                                    // (main.css) truncates
+                                                    // date+topic together with
+                                                    // a single ellipsis
+                                                    // normally; on hover
+                                                    // (after a short delay) it
+                                                    // marquees BOTH as one
+                                                    // unit to reveal the rest,
+                                                    // instead of only the
+                                                    // topic moving while the
+                                                    // date sits frozen.
+                                                    // `--tab-topic-shift` is a
+                                                    // cheap character-count
+                                                    // estimate of how far it
+                                                    // needs to slide — see
+                                                    // `tab_text_marquee_shift_px`.
+                                                    class: "flex-1 min-w-0 tab-topic-track",
+                                                    style: "--tab-topic-shift: {tab_text_marquee_shift_px(&marquee_source)}px;",
+                                                    span {
+                                                        // display/align-items come from
+                                                        // `.tab-topic-text` in main.css (which
+                                                        // loads after tailwind.css, so it — not
+                                                        // a same-specificity Tailwind utility
+                                                        // here — is the one that must own
+                                                        // `display` for this element); `gap-1`
+                                                        // is still a plain Tailwind spacing
+                                                        // utility with nothing to conflict with.
+                                                        class: "tab-topic-text gap-1",
+                                                        span {
+                                                            // The .tab-date
+                                                            // container-query
+                                                            // class (main.css,
+                                                            // against the
+                                                            // ".tab-item"
+                                                            // wrapper) only
+                                                            // takes effect
+                                                            // when actually
+                                                            // present — the
+                                                            // active tab omits
+                                                            // it so it's
+                                                            // exempt from
+                                                            // width-based
+                                                            // hiding, same
+                                                            // guarantee the
+                                                            // old density
+                                                            // system gave it
+                                                            // explicitly.
+                                                            class: if is_active { "font-mono text-[11px] text-fg-muted tabular-nums shrink-0" } else { "tab-date font-mono text-[11px] text-fg-muted tabular-nums shrink-0" },
+                                                            "{date}"
+                                                        }
+                                                        if let Some(t) = &topic_text {
+                                                            span {
+                                                                class: if is_active { "text-xs text-fg font-medium" } else { "text-xs text-fg-muted" },
+                                                                "{t}"
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -613,23 +646,36 @@ fn TabBarIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq +
 }
 
 #[cfg(test)]
-mod topic_marquee_tests {
+mod tab_text_marquee_tests {
     use super::*;
 
     #[test]
-    fn shift_is_always_negative_and_nonzero_even_for_empty_topic() {
+    fn shift_is_always_negative_and_nonzero_even_for_empty_text() {
         // Zero would leave the marquee's translateX(var(--tab-topic-shift))
-        // as a no-op, which is fine for a genuinely empty topic (there's
+        // as a no-op, which is fine for genuinely empty text (there's
         // nothing to reveal) — but the fixed 24px pad means it's still
         // negative, matching the "always slide a little" behavior for any
-        // real (non-empty) topic.
-        assert!(topic_marquee_shift_px("") < 0);
+        // real (non-empty) label.
+        assert!(tab_text_marquee_shift_px("") < 0);
     }
 
     #[test]
-    fn longer_topics_get_a_larger_shift() {
-        let short = topic_marquee_shift_px("Short");
-        let long = topic_marquee_shift_px("A considerably longer chat topic");
-        assert!(long < short, "longer topic should shift further: {long} vs {short}");
+    fn longer_text_gets_a_larger_shift() {
+        let short = tab_text_marquee_shift_px("Short");
+        let long = tab_text_marquee_shift_px("A considerably longer chat topic");
+        assert!(long < short, "longer text should shift further: {long} vs {short}");
+    }
+
+    #[test]
+    fn date_and_topic_combined_shift_further_than_topic_alone() {
+        // The date rides along in the same marquee as the topic (they
+        // scroll as one unit), so the shift estimate must account for the
+        // date's characters too, not just the topic's.
+        let topic_only = tab_text_marquee_shift_px("Trust dispatch");
+        let date_and_topic = tab_text_marquee_shift_px("Sep 16 Trust dispatch");
+        assert!(
+            date_and_topic < topic_only,
+            "date+topic should shift further than topic alone: {date_and_topic} vs {topic_only}"
+        );
     }
 }
