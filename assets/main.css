@@ -354,3 +354,31 @@ body {
         animation: none;
     }
 }
+
+/*
+ * Chat tab identity layers (emoji · date · topic) degrade per-tab, based on
+ * that tab's own rendered width — the same idea Chrome/Safari use for their
+ * own tab strips — instead of a single global tier computed from how many
+ * tabs happen to be open. `container-type: inline-size` turns the tab's own
+ * flex-item box into a size query context its own children (.tab-date,
+ * .tab-topic) can react to; as flex-shrink narrows one tab because a
+ * neighbor opened, only that tab's own layers drop out, gradually, instead
+ * of every open tab losing its date/topic in the same frame the moment a
+ * fixed tab-count threshold was crossed (the previous behavior — see the
+ * removed `Density`/`tab_density` in tab_bar.rs). The active tab (see
+ * tab_bar.rs) never wears .tab-date/.tab-topic at all, so it's exempt from
+ * this and always shows every layer regardless of width.
+ */
+.tab-item {
+    container-type: inline-size;
+}
+@container (max-width: 199px) {
+    .tab-item .tab-topic {
+        display: none;
+    }
+}
+@container (max-width: 84px) {
+    .tab-item .tab-date {
+        display: none;
+    }
+}

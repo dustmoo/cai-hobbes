@@ -6,37 +6,6 @@ use crate::settings::{Settings, UiState};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
-/// How much room the tab strip has to spend on each chat tab's identity
-/// layers (emoji · date · topic). Chosen purely from the number of open chat
-/// tabs — see [`tab_density`] — never from pixel measurement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Density {
-    /// emoji · date · topic all shown.
-    Roomy,
-    /// emoji · date shown; topic dropped.
-    Medium,
-    /// emoji only.
-    Crowded,
-}
-
-/// Open-chat-tab count at/under which the strip stays [`Density::Roomy`].
-pub const DENSITY_ROOMY_MAX: usize = 6;
-/// Open-chat-tab count at/under which the strip stays [`Density::Medium`]
-/// (above [`DENSITY_ROOMY_MAX`]); beyond this it's [`Density::Crowded`].
-pub const DENSITY_MEDIUM_MAX: usize = 10;
-
-/// Pure density selector — the ACTIVE tab always renders all three layers
-/// regardless of what this returns (see the render loop).
-pub fn tab_density(open_chat_tabs: usize) -> Density {
-    if open_chat_tabs <= DENSITY_ROOMY_MAX {
-        Density::Roomy
-    } else if open_chat_tabs <= DENSITY_MEDIUM_MAX {
-        Density::Medium
-    } else {
-        Density::Crowded
-    }
-}
-
 #[derive(Props, PartialEq, Clone)]
 pub struct TabBarProps {
     pub open_tabs: Vec<String>,
@@ -209,11 +178,26 @@ pub fn TabBar(props: TabBarProps) -> Element {
                 }
             }
 
-            // Tab items — density from open-chat-tab count decides how many
-            // identity layers (emoji · date · topic) each non-active tab
-            // gets; the active tab always shows all three (see `tab_density`).
+            // Tab items — each chat tab's identity layers (emoji · date ·
+            // topic) degrade based on that tab's OWN rendered width (a CSS
+            // container query keyed to the ".tab-item" div below, in
+            // assets/main.css), not on how many tabs happen to be open.
+            // Previously this was a hard cliff computed purely from
+            // `open_tabs.len()` (see the removed `tab_density`/`Density`):
+            // three fixed tiers (<=6 tabs showed everything, 7-10 dropped
+            // the topic, >10 dropped the date too) that applied to every
+            // non-active tab identically and all at once. Opening one more
+            // tab that crossed a tier boundary made every other already-open
+            // tab lose information in the same frame — a jarring whole-strip
+            // "shift" a user could feel and reported getting lost from.
+            // Continuous per-tab shrinking (like real browser tabs) means
+            // each tab degrades only as its own box actually gets tight, and
+            // adding one tab nudges neighbors gradually instead of flipping
+            // a global switch. The active tab is still exempted (see
+            // `is_active` below) — it doesn't wear the CSS classes that
+            // container queries hide, so it always shows every layer
+            // regardless of width, same guarantee as before.
             {
-                let density = tab_density(props.open_tabs.len());
                 rsx! {
                     for (idx, session_id) in props.open_tabs.iter().enumerate() {
                         {
@@ -232,8 +216,6 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     let profile = props.tab_profile.get(idx).cloned().flatten();
                     let has_summary = emoji.is_some() || topic.is_some();
                     let show_emoji = emoji.is_some();
-                    let show_date = is_active || !has_summary || matches!(density, Density::Roomy | Density::Medium);
-                    let show_topic = has_summary && topic.is_some() && (is_active || matches!(density, Density::Roomy));
                     // Collapsed tabs keep the full identity in the tooltip,
                     // regardless of what the collapsed layers show.
                     let tooltip = {
@@ -260,9 +242,9 @@ pub fn TabBar(props: TabBarProps) -> Element {
                         div {
                             key: "{session_id_key}",
                             class: if is_active {
-                                "group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink overflow-hidden select-none bg-card border-b-2 border-b-primary-500"
+                                "tab-item group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink overflow-hidden select-none bg-card border-b-2 border-b-primary-500"
                             } else {
-                                "group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink overflow-hidden select-none hover:bg-card"
+                                "tab-item group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink overflow-hidden select-none hover:bg-card"
                             },
                             title: "{tooltip}",
                             onclick: move |_| {
@@ -370,15 +352,27 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                             "{date}"
                                         }
                                     } else {
-                                        if show_date {
-                                            span {
-                                                class: "font-mono text-[11px] text-fg-muted tabular-nums shrink-0",
-                                                "{date}"
-                                            }
+                                        span {
+                                            // The container-query classes
+                                            // (tab-date/tab-topic, defined in
+                                            // main.css against the ".tab-item"
+                                            // wrapper above) only take effect
+                                            // when actually present in the
+                                            // class list — the active tab
+                                            // omits them so it's exempt from
+                                            // width-based hiding, same
+                                            // guarantee the old density
+                                            // system gave it explicitly.
+                                            class: if is_active { "font-mono text-[11px] text-fg-muted tabular-nums shrink-0" } else { "tab-date font-mono text-[11px] text-fg-muted tabular-nums shrink-0" },
+                                            "{date}"
                                         }
-                                        if show_topic {
+                                        if topic.is_some() {
                                             span {
-                                                class: if is_active { "truncate text-xs text-fg font-medium" } else { "truncate text-xs text-fg-muted" },
+                                                class: if is_active {
+                                                    "truncate text-xs text-fg font-medium"
+                                                } else {
+                                                    "tab-topic truncate text-xs text-fg-muted"
+                                                },
                                                 "{topic.clone().unwrap_or_default()}"
                                             }
                                         }
@@ -577,29 +571,5 @@ fn TabBarIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq +
                 icon: icon,
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tab_density_tests {
-    use super::*;
-
-    #[test]
-    fn roomy_at_and_under_the_threshold() {
-        assert_eq!(tab_density(0), Density::Roomy);
-        assert_eq!(tab_density(1), Density::Roomy);
-        assert_eq!(tab_density(DENSITY_ROOMY_MAX), Density::Roomy);
-    }
-
-    #[test]
-    fn medium_just_above_roomy_and_at_its_own_threshold() {
-        assert_eq!(tab_density(DENSITY_ROOMY_MAX + 1), Density::Medium);
-        assert_eq!(tab_density(DENSITY_MEDIUM_MAX), Density::Medium);
-    }
-
-    #[test]
-    fn crowded_above_the_medium_threshold() {
-        assert_eq!(tab_density(DENSITY_MEDIUM_MAX + 1), Density::Crowded);
-        assert_eq!(tab_density(50), Density::Crowded);
     }
 }
