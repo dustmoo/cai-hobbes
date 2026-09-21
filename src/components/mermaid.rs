@@ -72,10 +72,24 @@ async fn ensure_mermaid_loaded() -> Result<(), String> {
                         // failures through the styled "Diagram may be out of
                         // date" message; this only stops mermaid's *own*
                         // fallback UI from ever becoming visible.
+                        //
+                        // Width/height matter here beyond just being
+                        // off-screen: some diagram types (gantt) measure
+                        // `elem.parentElement.offsetWidth` during layout to
+                        // pick their own timeline scale, instead of relying
+                        // solely on content geometry like flowcharts/
+                        // mindmaps do. A 1x1 sandbox reads back as a real
+                        // (not undefined) offsetWidth of 1, so mermaid
+                        // dutifully lays the whole chart out across one
+                        // pixel — the SVG still "renders" but is crushed to
+                        // a hairline. Match this to a normal message-column
+                        // width so gantt (and anything else that measures
+                        // its container) gets sane geometry independent of
+                        // where the diagram happens to land in the DOM.
                         if (!document.getElementById('hobbes-mermaid-sandbox')) {{
                             const sandbox = document.createElement('div');
                             sandbox.id = 'hobbes-mermaid-sandbox';
-                            sandbox.style.cssText = 'position:fixed;top:-99999px;left:-99999px;width:1px;height:1px;overflow:hidden;pointer-events:none;';
+                            sandbox.style.cssText = 'position:fixed;top:-99999px;left:-99999px;width:1200px;height:800px;overflow:hidden;pointer-events:none;';
                             document.body.appendChild(sandbox);
                         }}
                         if (!window.__hobbesMermaidInit) {{
