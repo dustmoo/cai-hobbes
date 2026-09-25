@@ -743,13 +743,8 @@ You MUST respond with valid JSON containing exactly these fields:
 
         let content = extract_output_text(&response_json);
         if !content.is_empty() {
-            if let Ok(json_value) = serde_json::from_str::<Value>(&content) {
+            if let Some(json_value) = super::extract_json_object(&content) {
                 return Ok(json_value);
-            }
-            if let (Some(start), Some(end)) = (content.find('{'), content.rfind('}')) {
-                if let Ok(json_value) = serde_json::from_str::<Value>(&content[start..=end]) {
-                    return Ok(json_value);
-                }
             }
             tracing::warn!("OpenAI Responses: summary not valid JSON, using raw text.");
             return Ok(json!({ "summary": content, "entities": {}, "sentiment": "neutral" }));

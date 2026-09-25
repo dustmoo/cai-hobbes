@@ -691,22 +691,8 @@ You MUST respond with valid JSON containing exactly these fields:
         // Extract content from OpenAI response format:
         // { "choices": [{ "message": { "content": "..." } }] }
         if let Some(content) = response_json["choices"][0]["message"]["content"].as_str() {
-            // Try parsing as JSON
-            if let Ok(json_value) = serde_json::from_str(content) {
+            if let Some(json_value) = super::extract_json_object(content) {
                 return Ok(json_value);
-            }
-
-            // Fallback: extract JSON from markdown code block
-            if let Some(start) = content.find('{') {
-                if let Some(end) = content.rfind('}') {
-                    let potential_json = &content[start..=end];
-                    if let Ok(json_value) = serde_json::from_str(potential_json) {
-                        tracing::warn!(
-                            "OpenAI Compat: Parsed summary JSON from markdown code block."
-                        );
-                        return Ok(json_value);
-                    }
-                }
             }
 
             // Last resort: wrap raw text as summary

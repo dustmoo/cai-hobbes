@@ -95,6 +95,24 @@ pub fn strip_thought_signatures(messages: &mut [ChatMessage]) {
     }
 }
 
+/// Pull the JSON object out of a model's summary reply, tolerating the ways
+/// smaller (often local) models wrap it: surrounding prose, a code fence, or
+/// a stray extra brace (`{{"summary": … }` was seen from a local model). Tries
+/// the whole text, then parses from each `{` in turn and keeps the first
+/// complete object, ignoring whatever trails it.
+pub fn extract_json_object(text: &str) -> Option<serde_json::Value> {
+    if let Ok(v @ serde_json::Value::Object(_)) = serde_json::from_str(text.trim()) {
+        return Some(v);
+    }
+    text.match_indices('{').take(16).find_map(|(i, _)| {
+        serde_json::Deserializer::from_str(&text[i..])
+            .into_iter::<serde_json::Value>()
+            .next()
+            .and_then(Result::ok)
+            .filter(serde_json::Value::is_object)
+    })
+}
+
 /// Build a connector for a specific connector instance, optionally overriding
 /// the chat model (per-session model pins). Gemini connectors share a
 /// process-wide cache store, so per-request construction does not orphan
@@ -272,6 +290,23 @@ mod tests {
         let odd = StubConnector(serde_json::json!({"summary": "", "other": 1}));
         let out = odd.generate_fleet_rollup("framed".into()).await.unwrap();
         assert!(out.contains("other"));
+    }
+
+    #[test]
+    fn extract_json_object_tolerates_wrapping() {
+        let want = serde_json::json!({"summary": "did x", "tab_emoji": "🧾"});
+        for text in [
+            r#"{"summary":"did x","tab_emoji":"🧾"}"#,
+            // Stray leading brace, as a local model returned it.
+            r#"{{"summary":"did x","tab_emoji":"🧾"}"#,
+            // Stray trailing brace.
+            r#"{"summary":"did x","tab_emoji":"🧾"}}"#,
+            "Here you go:\n```json\n{\"summary\":\"did x\",\"tab_emoji\":\"🧾\"}\n```",
+        ] {
+            assert_eq!(extract_json_object(text), Some(want.clone()), "{text}");
+        }
+        assert_eq!(extract_json_object("no json here"), None);
+        assert_eq!(extract_json_object("[1, 2]"), None);
     }
 
     #[tokio::test]

@@ -391,7 +391,23 @@ pub fn rollup_framing(date: NaiveDate, lines: &[String], total_minutes: u32) -> 
 /// day card) — the cache key lives next to its writer.
 pub fn load_rollup(date: NaiveDate) -> Option<DayRollup> {
     crate::session_store::meta_get(&rollup_meta_key(date))
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| serde_json::from_str::<DayRollup>(&s).ok())
+        .map(|mut rollup| {
+            rollup.narrative = unwrap_narrative(rollup.narrative);
+            rollup
+        })
+}
+
+/// A narrative cached before the summary parser tolerated wrapped JSON holds
+/// the model's whole reply (`{{"summary": …}`); show its `summary` instead.
+fn unwrap_narrative(narrative: String) -> String {
+    if !narrative.trim_start().starts_with('{') {
+        return narrative;
+    }
+    crate::llm::extract_json_object(&narrative)
+        .and_then(|v| v.get("summary").and_then(|s| s.as_str()).map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(narrative)
 }
 
 /// Generate (and cache) the day rollup for `date` with the same connector
@@ -455,6 +471,17 @@ pub async fn generate_day_rollup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_wrapped_narrative_is_unwrapped() {
+        let wrapped = r#"{{"summary":"Shipped briefs.","sentiment":"good"}"#.to_string();
+        assert_eq!(unwrap_narrative(wrapped), "Shipped briefs.");
+        let plain = "Today's sessions shipped briefs.".to_string();
+        assert_eq!(unwrap_narrative(plain.clone()), plain);
+        // Unparseable braces stay as they were rather than vanishing.
+        let odd = "{not json".to_string();
+        assert_eq!(unwrap_narrative(odd.clone()), odd);
+    }
     use crate::fleet::transcript::TranscriptDigest;
     use chrono::TimeZone;
 

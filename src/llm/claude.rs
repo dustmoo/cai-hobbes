@@ -526,17 +526,8 @@ You MUST respond with ONLY valid JSON (no prose, no markdown fences) containing 
             return Ok(serde_json::Value::Null);
         }
 
-        if let Ok(json_value) = serde_json::from_str::<Value>(text) {
+        if let Some(json_value) = super::extract_json_object(text) {
             return Ok(json_value);
-        }
-        // Fallback: extract the JSON object from any surrounding prose.
-        if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
-            if start <= end {
-                if let Ok(json_value) = serde_json::from_str::<Value>(&text[start..=end]) {
-                    tracing::warn!("Claude: Parsed summary JSON from within prose.");
-                    return Ok(json_value);
-                }
-            }
         }
         tracing::warn!("Claude: Failed to parse summary as JSON. Using raw text.");
         Ok(json!({ "summary": text, "entities": {}, "sentiment": "neutral" }))
