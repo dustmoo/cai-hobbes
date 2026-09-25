@@ -426,6 +426,187 @@ pub fn ChatBarIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + Partia
     }
 }
 
+// --- Message timestamps ---------------------------------------------------
+//
+// Every caption under a message reads `Author · 8:04 AM`, and a divider marks
+// the first message of each local day. The pure helpers work on naive local
+// times so they can be tested without depending on the machine's timezone;
+// the `*_utc` wrappers convert a stored `created_at` to local time.
+
+fn to_local(ts: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDateTime {
+    ts.with_timezone(&chrono::Local).naive_local()
+}
+
+/// The short time shown in a caption, e.g. `8:04 AM`.
+pub fn caption_time(ts: chrono::NaiveDateTime) -> String {
+    ts.format("%-I:%M %p").to_string()
+}
+
+/// The full stamp shown on hover, e.g. `Fri, Sep 25, 2026 · 8:04:29 AM`.
+pub fn full_timestamp(ts: chrono::NaiveDateTime) -> String {
+    ts.format("%a, %b %-d, %Y · %-I:%M:%S %p").to_string()
+}
+
+/// Label for the divider before the first message of `day`:
+/// `Today · Fri, Sep 25`, `Yesterday · Thu, Sep 24`, `Tue, Sep 15`, or
+/// `Tue, Dec 9, 2025` once it's outside the current year.
+pub fn day_divider_label(day: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    let short = day.format("%a, %b %-d");
+    if day == today {
+        format!("Today · {short}")
+    } else if today.pred_opt() == Some(day) {
+        format!("Yesterday · {short}")
+    } else if day.year() == today.year() {
+        short.to_string()
+    } else {
+        day.format("%a, %b %-d, %Y").to_string()
+    }
+}
+
+/// Whether a caption should carry its time. A caption repeats the previous
+/// one's time only when the author and the local minute both match (e.g. an
+/// activity block and the reply that follows it in the same minute), and then
+/// the time is dropped.
+pub fn caption_shows_time(
+    prev: Option<(&str, chrono::NaiveDateTime)>,
+    cur: (&str, chrono::NaiveDateTime),
+) -> bool {
+    use chrono::Timelike;
+    match prev {
+        Some((prev_author, prev_ts)) => {
+            prev_author != cur.0
+                || prev_ts.date() != cur.1.date()
+                || prev_ts.hour() != cur.1.hour()
+                || prev_ts.minute() != cur.1.minute()
+        }
+        None => true,
+    }
+}
+
+/// [`caption_shows_time`] over stored UTC stamps.
+pub fn caption_shows_time_utc(
+    prev: Option<(&str, chrono::DateTime<chrono::Utc>)>,
+    cur: (&str, chrono::DateTime<chrono::Utc>),
+) -> bool {
+    caption_shows_time(prev.map(|(a, ts)| (a, to_local(ts))), (cur.0, to_local(cur.1)))
+}
+
+/// The divider label to render before a message stamped `cur`, or `None` when
+/// it falls on the same local day as the previous rendered message.
+pub fn day_divider_utc(
+    prev: Option<chrono::DateTime<chrono::Utc>>,
+    cur: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let day = to_local(cur).date();
+    if prev.map(|p| to_local(p).date()) == Some(day) {
+        return None;
+    }
+    Some(day_divider_label(day, chrono::Local::now().date_naive()))
+}
+
+/// The muted caption under a message: `Hobbes · 8:04 AM`, with the full
+/// stamp on hover. `show_time: false` renders the label alone (see
+/// [`caption_shows_time`]).
+#[component]
+pub fn MessageCaption(
+    label: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    #[props(default = true)] show_time: bool,
+    #[props(default = false)] align_right: bool,
+) -> Element {
+    let align = if align_right { "text-right" } else { "text-left" };
+    let local = to_local(created_at);
+    rsx! {
+        div {
+            class: "text-xs text-fg-muted mt-1 px-2 {align}",
+            "{label}"
+            if show_time {
+                span {
+                    class: "cursor-default",
+                    title: "{full_timestamp(local)}",
+                    " · {caption_time(local)}"
+                }
+            }
+        }
+    }
+}
+
+/// Centered hairline marking the first message of a local day.
+#[component]
+pub fn DayDivider(label: String) -> Element {
+    rsx! {
+        div {
+            class: "flex items-center gap-3 pt-1",
+            div { class: "flex-1 border-t border-faint" }
+            div { class: "text-[11px] font-semibold tracking-wide text-fg-muted", "{label}" }
+            div { class: "flex-1 border-t border-faint" }
+        }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn at(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> chrono::NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, s)
+            .unwrap()
+    }
+
+    #[test]
+    fn caption_time_is_12h_without_leading_zero() {
+        assert_eq!(caption_time(at(2026, 9, 25, 8, 4, 29)), "8:04 AM");
+        assert_eq!(caption_time(at(2026, 9, 24, 21, 12, 0)), "9:12 PM");
+        assert_eq!(caption_time(at(2026, 9, 25, 0, 5, 0)), "12:05 AM");
+    }
+
+    #[test]
+    fn full_timestamp_has_date_and_seconds() {
+        assert_eq!(
+            full_timestamp(at(2026, 9, 25, 8, 4, 29)),
+            "Fri, Sep 25, 2026 · 8:04:29 AM"
+        );
+    }
+
+    #[test]
+    fn divider_labels_by_distance_from_today() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 25).unwrap();
+        let day = |m, d| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+        assert_eq!(day_divider_label(today, today), "Today · Fri, Sep 25");
+        assert_eq!(day_divider_label(day(9, 24), today), "Yesterday · Thu, Sep 24");
+        assert_eq!(day_divider_label(day(9, 15), today), "Tue, Sep 15");
+        assert_eq!(
+            day_divider_label(NaiveDate::from_ymd_opt(2025, 12, 9).unwrap(), today),
+            "Tue, Dec 9, 2025"
+        );
+    }
+
+    #[test]
+    fn yesterday_crosses_a_year_boundary() {
+        let today = NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+        let dec31 = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        assert_eq!(day_divider_label(dec31, today), "Yesterday · Thu, Dec 31");
+    }
+
+    #[test]
+    fn time_hidden_only_for_same_author_same_minute() {
+        let t = at(2026, 9, 24, 21, 12, 5);
+        assert!(caption_shows_time(None, ("Hobbes", t)));
+        // Author changed.
+        assert!(caption_shows_time(Some(("User", t)), ("Hobbes", at(2026, 9, 24, 21, 12, 40))));
+        // Same author, same minute: activity block then its reply.
+        assert!(!caption_shows_time(Some(("Hobbes", t)), ("Hobbes", at(2026, 9, 24, 21, 12, 58))));
+        // Same author, a later minute: a long tool run still shows.
+        assert!(caption_shows_time(Some(("Hobbes", t)), ("Hobbes", at(2026, 9, 24, 21, 14, 0))));
+        // Same clock minute on a different day.
+        assert!(caption_shows_time(Some(("Hobbes", t)), ("Hobbes", at(2026, 9, 25, 21, 12, 5))));
+    }
+}
+
 #[cfg(test)]
 mod signature_provider_tests {
     use super::*;

@@ -8,7 +8,7 @@ use super::forget_memory_modal::ForgetMemoryModal;
 use super::message_list::MessageList;
 use super::new_chat_memory_modal::NewChatMemoryModal;
 use super::quick_fix::QuickFix;
-use super::shared::{DraftContext, MessageContent, SessionIdContext, StreamMessage};
+use super::shared::{DraftContext, MessageCaption, MessageContent, SessionIdContext, StreamMessage};
 use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRenderer};
 use crate::components::stream_manager::StreamManagerContext;
 use crate::context::permissions::PermissionManager;
@@ -1501,6 +1501,10 @@ pub fn MessageBubble(
     #[props(default)] on_edit_save: EventHandler<String>,
     #[props(default)] on_edit_resend: EventHandler<String>,
     on_comment: EventHandler<()>,
+    /// Whether the caption carries its time; the list drops it when the
+    /// previous caption shares this author and minute.
+    #[props(default = true)]
+    show_time: bool,
 ) -> Element {
     let is_user = message.author == "User";
 
@@ -1818,11 +1822,6 @@ pub fn MessageBubble(
             } else {
                 "flex justify-start"
             };
-            let author_classes = format!(
-                "text-xs text-fg-muted mt-1 px-2 {}",
-                if is_user { "text-right" } else { "text-left" }
-            );
-
             let _button_position_classes = if is_user {
                 "absolute bottom-[-10px] left-[-10px]"
             } else {
@@ -2401,9 +2400,11 @@ pub fn MessageBubble(
                             }
                         }
                     }
-                    div {
-                        class: "{author_classes}",
-                        "{message.author}"
+                    MessageCaption {
+                        label: message.author.clone(),
+                        created_at: message.created_at,
+                        show_time,
+                        align_right: is_user,
                     }
                 }
             }
@@ -2412,7 +2413,6 @@ pub fn MessageBubble(
         MessageContent::Error { message: error_msg } => {
             let container_classes = "flex justify-start";
             let bubble_classes = "bg-red-900 border border-red-700 text-fg self-start mr-auto";
-            let author_classes = "text-xs text-fg-muted mt-1 px-2 text-left";
 
             rsx! {
                 div {
@@ -2447,9 +2447,10 @@ pub fn MessageBubble(
                                 }
                             }
                         }
-                        div {
-                            class: "{author_classes}",
-                            "{message.author}"
+                        MessageCaption {
+                            label: message.author.clone(),
+                            created_at: message.created_at,
+                            show_time,
                         }
                     }
                 }

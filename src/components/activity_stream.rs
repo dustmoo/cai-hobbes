@@ -787,6 +787,10 @@ pub struct ActivityStreamProps {
     pub profile_name: String,
     pub connector_label: String,
     pub on_stop: EventHandler<()>,
+    /// Whether the caption carries its time; the list drops it when the
+    /// previous caption shares this author and minute.
+    #[props(default = true)]
+    pub show_time: bool,
 }
 
 #[component]
@@ -1026,7 +1030,11 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
                         }
                     }
                 }
-                div { class: "text-xs text-fg-muted mt-1 px-2 text-left", "Hobbes" }
+                crate::components::shared::MessageCaption {
+                    label: "Hobbes".to_string(),
+                    created_at: messages[0].created_at,
+                    show_time: props.show_time,
+                }
             }
         }
         if props.is_live {

@@ -10,7 +10,10 @@ use crate::components::activity_stream::{
 use crate::components::tool_call_display::{PermissionPrompt, ToolCallDisplay};
 
 use super::chat::{MessageBubble, WelcomeMessage};
-use super::shared::{MessageContent, SessionIdContext};
+use super::shared::{
+    caption_shows_time_utc, day_divider_utc, DayDivider, MessageCaption, MessageContent,
+    SessionIdContext,
+};
 
 const INITIAL_MESSAGES_TO_SHOW: usize = 20;
 
@@ -32,6 +35,44 @@ fn item_key(item: &RenderItem, sorted_messages: &[crate::components::chat::Messa
         RenderItem::Run(run) => sorted_messages[run.start].id.to_string(),
         RenderItem::Single(idx) => sorted_messages[*idx].id.to_string(),
     }
+}
+
+/// The caption an item renders under itself — `(label, created_at)` — or
+/// `None` when the item renders nothing (an empty text message whose thinking
+/// was absorbed into an activity block). Mirrors the labels each arm of the
+/// `MessageList` match paints, so the repeat and day-divider rules see exactly
+/// the captions on screen.
+fn item_caption<'a>(
+    item: &RenderItem,
+    sorted_messages: &'a [crate::components::chat::Message],
+    is_generating: impl Fn(&Uuid) -> bool,
+) -> Option<(&'a str, chrono::DateTime<chrono::Utc>)> {
+    let message = match item {
+        RenderItem::Run(run) => return Some(("Hobbes", sorted_messages[run.start].created_at)),
+        RenderItem::Single(idx) => &sorted_messages[*idx],
+    };
+    let label = match &message.content {
+        MessageContent::Text { content, .. } => {
+            let renders = !content.trim().is_empty()
+                || is_generating(&message.id)
+                || !message.attachments.is_empty();
+            if !renders {
+                return None;
+            }
+            message.author.as_str()
+        }
+        MessageContent::ToolCall(_) | MessageContent::Error { .. } => message.author.as_str(),
+        MessageContent::PermissionRequest(_) => "System",
+        MessageContent::SkillCall(_) | MessageContent::SkillPermissionRequest(_) => "User",
+    };
+    Some((label, message.created_at))
+}
+
+/// Per-item timestamp chrome: the day divider to draw above it, and whether
+/// its caption carries a time.
+struct ItemTimestamp {
+    divider: Option<String>,
+    show_time: bool,
 }
 
 #[component]
@@ -223,7 +264,7 @@ pub fn MessageList(
                             absorb_live_placeholder(&sorted_messages, &mut runs);
                         }
                         let skip = total_messages.saturating_sub(*visible_message_count.read());
-                        let items: Vec<RenderItem> = {
+                        let items: Vec<(RenderItem, ItemTimestamp)> = {
                             let mut items = Vec::new();
                             let mut i = 0usize;
                             while i < total_messages {
@@ -238,13 +279,42 @@ pub fn MessageList(
                                     }
                                 }
                             }
+                            // Walk every item (not just the visible window) so the
+                            // first visible caption still compares against the one
+                            // above it; the oldest visible day always gets a divider.
+                            let mut prev: Option<(&str, chrono::DateTime<chrono::Utc>)> = None;
+                            let mut first_visible = true;
                             items
                                 .into_iter()
-                                .filter(|it| match it {
-                                    RenderItem::Single(i) => *i >= skip,
-                                    RenderItem::Run(r) => r.end > skip,
+                                .filter_map(|it| {
+                                    let visible = match &it {
+                                        RenderItem::Single(i) => *i >= skip,
+                                        RenderItem::Run(r) => r.end > skip,
+                                    };
+                                    let caption = item_caption(&it, &sorted_messages, |id| {
+                                        stream_manager.is_generating(id)
+                                    });
+                                    let stamp = match caption {
+                                        Some(cur) => {
+                                            let prev_ts = if visible && first_visible { None } else { prev.map(|p| p.1) };
+                                            let stamp = ItemTimestamp {
+                                                divider: day_divider_utc(prev_ts, cur.1),
+                                                show_time: caption_shows_time_utc(prev, cur),
+                                            };
+                                            prev = Some(cur);
+                                            stamp
+                                        }
+                                        None => ItemTimestamp { divider: None, show_time: true },
+                                    };
+                                    if !visible {
+                                        return None;
+                                    }
+                                    if caption.is_some() {
+                                        first_visible = false;
+                                    }
+                                    Some((it, stamp))
                                 })
-                                .collect()
+                                .collect::<Vec<(RenderItem, ItemTimestamp)>>()
                         };
                         let last_run_start = runs.last().map(|r| r.start);
 
@@ -265,9 +335,12 @@ pub fn MessageList(
                                         }
                                     }
                                 }
-                                for item in items {
+                                for (item, stamp) in items {
                                     div {
                                         key: "{item_key(&item, &sorted_messages)}",
+                                        if let Some(label) = stamp.divider.clone() {
+                                            div { class: "pb-4", DayDivider { label } }
+                                        }
                                         {
                                         let session_id = session_id.read().clone();
                                         match &item {
@@ -299,6 +372,7 @@ pub fn MessageList(
                                                     profile_name: run_profile_name,
                                                     connector_label: run_connector_label,
                                                     on_stop: move |_| on_stop.call(()),
+                                                    show_time: stamp.show_time,
                                                 }
                                             }
                                         }
@@ -337,6 +411,7 @@ pub fn MessageList(
                                                                     move |text: String| on_edit_resend.call((msg_id, text))
                                                                 },
                                                                 on_comment: move |_| on_comment.call(()),
+                                                                show_time: stamp.show_time,
                                                             }
                                                         }
                                                     } else {
@@ -351,10 +426,6 @@ pub fn MessageList(
                                                 MessageContent::ToolCall(tool_call) => {
                                                     let bubble_classes = "bg-input text-fg self-start mr-auto";
                                                     let container_classes = "flex justify-start";
-                                                    let author_classes = format!(
-                                                        "text-xs text-fg-muted mt-1 px-2 {}",
-                                                        "text-left"
-                                                    );
                                                     rsx! {
                                                         div {
                                                             class: "{container_classes} w-full",
@@ -368,9 +439,10 @@ pub fn MessageList(
                                                                         token_display_mode: ui_state.read().token_display_mode.clone()
                                                                     }
                                                                 }
-                                                                div {
-                                                                    class: "{author_classes}",
-                                                                    "{message.author}"
+                                                                MessageCaption {
+                                                                    label: message.author.clone(),
+                                                                    created_at: message.created_at,
+                                                                    show_time: stamp.show_time,
                                                                 }
                                                             }
                                                         }
@@ -378,7 +450,6 @@ pub fn MessageList(
                                                 }
                                                 MessageContent::PermissionRequest(tool_call) => {
                                                     let container_classes = "flex justify-start";
-                                                    let author_classes = "text-xs text-fg-muted mt-1 px-2 text-left";
                                                     rsx! {
                                                         div {
                                                             class: "{container_classes} w-full",
@@ -388,9 +459,10 @@ pub fn MessageList(
                                                                     tool_call: tool_call.clone(),
                                                                     session_id: session_id.clone(),
                                                                 },
-                                                                div {
-                                                                    class: "{author_classes}",
-                                                                    "System"
+                                                                MessageCaption {
+                                                                    label: "System".to_string(),
+                                                                    created_at: message.created_at,
+                                                                    show_time: stamp.show_time,
                                                                 }
                                                             }
                                                         }
@@ -411,12 +483,12 @@ pub fn MessageList(
                                                                 move |_| on_fork.call(msg_id)
                                                             },
                                                             on_comment: move |_| on_comment.call(()),
+                                                            show_time: stamp.show_time,
                                                         }
                                                     }
                                                 }
                                                 MessageContent::SkillCall(skill_call) => {
                                                     let container_classes = "flex justify-end text-fg";
-                                                    let author_classes = "text-xs text-fg-muted mt-1 px-2 text-right";
                                                     rsx! {
                                                         div {
                                                             class: "{container_classes} w-full",
@@ -439,9 +511,11 @@ pub fn MessageList(
                                                                         },
                                                                     }
                                                                 }
-                                                                div {
-                                                                    class: "{author_classes}",
-                                                                    "User"
+                                                                MessageCaption {
+                                                                    label: "User".to_string(),
+                                                                    created_at: message.created_at,
+                                                                    show_time: stamp.show_time,
+                                                                    align_right: true,
                                                                 }
                                                             }
                                                         }
@@ -449,7 +523,6 @@ pub fn MessageList(
                                                 }
                                                 MessageContent::SkillPermissionRequest(skill_call) => {
                                                     let container_classes = "flex justify-end text-fg";
-                                                    let author_classes = "text-xs text-fg-muted mt-1 px-2 text-right";
                                                     let execution_id = skill_call.execution_id.clone();
                                                     let message_id = message.id;
                                                     rsx! {
@@ -589,9 +662,11 @@ pub fn MessageList(
                                                                         }
                                                                     }
                                                                 }
-                                                                div {
-                                                                    class: "{author_classes}",
-                                                                    "User"
+                                                                MessageCaption {
+                                                                    label: "User".to_string(),
+                                                                    created_at: message.created_at,
+                                                                    show_time: stamp.show_time,
+                                                                    align_right: true,
                                                                 }
                                                             }
                                                         }
