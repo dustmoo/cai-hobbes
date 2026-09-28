@@ -266,6 +266,82 @@ impl IconShape for HobbesTigerFrame {
     }
 }
 
+/// A pixel speech bubble on a 16×15 grid, drawn to sit beside the tiger in
+/// the empty-chat state: `#` is the outline, `1`–`3` are the three 2×2
+/// "typing" dots (numbered so each can take its own animation delay), and the
+/// tail at the bottom-left points back toward the mascot.
+pub const CHAT_BUBBLE_GRID: [&str; 15] = [
+    "..############..",
+    ".#............#.",
+    "#..............#",
+    "#..............#",
+    "#..............#",
+    "#...11.22.33...#",
+    "#...11.22.33...#",
+    "#..............#",
+    "#..............#",
+    "#..............#",
+    "#..............#",
+    ".#............#.",
+    "..##.#########..",
+    "...#.#..........",
+    "..###...........",
+];
+
+/// [`CHAT_BUBBLE_GRID`] as an inline svg. The outline takes `currentColor`
+/// (so a `text-*` class tints it for either theme); the dots are the tiger's
+/// body orange and, with `animate`, pulse in turn via `.bubble-typing-dot`
+/// (main.css, which also honours reduced motion).
+///
+/// Not an [`IconShape`]: the dots need per-cell classes and delays.
+#[component]
+pub fn PixelChatBubble(
+    width: u32,
+    height: u32,
+    #[props(default = true)] animate: bool,
+) -> Element {
+    let dot_fill = TigerCell::Body.hex().unwrap_or("currentColor");
+    let cells = CHAT_BUBBLE_GRID.iter().enumerate().flat_map(|(y, row)| {
+        row.chars()
+            .enumerate()
+            .filter(|(_, c)| *c != '.')
+            .map(move |(x, c)| (x, y, c))
+    });
+    rsx! {
+        svg {
+            width: "{width}",
+            height: "{height}",
+            view_box: "0 0 16 15",
+            xmlns: "http://www.w3.org/2000/svg",
+            shape_rendering: "crispEdges",
+            "aria-hidden": "true",
+            for (x, y, c) in cells {
+                if let Some(dot) = c.to_digit(10) {
+                    rect {
+                        key: "{x}-{y}",
+                        x: "{x}",
+                        y: "{y}",
+                        width: "1",
+                        height: "1",
+                        fill: "{dot_fill}",
+                        class: if animate { "bubble-typing-dot" } else { "" },
+                        style: "animation-delay: {(dot - 1) as f32 * 0.6}s",
+                    }
+                } else {
+                    rect {
+                        key: "{x}-{y}",
+                        x: "{x}",
+                        y: "{y}",
+                        width: "1",
+                        height: "1",
+                        fill: "currentColor",
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Cells of air on each side of the 16×16 grid inside the raster canvas.
 const TIGER_MARGIN_CELLS: u32 = 1;
 /// Canvas edge in cells: the 16×16 mark plus one cell of air per side, so the
@@ -385,6 +461,19 @@ mod tests {
         assert_eq!(TIGER_GRID.len(), 16);
         for row in TIGER_GRID {
             assert_eq!(row.chars().count(), 16, "row {row:?}");
+        }
+    }
+
+    #[test]
+    fn chat_bubble_grid_is_16x15_with_three_2x2_dots() {
+        assert_eq!(CHAT_BUBBLE_GRID.len(), 15);
+        for row in CHAT_BUBBLE_GRID {
+            assert_eq!(row.chars().count(), 16, "row {row:?}");
+            assert!(row.chars().all(|c| matches!(c, '.' | '#' | '1' | '2' | '3')), "row {row:?}");
+        }
+        for dot in ['1', '2', '3'] {
+            let n: usize = CHAT_BUBBLE_GRID.iter().map(|r| r.matches(dot).count()).sum();
+            assert_eq!(n, 4, "dot {dot}");
         }
     }
 

@@ -2574,18 +2574,16 @@ pub fn WelcomeMessage() -> Element {
     rsx! {
         div {
             class: "flex flex-col items-center justify-center h-full text-fg-muted",
-            svg {
-                class: "w-24 h-24 mb-4",
-                fill: "none",
-                stroke: "currentColor",
-                view_box: "0 0 24 24",
-                xmlns: "http://www.w3.org/2000/svg",
-                path {
-                    stroke_linecap: "round",
-                    stroke_linejoin: "round",
-                    stroke_width: "2",
-                    d: "M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+            // The mascot beside a pixel speech bubble, tops aligned, both on
+            // the same 6px/5px pixel scale as the mockup (option B).
+            div {
+                class: "flex items-start gap-1.5 mb-6",
+                Icon {
+                    icon: crate::components::pixel_icons::HobbesTiger,
+                    width: 96,
+                    height: 96,
                 }
+                crate::components::pixel_icons::PixelChatBubble { width: 80, height: 75 }
             }
             p {
                 class: "text-lg",
