@@ -30,7 +30,12 @@ pub fn use_summarization_scheduler() {
         let processor = processor.to_owned();
         let planner = planner.to_owned();
         async move {
-            let mut last_summarized_message_count = 0;
+            // Per session: one shared counter meant a long tab (say 100
+            // messages) blocked idle summaries for every shorter tab until it
+            // outgrew that count — so newer tabs never got a summary or a
+            // tab emoji/topic.
+            let mut last_summarized: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             loop {
                 match tokio::time::timeout(INACTIVITY_DELAY, rx.next()).await {
                     Ok(Some(SchedulerSignal::Activity)) => {
@@ -100,7 +105,7 @@ pub fn use_summarization_scheduler() {
                                     },
                                 );
                             }
-                            last_summarized_message_count = current_message_count;
+                            last_summarized.insert(active_session.id.clone(), current_message_count);
                             crate::services::project_tagger::maybe_auto_tag(
                                 &active_session.id,
                                 session_state,
@@ -127,7 +132,9 @@ pub fn use_summarization_scheduler() {
 
                         let current_message_count = active_session.messages.len();
 
-                        if current_message_count > last_summarized_message_count && settings_guard.enable_summarization {
+                        let last_count =
+                            last_summarized.get(&active_session.id).copied().unwrap_or(0);
+                        if current_message_count > last_count && settings_guard.enable_summarization {
                             tracing::info!("Inactivity detected. Summarizing conversation.");
                             let processor_guard = processor.read();
                             if let Some(summary) = processor_guard
@@ -178,7 +185,7 @@ pub fn use_summarization_scheduler() {
                                         },
                                     );
                                 }
-                                last_summarized_message_count = current_message_count;
+                                last_summarized.insert(active_session.id.clone(), current_message_count);
                                 crate::services::project_tagger::maybe_auto_tag(
                                     &active_session.id,
                                     session_state,

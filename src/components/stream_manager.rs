@@ -1306,13 +1306,13 @@ impl StreamManagerContext {
                 // Without this, turns chain too fast for the 5s idle timer to fire,
                 // causing the model to lose context on long tool loops.
                 {
-                    let msg_count = self
+                    let (msg_count, needs_identity) = self
                         .session_state
                         .read()
                         .sessions
                         .get(&session_id)
-                        .map(|s| s.messages.len())
-                        .unwrap_or(0);
+                        .map(|s| (s.messages.len(), s.tab_title.is_none() && !s.name_user_set))
+                        .unwrap_or((0, false));
                     let (tuning, context_tokens, enable_summarization) = {
                         let settings_guard = self.settings.read();
                         let state_guard = self.session_state.read();
@@ -1350,7 +1350,14 @@ impl StreamManagerContext {
                         "Proactive summarizer: dynamic threshold resolved"
                     );
 
-                    if msg_count >= threshold && msg_count > 0 && enable_summarization {
+                    // An untitled tab also summarizes here: a tab working in the
+                    // background (e.g. HOBBES_DISPATCH) is never the active tab
+                    // when the idle scheduler fires, so this is its only chance
+                    // to get an emoji/topic.
+                    if (msg_count >= threshold || needs_identity)
+                        && msg_count > 0
+                        && enable_summarization
+                    {
                         // Overlap guard: skip if a proactive summary is already in-flight for THIS session.
                         if self.summarizing_sessions.read().contains(&session_id) {
                             tracing::debug!(
@@ -1363,7 +1370,8 @@ impl StreamManagerContext {
                                 msg_count,
                                 effective_limit,
                                 threshold,
-                                "Proactive summarization: messages approaching history limit"
+                                needs_identity,
+                                "Proactive summarization: history limit or untitled tab"
                             );
                             let session_snapshot =
                                 self.session_state.read().sessions.get(&session_id).cloned();
