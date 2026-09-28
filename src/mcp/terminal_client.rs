@@ -18,6 +18,13 @@
 //! chatty long-running command must cost O(cap) memory and per-chunk CPU,
 //! never O(total output). The reader thread holds only the ring Arc — never
 //! the session Arc — so Drop runs.
+//!
+//! Output attribution: EXEC/TAIL on one shell are serialized (`op_lock`),
+//! and EXEC claims the `running` marker before writing, so a timed-out or
+//! abandoned command's output is only ever returned by TAIL (or discarded by
+//! RESET) — never mixed into a later EXEC. As defence in depth, finalized
+//! output drops anything before another command's completed sentinel and
+//! scrubs any protocol sentinel text before it reaches the model.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -87,6 +94,13 @@ struct PtySession {
     _master: std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     ring: Arc<(std::sync::Mutex<OutputRing>, tokio::sync::Notify)>,
     running: std::sync::Mutex<Option<RunningCmd>>,
+    /// Serializes EXEC/TAIL on this shell. Every tool call runs in its own
+    /// spawned task, so two EXECs from one assistant turn would otherwise
+    /// both pass the `running` check, both write, and both drain the SAME
+    /// ring — each result then carries the other command's output and raw
+    /// sentinel. Held across the (bounded) read, so a waiter waits at most
+    /// one call's timeout.
+    op_lock: tokio::sync::Mutex<()>,
 }
 
 /// One `read_until_sentinel` outcome: the command finished, or the deadline
@@ -121,15 +135,17 @@ fn shape_output(output: &str, was_trimmed: bool) -> String {
     }
 }
 
-/// Full response-shaping pipeline: strip an echoed copy of the input, strip
-/// stray continuation prompts, then the existing ANSI-strip/cap/truncate
-/// shaping. Shared by EXEC's and TAIL's `Done` arms — echoed input always
-/// lands at the very front of the accumulation regardless of which call
-/// finalizes it.
+/// Full response-shaping pipeline: drop anything left over from earlier
+/// commands, strip an echoed copy of the input, strip stray continuation
+/// prompts, then the ANSI-strip/cap/truncate shaping, and finally scrub any
+/// protocol sentinel that survived. Shared by EXEC's and TAIL's `Done` arms —
+/// echoed input always lands at the very front of the accumulation
+/// regardless of which call finalizes it.
 fn finalize_output(output: &str, wrapped: &str, sentinel_line: &str, was_trimmed: bool) -> String {
-    let de_echoed = strip_echoed_input(output, wrapped, sentinel_line);
+    let own = drop_foreign_sentinel_prefix(output);
+    let de_echoed = strip_echoed_input(own, wrapped, sentinel_line);
     let de_prompted = strip_continuation_prompts(&de_echoed);
-    shape_output(&de_prompted, was_trimmed)
+    scrub_sentinels(&shape_output(&de_prompted, was_trimmed))
 }
 
 impl Drop for PtySession {
@@ -147,21 +163,43 @@ pub struct TerminalClient {
 
 // ── Pure helpers (unit-tested) ──────────────────────────────────────────────
 
-/// Find `__HOBBES_DONE_<nonce>__ <code>` in the accumulated bytes; return
+/// If `s` starts with ` <int>\r?\n` — the tail of a COMPLETE sentinel line —
+/// return (exit code, bytes consumed). A line still arriving (`__ 1` of an
+/// eventual `__ 127`) must not match, or the code is wrong and the rest of
+/// the line leaks into the next command's output.
+fn parse_sentinel_code(s: &str) -> Option<(i32, usize)> {
+    let rest = s.strip_prefix(' ')?;
+    let digits_start = usize::from(rest.starts_with('-'));
+    let digits_len = rest[digits_start..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    if digits_len == 0 {
+        return None;
+    }
+    let num_end = digits_start + digits_len;
+    let code = rest[..num_end].parse::<i32>().ok()?;
+    let after = &rest[num_end..];
+    let eol = if after.starts_with("\r\n") {
+        2
+    } else if after.starts_with('\n') {
+        1
+    } else {
+        return None;
+    };
+    Some((code, 1 + num_end + eol))
+}
+
+/// Find `__HOBBES_DONE_<nonce>__ <code>\n` in the accumulated bytes; return
 /// (output before it, exit code). The tty ECHOES the typed command, so the
 /// first occurrence is usually the echoed printf format (followed by `%d`,
-/// not a number) — scan every occurrence until one parses.
+/// not a number) — scan every occurrence until one parses as a complete line.
 pub(crate) fn split_at_sentinel(buf: &[u8], sentinel: &str) -> Option<(String, i32)> {
     let text = String::from_utf8_lossy(buf);
     let mut search = 0usize;
     while let Some(rel) = text[search..].find(sentinel) {
         let idx = search + rel;
-        let after = &text[idx + sentinel.len()..];
-        if let Some(code) = after
-            .split_whitespace()
-            .next()
-            .and_then(|t| t.parse::<i32>().ok())
-        {
+        if let Some((code, _)) = parse_sentinel_code(&text[idx + sentinel.len()..]) {
             return Some((text[..idx].to_string(), code));
         }
         search = idx + sentinel.len();
@@ -169,10 +207,207 @@ pub(crate) fn split_at_sentinel(buf: &[u8], sentinel: &str) -> Option<(String, i
     None
 }
 
-/// Strip ANSI escapes and keep the LAST `cap` bytes (UTF-8-safe), marking
-/// truncation.
+/// Locate the next protocol sentinel token at or after `from`:
+/// `__HOBBES_DONE_<32 hex>__` or `__HOBBES_INIT_<32 hex>__` (the nonce is a
+/// simple-format UUID). Returns its byte range. Requiring the full hex nonce
+/// keeps source code that merely mentions the format (`__HOBBES_DONE_{nonce}__`)
+/// from matching.
+fn find_sentinel_token(s: &str, from: usize) -> Option<(usize, usize)> {
+    const NONCE_LEN: usize = 32;
+    let mut search = from;
+    while let Some(rel) = s[search..].find("__HOBBES_") {
+        let start = search + rel;
+        let after_prefix = &s[start + "__HOBBES_".len()..];
+        if after_prefix.starts_with("DONE_") || after_prefix.starts_with("INIT_") {
+            let nonce = &after_prefix.as_bytes()["DONE_".len()..];
+            if nonce.len() >= NONCE_LEN + 2
+                && nonce[..NONCE_LEN]
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+                && &nonce[NONCE_LEN..NONCE_LEN + 2] == b"__"
+            {
+                let end = start + "__HOBBES_DONE_".len() + NONCE_LEN + 2;
+                return Some((start, end));
+            }
+        }
+        search = start + "__HOBBES_".len();
+    }
+    None
+}
+
+/// Drop everything up to and including the LAST completed sentinel line of
+/// ANOTHER command (or the init line) in a finished command's output. The
+/// shell runs lines strictly in order, so anything before a completed foreign
+/// sentinel belongs to earlier work — late init residue when the bounded init
+/// wait gave up, or a command whose reader went away — never to this one.
+/// Only called on text that precedes this command's own sentinel, so its own
+/// line can't be matched here (and its echoed printf has `%d`, not a code).
+pub(crate) fn drop_foreign_sentinel_prefix(output: &str) -> &str {
+    let mut cut = None;
+    let mut search = 0usize;
+    while let Some((_, end)) = find_sentinel_token(output, search) {
+        if let Some((_, consumed)) = parse_sentinel_code(&output[end..]) {
+            cut = Some(end + consumed);
+        }
+        search = end;
+    }
+    cut.map_or(output, |c| &output[c..])
+}
+
+/// Last line of defence: no raw protocol sentinel may ever reach the model.
+/// A line that is nothing but a sentinel (`__HOBBES_DONE_… 0`) or an echoed
+/// sentinel `printf` is removed outright; any other occurrence has just the
+/// token replaced, so a genuine output line around it survives.
+pub(crate) fn scrub_sentinels(text: &str) -> String {
+    if find_sentinel_token(text, 0).is_none() {
+        return text.to_string();
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        let Some((start, end)) = find_sentinel_token(line, 0) else {
+            kept.push(line.to_string());
+            continue;
+        };
+        let before = line[..start].trim();
+        let after = line[end..].trim();
+        let bare = before.is_empty()
+            && (after.is_empty() || after.trim_start_matches('-').parse::<u32>().is_ok());
+        let echoed_printf = before.starts_with("printf ");
+        if bare || echoed_printf {
+            continue;
+        }
+        let mut cleaned = String::with_capacity(line.len());
+        let mut pos = 0usize;
+        while let Some((s, e)) = find_sentinel_token(line, pos) {
+            cleaned.push_str(&line[pos..s]);
+            cleaned.push_str("[hobbes-sentinel]");
+            pos = e;
+        }
+        cleaned.push_str(&line[pos..]);
+        kept.push(cleaned);
+    }
+    kept.join("\n")
+}
+
+/// Render raw pty output to plain text the way a terminal would display it:
+/// strip escape sequences (CSI, OSC, DCS/SOS/PM/APC strings, charset and
+/// other two-byte escapes) while KEEPING tabs and newlines. `\r` returns to
+/// column 0 and later text overwrites (so progress bars collapse to their
+/// final state), backspace steps back, and `ESC[K` erases. Every other
+/// control character is dropped.
+///
+/// Replaces `strip_ansi_escapes::strip_str`, whose vte-based parser executes
+/// C0 controls without emitting them — it silently deleted `\t`, turning
+/// `printf 'A\tB'` into `AB` and gluing `ls` columns together.
+pub(crate) fn strip_terminal_controls(raw: &str) -> String {
+    fn put(line: &mut Vec<char>, col: &mut usize, c: char) {
+        while line.len() < *col {
+            line.push(' ');
+        }
+        if *col < line.len() {
+            line[*col] = c;
+        } else {
+            line.push(c);
+        }
+        *col += 1;
+    }
+
+    let mut out = String::with_capacity(raw.len());
+    let mut line: Vec<char> = Vec::new();
+    let mut col = 0usize;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        let csi = match c {
+            '\u{1b}' => match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    true
+                }
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    // String sequence: runs to BEL or ST (`ESC \`).
+                    chars.next();
+                    while let Some(p) = chars.next() {
+                        if p == '\u{07}' {
+                            break;
+                        }
+                        if p == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some(p) if ('\u{20}'..='\u{2f}').contains(&p) => {
+                    // nF escape (e.g. `ESC ( B`): intermediates then a final.
+                    while chars.next_if(|p| ('\u{20}'..='\u{2f}').contains(p)).is_some() {}
+                    chars.next();
+                    continue;
+                }
+                Some(p) if ('\u{30}'..='\u{7e}').contains(&p) => {
+                    // Two-byte escape (`ESC =`, `ESC 7`, `ESC M`, …).
+                    chars.next();
+                    continue;
+                }
+                _ => continue,
+            },
+            '\u{9b}' => true,
+            _ => false,
+        };
+        if csi {
+            // Parameter/intermediate bytes, then a final byte. A byte outside
+            // the CSI ranges aborts the sequence and is processed normally,
+            // so a malformed escape can't swallow real text or a newline.
+            let mut params = String::new();
+            let mut fin = None;
+            while let Some(&p) = chars.peek() {
+                if ('\u{20}'..='\u{3f}').contains(&p) {
+                    params.push(p);
+                    chars.next();
+                } else {
+                    if ('\u{40}'..='\u{7e}').contains(&p) {
+                        fin = Some(p);
+                        chars.next();
+                    }
+                    break;
+                }
+            }
+            if fin == Some('K') {
+                match params.as_str() {
+                    "" | "0" => line.truncate(col),
+                    "1" => {
+                        for slot in line.iter_mut().take(col + 1) {
+                            *slot = ' ';
+                        }
+                    }
+                    "2" => line.clear(),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        match c {
+            '\n' => {
+                out.extend(line.drain(..));
+                out.push('\n');
+                col = 0;
+            }
+            '\r' => col = 0,
+            '\u{08}' => col = col.saturating_sub(1),
+            '\t' => put(&mut line, &mut col, c),
+            c if c.is_control() => {}
+            c => put(&mut line, &mut col, c),
+        }
+    }
+    out.extend(line);
+    out
+}
+
+/// Strip terminal controls and keep the LAST `cap` bytes (UTF-8-safe),
+/// marking truncation.
 pub(crate) fn clean_output(raw: &str, cap: usize) -> String {
-    let stripped = strip_ansi_escapes::strip_str(raw);
+    let stripped = strip_terminal_controls(raw);
     let trimmed = stripped.trim_matches(|c| c == '\r' || c == '\n');
     if trimmed.len() <= cap {
         return trimmed.to_string();
@@ -366,6 +601,7 @@ fn spawn_shell(cwd: &str, init_sentinel: &str) -> Result<PtySession, String> {
         _master: std::sync::Mutex::new(pair.master),
         ring,
         running: std::sync::Mutex::new(None),
+        op_lock: tokio::sync::Mutex::new(()),
     };
 
     // Neuter prompts/echo so the sentinel protocol sees clean output, then
@@ -438,7 +674,8 @@ impl TerminalClient {
         // everything up to and including it — init output (zprofile sourcing,
         // any stray echo before `stty -echo` takes effect) must never reach a
         // response. Best-effort: if the shell is unusually slow, or dies, the
-        // normal EXEC path below will surface the problem.
+        // normal EXEC path below will surface the problem, and late init
+        // residue is cut by `drop_foreign_sentinel_prefix` at finalize time.
         let _ = self
             .read_until_sentinel(&fresh, &init_sentinel, 2, Vec::new(), false)
             .await;
@@ -487,17 +724,7 @@ impl TerminalClient {
             .clamp(1, MAX_EXEC_TIMEOUT_SECS);
 
         let session = self.session_for(ctx).await?;
-        {
-            let running = session.running.lock().map_err(|_| "state poisoned")?;
-            if let Some(r) = &*running {
-                return Err(format!(
-                    "A command is still running in this shell: `{}`. Use \
-                     HOBBES_TERMINAL_TAIL to read its output, or \
-                     HOBBES_TERMINAL_RESET to kill the shell.",
-                    r.command
-                ));
-            }
-        }
+        let _op = session.op_lock.lock().await;
 
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let sentinel = format!("__HOBBES_DONE_{nonce}__");
@@ -508,25 +735,56 @@ impl TerminalClient {
             _ => command.to_string(),
         };
         let sentinel_line = format!("printf '\\n{sentinel} %d\\n' $?");
-        session.write_line(&format!("{wrapped}\n{sentinel_line}"))?;
+
+        // Claim the shell BEFORE writing: if this future is dropped mid-read
+        // (turn cancelled), the marker stays, so the next EXEC is refused and
+        // the orphaned output is only ever reachable via TAIL — it can never
+        // be drained into a later command's result.
+        {
+            let mut running = session.running.lock().map_err(|_| "state poisoned")?;
+            if let Some(r) = &*running {
+                return Err(format!(
+                    "A command is still running in this shell: `{}`. Use \
+                     HOBBES_TERMINAL_TAIL to read its output, or \
+                     HOBBES_TERMINAL_RESET to kill the shell.",
+                    r.command
+                ));
+            }
+            *running = Some(RunningCmd {
+                sentinel: sentinel.clone(),
+                command: command.to_string(),
+                wrapped: wrapped.clone(),
+                sentinel_line: sentinel_line.clone(),
+                carry: Vec::new(),
+                carry_trimmed: false,
+            });
+        }
+        if let Err(e) = session.write_line(&format!("{wrapped}\n{sentinel_line}")) {
+            *session.running.lock().map_err(|_| "state poisoned")? = None;
+            return Err(e);
+        }
 
         match self
             .read_until_sentinel(&session, &sentinel, timeout_secs, Vec::new(), false)
             .await?
         {
-            ReadOutcome::Done(output, code, trimmed) => Ok(format!(
-                "{}\n(exit code: {code})",
-                finalize_output(&output, &wrapped, &sentinel_line, trimmed)
-            )),
+            ReadOutcome::Done(output, code, trimmed) => {
+                *session.running.lock().map_err(|_| "state poisoned")? = None;
+                Ok(format!(
+                    "{}\n(exit code: {code})",
+                    finalize_output(&output, &wrapped, &sentinel_line, trimmed)
+                ))
+            }
             ReadOutcome::Pending(carry, carry_trimmed) => {
-                *session.running.lock().map_err(|_| "state poisoned")? = Some(RunningCmd {
-                    sentinel,
-                    command: command.to_string(),
-                    wrapped,
-                    sentinel_line,
-                    carry,
-                    carry_trimmed,
-                });
+                if let Some(r) = session
+                    .running
+                    .lock()
+                    .map_err(|_| "state poisoned")?
+                    .as_mut()
+                {
+                    r.carry = carry;
+                    r.carry_trimmed = carry_trimmed;
+                }
                 Ok(format!(
                     "Command still running after {timeout_secs}s. Use HOBBES_TERMINAL_TAIL \
                      to keep reading output, or HOBBES_TERMINAL_RESET to kill the shell."
@@ -547,19 +805,21 @@ impl TerminalClient {
         }
         .ok_or("No shell is running for this session — use HOBBES_TERMINAL_EXEC first.")?;
 
-        // Take the carry out (rather than clone) so a re-timeout replaces it
-        // instead of duplicating what this read already drained.
+        let _op = session.op_lock.lock().await;
+        // Clone (not take) the carry: a re-timeout REPLACES it with this
+        // read's superset, so nothing duplicates, and if this future is
+        // dropped mid-read the stored carry is still intact.
         let taken = session
             .running
             .lock()
             .map_err(|_| "state poisoned")?
-            .as_mut()
+            .as_ref()
             .map(|r| {
                 (
                     r.sentinel.clone(),
                     r.wrapped.clone(),
                     r.sentinel_line.clone(),
-                    std::mem::take(&mut r.carry),
+                    r.carry.clone(),
                     r.carry_trimmed,
                 )
             });
@@ -966,6 +1226,247 @@ mod tests {
         assert!(out.contains("[output truncated"), "got head: {}", &out[..200.min(out.len())]);
         assert!(out.contains("300000"), "tail survives");
         assert!(out.contains("(exit code: 0)"));
+        client.shutdown_all().await;
+    }
+
+    const NONCE_A: &str = "0123456789abcdef0123456789abcdef";
+    const NONCE_B: &str = "fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn sentinel_requires_a_complete_line() {
+        let s = "__HOBBES_DONE_abc__";
+        // `127` still arriving: `__ 1` must NOT finalize as exit code 1 (and
+        // leave `27` to leak into the next command).
+        assert!(split_at_sentinel(b"out\n__HOBBES_DONE_abc__ 1", s).is_none());
+        assert!(split_at_sentinel(b"out\n__HOBBES_DONE_abc__ 12\r", s).is_none());
+        let (out, code) = split_at_sentinel(b"out\n__HOBBES_DONE_abc__ 127\r\n", s).unwrap();
+        assert_eq!((out.as_str(), code), ("out\n", 127));
+        assert_eq!(split_at_sentinel(b"__HOBBES_DONE_abc__ -1\n", s).unwrap().1, -1);
+    }
+
+    #[test]
+    fn clean_output_preserves_tabs() {
+        assert_eq!(clean_output("A\tB\tC\r\n", 10_000), "A\tB\tC");
+        assert_eq!(
+            clean_output(".gitignore:3:target\tsrc/target\r\n", 10_000),
+            ".gitignore:3:target\tsrc/target"
+        );
+        assert_eq!(
+            clean_output("async_persist.rs\tkeychain_tests.rs\r\n", 10_000),
+            "async_persist.rs\tkeychain_tests.rs"
+        );
+    }
+
+    #[test]
+    fn clean_output_strips_escape_sequences() {
+        // SGR colours, including 256-colour and bold.
+        assert_eq!(
+            clean_output("\x1b[1;38;5;208mwarn\x1b[0m: \x1b[32mok\x1b[m", 10_000),
+            "warn: ok"
+        );
+        // OSC window title, BEL- and ST-terminated.
+        assert_eq!(clean_output("\x1b]0;title\x07a\x1b]2;t2\x1b\\b", 10_000), "ab");
+        // OSC 8 hyperlink.
+        assert_eq!(
+            clean_output("\x1b]8;;https://x.y\x1b\\link\x1b]8;;\x1b\\", 10_000),
+            "link"
+        );
+        // Charset select, keypad mode, cursor save, 8-bit CSI.
+        assert_eq!(clean_output("\x1b(Ba\x1b=b\x1b7c\u{9b}31md", 10_000), "abcd");
+        // DEC private modes (cursor hide/show).
+        assert_eq!(clean_output("\x1b[?25lx\x1b[?25h", 10_000), "x");
+        // Stray BEL / NUL dropped; a malformed CSI can't eat the newline.
+        assert_eq!(clean_output("a\x07b\x00c\x1b[12\nnext", 10_000), "abc\nnext");
+    }
+
+    #[test]
+    fn clean_output_handles_carriage_returns() {
+        // CRLF line endings.
+        assert_eq!(clean_output("one\r\ntwo\r\n", 10_000), "one\ntwo");
+        // Progress bar redraws collapse to the final state.
+        assert_eq!(clean_output(" 10%\r 50%\r100%\r\ndone", 10_000), "100%\ndone");
+        // Overwrite is column-wise like a terminal; ESC[K erases the rest.
+        assert_eq!(clean_output("hello\rab", 10_000), "abllo");
+        assert_eq!(clean_output("Downloading...\r\x1b[KDone\r\n", 10_000), "Done");
+        assert_eq!(clean_output("xxxx\r\x1b[2Kyy", 10_000), "yy");
+        // Backspace.
+        assert_eq!(clean_output("ab\x08c", 10_000), "ac");
+        // CR CR LF (a program that emits \r\n itself through onlcr).
+        assert_eq!(clean_output("a\r\r\nb", 10_000), "a\nb");
+    }
+
+    #[test]
+    fn clean_output_keeps_utf8() {
+        assert_eq!(
+            clean_output("\x1b[33mcafé 🐯 日本\x1b[0m\tñ\r\n", 10_000),
+            "café 🐯 日本\tñ"
+        );
+        // Overwriting multi-byte chars works per character, not per byte.
+        assert_eq!(clean_output("日本語\rab", 10_000), "ab語");
+        // Truncation stays on a char boundary.
+        let long = "é".repeat(2_000);
+        let cleaned = clean_output(&long, 1025);
+        assert!(cleaned.starts_with("[output truncated"));
+        assert!(cleaned.ends_with('é'));
+    }
+
+    #[test]
+    fn foreign_sentinel_prefix_is_dropped() {
+        let stale = format!(
+            "old-output\r\n\r\n__HOBBES_DONE_{NONCE_A}__ 0\r\n\r\n__HOBBES_INIT_{NONCE_B}__ 0\r\nmine\r\n"
+        );
+        assert_eq!(drop_foreign_sentinel_prefix(&stale), "mine\r\n");
+        // An echoed printf (`%d`, not a code) is not a completed sentinel.
+        let echoed = format!("printf '\\n__HOBBES_DONE_{NONCE_A}__ %d\\n' $?\r\nmine\n");
+        assert_eq!(drop_foreign_sentinel_prefix(&echoed), echoed);
+        // Short/non-hex nonces (source code mentioning the format) don't count.
+        let code = "let s = \"__HOBBES_DONE_{nonce}__ 0\n\";\nrest";
+        assert_eq!(drop_foreign_sentinel_prefix(code), code);
+    }
+
+    #[test]
+    fn scrub_removes_every_sentinel() {
+        let text = format!(
+            "a\n__HOBBES_DONE_{NONCE_A}__ 0\nprintf '\\n__HOBBES_DONE_{NONCE_B}__ %d\\n' $?\n\
+             log: saw __HOBBES_INIT_{NONCE_B}__ here\n__HOBBES_DONE_{NONCE_B}__\nb"
+        );
+        let scrubbed = scrub_sentinels(&text);
+        assert!(!scrubbed.contains("__HOBBES_DONE_"), "{scrubbed}");
+        assert!(!scrubbed.contains("__HOBBES_INIT_"), "{scrubbed}");
+        assert_eq!(scrubbed, "a\nlog: saw [hobbes-sentinel] here\nb");
+        // Nothing to scrub → untouched (source code mentioning the format).
+        let src = "format!(\"__HOBBES_DONE_{nonce}__\")\tx";
+        assert_eq!(scrub_sentinels(src), src);
+    }
+
+    #[test]
+    fn finalize_output_never_leaks_prior_command() {
+        // The observed leak: a previous command's output and its raw sentinel
+        // in front of this command's output.
+        let wrapped = "echo mine";
+        let sentinel_line = format!("printf '\\n__HOBBES_DONE_{NONCE_B}__ %d\\n' $?");
+        let raw = format!(
+            "prior-output\r\n\r\n__HOBBES_DONE_{NONCE_A}__ 0\r\n{wrapped}\r\n{sentinel_line}\r\nmine\tcol2\r\n\r\n"
+        );
+        assert_eq!(finalize_output(&raw, wrapped, &sentinel_line, false), "mine\tcol2");
+    }
+
+    #[test]
+    fn finalize_output_over_carry_keeps_early_output_and_marks_trim() {
+        // TAIL finalizes carry (drained before the timeout) + the rest.
+        let wrapped = "slow";
+        let sentinel_line = format!("printf '\\n__HOBBES_DONE_{NONCE_A}__ %d\\n' $?");
+        let mut acc = b"early\r\n".to_vec();
+        acc.extend_from_slice(format!("late\r\n\r\n__HOBBES_DONE_{NONCE_A}__ 0\r\n").as_bytes());
+        let (out, code) = split_at_sentinel(&acc, &format!("__HOBBES_DONE_{NONCE_A}__")).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(finalize_output(&out, wrapped, &sentinel_line, false), "early\nlate");
+        let marked = finalize_output(&out, wrapped, &sentinel_line, true);
+        assert!(marked.starts_with("[output truncated"), "{marked}");
+        assert!(marked.ends_with("early\nlate"));
+    }
+
+    fn test_ctx(id: &str) -> TerminalCtx {
+        TerminalCtx {
+            session_id: id.into(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            project_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn real_shell_output_keeps_tabs() {
+        let client = TerminalClient::new();
+        let ctx = test_ctx("t5");
+        let out = client
+            .exec(&ctx, &serde_json::json!({"command": "printf 'A\\tB\\tC\\n'", "timeout_secs": 20}))
+            .await
+            .unwrap();
+        assert!(out.starts_with("A\tB\tC\n"), "got: {out:?}");
+        client.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn timeout_then_tail_then_exec_is_isolated() {
+        let client = TerminalClient::new();
+        let ctx = test_ctx("t6");
+        let out = client
+            .exec(
+                &ctx,
+                &serde_json::json!({"command": "echo first-a; sleep 2; echo first-b", "timeout_secs": 1}),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("still running"), "got: {out}");
+        let out = client
+            .tail(&ctx, &serde_json::json!({"timeout_secs": 20}))
+            .await
+            .unwrap();
+        assert!(out.contains("first-a") && out.contains("first-b"), "got: {out}");
+        assert!(!out.contains("__HOBBES_"), "sentinel leaked: {out}");
+
+        let out = client
+            .exec(&ctx, &serde_json::json!({"command": "echo second", "timeout_secs": 20}))
+            .await
+            .unwrap();
+        assert_eq!(out, "second\n(exit code: 0)");
+        client.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn abandoned_exec_output_only_reaches_tail() {
+        // The turn is cancelled mid-read: the exec future is dropped. The
+        // command keeps running in the shell; its output must not end up in
+        // the next EXEC's result.
+        let client = TerminalClient::new();
+        let ctx = test_ctx("t7");
+        // Warm the shell so the cut-off lands in the read, not the spawn.
+        client
+            .exec(&ctx, &serde_json::json!({"command": "true", "timeout_secs": 20}))
+            .await
+            .unwrap();
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.exec(
+                &ctx,
+                &serde_json::json!({"command": "sleep 1; echo orphan-out", "timeout_secs": 30}),
+            ),
+        )
+        .await;
+        assert!(abandoned.is_err(), "exec should have been cut off");
+
+        let err = client
+            .exec(&ctx, &serde_json::json!({"command": "echo next", "timeout_secs": 20}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("HOBBES_TERMINAL_TAIL"), "got: {err}");
+
+        let out = client
+            .tail(&ctx, &serde_json::json!({"timeout_secs": 20}))
+            .await
+            .unwrap();
+        assert!(out.contains("orphan-out"), "got: {out}");
+        assert!(!out.contains("__HOBBES_"), "sentinel leaked: {out}");
+
+        let out = client
+            .exec(&ctx, &serde_json::json!({"command": "echo next", "timeout_secs": 20}))
+            .await
+            .unwrap();
+        assert_eq!(out, "next\n(exit code: 0)");
+        client.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_execs_do_not_cross_contaminate() {
+        // Parallel tool calls in one turn each run in their own task.
+        let client = TerminalClient::new();
+        let ctx = test_ctx("t8");
+        let a_args = serde_json::json!({"command": "sleep 0.3; echo out-a", "timeout_secs": 20});
+        let b_args = serde_json::json!({"command": "echo out-b", "timeout_secs": 20});
+        let (a, b) = tokio::join!(client.exec(&ctx, &a_args), client.exec(&ctx, &b_args));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a, "out-a\n(exit code: 0)");
+        assert_eq!(b, "out-b\n(exit code: 0)");
         client.shutdown_all().await;
     }
 
