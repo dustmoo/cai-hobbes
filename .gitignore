@@ -102,3 +102,7 @@ credentials/
 out.txt
 test_actual.py
 __pycache__/
+
+# Provisioning profile dumps (contain team/device IDs) and build scratch
+*profile*.plist
+build_errors.txt
