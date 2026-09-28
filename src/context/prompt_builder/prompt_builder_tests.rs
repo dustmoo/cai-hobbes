@@ -329,6 +329,7 @@ fn tool_call_msg(tool_name: &str, response: String, result_summary: Option<Strin
             profile_id: None,
             connector_name: None,
             model: None,
+            round_id: None,
         }),
         attachments: vec![],
         comments: vec![],
