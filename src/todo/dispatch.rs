@@ -161,7 +161,20 @@ pub fn handle_dispatch(
             // New tab, project-tagged, linked, seeded, focused. Focus-steal
             // is v1-accepted; background drain is out of scope (the queue
             // drain only serves the active session).
-            let new_id = deps.session_state.write().create_session(None);
+            // Inherit the dispatching tab's Composio profile (else the
+            // global default), as every UI path that opens a tab does. A
+            // tab with no profile would see every profile's Composio tools,
+            // which collide by name ("Duplicate function declaration").
+            let profile = parent_session_id
+                .and_then(|pid| {
+                    deps.session_state
+                        .peek()
+                        .sessions
+                        .get(pid)
+                        .and_then(|s| s.composio_profile.clone())
+                })
+                .or_else(|| deps.settings.peek().get_active_profile().map(|p| p.id.clone()));
+            let new_id = deps.session_state.write().create_session(profile);
             {
                 let mut state = deps.session_state.write();
                 if let Some(s) = state.sessions.get_mut(&new_id) {

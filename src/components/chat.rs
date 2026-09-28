@@ -123,12 +123,16 @@ pub fn ChatWindow(
     // Shared helper: fetch fresh MCP context for a session and update its active_context.
     // Returns the fetched McpContext for downstream use (e.g. passing to send_prompt_to_llm).
     let fetch_fresh_mcp_context = move |target_id: String, settings_snapshot: Settings| async move {
-        // Pass the profile ID directly (composio_profile is the stable ID)
+        // Pass the profile ID directly (composio_profile is the stable ID).
+        // A session with no pinned profile uses the global active one —
+        // `get_mcp_context(None)` would return every profile's Composio
+        // server, whose tools collide by name at the provider.
         let profile_id = session_state
             .read()
             .sessions
             .get(&target_id)
-            .and_then(|s| s.composio_profile.clone());
+            .and_then(|s| s.composio_profile.clone())
+            .or_else(|| settings_snapshot.get_active_profile().map(|p| p.id.clone()));
 
         // ensure_native_client_for_profile can accept name or ID — pass the ID
         if let Some(ref id) = profile_id {
@@ -200,7 +204,12 @@ pub fn ChatWindow(
         let mut current_context = mcp_context_signal.read().clone();
         let mut state = session_state.write();
         if let Some(session) = state.sessions.get_mut(&*current_target_id.read()) {
-            let profile_id = session.composio_profile.clone();
+            // Same fallback as `fetch_fresh_mcp_context`: an unpinned session
+            // follows the global active profile.
+            let profile_id = session
+                .composio_profile
+                .clone()
+                .or_else(|| settings.read().get_active_profile().map(|p| p.id.clone()));
 
             // Filter servers to only include non-native or profile-matching native tools
             // Use the server_name convention: config.name contains the display key,

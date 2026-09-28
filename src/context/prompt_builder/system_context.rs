@@ -28,11 +28,18 @@ impl<'a> PromptBuilder<'a> {
         // 1. Extract and format tools from the session context.
         let mut tools = Vec::new();
         if let Some(mcp_context) = &self.session.active_context.mcp_tools {
-            for server in &mcp_context.servers {
-                for tool in &server.tools {
-                    tools.push(ToolDefinition::from_mcp(tool, &server.name));
-                }
-            }
+            tools = dedupe_by_wire_name(
+                mcp_context
+                    .servers
+                    .iter()
+                    .flat_map(|server| {
+                        server
+                            .tools
+                            .iter()
+                            .map(|tool| ToolDefinition::from_mcp(tool, &server.name))
+                    })
+                    .collect(),
+            );
         }
 
         // 2. Build the system instruction from the remaining context.
@@ -552,5 +559,67 @@ impl<'a> PromptBuilder<'a> {
             provider_context,
             is_continuation_placeholder,
         }
+    }
+}
+
+/// Drop tools whose provider-facing name repeats an earlier one, keeping the
+/// first. Every connector names a tool `get_prefixed_tool_name(server, tool)`,
+/// which folds all `composio-native:{profile}` servers into one
+/// `composio-native_` prefix; if two profiles' Composio servers ever reach one
+/// context, their meta-tools collide and the provider rejects the whole
+/// request (Gemini: "Duplicate function declaration found").
+fn dedupe_by_wire_name(tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    let mut seen = std::collections::HashSet::new();
+    tools
+        .into_iter()
+        .filter(|t| {
+            let wire = crate::gemini::convert::get_prefixed_tool_name(&t.server_name, &t.name);
+            let first = seen.insert(wire.clone());
+            if !first {
+                tracing::warn!(
+                    tool = %wire,
+                    server = %t.server_name,
+                    "Dropping duplicate tool declaration (same provider-facing name)"
+                );
+            }
+            first
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::*;
+
+    fn tool(server: &str, name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            server_name: server.to_string(),
+            description: String::new(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn two_composio_profiles_collapse_to_one_declaration() {
+        let tools = vec![
+            tool("composio-native:profile-a", "COMPOSIO_DISCOVER_APPS"),
+            tool("composio-native:profile-b", "COMPOSIO_DISCOVER_APPS"),
+            tool("composio-native:profile-b", "COMPOSIO_EXECUTE_TOOL"),
+            tool("fs", "list_files"),
+        ];
+        let kept = dedupe_by_wire_name(tools);
+        let names: Vec<(&str, &str)> = kept
+            .iter()
+            .map(|t| (t.server_name.as_str(), t.name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("composio-native:profile-a", "COMPOSIO_DISCOVER_APPS"),
+                ("composio-native:profile-b", "COMPOSIO_EXECUTE_TOOL"),
+                ("fs", "list_files"),
+            ]
+        );
     }
 }
