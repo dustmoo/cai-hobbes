@@ -688,7 +688,7 @@ pub(crate) fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
     let mut ui_state = use_context::<Signal<crate::settings::UiState>>();
     let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
     use_hook(|| {
-        let _ = document::eval(include_str!("../../assets/list_flip.js"));
+        let _ = document::eval(include_str!("../../../assets/list_flip.js"));
     });
     let seed = move |sel: &PlannerSelection| -> ListOrder {
         let (keys, groups) = views::order_options(sel.view());
