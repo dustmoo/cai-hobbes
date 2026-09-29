@@ -95,6 +95,7 @@ mod tests {
                     profile_id: None,
                     connector_name: None,
                     model: None,
+                    round_id: None,
                 },
                 result: ToolResult {
                     status: ToolCallStatus::Completed,
@@ -175,6 +176,7 @@ mod tests {
                 profile_id: None,
                 connector_name: None,
                 model: None,
+                round_id: None,
             },
             result: ToolResult {
                 status: ToolCallStatus::Completed,

@@ -607,6 +607,9 @@ impl StreamManagerContext {
                             stream_connector_name.clone(),
                             Some(stream_model.clone()),
                         );
+                        // Every call in this response shares the turn's placeholder id,
+                        // so the prompt builder can find the latest round.
+                        tool_call.round_id = Some(message_id.to_string());
 
                         tool_call_count += 1;
                         let mut tool_call_snapshot: Option<crate::components::chat::Message> = None;
@@ -988,11 +991,14 @@ impl StreamManagerContext {
                                 &tool_call_message_id,
                             ) {
                                 if is_permission_request {
-                                    if let Ok(tc) =
+                                    if let Ok(mut tc) =
                                         serde_json::from_str::<crate::components::shared::ToolCall>(
                                             &response_str,
                                         )
                                     {
+                                        if let crate::components::shared::MessageContent::ToolCall(orig) = &msg.content {
+                                            tc.round_id = orig.round_id.clone();
+                                        }
                                         msg.content = crate::components::shared::MessageContent::PermissionRequest(tc);
                                     }
                                 } else if let crate::components::shared::MessageContent::ToolCall(

@@ -123,6 +123,7 @@ mod tests {
                 profile_id: None,
                 connector_name: None,
                 model: None,
+                round_id: None,
             }),
             attachments: vec![],
             comments: vec![],

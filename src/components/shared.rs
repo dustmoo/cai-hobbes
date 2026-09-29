@@ -164,6 +164,12 @@ pub struct ToolCall {
     /// The effective chat model at turn time. `None` on legacy rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Id of the stream turn (tool round) that minted this call; every call
+    /// the model emitted in one response shares it. Lets the prompt builder
+    /// tell the latest round apart from earlier back-to-back rounds, which are
+    /// otherwise adjacent `ToolCall` messages. `None` on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_id: Option<String>,
 }
 
 pub enum StreamMessage {
@@ -221,6 +227,7 @@ impl ToolCall {
             profile_id: None,
             connector_name: None,
             model: None,
+            round_id: None,
         }
     }
 

@@ -104,14 +104,14 @@ impl<'a> PromptBuilder<'a> {
             }
         }
 
-        if self.session.tool_call_history.iter().any(|r| {
-            matches!(
-                r.result.status,
-                crate::components::shared::ToolCallStatus::Error
-            )
-        }) {
-            let recovery_instruction = "\n\nCRITICAL RECOVERY INSTRUCTION: A previous tool call failed. Analyze the error message and attempt a different tool call to accomplish the user's goal. Do not repeat the failed tool call.";
-            persona.push_str(recovery_instruction);
+        // Only the round the model is about to respond to matters: once a later
+        // round succeeds, an earlier failure is already handled.
+        let failed_tools = latest_round_failed_tools(&self.session.messages);
+        if !failed_tools.is_empty() {
+            persona.push_str(&format!(
+                "\n\nRECOVERY NOTE: The last tool call(s) failed ({}). Read the error, then try a different approach rather than repeating the identical call.",
+                failed_tools.join(", ")
+            ));
         }
 
         active_context.system_persona = Some(persona);
@@ -587,6 +587,40 @@ fn dedupe_by_wire_name(tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// Names of the tools that errored in the latest tool round — the trailing
+/// tool-call messages (ignoring an empty continuation placeholder) that share
+/// the last call's `round_id`, i.e. the results the model is about to respond
+/// to. Empty when the conversation doesn't end in a tool round or every call
+/// in it succeeded.
+fn latest_round_failed_tools(messages: &[crate::components::chat::Message]) -> Vec<String> {
+    let mut failed = Vec::new();
+    let mut round: Option<&Option<String>> = None;
+    for m in messages.iter().rev() {
+        let tc = match &m.content {
+            MessageContent::Text { content, .. }
+                if round.is_none() && m.author == "Hobbes" && content.is_empty() =>
+            {
+                continue
+            }
+            MessageContent::ToolCall(tc) | MessageContent::PermissionRequest(tc) => tc,
+            _ => break,
+        };
+        match round {
+            None => round = Some(&tc.round_id),
+            Some(r) if *r != tc.round_id => break,
+            Some(_) => {}
+        }
+        if matches!(m.content, MessageContent::ToolCall(_))
+            && tc.status == crate::components::shared::ToolCallStatus::Error
+            && !failed.contains(&tc.tool_name)
+        {
+            failed.push(tc.tool_name.clone());
+        }
+    }
+    failed.reverse();
+    failed
+}
+
 #[cfg(test)]
 mod dedupe_tests {
     use super::*;
@@ -621,5 +655,110 @@ mod dedupe_tests {
                 ("fs", "list_files"),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_note_tests {
+    use crate::components::chat::Message;
+    use crate::components::shared::{MessageContent, ToolCall, ToolCallStatus};
+    use crate::context::prompt_builder::PromptBuilder;
+    use crate::session::SessionState;
+    use crate::settings::Settings;
+
+    fn msg(author: &str, content: MessageContent) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4(),
+            author: author.to_string(),
+            content,
+            attachments: vec![],
+            comments: vec![],
+            created_at: chrono::Utc::now(),
+            usage: None,
+        }
+    }
+
+    fn text(author: &str, content: &str) -> Message {
+        msg(
+            author,
+            MessageContent::Text {
+                content: content.to_string(),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            },
+        )
+    }
+
+    fn call(round: &str, tool: &str, status: ToolCallStatus) -> Message {
+        msg(
+            "Hobbes",
+            MessageContent::ToolCall(ToolCall {
+                server_name: "terminal".to_string(),
+                tool_name: tool.to_string(),
+                arguments: "{}".to_string(),
+                status,
+                response: "result".to_string(),
+                round_id: Some(round.to_string()),
+                ..Default::default()
+            }),
+        )
+    }
+
+    fn system_prompt(messages: Vec<Message>) -> String {
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        let session = state.sessions.get_mut(&id).unwrap();
+        session.messages = messages;
+        let settings = Settings::default();
+        PromptBuilder::new(session, &settings)
+            .build_system_context()
+            .system
+    }
+
+    #[test]
+    fn error_in_latest_round_names_the_failing_tool() {
+        let system = system_prompt(vec![
+            text("User", "run it"),
+            call("r1", "run_command", ToolCallStatus::Completed),
+            call("r2", "read_file", ToolCallStatus::Completed),
+            call("r2", "run_command", ToolCallStatus::Error),
+            text("Hobbes", ""),
+        ]);
+        assert!(system.contains("RECOVERY NOTE"), "{system}");
+        assert!(system.contains("failed (run_command)"), "{system}");
+        assert!(!system.contains("CRITICAL RECOVERY INSTRUCTION"));
+    }
+
+    #[test]
+    fn earlier_round_error_is_forgotten_once_latest_round_succeeds() {
+        let system = system_prompt(vec![
+            text("User", "run it"),
+            call("r1", "run_command", ToolCallStatus::Error),
+            call("r2", "reset_terminal", ToolCallStatus::Completed),
+            call("r3", "run_command", ToolCallStatus::Completed),
+            text("Hobbes", ""),
+        ]);
+        assert!(!system.contains("RECOVERY NOTE"), "{system}");
+    }
+
+    #[test]
+    fn no_errors_means_no_recovery_note() {
+        let system = system_prompt(vec![
+            text("User", "run it"),
+            call("r1", "run_command", ToolCallStatus::Completed),
+            text("Hobbes", ""),
+        ]);
+        assert!(!system.contains("RECOVERY NOTE"), "{system}");
+    }
+
+    #[test]
+    fn failure_does_not_leak_past_a_user_message() {
+        let system = system_prompt(vec![
+            text("User", "run it"),
+            call("r1", "run_command", ToolCallStatus::Error),
+            text("User", "never mind"),
+        ]);
+        assert!(!system.contains("RECOVERY NOTE"), "{system}");
     }
 }
