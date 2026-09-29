@@ -500,7 +500,10 @@ pub fn ChatInput(
                     let arguments = inv.arguments;
                     let permission_status = permission_manager
                         .read()
-                        .check_skill_permission(&skill.metadata.name);
+                        .check_skill_permission(
+                            &skill.metadata.name,
+                            crate::context::permissions::SkillInvoker::User,
+                        );
 
                     let skill_call = crate::components::shared::SkillCall {
                         execution_id: uuid::Uuid::new_v4().to_string(),

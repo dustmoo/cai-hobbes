@@ -690,21 +690,63 @@ impl StreamManagerContext {
                             // that McpManager doesn't own. The same dispatcher backs
                             // the approval-resume path in chat.rs; see
                             // components::builtin_tools.
+                            let builtin_ctx = crate::components::builtin_tools::BuiltinToolCtx {
+                                session_state,
+                                settings: self.settings,
+                                skill_registry: self.skill_registry,
+                                permission_manager: self.permission_manager,
+                                mcp_context: self.mcp_context,
+                                planner: self.planner_state,
+                                chat_command: self.chat_command,
+                            };
+
+                            // A model skill load the user hasn't pre-approved is
+                            // held exactly like an MCP call that needs approval:
+                            // the message becomes a PermissionRequest (rendered as
+                            // the skill approval bubble) and no result is sent.
+                            // Approve flips it back to a Running ToolCall, which
+                            // the resume path in chat.rs dispatches.
+                            if crate::components::builtin_tools::skill_invoke_needs_approval(
+                                builtin_ctx,
+                                &tool_call,
+                                &args_json,
+                                &session_id_inner,
+                            ) {
+                                let mut pending_snapshot: Option<
+                                    crate::components::chat::Message,
+                                > = None;
+                                {
+                                    let mut state = session_state.write();
+                                    if let Some(msg) = state.get_message_mut_in_session(
+                                        &session_id_inner,
+                                        &tool_call_message_id,
+                                    ) {
+                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
+                                            msg.content = crate::components::shared::MessageContent::PermissionRequest(tc.clone());
+                                            pending_snapshot = Some(msg.clone());
+                                        }
+                                    }
+                                }
+                                *self.stream_activity.write() += 1;
+                                if let Some(message) = pending_snapshot {
+                                    log_event(
+                                        &session_id_inner,
+                                        SessionEvent::ToolResult { message },
+                                    );
+                                }
+                                completed_tool_tasks_clone
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            }
+
                             if let Some(outcome) =
                                 crate::components::builtin_tools::dispatch_builtin_tool(
-                                    crate::components::builtin_tools::BuiltinToolCtx {
-                                        session_state,
-                                        settings: self.settings,
-                                        skill_registry: self.skill_registry,
-                                        permission_manager: self.permission_manager,
-                                        mcp_context: self.mcp_context,
-                                        planner: self.planner_state,
-                                        chat_command: self.chat_command,
-                                    },
+                                    builtin_ctx,
                                     &tool_call,
                                     &args_json,
                                     &session_id_inner,
                                     profile_id.as_ref(),
+                                    false,
                                 )
                                 .await
                             {

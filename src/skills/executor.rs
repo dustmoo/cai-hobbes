@@ -57,8 +57,9 @@ impl std::fmt::Display for SkillExecutionError {
 pub fn check_permission(
     permission_manager: &PermissionManager,
     skill_name: &str,
+    invoker: crate::context::permissions::SkillInvoker,
 ) -> PermissionStatus {
-    permission_manager.check_skill_permission(skill_name)
+    permission_manager.check_skill_permission(skill_name, invoker)
 }
 
 /// Helper to extract all available tool names from the MCP context, indexed by:

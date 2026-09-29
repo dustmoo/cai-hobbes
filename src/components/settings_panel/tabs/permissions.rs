@@ -124,28 +124,37 @@ pub(in super::super) fn PermissionsTab(
                     class: "p-4 bg-section rounded-lg",
                     h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-4", "Skill Permissions" }
                     p { class: "text-xs text-fg-muted mb-4",
-                        "Manage auto-approval for specific skills. When enabled, these skills will execute without prompting."
+                        "When on, Hobbes can load the skill by itself without asking. When off, Hobbes must ask you first each time it wants to load it. Skills you run yourself with /name go straight through unless you've turned them off here."
                     }
 
                     {
                         // Get all skills from registry AND saved permissions
                         let registry = skill_registry.read();
-                        let saved_permissions = local_settings.read().permission_settings.skill_permissions.clone();
+                        let permission_settings = local_settings.read().permission_settings.clone();
+                        let saved_permissions = permission_settings.skill_permissions.clone();
 
-                        // Build merged map: registry skills + any saved permissions
+                        // Build merged map: registry skills + any saved permissions.
+                        // The shown state is the backend's own resolution for a
+                        // model-initiated load (an unlisted skill needs approval → OFF).
                         let mut all_skills: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
 
-                        // Add all registered skills (default to false if no saved permission)
                         for skill in registry.list_skills() {
-                            let is_allowed = saved_permissions.get(&skill.metadata.name).copied().unwrap_or(false);
+                            let is_allowed = permission_settings.skill_permission(
+                                &skill.metadata.name,
+                                crate::context::permissions::SkillInvoker::Model,
+                            ) == crate::context::permissions::PermissionStatus::Allowed;
                             all_skills.insert(skill.metadata.name.clone(), is_allowed);
                         }
 
                         // Also include any saved permissions for skills not currently in registry
                         // (in case a skill was removed but permission was saved)
-                        for (name, allowed) in &saved_permissions {
+                        for name in saved_permissions.keys() {
                             if !all_skills.contains_key(name) {
-                                all_skills.insert(name.clone(), *allowed);
+                                let is_allowed = permission_settings.skill_permission(
+                                    name,
+                                    crate::context::permissions::SkillInvoker::Model,
+                                ) == crate::context::permissions::PermissionStatus::Allowed;
+                                all_skills.insert(name.clone(), is_allowed);
                             }
                         }
 

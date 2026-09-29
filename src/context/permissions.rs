@@ -121,30 +121,52 @@ impl PermissionManager {
     }
 
     /// Check if skill execution is allowed based on permission settings.
-    pub fn check_skill_permission(&self, skill_name: &str) -> PermissionStatus {
-        let settings = self.settings.read();
-
-        // 1. Per-Skill Toggle (Specific Rule Priority)
-        if let Some(&allowed) = settings
+    /// See [`PermissionSettings::skill_permission`] for the resolution table.
+    pub fn check_skill_permission(
+        &self,
+        skill_name: &str,
+        invoker: SkillInvoker,
+    ) -> PermissionStatus {
+        self.settings
+            .read()
             .permission_settings
-            .skill_permissions
-            .get(skill_name)
-        {
-            if allowed {
-                return PermissionStatus::Allowed;
-            } else {
-                return PermissionStatus::RequiresPrompt;
-            }
-        }
+            .skill_permission(skill_name, invoker)
+    }
+}
 
-        // 2. Global Auto-Approval Check (Fallback)
-        if settings.permission_settings.auto_approval_enabled {
-            return PermissionStatus::Allowed;
-        }
+/// Who is asking to load a skill. The user typing `/name` is itself the
+/// approval; the model loading a skill on its own is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillInvoker {
+    /// The user typed `/skill` in the chat input.
+    User,
+    /// The model called `HOBBES_INVOKE_SKILL`.
+    Model,
+}
 
-        // 3. Default: Auto-proceed for skills
-        // Skills only inject context; actual tool calls have their own permission controls.
-        PermissionStatus::Allowed
+impl PermissionSettings {
+    /// The one skill-permission resolution function — the backend gates and
+    /// the Settings → Permissions toggles all go through it, so the UI can
+    /// never show a different state than the gate enforces.
+    ///
+    /// | `skill_permissions[name]` | model invoke      | user `/name`      |
+    /// |---------------------------|-------------------|-------------------|
+    /// | absent                    | RequiresPrompt    | Allowed           |
+    /// | `true`                    | Allowed           | Allowed           |
+    /// | `false`                   | RequiresPrompt    | RequiresPrompt    |
+    ///
+    /// `auto_approval_enabled` deliberately does NOT apply to skills. It is the
+    /// blanket switch for MCP tool calls; letting it silently grant the model
+    /// self-service skill loading would recreate the "UI shows OFF, behaviour is
+    /// ON" mismatch. Skills are opted in one by one (Settings toggle, or the
+    /// approval bubble's "Always allow").
+    pub fn skill_permission(&self, skill_name: &str, invoker: SkillInvoker) -> PermissionStatus {
+        match (self.skill_permissions.get(skill_name), invoker) {
+            (Some(true), _) => PermissionStatus::Allowed,
+            (Some(false), _) => PermissionStatus::RequiresPrompt,
+            (None, SkillInvoker::User) => PermissionStatus::Allowed,
+            (None, SkillInvoker::Model) => PermissionStatus::RequiresPrompt,
+        }
     }
 }
 
@@ -152,6 +174,51 @@ impl PermissionManager {
 mod tests {
     use super::*;
     use dioxus::prelude::*;
+
+    fn skill_settings(entry: Option<bool>) -> PermissionSettings {
+        let mut s = PermissionSettings::default();
+        if let Some(v) = entry {
+            s.skill_permissions.insert("news".to_string(), v);
+        }
+        s
+    }
+
+    #[test]
+    fn skill_permission_resolution_table() {
+        use PermissionStatus::{Allowed, RequiresPrompt};
+        use SkillInvoker::{Model, User};
+        let cases = [
+            (None, Model, RequiresPrompt),
+            (None, User, Allowed),
+            (Some(true), Model, Allowed),
+            (Some(true), User, Allowed),
+            (Some(false), Model, RequiresPrompt),
+            (Some(false), User, RequiresPrompt),
+        ];
+        for (entry, invoker, expected) in cases {
+            assert_eq!(
+                skill_settings(entry).skill_permission("news", invoker),
+                expected,
+                "entry={entry:?} invoker={invoker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_permission_ignores_global_auto_approval() {
+        let mut s = skill_settings(None);
+        s.auto_approval_enabled = true;
+        assert_eq!(
+            s.skill_permission("news", SkillInvoker::Model),
+            PermissionStatus::RequiresPrompt
+        );
+        let mut s = skill_settings(Some(false));
+        s.auto_approval_enabled = true;
+        assert_eq!(
+            s.skill_permission("news", SkillInvoker::User),
+            PermissionStatus::RequiresPrompt
+        );
+    }
 
     #[tokio::test]
     async fn test_turn_counting() {
