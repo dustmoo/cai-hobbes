@@ -1363,6 +1363,10 @@ video {
   pointer-events: none;
 }
 
+.pointer-events-auto {
+  pointer-events: auto;
+}
+
 .\!visible {
   visibility: visible !important;
 }
@@ -1406,6 +1410,10 @@ video {
 .inset-x-0 {
   left: 0px;
   right: 0px;
+}
+
+.-left-3 {
+  left: -0.75rem;
 }
 
 .-top-0\.5 {
@@ -1476,6 +1484,10 @@ video {
   right: 0.5rem;
 }
 
+.right-3 {
+  right: 0.75rem;
+}
+
 .right-4 {
   right: 1rem;
 }
@@ -1510,6 +1522,10 @@ video {
 
 .top-2 {
   top: 0.5rem;
+}
+
+.top-3 {
+  top: 0.75rem;
 }
 
 .top-full {
@@ -1687,6 +1703,10 @@ video {
 
 .mt-1 {
   margin-top: 0.25rem;
+}
+
+.mt-1\.5 {
+  margin-top: 0.375rem;
 }
 
 .mt-2 {
@@ -2028,6 +2048,10 @@ video {
   width: 480px;
 }
 
+.w-\[560px\] {
+  width: 560px;
+}
+
 .w-\[600px\] {
   width: 600px;
 }
@@ -2116,6 +2140,14 @@ video {
 
 .max-w-64 {
   max-width: 16rem;
+}
+
+.max-w-72 {
+  max-width: 18rem;
+}
+
+.max-w-80 {
+  max-width: 20rem;
 }
 
 .max-w-\[200px\] {
@@ -2330,6 +2362,14 @@ video {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.grid-cols-4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.grid-cols-\[2\.5rem_1fr\] {
+  grid-template-columns: 2.5rem 1fr;
+}
+
 .grid-cols-\[20px_minmax\(0\2c 1fr\)_auto\] {
   grid-template-columns: 20px minmax(0,1fr) auto;
 }
@@ -2451,6 +2491,10 @@ video {
 
 .gap-y-1 {
   row-gap: 0.25rem;
+}
+
+.gap-y-1\.5 {
+  row-gap: 0.375rem;
 }
 
 .gap-y-4 {
@@ -2689,6 +2733,10 @@ video {
 
 .border-none {
   border-style: none;
+}
+
+.border-\[var\(--color-border-muted\)\] {
+  border-color: var(--color-border-muted);
 }
 
 .border-accent-500 {
@@ -3387,6 +3435,11 @@ video {
   padding-right: 1.125rem;
 }
 
+.py-0 {
+  padding-top: 0px;
+  padding-bottom: 0px;
+}
+
 .py-0\.5 {
   padding-top: 0.125rem;
   padding-bottom: 0.125rem;
@@ -3498,12 +3551,20 @@ video {
   padding-left: 7px;
 }
 
+.pr-1 {
+  padding-right: 0.25rem;
+}
+
 .pr-2 {
   padding-right: 0.5rem;
 }
 
 .pr-2\.5 {
   padding-right: 0.625rem;
+}
+
+.pr-7 {
+  padding-right: 1.75rem;
 }
 
 .pt-1 {
@@ -3536,6 +3597,10 @@ video {
 
 .pt-6 {
   padding-top: 1.5rem;
+}
+
+.pt-\[18vh\] {
+  padding-top: 18vh;
 }
 
 .text-left {
@@ -3633,6 +3698,10 @@ video {
   text-transform: capitalize;
 }
 
+.normal-case {
+  text-transform: none;
+}
+
 .italic {
   font-style: italic;
 }
@@ -3672,6 +3741,10 @@ video {
 
 .tracking-\[0\.2em\] {
   letter-spacing: 0.2em;
+}
+
+.tracking-normal {
+  letter-spacing: 0em;
 }
 
 .tracking-tight {
@@ -4061,6 +4134,10 @@ video {
   --tw-ring-color: rgb(132 164 209 / var(--tw-ring-opacity, 1));
 }
 
+.ring-primary-300\/50 {
+  --tw-ring-color: rgb(132 164 209 / 0.5);
+}
+
 .ring-primary-400 {
   --tw-ring-opacity: 1;
   --tw-ring-color: rgb(91 134 193 / var(--tw-ring-opacity, 1));
@@ -4095,6 +4172,11 @@ video {
 
 .ring-offset-section {
   --tw-ring-offset-color: var(--color-bg-section);
+}
+
+.blur {
+  --tw-blur: blur(8px);
+  filter: var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow);
 }
 
 .invert {
@@ -4586,6 +4668,11 @@ video {
   filter: var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow);
 }
 
+.hover\:brightness-125:hover {
+  --tw-brightness: brightness(1.25);
+  filter: var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow);
+}
+
 .focus\:border-faint:focus {
   border-color: var(--color-border-muted);
 }
@@ -4673,6 +4760,10 @@ video {
   --tw-ring-opacity: 0.5;
 }
 
+.focus-visible\:bg-section:focus-visible {
+  background-color: var(--color-bg-section);
+}
+
 .active\:scale-95:active {
   --tw-scale-x: .95;
   --tw-scale-y: .95;
@@ -4706,6 +4797,10 @@ video {
 
 .disabled\:opacity-50:disabled {
   opacity: 0.5;
+}
+
+.group:focus-within .group-focus-within\:opacity-100 {
+  opacity: 1;
 }
 
 .group\/comment:hover .group-hover\/comment\:pointer-events-auto {
