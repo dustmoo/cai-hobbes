@@ -349,7 +349,7 @@ against the official pricing pages.
 |----------|-------|--------------|
 | OpenAI | `src/llm/openai_pricing.rs` → `PRICES` | developers.openai.com/api/docs/pricing |
 | Gemini | `src/llm/gemini.rs` → `GeminiModel::get_rates` | ai.google.dev/gemini-api/docs/pricing |
-| Claude | `src/llm/claude_models.rs` → `input_price_per_mtok` / `output_price_per_mtok` | platform.claude.com/docs/en/about-claude/pricing |
+| Claude | `src/llm/claude_models.rs` → `input_price_per_mtok` / `output_price_per_mtok` / `cache_read_price_per_mtok` | platform.claude.com/docs/en/about-claude/pricing |
 
 > **Last verified**: 2026-06-17 (all three confirmed against published rates).
 
