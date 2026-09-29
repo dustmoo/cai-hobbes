@@ -22,7 +22,7 @@
 //! new built-ins here, never at a call site.
 
 use crate::components::shared::{ToolCall, ToolCallStatus};
-use crate::context::permissions::{PermissionManager, PermissionStatus};
+use crate::context::permissions::{PermissionManager, PermissionStatus, SkillInvoker};
 use crate::mcp::manager::McpContext;
 use crate::session::SessionState;
 use crate::settings::Settings;
@@ -45,6 +45,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_PAGE_RESULT",
     "HOBBES_UPDATE_SCRATCHPAD",
     "HOBBES_INVOKE_SKILL",
+    "HOBBES_UNLOAD_SKILL",
     "HOBBES_SET_TIMER",
     "HOBBES_LIST_TIMERS",
     "HOBBES_CANCEL_TIMER",
@@ -190,8 +191,54 @@ pub struct BuiltinOutcome {
     pub persist: bool,
 }
 
+/// Whether this tool call is a model `HOBBES_INVOKE_SKILL` that must wait for
+/// the user's approval before it runs. The streaming path asks this first and,
+/// when true, parks the call as a `PermissionRequest` (the same hold-and-resume
+/// mechanism MCP tool calls use) instead of dispatching it; the approval-resume
+/// path then dispatches with `user_approved = true`.
+///
+/// Unknown skills and `disable_model_invocation` skills return `false` — they
+/// are hard errors inside [`invoke_skill`], not something approval can unlock.
+/// A skill that is already loaded in this session was approved when it loaded,
+/// so re-invoking it (e.g. to reload an idle-stubbed manual) needs no new prompt.
+pub fn skill_invoke_needs_approval(
+    deps: BuiltinToolCtx,
+    tool_call: &ToolCall,
+    args_json: &serde_json::Value,
+    session_id: &str,
+) -> bool {
+    if tool_call.tool_name != "HOBBES_INVOKE_SKILL" {
+        return false;
+    }
+    let name = args_json.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(skill) = deps.skill_registry.read().get_skill(name) else {
+        return false;
+    };
+    if skill.metadata.disable_model_invocation {
+        return false;
+    }
+    let already_loaded = deps
+        .session_state
+        .read()
+        .sessions
+        .get(session_id)
+        .is_some_and(|s| s.loaded_skills.contains_key(&skill.metadata.name));
+    if already_loaded {
+        return false;
+    }
+    // Only Ask raises the bubble. Off is refused by `invoke_skill` with an error.
+    deps.permission_manager
+        .read()
+        .check_skill_permission(&skill.metadata.name, SkillInvoker::Model)
+        == PermissionStatus::RequiresPrompt
+}
+
 /// Run `tool_call` if it is a built-in, otherwise return `None` so the caller
 /// falls through to normal MCP dispatch.
+///
+/// `user_approved` is true only on the approval-resume path: the user just
+/// clicked Approve on this call's permission bubble, which satisfies the skill
+/// gate for this one invocation.
 ///
 /// Only computes the result — writing it back into the message, persisting, and
 /// recording it in tool-call history stay with the caller, since the two sites
@@ -202,6 +249,7 @@ pub async fn dispatch_builtin_tool(
     args_json: &serde_json::Value,
     session_id: &str,
     profile_id: Option<&String>,
+    user_approved: bool,
 ) -> Option<BuiltinOutcome> {
     let mut session_state = deps.session_state;
 
@@ -303,7 +351,16 @@ pub async fn dispatch_builtin_tool(
 
         "HOBBES_INVOKE_SKILL" => {
             let (status, response) =
-                invoke_skill(deps, args_json, session_id, profile_id).await;
+                invoke_skill(deps, args_json, session_id, profile_id, user_approved).await;
+            Some(BuiltinOutcome {
+                status,
+                response,
+                persist: true,
+            })
+        }
+
+        "HOBBES_UNLOAD_SKILL" => {
+            let (status, response) = unload_skill(deps, args_json, session_id);
             Some(BuiltinOutcome {
                 status,
                 response,
@@ -452,6 +509,7 @@ async fn invoke_skill(
     args_json: &serde_json::Value,
     session_id: &str,
     profile_id: Option<&String>,
+    user_approved: bool,
 ) -> (ToolCallStatus, String) {
     let mut session_state = deps.session_state;
 
@@ -489,18 +547,39 @@ async fn invoke_skill(
         Some(skill) => skill,
     };
 
-    let permission = deps
-        .permission_manager
+    // The streaming path parks calls that need approval before dispatching
+    // (`skill_invoke_needs_approval`), so reaching a non-Allowed skill here
+    // means a path skipped that step — refuse rather than load unapproved.
+    // A skill already loaded this session stays reloadable even if it was
+    // switched Off meanwhile; once unloaded, Off means it cannot come back.
+    let already_loaded = session_state
         .read()
-        .check_skill_permission(&skill.metadata.name);
-    if permission != PermissionStatus::Allowed {
-        return (
-            ToolCallStatus::Error,
-            format!(
-                "The user has disabled auto-approval for skill '{}'. Ask them to run /{} themselves or enable the skill in Settings → Permissions.",
-                skill_name, skill_name
-            ),
-        );
+        .sessions
+        .get(session_id)
+        .is_some_and(|s| s.loaded_skills.contains_key(&skill.metadata.name));
+    if !already_loaded {
+        let status = deps
+            .permission_manager
+            .read()
+            .check_skill_permission(&skill.metadata.name, SkillInvoker::Model);
+        match status {
+            PermissionStatus::Denied(reason) => {
+                return (
+                    ToolCallStatus::Error,
+                    format!("Skill '{}': {}", skill_name, reason),
+                );
+            }
+            PermissionStatus::RequiresPrompt if !user_approved => {
+                return (
+                    ToolCallStatus::Error,
+                    format!(
+                        "Skill '{}' needs the user's approval before it can be loaded. Ask them to run /{} themselves or enable the skill in Settings → Permissions.",
+                        skill_name, skill_name
+                    ),
+                );
+            }
+            _ => {}
+        }
     }
 
     let mut skill_call = crate::components::shared::SkillCall {
@@ -561,9 +640,94 @@ async fn invoke_skill(
     }
 }
 
+/// Drop `name` from the session's loaded skills. `Err` carries the model-facing
+/// explanation (with what *is* loaded, so it can correct itself).
+fn remove_loaded_skill(
+    state: &mut SessionState,
+    session_id: &str,
+    name: &str,
+) -> Result<(), String> {
+    let Some(session) = state.sessions.get_mut(session_id) else {
+        return Err("Session not found.".to_string());
+    };
+    if session.loaded_skills.remove(name).is_some() {
+        return Ok(());
+    }
+    let mut loaded: Vec<&str> = session.loaded_skills.keys().map(String::as_str).collect();
+    loaded.sort_unstable();
+    Err(format!(
+        "Skill '{}' is not loaded. Currently loaded skills: [{}].",
+        name,
+        loaded.join(", ")
+    ))
+}
+
+/// The model-unload path — same effect and journal event as the user's
+/// `/unload` (SkillUnloaded, which session replay applies), minus the
+/// confirmation chat bubble: the tool result is the confirmation.
+fn unload_skill(
+    deps: BuiltinToolCtx,
+    args_json: &serde_json::Value,
+    session_id: &str,
+) -> (ToolCallStatus, String) {
+    let mut session_state = deps.session_state;
+    let name = args_json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let result = remove_loaded_skill(&mut session_state.write(), session_id, &name);
+    match result {
+        Ok(()) => {
+            crate::session_events::log_event(
+                session_id,
+                crate::session_events::SessionEvent::SkillUnloaded { name: name.clone() },
+            );
+            tracing::info!("Model unloaded skill '{}' from session.loaded_skills", name);
+            (
+                ToolCallStatus::Completed,
+                format!("Unloaded skill '{}' from session context.", name),
+            )
+        }
+        Err(msg) => (ToolCallStatus::Error, msg),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unload_removes_only_the_named_skill() {
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        {
+            let s = state.sessions.get_mut(&id).unwrap();
+            s.loaded_skills.insert("news".into(), "{}".into());
+            s.loaded_skills.insert("timestamp".into(), "{}".into());
+        }
+        assert!(remove_loaded_skill(&mut state, &id, "news").is_ok());
+        let s = state.sessions.get(&id).unwrap();
+        assert!(!s.loaded_skills.contains_key("news"));
+        assert!(s.loaded_skills.contains_key("timestamp"));
+    }
+
+    #[test]
+    fn unload_of_unloaded_skill_errors_and_lists_loaded() {
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        state
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .loaded_skills
+            .insert("timestamp".into(), "{}".into());
+        let err = remove_loaded_skill(&mut state, &id, "news").unwrap_err();
+        assert!(err.contains("'news' is not loaded"), "{err}");
+        assert!(err.contains("[timestamp]"), "{err}");
+        assert!(remove_loaded_skill(&mut state, "missing-session", "news").is_err());
+    }
 
     /// Guards the drift that caused the original bug: a tool advertised by
     /// `CoreClient` but missing from `BUILTIN_TOOLS` reaches `NativeCore` and

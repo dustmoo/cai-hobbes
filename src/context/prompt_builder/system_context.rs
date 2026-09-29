@@ -18,6 +18,98 @@ pub(crate) struct SystemContextResult {
     pub is_continuation_placeholder: bool,
 }
 
+/// Default of `Settings.skill_idle_turns` (user turns a loaded skill may go
+/// unused before its full manual is replaced by the idle stub); used by tests.
+#[cfg(test)]
+pub(crate) const SKILL_IDLE_USER_TURNS: usize = 6;
+
+/// Loaded skills that have gone `idle_after_user_turns` user turns without use.
+///
+/// "Use" is the latest message that either calls one of the skill's resolved
+/// tools (same server-prefix match as the turn-active check), re-invokes the
+/// skill by name (`HOBBES_INVOKE_SKILL`), or is the user's `/skill` run of it.
+/// Idle = that many user text messages have followed the last use. A skill with
+/// no use found in history is treated as fresh, never idle — we don't silently
+/// drop a manual we can't account for.
+///
+/// `idle_after_user_turns == 0` disables stubbing entirely.
+///
+/// Pure over `messages` + `loaded_skills`, so session replay reproduces the
+/// same decision the live session made.
+pub(crate) fn idle_loaded_skills(
+    messages: &[crate::components::chat::Message],
+    loaded_skills: &std::collections::HashMap<String, String>,
+    idle_after_user_turns: usize,
+) -> std::collections::HashSet<String> {
+    if idle_after_user_turns == 0 {
+        return std::collections::HashSet::new();
+    }
+    loaded_skills
+        .iter()
+        .filter_map(|(name, payload_json)| {
+            let payload = serde_json::from_str::<
+                crate::components::shared::CapabilityContextPayload,
+            >(payload_json)
+            .ok()?;
+            let last_use = messages
+                .iter()
+                .rposition(|m| message_uses_skill(m, name, &payload))?;
+            let user_turns_since = messages[last_use + 1..]
+                .iter()
+                .filter(|m| {
+                    m.author == "User" && matches!(m.content, MessageContent::Text { .. })
+                })
+                .count();
+            (user_turns_since >= idle_after_user_turns).then(|| name.clone())
+        })
+        .collect()
+}
+
+fn message_uses_skill(
+    message: &crate::components::chat::Message,
+    skill_name: &str,
+    payload: &crate::components::shared::CapabilityContextPayload,
+) -> bool {
+    match &message.content {
+        MessageContent::ToolCall(tc) if tc.tool_name == "HOBBES_INVOKE_SKILL" => {
+            serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                .ok()
+                .and_then(|a| a.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .as_deref()
+                == Some(skill_name)
+        }
+        MessageContent::ToolCall(tc) => {
+            !tc.server_name.is_empty()
+                && payload
+                    .resolved_tools
+                    .values()
+                    .any(|tool_str| tool_str.contains(tc.server_name.as_str()))
+        }
+        MessageContent::SkillCall(sc) => sc.skill_name == skill_name,
+        _ => false,
+    }
+}
+
+/// Whether a registry skill belongs in the `available_skills` advert.
+///
+/// - Not loaded: advertised unless the user explicitly turned it off (`false`).
+///   Unlisted skills stay advertised — the model may ask, and the user answers
+///   the approval bubble.
+/// - Loaded and fresh: already in context, not advertised.
+/// - Loaded but idle-stubbed: advertised so the model can reload the manual
+///   (a loaded skill needs no fresh approval to be re-invoked).
+pub(crate) fn skill_is_advertised(
+    name: &str,
+    loaded: bool,
+    idle: bool,
+    permissions: &crate::context::permissions::PermissionSettings,
+) -> bool {
+    if loaded {
+        return idle;
+    }
+    permissions.skill_permissions.get(name) != Some(&false)
+}
+
 impl<'a> PromptBuilder<'a> {
     /// Build the system instruction and tool list from session context.
     ///
@@ -259,6 +351,10 @@ impl<'a> PromptBuilder<'a> {
         // while a skill is mid-execution, no other skills are advertised.
         let mut turn_active_skill_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Loaded skills currently shown as idle stubs; also drives re-advertising
+        // them below so the model can reload the manual.
+        let mut idle_skill_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         if !self.session.loaded_skills.is_empty() {
             // Step 1: Collect tool server prefixes used in the last 5 messages.
             let recently_used_servers: std::collections::HashSet<String> = self
@@ -300,7 +396,15 @@ impl<'a> PromptBuilder<'a> {
             // Step 3: Build the loaded_skills array for the system context map.
             // Full manual → turn-active skills; stub only → inactive skills.
             // If no active skills were detected, fall back to injecting all skills fully.
+            // Skills idle for `settings.skill_idle_turns` user turns are stubbed regardless
+            // (see `idle_loaded_skills`), so a one-off load stops costing its manual
+            // on every later turn.
             let use_lazy = !turn_active_skill_names.is_empty();
+            idle_skill_names = idle_loaded_skills(
+                &self.session.messages,
+                &self.session.loaded_skills,
+                self.settings.skill_idle_turns,
+            );
             let skills_array: Vec<serde_json::Value> = self
                 .session
                 .loaded_skills
@@ -315,6 +419,21 @@ impl<'a> PromptBuilder<'a> {
                         .iter()
                         .map(|(cap, tool)| json!({"capability": cap, "use_tool": tool}))
                         .collect();
+
+                    if idle_skill_names.contains(skill_name) {
+                        tracing::debug!(
+                            "Loaded skill '{}': idle stub (unused for {}+ user turns)",
+                            skill_name, self.settings.skill_idle_turns
+                        );
+                        return Some(json!({
+                            "name": skill_name,
+                            "resolved_tools": tool_mappings,
+                            "note": format!(
+                                "Skill idle — its full manual was dropped after {} user turns without use. Call HOBBES_INVOKE_SKILL with this name to reload the full manual, or HOBBES_UNLOAD_SKILL to drop it.",
+                                self.settings.skill_idle_turns
+                            ),
+                        }));
+                    }
 
                     let is_active = !use_lazy || turn_active_skill_names.contains(skill_name);
                     if is_active {
@@ -470,7 +589,14 @@ impl<'a> PromptBuilder<'a> {
                 crate::skills::registry::available_skills_snapshot()
                     .into_iter()
                     .filter(|s| !s.disable_model_invocation)
-                    .filter(|s| !self.session.loaded_skills.contains_key(&s.name))
+                    .filter(|s| {
+                        skill_is_advertised(
+                            &s.name,
+                            self.session.loaded_skills.contains_key(&s.name),
+                            idle_skill_names.contains(&s.name),
+                            &self.settings.permission_settings,
+                        )
+                    })
                     .map(|s| {
                         let mut entry = json!({
                             "name": s.name,
@@ -501,6 +627,11 @@ impl<'a> PromptBuilder<'a> {
                     }),
                 );
             }
+        }
+
+        // Nothing to unload → don't spend a tool definition on it.
+        if self.session.loaded_skills.is_empty() {
+            tools.retain(|t| t.name != "HOBBES_UNLOAD_SKILL");
         }
 
         let persona = system_context_map

@@ -455,10 +455,18 @@ pub fn MessageList(
                                                             class: "{container_classes} w-full",
                                                             div {
                                                                 class: "flex flex-col max-w-full min-w-0",
-                                                                PermissionPrompt {
-                                                                    tool_call: tool_call.clone(),
-                                                                    session_id: session_id.clone(),
-                                                                },
+                                                                if crate::components::tool_call_display::is_skill_invoke_request(tool_call) {
+                                                                    crate::components::tool_call_display::SkillToolPermissionPrompt {
+                                                                        tool_call: tool_call.clone(),
+                                                                        session_id: session_id.clone(),
+                                                                        profile_color: profile_color.clone(),
+                                                                    }
+                                                                } else {
+                                                                    PermissionPrompt {
+                                                                        tool_call: tool_call.clone(),
+                                                                        session_id: session_id.clone(),
+                                                                    }
+                                                                }
                                                                 MessageCaption {
                                                                     label: "System".to_string(),
                                                                     created_at: message.created_at,

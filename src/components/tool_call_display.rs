@@ -543,9 +543,134 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
     }
 }
 
+/// Whether a held permission request is the model asking to load a skill —
+/// those render as the skill approval bubble (`SkillPermissionPrompt`, the same
+/// one `/slash` raises) instead of the generic tool prompt.
+pub fn is_skill_invoke_request(tool_call: &ToolCall) -> bool {
+    tool_call.tool_name == "HOBBES_INVOKE_SKILL"
+}
+
+/// The `SkillCall` the skill bubble displays for a held `HOBBES_INVOKE_SKILL`.
+/// Only the name, arguments and execution id are shown by the prompt.
+fn skill_call_from_invoke(tool_call: &ToolCall) -> super::shared::SkillCall {
+    let args: serde_json::Value =
+        serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
+    let field = |key: &str| {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    super::shared::SkillCall {
+        execution_id: tool_call.execution_id.clone(),
+        skill_name: field("name"),
+        arguments: field("arguments"),
+        status: super::shared::SkillCallStatus::Pending,
+        ..Default::default()
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+pub struct SkillToolPermissionPromptProps {
+    pub tool_call: ToolCall,
+    /// Owning session — same contract as `PermissionPromptProps::session_id`.
+    pub session_id: String,
+    pub profile_color: String,
+}
+
+/// Approval bubble for a model-initiated skill load. Wraps the shared
+/// `SkillPermissionPrompt` (Approve / Deny + "Always allow this skill") and
+/// resolves the held tool call the way `PermissionPrompt` does: Approve turns it
+/// back into a `Running` ToolCall and signals the resume path in chat.rs, which
+/// loads the skill and continues the turn; Deny records an error result.
+#[component]
+pub fn SkillToolPermissionPrompt(props: SkillToolPermissionPromptProps) -> Element {
+    let session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let has_pending_approvals =
+        consume_context::<Signal<std::collections::HashSet<String>>>();
+    let skill_call = skill_call_from_invoke(&props.tool_call);
+
+    rsx! {
+        div {
+            class: format!("relative group rounded-2xl {} shadow-md overflow-hidden", props.profile_color),
+            div {
+                class: "px-4 pt-3 pb-1 text-[10px] font-bold opacity-60 uppercase tracking-[0.2em]",
+                "> SKILL COMMAND"
+            }
+            crate::components::skill_call_display::SkillPermissionPrompt {
+                skill_call: skill_call,
+                on_approve: {
+                    let session_id = props.session_id.clone();
+                    move |execution_id: String| {
+                        let mut session_state = session_state;
+                        let mut has_pending_approvals = has_pending_approvals;
+                        let mut found = false;
+                        {
+                            let mut state = session_state.write();
+                            if let Some(session) = state.sessions.get_mut(&session_id) {
+                                found = true;
+                                if let Some(msg) = message_mut_by_execution_id(session, &execution_id) {
+                                    if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
+                                        let mut approved_tc = tc.clone();
+                                        approved_tc.status = ToolCallStatus::Running;
+                                        msg.content = super::shared::MessageContent::ToolCall(approved_tc);
+                                    }
+                                }
+                            }
+                        }
+                        if found {
+                            has_pending_approvals.write().insert(session_id.clone());
+                        }
+                    }
+                },
+                on_deny: {
+                    let session_id = props.session_id.clone();
+                    move |execution_id: String| {
+                        let mut session_state = session_state;
+                        let mut state = session_state.write();
+                        if let Some(session) = state.sessions.get_mut(&session_id) {
+                            if let Some(msg) = message_mut_by_execution_id(session, &execution_id) {
+                                if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
+                                    let mut denied_tc = tc.clone();
+                                    denied_tc.status = ToolCallStatus::Error;
+                                    denied_tc.response = "Denied by user.".to_string();
+                                    msg.content = super::shared::MessageContent::ToolCall(denied_tc);
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::message_mut_by_execution_id;
+    use super::{is_skill_invoke_request, skill_call_from_invoke};
+
+    #[test]
+    fn skill_invoke_request_maps_to_skill_bubble() {
+        let tc = crate::components::shared::ToolCall {
+            execution_id: "e1".into(),
+            server_name: "hobbes-core".into(),
+            tool_name: "HOBBES_INVOKE_SKILL".into(),
+            arguments: r#"{"name":"news","arguments":"tech"}"#.into(),
+            ..Default::default()
+        };
+        assert!(is_skill_invoke_request(&tc));
+        let sc = skill_call_from_invoke(&tc);
+        assert_eq!(sc.execution_id, "e1");
+        assert_eq!(sc.skill_name, "news");
+        assert_eq!(sc.arguments, "tech");
+
+        let other = crate::components::shared::ToolCall {
+            tool_name: "HOBBES_SET_TIMER".into(),
+            ..Default::default()
+        };
+        assert!(!is_skill_invoke_request(&other));
+    }
     use crate::components::chat::Message;
     use crate::components::shared::{MessageContent, ToolCall, ToolCallStatus};
     use crate::session::{Session, SessionState};

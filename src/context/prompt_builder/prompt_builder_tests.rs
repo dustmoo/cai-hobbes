@@ -609,6 +609,74 @@ fn test_available_skills_gated_by_running_skill() {
         "just-loaded: loader tool withheld"
     );
 
+    // 3b. Advert filtering: explicit `false` is omitted, unlisted and `true`
+    // stay advertised.
+    set_available_skills_for_test(vec![
+        AvailableSkill {
+            name: "denied-skill".to_string(),
+            description: "d".to_string(),
+            argument_hint: None,
+            disable_model_invocation: false,
+        },
+        AvailableSkill {
+            name: "unlisted-skill".to_string(),
+            description: "u".to_string(),
+            argument_hint: None,
+            disable_model_invocation: false,
+        },
+        AvailableSkill {
+            name: "allowed-skill".to_string(),
+            description: "a".to_string(),
+            argument_hint: None,
+            disable_model_invocation: false,
+        },
+    ]);
+    let mut filtered_settings = Settings::default();
+    filtered_settings
+        .permission_settings
+        .skill_permissions
+        .insert("denied-skill".to_string(), false);
+    filtered_settings
+        .permission_settings
+        .skill_permissions
+        .insert("allowed-skill".to_string(), true);
+    let session = session_with_core_tools();
+    let prompt =
+        PromptBuilder::new(&session, &filtered_settings).build_prompt("Hi".to_string());
+    let system = prompt.prompt.system.clone().unwrap();
+    assert!(!system.contains("denied-skill"), "explicit false is not advertised");
+    assert!(system.contains("unlisted-skill"), "unlisted stays advertised");
+    assert!(system.contains("allowed-skill"), "allowed stays advertised");
+
+    // 3c. An idle-stubbed loaded skill is re-advertised so it can be reloaded.
+    set_available_skills_for_test(vec![AvailableSkill {
+        name: "news".to_string(),
+        description: "News".to_string(),
+        argument_hint: None,
+        disable_model_invocation: false,
+    }]);
+    let mut session = session_with_core_tools();
+    session.loaded_skills.insert(
+        "news".to_string(),
+        loaded_skill_payload("news", "unrelated"),
+    );
+    let mut msgs = vec![invoke_skill_msg("news")];
+    msgs.extend((0..SKILL_IDLE_USER_TURNS).map(|i| user_text_msg(&format!("turn {i}"))));
+    session.messages = msgs;
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+    assert!(
+        prompt.prompt.system.clone().unwrap().contains("available_skills"),
+        "idle-stubbed skill is advertised for reload"
+    );
+    assert!(
+        prompt
+            .prompt
+            .tools
+            .iter()
+            .any(|t| t.name == "HOBBES_INVOKE_SKILL"),
+        "loader tool present so the idle skill can be reloaded"
+    );
+
     // 4. No skills on disk → loader tool withheld even when idle
     set_available_skills_for_test(vec![]);
     let session = session_with_core_tools();
@@ -1071,4 +1139,147 @@ fn strip_historical_thinking_keeps_the_current_tool_loop() {
     assert!(!has_thinking(&messages[1]), "earlier turn is stripped");
     assert!(has_thinking(&messages[3]), "first loop step keeps its thinking");
     assert!(has_thinking(&messages[5]), "latest loop step keeps its thinking");
+}
+
+// =========================================================================
+// Idle skill stub (lifetime control)
+// =========================================================================
+
+use super::system_context::{idle_loaded_skills, skill_is_advertised, SKILL_IDLE_USER_TURNS};
+
+fn invoke_skill_msg(skill: &str) -> Message {
+    let mut m = tool_call_msg("HOBBES_INVOKE_SKILL", "manual".to_string(), None);
+    if let MessageContent::ToolCall(tc) = &mut m.content {
+        tc.server_name = "hobbes-core".to_string();
+        tc.arguments = serde_json::json!({ "name": skill }).to_string();
+    }
+    m
+}
+
+fn loaded(skill: &str, tool: &str) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([(skill.to_string(), loaded_skill_payload(skill, tool))])
+}
+
+fn user_turns(n: usize) -> Vec<Message> {
+    (0..n).map(|i| user_text_msg(&format!("turn {i}"))).collect()
+}
+
+#[test]
+fn idle_decision_counts_user_turns_since_last_use() {
+    let skills = loaded("news", "test-server_search");
+
+    // Load, then N-1 user turns → still fresh; N → idle.
+    let mut msgs = vec![invoke_skill_msg("news")];
+    msgs.extend(user_turns(SKILL_IDLE_USER_TURNS - 1));
+    assert!(idle_loaded_skills(&msgs, &skills, SKILL_IDLE_USER_TURNS).is_empty());
+    msgs.extend(user_turns(1));
+    assert!(idle_loaded_skills(&msgs, &skills, SKILL_IDLE_USER_TURNS).contains("news"));
+
+    // A call to the skill's resolved tool resets the clock.
+    msgs.push(tool_call_msg("search", "r".to_string(), None));
+    assert!(idle_loaded_skills(&msgs, &skills, SKILL_IDLE_USER_TURNS).is_empty());
+    msgs.extend(user_turns(SKILL_IDLE_USER_TURNS));
+    assert!(idle_loaded_skills(&msgs, &skills, SKILL_IDLE_USER_TURNS).contains("news"));
+
+    // A re-invoke by name resets it too.
+    msgs.push(invoke_skill_msg("news"));
+    assert!(idle_loaded_skills(&msgs, &skills, SKILL_IDLE_USER_TURNS).is_empty());
+}
+
+#[test]
+fn idle_decision_ignores_other_skills_and_non_user_text() {
+    let skills = loaded("news", "test-server_search");
+    // Re-invoking a DIFFERENT skill is not use of "news"; assistant text and
+    // tool calls between user turns are not user turns.
+    let mut msgs = vec![invoke_skill_msg("news")];
+    msgs.extend(user_turns(SKILL_IDLE_USER_TURNS - 1));
+    msgs.push(invoke_skill_msg("other"));
+    msgs.push(assistant_thinking_msg("hi", None, None));
+    msgs.extend(user_turns(1));
+    assert!(idle_loaded_skills(&msgs, &skills, SKILL_IDLE_USER_TURNS).contains("news"));
+}
+
+#[test]
+fn skill_with_no_recorded_use_is_never_idle() {
+    let skills = loaded("news", "unrelated");
+    let msgs = user_turns(SKILL_IDLE_USER_TURNS * 2);
+    assert!(idle_loaded_skills(&msgs, &skills, SKILL_IDLE_USER_TURNS).is_empty());
+}
+
+#[test]
+fn zero_idle_turns_never_stubs() {
+    let skills = loaded("news", "unrelated");
+    let mut msgs = vec![invoke_skill_msg("news")];
+    msgs.extend(user_turns(50));
+    assert!(idle_loaded_skills(&msgs, &skills, SKILL_IDLE_USER_TURNS).contains("news"));
+    assert!(idle_loaded_skills(&msgs, &skills, 0).is_empty());
+}
+
+#[test]
+fn idle_skill_is_injected_as_stub_not_manual() {
+    let settings = Settings::default();
+    let mut session = session_with_core_tools();
+    session
+        .loaded_skills
+        .insert("news".to_string(), loaded_skill_payload("news", "unrelated"));
+    let mut msgs = vec![invoke_skill_msg("news")];
+    msgs.extend(user_turns(SKILL_IDLE_USER_TURNS - 1));
+    session.messages = msgs.clone();
+
+    let fresh = PromptBuilder::new(&session, &settings)
+        .build_prompt(String::new())
+        .prompt
+        .system
+        .unwrap();
+    assert!(fresh.contains("Do the thing."), "fresh skill keeps its manual");
+
+    msgs.extend(user_turns(1));
+    session.messages = msgs;
+    let idle = PromptBuilder::new(&session, &settings)
+        .build_prompt(String::new())
+        .prompt
+        .system
+        .unwrap();
+    assert!(!idle.contains("Do the thing."), "idle skill's manual is dropped");
+    assert!(idle.contains("HOBBES_INVOKE_SKILL with this name to reload"));
+    assert!(idle.contains("unrelated"), "stub keeps the tool list");
+}
+
+#[test]
+fn advert_filter_table() {
+    use crate::context::permissions::PermissionSettings;
+    let mut perms = PermissionSettings::default();
+    perms.skill_permissions.insert("no".into(), false);
+    perms.skill_permissions.insert("yes".into(), true);
+    // not loaded: only explicit false is hidden
+    assert!(!skill_is_advertised("no", false, false, &perms));
+    assert!(skill_is_advertised("yes", false, false, &perms));
+    assert!(skill_is_advertised("unlisted", false, false, &perms));
+    // loaded: hidden while fresh, advertised when idle-stubbed
+    assert!(!skill_is_advertised("yes", true, false, &perms));
+    assert!(skill_is_advertised("yes", true, true, &perms));
+}
+
+#[test]
+fn unload_tool_withheld_when_nothing_loaded() {
+    let mut session = session_with_core_tools();
+    if let Some(ctx) = session.active_context.mcp_tools.as_mut() {
+        let mut t = invoke_skill_tool();
+        t.name = "HOBBES_UNLOAD_SKILL".into();
+        ctx.servers[0].tools.push(t);
+    }
+    let settings = Settings::default();
+    let has_unload = |s: &Session| {
+        PromptBuilder::new(s, &settings)
+            .build_prompt("Hi".to_string())
+            .prompt
+            .tools
+            .iter()
+            .any(|t| t.name == "HOBBES_UNLOAD_SKILL")
+    };
+    assert!(!has_unload(&session));
+    session
+        .loaded_skills
+        .insert("news".to_string(), loaded_skill_payload("news", "x"));
+    assert!(has_unload(&session));
 }

@@ -441,6 +441,9 @@ pub fn ChatWindow(
                         &args_json,
                         &owning_id,
                         composio_profile.as_ref(),
+                        // Only approved calls are `Running` here (see step 1):
+                        // the Approve click already satisfied the skill gate.
+                        true,
                     )
                     .await;
 

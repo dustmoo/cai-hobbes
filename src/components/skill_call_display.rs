@@ -69,7 +69,7 @@ pub fn SkillPermissionPrompt(props: SkillPermissionPromptProps) -> Element {
                 label {
                     r#for: "remember-skill-permission",
                     class: "text-xs cursor-pointer select-none",
-                    "Always allow this skill"
+                    "Remember my choice: Approve sets this skill to Auto, Deny sets it to Off"
                 }
             }
             div {
@@ -84,7 +84,7 @@ pub fn SkillPermissionPrompt(props: SkillPermissionPromptProps) -> Element {
                             let remember = *remember_choice.read();
                             if remember {
                                 let mut s = settings.write();
-                                s.permission_settings.skill_permissions.insert(skill_name.clone(), false);
+                                s.permission_settings.set_skill_policy(&skill_name, crate::context::permissions::SkillPolicy::Off);
                                 let _ = settings_manager.read().save(&s);
                             }
                             on_deny.call(execution_id.clone());
@@ -102,7 +102,7 @@ pub fn SkillPermissionPrompt(props: SkillPermissionPromptProps) -> Element {
                             let remember = *remember_choice.read();
                             if remember {
                                 let mut s = settings.write();
-                                s.permission_settings.skill_permissions.insert(skill_name.clone(), true);
+                                s.permission_settings.set_skill_policy(&skill_name, crate::context::permissions::SkillPolicy::Auto);
                                 let _ = settings_manager.read().save(&s);
                             }
                             on_approve.call(execution_id.clone());

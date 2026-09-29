@@ -1,6 +1,7 @@
 use super::super::SettingsCtx;
 use super::super::trust_rules::TrustRulesSection;
-use crate::context::permissions::ToolCategory;
+use super::super::shared::INPUT;
+use crate::context::permissions::{SkillPolicy, ToolCategory};
 use dioxus::prelude::*;
 
 #[component]
@@ -27,7 +28,10 @@ pub(in super::super) fn PermissionsTab(
                             class: "p-4",
                             div {
                                 class: "flex items-center justify-between mb-4",
-                                label { class: "block text-sm font-medium text-fg-muted", "Enable Auto-Approval" }
+                                div {
+                                    label { class: "block text-sm font-medium text-fg-muted", "Auto-approve MCP tool calls" }
+                                    p { class: "text-xs text-fg-muted", "Applies to MCP tool calls only. Skills have their own per-skill setting below." }
+                                }
                                 label {
                                     class: "relative inline-flex items-center cursor-pointer",
                                     input {
@@ -124,28 +128,31 @@ pub(in super::super) fn PermissionsTab(
                     class: "p-4 bg-section rounded-lg",
                     h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-4", "Skill Permissions" }
                     p { class: "text-xs text-fg-muted mb-4",
-                        "Manage auto-approval for specific skills. When enabled, these skills will execute without prompting."
+                        "Auto: Hobbes can load the skill by itself, and /name runs. Ask (default): Hobbes must get your approval each time it wants to load the skill; typing /name yourself runs it directly. Off: the skill is blocked — Hobbes can't see or load it and /name is refused. A skill already loaded in a chat stays loaded there until unloaded."
                     }
 
                     {
                         // Get all skills from registry AND saved permissions
                         let registry = skill_registry.read();
-                        let saved_permissions = local_settings.read().permission_settings.skill_permissions.clone();
+                        let permission_settings = local_settings.read().permission_settings.clone();
+                        let saved_permissions = permission_settings.skill_permissions.clone();
 
-                        // Build merged map: registry skills + any saved permissions
-                        let mut all_skills: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+                        // Build merged map: registry skills + any saved permissions.
+                        // The shown state is the stored policy, the same one the gates read.
+                        let mut all_skills: std::collections::HashMap<String, SkillPolicy> = std::collections::HashMap::new();
 
-                        // Add all registered skills (default to false if no saved permission)
                         for skill in registry.list_skills() {
-                            let is_allowed = saved_permissions.get(&skill.metadata.name).copied().unwrap_or(false);
-                            all_skills.insert(skill.metadata.name.clone(), is_allowed);
+                            all_skills.insert(
+                                skill.metadata.name.clone(),
+                                permission_settings.skill_policy(&skill.metadata.name),
+                            );
                         }
 
                         // Also include any saved permissions for skills not currently in registry
                         // (in case a skill was removed but permission was saved)
-                        for (name, allowed) in &saved_permissions {
+                        for name in saved_permissions.keys() {
                             if !all_skills.contains_key(name) {
-                                all_skills.insert(name.clone(), *allowed);
+                                all_skills.insert(name.clone(), permission_settings.skill_policy(name));
                             }
                         }
 
@@ -164,7 +171,7 @@ pub(in super::super) fn PermissionsTab(
                             rsx! {
                                 div {
                                     class: "space-y-3",
-                                    for (skill_name, is_allowed) in sorted_skills {
+                                    for (skill_name, policy) in sorted_skills {
                                         {
                                             // Metadata Lookup
                                         let skill_opt = registry.get_skill(&skill_name);
@@ -180,29 +187,32 @@ pub(in super::super) fn PermissionsTab(
                                                 div {
                                                     class: "flex items-center gap-2",
                                                     span { class: "text-sm font-bold text-fg", "/{skill_name}" }
-                                                    if is_allowed {
-                                                        span { class: "px-1.5 py-0.5 text-[10px] font-bold bg-action-success text-action-success-text rounded", "ALLOWED" }
+                                                    if policy == SkillPolicy::Auto {
+                                                        span { class: "px-1.5 py-0.5 text-[10px] font-bold bg-action-success text-action-success-text rounded", "AUTO" }
                                                     }
                                                 }
                                                 span { class: "text-xs text-fg-muted mt-1 line-clamp-2", "{description}" }
                                             }
-                                            label {
-                                                class: "relative inline-flex items-center cursor-pointer",
-                                                input {
-                                                    r#type: "checkbox",
-                                                    class: "sr-only peer",
-                                                    checked: is_allowed,
-                                                    oninput: {
+                                            div {
+                                                class: "w-28 shrink-0",
+                                                select {
+                                                    class: "{INPUT}",
+                                                    onchange: {
                                                         let skill_name = skill_name.clone();
                                                         move |event: Event<FormData>| {
-                                                            if let Ok(checked) = event.value().parse() {
-                                                                // Use write() to trigger signal notification (Pattern 33)
-                                                                local_settings.write().permission_settings.skill_permissions.insert(skill_name.clone(), checked);
-                                                            }
+                                                            let policy = match event.value().as_str() {
+                                                                "auto" => SkillPolicy::Auto,
+                                                                "off" => SkillPolicy::Off,
+                                                                _ => SkillPolicy::Ask,
+                                                            };
+                                                            // Use write() to trigger signal notification (Pattern 33)
+                                                            local_settings.write().permission_settings.set_skill_policy(&skill_name, policy);
                                                         }
-                                                    }
+                                                    },
+                                                    option { value: "auto", selected: policy == SkillPolicy::Auto, "Auto" }
+                                                    option { value: "ask", selected: policy == SkillPolicy::Ask, "Ask" }
+                                                    option { value: "off", selected: policy == SkillPolicy::Off, "Off" }
                                                 }
-                                                div { class: if is_allowed { "toggle-switch-sm active" } else { "toggle-switch-sm" } }
                                             }
                                         }
                                     }
