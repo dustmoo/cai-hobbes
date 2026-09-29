@@ -1,19 +1,23 @@
+use super::composio::composio_server_key;
+use super::tool_call::get_local_meta_tools;
+use super::{
+    is_builtin_virtual_server, is_composio_native, ActiveMcpClient, AuthRequiredInfo,
+    McpClientType, McpContext, McpManager, McpServerConfig, COMPOSIO_NATIVE_PREFIX,
+    HOBBES_CORE_SERVER, HOBBES_META_SERVER, HOBBES_PLANNER_SERVER, HOBBES_TERMINAL_SERVER,
+};
 use crate::components::smithery_registry::SmitheryServerDetail;
 use crate::mcp::authenticated_sse::AuthenticatedClientError;
 use crate::mcp::composio_client::{composio_to_rmcp_tool, ComposioClient};
 use dioxus::prelude::spawn;
 use dioxus_signals::{Readable, Writable};
-use rmcp::model::{PaginatedRequestParam};
-use rmcp::service::{ServiceExt};
+use rmcp::model::PaginatedRequestParam;
+use rmcp::service::ServiceExt;
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::sse_client::SseTransportError;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::mpsc::{self};
-use super::{COMPOSIO_NATIVE_PREFIX, is_composio_native, HOBBES_CORE_SERVER, HOBBES_META_SERVER, HOBBES_PLANNER_SERVER, HOBBES_TERMINAL_SERVER, is_builtin_virtual_server, McpServerConfig, McpContext, McpClientType, ActiveMcpClient, AuthRequiredInfo, McpManager};
-use super::composio::{composio_server_key};
-use super::tool_call::{get_local_meta_tools};
 
 impl McpManager {
     /// Remove dynamically loaded tools belonging to `server_name` from the
@@ -299,8 +303,7 @@ impl McpManager {
             let tx_clone = tx.clone();
             spawn(async move {
                 tracing::info!("Initializing native terminal server");
-                let terminal_client =
-                    Arc::new(crate::mcp::terminal_client::TerminalClient::new());
+                let terminal_client = Arc::new(crate::mcp::terminal_client::TerminalClient::new());
                 let tools = terminal_client.list_tools();
                 let config = McpServerConfig::native_stub(
                     HOBBES_TERMINAL_SERVER.to_string(),
@@ -426,7 +429,9 @@ impl McpManager {
                             let base_url = profile.base_url.clone().unwrap_or_else(|| {
                                 "https://backend.composio.dev/v3/mcp".to_string()
                             });
-                            let has_server_uuid = profile.base_url.as_ref()
+                            let has_server_uuid = profile
+                                .base_url
+                                .as_ref()
                                 .is_some_and(|u| u.contains("/v3/mcp/"));
 
                             let entity_id = profile.entity_id.clone();
@@ -465,8 +470,7 @@ impl McpManager {
                                     warning: Some("No MCP server configured. Connect a toolkit to get started.".into()),
                                 })
                             };
-                            match tool_result
-                            {
+                            match tool_result {
                                 Ok(discovery_result) => {
                                     let tools = discovery_result
                                         .tools
@@ -1071,7 +1075,9 @@ impl McpManager {
                             .base_url
                             .clone()
                             .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
-                        let has_server_uuid = profile.base_url.as_ref()
+                        let has_server_uuid = profile
+                            .base_url
+                            .as_ref()
                             .is_some_and(|u| u.contains("/v3/mcp/"));
 
                         let entity_id = profile.entity_id.clone();
@@ -1096,7 +1102,9 @@ impl McpManager {
 
                         // Guard: skip MCP list_tools when no server UUID (prevents 10401)
                         if !has_server_uuid {
-                            tracing::warn!("No MCP server UUID in base_url (retry) — skipping retry");
+                            tracing::warn!(
+                                "No MCP server UUID in base_url (retry) — skipping retry"
+                            );
                             return;
                         }
                         match client_for_tools.list_tools().await {
@@ -1474,10 +1482,7 @@ impl McpManager {
         server_name: &str,
         config: McpServerConfig,
     ) -> Result<(), String> {
-        tracing::info!(
-            "[RECONNECT] Restarting stdio MCP server '{}'",
-            server_name
-        );
+        tracing::info!("[RECONNECT] Restarting stdio MCP server '{}'", server_name);
 
         // 1. Remove the dead server entry
         {
@@ -1538,25 +1543,19 @@ impl McpManager {
         }
 
         // 3. Spawn the child process and initialize the rmcp service
-        let transport = TokioChildProcess::new(cmd).map_err(|e| {
-            format!(
-                "Failed to launch stdio MCP server '{}': {}",
-                server_name, e
-            )
-        })?;
+        let transport = TokioChildProcess::new(cmd)
+            .map_err(|e| format!("Failed to launch stdio MCP server '{}': {}", server_name, e))?;
 
-        let service = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            ().serve(transport),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "Timeout waiting for stdio MCP server '{}' to initialize",
-                server_name
-            )
-        })?
-        .map_err(|e| format!("Failed to serve MCP server '{}': {}", server_name, e))?;
+        let service =
+            tokio::time::timeout(std::time::Duration::from_secs(300), ().serve(transport))
+                .await
+                .map_err(|_| {
+                    format!(
+                        "Timeout waiting for stdio MCP server '{}' to initialize",
+                        server_name
+                    )
+                })?
+                .map_err(|e| format!("Failed to serve MCP server '{}': {}", server_name, e))?;
 
         // 4. Discover tools from the new server
         let mut all_tools = Vec::new();

@@ -1,8 +1,14 @@
-use dioxus_signals::{Readable};
+use super::composio::{
+    composio_server_key, dyn_composio_key, resolve_composio_key, ComposioKeyLookup,
+};
+use super::{
+    is_composio_native, ActiveMcpClient, McpClientType, McpContext, McpManager, McpServerConfig,
+    McpServerContext, McpServerStatus, ServerStatus, COMPOSIO_NATIVE_PREFIX, HOBBES_CORE_SERVER,
+    HOBBES_META_SERVER, HOBBES_PLANNER_SERVER, HOBBES_TERMINAL_SERVER,
+};
+use dioxus_signals::Readable;
 use rmcp::model::Tool;
-use std::collections::{HashSet};
-use super::{COMPOSIO_NATIVE_PREFIX, is_composio_native, HOBBES_CORE_SERVER, HOBBES_META_SERVER, HOBBES_PLANNER_SERVER, HOBBES_TERMINAL_SERVER, McpServerConfig, McpContext, McpServerContext, ServerStatus, McpServerStatus, McpClientType, ActiveMcpClient, McpManager};
-use super::composio::{ComposioKeyLookup, composio_server_key, dyn_composio_key, resolve_composio_key};
+use std::collections::HashSet;
 
 impl McpManager {
     pub async fn get_mcp_context(&self, profile_id: Option<String>) -> McpContext {
@@ -147,9 +153,8 @@ impl McpManager {
         // Populate connected toolkit slugs from cached Composio toolkit info (MCP-First, Section 6).
         // This is a pure cache read — no network calls. The cache is hydrated by
         // list_connected_toolkits() which uses the MCP `tools/list` endpoint.
-        let composio_lookup = resolve_composio_key(&servers, profile_id.as_deref(), |c| {
-            c.profile_id.as_deref()
-        });
+        let composio_lookup =
+            resolve_composio_key(&servers, profile_id.as_deref(), |c| c.profile_id.as_deref());
         if let ComposioKeyLookup::Ambiguous { ref candidates } = composio_lookup {
             // Not a warning here: this is the prompt-build path, called on every
             // turn, so a degrade (silently reporting no connected toolkits) must
@@ -212,12 +217,20 @@ impl McpManager {
                 // User has manually unloaded/disabled this server
                 McpServerStatus {
                     uri: config.uri.clone(),
-                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Disabled)
+                    ..McpServerStatus::new(
+                        config.name.clone(),
+                        config.description.clone(),
+                        ServerStatus::Disabled,
+                    )
                 }
             } else if config.disabled {
                 McpServerStatus {
                     uri: config.uri.clone(),
-                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Disabled)
+                    ..McpServerStatus::new(
+                        config.name.clone(),
+                        config.description.clone(),
+                        ServerStatus::Disabled,
+                    )
                 }
             } else if let Some(client) = servers.get(&config.name) {
                 // For on-demand servers, count only tools that have been explicitly
@@ -239,7 +252,11 @@ impl McpManager {
                     is_on_demand,
                     uri: config.uri.clone(),
                     warning_message: client.warning_message.clone(),
-                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Loaded)
+                    ..McpServerStatus::new(
+                        config.name.clone(),
+                        config.description.clone(),
+                        ServerStatus::Loaded,
+                    )
                 }
             } else if let Some(auth_info) = auth_required.get(&config.name) {
                 // Server requires OAuth authentication
@@ -247,20 +264,32 @@ impl McpManager {
                     error_message: Some(auth_info.error_message.clone()),
                     auth_url: auth_info.auth_url.clone(),
                     uri: config.uri.clone(),
-                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::NeedsAuth)
+                    ..McpServerStatus::new(
+                        config.name.clone(),
+                        config.description.clone(),
+                        ServerStatus::NeedsAuth,
+                    )
                 }
             } else if let Some((_, error)) = failed.get(&config.name) {
                 McpServerStatus {
                     error_message: Some(error.clone()),
                     uri: config.uri.clone(),
-                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Error)
+                    ..McpServerStatus::new(
+                        config.name.clone(),
+                        config.description.clone(),
+                        ServerStatus::Error,
+                    )
                 }
             } else {
                 // Server is still initializing or hasn't been attempted yet
                 McpServerStatus {
                     error_message: Some("Initializing...".to_string()),
                     uri: config.uri.clone(),
-                    ..McpServerStatus::new(config.name.clone(), config.description.clone(), ServerStatus::Error)
+                    ..McpServerStatus::new(
+                        config.name.clone(),
+                        config.description.clone(),
+                        ServerStatus::Error,
+                    )
                 }
             };
             statuses.push(status);
@@ -277,9 +306,10 @@ impl McpManager {
                 .peek()
                 .get_active_profile()
                 .map(|p| p.id.clone());
-            let composio_lookup = resolve_composio_key(&servers, active_profile_id.as_deref(), |c| {
-                c.profile_id.as_deref()
-            });
+            let composio_lookup =
+                resolve_composio_key(&servers, active_profile_id.as_deref(), |c| {
+                    c.profile_id.as_deref()
+                });
             let active_composio: Option<(&String, &ActiveMcpClient)> = match &composio_lookup {
                 ComposioKeyLookup::Found(k) => servers.get_key_value(k),
                 _ => None,
@@ -299,7 +329,11 @@ impl McpManager {
                     loaded_tools: client.tools.len(),
                     is_loaded: composio_is_loaded,
                     warning_message: client.warning_message.clone(),
-                    ..McpServerStatus::new(display_name.clone(), "Native Composio API client".to_string(), ServerStatus::Loaded)
+                    ..McpServerStatus::new(
+                        display_name.clone(),
+                        "Native Composio API client".to_string(),
+                        ServerStatus::Loaded,
+                    )
                 });
             }
             // Check if native Composio failed to initialize
@@ -307,7 +341,11 @@ impl McpManager {
                 statuses.push(McpServerStatus {
                     name: display_name.clone(),
                     error_message: Some(error.clone()),
-                    ..McpServerStatus::new(display_name.clone(), "Native Composio API client".to_string(), ServerStatus::Error)
+                    ..McpServerStatus::new(
+                        display_name.clone(),
+                        "Native Composio API client".to_string(),
+                        ServerStatus::Error,
+                    )
                 });
             }
             // Several Composio profiles are connected but none matches the active
@@ -348,7 +386,11 @@ impl McpManager {
                     tools: client.tools.len(),
                     loaded_tools: client.tools.len(),
                     is_loaded: true,
-                    ..McpServerStatus::new(server_key.to_string(), client.config.description.clone(), ServerStatus::Loaded)
+                    ..McpServerStatus::new(
+                        server_key.to_string(),
+                        client.config.description.clone(),
+                        ServerStatus::Loaded,
+                    )
                 });
             }
         }

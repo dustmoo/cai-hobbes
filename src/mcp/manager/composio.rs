@@ -1,3 +1,7 @@
+use super::{
+    is_composio_native, ActiveMcpClient, McpClientType, McpContext, McpManager, McpServerConfig,
+    COMPOSIO_NATIVE_PREFIX,
+};
 use crate::mcp::composio_client::{composio_to_rmcp_tool, ComposioClient};
 use crate::settings::{Settings, SettingsManager};
 use dioxus::prelude::spawn;
@@ -5,7 +9,6 @@ use dioxus::prelude::Signal;
 use dioxus_signals::{Readable, Writable};
 use std::collections::HashMap;
 use std::sync::Arc;
-use super::{COMPOSIO_NATIVE_PREFIX, is_composio_native, McpServerConfig, McpContext, McpClientType, ActiveMcpClient, McpManager};
 
 /// Canonical key for a profile-scoped Composio-native server in the servers map.
 pub(super) fn composio_server_key(profile_id: &str) -> String {
@@ -232,7 +235,9 @@ impl McpManager {
             .clone()
             .unwrap_or_else(|| "https://backend.composio.dev/v3/mcp".to_string());
         // Guard: bare /v3/mcp URL has no server UUID — MCP endpoint will 10401
-        let has_server_uuid = profile.base_url.as_ref()
+        let has_server_uuid = profile
+            .base_url
+            .as_ref()
             .is_some_and(|u| u.contains("/v3/mcp/"));
         let entity_id = profile.entity_id.clone();
         let user_id = profile.user_id.clone();
@@ -396,14 +401,15 @@ impl McpManager {
             // — its client names no configured profile, so no reinit will ever
             // claim it, and it would otherwise linger as a stale last-resort
             // fallback forever.
-            let singleton_orphaned = servers
-                .get(COMPOSIO_NATIVE_PREFIX)
-                .is_some_and(|c: &ActiveMcpClient| {
-                    legacy_singleton_orphaned(
-                        c.profile_id.as_deref(),
-                        settings.composio_profiles.iter().map(|p| p.id.as_str()),
-                    )
-                });
+            let singleton_orphaned =
+                servers
+                    .get(COMPOSIO_NATIVE_PREFIX)
+                    .is_some_and(|c: &ActiveMcpClient| {
+                        legacy_singleton_orphaned(
+                            c.profile_id.as_deref(),
+                            settings.composio_profiles.iter().map(|p| p.id.as_str()),
+                        )
+                    });
             owns_legacy_singleton = active_owns_legacy || singleton_orphaned;
             let dynamic_local = self.dynamic_local_tools.lock().await;
             let mut dynamic_composio = self.dynamic_composio_tools.lock().await;
@@ -551,12 +557,7 @@ impl McpManager {
                 McpClientType::NativeComposio(c) => Some(c.clone()),
                 _ => None,
             })
-            .ok_or_else(|| {
-                format!(
-                    "No connected Composio client for profile '{}'",
-                    profile_id
-                )
-            })
+            .ok_or_else(|| format!("No connected Composio client for profile '{}'", profile_id))
     }
 
     /// Recovery for an already-wedged Composio server: its poisoned
@@ -745,7 +746,10 @@ impl McpManager {
             resolved.len().saturating_sub(1)
         );
         for (slug, auth, _) in resolved.iter().skip(1) {
-            match client.add_toolkit_to_server(slug, auth.as_deref(), None).await {
+            match client
+                .add_toolkit_to_server(slug, auth.as_deref(), None)
+                .await
+            {
                 Ok(_) => {
                     tracing::info!("[RECREATE] Bound '{}' (auth={:?})", slug, auth);
                     rebound.push(slug.clone());
@@ -773,10 +777,7 @@ impl McpManager {
             if tools.is_empty() || !rebound.contains(slug) {
                 continue;
             }
-            match client
-                .set_toolkit_enabled_tools(slug, tools.clone())
-                .await
-            {
+            match client.set_toolkit_enabled_tools(slug, tools.clone()).await {
                 Ok(()) => {
                     tracing::info!(
                         "[RECREATE] Re-applied curation for '{}' ({} tools)",
@@ -844,11 +845,9 @@ impl McpManager {
             } else {
                 match client.delete_mcp_server(&old_id).await {
                     Ok(()) => tracing::info!("[RECREATE] Retired old server {}", old_id),
-                    Err(e) => tracing::warn!(
-                        "[RECREATE] Could not delete old server {}: {}",
-                        old_id,
-                        e
-                    ),
+                    Err(e) => {
+                        tracing::warn!("[RECREATE] Could not delete old server {}: {}", old_id, e)
+                    }
                 }
             }
         }
@@ -915,7 +914,9 @@ mod purge_tests {
     struct Stub(&'static str);
 
     fn servers_with(keys: &[&str]) -> HashMap<String, Stub> {
-        keys.iter().map(|k| (k.to_string(), Stub("client"))).collect()
+        keys.iter()
+            .map(|k| (k.to_string(), Stub("client")))
+            .collect()
     }
 
     #[test]
@@ -1021,7 +1022,9 @@ mod purge_tests {
     #[derive(Debug, PartialEq, Clone)]
     struct ProfiledStub(Option<&'static str>);
 
-    fn profiled_servers(entries: &[(&'static str, Option<&'static str>)]) -> HashMap<String, ProfiledStub> {
+    fn profiled_servers(
+        entries: &[(&'static str, Option<&'static str>)],
+    ) -> HashMap<String, ProfiledStub> {
         entries
             .iter()
             .map(|(k, pid)| (k.to_string(), ProfiledStub(*pid)))

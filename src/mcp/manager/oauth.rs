@@ -1,5 +1,5 @@
-use rmcp::model::CallToolRequestParam;
 use super::{McpClientType, McpManager};
+use rmcp::model::CallToolRequestParam;
 
 impl McpManager {
     /// Start OAuth flow for a server that requires authentication

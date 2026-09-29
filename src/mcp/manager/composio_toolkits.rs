@@ -1,3 +1,7 @@
+use super::composio::{
+    composio_server_key, dyn_composio_key, resolve_composio_key, ComposioKeyLookup,
+};
+use super::{ActiveMcpClient, McpClientType, McpContext, McpManager, McpServerConfig};
 use crate::mcp::composio_client::{composio_to_rmcp_tool, ComposioClient};
 use crate::mcp::tool_selection::{ToolCandidate, ToolSelectionRequest, TOOL_SELECTION_THRESHOLD};
 use crate::settings::{Settings, SettingsManager};
@@ -5,8 +9,6 @@ use dioxus::prelude::spawn;
 use dioxus::prelude::Signal;
 use dioxus_signals::{Readable, Writable};
 use std::collections::HashSet;
-use super::{McpServerConfig, McpContext, McpClientType, ActiveMcpClient, McpManager};
-use super::composio::{ComposioKeyLookup, composio_server_key, dyn_composio_key, resolve_composio_key};
 
 impl McpManager {
     /// Data for the toolkit tool editor: every tool the toolkit offers
@@ -520,7 +522,11 @@ impl McpManager {
                     .find(|c| c.slug.eq_ignore_ascii_case(&toolkit_slug))
                     .and_then(|c| c.enabled_tools.clone())
                     // Curation retained across a delete → re-add cycle.
-                    .or_else(|| p.retained_curation.get(&toolkit_slug.to_lowercase()).cloned())
+                    .or_else(|| {
+                        p.retained_curation
+                            .get(&toolkit_slug.to_lowercase())
+                            .cloned()
+                    })
             })
             .filter(|t| !t.is_empty());
         // LLM selection applied this connect, to persist as local curation in Step 5.
@@ -539,7 +545,11 @@ impl McpManager {
             );
             connection_status.set("Restoring your tool selection...".to_string());
             match client
-                .add_toolkit_to_server(&toolkit_slug, auth_config_id.as_deref(), Some(saved.clone()))
+                .add_toolkit_to_server(
+                    &toolkit_slug,
+                    auth_config_id.as_deref(),
+                    Some(saved.clone()),
+                )
                 .await
             {
                 Ok(_) => applied_selection = Some(saved),
@@ -553,79 +563,82 @@ impl McpManager {
             tracing::info!("[Step 4/5] optimizing Tool Selection...");
             connection_status.set("Optimizing Tools...".to_string());
 
-            let selected_tools: Option<Vec<String>> =
-                match client.get_toolkit_tools_detailed(&toolkit_slug).await {
-                    Ok(tools) if tools.len() > TOOL_SELECTION_THRESHOLD => {
-                        connection_status.set(format!("Selecting from {} tools...", tools.len()));
-                        let candidates: Vec<ToolCandidate> = tools
-                            .into_iter()
-                            .map(|(name, desc)| ToolCandidate {
-                                name,
-                                description: desc,
-                            })
-                            .collect();
+            let selected_tools: Option<Vec<String>> = match client
+                .get_toolkit_tools_detailed(&toolkit_slug)
+                .await
+            {
+                Ok(tools) if tools.len() > TOOL_SELECTION_THRESHOLD => {
+                    connection_status.set(format!("Selecting from {} tools...", tools.len()));
+                    let candidates: Vec<ToolCandidate> = tools
+                        .into_iter()
+                        .map(|(name, desc)| ToolCandidate {
+                            name,
+                            description: desc,
+                        })
+                        .collect();
 
-                        let request =
-                            ToolSelectionRequest::new(toolkit_slug.clone(), None, candidates);
+                    let request = ToolSelectionRequest::new(toolkit_slug.clone(), None, candidates);
 
-                        // Use the actively selected LLM connector for smart selection.
-                        // Fall back to any configured connector so selection still
-                        // works when the active one has no credentials.
-                        let instance = settings_snapshot
-                            .active_connector()
-                            .filter(|c| settings_snapshot.is_connector_configured(c))
-                            .or_else(|| {
-                                settings_snapshot
-                                    .llm_connectors
-                                    .iter()
-                                    .find(|c| settings_snapshot.is_connector_configured(c))
-                            })
-                            .cloned();
+                    // Use the actively selected LLM connector for smart selection.
+                    // Fall back to any configured connector so selection still
+                    // works when the active one has no credentials.
+                    let instance = settings_snapshot
+                        .active_connector()
+                        .filter(|c| settings_snapshot.is_connector_configured(c))
+                        .or_else(|| {
+                            settings_snapshot
+                                .llm_connectors
+                                .iter()
+                                .find(|c| settings_snapshot.is_connector_configured(c))
+                        })
+                        .cloned();
 
-                        let selection = match instance {
-                            Some(instance) => {
-                                tracing::info!(
-                                    "Tool selection using connector '{}' ({:?}) for toolkit '{}'",
-                                    instance.name,
-                                    instance.provider(),
-                                    toolkit_slug
-                                );
-                                let connector =
-                                    crate::llm::build_connector_for_instance(&instance, None);
-                                connector.select_tools_for_toolkit(&request).await
-                            }
-                            None => {
-                                Err("No LLM provider is configured for tool selection".to_string())
-                            }
-                        };
+                    let selection = match instance {
+                        Some(instance) => {
+                            tracing::info!(
+                                "Tool selection using connector '{}' ({:?}) for toolkit '{}'",
+                                instance.name,
+                                instance.provider(),
+                                toolkit_slug
+                            );
+                            let connector =
+                                crate::llm::build_connector_for_instance(&instance, None);
+                            connector.select_tools_for_toolkit(&request).await
+                        }
+                        None => Err("No LLM provider is configured for tool selection".to_string()),
+                    };
 
-                        match selection {
-                            Ok(selection) => Some(selection.selected_tools),
-                            Err(e) => {
-                                tracing::warn!("LLM tool selection failed: {}. Using default.", e);
-                                None
-                            }
+                    match selection {
+                        Ok(selection) => Some(selection.selected_tools),
+                        Err(e) => {
+                            tracing::warn!("LLM tool selection failed: {}. Using default.", e);
+                            None
                         }
                     }
-                    Ok(tools) if !tools.is_empty() => {
-                        // Small toolkit: leave the backend default (all tools).
-                        // Writing an explicit whitelist here used to flip the
-                        // shared server into whitelist mode for no benefit.
-                        tracing::info!(
-                            "Toolkit '{}' has {} tools (under threshold), keeping all enabled.",
-                            toolkit_slug,
-                            tools.len()
-                        );
-                        None
-                    }
-                    _ => None,
-                };
+                }
+                Ok(tools) if !tools.is_empty() => {
+                    // Small toolkit: leave the backend default (all tools).
+                    // Writing an explicit whitelist here used to flip the
+                    // shared server into whitelist mode for no benefit.
+                    tracing::info!(
+                        "Toolkit '{}' has {} tools (under threshold), keeping all enabled.",
+                        toolkit_slug,
+                        tools.len()
+                    );
+                    None
+                }
+                _ => None,
+            };
 
             // If selected_tools is present, re-patch to apply filter
             if let Some(tools) = selected_tools.clone() {
                 tracing::info!("Applying smart selection of {} tools", tools.len());
                 match client
-                    .add_toolkit_to_server(&toolkit_slug, auth_config_id.as_deref(), Some(tools.clone()))
+                    .add_toolkit_to_server(
+                        &toolkit_slug,
+                        auth_config_id.as_deref(),
+                        Some(tools.clone()),
+                    )
                     .await
                 {
                     Ok(_) => applied_selection = Some(tools),

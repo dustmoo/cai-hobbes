@@ -1,9 +1,9 @@
-use crate::context::permissions::{PermissionManager};
-use crate::mcp::composio_client::{ComposioClient};
+use crate::context::permissions::PermissionManager;
+use crate::mcp::composio_client::ComposioClient;
 use crate::SecretManagerTrait;
 use dioxus::prelude::Signal;
-use dioxus_signals::{Readable};
-use rmcp::model::{Tool};
+use dioxus_signals::Readable;
+use rmcp::model::Tool;
 use rmcp::service::{RoleClient, RunningService};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -467,6 +467,4 @@ impl McpManager {
 
         Err(format!("Server '{}' not found", server_name))
     }
-
 }
-

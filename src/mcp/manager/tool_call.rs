@@ -1,14 +1,16 @@
+use super::composio::{composio_server_key, dyn_composio_key};
+use super::{
+    is_composio_native, McpClientType, McpManager, COMPOSIO_NATIVE_PREFIX, HOBBES_META_SERVER,
+};
 use crate::components::shared::ToolCallStatus;
 use crate::context::permissions::PermissionStatus;
 use crate::mcp::composio_client::{composio_to_rmcp_tool, ComposioClient};
 use crate::SecretManagerTrait;
 use dioxus::prelude::spawn;
-use dioxus_signals::{Readable};
+use dioxus_signals::Readable;
 use rmcp::model::{CallToolRequestParam, CallToolResult, Tool};
-use std::collections::{HashSet};
+use std::collections::HashSet;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
-use super::{COMPOSIO_NATIVE_PREFIX, is_composio_native, HOBBES_META_SERVER, McpClientType, McpManager};
-use super::composio::{composio_server_key, dyn_composio_key};
 
 /// Gemini's practical tool limit for FunctionDeclarations.
 const GEMINI_TOOL_LIMIT: usize = 128;
@@ -234,11 +236,17 @@ impl McpManager {
         session_ctx: Option<crate::mcp::terminal_client::TerminalCtx>,
     ) -> Result<UnboundedReceiver<Result<CallToolResult, String>>, String> {
         // Intercept local on-demand meta-tools before normal dispatch
-        if server_name == HOBBES_META_SERVER || tool_name == "MCP_LOAD_SERVER_TOOLS" || tool_name == "MCP_UNLOAD_SERVER_TOOLS" {
+        if server_name == HOBBES_META_SERVER
+            || tool_name == "MCP_LOAD_SERVER_TOOLS"
+            || tool_name == "MCP_UNLOAD_SERVER_TOOLS"
+        {
             let (tx, rx) = mpsc::unbounded_channel();
 
             if tool_name == "MCP_LOAD_SERVER_TOOLS" {
-                let target_server = args.get("server_name").and_then(|v| v.as_str()).unwrap_or("");
+                let target_server = args
+                    .get("server_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if target_server.is_empty() {
                     let _ = tx.send(Err("Missing 'server_name' argument".to_string()));
                     return Ok(rx);
@@ -267,13 +275,17 @@ impl McpManager {
                 let servers = self.servers.lock().await;
                 if let Some(client) = servers.get(target_server) {
                     let tool_count = client.tools.len();
-                    let tool_names: Vec<String> = client.tools.iter().map(|t| t.name.to_string()).collect();
+                    let tool_names: Vec<String> =
+                        client.tools.iter().map(|t| t.name.to_string()).collect();
 
                     // Add to dynamic cache (deduplicating)
                     let mut dynamic = self.dynamic_local_tools.lock().await;
                     let mut sources = self.dynamic_local_tool_sources.lock().await;
-                    let existing_names: HashSet<String> = dynamic.iter().map(|t| t.name.to_string()).collect();
-                    let new_tools: Vec<Tool> = client.tools.iter()
+                    let existing_names: HashSet<String> =
+                        dynamic.iter().map(|t| t.name.to_string()).collect();
+                    let new_tools: Vec<Tool> = client
+                        .tools
+                        .iter()
                         .filter(|t| !existing_names.contains(t.name.as_ref()))
                         .cloned()
                         .collect();
@@ -305,7 +317,10 @@ impl McpManager {
                 }
                 return Ok(rx);
             } else if tool_name == "MCP_UNLOAD_SERVER_TOOLS" {
-                let target_server = args.get("server_name").and_then(|v| v.as_str()).unwrap_or("");
+                let target_server = args
+                    .get("server_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if target_server.is_empty() {
                     let _ = tx.send(Err("Missing 'server_name' argument".to_string()));
                     return Ok(rx);
@@ -527,23 +542,23 @@ impl McpManager {
                 );
                 // Fall through as allowed.
             } else {
-            let pm = self.permission_manager.read();
-            match pm.check_mcp_permission(permission_check_name) {
-                PermissionStatus::Allowed => {}
-                PermissionStatus::RequiresPrompt => {
-                    let tool_call = crate::components::shared::ToolCall::new(
-                        server_name.to_string(),
-                        tool_name.to_string(),
-                        args,
-                        None,
-                        None, // thought_summary not available in permission check context
-                    );
-                    return Err(serde_json::to_string(&tool_call).unwrap_or_default());
+                let pm = self.permission_manager.read();
+                match pm.check_mcp_permission(permission_check_name) {
+                    PermissionStatus::Allowed => {}
+                    PermissionStatus::RequiresPrompt => {
+                        let tool_call = crate::components::shared::ToolCall::new(
+                            server_name.to_string(),
+                            tool_name.to_string(),
+                            args,
+                            None,
+                            None, // thought_summary not available in permission check context
+                        );
+                        return Err(serde_json::to_string(&tool_call).unwrap_or_default());
+                    }
+                    PermissionStatus::Denied(reason) => {
+                        return Err(format!("Tool use denied: {}", reason));
+                    }
                 }
-                PermissionStatus::Denied(reason) => {
-                    return Err(format!("Tool use denied: {}", reason));
-                }
-            }
             }
         }
 
@@ -568,7 +583,12 @@ impl McpManager {
                     let found = dynamic_cache
                         .get(&key)
                         .and_then(|v| v.iter().find(|t| t.name == tool_name))
-                        .or_else(|| dynamic_cache.values().flatten().find(|t| t.name == tool_name));
+                        .or_else(|| {
+                            dynamic_cache
+                                .values()
+                                .flatten()
+                                .find(|t| t.name == tool_name)
+                        });
                     match found {
                         Some(t) => t.clone(),
                         None => return Err(format!("Tool not found: {}", tool_name)),
@@ -716,7 +736,15 @@ impl McpManager {
                 }
                 McpClientType::NativeImage(image_client) => {
                     // Pattern 30: Both model and key are read fresh at call time
-                    match image_client.execute_tool(&tool.name, args.clone(), &native_image_model, native_image_api_key.as_deref()).await {
+                    match image_client
+                        .execute_tool(
+                            &tool.name,
+                            args.clone(),
+                            &native_image_model,
+                            native_image_api_key.as_deref(),
+                        )
+                        .await
+                    {
                         Ok(result) => Ok(result),
                         Err(e) => Err(e),
                     }
@@ -863,7 +891,8 @@ impl McpManager {
                                     let injected_count = rmcp_tools.len();
                                     {
                                         let mut cache = dynamic_tools_cache.lock().await;
-                                        let bucket = cache.entry(dyn_profile_key.clone()).or_default();
+                                        let bucket =
+                                            cache.entry(dyn_profile_key.clone()).or_default();
                                         let new_names: std::collections::HashSet<String> =
                                             rmcp_tools.iter().map(|t| t.name.to_string()).collect();
                                         bucket.retain(|t| !new_names.contains(&t.name.to_string()));
@@ -894,18 +923,20 @@ impl McpManager {
                                         })
                                         .collect();
 
-                                    let already_loaded_results: Vec<serde_json::Value> = already_loaded
-                                        .iter()
-                                        .map(|t| {
-                                            serde_json::json!({
-                                                "name": t.name,
-                                                "description": t.description,
+                                    let already_loaded_results: Vec<serde_json::Value> =
+                                        already_loaded
+                                            .iter()
+                                            .map(|t| {
+                                                serde_json::json!({
+                                                    "name": t.name,
+                                                    "description": t.description,
+                                                })
                                             })
-                                        })
-                                        .collect();
+                                            .collect();
                                     let already_loaded_count = already_loaded_results.len();
 
-                                    let hint = if !already_loaded.is_empty() && selected.is_empty() {
+                                    let hint = if !already_loaded.is_empty() && selected.is_empty()
+                                    {
                                         // All tools already force-loaded — tell the AI exactly what it has
                                         format!(
                                             "All {} tools are already loaded as native function calls. Call them directly by name — they are listed in 'already_loaded' below.",
@@ -929,8 +960,14 @@ impl McpManager {
                                     // Include already-loaded tool names so the AI knows what it can call
                                     if !already_loaded_results.is_empty() {
                                         if let Some(obj) = response_json.as_object_mut() {
-                                            obj.insert("already_loaded_count".to_string(), serde_json::json!(already_loaded_count));
-                                            obj.insert("already_loaded".to_string(), serde_json::json!(already_loaded_results));
+                                            obj.insert(
+                                                "already_loaded_count".to_string(),
+                                                serde_json::json!(already_loaded_count),
+                                            );
+                                            obj.insert(
+                                                "already_loaded".to_string(),
+                                                serde_json::json!(already_loaded_results),
+                                            );
                                         }
                                     }
 
@@ -960,10 +997,8 @@ impl McpManager {
                         // so one tab clearing its toolset doesn't wipe another
                         // profile's discovered tools.
                         let mut cache = dynamic_tools_cache.lock().await;
-                        let cleared_count = cache
-                            .remove(&dyn_profile_key)
-                            .map(|v| v.len())
-                            .unwrap_or(0);
+                        let cleared_count =
+                            cache.remove(&dyn_profile_key).map(|v| v.len()).unwrap_or(0);
                         tracing::info!(
                             "COMPOSIO_CLEAR_TOOLS: cleared {} dynamic tools for profile '{}'",
                             cleared_count,
