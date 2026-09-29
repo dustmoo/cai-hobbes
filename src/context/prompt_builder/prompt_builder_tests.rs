@@ -1042,3 +1042,32 @@ fn a_live_send_ends_on_the_users_own_message() {
         "the user's own message is the final turn, not a nudge"
     );
 }
+
+/// Thinking survives on every assistant message of the current tool loop
+/// (Opus 5.5 / Fable 5.1 reject a loop with dropped blocks), while earlier
+/// turns are still stripped.
+#[test]
+fn strip_historical_thinking_keeps_the_current_tool_loop() {
+    let thinking = |sig: &str| ContentBlock::Thinking {
+        text: "t".into(),
+        signature: Some(sig.into()),
+    };
+    let text = |t: &str| ContentBlock::Text { text: t.into() };
+    let msg = |role, content| ChatMessage { role, content };
+    let mut messages = vec![
+        msg(ChatRole::User, vec![text("first question")]),
+        msg(ChatRole::Assistant, vec![thinking("old"), text("old answer")]),
+        msg(ChatRole::User, vec![text("second question")]),
+        msg(ChatRole::Assistant, vec![thinking("loop-1"), text("calling a tool")]),
+        msg(ChatRole::Tool, vec![text("result 1")]),
+        msg(ChatRole::Assistant, vec![thinking("loop-2"), text("calling again")]),
+        msg(ChatRole::Tool, vec![text("result 2")]),
+    ];
+    PromptBuilder::strip_historical_thinking(&mut messages);
+    let has_thinking = |m: &ChatMessage| {
+        m.content.iter().any(|b| matches!(b, ContentBlock::Thinking { .. }))
+    };
+    assert!(!has_thinking(&messages[1]), "earlier turn is stripped");
+    assert!(has_thinking(&messages[3]), "first loop step keeps its thinking");
+    assert!(has_thinking(&messages[5]), "latest loop step keeps its thinking");
+}

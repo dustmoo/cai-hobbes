@@ -187,13 +187,20 @@ impl<'a> PromptBuilder<'a> {
     /// with finite context windows — thinking content from historical turns is
     /// the single largest contributor to context exhaustion on small models.
     ///
-    /// Walks messages in reverse: the first `ChatRole::Assistant` message encountered
-    /// keeps its thinking blocks; all earlier assistant messages have them removed.
+    /// Walks messages in reverse: the most recent `ChatRole::Assistant` message
+    /// keeps its thinking blocks, and so does every assistant message in the
+    /// current tool loop (after the last `ChatRole::User` message) — Claude
+    /// Opus 5.5 and Fable 5.1 reject a tool loop whose thinking blocks were
+    /// partially dropped. Assistant messages from earlier turns are stripped.
     fn strip_historical_thinking(messages: &mut [ChatMessage]) {
         let mut found_latest = false;
+        let mut in_current_turn = true;
         for msg in messages.iter_mut().rev() {
+            if msg.role == ChatRole::User {
+                in_current_turn = false;
+            }
             if msg.role == ChatRole::Assistant {
-                if found_latest {
+                if found_latest && !in_current_turn {
                     // Strip thinking from older assistant messages
                     let before = msg.content.len();
                     msg.content.retain(|block| !matches!(block, ContentBlock::Thinking { .. }));

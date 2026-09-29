@@ -180,7 +180,11 @@ impl LlmConnector for ClaudeConnector {
             if prompt == 0 && completion == 0 {
                 return;
             }
+            // Anthropic's `input_tokens` excludes cache reads, which bill
+            // separately at the model's cache-read rate.
             let cost = (prompt as f64 / 1_000_000.0) * model_for_cost.input_price_per_mtok()
+                + (cached.unwrap_or(0) as f64 / 1_000_000.0)
+                    * model_for_cost.cache_read_price_per_mtok()
                 + (completion as f64 / 1_000_000.0) * model_for_cost.output_price_per_mtok();
             let _ = tx.send(StreamMessage::Usage(UsageData {
                 prompt_tokens: prompt,
@@ -613,8 +617,12 @@ impl LlmFormatConverter for ClaudeConnector {
     fn to_native_request(&self, prompt: &LlmPrompt, streaming: bool) -> serde_json::Value {
         // Extended thinking is only sent when enabled AND the model supports it.
         // Gated here so thinking blocks in history are serialized consistently.
-        let thinking_enabled = self.config.extended_thinking
-            && ClaudeModel::from_slug(&self.config.model).supports_thinking();
+        // Always-on models (Fable 5.1, Opus 5.5) think regardless of the toggle
+        // and reject a tool loop whose signed thinking blocks were dropped, so
+        // for them the toggle cannot switch thinking off.
+        let model = ClaudeModel::from_slug(&self.config.model);
+        let thinking_enabled = model.thinking_always_on()
+            || (self.config.extended_thinking && model.supports_thinking());
 
         // Build the Anthropic `messages` array. Claude only allows "user" and
         // "assistant" roles; tool results ride inside user-turn content blocks.
@@ -636,11 +644,14 @@ impl LlmFormatConverter for ClaudeConnector {
                         // (history is already ordered thinking-first). Only include
                         // when thinking is enabled AND we have a non-empty signature
                         // — a thinking block without a valid signature returns a 400.
+                        // An empty `thinking` text is still replayed: always-on
+                        // models return signed blocks with no text, and dropping
+                        // them from a tool loop is itself a 400.
                         // Otherwise omit (safe: we never end on an assistant turn, so
                         // the "must start with thinking" rule never applies here).
                         if thinking_enabled {
                             if let Some(sig) = signature {
-                                if !sig.is_empty() && !text.is_empty() {
+                                if !sig.is_empty() {
                                     content.push(json!({
                                         "type": "thinking",
                                         "thinking": text,
@@ -732,7 +743,14 @@ impl LlmFormatConverter for ClaudeConnector {
         // thinking with tools). budget_tokens is intentionally NOT used — it is
         // removed on current models and returns 400.
         if thinking_enabled {
-            request["thinking"] = json!({ "type": "adaptive" });
+            request["thinking"] = if model.thinking_always_on() {
+                // These models default `display` to "omitted" (empty thinking
+                // text), which would leave the thinking pane blank and hide
+                // the narration they write between tool calls.
+                json!({ "type": "adaptive", "display": "summarized" })
+            } else {
+                json!({ "type": "adaptive" })
+            };
         }
 
         // Tools — sent with prompt_builder-consistent prefixed names so the
@@ -1050,6 +1068,47 @@ mod tests {
             other => panic!("expected Usage, got {:?}", other),
         }
         assert!(matches!(c.parse_stream_chunk(stop)[0], StreamEvent::Done));
+    }
+
+    /// Opus 5.5 thinks on every request: the toggle can't drop its signed
+    /// thinking blocks (a tool loop missing them is a 400), empty-text blocks
+    /// are replayed, and `display: "summarized"` is requested so the
+    /// thinking text isn't omitted.
+    #[test]
+    fn always_on_model_replays_thinking_even_with_toggle_off() {
+        let connector = ClaudeConnector::new(ClaudeConfig {
+            model: "claude-opus-5-5".to_string(),
+            max_tokens: Some(4096),
+            extended_thinking: false,
+            ..Default::default()
+        });
+        let prompt = LlmPrompt {
+            system: None,
+            messages: vec![ChatMessage {
+                role: ChatRole::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        text: String::new(),
+                        signature: Some("sig-empty".into()),
+                    },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                    },
+                ],
+            }],
+            tools: vec![],
+        };
+        let req = connector.to_native_request(&prompt, true);
+        assert_eq!(req["thinking"]["type"], "adaptive");
+        assert_eq!(req["thinking"]["display"], "summarized");
+        let blocks = req["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["signature"], "sig-empty");
+        assert_eq!(blocks[1]["type"], "text");
+
+        // Other adaptive models keep the plain request shape.
+        let other = thinking_connector(true).to_native_request(&prompt, true);
+        assert!(other["thinking"].get("display").is_none());
     }
 
     fn thinking_connector(enabled: bool) -> ClaudeConnector {

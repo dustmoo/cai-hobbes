@@ -14,10 +14,14 @@
 //!   **adaptive** thinking (`thinking: {type: "adaptive"}`); `budget_tokens`
 //!   is removed and returns 400. All Claude models support image input
 //!   (vision).
-//! - Claude 5 (Opus 5, Sonnet 5) is the current flagship generation,
-//!   released after the 4.x line; Fable 5.1 sits above it as the
-//!   Mythos-class tier. The 4.x models remain live and selectable — nothing
-//!   here has been deprecated, only superseded as the default.
+//! - Opus 5.5 and Sonnet 5.5 (September 2026) are the current flagship
+//!   generation; Fable 5.1 sits above them as the Mythos-class tier. Opus 5,
+//!   Sonnet 5, Fable 5 and the 4.x models are legacy but still live.
+//! - Fable 5.1 and Opus 5.5 think on every request: `thinking: disabled`
+//!   returns 400, and thinking text is omitted unless `display` asks for it
+//!   (see [`ClaudeModel::thinking_always_on`]).
+//! - Opus 4.1 is retired on the Claude API (Bedrock/Google Cloud only), so it
+//!   is kept for parsing and pricing old sessions but left out of the picker.
 
 /// Supported Claude models for metadata, pricing, and UI display.
 #[derive(Debug, PartialEq, Clone)]
@@ -27,14 +31,18 @@ pub enum ClaudeModel {
     /// Retained: the pre-5.1 Fable alias. Distinct pricing/caps from Fable5_1
     /// (see `SYSTEM_PATTERNS` P-013 verification note below).
     Fable5,
-    /// Claude 5 flagship.
+    /// Current flagship (September 2026).
+    Opus5_5,
+    /// Legacy: the previous flagship.
     Opus5,
     Opus4_8,
     Opus4_7,
     Opus4_6,
     Opus4_5,
     Opus4_1,
-    /// Claude 5 mid-tier.
+    /// Current mid-tier (September 2026).
+    Sonnet5_5,
+    /// Legacy: the previous mid-tier.
     Sonnet5,
     Sonnet4_6,
     Sonnet4_5,
@@ -45,7 +53,7 @@ pub enum ClaudeModel {
 
 impl ClaudeModel {
     /// The default chat model shipped with Hobbes.
-    pub const DEFAULT_CHAT_SLUG: &'static str = "claude-opus-5";
+    pub const DEFAULT_CHAT_SLUG: &'static str = "claude-opus-5-5";
 
     /// Parse a model slug (alias or full dated ID) into a [`ClaudeModel`].
     pub fn from_slug(slug: &str) -> Self {
@@ -53,12 +61,16 @@ impl ClaudeModel {
         match s {
             _ if s.starts_with("claude-fable-5-1") => ClaudeModel::Fable5_1,
             _ if s.starts_with("claude-fable-5") => ClaudeModel::Fable5,
+            // Point releases before their bare prefix: "claude-opus-5-5"
+            // also starts with "claude-opus-5".
+            _ if s.starts_with("claude-opus-5-5") => ClaudeModel::Opus5_5,
             _ if s.starts_with("claude-opus-5") => ClaudeModel::Opus5,
             _ if s.starts_with("claude-opus-4-8") => ClaudeModel::Opus4_8,
             _ if s.starts_with("claude-opus-4-7") => ClaudeModel::Opus4_7,
             _ if s.starts_with("claude-opus-4-6") => ClaudeModel::Opus4_6,
             _ if s.starts_with("claude-opus-4-5") => ClaudeModel::Opus4_5,
             _ if s.starts_with("claude-opus-4-1") => ClaudeModel::Opus4_1,
+            _ if s.starts_with("claude-sonnet-5-5") => ClaudeModel::Sonnet5_5,
             _ if s.starts_with("claude-sonnet-5") => ClaudeModel::Sonnet5,
             _ if s.starts_with("claude-sonnet-4-6") => ClaudeModel::Sonnet4_6,
             _ if s.starts_with("claude-sonnet-4-5") => ClaudeModel::Sonnet4_5,
@@ -72,12 +84,14 @@ impl ClaudeModel {
         match self {
             ClaudeModel::Fable5_1 => "claude-fable-5-1",
             ClaudeModel::Fable5 => "claude-fable-5",
+            ClaudeModel::Opus5_5 => "claude-opus-5-5",
             ClaudeModel::Opus5 => "claude-opus-5",
             ClaudeModel::Opus4_8 => "claude-opus-4-8",
             ClaudeModel::Opus4_7 => "claude-opus-4-7",
             ClaudeModel::Opus4_6 => "claude-opus-4-6",
             ClaudeModel::Opus4_5 => "claude-opus-4-5",
             ClaudeModel::Opus4_1 => "claude-opus-4-1",
+            ClaudeModel::Sonnet5_5 => "claude-sonnet-5-5",
             ClaudeModel::Sonnet5 => "claude-sonnet-5",
             ClaudeModel::Sonnet4_6 => "claude-sonnet-4-6",
             ClaudeModel::Sonnet4_5 => "claude-sonnet-4-5",
@@ -91,12 +105,14 @@ impl ClaudeModel {
         match self {
             ClaudeModel::Fable5_1 => "Claude Fable 5.1".to_string(),
             ClaudeModel::Fable5 => "Claude Fable 5".to_string(),
+            ClaudeModel::Opus5_5 => "Claude Opus 5.5".to_string(),
             ClaudeModel::Opus5 => "Claude Opus 5".to_string(),
             ClaudeModel::Opus4_8 => "Claude Opus 4.8".to_string(),
             ClaudeModel::Opus4_7 => "Claude Opus 4.7".to_string(),
             ClaudeModel::Opus4_6 => "Claude Opus 4.6".to_string(),
             ClaudeModel::Opus4_5 => "Claude Opus 4.5".to_string(),
             ClaudeModel::Opus4_1 => "Claude Opus 4.1".to_string(),
+            ClaudeModel::Sonnet5_5 => "Claude Sonnet 5.5".to_string(),
             ClaudeModel::Sonnet5 => "Claude Sonnet 5".to_string(),
             ClaudeModel::Sonnet4_6 => "Claude Sonnet 4.6".to_string(),
             ClaudeModel::Sonnet4_5 => "Claude Sonnet 4.5".to_string(),
@@ -124,10 +140,12 @@ impl ClaudeModel {
             // 1M context window at standard pricing.
             ClaudeModel::Fable5_1
             | ClaudeModel::Fable5
+            | ClaudeModel::Opus5_5
             | ClaudeModel::Opus5
             | ClaudeModel::Opus4_8
             | ClaudeModel::Opus4_7
             | ClaudeModel::Opus4_6
+            | ClaudeModel::Sonnet5_5
             | ClaudeModel::Sonnet5
             | ClaudeModel::Sonnet4_6
             | ClaudeModel::Sonnet4_5 => 1_000_000,
@@ -144,10 +162,12 @@ impl ClaudeModel {
         match self {
             ClaudeModel::Fable5_1
             | ClaudeModel::Fable5
+            | ClaudeModel::Opus5_5
             | ClaudeModel::Opus5
             | ClaudeModel::Opus4_8
             | ClaudeModel::Opus4_7
-            | ClaudeModel::Opus4_6 => 128_000,
+            | ClaudeModel::Opus4_6
+            | ClaudeModel::Sonnet5_5 => 128_000,
             ClaudeModel::Sonnet5
             | ClaudeModel::Sonnet4_6
             | ClaudeModel::Sonnet4_5
@@ -164,13 +184,13 @@ impl ClaudeModel {
     /// USD price per 1M input tokens (for cost estimation in `UsageData`).
     /// Manually maintained; re-verify against
     /// platform.claude.com/docs/en/about-claude/pricing (SYSTEM_PATTERNS P-013).
-    /// Last verified: 2026-09-17 — added the Claude 5 family (Opus 5,
-    /// Sonnet 5) and Fable 5.1, which the file previously had no slugs for
-    /// at all (it topped out at the 4.x ladder plus the bare "Fable 5" alias).
+    /// Last verified: 2026-09-28 — added Opus 5.5 ($4/$20, the first Opus
+    /// priced below $5/$25) and Sonnet 5.5 ($2/$10).
     pub fn input_price_per_mtok(&self) -> f64 {
         match self {
             ClaudeModel::Fable5_1 => 10.0,
             ClaudeModel::Fable5 => 10.0,
+            ClaudeModel::Opus5_5 => 4.0,
             ClaudeModel::Opus5
             | ClaudeModel::Opus4_8
             | ClaudeModel::Opus4_7
@@ -181,7 +201,7 @@ impl ClaudeModel {
             // is now the standard rate (the scheduled $3/$15 rise on
             // 2026-09-01 did not happen) — verified live, not carried over
             // from the old Sonnet 4.6 ladder rung.
-            ClaudeModel::Sonnet5 => 2.0,
+            ClaudeModel::Sonnet5_5 | ClaudeModel::Sonnet5 => 2.0,
             ClaudeModel::Sonnet4_6 | ClaudeModel::Sonnet4_5 => 3.0,
             ClaudeModel::Haiku4_5 => 1.0,
             ClaudeModel::Unknown(_) => 0.0,
@@ -193,17 +213,36 @@ impl ClaudeModel {
         match self {
             ClaudeModel::Fable5_1 => 50.0,
             ClaudeModel::Fable5 => 50.0,
+            ClaudeModel::Opus5_5 => 20.0,
             ClaudeModel::Opus5
             | ClaudeModel::Opus4_8
             | ClaudeModel::Opus4_7
             | ClaudeModel::Opus4_6 => 25.0,
             ClaudeModel::Opus4_5 => 25.0,
             ClaudeModel::Opus4_1 => 75.0,
-            ClaudeModel::Sonnet5 => 10.0,
+            ClaudeModel::Sonnet5_5 | ClaudeModel::Sonnet5 => 10.0,
             ClaudeModel::Sonnet4_6 | ClaudeModel::Sonnet4_5 => 15.0,
             ClaudeModel::Haiku4_5 => 5.0,
             ClaudeModel::Unknown(_) => 0.0,
         }
+    }
+
+    /// USD price per 1M prompt-cache read tokens. The standard multiplier is
+    /// 0.1x base input; Fable 5.1 is 0.025x and Opus 5.5 is 0.05x.
+    pub fn cache_read_price_per_mtok(&self) -> f64 {
+        match self {
+            ClaudeModel::Fable5_1 => 0.25,
+            ClaudeModel::Opus5_5 => 0.20,
+            other => other.input_price_per_mtok() * 0.1,
+        }
+    }
+
+    /// Models that think on every request. `thinking: {type: "disabled"}` is
+    /// rejected with a 400, so the connector must replay their signed
+    /// thinking blocks even when the user's thinking toggle is off, and must
+    /// ask for `display: "summarized"` or the thinking text arrives empty.
+    pub fn thinking_always_on(&self) -> bool {
+        matches!(self, ClaudeModel::Fable5_1 | ClaudeModel::Opus5_5)
     }
 
     /// Whether the model supports extended/adaptive thinking.
@@ -212,11 +251,13 @@ impl ClaudeModel {
         match self {
             ClaudeModel::Fable5_1
             | ClaudeModel::Fable5
+            | ClaudeModel::Opus5_5
             | ClaudeModel::Opus5
             | ClaudeModel::Opus4_8
             | ClaudeModel::Opus4_7
             | ClaudeModel::Opus4_6
             | ClaudeModel::Opus4_5
+            | ClaudeModel::Sonnet5_5
             | ClaudeModel::Sonnet5
             | ClaudeModel::Sonnet4_6
             | ClaudeModel::Sonnet4_5
@@ -235,10 +276,13 @@ impl ClaudeModel {
 
     /// Recommended/current models for the slot picker, best-first. Excludes
     /// `Unknown`. Legacy-but-active models are included so users with scoped
-    /// API access can still select them.
+    /// API access can still select them; retired ones (Opus 4.1) are not.
     pub fn all_models() -> Vec<ClaudeModel> {
         vec![
+            ClaudeModel::Opus5_5,
             ClaudeModel::Fable5_1,
+            ClaudeModel::Sonnet5_5,
+            ClaudeModel::Haiku4_5,
             ClaudeModel::Opus5,
             ClaudeModel::Sonnet5,
             ClaudeModel::Fable5,
@@ -246,9 +290,7 @@ impl ClaudeModel {
             ClaudeModel::Opus4_7,
             ClaudeModel::Opus4_6,
             ClaudeModel::Sonnet4_6,
-            ClaudeModel::Haiku4_5,
             ClaudeModel::Opus4_5,
-            ClaudeModel::Opus4_1,
             ClaudeModel::Sonnet4_5,
         ]
     }
@@ -325,8 +367,44 @@ mod tests {
     fn default_chat_slug_is_a_known_model() {
         assert_eq!(
             ClaudeModel::from_slug(ClaudeModel::DEFAULT_CHAT_SLUG),
-            ClaudeModel::Opus5
+            ClaudeModel::Opus5_5
         );
+    }
+
+    /// "claude-opus-5-5" also starts with "claude-opus-5"; it must not be
+    /// parsed (and priced) as Opus 5.
+    #[test]
+    fn point_five_releases_are_distinguished_from_their_bare_prefix() {
+        assert_eq!(ClaudeModel::from_slug("claude-opus-5-5"), ClaudeModel::Opus5_5);
+        assert_eq!(ClaudeModel::from_slug("claude-sonnet-5-5"), ClaudeModel::Sonnet5_5);
+        assert_eq!(ClaudeModel::from_slug("claude-opus-5"), ClaudeModel::Opus5);
+        assert_eq!(ClaudeModel::from_slug("claude-sonnet-5"), ClaudeModel::Sonnet5);
+    }
+
+    #[test]
+    fn september_2026_prices() {
+        assert_eq!(ClaudeModel::Opus5_5.input_price_per_mtok(), 4.0);
+        assert_eq!(ClaudeModel::Opus5_5.output_price_per_mtok(), 20.0);
+        assert_eq!(ClaudeModel::Opus5_5.cache_read_price_per_mtok(), 0.20);
+        assert_eq!(ClaudeModel::Sonnet5_5.input_price_per_mtok(), 2.0);
+        assert_eq!(ClaudeModel::Sonnet5_5.output_price_per_mtok(), 10.0);
+        assert_eq!(ClaudeModel::Sonnet5_5.max_output_tokens(), 128_000);
+        assert_eq!(ClaudeModel::Fable5_1.cache_read_price_per_mtok(), 0.25);
+        assert!((ClaudeModel::Opus5.cache_read_price_per_mtok() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn always_on_thinking_models() {
+        assert!(ClaudeModel::Opus5_5.thinking_always_on());
+        assert!(ClaudeModel::Fable5_1.thinking_always_on());
+        assert!(!ClaudeModel::Sonnet5_5.thinking_always_on());
+        assert!(!ClaudeModel::Opus5.thinking_always_on());
+    }
+
+    #[test]
+    fn retired_opus_4_1_is_not_offered() {
+        assert!(!ClaudeModel::all_models().contains(&ClaudeModel::Opus4_1));
+        assert_eq!(ClaudeModel::from_slug("claude-opus-4-1"), ClaudeModel::Opus4_1);
     }
 
     #[test]
