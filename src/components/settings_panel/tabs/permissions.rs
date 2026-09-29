@@ -186,11 +186,11 @@ pub(in super::super) fn PermissionsTab(
                                                 }
                                                 span { class: "text-xs text-fg-muted mt-1 line-clamp-2", "{description}" }
                                             }
-                                            div {
-                                                class: "relative inline-block w-10 h-5 align-middle select-none transition duration-200 ease-in",
+                                            label {
+                                                class: "relative inline-flex items-center cursor-pointer",
                                                 input {
                                                     r#type: "checkbox",
-                                                    class: "toggle-checkbox absolute block w-5 h-5 rounded-full bg-white border-4 appearance-none cursor-pointer",
+                                                    class: "sr-only peer",
                                                     checked: is_allowed,
                                                     oninput: {
                                                         let skill_name = skill_name.clone();
