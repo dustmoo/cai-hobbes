@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::mpsc::{self};
-use super::{COMPOSIO_NATIVE_PREFIX, is_composio_native, HOBBES_CORE_SERVER, HOBBES_META_SERVER, HOBBES_PLANNER_SERVER, HOBBES_TERMINAL_SERVER, is_builtin_virtual_server, McpServerConfig, McpContext, McpClientType, ActiveMcpClient, AuthRequiredInfo, McpManager, composio_server_key};
+use super::{COMPOSIO_NATIVE_PREFIX, is_composio_native, HOBBES_CORE_SERVER, HOBBES_META_SERVER, HOBBES_PLANNER_SERVER, HOBBES_TERMINAL_SERVER, is_builtin_virtual_server, McpServerConfig, McpContext, McpClientType, ActiveMcpClient, AuthRequiredInfo, McpManager};
+use super::composio::{composio_server_key};
 use super::tool_call::{get_local_meta_tools};
 
 impl McpManager {
@@ -94,7 +95,7 @@ impl McpManager {
     }
 
     /// Check if an error message indicates authentication is required
-    pub(super) fn is_auth_error(error_msg: &str) -> bool {
+    fn is_auth_error(error_msg: &str) -> bool {
         let lower_msg = error_msg.to_lowercase();
         lower_msg.contains("401")
             || lower_msg.contains("unauthorized")

@@ -7,7 +7,8 @@ use dioxus_signals::{Readable};
 use rmcp::model::{CallToolRequestParam, CallToolResult, Tool};
 use std::collections::{HashSet};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
-use super::{COMPOSIO_NATIVE_PREFIX, is_composio_native, HOBBES_META_SERVER, McpClientType, McpManager, composio_server_key, dyn_composio_key};
+use super::{COMPOSIO_NATIVE_PREFIX, is_composio_native, HOBBES_META_SERVER, McpClientType, McpManager};
+use super::composio::{composio_server_key, dyn_composio_key};
 
 /// Gemini's practical tool limit for FunctionDeclarations.
 const GEMINI_TOOL_LIMIT: usize = 128;

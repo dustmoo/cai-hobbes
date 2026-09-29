@@ -5,7 +5,8 @@ use dioxus::prelude::spawn;
 use dioxus::prelude::Signal;
 use dioxus_signals::{Readable, Writable};
 use std::collections::HashSet;
-use super::{McpServerConfig, McpContext, McpClientType, ActiveMcpClient, McpManager, composio_server_key, resolve_composio_key, dyn_composio_key, ComposioKeyLookup};
+use super::{McpServerConfig, McpContext, McpClientType, ActiveMcpClient, McpManager};
+use super::composio::{ComposioKeyLookup, composio_server_key, dyn_composio_key, resolve_composio_key};
 
 impl McpManager {
     /// Data for the toolkit tool editor: every tool the toolkit offers
