@@ -61,7 +61,7 @@ impl<'a> PromptBuilder<'a> {
         let mut persona = self.settings.persona.clone();
 
         if let Some(instruction) = &self.settings.force_tool_use_instruction {
-            persona = format!("{}\n\nCRITICAL INSTRUCTION: {}", persona, instruction);
+            persona = format!("{}\n\nTOOL POLICY: {}", persona, instruction);
         }
 
         // Check if the last message is an empty placeholder from Hobbes (continuation scenario)

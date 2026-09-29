@@ -75,7 +75,6 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 portable-pty = "0.9"
-strip-ansi-escapes = "0.2"
 chrono-tz = "0.10"
 icalendar = { version = "0.17", features = ["recurrence"] }
 rrule = "0.14"
