@@ -153,6 +153,25 @@ pub(in super::super) fn BehaviorTab(
                                         }
                                     }
 
+                                    // Skill Idle Turns
+                                    div {
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Skill Idle Turns" }
+                                            p { class: "text-xs text-fg-muted", "User turns a loaded skill's full instructions stay in context while unused, before being replaced by a short stub (0 = never)" }
+                                        }
+                                        input {
+                                            r#type: "number",
+                                            class: "{INPUT} justify-self-end",
+                                            value: "{local_settings.read().skill_idle_turns}",
+                                            oninput: move |e| {
+                                                if let Ok(value) = e.value().parse::<usize>() {
+                                                    local_settings.write().skill_idle_turns = value;
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // Tool Result Budget Ratio
                                     div {
                                         class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-b border-faint",

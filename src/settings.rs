@@ -312,6 +312,10 @@ pub struct Settings {
     pub max_summary_chars: usize,
     #[serde(default = "default_max_entity_count")]
     pub max_entity_count: usize,
+    /// User turns a loaded skill's full manual stays in context while unused
+    /// before it is replaced by a short stub. 0 = never stub.
+    #[serde(default = "default_skill_idle_turns")]
+    pub skill_idle_turns: usize,
     /// Fraction of the context window to allocate for active tool results (0.0–1.0).
     /// Default: 0.30 (30%). Used by `effective_tool_result_limit` for providers with
     /// finite context windows (OpenAI-compat, Claude).
@@ -839,6 +843,7 @@ impl Default for Settings {
             max_active_tool_output_length: default_max_active_tool_output_length(),
             max_summary_chars: default_max_summary_chars(),
             max_entity_count: default_max_entity_count(),
+            skill_idle_turns: default_skill_idle_turns(),
             tool_result_budget_ratio: default_tool_result_budget_ratio(),
             image_generation_config: ImageGenerationConfig::default(),
             composio_profiles: Vec::new(),
@@ -1770,6 +1775,10 @@ fn default_max_summary_chars() -> usize {
 
 fn default_max_entity_count() -> usize {
     50
+}
+
+fn default_skill_idle_turns() -> usize {
+    6
 }
 
 fn default_tool_result_budget_ratio() -> f64 {

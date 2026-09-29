@@ -1207,6 +1207,15 @@ fn skill_with_no_recorded_use_is_never_idle() {
 }
 
 #[test]
+fn zero_idle_turns_never_stubs() {
+    let skills = loaded("news", "unrelated");
+    let mut msgs = vec![invoke_skill_msg("news")];
+    msgs.extend(user_turns(50));
+    assert!(idle_loaded_skills(&msgs, &skills, SKILL_IDLE_USER_TURNS).contains("news"));
+    assert!(idle_loaded_skills(&msgs, &skills, 0).is_empty());
+}
+
+#[test]
 fn idle_skill_is_injected_as_stub_not_manual() {
     let settings = Settings::default();
     let mut session = session_with_core_tools();

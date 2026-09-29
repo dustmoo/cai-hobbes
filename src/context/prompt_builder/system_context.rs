@@ -18,9 +18,9 @@ pub(crate) struct SystemContextResult {
     pub is_continuation_placeholder: bool,
 }
 
-/// User turns a loaded skill may go unused before its full manual is replaced
-/// by the idle stub. A constant rather than a setting: nothing else needs to
-/// tune it yet.
+/// Default of `Settings.skill_idle_turns` (user turns a loaded skill may go
+/// unused before its full manual is replaced by the idle stub); used by tests.
+#[cfg(test)]
 pub(crate) const SKILL_IDLE_USER_TURNS: usize = 6;
 
 /// Loaded skills that have gone `idle_after_user_turns` user turns without use.
@@ -32,6 +32,8 @@ pub(crate) const SKILL_IDLE_USER_TURNS: usize = 6;
 /// no use found in history is treated as fresh, never idle — we don't silently
 /// drop a manual we can't account for.
 ///
+/// `idle_after_user_turns == 0` disables stubbing entirely.
+///
 /// Pure over `messages` + `loaded_skills`, so session replay reproduces the
 /// same decision the live session made.
 pub(crate) fn idle_loaded_skills(
@@ -39,6 +41,9 @@ pub(crate) fn idle_loaded_skills(
     loaded_skills: &std::collections::HashMap<String, String>,
     idle_after_user_turns: usize,
 ) -> std::collections::HashSet<String> {
+    if idle_after_user_turns == 0 {
+        return std::collections::HashSet::new();
+    }
     loaded_skills
         .iter()
         .filter_map(|(name, payload_json)| {
@@ -391,14 +396,14 @@ impl<'a> PromptBuilder<'a> {
             // Step 3: Build the loaded_skills array for the system context map.
             // Full manual → turn-active skills; stub only → inactive skills.
             // If no active skills were detected, fall back to injecting all skills fully.
-            // Skills idle for SKILL_IDLE_USER_TURNS user turns are stubbed regardless
+            // Skills idle for `settings.skill_idle_turns` user turns are stubbed regardless
             // (see `idle_loaded_skills`), so a one-off load stops costing its manual
             // on every later turn.
             let use_lazy = !turn_active_skill_names.is_empty();
             idle_skill_names = idle_loaded_skills(
                 &self.session.messages,
                 &self.session.loaded_skills,
-                SKILL_IDLE_USER_TURNS,
+                self.settings.skill_idle_turns,
             );
             let skills_array: Vec<serde_json::Value> = self
                 .session
@@ -418,14 +423,14 @@ impl<'a> PromptBuilder<'a> {
                     if idle_skill_names.contains(skill_name) {
                         tracing::debug!(
                             "Loaded skill '{}': idle stub (unused for {}+ user turns)",
-                            skill_name, SKILL_IDLE_USER_TURNS
+                            skill_name, self.settings.skill_idle_turns
                         );
                         return Some(json!({
                             "name": skill_name,
                             "resolved_tools": tool_mappings,
                             "note": format!(
                                 "Skill idle — its full manual was dropped after {} user turns without use. Call HOBBES_INVOKE_SKILL with this name to reload the full manual, or HOBBES_UNLOAD_SKILL to drop it.",
-                                SKILL_IDLE_USER_TURNS
+                                self.settings.skill_idle_turns
                             ),
                         }));
                     }
