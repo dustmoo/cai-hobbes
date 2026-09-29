@@ -144,28 +144,71 @@ pub enum SkillInvoker {
     Model,
 }
 
+/// The per-skill permission a user picks in Settings → Permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillPolicy {
+    /// The model may load the skill without asking; `/name` runs.
+    Auto,
+    /// The model must raise the approval bubble; `/name` runs directly. Default.
+    Ask,
+    /// Blocked: not advertised, model invoke errors, `/name` is refused.
+    Off,
+}
+
+/// Message returned to the model when it tries to load an Off skill.
+pub const SKILL_OFF_MODEL_ERROR: &str =
+    "Skill is turned off in Settings → Permissions and cannot be loaded.";
+
 impl PermissionSettings {
+    /// The skill's stored policy: `true` → Auto, absent → Ask, `false` → Off.
+    pub fn skill_policy(&self, skill_name: &str) -> SkillPolicy {
+        match self.skill_permissions.get(skill_name) {
+            Some(true) => SkillPolicy::Auto,
+            Some(false) => SkillPolicy::Off,
+            None => SkillPolicy::Ask,
+        }
+    }
+
+    /// Store a policy. Ask is the absence of an entry.
+    pub fn set_skill_policy(&mut self, skill_name: &str, policy: SkillPolicy) {
+        match policy {
+            SkillPolicy::Auto => {
+                self.skill_permissions.insert(skill_name.to_string(), true);
+            }
+            SkillPolicy::Off => {
+                self.skill_permissions.insert(skill_name.to_string(), false);
+            }
+            SkillPolicy::Ask => {
+                self.skill_permissions.remove(skill_name);
+            }
+        }
+    }
+
     /// The one skill-permission resolution function — the backend gates and
-    /// the Settings → Permissions toggles all go through it, so the UI can
+    /// the Settings → Permissions control all go through it, so the UI can
     /// never show a different state than the gate enforces.
     ///
-    /// | `skill_permissions[name]` | model invoke      | user `/name`      |
-    /// |---------------------------|-------------------|-------------------|
-    /// | absent                    | RequiresPrompt    | Allowed           |
-    /// | `true`                    | Allowed           | Allowed           |
-    /// | `false`                   | RequiresPrompt    | RequiresPrompt    |
+    /// | policy (`skill_permissions[name]`) | model invoke   | user `/name`   |
+    /// |------------------------------------|----------------|----------------|
+    /// | Auto (`true`)                      | Allowed        | Allowed        |
+    /// | Ask (absent)                       | RequiresPrompt | Allowed        |
+    /// | Off (`false`)                      | Denied         | Denied         |
     ///
     /// `auto_approval_enabled` deliberately does NOT apply to skills. It is the
     /// blanket switch for MCP tool calls; letting it silently grant the model
     /// self-service skill loading would recreate the "UI shows OFF, behaviour is
-    /// ON" mismatch. Skills are opted in one by one (Settings toggle, or the
-    /// approval bubble's "Always allow").
+    /// ON" mismatch.
     pub fn skill_permission(&self, skill_name: &str, invoker: SkillInvoker) -> PermissionStatus {
-        match (self.skill_permissions.get(skill_name), invoker) {
-            (Some(true), _) => PermissionStatus::Allowed,
-            (Some(false), _) => PermissionStatus::RequiresPrompt,
-            (None, SkillInvoker::User) => PermissionStatus::Allowed,
-            (None, SkillInvoker::Model) => PermissionStatus::RequiresPrompt,
+        match (self.skill_policy(skill_name), invoker) {
+            (SkillPolicy::Auto, _) => PermissionStatus::Allowed,
+            (SkillPolicy::Off, SkillInvoker::Model) => {
+                PermissionStatus::Denied(SKILL_OFF_MODEL_ERROR.to_string())
+            }
+            (SkillPolicy::Off, SkillInvoker::User) => PermissionStatus::Denied(format!(
+                "/{skill_name} is turned off. Turn it on in Settings → Permissions to use it."
+            )),
+            (SkillPolicy::Ask, SkillInvoker::User) => PermissionStatus::Allowed,
+            (SkillPolicy::Ask, SkillInvoker::Model) => PermissionStatus::RequiresPrompt,
         }
     }
 }
@@ -192,8 +235,19 @@ mod tests {
             (None, User, Allowed),
             (Some(true), Model, Allowed),
             (Some(true), User, Allowed),
-            (Some(false), Model, RequiresPrompt),
-            (Some(false), User, RequiresPrompt),
+            (
+                Some(false),
+                Model,
+                PermissionStatus::Denied(SKILL_OFF_MODEL_ERROR.to_string()),
+            ),
+            (
+                Some(false),
+                User,
+                PermissionStatus::Denied(
+                    "/news is turned off. Turn it on in Settings → Permissions to use it."
+                        .to_string(),
+                ),
+            ),
         ];
         for (entry, invoker, expected) in cases {
             assert_eq!(
@@ -202,6 +256,17 @@ mod tests {
                 "entry={entry:?} invoker={invoker:?}"
             );
         }
+    }
+
+    #[test]
+    fn skill_policy_round_trips() {
+        let mut s = PermissionSettings::default();
+        assert_eq!(s.skill_policy("news"), SkillPolicy::Ask);
+        for p in [SkillPolicy::Auto, SkillPolicy::Off, SkillPolicy::Ask] {
+            s.set_skill_policy("news", p);
+            assert_eq!(s.skill_policy("news"), p);
+        }
+        assert!(!s.skill_permissions.contains_key("news"));
     }
 
     #[test]
@@ -214,10 +279,10 @@ mod tests {
         );
         let mut s = skill_settings(Some(false));
         s.auto_approval_enabled = true;
-        assert_eq!(
+        assert!(matches!(
             s.skill_permission("news", SkillInvoker::User),
-            PermissionStatus::RequiresPrompt
-        );
+            PermissionStatus::Denied(_)
+        ));
     }
 
     #[tokio::test]

@@ -226,10 +226,11 @@ pub fn skill_invoke_needs_approval(
     if already_loaded {
         return false;
     }
+    // Only Ask raises the bubble. Off is refused by `invoke_skill` with an error.
     deps.permission_manager
         .read()
         .check_skill_permission(&skill.metadata.name, SkillInvoker::Model)
-        != PermissionStatus::Allowed
+        == PermissionStatus::RequiresPrompt
 }
 
 /// Run `tool_call` if it is a built-in, otherwise return `None` so the caller
@@ -549,25 +550,36 @@ async fn invoke_skill(
     // The streaming path parks calls that need approval before dispatching
     // (`skill_invoke_needs_approval`), so reaching a non-Allowed skill here
     // means a path skipped that step — refuse rather than load unapproved.
-    if !user_approved
-        && deps
+    // A skill already loaded this session stays reloadable even if it was
+    // switched Off meanwhile; once unloaded, Off means it cannot come back.
+    let already_loaded = session_state
+        .read()
+        .sessions
+        .get(session_id)
+        .is_some_and(|s| s.loaded_skills.contains_key(&skill.metadata.name));
+    if !already_loaded {
+        let status = deps
             .permission_manager
             .read()
-            .check_skill_permission(&skill.metadata.name, SkillInvoker::Model)
-            != PermissionStatus::Allowed
-        && !session_state
-            .read()
-            .sessions
-            .get(session_id)
-            .is_some_and(|s| s.loaded_skills.contains_key(&skill.metadata.name))
-    {
-        return (
-            ToolCallStatus::Error,
-            format!(
-                "Skill '{}' needs the user's approval before it can be loaded. Ask them to run /{} themselves or enable the skill in Settings → Permissions.",
-                skill_name, skill_name
-            ),
-        );
+            .check_skill_permission(&skill.metadata.name, SkillInvoker::Model);
+        match status {
+            PermissionStatus::Denied(reason) => {
+                return (
+                    ToolCallStatus::Error,
+                    format!("Skill '{}': {}", skill_name, reason),
+                );
+            }
+            PermissionStatus::RequiresPrompt if !user_approved => {
+                return (
+                    ToolCallStatus::Error,
+                    format!(
+                        "Skill '{}' needs the user's approval before it can be loaded. Ask them to run /{} themselves or enable the skill in Settings → Permissions.",
+                        skill_name, skill_name
+                    ),
+                );
+            }
+            _ => {}
+        }
     }
 
     let mut skill_call = crate::components::shared::SkillCall {

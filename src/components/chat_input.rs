@@ -505,6 +505,39 @@ pub fn ChatInput(
                             crate::context::permissions::SkillInvoker::User,
                         );
 
+                    // Off: refuse inline, no approval bubble and no model turn.
+                    if let crate::context::permissions::PermissionStatus::Denied(reason) =
+                        &permission_status
+                    {
+                        let mk = |content: String| crate::components::chat::Message {
+                            id: uuid::Uuid::new_v4(),
+                            author: "User".to_string(),
+                            content: crate::components::shared::MessageContent::Text {
+                                content,
+                                thought_signature: None,
+                                thought_summary: None,
+                                signature_provider: None,
+                            },
+                            attachments: Vec::new(),
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        let refusal = mk(reason.clone());
+                        let mut refusal_log: Option<String> = None;
+                        {
+                            let mut state = session_state.write();
+                            if let Some(session) = state.sessions.get_mut(&target_sid) {
+                                refusal_log = Some(session.id.clone());
+                                session.messages.push(refusal.clone());
+                            }
+                        }
+                        if let Some(sid) = refusal_log {
+                            log_events(&sid, vec![SessionEvent::UserMessage { message: refusal }]);
+                        }
+                        return;
+                    }
+
                     let skill_call = crate::components::shared::SkillCall {
                         execution_id: uuid::Uuid::new_v4().to_string(),
                         skill_name: skill.metadata.name.clone(),
