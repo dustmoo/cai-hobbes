@@ -2,26 +2,23 @@ mod calendar;
 mod fleet;
 mod license;
 mod shared;
+mod tabs;
 mod terminal;
 mod trust_rules;
 
-use calendar::CalendarSubscriptionsSection;
 use fleet::FleetSection;
-use license::LicenseSection;
 use shared::{comparable, flush_draft_into_instance, load_instance_into_draft, selected_kind, Toggle, INPUT};
+use tabs::{AboutTab, HotkeysTab, PlannerTab};
 use terminal::TerminalSection;
 use trust_rules::TrustRulesSection;
 
 use crate::components::confirm_delete_modal::ConfirmDeleteModal;
 use crate::components::confirm_save_modal::ConfirmSaveModal;
 use crate::components::conflict_modal::ConflictModal;
-use crate::components::hotkey_recorder::HotkeyRecorder;
-use crate::components::markdown_renderer::MarkdownRenderer;
-use crate::components::onboarding::TOS_CONTENT;
 use crate::components::tool_credentials::ToolCredentials;
 use crate::llm::GeminiModel;
 use crate::mcp::composio_client::validate_composio_api_key;
-use crate::settings::{get_slot_icon, is_sandboxed, HotkeySettings, Settings, SettingsManager};
+use crate::settings::{get_slot_icon, is_sandboxed, Settings, SettingsManager};
 use crate::SecretManagerTrait;
 use crate::{context::permissions::ToolCategory, session::SessionState};
 use dioxus::prelude::*;
@@ -29,6 +26,15 @@ use dioxus_free_icons::{icons::fi_icons, Icon};
 use rfd;
 use std::io::Write;
 use zip::write::{FileOptions, ZipWriter};
+
+/// Signals shared by most settings tabs, bundled so each tab component takes
+/// them as one prop. Every field is a `Copy` handle to a hook owned by
+/// `SettingsPanel`, so switching tabs never resets the draft or UI state.
+#[derive(Clone, Copy, PartialEq)]
+struct SettingsCtx {
+    settings: Signal<Settings>,
+    local_settings: Signal<Settings>,
+}
 
 #[component]
 pub fn SettingsPanel() -> Element {
@@ -293,7 +299,7 @@ pub fn SettingsPanel() -> Element {
     let mut permissions_collapsed = use_signal(|| false);
     let mut show_conflict_modal = use_signal(|| false);
     let mut show_confirm_save_modal = use_signal(|| false);
-    let mut show_tos_modal = use_signal(|| false);
+    let show_tos_modal = use_signal(|| false);
     // Skill management: None = editor closed, Some(None) = new skill,
     // Some(Some(skill)) = editing an existing skill (editing_toolkit pattern)
     let mut editing_skill: Signal<Option<Option<crate::skills::Skill>>> = use_signal(|| None);
@@ -334,6 +340,11 @@ pub fn SettingsPanel() -> Element {
     let mut composio_url_warning = use_signal(|| Option::<String>::None);
     // Advanced mode toggle for Composio profile (hides User ID and Server URL by default)
     let mut show_composio_advanced = use_signal(|| false);
+
+    let ctx = SettingsCtx {
+        settings,
+        local_settings,
+    };
 
     rsx! {
         div {
@@ -748,224 +759,7 @@ pub fn SettingsPanel() -> Element {
                    class: "flex-1 overflow-y-auto pr-2",
                    match ui_state.read().active_settings_tab {
                        crate::settings::SettingsTab::Planner => rsx! {
-                            div {
-                                class: "border border-subtle rounded-lg mb-4",
-                                div {
-                                    class: "p-4 bg-section rounded-lg",
-                                    h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-3", "Planner" }
-                                    p { class: "text-sm text-fg-muted mb-4",
-                                        "The built-in to-do list and daily planner, shared between you and Hobbes."
-                                    }
-
-                                    div {
-                                        class: "flex items-center justify-between mb-4",
-                                        div {
-                                            label { class: "text-sm font-medium text-fg-muted", "Enable Planner" }
-                                            p { class: "text-xs text-fg-muted", "When off, the planner tools are withheld from the AI and the Planner view is hidden." }
-                                        }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().planner_enabled}",
-                                            onchange: move |e| {
-                                                local_settings.write().planner_enabled = e.value() == "true";
-                                            }
-                                        }
-                                    }
-
-                                    div {
-                                        class: "flex items-center justify-between mb-4",
-                                        div {
-                                            label { class: "text-sm font-medium text-fg-muted", "Share Today's Plan with the AI" }
-                                            p { class: "text-xs text-fg-muted", "Inject today's todos, timeline, and capacity into the AI's context each turn (costs a few hundred tokens)." }
-                                        }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().planner_inject_today_context}",
-                                            onchange: move |e| {
-                                                local_settings.write().planner_inject_today_context = e.value() == "true";
-                                            }
-                                        }
-                                    }
-
-                                    div {
-                                        class: "flex items-center justify-between mb-4",
-                                        div {
-                                            label { class: "text-sm font-medium text-fg-muted", "Roll Unfinished Work Forward" }
-                                            p { class: "text-xs text-fg-muted", "Todos scheduled for a past day move onto today when the planner opens." }
-                                        }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().planner_auto_rollover}",
-                                            onchange: move |e| {
-                                                local_settings.write().planner_auto_rollover = e.value() == "true";
-                                            }
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 gap-4 mb-4",
-                                        div {
-                                            label { class: "block text-sm font-medium text-fg-muted mb-1", "Workday Starts" }
-                                            input {
-                                                r#type: "text",
-                                                class: "w-full rounded border border-subtle bg-input px-3 py-2 text-sm text-fg",
-                                                placeholder: "09:00",
-                                                value: "{local_settings.read().planner_workday_start}",
-                                                oninput: move |e| {
-                                                    local_settings.write().planner_workday_start = e.value();
-                                                }
-                                            }
-                                        }
-                                        div {
-                                            label { class: "block text-sm font-medium text-fg-muted mb-1", "Workday Ends" }
-                                            input {
-                                                r#type: "text",
-                                                class: "w-full rounded border border-subtle bg-input px-3 py-2 text-sm text-fg",
-                                                placeholder: "17:00",
-                                                value: "{local_settings.read().planner_workday_end}",
-                                                oninput: move |e| {
-                                                    local_settings.write().planner_workday_end = e.value();
-                                                }
-                                            }
-                                        }
-                                    }
-                                    p { class: "text-xs text-fg-muted -mt-2 mb-4",
-                                        "24-hour HH:MM. The timeline falls back to 09:00–17:00 if these don't parse."
-                                    }
-
-                                    div {
-                                        class: "mb-4",
-                                        label { class: "block text-sm font-medium text-fg-muted mb-1", "Daily Capacity (minutes)" }
-                                        p { class: "text-xs text-fg-muted mb-1", "Focused work the day is planned against — an honest number, not your hours at a desk. 360 = 6h." }
-                                        input {
-                                            r#type: "number",
-                                            min: "0",
-                                            class: "w-32 rounded border border-subtle bg-input px-3 py-2 text-sm text-fg",
-                                            value: "{local_settings.read().planner_daily_capacity_minutes}",
-                                            oninput: move |e| {
-                                                if let Ok(v) = e.value().parse::<u32>() {
-                                                    local_settings.write().planner_daily_capacity_minutes = v;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    div {
-                                        class: "mb-4",
-                                        label { class: "block text-sm font-medium text-fg-muted mb-1", "Default Estimate (minutes)" }
-                                        p { class: "text-xs text-fg-muted mb-1", "Auto-filled onto quick-added todos with no ~duration token. 0 leaves them unestimated." }
-                                        input {
-                                            r#type: "number",
-                                            min: "0",
-                                            class: "w-32 rounded border border-subtle bg-input px-3 py-2 text-sm text-fg",
-                                            value: "{local_settings.read().planner_default_estimate_minutes}",
-                                            oninput: move |e| {
-                                                if let Ok(v) = e.value().parse::<u32>() {
-                                                    local_settings.write().planner_default_estimate_minutes = v;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    div {
-                                        class: "mb-1",
-                                        label { class: "block text-sm font-medium text-fg-muted mb-1", "Default Block Length (minutes)" }
-                                        p { class: "text-xs text-fg-muted mb-1", "Blocks created by clicking the timeline, or by an @time token on an unestimated todo." }
-                                        input {
-                                            r#type: "number",
-                                            min: "15",
-                                            class: "w-32 rounded border border-subtle bg-input px-3 py-2 text-sm text-fg",
-                                            value: "{local_settings.read().planner_default_block_minutes}",
-                                            oninput: move |e| {
-                                                if let Ok(v) = e.value().parse::<u32>() {
-                                                    local_settings.write().planner_default_block_minutes = v.max(15);
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Priority naming: display only — P1 is Q1, so switching
-                                    // never rewrites a todo.
-                                    {
-                                        use crate::todo::model::{Priority, PriorityDisplay, PriorityScheme};
-                                        let scheme = local_settings.read().planner_priority.scheme;
-                                        rsx! {
-                                            div {
-                                                class: "mt-4 mb-1",
-                                                label { class: "block text-sm font-medium text-fg-muted mb-1", "Priority Labels" }
-                                                p { class: "text-xs text-fg-muted mb-1", "How the four priority levels read on rows, menus and band headers. Rename any level; blank uses the default. Rows take 1–4 (0 clears, p cycles) when focused." }
-                                                select {
-                                                    class: "mb-2 block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",
-                                                    onchange: move |e| {
-                                                        local_settings.write().planner_priority.scheme = if e.value() == "linear" {
-                                                            PriorityScheme::Linear
-                                                        } else {
-                                                            PriorityScheme::Eisenhower
-                                                        };
-                                                    },
-                                                    option { value: "eisenhower", selected: scheme == PriorityScheme::Eisenhower, "Eisenhower quadrants (Q1–Q4)" }
-                                                    option { value: "linear", selected: scheme == PriorityScheme::Linear, "Linear scale (P1–P4)" }
-                                                }
-                                                div {
-                                                    class: "grid grid-cols-[2.5rem_1fr] items-center gap-x-2 gap-y-1.5",
-                                                    for p in Priority::ALL {
-                                                        {
-                                                            let i = p.quadrant() as usize - 1;
-                                                            let display = local_settings.read().planner_priority.clone();
-                                                            let value = display.names.get(i).cloned().unwrap_or_default();
-                                                            rsx! {
-                                                                span { key: "b-{i}", class: "font-mono text-xs text-fg-muted", "{display.badge(p)}" }
-                                                                input {
-                                                                    key: "n-{i}",
-                                                                    r#type: "text",
-                                                                    class: "w-64 rounded border border-subtle bg-input px-3 py-1.5 text-sm text-fg",
-                                                                    placeholder: "{PriorityDisplay::default_name(scheme, p)}",
-                                                                    value: "{value}",
-                                                                    oninput: move |e| {
-                                                                        let mut s = local_settings.write();
-                                                                        let names = &mut s.planner_priority.names;
-                                                                        if names.len() < 4 {
-                                                                            names.resize(4, String::new());
-                                                                        }
-                                                                        names[i] = e.value();
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            div {
-                                class: "border border-subtle rounded-lg mb-4",
-                                div {
-                                    class: "p-4 bg-section rounded-lg",
-                                    h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-3", "Quick-Add Syntax" }
-                                    p { class: "text-sm text-fg-muted mb-2",
-                                        "Tokens anywhere in the quick-add input; anything that doesn't parse stays in the title."
-                                    }
-                                    div {
-                                        class: "text-xs text-fg-muted space-y-1 font-mono",
-                                        p { "~30m  ~1h30m  ~90     estimate" }
-                                        p { "#tag                  tag (repeatable)" }
-                                        p { "@2pm  @14:30  @9      place on today's timeline" }
-                                        p { "@morning  @evening    time-of-day group" }
-                                        p { "*mon  *tomorrow       scheduled day" }
-                                        p { "!fri  !tomorrow       deadline" }
-                                        p { "!!1…!!4  !!p1…!!p4    priority" }
-                                        p { "+hobbes  +hobbes-rc   project (slug or word prefix)" }
-                                    }
-                                }
-                            }
-
-                            CalendarSubscriptionsSection {}
+                           PlannerTab { ctx }
                        },
                        crate::settings::SettingsTab::General => rsx! {
 
@@ -4384,286 +4178,7 @@ pub fn SettingsPanel() -> Element {
             }
         }, // End Permissions
                     crate::settings::SettingsTab::Hotkeys => rsx! {
-                        div {
-                            class: "border border-subtle rounded-lg mb-4",
-                            div {
-                                class: "p-4 bg-section rounded-lg",
-                                h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-4", "Keyboard Shortcuts" }
-                                p { class: "text-xs text-fg-muted mb-4",
-                                    "Customize global shortcuts using the format: "
-                                    code { class: "bg-black/30 px-1 rounded", "CmdOrCtrl+Shift+Key" }
-                                ". Changes apply immediately after saving."
-                                }
-                                if local_settings.read().hotkeys != settings.read().hotkeys {
-                                    div {
-                                        class: "mb-4 p-3 bg-yellow-900/30 border border-yellow-700/50 rounded-md flex items-center gap-3",
-                                        Icon {
-                                            width: 18,
-                                            height: 18,
-                                            fill: "none",
-                                            class: "text-yellow-500 min-w-[18px]",
-                                            icon: fi_icons::FiAlertTriangle,
-                                        }
-                                        span { class: "text-xs text-yellow-200", "Restart required to apply changes." }
-                                    }
-                                }
-
-                                div {
-                                    class: "space-y-4",
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Submit Message" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.submit_chat.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.submit_chat = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Cancel Generation" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.cancel_generation.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.cancel_generation = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Focus Chat Input" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_focus_chat.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_focus_chat = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Toggle Settings" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_settings.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_settings = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Toggle History" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_history.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_history = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Toggle MCP Config" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_mcp.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_mcp = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Toggle Planner" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_planner.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_planner = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Toggle Fleet" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_fleet.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_fleet = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Quick Capture to Planner" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.quick_capture.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.quick_capture = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Next Tab" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.next_tab.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.next_tab = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Previous Tab" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.prev_tab.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.prev_tab = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Open Profile Selector" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_profile.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_profile = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Open Provider Selector" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_provider.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_provider = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Add Attachments" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_attachments.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_attachments = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Global Toggle (Show/Hide)" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_tray.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_tray = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "New Chat (No Memory)" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_new_chat.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_new_chat = v,
-                                        }
-                                    }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "New Chat with Memory" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.toggle_new_chat_with_memory.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.toggle_new_chat_with_memory = v,
-                                        }
-                                    }
-
-                                    div { class: "pt-2 pb-1", h4 { class: "text-xs uppercase tracking-[0.06em] text-fg-muted mt-2", "Session Tabs" } }
-
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Switch to Tab 1" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.switch_tab_1.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_1 = v,
-                                        }
-                                    }
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Switch to Tab 2" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.switch_tab_2.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_2 = v,
-                                        }
-                                    }
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Switch to Tab 3" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.switch_tab_3.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_3 = v,
-                                        }
-                                    }
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Switch to Tab 4" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.switch_tab_4.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_4 = v,
-                                        }
-                                    }
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Switch to Tab 5" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.switch_tab_5.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_5 = v,
-                                        }
-                                    }
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Switch to Tab 6" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.switch_tab_6.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_6 = v,
-                                        }
-                                    }
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Switch to Tab 7" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.switch_tab_7.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_7 = v,
-                                        }
-                                    }
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Switch to Tab 8" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.switch_tab_8.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_8 = v,
-                                        }
-                                    }
-                                    div {
-                                        class: "grid grid-cols-2 items-center gap-4",
-                                        label { class: "text-sm text-fg-muted", "Switch to Tab 9" }
-                                        HotkeyRecorder {
-                                            value: local_settings.read().hotkeys.switch_tab_9.clone(),
-                                            onchange: move |v: String| local_settings.write().hotkeys.switch_tab_9 = v,
-                                        }
-                                    }
-
-                                    // Reset to Defaults button
-                                    div {
-                                        class: "pt-4 border-t border-gray-800",
-                                        button {
-                                            class: "px-4 py-2 bg-input rounded-md text-sm text-fg-muted hover:bg-input hover:text-fg transition-colors",
-                                            onclick: move |_| {
-                                                local_settings.write().hotkeys = HotkeySettings::default();
-                                            },
-                                            "Reset to Defaults"
-                                        }
-                                    }
-
-                                    div {
-                                        class: "pt-4 border-t border-gray-800",
-
-                                        div {
-                                            class: "flex justify-between items-center text-sm",
-                                            span { class: "text-fg-muted", "Switch Profile (1-9)" }
-                                            span { class: "font-mono text-fg-muted", "CmdOrCtrl + [1-9]" }
-                                        }
-                                        p { class: "text-[10px] text-fg-muted mt-1", "Profile switching hotkeys are currently fixed." }
-                                    }
-                                }
-                            }
-                        }
+                        HotkeysTab { ctx }
                     },
                     crate::settings::SettingsTab::Credentials => rsx! {
                          ToolCredentials {}
@@ -4875,93 +4390,8 @@ pub fn SettingsPanel() -> Element {
                         }
                     },
                     crate::settings::SettingsTab::About => rsx! {
-                // About & Legal Section
-                div {
-                    class: "border border-subtle rounded-lg mb-4",
-                    div {
-                        class: "p-4 bg-section rounded-lg",
-                        h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium", "About & Legal" }
-                        p { class: "text-sm text-fg-muted mb-3", "What Hobbes is, and where the license and legal terms live." }
-
-                        // Version and app name
-                        div {
-                            class: "flex items-center gap-2 mb-3",
-                            span { class: "text-sm text-fg-muted", "{app_name}" }
-                            span { class: "font-mono text-[11px] text-fg-muted", "{app_version}" }
-                        }
-
-                        // Privacy statement
-                        p {
-                            class: "text-sm text-green-400 mb-3",
-                            "🔒 Built without telemetry for your privacy."
-                        }
-
-                        // Attribution
-                        p {
-                            class: "text-xs text-fg-muted mb-4",
-                            "{crate::settings::APP_ATTRIBUTION}"
-                        }
-
-                        // Legal links
-                        div {
-                            class: "flex gap-4",
-                            button {
-                                class: "border border-faint text-fg rounded px-3 py-1.5 text-sm hover:bg-card",
-                                onclick: move |_| show_tos_modal.set(true),
-                                "Terms of Service"
-                            }
-                            a {
-                                class: "text-sm text-primary-400 hover:text-primary-300 underline",
-                                href: "https://clearmirror.ai/privacy-policy",
-                                target: "_blank",
-                                "Privacy Policy"
-                            }
-                        }
-
-                        // TOS Modal
-                        if show_tos_modal() {
-                            div {
-                                class: "fixed inset-0 bg-black/60 flex items-center justify-center z-50",
-                                onclick: move |_| show_tos_modal.set(false),
-                                div {
-                                    class: "bg-section rounded-lg shadow-xl max-w-lg w-full mx-4 max-h-[80vh] flex flex-col",
-                                    onclick: move |e| e.stop_propagation(),
-                                    // Header
-                                    div {
-                                        class: "flex justify-between items-center p-4 border-b border-subtle",
-                                        h2 { class: "text-lg font-bold", "Terms of Service" }
-                                        button {
-                                            class: "text-fg-muted hover:text-fg text-xl font-bold w-8 h-8 flex items-center justify-center rounded hover:bg-input transition-colors",
-                                            onclick: move |_| show_tos_modal.set(false),
-                                            "×"
-                                        }
-                                    }
-                                    // Content
-                                    div {
-                                        class: "flex-1 overflow-y-auto p-4 text-sm prose prose-sm dark:prose-invert max-w-none",
-                                        MarkdownRenderer {
-                                            content: TOS_CONTENT.to_string(),
-                                            comments: None,
-                                            pending_highlight: None,
-                                        }
-                                    }
-                                    // Footer
-                                    div {
-                                        class: "p-4 border-t border-subtle",
-                                        button {
-                                            class: "w-full bg-btn-primary hover:bg-btn-primary-hover text-fg rounded px-3 py-1.5 text-sm",
-                                            onclick: move |_| show_tos_modal.set(false),
-                                            "Close"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Pro license status + key entry
-                LicenseSection {}
-                   }, // End About
+                        AboutTab { app_name: app_name, app_version: app_version.clone(), show_tos_modal: show_tos_modal }
+                    },
                    // ImageGen tab removed — image model is now inline in General.
                    // Keep the arm for serialization backwards compat; render nothing.
                    crate::settings::SettingsTab::ImageGen => rsx! {
