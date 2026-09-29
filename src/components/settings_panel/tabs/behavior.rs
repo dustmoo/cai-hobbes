@@ -1,12 +1,15 @@
 use super::super::SettingsCtx;
-use super::super::shared::Toggle;
-use super::super::shared::INPUT;
 use super::super::fleet::FleetSection;
+use super::super::shared::INPUT;
+use super::super::shared::Toggle;
 use super::super::terminal::TerminalSection;
 use dioxus::prelude::*;
 
 #[component]
-pub(in super::super) fn BehaviorTab(ctx: SettingsCtx, mut app_behavior_collapsed: Signal<bool>) -> Element {
+pub(in super::super) fn BehaviorTab(
+    ctx: SettingsCtx,
+    mut app_behavior_collapsed: Signal<bool>,
+) -> Element {
     let mut ui_state = ctx.ui_state;
     let ui_state_manager = ctx.ui_state_manager;
     let mut local_settings = ctx.local_settings;

@@ -7,17 +7,20 @@ mod terminal;
 mod trust_rules;
 
 use shared::{comparable, flush_draft_into_instance, load_instance_into_draft};
-use tabs::{AboutTab, BehaviorTab, DataTab, GeneralTab, HotkeysTab, McpTab, PermissionsTab, PlannerTab, SkillsTab};
+use tabs::{
+    AboutTab, BehaviorTab, DataTab, GeneralTab, HotkeysTab, McpTab, PermissionsTab, PlannerTab,
+    SkillsTab,
+};
 
+use crate::SecretManagerTrait;
 use crate::components::confirm_save_modal::ConfirmSaveModal;
 use crate::components::conflict_modal::ConflictModal;
 use crate::components::tool_credentials::ToolCredentials;
 use crate::mcp::composio_client::validate_composio_api_key;
-use crate::settings::{Settings, SettingsManager};
-use crate::SecretManagerTrait;
 use crate::session::SessionState;
+use crate::settings::{Settings, SettingsManager};
 use dioxus::prelude::*;
-use dioxus_free_icons::{icons::fi_icons, Icon};
+use dioxus_free_icons::{Icon, icons::fi_icons};
 
 /// Signals shared by most settings tabs, bundled so each tab component takes
 /// them as one prop. Every field is a `Copy` handle to a hook owned by
@@ -53,12 +56,8 @@ pub fn SettingsPanel() -> Element {
     let save_error = use_context::<crate::components::shared::SaveErrorContext>().0;
 
     // The connector instance currently selected for editing in the list.
-    let mut selected_connector_id = use_signal(|| {
-        settings
-            .read()
-            .active_connector()
-            .map(|c| c.id.clone())
-    });
+    let mut selected_connector_id =
+        use_signal(|| settings.read().active_connector().map(|c| c.id.clone()));
 
     // Create a local copy of the settings for editing. The selected connector's
     // config is loaded into the legacy singleton slots, which the per-provider

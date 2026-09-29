@@ -4,7 +4,11 @@ use crate::context::permissions::ToolCategory;
 use dioxus::prelude::*;
 
 #[component]
-pub(in super::super) fn PermissionsTab(ctx: SettingsCtx, mcp_context: Signal<crate::mcp::manager::McpContext>, mut permissions_collapsed: Signal<bool>) -> Element {
+pub(in super::super) fn PermissionsTab(
+    ctx: SettingsCtx,
+    mcp_context: Signal<crate::mcp::manager::McpContext>,
+    mut permissions_collapsed: Signal<bool>,
+) -> Element {
     let _mcp_context = mcp_context;
     let mut local_settings = ctx.local_settings;
     let skill_registry = ctx.skill_registry;

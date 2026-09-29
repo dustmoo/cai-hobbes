@@ -181,6 +181,24 @@ For deeper documentation on specific subsystems:
 | macOS Signing | [GUIDE_TO_APPLE_SIGNING.md](GUIDE_TO_APPLE_SIGNING.md) |
 | Contributing | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
+### Module map: components/settings_panel/
+
+| File | Owns |
+|------|------|
+| `mod.rs` | `SettingsPanel` (the only public item): every hook, the draft/sync effects, model-fetch effects, save + keychain-mode + conflict modals, the tab bar, the footer Save button, and a short `match` dispatching to tab components. Also defines `SettingsCtx`. |
+| `shared.rs` | `INPUT` class string, `Toggle` switch, connector draft helpers (`load_instance_into_draft`, `selected_kind`, `flush_draft_into_instance`, `comparable`). |
+| `calendar.rs` | Planner-tab calendar subscriptions: palette, ICS URL validation, `CalendarSubscriptionRow`, `CalendarSubscriptionsSection` (+ its unit tests). |
+| `license.rs` | `LicenseSection` (About tab). |
+| `trust_rules.rs` | `TrustRulesSection` (Permissions tab). |
+| `terminal.rs` | `TerminalSection` (Behavior tab). |
+| `fleet.rs` | `FleetSection` (Behavior tab). |
+| `tabs/mod.rs` | Declares and re-exports the tab components. |
+| `tabs/general.rs` … `tabs/about.rs` | One component per tab: `GeneralTab`, `McpTab`, `BehaviorTab`, `PlannerTab`, `DataTab`, `PermissionsTab`, `HotkeysTab`, `SkillsTab`, `AboutTab`. Credentials renders `ToolCredentials` directly; ImageGen is a one-line placeholder in the match. |
+
+`SettingsCtx` is a `#[derive(Clone, Copy, PartialEq)]` bundle of the signals most tabs share (`settings`, `settings_manager`, `local_settings`, `ui_state`, `ui_state_manager`, `session_state`, `secret_manager`, `save_error`, `selected_connector_id`, `skill_registry`). Tab-specific signals are passed as individual `Signal<T>` props.
+
+**Rule:** new settings tabs go in `tabs/<name>.rs` and receive shared state via `SettingsCtx` props, not new hooks. Any state that must survive switching tabs (drafts, collapse flags, modal state) is a hook in `SettingsPanel` passed down; calling `use_signal` inside a tab component resets it on every tab switch.
+
 ---
 
 *This document supersedes `memory-bank/systemPatterns.md` as of Beta release.*

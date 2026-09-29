@@ -2,7 +2,7 @@ use super::super::SettingsCtx;
 use crate::components::hotkey_recorder::HotkeyRecorder;
 use crate::settings::HotkeySettings;
 use dioxus::prelude::*;
-use dioxus_free_icons::{icons::fi_icons, Icon};
+use dioxus_free_icons::{Icon, icons::fi_icons};
 
 #[component]
 pub(in super::super) fn HotkeysTab(ctx: SettingsCtx) -> Element {

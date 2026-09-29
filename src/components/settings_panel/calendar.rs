@@ -1,7 +1,7 @@
-use crate::settings::{Settings, SettingsManager};
 use crate::SecretManagerTrait;
+use crate::settings::{Settings, SettingsManager};
 use dioxus::prelude::*;
-use dioxus_free_icons::{icons::fi_icons, Icon};
+use dioxus_free_icons::{Icon, icons::fi_icons};
 
 // ── Calendar subscriptions (Planner tab) ────────────────────────────────────
 
@@ -45,7 +45,10 @@ fn validate_ics_url(raw: &str) -> Result<(), String> {
 
 /// Friendly relative time for the sync status line: "just now", "5m ago",
 /// "3h ago", then the planner's friendly date for anything older.
-fn friendly_sync_time(t: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+fn friendly_sync_time(
+    t: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
     let secs = (now - t).num_seconds();
     if secs < 60 {
         return "just now".to_string();
@@ -293,8 +296,7 @@ pub(super) fn CalendarSubscriptionsSection() -> Element {
     let mut gcal_form_open = use_signal(|| false);
     let mut gcal_profile_id = use_signal(|| Option::<String>::None);
     let mut gcal_loading = use_signal(|| false);
-    let mut gcal_calendars =
-        use_signal(|| Option::<Result<Vec<(String, String)>, String>>::None);
+    let mut gcal_calendars = use_signal(|| Option::<Result<Vec<(String, String)>, String>>::None);
     let mut gcal_selected = use_signal(|| Option::<String>::None);
     let mut gcal_manual_id = use_signal(|| "primary".to_string());
 
@@ -701,14 +703,23 @@ mod tests {
     fn friendly_sync_time_scales_with_age() {
         let now = Utc.with_ymd_and_hms(2026, 8, 12, 12, 0, 0).unwrap();
         assert_eq!(friendly_sync_time(now, now), "just now");
-        assert_eq!(friendly_sync_time(now - Duration::seconds(30), now), "just now");
-        assert_eq!(friendly_sync_time(now - Duration::minutes(5), now), "5m ago");
+        assert_eq!(
+            friendly_sync_time(now - Duration::seconds(30), now),
+            "just now"
+        );
+        assert_eq!(
+            friendly_sync_time(now - Duration::minutes(5), now),
+            "5m ago"
+        );
         assert_eq!(friendly_sync_time(now - Duration::hours(3), now), "3h ago");
         // Older than a day: falls through to the planner's friendly date
         // (exact wording covered by views::friendly_date's own tests).
         let old = friendly_sync_time(now - Duration::days(30), now);
         assert!(!old.contains("ago"), "{}", old);
         // A clock skewed slightly into the future must not underflow.
-        assert_eq!(friendly_sync_time(now + Duration::seconds(10), now), "just now");
+        assert_eq!(
+            friendly_sync_time(now + Duration::seconds(10), now),
+            "just now"
+        );
     }
 }

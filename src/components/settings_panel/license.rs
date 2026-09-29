@@ -1,6 +1,6 @@
 use super::shared::INPUT;
-use crate::settings::Settings;
 use crate::SecretManagerTrait;
+use crate::settings::Settings;
 use dioxus::prelude::*;
 
 /// License section on the About tab: current status (Free / Pro), paste-key
@@ -39,9 +39,10 @@ pub(super) fn LicenseSection() -> Element {
                     use_biometric,
                 ) {
                     Ok(()) => {
-                        secret_manager
-                            .write()
-                            .update_cache(crate::entitlement::LICENSE_KEYCHAIN_KEY.to_string(), key);
+                        secret_manager.write().update_cache(
+                            crate::entitlement::LICENSE_KEYCHAIN_KEY.to_string(),
+                            key,
+                        );
                         crate::entitlement::activate(info);
                         key_input.set(String::new());
                         license_error.set(None);

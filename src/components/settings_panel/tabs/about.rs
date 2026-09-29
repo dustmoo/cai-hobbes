@@ -4,7 +4,11 @@ use crate::components::onboarding::TOS_CONTENT;
 use dioxus::prelude::*;
 
 #[component]
-pub(in super::super) fn AboutTab(app_name: &'static str, app_version: String, mut show_tos_modal: Signal<bool>) -> Element {
+pub(in super::super) fn AboutTab(
+    app_name: &'static str,
+    app_version: String,
+    mut show_tos_modal: Signal<bool>,
+) -> Element {
     rsx! {
                 // About & Legal Section
                 div {

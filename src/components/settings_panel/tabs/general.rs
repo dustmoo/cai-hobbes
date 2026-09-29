@@ -7,7 +7,20 @@ use crate::settings::is_sandboxed;
 use dioxus::prelude::*;
 
 #[component]
-pub(in super::super) fn GeneralTab(ctx: SettingsCtx, mut available_models: Signal<Vec<crate::services::gemini_models::GeminiModel>>, mut models_loading: Signal<bool>, mut models_error: Signal<Option<String>>, mut models_fetch_trigger: Signal<u32>, mut picker_open_for_slot: Signal<Option<usize>>, mut oai_available_models: Signal<Vec<String>>, mut oai_models_loading: Signal<bool>, mut oai_models_error: Signal<Option<String>>, mut oai_models_fetch_trigger: Signal<u32>, mut show_keychain_mode_confirm: Signal<bool>, mut pending_keychain_mode: Signal<Option<crate::settings::KeychainStorageMode>>) -> Element {
+pub(in super::super) fn GeneralTab(
+    ctx: SettingsCtx,
+    mut available_models: Signal<Vec<crate::services::gemini_models::GeminiModel>>,
+    mut models_loading: Signal<bool>,
+    mut models_error: Signal<Option<String>>,
+    mut models_fetch_trigger: Signal<u32>,
+    mut picker_open_for_slot: Signal<Option<usize>>,
+    mut oai_available_models: Signal<Vec<String>>,
+    mut oai_models_loading: Signal<bool>,
+    mut oai_models_error: Signal<Option<String>>,
+    mut oai_models_fetch_trigger: Signal<u32>,
+    mut show_keychain_mode_confirm: Signal<bool>,
+    mut pending_keychain_mode: Signal<Option<crate::settings::KeychainStorageMode>>,
+) -> Element {
     let mut ui_state = ctx.ui_state;
     let ui_state_manager = ctx.ui_state_manager;
     let mut selected_connector_id = ctx.selected_connector_id;

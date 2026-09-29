@@ -1,14 +1,19 @@
 use super::super::SettingsCtx;
 use super::super::shared::load_instance_into_draft;
-use crate::settings::Settings;
 use crate::SecretManagerTrait;
 use crate::session::SessionState;
+use crate::settings::Settings;
 use dioxus::prelude::*;
 use std::io::Write;
 use zip::write::{FileOptions, ZipWriter};
 
 #[component]
-pub(in super::super) fn DataTab(ctx: SettingsCtx, mut data_management_collapsed: Signal<bool>, mut show_conflict_modal: Signal<bool>, mut conflicting_sessions: Signal<Vec<(String, crate::session::Session)>>) -> Element {
+pub(in super::super) fn DataTab(
+    ctx: SettingsCtx,
+    mut data_management_collapsed: Signal<bool>,
+    mut show_conflict_modal: Signal<bool>,
+    mut conflicting_sessions: Signal<Vec<(String, crate::session::Session)>>,
+) -> Element {
     let settings = ctx.settings;
     let session_state = ctx.session_state;
     let mut secret_manager = ctx.secret_manager;

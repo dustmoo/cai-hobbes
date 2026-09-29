@@ -1,9 +1,13 @@
 use super::super::SettingsCtx;
 use dioxus::prelude::*;
-use dioxus_free_icons::{icons::fi_icons, Icon};
+use dioxus_free_icons::{Icon, icons::fi_icons};
 
 #[component]
-pub(in super::super) fn McpTab(ctx: SettingsCtx, mut composio_url_warning: Signal<Option<String>>, mut show_composio_advanced: Signal<bool>) -> Element {
+pub(in super::super) fn McpTab(
+    ctx: SettingsCtx,
+    mut composio_url_warning: Signal<Option<String>>,
+    mut show_composio_advanced: Signal<bool>,
+) -> Element {
     let settings = ctx.settings;
     let mut ui_state = ctx.ui_state;
     let ui_state_manager = ctx.ui_state_manager;

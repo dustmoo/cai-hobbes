@@ -3,7 +3,12 @@ use crate::components::confirm_delete_modal::ConfirmDeleteModal;
 use dioxus::prelude::*;
 
 #[component]
-pub(in super::super) fn SkillsTab(ctx: SettingsCtx, mut editing_skill: Signal<Option<Option<crate::skills::Skill>>>, mut deleting_skill: Signal<Option<String>>, mut skill_delete_visible: Signal<bool>) -> Element {
+pub(in super::super) fn SkillsTab(
+    ctx: SettingsCtx,
+    mut editing_skill: Signal<Option<Option<crate::skills::Skill>>>,
+    mut deleting_skill: Signal<Option<String>>,
+    mut skill_delete_visible: Signal<bool>,
+) -> Element {
     let mut settings = ctx.settings;
     let settings_manager = ctx.settings_manager;
     let session_state = ctx.session_state;
