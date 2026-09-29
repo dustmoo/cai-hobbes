@@ -1,19 +1,23 @@
-use chrono::{NaiveDate, Utc};
-use dioxus_free_icons::{icons::fi_icons, Icon};
-use crate::todo::model::{self, BlockSource, TimeBlock, TimeOfDay, Todo, TodoBucket, TodoStatus};
-use crate::todo::project_match::{self, MatchTier, ProjectIndex, ProjectResolution, Ranked, PENDING_PROJECT_ID};
-use crate::todo::quick_add::{active_project_query, parse_quick_add_with, set_project_token, QuickAddParse};
-use crate::todo::views::{self, TodoView};
 use super::super::planner_timeline::{fmt_hhmm, local_minutes_to_utc};
 use super::super::planner_view::{persist_block, today, PlannerSelection};
-use std::collections::HashMap;
-use crate::settings::Settings;
-use crate::todo::store;
-use crate::todo::PlannerState;
-use dioxus::prelude::*;
-use super::{PILL, META, POPOVER, MENU_ITEM, MENU_LABEL, MENU_RULE};
 use super::helpers::{priority_tone_class, todos_for_selection};
-use super::list::{ProjectPicker};
+use super::list::ProjectPicker;
+use super::{MENU_ITEM, MENU_LABEL, MENU_RULE, META, PILL, POPOVER};
+use crate::settings::Settings;
+use crate::todo::model::{self, BlockSource, TimeBlock, TimeOfDay, Todo, TodoBucket, TodoStatus};
+use crate::todo::project_match::{
+    self, MatchTier, ProjectIndex, ProjectResolution, Ranked, PENDING_PROJECT_ID,
+};
+use crate::todo::quick_add::{
+    active_project_query, parse_quick_add_with, set_project_token, QuickAddParse,
+};
+use crate::todo::store;
+use crate::todo::views::{self, TodoView};
+use crate::todo::PlannerState;
+use chrono::{NaiveDate, Utc};
+use dioxus::prelude::*;
+use dioxus_free_icons::{icons::fi_icons, Icon};
+use std::collections::HashMap;
 
 /// Where a quick-add surface's default project came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +51,10 @@ pub(crate) struct QuickAddDraft {
 
 impl QuickAddDraft {
     pub(crate) fn with_inherited(inherited: Option<Inherited>) -> Self {
-        Self { inherited, ..Default::default() }
+        Self {
+            inherited,
+            ..Default::default()
+        }
     }
 
     fn index(&self, state: &PlannerState) -> ProjectIndex {
@@ -126,9 +133,12 @@ pub(crate) fn resolve_birth(
     }
 
     let project = match &parsed.project {
-        Some(p) if p.id == PENDING_PROJECT_ID => {
-            BirthProject::Create(draft.create_project.clone().unwrap_or_else(|| p.title.clone()))
-        }
+        Some(p) if p.id == PENDING_PROJECT_ID => BirthProject::Create(
+            draft
+                .create_project
+                .clone()
+                .unwrap_or_else(|| p.title.clone()),
+        ),
         Some(p) => BirthProject::Existing(p.id.clone()),
         None => match (&draft.inherited, view_project) {
             (Some(i), _) => BirthProject::Existing(i.project_id.clone()),
@@ -140,7 +150,11 @@ pub(crate) fn resolve_birth(
     if project != BirthProject::None && bucket == TodoBucket::Inbox {
         bucket = TodoBucket::Anytime;
     }
-    Birth { project, bucket, scheduled_for }
+    Birth {
+        project,
+        bucket,
+        scheduled_for,
+    }
 }
 
 /// Where a todo ended up, in the words the Planner's sidebar uses, led by
@@ -178,7 +192,11 @@ pub(crate) fn birth_project_title(state: &PlannerState, project: &BirthProject) 
     match project {
         BirthProject::None => None,
         BirthProject::Create(t) => Some(t.clone()),
-        BirthProject::Existing(id) => state.projects.iter().find(|p| &p.id == id).map(|p| p.title.clone()),
+        BirthProject::Existing(id) => state
+            .projects
+            .iter()
+            .find(|p| &p.id == id)
+            .map(|p| p.title.clone()),
     }
 }
 
@@ -195,10 +213,16 @@ fn title_from_query(q: &str) -> String {
 /// Splits `title` into runs marked by whether they match `query`'s
 /// characters in order (the list's highlight).
 fn highlight_runs(title: &str, query: &str) -> Vec<(String, bool)> {
-    let mut want = query.chars().filter(|c| *c != '-').flat_map(char::to_lowercase).peekable();
+    let mut want = query
+        .chars()
+        .filter(|c| *c != '-')
+        .flat_map(char::to_lowercase)
+        .peekable();
     let mut runs: Vec<(String, bool)> = Vec::new();
     for c in title.chars() {
-        let hit = want.peek().is_some_and(|w| c.to_lowercase().any(|l| l == *w));
+        let hit = want
+            .peek()
+            .is_some_and(|w| c.to_lowercase().any(|l| l == *w));
         if hit {
             want.next();
         }
@@ -212,7 +236,11 @@ fn highlight_runs(title: &str, query: &str) -> Vec<(String, bool)> {
 
 /// Picking from a project picker is a text edit: it writes (or removes) the
 /// `+slug` token and pins it, so the pick survives colliding slugs.
-pub(crate) fn apply_project_pick(mut draft: Signal<QuickAddDraft>, state: &PlannerState, pick: Option<String>) {
+pub(crate) fn apply_project_pick(
+    mut draft: Signal<QuickAddDraft>,
+    state: &PlannerState,
+    pick: Option<String>,
+) {
     let mut d = draft.write();
     d.create_project = None;
     match pick.and_then(|id| state.projects.iter().find(|p| p.id == id)) {
@@ -281,7 +309,9 @@ pub(super) fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
         draft.set(QuickAddDraft::default());
         let (visible, landing) = {
             let state = planner.peek();
-            let visible = todos_for_selection(&state, &sel, day).iter().any(|t| t.id == todo.id);
+            let visible = todos_for_selection(&state, &sel, day)
+                .iter()
+                .any(|t| t.id == todo.id);
             let project = todo
                 .project_id
                 .as_ref()
@@ -289,7 +319,13 @@ pub(super) fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
                 .map(|p| p.title.clone());
             (
                 visible,
-                landing_label(project.as_deref(), todo.scheduled_for, todo.bucket, block_start, day),
+                landing_label(
+                    project.as_deref(),
+                    todo.scheduled_for,
+                    todo.bucket,
+                    block_start,
+                    day,
+                ),
             )
         };
         if visible {
@@ -299,7 +335,11 @@ pub(super) fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
         confirmation.set(Some((generation, todo.title, landing)));
         spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-            if confirmation.peek().as_ref().is_some_and(|c| c.0 == generation) {
+            if confirmation
+                .peek()
+                .as_ref()
+                .is_some_and(|c| c.0 == generation)
+            {
                 confirmation.set(None);
             }
         });
@@ -456,13 +496,20 @@ pub(crate) fn QuickAddField(
             // An exact token needs no list: "… +hobbes-rc⏎" submits at once.
             let exact = matches!(
                 ix.resolve(q),
-                ProjectResolution::Resolved { tier: MatchTier::Exact, .. }
+                ProjectResolution::Resolved {
+                    tier: MatchTier::Exact,
+                    ..
+                }
             );
             if exact {
                 Vec::new()
             } else {
-                let mut rows: Vec<ProjectRow> =
-                    ix.rank(q).into_iter().take(8).map(ProjectRow::Project).collect();
+                let mut rows: Vec<ProjectRow> = ix
+                    .rank(q)
+                    .into_iter()
+                    .take(8)
+                    .map(ProjectRow::Project)
+                    .collect();
                 let title = title_from_query(q);
                 if !title.is_empty() {
                     rows.push(ProjectRow::Create(title));
@@ -647,9 +694,17 @@ pub(crate) fn QuickAddField(
 #[derive(Clone, Debug, PartialEq)]
 enum ProjectPill {
     /// A resolved `+token`. `not_view` names the view's project it overrides.
-    Token { title: String, not_view: Option<String> },
-    Creating { title: String },
-    Inherited { title: String, why: InheritedFrom },
+    Token {
+        title: String,
+        not_view: Option<String>,
+    },
+    Creating {
+        title: String,
+    },
+    Inherited {
+        title: String,
+        why: InheritedFrom,
+    },
 }
 
 /// The token chips under a quick-add input: what Enter will actually do.
@@ -671,9 +726,17 @@ fn QuickAddPreview(
         let d = draft.read();
         let preview = d.parse(&state, day);
         let birth = resolve_birth(&preview, &d, &selection, day);
-        let title_of = |id: &str| state.projects.iter().find(|p| p.id == id).map(|p| p.title.clone());
+        let title_of = |id: &str| {
+            state
+                .projects
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.title.clone())
+        };
         let pill = match &birth.project {
-            BirthProject::Create(title) => Some(ProjectPill::Creating { title: title.clone() }),
+            BirthProject::Create(title) => Some(ProjectPill::Creating {
+                title: title.clone(),
+            }),
             BirthProject::Existing(id) if preview.project.is_some() => {
                 let not_view = match &selection {
                     PlannerSelection::Project(v) if v != id => title_of(v),
@@ -698,9 +761,9 @@ fn QuickAddPreview(
         Some(ProjectResolution::NoMatch { query }) => {
             Some(format!("+{query} · no such project, stays in title"))
         }
-        Some(ProjectResolution::Ambiguous { query, candidates }) => {
-            Some(format!("+{query} · {candidates} projects match, stays in title"))
-        }
+        Some(ProjectResolution::Ambiguous { query, candidates }) => Some(format!(
+            "+{query} · {candidates} projects match, stays in title"
+        )),
         _ => None,
     };
     let timeline_hint = preview
@@ -883,13 +946,13 @@ fn QuickAddPreview(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::planner_view::PlannerSelection;
+    use super::super::test_support::d;
     use super::*;
-    use chrono::Utc;
-    use crate::todo::PlannerState;
     use crate::todo::model::{self, TodoBucket, TodoStatus};
     use crate::todo::views::TodoView;
-    use super::super::super::planner_view::{PlannerSelection};
-    use super::super::test_support::d;
+    use crate::todo::PlannerState;
+    use chrono::Utc;
 
     // ── Quick-add birth ─────────────────────────────────────────────────────
 
@@ -918,16 +981,25 @@ mod tests {
     }
 
     fn text(t: &str) -> QuickAddDraft {
-        QuickAddDraft { text: t.into(), ..Default::default() }
+        QuickAddDraft {
+            text: t.into(),
+            ..Default::default()
+        }
     }
 
     fn inherited(id: &str) -> Option<Inherited> {
-        Some(Inherited { project_id: id.into(), why: InheritedFrom::View })
+        Some(Inherited {
+            project_id: id.into(),
+            why: InheritedFrom::View,
+        })
     }
 
     #[test]
     fn token_overrides_view_project() {
-        let b = birth(&text("tiles +reno"), &PlannerSelection::Project("rc".into()));
+        let b = birth(
+            &text("tiles +reno"),
+            &PlannerSelection::Project("rc".into()),
+        );
         assert_eq!(b.project, BirthProject::Existing("reno".into()));
         assert_eq!(b.bucket, TodoBucket::Anytime);
 
@@ -943,12 +1015,19 @@ mod tests {
         draft.inherited = inherited("rc");
         let b = birth(&draft, &PlannerSelection::View(TodoView::Inbox));
         assert_eq!(b.project, BirthProject::Existing("rc".into()));
-        assert_eq!(b.bucket, TodoBucket::Anytime, "filed into a project = triaged");
+        assert_eq!(
+            b.bucket,
+            TodoBucket::Anytime,
+            "filed into a project = triaged"
+        );
     }
 
     #[test]
     fn cleared_inherited_means_no_project() {
-        let b = birth(&text("ship notes"), &PlannerSelection::View(TodoView::Inbox));
+        let b = birth(
+            &text("ship notes"),
+            &PlannerSelection::View(TodoView::Inbox),
+        );
         assert_eq!(b.project, BirthProject::None);
         assert_eq!(b.bucket, TodoBucket::Inbox);
     }
@@ -969,7 +1048,10 @@ mod tests {
 
     #[test]
     fn project_with_someday_view_stays_someday() {
-        let b = birth(&text("ship +rc"), &PlannerSelection::View(TodoView::Someday));
+        let b = birth(
+            &text("ship +rc"),
+            &PlannerSelection::View(TodoView::Someday),
+        );
         assert_eq!(b.bucket, TodoBucket::Someday);
         let today = birth(&text("ship +rc"), &PlannerSelection::View(TodoView::Today));
         assert_eq!(today.scheduled_for, Some(d("2026-09-24")));

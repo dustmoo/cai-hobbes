@@ -11,7 +11,6 @@
 //! the list answers the three questions in fixed places instead of reading a
 //! ragged chip stream.
 
-
 mod centre;
 mod helpers;
 mod list;
@@ -22,10 +21,13 @@ mod schedule;
 #[cfg(test)]
 mod test_support;
 
-pub(crate) use schedule::{ScheduleChoice, set_schedule};
-pub(crate) use centre::{CentreColumn};
-pub(crate) use quick_add::{BirthProject, Inherited, InheritedFrom, QuickAddDraft, QuickAddField, apply_project_pick, birth_project_title, commit_quick_add, landing_label, resolve_birth};
-pub(crate) use list::{ProjectPicker};
+pub(crate) use centre::CentreColumn;
+pub(crate) use list::ProjectPicker;
+pub(crate) use quick_add::{
+    apply_project_pick, birth_project_title, commit_quick_add, landing_label, resolve_birth,
+    BirthProject, Inherited, InheritedFrom, QuickAddDraft, QuickAddField,
+};
+pub(crate) use schedule::{set_schedule, ScheduleChoice};
 
 // ── Shared class vocabulary ────────────────────────────────────────────────
 
@@ -44,8 +46,7 @@ const MENU_ITEM: &str =
 const SECTION_HEADER: &str =
     "text-[11px] uppercase tracking-[0.08em] text-fg-muted px-2.5 pt-3.5 pb-1";
 
-const MENU_LABEL: &str =
-    "px-2.5 pt-1.5 pb-1 text-[11px] uppercase tracking-[0.08em] text-fg-muted";
+const MENU_LABEL: &str = "px-2.5 pt-1.5 pb-1 text-[11px] uppercase tracking-[0.08em] text-fg-muted";
 const MENU_RULE: &str = "h-px bg-[var(--color-border-muted)] my-1";
 /// The faint "this is what the list is sorted by" ring on a row's chip.
 const KEY_RING: &str = " ring-1 ring-primary-300/50";

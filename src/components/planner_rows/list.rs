@@ -1,17 +1,20 @@
+use super::super::planner_view::{today, PlannerSelection};
+use super::centre::GroupHeader;
+use super::helpers::{block_slots, empty_state_line, todos_for_selection};
+use super::reorder::{
+    apply_move, bump_flip, drag_over_index, flip_snap, reorder_target, AdoptUndo, ListDrag,
+    ListDragContext, Reorder,
+};
+use super::row::TodoRow;
+use super::{MENU_ITEM, MENU_LABEL};
 use crate::fleet::FleetSession;
+use crate::settings::Settings;
 use crate::todo::model::{Priority, Todo};
 use crate::todo::project_match::ProjectIndex;
 use crate::todo::views::{self, ArrangeInputs, GroupBy, ListOrder, RowGroup, SortKey, TodoView};
-use super::super::planner_view::{today, PlannerSelection};
-use std::collections::HashMap;
-use crate::settings::Settings;
 use crate::todo::PlannerState;
 use dioxus::prelude::*;
-use super::{MENU_ITEM, MENU_LABEL};
-use super::centre::{GroupHeader};
-use super::helpers::{block_slots, empty_state_line, todos_for_selection};
-use super::reorder::{AdoptUndo, ListDrag, ListDragContext, Reorder, apply_move, bump_flip, drag_over_index, flip_snap, reorder_target};
-use super::row::{TodoRow};
+use std::collections::HashMap;
 
 /// One rendered section of the list: a header (or none, for the lead
 /// section) and its rows, owned so the render doesn't borrow planner state.
@@ -97,7 +100,10 @@ pub(super) fn TodoList(
             // Day headers are Upcoming's grouping; the sort applies within
             // each day, with no bands (headers never nest).
             PlannerSelection::View(TodoView::Upcoming) => {
-                let within = ListOrder { group: GroupBy::None, ..current };
+                let within = ListOrder {
+                    group: GroupBy::None,
+                    ..current
+                };
                 let inputs = inputs(false, false);
                 views::upcoming_grouped(&state.todos, day)
                     .into_iter()
@@ -132,10 +138,15 @@ pub(super) fn TodoList(
             .collect(),
             _ => {
                 let open = todos_for_selection(&state, &sel, day);
-                views::arrange(open.iter().collect(), Vec::new(), current, &inputs(false, true))
-                    .into_iter()
-                    .map(|g| Section::from_group(g, grouped))
-                    .collect()
+                views::arrange(
+                    open.iter().collect(),
+                    Vec::new(),
+                    current,
+                    &inputs(false, true),
+                )
+                .into_iter()
+                .map(|g| Section::from_group(g, grouped))
+                .collect()
             }
         }
     };
@@ -216,7 +227,16 @@ pub(super) fn TodoList(
             // FLIP play settles it from there into its slot.
             flip_snap();
             if d.over_index != d.from_index {
-                apply_move(planner, order, undo, set_order, &groups, &d.todo_id, &d.group_id, d.over_index);
+                apply_move(
+                    planner,
+                    order,
+                    undo,
+                    set_order,
+                    &groups,
+                    &d.todo_id,
+                    &d.group_id,
+                    d.over_index,
+                );
             }
             bump_flip(flip, 180);
         }

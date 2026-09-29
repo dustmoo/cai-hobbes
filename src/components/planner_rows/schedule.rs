@@ -1,8 +1,8 @@
-use chrono::NaiveDate;
+use super::super::planner_view::mutate_todo;
 use crate::todo::model::{TimeOfDay, Todo, TodoBucket};
-use super::super::planner_view::{mutate_todo};
 use crate::todo::store;
 use crate::todo::PlannerState;
+use chrono::NaiveDate;
 use dioxus::prelude::*;
 
 /// How loudly a deadline should read.
@@ -37,7 +37,11 @@ pub(super) fn due_tone_class(tone: DueTone) -> &'static str {
 ///
 /// "Evening" wins only on today: on any other day the day itself is the more
 /// useful word, and the evening grouping is visible from its section header.
-pub(super) fn date_pill_label(scheduled_for: Option<NaiveDate>, evening: bool, today: NaiveDate) -> Option<String> {
+pub(super) fn date_pill_label(
+    scheduled_for: Option<NaiveDate>,
+    evening: bool,
+    today: NaiveDate,
+) -> Option<String> {
     let d = scheduled_for?;
     if evening && d == today {
         return Some("Evening".to_string());
@@ -141,16 +145,20 @@ pub(crate) fn set_schedule(
     let pruned = planner.write().prune_blocks_for_todo(id, keep);
     for b in &pruned {
         if let Err(e) = store::delete_block(&b.id) {
-            tracing::error!("planner: failed to delete rescheduled block {}: {}", b.id, e);
+            tracing::error!(
+                "planner: failed to delete rescheduled block {}: {}",
+                b.id,
+                e
+            );
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::d;
     use super::*;
     use crate::todo::model::{TimeOfDay, Todo, TodoBucket};
-    use super::super::test_support::d;
 
     // ── due_tone ───────────────────────────────────────────────────────────
 

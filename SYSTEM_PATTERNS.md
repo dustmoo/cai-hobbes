@@ -216,6 +216,26 @@ For deeper documentation on specific subsystems:
 
 **Rule:** new `McpManager` methods go in the module for their concern as a separate `impl McpManager` block; `mod.rs` holds types only. A private method called from a sibling module is `pub(super)` — no wider.
 
+### Module map: components/planner_rows/
+
+The Things-style planner list surfaces (centre column, quick-add, list, row). Public paths are unchanged: everything is still `crate::components::planner_rows::X`; `mod.rs` re-exports (with the same `pub(crate)` visibility) only what other components import.
+
+| File | Owns |
+|------|------|
+| `mod.rs` | Module docs, `mod` declarations, the `pub(crate)` re-exports, and the shared style consts (`DEFAULT_PROFILE_COLOR`, `PILL`, `META`, `BTN_*`, `POPOVER`, `MENU_*`, `SECTION_HEADER`, `KEY_RING`). Child modules read the consts via `use super::{…}`; they stay private. |
+| `centre.rs` | `CentreColumn` (entry point, used by `planner_view.rs`), `ListOrderControl`, `GroupHeader`. |
+| `quick_add.rs` | The quick-add flow: `QuickAdd`, `QuickAddField`, `QuickAddPreview`, `QuickAddDraft`, `Inherited`/`InheritedFrom`, `BirthProject`/`Birth`, `resolve_birth`, `commit_quick_add`, `apply_project_pick`, `create_project`, title/highlight helpers (+ birth tests). Also consumed by `quick_capture.rs`. |
+| `list.rs` | `Section`, `TodoList` (grouping, drag wiring, adopt-undo), `ProjectPicker`. |
+| `row.rs` | `TodoRow` (the WHO / WHAT / WHEN grid and its popovers) and the `RowMenu` state enum. |
+| `reorder.rs` | Manual-order math (`Reorder`, `reorder_target`, `moved`, `drag_over_index`, `flatten_with`), drag/undo plumbing (`ListDrag`, `ListDragContext`, `AdoptUndo`, `UNDO_GENERATION`), FLIP helpers (`bump_flip`, `flip_snap`), `apply_move`. |
+| `schedule.rs` | `ScheduleChoice`, `apply_schedule_choice`, `current_schedule_choice`, `set_schedule` (also used by `todo_detail.rs`), `DueTone`/`due_tone`/`due_tone_class`, `date_pill_label`. |
+| `helpers.rs` | Pure display and selection helpers: `WhoState`/`who_state`, `cycle_estimate`, `activation_seed`, profile swatch classes, `working_minutes`, `view_title`, `empty_state_line`, `todos_for_selection`, `first_block_on_day`, `block_slots`, `priority_tone_class`, `order_hint`. |
+| `test_support.rs` | `#[cfg(test)]` helper shared by more than one file's tests (`d`, a date parser). Other test helpers live beside their tests. |
+
+Tests sit in a `#[cfg(test)] mod tests` at the bottom of the file that owns the code under test.
+
+**Rule:** new planner row/list UI goes in the file for its concern; shared style consts live in `mod.rs`. A private item used from a sibling module is `pub(super)` — no wider. `TodoRow` is deliberately one ~1,000-line component: splitting it means moving hooks, so don't do it as a drive-by.
+
 ---
 
 *This document supersedes `memory-bank/systemPatterns.md` as of Beta release.*

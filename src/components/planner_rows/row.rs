@@ -1,19 +1,30 @@
-use chrono::{Local, NaiveDate, Utc};
-use dioxus_free_icons::{icons::fi_icons, Icon};
-use crate::fleet::FleetSession;
-use crate::todo::model::{self, FocusActor, Priority, TimeOfDay, Todo, TodoStatus};
-use crate::todo::views::{self, SortKey, TodoView};
-use super::super::planner_view::{mutate_todo, persist_block, persist_focus_sessions, persist_todo, today, PlannerSelection, SelectedBlockContext};
-use dioxus::html::input_data::MouseButton;
-use crate::settings::Settings;
-use crate::todo::store;
-use crate::todo::PlannerState;
-use dioxus::prelude::*;
-use super::{PILL, META, BTN_PRIMARY, BTN_SECONDARY, POPOVER, MENU_ITEM, MENU_LABEL, MENU_RULE, KEY_RING};
-use super::helpers::{WhoState, activation_seed, cycle_estimate, first_block_on_day, priority_tone_class, profile_pill_border_class, profile_stripe_class, who_state, working_minutes};
-use super::list::{ProjectPicker};
+use super::super::planner_view::{
+    mutate_todo, persist_block, persist_focus_sessions, persist_todo, today, PlannerSelection,
+    SelectedBlockContext,
+};
+use super::helpers::{
+    activation_seed, cycle_estimate, first_block_on_day, priority_tone_class,
+    profile_pill_border_class, profile_stripe_class, who_state, working_minutes, WhoState,
+};
+use super::list::ProjectPicker;
 use super::reorder::{ListDrag, ListDragContext, Reorder};
-use super::schedule::{ScheduleChoice, current_schedule_choice, date_pill_label, due_tone, due_tone_class, set_schedule};
+use super::schedule::{
+    current_schedule_choice, date_pill_label, due_tone, due_tone_class, set_schedule,
+    ScheduleChoice,
+};
+use super::{
+    BTN_PRIMARY, BTN_SECONDARY, KEY_RING, MENU_ITEM, MENU_LABEL, MENU_RULE, META, PILL, POPOVER,
+};
+use crate::fleet::FleetSession;
+use crate::settings::Settings;
+use crate::todo::model::{self, FocusActor, Priority, TimeOfDay, Todo, TodoStatus};
+use crate::todo::store;
+use crate::todo::views::{self, SortKey, TodoView};
+use crate::todo::PlannerState;
+use chrono::{Local, NaiveDate, Utc};
+use dioxus::html::input_data::MouseButton;
+use dioxus::prelude::*;
+use dioxus_free_icons::{icons::fi_icons, Icon};
 
 /// Which of a row's popovers is open. Exactly one at a time, so a menu never
 /// stacks on top of another.
@@ -80,7 +91,12 @@ pub(super) fn TodoRow(
         let profile = session
             .composio_profile
             .as_ref()
-            .and_then(|pid| settings_read.composio_profiles.iter().find(|p| &p.id == pid))
+            .and_then(|pid| {
+                settings_read
+                    .composio_profiles
+                    .iter()
+                    .find(|p| &p.id == pid)
+            })
             .or_else(|| settings_read.get_active_profile())?;
         Some((
             profile
@@ -160,11 +176,11 @@ pub(super) fn TodoRow(
     let block_info: Option<(String, String)> = todo.scheduled_for.and_then(|d| {
         let state = planner.read();
         first_block_on_day(&state.blocks, &todo.id, d).map(|b| {
-                (
-                    b.start.with_timezone(&Local).format("%H:%M").to_string(),
-                    b.id.clone(),
-                )
-            })
+            (
+                b.start.with_timezone(&Local).format("%H:%M").to_string(),
+                b.id.clone(),
+            )
+        })
     });
     let date_label = date_pill_label(
         todo.scheduled_for,
@@ -265,9 +281,10 @@ pub(super) fn TodoRow(
         move || {
             // Focus implies today: start_focus may reschedule the todo and
             // prune off-day blocks, whose rows we must delete.
-            let (changed, pruned) = planner
-                .write()
-                .start_focus(&id, Utc::now(), FocusActor::Person);
+            let (changed, pruned) =
+                planner
+                    .write()
+                    .start_focus(&id, Utc::now(), FocusActor::Person);
             for cid in &changed {
                 persist_todo(&planner, cid);
             }

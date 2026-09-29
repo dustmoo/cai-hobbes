@@ -1,7 +1,7 @@
-use chrono::Utc;
+use super::super::planner_view::persist_todo;
 use crate::todo::views::{ListOrder, SortDir, SortKey};
-use super::super::planner_view::{persist_todo};
 use crate::todo::PlannerState;
+use chrono::Utc;
 use dioxus::prelude::*;
 
 /// Where a menu or keyboard move sends a row within its group.
@@ -48,10 +48,20 @@ pub(super) fn drag_over_index(from: usize, len: usize, dy: f64) -> usize {
 
 /// The on-screen open order across every group, with one group's segment
 /// replaced by its post-move order — what an adopt makes the manual order.
-fn flatten_with(groups: &[(String, Vec<String>)], group_id: &str, replacement: &[String]) -> Vec<String> {
+fn flatten_with(
+    groups: &[(String, Vec<String>)],
+    group_id: &str,
+    replacement: &[String],
+) -> Vec<String> {
     groups
         .iter()
-        .flat_map(|(id, ids)| if id == group_id { replacement.to_vec() } else { ids.clone() })
+        .flat_map(|(id, ids)| {
+            if id == group_id {
+                replacement.to_vec()
+            } else {
+                ids.clone()
+            }
+        })
         .collect()
 }
 
@@ -140,7 +150,11 @@ pub(super) fn apply_move(
     if current.key == SortKey::Manual {
         let before = to.checked_sub(1).map(|i| new_ids[i].as_str());
         let after = new_ids.get(to + 1).map(String::as_str);
-        let changed = { planner.write().move_between(todo_id, before, after, &new_ids, now) };
+        let changed = {
+            planner
+                .write()
+                .move_between(todo_id, before, after, &new_ids, now)
+        };
         for id in &changed {
             persist_todo(&planner, id);
         }
@@ -165,7 +179,11 @@ pub(super) fn apply_move(
     }));
     spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-        if undo.peek().as_ref().is_some_and(|u| u.generation == generation) {
+        if undo
+            .peek()
+            .as_ref()
+            .is_some_and(|u| u.generation == generation)
+        {
             undo.set(None);
         }
     });

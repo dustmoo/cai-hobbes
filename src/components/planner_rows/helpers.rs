@@ -1,11 +1,11 @@
-use chrono::{DateTime, Local, NaiveDate, Utc};
+use super::super::planner_view::PlannerSelection;
+use super::DEFAULT_PROFILE_COLOR;
 use crate::fleet::{FleetOrigin, FleetSession, FleetStatus};
 use crate::todo::model::{self, FocusActor, FocusSession, Priority, TimeBlock, Todo, TodoStatus};
 use crate::todo::views::{self, ListOrder, TodoView};
-use super::super::planner_view::{PlannerSelection};
-use std::collections::HashMap;
 use crate::todo::PlannerState;
-use super::{DEFAULT_PROFILE_COLOR};
+use chrono::{DateTime, Local, NaiveDate, Utc};
+use std::collections::HashMap;
 
 pub(super) fn cycle_estimate(current: Option<u32>) -> Option<u32> {
     const LADDER: [u32; 4] = [15, 30, 60, 120];
@@ -104,8 +104,8 @@ pub(super) fn who_state(
     let hobbes_carrier = fleet.is_some_and(|f| f.origin == FleetOrigin::Hobbes);
 
     if agent_focus || (fleet_working && hobbes_carrier) {
-        let (initial, color) = profile
-            .unwrap_or_else(|| ("H".to_string(), DEFAULT_PROFILE_COLOR.to_string()));
+        let (initial, color) =
+            profile.unwrap_or_else(|| ("H".to_string(), DEFAULT_PROFILE_COLOR.to_string()));
         return WhoState::Hobbes { initial, color };
     }
     if fleet_working {
@@ -176,7 +176,11 @@ pub(super) fn empty_state_line(selection: &PlannerSelection) -> &'static str {
 }
 
 /// Todos for the current selection, ordered for display.
-pub(super) fn todos_for_selection(state: &PlannerState, selection: &PlannerSelection, day: NaiveDate) -> Vec<Todo> {
+pub(super) fn todos_for_selection(
+    state: &PlannerState,
+    selection: &PlannerSelection,
+    day: NaiveDate,
+) -> Vec<Todo> {
     match selection {
         PlannerSelection::View(view) => views::in_view(&state.todos, *view, day)
             .into_iter()
@@ -203,11 +207,16 @@ pub(super) fn todos_for_selection(state: &PlannerState, selection: &PlannerSelec
 /// A todo's earliest timeline block on its scheduled day. The one query
 /// behind both the row's "@ 10:15" chip and the Time sort, so the chip and
 /// the sort can't disagree.
-pub(super) fn first_block_on_day<'a>(blocks: &'a [TimeBlock], todo_id: &str, day: NaiveDate) -> Option<&'a TimeBlock> {
+pub(super) fn first_block_on_day<'a>(
+    blocks: &'a [TimeBlock],
+    todo_id: &str,
+    day: NaiveDate,
+) -> Option<&'a TimeBlock> {
     blocks
         .iter()
         .filter(|b| {
-            b.todo_id.as_deref() == Some(todo_id) && b.start.with_timezone(&Local).date_naive() == day
+            b.todo_id.as_deref() == Some(todo_id)
+                && b.start.with_timezone(&Local).date_naive() == day
         })
         .min_by_key(|b| b.start)
 }
@@ -221,7 +230,9 @@ pub(super) fn block_slots(todos: &[Todo], blocks: &[TimeBlock]) -> HashMap<Strin
         .filter(|t| !t.status.is_closed())
         .filter_map(|t| {
             let day = t.scheduled_for?;
-            let start = first_block_on_day(blocks, &t.id, day)?.start.with_timezone(&Local);
+            let start = first_block_on_day(blocks, &t.id, day)?
+                .start
+                .with_timezone(&Local);
             Some((t.id.clone(), start.hour() * 60 + start.minute()))
         })
         .collect()
@@ -260,14 +271,14 @@ pub(super) fn order_hint(order: ListOrder) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::schedule::{due_tone_class, DueTone};
+    use super::super::DEFAULT_PROFILE_COLOR;
     use super::*;
-    use chrono::Utc;
     use crate::fleet::AttentionKind;
     use crate::fleet::{FleetOrigin, FleetSession, FleetStatus};
     use crate::todo::model::{FocusActor, FocusSession, Priority, Todo, TodoStatus};
     use crate::todo::views::{GroupBy, ListOrder, SortDir, SortKey};
-    use super::super::schedule::{DueTone, due_tone_class};
-    use super::super::{DEFAULT_PROFILE_COLOR};
+    use chrono::Utc;
 
     fn fleet_session(origin: FleetOrigin, status: FleetStatus) -> FleetSession {
         let mut s = FleetSession {
@@ -445,12 +456,19 @@ mod tests {
     #[test]
     fn order_hint_is_silent_in_the_default_state() {
         assert_eq!(order_hint(ListOrder::default()), None);
-        let sorted = ListOrder { key: SortKey::Deadline, dir: SortDir::Asc, group: GroupBy::None };
+        let sorted = ListOrder {
+            key: SortKey::Deadline,
+            dir: SortDir::Asc,
+            group: GroupBy::None,
+        };
         assert_eq!(
             order_hint(sorted).as_deref(),
             Some("Due date · Soonest first — drag a row to make this your order")
         );
-        let grouped = ListOrder { group: GroupBy::Project, ..ListOrder::default() };
+        let grouped = ListOrder {
+            group: GroupBy::Project,
+            ..ListOrder::default()
+        };
         assert_eq!(
             order_hint(grouped).as_deref(),
             Some("Grouped by project — drag within a group to reorder")
@@ -459,9 +477,18 @@ mod tests {
 
     #[test]
     fn priority_tones_reuse_existing_row_colours() {
-        assert_eq!(priority_tone_class(Priority::UrgentImportant), due_tone_class(DueTone::Overdue));
-        assert_eq!(priority_tone_class(Priority::Urgent), due_tone_class(DueTone::Soon));
-        assert_eq!(priority_tone_class(Priority::Neither), due_tone_class(DueTone::Neutral));
+        assert_eq!(
+            priority_tone_class(Priority::UrgentImportant),
+            due_tone_class(DueTone::Overdue)
+        );
+        assert_eq!(
+            priority_tone_class(Priority::Urgent),
+            due_tone_class(DueTone::Soon)
+        );
+        assert_eq!(
+            priority_tone_class(Priority::Neither),
+            due_tone_class(DueTone::Neutral)
+        );
     }
 
     // ── pre-existing helpers ───────────────────────────────────────────────

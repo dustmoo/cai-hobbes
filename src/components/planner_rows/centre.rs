@@ -1,15 +1,15 @@
-use chrono::{Local, Utc};
+use super::super::planner_view::{persist_todo, today, PlannerSelection};
+use super::helpers::{order_hint, view_title};
+use super::list::TodoList;
+use super::quick_add::QuickAdd;
+use super::reorder::{bump_flip, flip_snap, AdoptUndo};
+use super::{MENU_ITEM, MENU_LABEL, MENU_RULE, META, PILL, POPOVER, SECTION_HEADER};
+use crate::settings::Settings;
 use crate::todo::model::{self};
 use crate::todo::views::{self, GroupBy, ListOrder, SortDir, SortKey, TodoView};
-use super::super::planner_view::{persist_todo, today, PlannerSelection};
-use crate::settings::Settings;
 use crate::todo::PlannerState;
+use chrono::{Local, Utc};
 use dioxus::prelude::*;
-use super::{PILL, META, POPOVER, MENU_ITEM, SECTION_HEADER, MENU_LABEL, MENU_RULE};
-use super::helpers::{order_hint, view_title};
-use super::list::{TodoList};
-use super::quick_add::{QuickAdd};
-use super::reorder::{AdoptUndo, bump_flip, flip_snap};
 
 #[component]
 pub(crate) fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
@@ -98,7 +98,12 @@ pub(crate) fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
         order.set(next);
         undo.set(None);
         let key = selection.peek().list_key();
-        let live: Vec<String> = planner.peek().projects.iter().map(|p| p.id.clone()).collect();
+        let live: Vec<String> = planner
+            .peek()
+            .projects
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
         {
             let mut ui = ui_state.write();
             if next == ListOrder::default() {
@@ -211,7 +216,11 @@ fn ListOrderControl(
         (k, GroupBy::None) => k.label().to_string(),
         (k, g) => format!("{} · {}", k.label(), g.label().to_lowercase()),
     };
-    let arrow = if current.dir == SortDir::Asc { "↑" } else { "↓" };
+    let arrow = if current.dir == SortDir::Asc {
+        "↑"
+    } else {
+        "↓"
+    };
     let flip_title = current
         .key
         .dir_label(current.dir.flipped())
