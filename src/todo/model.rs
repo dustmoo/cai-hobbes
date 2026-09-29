@@ -74,6 +74,186 @@ pub enum TimeOfDay {
     Evening,
 }
 
+/// An Eisenhower-matrix quadrant. Optional on every todo: `None` means "not
+/// triaged for priority", which is the default for new and pre-existing
+/// todos alike — `Neither` is a deliberate call ("not urgent, not
+/// important"), not the absence of one.
+///
+/// Manual order stays the user's canonical "what first"; priority is a
+/// label the planner can sort and band by, never a rewrite of that order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    /// Q1 — urgent and important: do it first.
+    UrgentImportant,
+    /// Q2 — important, not urgent: schedule it.
+    Important,
+    /// Q3 — urgent, not important: delegate it.
+    Urgent,
+    /// Q4 — neither: drop or defer it.
+    Neither,
+}
+
+impl Priority {
+    /// Quadrant order, Q1 first — also the ascending sort order.
+    pub const ALL: [Priority; 4] = [
+        Priority::UrgentImportant,
+        Priority::Important,
+        Priority::Urgent,
+        Priority::Neither,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Priority::UrgentImportant => "urgent_important",
+            Priority::Important => "important",
+            Priority::Urgent => "urgent",
+            Priority::Neither => "neither",
+        }
+    }
+
+    /// 1–4, the conventional quadrant number.
+    pub fn quadrant(self) -> u8 {
+        match self {
+            Priority::UrgentImportant => 1,
+            Priority::Important => 2,
+            Priority::Urgent => 3,
+            Priority::Neither => 4,
+        }
+    }
+
+    /// The compact badge text: `"Q1"`…`"Q4"`.
+    pub fn short_label(self) -> String {
+        format!("Q{}", self.quadrant())
+    }
+
+    /// Plain-language name, for menus, band headers and the AI's summary.
+    pub fn label(self) -> &'static str {
+        match self {
+            Priority::UrgentImportant => "Urgent & important",
+            Priority::Important => "Important, not urgent",
+            Priority::Urgent => "Urgent, not important",
+            Priority::Neither => "Neither",
+        }
+    }
+
+    /// The matrix's verb for the quadrant.
+    pub fn action(self) -> &'static str {
+        match self {
+            Priority::UrgentImportant => "Do first",
+            Priority::Important => "Schedule",
+            Priority::Urgent => "Delegate",
+            Priority::Neither => "Drop",
+        }
+    }
+
+    /// Accepts the stored names, `q1`–`q4` / `1`–`4`, and the matrix verbs
+    /// (`do`, `schedule`, `delegate`, `drop`/`eliminate`). Shared by the
+    /// quick-add `!!` token and the AI tools.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw.trim().to_ascii_lowercase().as_str() {
+            "urgent_important" | "urgent-important" | "q1" | "1" | "do" | "do_first" => {
+                Priority::UrgentImportant
+            }
+            "important" | "q2" | "2" | "schedule" | "plan" => Priority::Important,
+            "urgent" | "q3" | "3" | "delegate" => Priority::Urgent,
+            "neither" | "q4" | "4" | "drop" | "eliminate" => Priority::Neither,
+            // The linear scheme's names for the same four levels.
+            "p1" => Priority::UrgentImportant,
+            "p2" => Priority::Important,
+            "p3" => Priority::Urgent,
+            "p4" => Priority::Neither,
+            _ => return None,
+        })
+    }
+
+    /// One click / `p` press on a row: Q1 → Q2 → Q3 → Q4 → none → Q1.
+    pub fn cycle(current: Option<Priority>) -> Option<Priority> {
+        match current {
+            None => Some(Priority::UrgentImportant),
+            Some(Priority::UrgentImportant) => Some(Priority::Important),
+            Some(Priority::Important) => Some(Priority::Urgent),
+            Some(Priority::Urgent) => Some(Priority::Neither),
+            Some(Priority::Neither) => None,
+        }
+    }
+}
+
+/// How the four priority levels read in the UI. Display only: storage and
+/// the AI tools always speak quadrants, so switching scheme never rewrites a
+/// todo — P1 *is* Q1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorityScheme {
+    /// Q1–Q4, the Eisenhower matrix.
+    #[default]
+    Eisenhower,
+    /// P1–P4, a plain highest-to-lowest scale.
+    Linear,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PriorityDisplay {
+    #[serde(default)]
+    pub scheme: PriorityScheme,
+    /// Custom names, level 1 first. Missing or blank = the scheme's default.
+    #[serde(default)]
+    pub names: Vec<String>,
+}
+
+impl PriorityDisplay {
+    /// The compact badge: `"Q1"` or `"P1"`.
+    pub fn badge(&self, p: Priority) -> String {
+        match self.scheme {
+            PriorityScheme::Eisenhower => p.short_label(),
+            PriorityScheme::Linear => format!("P{}", p.quadrant()),
+        }
+    }
+
+    pub fn default_name(scheme: PriorityScheme, p: Priority) -> &'static str {
+        match scheme {
+            PriorityScheme::Eisenhower => p.label(),
+            PriorityScheme::Linear => match p {
+                Priority::UrgentImportant => "Highest",
+                Priority::Important => "High",
+                Priority::Urgent => "Medium",
+                Priority::Neither => "Low",
+            },
+        }
+    }
+
+    /// The level's name: the user's, else the scheme's.
+    pub fn name(&self, p: Priority) -> String {
+        self.names
+            .get(p.quadrant() as usize - 1)
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+            .unwrap_or(Self::default_name(self.scheme, p))
+            .to_string()
+    }
+
+    /// A compact caption for tight spots: the matrix verb for an unrenamed
+    /// Eisenhower level, else the name.
+    pub fn short_name(&self, p: Priority) -> String {
+        let custom = self
+            .names
+            .get(p.quadrant() as usize - 1)
+            .is_some_and(|n| !n.trim().is_empty());
+        match self.scheme {
+            PriorityScheme::Eisenhower if !custom => p.action().to_string(),
+            _ => self.name(p),
+        }
+    }
+
+    /// Tooltip line: the name, plus the matrix verb for Eisenhower.
+    pub fn describe(&self, p: Priority) -> String {
+        match self.scheme {
+            PriorityScheme::Eisenhower => format!("{} — {}", self.name(p), p.action()),
+            PriorityScheme::Linear => self.name(p),
+        }
+    }
+}
+
 /// Who created the todo. `Ai` records the originating session so provenance
 /// survives even though the list itself is global.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -379,6 +559,10 @@ pub struct Todo {
     pub estimate_minutes: Option<u32>,
     #[serde(default)]
     pub actual_minutes: u32,
+    /// Eisenhower quadrant; `None` = not triaged (the default, so rows
+    /// written before this field existed load unchanged).
+    #[serde(default)]
+    pub priority: Option<Priority>,
 
     #[serde(default)]
     pub tags: Vec<String>,
@@ -412,6 +596,16 @@ pub struct Todo {
 }
 
 impl Todo {
+    /// Assign (or clear) the project. Filing an Inbox todo into a project is
+    /// a triage decision (Things does the same), so it leaves Inbox for
+    /// Anytime. Clearing never moves it back.
+    pub fn set_project(&mut self, project_id: Option<String>) {
+        if project_id.is_some() && self.bucket == TodoBucket::Inbox {
+            self.bucket = TodoBucket::Anytime;
+        }
+        self.project_id = project_id;
+    }
+
     /// A new todo in the Inbox, sorted to the end.
     pub fn new(title: impl Into<String>, sort_order: f64) -> Self {
         let now = Utc::now();
@@ -428,6 +622,7 @@ impl Todo {
             deadline: None,
             estimate_minutes: None,
             actual_minutes: 0,
+            priority: None,
             tags: Vec::new(),
             checklist: Vec::new(),
             started_at: None,
@@ -506,6 +701,9 @@ impl Todo {
         }
         if let Some(d) = self.deadline {
             parts.push(format!("due {}", d));
+        }
+        if let Some(p) = self.priority {
+            parts.push(format!("{} {}", p.short_label(), p.label().to_lowercase()));
         }
         for tag in &self.tags {
             parts.push(format!("#{}", tag));
@@ -952,14 +1150,12 @@ pub const SORT_STEP: f64 = 1024.0;
 
 /// Below this gap, `sort_between` can no longer split cleanly and the list
 /// should be renormalised.
-#[allow(dead_code)] // consumer is drag-and-drop reordering, deferred from P2
 pub const SORT_MIN_GAP: f64 = 1e-6;
 
 /// A sort key placing an item between two neighbours.
 ///
 /// `None` means "no neighbour on that side". Writing one row instead of
 /// renumbering the whole list is what keeps drag-and-drop responsive.
-#[allow(dead_code)] // consumer is drag-and-drop reordering, deferred from P2
 pub fn sort_between(before: Option<f64>, after: Option<f64>) -> f64 {
     match (before, after) {
         (None, None) => 0.0,
@@ -971,7 +1167,6 @@ pub fn sort_between(before: Option<f64>, after: Option<f64>) -> f64 {
 
 /// Whether the neighbours have collapsed too close together to split again.
 /// The caller should renormalise the list and retry.
-#[allow(dead_code)] // consumer is drag-and-drop reordering, deferred from P2
 pub fn needs_renormalise(before: Option<f64>, after: Option<f64>) -> bool {
     match (before, after) {
         (Some(b), Some(a)) => (a - b).abs() < SORT_MIN_GAP,
@@ -979,10 +1174,10 @@ pub fn needs_renormalise(before: Option<f64>, after: Option<f64>) -> bool {
     }
 }
 
-/// Rewrite an ordered slice's sort keys onto a fresh evenly-spaced ladder.
-#[allow(dead_code)] // consumer is drag-and-drop reordering, deferred from P2
-pub fn renormalise(todos: &mut [Todo]) {
-    for (i, todo) in todos.iter_mut().enumerate() {
+/// Rewrite an ordered run of todos' sort keys onto a fresh evenly-spaced
+/// ladder from 0.
+pub fn renormalise<'a>(todos: impl IntoIterator<Item = &'a mut Todo>) {
+    for (i, todo) in todos.into_iter().enumerate() {
         todo.sort_order = i as f64 * SORT_STEP;
     }
 }
@@ -1002,6 +1197,62 @@ pub fn format_minutes(minutes: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filing_an_inbox_todo_into_a_project_triages_it() {
+        let mut t = Todo::new("x", 0.0);
+        t.set_project(Some("p".into()));
+        assert_eq!(t.bucket, TodoBucket::Anytime);
+        t.set_project(None);
+        assert_eq!(t.bucket, TodoBucket::Anytime, "clearing never un-triages");
+
+        let mut s = Todo::new("y", 0.0);
+        s.bucket = TodoBucket::Someday;
+        s.set_project(Some("p".into()));
+        assert_eq!(s.bucket, TodoBucket::Someday);
+    }
+
+    #[test]
+    fn priority_cycle_walks_the_quadrants_then_clears() {
+        let mut p = None;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            p = Priority::cycle(p);
+            seen.push(p);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Some(Priority::UrgentImportant),
+                Some(Priority::Important),
+                Some(Priority::Urgent),
+                Some(Priority::Neither),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn priority_display_schemes_and_custom_names() {
+        let q = PriorityDisplay::default();
+        assert_eq!(q.badge(Priority::Important), "Q2");
+        assert_eq!(q.name(Priority::Important), "Important, not urgent");
+        assert_eq!(q.describe(Priority::Important), "Important, not urgent — Schedule");
+
+        let p = PriorityDisplay {
+            scheme: PriorityScheme::Linear,
+            names: vec!["Now".into(), "  ".into()],
+        };
+        assert_eq!(p.badge(Priority::UrgentImportant), "P1");
+        assert_eq!(p.name(Priority::UrgentImportant), "Now");
+        assert_eq!(p.name(Priority::Important), "High", "blank falls back");
+        assert_eq!(p.name(Priority::Neither), "Low", "missing falls back");
+        assert_eq!(Priority::parse("p3"), Some(Priority::Urgent));
+
+        // Old settings files carry no priority block at all.
+        let d: PriorityDisplay = serde_json::from_str("{}").unwrap();
+        assert_eq!(d, PriorityDisplay::default());
+    }
 
     fn date(s: &str) -> NaiveDate {
         s.parse().unwrap()

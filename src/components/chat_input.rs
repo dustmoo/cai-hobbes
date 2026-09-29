@@ -38,6 +38,8 @@ pub enum ChatCommand {
     TogglePlanner,
     /// Show/hide the full-width Fleet view (its own tab, planner idiom).
     ToggleFleet,
+    /// Show/hide the quick-capture palette (one line into the Planner).
+    ToggleQuickCapture,
     NewChat,
     NewChatWithMemory,
     ScrollToBottom,
@@ -315,6 +317,7 @@ pub fn ChatInput(
                 | ChatCommand::ToggleMcp
                 | ChatCommand::TogglePlanner
                 | ChatCommand::ToggleFleet
+                | ChatCommand::ToggleQuickCapture
                 | ChatCommand::StartTodoInChat(_)
                 | ChatCommand::DispatchTodoToAgent(_)
                 | ChatCommand::SwitchToSettingsTab(_, _)

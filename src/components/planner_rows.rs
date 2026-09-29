@@ -11,17 +11,25 @@
 //! the list answers the three questions in fixed places instead of reading a
 //! ragged chip stream.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Local, NaiveDate, Utc};
+use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
 use crate::fleet::{FleetOrigin, FleetSession, FleetStatus};
 use crate::settings::Settings;
 use crate::todo::model::{
-    self, BlockSource, FocusActor, FocusSession, TimeBlock, TimeOfDay, Todo, TodoBucket, TodoStatus,
+    self, BlockSource, FocusActor, FocusSession, Priority, TimeBlock, TimeOfDay, Todo, TodoBucket,
+    TodoStatus,
+};
+use crate::todo::project_match::{self, MatchTier, ProjectIndex, ProjectResolution, Ranked, PENDING_PROJECT_ID};
+use crate::todo::quick_add::{
+    active_project_query, parse_quick_add_with, set_project_token, QuickAddParse,
 };
 use crate::todo::store;
-use crate::todo::views::{self, TodoView};
+use crate::todo::views::{self, ArrangeInputs, GroupBy, ListOrder, RowGroup, SortDir, SortKey, TodoView};
 use crate::todo::PlannerState;
 
 use super::planner_timeline::{fmt_hhmm, local_minutes_to_utc};
@@ -366,6 +374,115 @@ fn todos_for_selection(state: &PlannerState, selection: &PlannerSelection, day: 
     }
 }
 
+/// A todo's earliest timeline block on its scheduled day. The one query
+/// behind both the row's "@ 10:15" chip and the Time sort, so the chip and
+/// the sort can't disagree.
+fn first_block_on_day<'a>(blocks: &'a [TimeBlock], todo_id: &str, day: NaiveDate) -> Option<&'a TimeBlock> {
+    blocks
+        .iter()
+        .filter(|b| {
+            b.todo_id.as_deref() == Some(todo_id) && b.start.with_timezone(&Local).date_naive() == day
+        })
+        .min_by_key(|b| b.start)
+}
+
+/// todo id → local minutes since midnight of its first block on its
+/// scheduled day. Built once per list render for the Time sort.
+fn block_slots(todos: &[Todo], blocks: &[TimeBlock]) -> HashMap<String, u32> {
+    use chrono::Timelike;
+    todos
+        .iter()
+        .filter(|t| !t.status.is_closed())
+        .filter_map(|t| {
+            let day = t.scheduled_for?;
+            let start = first_block_on_day(blocks, &t.id, day)?.start.with_timezone(&Local);
+            Some((t.id.clone(), start.hour() * 60 + start.minute()))
+        })
+        .collect()
+}
+
+/// The quadrant badge's tone, from the colours rows already use: red for
+/// Q1 (the overdue red), primary for Q2, yellow for Q3 (the due-soon
+/// yellow), muted for Q4.
+fn priority_tone_class(p: Priority) -> &'static str {
+    match p {
+        Priority::UrgentImportant => "border-red-700 text-red-400",
+        Priority::Important => "border-primary-600 text-primary-300",
+        Priority::Urgent => "border-yellow-700 text-yellow-300",
+        Priority::Neither => "border-faint text-fg-muted",
+    }
+}
+
+/// The toolbar's left-hand hint. `None` in the default state, which shows
+/// no indicator at all.
+fn order_hint(order: ListOrder) -> Option<String> {
+    if order.is_manual() {
+        return None;
+    }
+    Some(match order.key.dir_label(order.dir) {
+        None => format!(
+            "Grouped by {} — drag within a group to reorder",
+            order.group.label().to_lowercase()
+        ),
+        Some(dir) => format!(
+            "{} · {} — drag a row to make this your order",
+            order.key.label(),
+            dir
+        ),
+    })
+}
+
+/// Where a menu or keyboard move sends a row within its group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reorder {
+    Top,
+    Bottom,
+    Up,
+    Down,
+}
+
+/// The destination index for a [`Reorder`], or `None` when it's a no-op.
+fn reorder_target(from: usize, len: usize, r: Reorder) -> Option<usize> {
+    if from >= len {
+        return None;
+    }
+    let to = match r {
+        Reorder::Top => 0,
+        Reorder::Bottom => len - 1,
+        Reorder::Up => from.checked_sub(1)?,
+        Reorder::Down => (from + 1 < len).then_some(from + 1)?,
+    };
+    (to != from).then_some(to)
+}
+
+/// `ids` with the row at `from` moved to `to`.
+fn moved(ids: &[String], from: usize, to: usize) -> Vec<String> {
+    let mut out = ids.to_vec();
+    if from < out.len() {
+        let id = out.remove(from);
+        out.insert(to.min(out.len()), id);
+    }
+    out
+}
+
+/// A row's height (`h-9`): a drag's insertion index is the grab index plus
+/// whole rows travelled, so nothing is measured mid-drag.
+const ROW_HEIGHT_PX: f64 = 36.0;
+
+fn drag_over_index(from: usize, len: usize, dy: f64) -> usize {
+    let steps = (dy / ROW_HEIGHT_PX).round() as i64;
+    (from as i64 + steps).clamp(0, len.saturating_sub(1) as i64) as usize
+}
+
+/// The on-screen open order across every group, with one group's segment
+/// replaced by its post-move order — what an adopt makes the manual order.
+fn flatten_with(groups: &[(String, Vec<String>)], group_id: &str, replacement: &[String]) -> Vec<String> {
+    groups
+        .iter()
+        .flat_map(|(id, ids)| if id == group_id { replacement.to_vec() } else { ids.clone() })
+        .collect()
+}
+
 // ── Shared class vocabulary ────────────────────────────────────────────────
 
 /// Mirrors `default_profile_color()` in `settings.rs` (private there).
@@ -383,6 +500,12 @@ const MENU_ITEM: &str =
 const SECTION_HEADER: &str =
     "text-[11px] uppercase tracking-[0.08em] text-fg-muted px-2.5 pt-3.5 pb-1";
 
+const MENU_LABEL: &str =
+    "px-2.5 pt-1.5 pb-1 text-[11px] uppercase tracking-[0.08em] text-fg-muted";
+const MENU_RULE: &str = "h-px bg-[var(--color-border-muted)] my-1";
+/// The faint "this is what the list is sorted by" ring on a row's chip.
+const KEY_RING: &str = " ring-1 ring-primary-300/50";
+
 /// Which of a row's popovers is open. Exactly one at a time, so a menu never
 /// stacks on top of another.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -391,13 +514,132 @@ enum RowMenu {
     Date,
     Hand,
     More,
+    Priority,
+}
+
+// ── List order: drag and undo plumbing ──────────────────────────────────────
+
+/// An armed or live row drag. Rows arm it on mousedown with the id and the
+/// pointer's y; `TodoList` fills in the group once the pointer has moved
+/// past the threshold.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub(crate) struct ListDrag {
+    pub todo_id: String,
+    /// RowGroup id — drops are confined to the grab's group.
+    pub group_id: String,
+    /// The group's open rows, in on-screen order.
+    pub ids: Vec<String>,
+    pub grab_y: f64,
+    pub from_index: usize,
+    /// Current insertion index within the group's open rows.
+    pub over_index: usize,
+    /// Past the 4px threshold: the overlay is up.
+    pub active: bool,
+}
+
+/// List-scoped drag state, provided by TodoList (same pattern as
+/// SelectedBlockContext). The drag itself is a non-reactive `CopyValue`, so
+/// mousemove never re-renders; only crossing the threshold does.
+#[derive(Clone, Copy)]
+pub(crate) struct ListDragContext {
+    drag: CopyValue<Option<ListDrag>>,
+    /// ⋯ menu "Move to top/bottom" and ⌥↑/⌥↓.
+    reorder: Callback<(String, Reorder)>,
+}
+
+/// Undo for an adopt, rendered as a toast at the CentreColumn root.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct AdoptUndo {
+    pub previous_order: ListOrder,
+    pub previous_slots: Vec<(String, f64)>,
+    /// Identifies this toast to its own 6s timer, so an older timer can't
+    /// close a newer toast.
+    generation: u64,
+}
+
+static UNDO_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Queue a FLIP play for after the next render (see `assets/list_flip.js`).
+fn bump_flip(mut flip: Signal<(u64, u32)>, duration_ms: u32) {
+    flip.with_mut(|f| {
+        f.0 = f.0.wrapping_add(1);
+        f.1 = duration_ms;
+    });
+}
+
+fn flip_snap() {
+    let _ = document::eval("window.hobbesFlip?.snap()");
+}
+
+/// Commit a move of `todo_id` to index `to` within its group.
+///
+/// In Manual this writes one row (or a renormalised group) through
+/// `move_between`. In a sorted view it first adopts the on-screen order as
+/// the manual order — permuting existing slots — then switches the list to
+/// Manual (keeping its grouping) and offers Undo. Dragging is the choice.
+#[allow(clippy::too_many_arguments)]
+fn apply_move(
+    mut planner: Signal<PlannerState>,
+    order: Signal<ListOrder>,
+    mut undo: Signal<Option<AdoptUndo>>,
+    set_order: Callback<ListOrder>,
+    groups: &[(String, Vec<String>)],
+    todo_id: &str,
+    group_id: &str,
+    to: usize,
+) {
+    let Some(ids) = groups.iter().find(|g| g.0 == group_id).map(|g| &g.1) else {
+        return;
+    };
+    let Some(from) = ids.iter().position(|id| id == todo_id) else {
+        return;
+    };
+    if from == to {
+        return;
+    }
+    let new_ids = moved(ids, from, to);
+    let now = Utc::now();
+    let current = *order.peek();
+
+    if current.key == SortKey::Manual {
+        let before = to.checked_sub(1).map(|i| new_ids[i].as_str());
+        let after = new_ids.get(to + 1).map(String::as_str);
+        let changed = { planner.write().move_between(todo_id, before, after, &new_ids, now) };
+        for id in &changed {
+            persist_todo(&planner, id);
+        }
+        return;
+    }
+
+    let flat = flatten_with(groups, group_id, &new_ids);
+    let previous_slots = { planner.write().adopt_order(&flat, now) };
+    for (id, _) in &previous_slots {
+        persist_todo(&planner, id);
+    }
+    set_order.call(ListOrder {
+        key: SortKey::Manual,
+        dir: SortDir::Asc,
+        group: current.group,
+    });
+    let generation = UNDO_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    undo.set(Some(AdoptUndo {
+        previous_order: current,
+        previous_slots,
+        generation,
+    }));
+    spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        if undo.peek().as_ref().is_some_and(|u| u.generation == generation) {
+            undo.set(None);
+        }
+    });
 }
 
 // ── Centre column ───────────────────────────────────────────────────────────
 
 #[component]
 pub(crate) fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
-    let planner = use_context::<Signal<PlannerState>>();
+    let mut planner = use_context::<Signal<PlannerState>>();
     let settings = use_context::<Signal<Settings>>();
     let sel = selection.read().clone();
 
@@ -440,9 +682,74 @@ pub(crate) fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
     // Quick-adding into the logbook would resurrect nothing — hide it there.
     let show_quick_add = sel != PlannerSelection::View(TodoView::Logbook);
 
+    // ── List order (a lens: never written to the todos) ────────────────────
+    // Saved per list in UiState, next to the column widths. The signal lives
+    // here so the toolbar control and TodoList read the same value.
+    let mut ui_state = use_context::<Signal<crate::settings::UiState>>();
+    let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
+    use_hook(|| {
+        let _ = document::eval(include_str!("../../assets/list_flip.js"));
+    });
+    let seed = move |sel: &PlannerSelection| -> ListOrder {
+        let (keys, groups) = views::order_options(sel.view());
+        ui_state
+            .peek()
+            .planner_list_orders
+            .get(&sel.list_key())
+            .copied()
+            .unwrap_or_default()
+            .sanitized(&keys, &groups)
+    };
+    let mut order = use_signal(|| seed(&selection.peek()));
+    let mut undo = use_signal(|| Option::<AdoptUndo>::None);
+    let flip = use_signal(|| (0u64, 220u32));
+    // Re-seed when the list changes; a pending Undo belongs to the old list.
+    use_effect(move || {
+        let sel = selection.read().clone();
+        let next = seed(&sel);
+        if *order.peek() != next {
+            order.set(next);
+        }
+        if undo.peek().is_some() {
+            undo.set(None);
+        }
+    });
+    // FLIP play: runs after the render that follows every order change,
+    // drop and undo (each bumps `flip` after snapping).
+    use_effect(move || {
+        let (_, ms) = *flip.read();
+        let _ = document::eval(&format!("window.hobbesFlip?.play({ms})"));
+    });
+    let set_order = use_callback(move |next: ListOrder| {
+        order.set(next);
+        undo.set(None);
+        let key = selection.peek().list_key();
+        let live: Vec<String> = planner.peek().projects.iter().map(|p| p.id.clone()).collect();
+        {
+            let mut ui = ui_state.write();
+            if next == ListOrder::default() {
+                ui.planner_list_orders.remove(&key);
+            } else {
+                ui.planner_list_orders.insert(key, next);
+            }
+            let live: Vec<&str> = live.iter().map(String::as_str).collect();
+            ui.prune_planner_list_orders(&live);
+        }
+        let state = ui_state.peek().clone();
+        let manager = ui_state_manager.peek().clone();
+        spawn(async move {
+            let _ = manager.save(&state);
+        });
+    });
+    let (order_keys, order_groups) = views::order_options(sel.view());
+    let hint = order_hint(*order.read());
+    let undo_now = undo.read().clone();
+
     rsx! {
         div {
-            class: "flex-1 min-w-0 flex flex-col overflow-y-auto",
+        class: "relative flex-1 min-w-0 min-h-0 flex flex-col",
+        div {
+            class: "flex-1 min-h-0 flex flex-col overflow-y-auto",
             div {
                 class: "px-6 pt-6 pb-2",
                 div {
@@ -460,193 +767,169 @@ pub(crate) fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
             if show_quick_add {
                 QuickAdd { selection }
             }
-            TodoList { selection }
+            if !order_keys.is_empty() {
+                div {
+                    class: "px-6 pb-1.5 flex items-center gap-1.5",
+                    if let Some(hint) = hint {
+                        span { class: "min-w-0 truncate text-[11px] text-fg-muted", "{hint}" }
+                    }
+                    div { class: "flex-1" }
+                    ListOrderControl {
+                        order,
+                        keys: order_keys.clone(),
+                        groups: order_groups.clone(),
+                        on_change: move |next: ListOrder| {
+                            flip_snap();
+                            set_order.call(next);
+                            bump_flip(flip, 220);
+                        },
+                    }
+                }
+            }
+            TodoList { selection, order, undo, flip, set_order }
             // Breathing room so hover menus on the last row aren't clipped.
             div { class: "h-16 shrink-0" }
+        }
+        if let Some(u) = undo_now {
+            div {
+                class: "absolute inset-x-0 bottom-4 z-40 flex justify-center px-6 pointer-events-none",
+                div {
+                    class: "pointer-events-auto planner-pop-in flex items-center gap-3 rounded-lg border border-subtle bg-card px-3 py-2 shadow-xl text-[11px] text-fg",
+                    span { "Now in manual order, kept the {u.previous_order.key.label()} arrangement" }
+                    button {
+                        class: "font-medium text-primary-300 hover:text-fg",
+                        onclick: move |_| {
+                            let Some(u) = undo.peek().clone() else { return };
+                            flip_snap();
+                            let ids = planner.write().restore_order(&u.previous_slots, Utc::now());
+                            for id in &ids {
+                                persist_todo(&planner, id);
+                            }
+                            set_order.call(u.previous_order);
+                            bump_flip(flip, 220);
+                        },
+                        "Undo"
+                    }
+                }
+            }
+        }
         }
     }
 }
 
+/// The toolbar pill + popover. Reads "Manual ▾" when idle; lit primary with
+/// its own direction arrow and a × when any lens is on. Owns no order state:
+/// the order lives in CentreColumn so TodoList and the control agree.
 #[component]
-fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
-    let mut planner = use_context::<Signal<PlannerState>>();
-    let settings = use_context::<Signal<Settings>>();
-    let mut draft = use_signal(String::new);
-
-    let mut submit = move |_| {
-        let day = today();
-        let parsed = crate::todo::quick_add::parse_quick_add(&draft.peek(), day);
-        if parsed.title.is_empty() {
-            return; // tokens without a title aren't a todo yet
-        }
-
-        let mut todo = Todo::new(parsed.title, planner.peek().next_sort_order());
-        // New todos land in the context being looked at, so quick-add never
-        // makes work vanish into a different list.
-        match selection.peek().clone() {
-            // Scheduled todos are born triaged (Anytime, like block-created
-            // ones): clearing the date later must not dump them into Inbox.
-            PlannerSelection::View(TodoView::Today) => {
-                todo.scheduled_for = Some(day);
-                todo.bucket = TodoBucket::Anytime;
-            }
-            PlannerSelection::View(TodoView::Upcoming) => {
-                todo.scheduled_for = day.succ_opt();
-                todo.bucket = TodoBucket::Anytime;
-            }
-            PlannerSelection::View(TodoView::Anytime) => todo.bucket = TodoBucket::Anytime,
-            PlannerSelection::View(TodoView::Someday) => todo.bucket = TodoBucket::Someday,
-            PlannerSelection::Project(id) => {
-                todo.project_id = Some(id);
-                todo.bucket = TodoBucket::Anytime;
-            }
-            _ => {} // Inbox (and Logbook, which hides quick-add)
-        }
-
-        // A *day token overrides the view-context date — the user said when.
-        // Born triaged (Anytime) like every other scheduled birth, so clearing
-        // the date later never dumps it into Inbox.
-        if let Some(d) = parsed.scheduled {
-            todo.scheduled_for = Some(d);
-            todo.bucket = TodoBucket::Anytime;
-        }
-
-        // Tokens beat defaults; defaults beat nothing.
-        let default_estimate = settings.peek().planner_default_estimate_minutes;
-        todo.estimate_minutes = parsed
-            .estimate_minutes
-            .or((default_estimate > 0).then_some(default_estimate));
-        todo.tags = parsed.tags;
-        todo.deadline = parsed.deadline;
-        todo.time_of_day = parsed.time_of_day;
-
-        // An @clock token also implies a time-of-day group when none was given
-        // explicitly, so "@7pm" lands in This Evening without a second token.
-        if todo.time_of_day.is_none() {
-            todo.time_of_day = parsed.block_start.map(|m| match m / 60 {
-                0..=11 => TimeOfDay::Morning,
-                12..=16 => TimeOfDay::Afternoon,
-                _ => TimeOfDay::Evening,
-            });
-        }
-
-        // An @clock token means "this happens at that time": it implies a
-        // scheduled day (today unless the view already picked one) and puts a
-        // linked block on that day's timeline.
-        let block_date = parsed.block_start.map(|_| {
-            let d = todo.scheduled_for.unwrap_or(day);
-            todo.scheduled_for = Some(d);
-            if todo.bucket == TodoBucket::Inbox {
-                todo.bucket = TodoBucket::Anytime;
-            }
-            d
-        });
-
-        if let Err(e) = store::save_todo(&todo) {
-            tracing::error!("planner: failed to save new todo: {}", e);
-        }
-
-        let block = match (block_date, parsed.block_start) {
-            (Some(d), Some(start)) => {
-                let duration = todo
-                    .estimate_minutes
-                    .unwrap_or(settings.peek().planner_default_block_minutes)
-                    .max(15);
-                let block = TimeBlock {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    todo_id: Some(todo.id.clone()),
-                    title: todo.title.clone(),
-                    start: local_minutes_to_utc(d, start),
-                    end: local_minutes_to_utc(d, start + duration),
-                    source: BlockSource::Manual,
-                };
-                persist_block(&block);
-                Some(block)
-            }
-            _ => None,
-        };
-
-        {
-            let mut state = planner.write();
-            state.upsert_todo(todo);
-            if let Some(b) = block {
-                state.blocks.push(b);
-            }
-        }
-        draft.set(String::new());
-        // The input stays mounted, so focus is retained across submits.
+fn ListOrderControl(
+    order: Signal<ListOrder>,
+    /// Keys valid for this list (see `views::order_options`).
+    keys: Vec<SortKey>,
+    /// Group options valid for this list; empty hides the Group section.
+    groups: Vec<GroupBy>,
+    on_change: EventHandler<ListOrder>,
+) -> Element {
+    let mut open = use_signal(|| false);
+    let current = *order.read();
+    let pill_label = match (current.key, current.group) {
+        (SortKey::Manual, GroupBy::None) => "Manual".to_string(),
+        (SortKey::Manual, g) => format!("By {}", g.label().to_lowercase()),
+        (k, GroupBy::None) => k.label().to_string(),
+        (k, g) => format!("{} · {}", k.label(), g.label().to_lowercase()),
     };
-
-    // Parsed inline on every keystroke (P-012: draft is a Signal, so this
-    // tracks). The chips show what Enter will actually do — the premium tell
-    // of Things/Todoist quick entry is that tokens are confirmed before commit.
-    let day = today();
-    let preview = crate::todo::quick_add::parse_quick_add(&draft.read(), day);
-    let timeline_hint = preview
-        .block_start
-        .map(|m| format!("Enter to add · goes on the timeline at {}", fmt_hhmm(m)));
+    let arrow = if current.dir == SortDir::Asc { "↑" } else { "↓" };
+    let flip_title = current
+        .key
+        .dir_label(current.dir.flipped())
+        .map(|l| format!("Flip to {}", l.to_lowercase()))
+        .unwrap_or_default();
+    let mut pick = move |next: ListOrder| {
+        open.set(false);
+        if next != current {
+            on_change.call(next);
+        }
+    };
 
     rsx! {
         div {
-            class: "px-6 pb-3",
-            // The composer idiom: one framed well that lights on focus, with
-            // the input itself invisible inside it.
-            div {
-                class: "bg-input border border-subtle rounded-xl px-3.5 pt-2.5 pb-2 focus-within:ring-2 focus-within:ring-primary-500",
-                input {
-                    class: "w-full bg-transparent border-0 p-0 text-sm text-fg placeholder:text-fg-muted focus:outline-none focus:ring-0",
-                    r#type: "text",
-                    placeholder: "Add a to-do — ~30m · #tag · @2pm · *mon · !fri — press Enter",
-                    value: "{draft}",
-                    oninput: move |evt| draft.set(evt.value()),
-                    onkeydown: move |evt| {
-                        if evt.key() == Key::Enter {
-                            evt.prevent_default();
-                            submit(());
-                        }
-                    },
+            class: "relative shrink-0",
+            if current.is_manual() {
+                button {
+                    class: "{PILL} hover:text-fg hover:border-subtle",
+                    title: "Sort and group this list",
+                    onclick: move |_| open.toggle(),
+                    "Manual ▾"
                 }
-                if preview.has_tokens() {
-                    div {
-                        class: "mt-2 flex flex-wrap items-center gap-1.5",
-                        if let Some(m) = preview.estimate_minutes {
-                            span { class: "{PILL}", "{model::format_minutes(m)}" }
+            } else {
+                span {
+                    class: "{PILL} border-primary-500 text-primary-300 pr-1 gap-1",
+                    button {
+                        class: "hover:text-fg",
+                        title: "Sort and group this list",
+                        onclick: move |_| open.toggle(),
+                        "{pill_label}"
+                    }
+                    if current.key != SortKey::Manual {
+                        button {
+                            class: "font-mono hover:text-fg",
+                            title: "{flip_title}",
+                            onclick: move |_| pick(ListOrder { dir: current.dir.flipped(), ..current }),
+                            "{arrow}"
                         }
-                        if let Some(start) = preview.block_start {
-                            span {
-                                class: "{PILL} border-primary-600 text-fg",
-                                "on timeline @{fmt_hhmm(start)}"
+                    }
+                    button {
+                        class: "rounded-full px-1 hover:text-fg hover:bg-input",
+                        title: "Back to manual order",
+                        onclick: move |_| pick(ListOrder::default()),
+                        "×"
+                    }
+                }
+            }
+            if *open.read() {
+                div {
+                    class: "fixed inset-0 z-40",
+                    onclick: move |_| open.set(false),
+                }
+                div {
+                    class: "{POPOVER} planner-pop-in",
+                    div { class: "{MENU_LABEL}", "Sort by" }
+                    for k in keys.iter().copied() {
+                        button {
+                            key: "{k.label()}",
+                            class: "{MENU_ITEM}",
+                            // A new key starts ascending; Manual has no direction.
+                            onclick: move |_| pick(ListOrder { key: k, dir: SortDir::Asc, ..current }),
+                            span { class: "w-3 shrink-0", if current.key == k { "✓" } }
+                            span { class: "flex-1", "{k.label()}" }
+                            if let Some(asc) = k.dir_label(SortDir::Asc) {
+                                span { class: "text-fg-muted", "{asc}" }
                             }
                         }
-                        if let Some(tod) = preview.time_of_day {
-                            span { class: "{PILL}",
-                                match tod {
-                                    TimeOfDay::Morning => "morning",
-                                    TimeOfDay::Afternoon => "afternoon",
-                                    TimeOfDay::Evening => "this evening",
-                                }
+                    }
+                    if current.key != SortKey::Manual {
+                        div { class: "{MENU_RULE}" }
+                        div { class: "{MENU_LABEL}", "Direction" }
+                        for d in [SortDir::Asc, SortDir::Desc] {
+                            button {
+                                key: "{d:?}",
+                                class: "{MENU_ITEM}",
+                                onclick: move |_| pick(ListOrder { dir: d, ..current }),
+                                span { class: "w-3 shrink-0", if current.dir == d { "✓" } }
+                                span { "{current.key.dir_label(d).unwrap_or_default()}" }
                             }
                         }
-                        if let Some(d) = preview.scheduled {
-                            span {
-                                class: "{PILL}",
-                                Icon { width: 10, height: 10, icon: fi_icons::FiCalendar }
-                                "→ {views::friendly_date(d, day)}"
+                    }
+                    if !groups.is_empty() {
+                        div { class: "{MENU_RULE}" }
+                        div { class: "{MENU_LABEL}", "Group by" }
+                        for g in groups.iter().copied() {
+                            button {
+                                key: "{g.label()}",
+                                class: "{MENU_ITEM}",
+                                onclick: move |_| pick(ListOrder { group: g, ..current }),
+                                span { class: "w-3 shrink-0", if current.group == g { "✓" } }
+                                span { "{g.label()}" }
                             }
-                        }
-                        if let Some(d) = preview.deadline {
-                            span {
-                                class: "{PILL} border-red-700 text-red-400",
-                                "due {views::friendly_date(d, day)}"
-                            }
-                        }
-                        for tag in preview.tags.iter() {
-                            span { class: "{PILL}", "#{tag}" }
-                        }
-                        if preview.title.is_empty() {
-                            span { class: "text-[11px] text-fg-muted", "…needs a title" }
-                        } else if let Some(hint) = timeline_hint {
-                            span { class: "text-[11px] text-fg-muted ml-auto", "{hint}" }
                         }
                     }
                 }
@@ -655,60 +938,1118 @@ fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
     }
 }
 
+/// One header row. Reuses SECTION_HEADER; `band` adds the hairline rule.
+/// Group headers carry the count and Σ estimate; bands only the count.
 #[component]
-fn TodoList(selection: Signal<PlannerSelection>) -> Element {
+fn GroupHeader(
+    id: String,
+    label: String,
+    count: Option<usize>,
+    estimate_minutes: Option<u32>,
+    band: bool,
+    warn: bool,
+) -> Element {
+    let mut class = if warn {
+        SECTION_HEADER.replace("text-fg-muted", "text-red-400")
+    } else {
+        SECTION_HEADER.to_string()
+    };
+    class.push_str(" flex items-baseline gap-1.5");
+    if band {
+        class.push_str(" mt-1 border-t border-[var(--color-border-muted)]");
+    }
+    rsx! {
+        h2 {
+            // FLIP fades a header in when a re-sort creates it.
+            "data-row-id": "head-{id}",
+            class: "{class}",
+            span { "{label}" }
+            if let Some(c) = count {
+                span { class: "font-mono tabular-nums normal-case tracking-normal", "· {c}" }
+            }
+            if let Some(m) = estimate_minutes {
+                span { class: "font-mono tabular-nums normal-case tracking-normal", "· {model::format_minutes(m)}" }
+            }
+        }
+    }
+}
+
+// ── Quick add ───────────────────────────────────────────────────────────────
+
+/// Where a quick-add surface's default project came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InheritedFrom {
+    /// The Planner was showing this project when ⌘K opened.
+    View,
+    /// The palette's previous ⇧↵ capture went here.
+    LastCapture,
+}
+
+/// A surface default project — not text, so it's shown as a dashed pill.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Inherited {
+    pub(crate) project_id: String,
+    pub(crate) why: InheritedFrom,
+}
+
+/// Everything a quick-add surface knows beyond its text. The text stays the
+/// source of truth: pins only disambiguate a picked token, and a pending
+/// create only exists while its `+slug` is still typed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct QuickAddDraft {
+    pub(crate) text: String,
+    /// slug → project id, written by list picks (see `ProjectIndex::with_pins`).
+    pub(crate) pins: HashMap<String, String>,
+    /// Surface default (the view's project, or the last ⇧↵ capture's).
+    pub(crate) inherited: Option<Inherited>,
+    /// "Create project …" chosen from the list: created at commit, never before.
+    pub(crate) create_project: Option<String>,
+}
+
+impl QuickAddDraft {
+    pub(crate) fn with_inherited(inherited: Option<Inherited>) -> Self {
+        Self { inherited, ..Default::default() }
+    }
+
+    fn index(&self, state: &PlannerState) -> ProjectIndex {
+        ProjectIndex::from_state(state)
+            .with_pins(&self.pins)
+            .with_pending(self.create_project.as_deref())
+    }
+
+    pub(crate) fn parse(&self, state: &PlannerState, day: NaiveDate) -> QuickAddParse {
+        parse_quick_add_with(&self.text, day, &self.index(state))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum BirthProject {
+    None,
+    Existing(String),
+    /// Create a project with this title at commit.
+    Create(String),
+}
+
+/// Where a quick-added todo is born: the placement half of the commit,
+/// pure so the precedence is testable without Signals.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Birth {
+    pub(crate) project: BirthProject,
+    pub(crate) bucket: TodoBucket,
+    pub(crate) scheduled_for: Option<NaiveDate>,
+}
+
+/// Project: a resolved `+token` beats a surface's inherited project, which
+/// beats the view's own project. Bucket: the view's default, then `*day` or
+/// `@clock` triage it, then filing into a project triages an Inbox birth.
+pub(crate) fn resolve_birth(
+    parsed: &QuickAddParse,
+    draft: &QuickAddDraft,
+    selection: &PlannerSelection,
+    day: NaiveDate,
+) -> Birth {
+    let mut bucket = TodoBucket::Inbox;
+    let mut scheduled_for = None;
+    let mut view_project = None;
+    // New todos land in the context being looked at, so quick-add never
+    // makes work vanish into a different list. Scheduled births are triaged
+    // (Anytime): clearing the date later must not dump them into Inbox.
+    match selection {
+        PlannerSelection::View(TodoView::Today) => {
+            scheduled_for = Some(day);
+            bucket = TodoBucket::Anytime;
+        }
+        PlannerSelection::View(TodoView::Upcoming) => {
+            scheduled_for = day.succ_opt();
+            bucket = TodoBucket::Anytime;
+        }
+        PlannerSelection::View(TodoView::Anytime) => bucket = TodoBucket::Anytime,
+        PlannerSelection::View(TodoView::Someday) => bucket = TodoBucket::Someday,
+        PlannerSelection::Project(id) => {
+            view_project = Some(id.clone());
+            bucket = TodoBucket::Anytime;
+        }
+        _ => {} // Inbox (and Logbook, which hides quick-add)
+    }
+
+    // A *day token overrides the view-context date — the user said when.
+    if let Some(d) = parsed.scheduled {
+        scheduled_for = Some(d);
+        bucket = TodoBucket::Anytime;
+    }
+    // An @clock token means "this happens at that time": it implies a day
+    // (today unless something already picked one).
+    if parsed.block_start.is_some() {
+        scheduled_for.get_or_insert(day);
+        if bucket == TodoBucket::Inbox {
+            bucket = TodoBucket::Anytime;
+        }
+    }
+
+    let project = match &parsed.project {
+        Some(p) if p.id == PENDING_PROJECT_ID => {
+            BirthProject::Create(draft.create_project.clone().unwrap_or_else(|| p.title.clone()))
+        }
+        Some(p) => BirthProject::Existing(p.id.clone()),
+        None => match (&draft.inherited, view_project) {
+            (Some(i), _) => BirthProject::Existing(i.project_id.clone()),
+            (None, Some(id)) => BirthProject::Existing(id),
+            (None, None) => BirthProject::None,
+        },
+    };
+    // Choosing a project is a triage decision: the todo is born in Anytime.
+    if project != BirthProject::None && bucket == TodoBucket::Inbox {
+        bucket = TodoBucket::Anytime;
+    }
+    Birth { project, bucket, scheduled_for }
+}
+
+/// Where a todo ended up, in the words the Planner's sidebar uses, led by
+/// its project: "Hobbes RC · Friday at 2:00 PM".
+pub(crate) fn landing_label(
+    project: Option<&str>,
+    scheduled_for: Option<NaiveDate>,
+    bucket: TodoBucket,
+    block_start: Option<u32>,
+    day: NaiveDate,
+) -> String {
+    let place = match scheduled_for {
+        Some(d) if d == day => "Today".to_string(),
+        Some(d) => views::friendly_date(d, day),
+        None => match bucket {
+            TodoBucket::Someday => "Someday".to_string(),
+            TodoBucket::Anytime => "Anytime".to_string(),
+            TodoBucket::Inbox => "Inbox".to_string(),
+        },
+    };
+    let place = match block_start {
+        Some(m) => format!("{place} at {}", fmt_hhmm(m)),
+        None => place,
+    };
+    match project {
+        // A project's Anytime is just "the project".
+        Some(p) if scheduled_for.is_none() && bucket == TodoBucket::Anytime => p.to_string(),
+        Some(p) => format!("{p} · {place}"),
+        None => place,
+    }
+}
+
+/// The project title a birth lands in, for labels.
+pub(crate) fn birth_project_title(state: &PlannerState, project: &BirthProject) -> Option<String> {
+    match project {
+        BirthProject::None => None,
+        BirthProject::Create(t) => Some(t.clone()),
+        BirthProject::Existing(id) => state.projects.iter().find(|p| &p.id == id).map(|p| p.title.clone()),
+    }
+}
+
+/// `"garden-shed"` → `"Garden shed"`: the title a "Create project" row offers.
+fn title_from_query(q: &str) -> String {
+    let words = q.replace('-', " ");
+    let mut chars = words.trim().chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Splits `title` into runs marked by whether they match `query`'s
+/// characters in order (the list's highlight).
+fn highlight_runs(title: &str, query: &str) -> Vec<(String, bool)> {
+    let mut want = query.chars().filter(|c| *c != '-').flat_map(char::to_lowercase).peekable();
+    let mut runs: Vec<(String, bool)> = Vec::new();
+    for c in title.chars() {
+        let hit = want.peek().is_some_and(|w| c.to_lowercase().any(|l| l == *w));
+        if hit {
+            want.next();
+        }
+        match runs.last_mut() {
+            Some((s, h)) if *h == hit => s.push(c),
+            _ => runs.push((c.to_string(), hit)),
+        }
+    }
+    runs
+}
+
+/// Picking from a project picker is a text edit: it writes (or removes) the
+/// `+slug` token and pins it, so the pick survives colliding slugs.
+pub(crate) fn apply_project_pick(mut draft: Signal<QuickAddDraft>, state: &PlannerState, pick: Option<String>) {
+    let mut d = draft.write();
+    d.create_project = None;
+    match pick.and_then(|id| state.projects.iter().find(|p| p.id == id)) {
+        Some(p) => {
+            let s = project_match::slug(&p.title);
+            d.text = set_project_token(&d.text, Some(&s));
+            d.pins.insert(s, p.id.clone());
+        }
+        None => {
+            d.text = set_project_token(&d.text, None);
+            d.inherited = None;
+        }
+    }
+    if !d.text.is_empty() && !d.text.ends_with(' ') {
+        d.text.push(' ');
+    }
+}
+
+fn create_project(mut planner: Signal<PlannerState>, title: &str) -> String {
+    let now = Utc::now();
+    let sort_order = planner
+        .peek()
+        .projects
+        .iter()
+        .map(|p| p.sort_order)
+        .fold(0.0f64, f64::max)
+        + model::SORT_STEP;
+    let project = model::Project {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: title.trim().to_string(),
+        notes: String::new(),
+        area_id: None,
+        status: TodoStatus::default(),
+        deadline: None,
+        sort_order,
+        path: None,
+        created_at: now,
+        updated_at: now,
+    };
+    if let Err(e) = store::save_project(&project) {
+        tracing::error!("planner: failed to save new project: {}", e);
+    }
+    let id = project.id.clone();
+    planner.write().projects.push(project);
+    id
+}
+
+#[component]
+fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
     let planner = use_context::<Signal<PlannerState>>();
+    let settings = use_context::<Signal<Settings>>();
+    let mut draft = use_signal(QuickAddDraft::default);
+    // "Added … → Hobbes RC", only when the todo landed outside this list.
+    // The counter lets a newer confirmation outlive an older one's timer.
+    let mut confirmation = use_signal(|| None::<(u64, String, String)>);
+
+    let submit = move |_keep_open: bool| {
+        let sel = selection.peek().clone();
+        let d = draft.peek().clone();
+        let day = today();
+        let block_start = d.parse(&planner.peek(), day).block_start;
+        let Some(todo) = commit_quick_add(planner, settings, &d, &sel) else {
+            return; // no title yet — the preview already says so
+        };
+        // The input stays mounted, so focus is retained across submits.
+        draft.set(QuickAddDraft::default());
+        let (visible, landing) = {
+            let state = planner.peek();
+            let visible = todos_for_selection(&state, &sel, day).iter().any(|t| t.id == todo.id);
+            let project = todo
+                .project_id
+                .as_ref()
+                .and_then(|id| state.projects.iter().find(|p| &p.id == id))
+                .map(|p| p.title.clone());
+            (
+                visible,
+                landing_label(project.as_deref(), todo.scheduled_for, todo.bucket, block_start, day),
+            )
+        };
+        if visible {
+            return;
+        }
+        let generation = confirmation.peek().as_ref().map_or(0, |c| c.0) + 1;
+        confirmation.set(Some((generation, todo.title, landing)));
+        spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            if confirmation.peek().as_ref().is_some_and(|c| c.0 == generation) {
+                confirmation.set(None);
+            }
+        });
+    };
+
+    rsx! {
+        div {
+            class: "px-6 pb-3",
+            // The composer idiom: one framed well that lights on focus, with
+            // the input itself invisible inside it.
+            div {
+                class: "bg-input border border-subtle rounded-xl px-3.5 pt-2.5 pb-2 focus-within:ring-2 focus-within:ring-primary-500",
+                QuickAddField {
+                    draft,
+                    selection: selection.read().clone(),
+                    on_submit: submit,
+                    on_escape: move |_| {
+                        let _ = document::eval("document.activeElement?.blur()");
+                    },
+                    input_class: "w-full bg-transparent border-0 p-0 text-sm text-fg placeholder:text-fg-muted focus:outline-none focus:ring-0",
+                    placeholder: "Add a to-do — ~30m · #tag · +project · @2pm · *mon · !fri · !!1 — press Enter",
+                }
+            }
+            if let Some((_, title, landing)) = confirmation.read().clone() {
+                div {
+                    class: "mt-1.5 px-1 flex items-center gap-1.5 text-[11px] text-fg-muted",
+                    Icon { width: 11, height: 11, icon: fi_icons::FiCheck }
+                    span { class: "truncate", "Added “{title}” → {landing}" }
+                }
+            }
+        }
+    }
+}
+
+/// Turns a quick-add draft into a saved todo (plus a linked timeline block
+/// for an `@clock` token, and the project a "Create project …" pick asked
+/// for). `selection` is the context the todo is born into; tokens override
+/// it (see [`resolve_birth`]). Returns the saved todo, or None — saving
+/// nothing — when the text has no title. Shared by the Planner's inline
+/// quick-add and the Cmd+K quick-capture palette.
+pub(crate) fn commit_quick_add(
+    mut planner: Signal<PlannerState>,
+    settings: Signal<Settings>,
+    draft: &QuickAddDraft,
+    selection: &PlannerSelection,
+) -> Option<Todo> {
+    let day = today();
+    let parsed = draft.parse(&planner.peek(), day);
+    if parsed.title.is_empty() {
+        return None; // tokens without a title aren't a todo yet
+    }
+    let birth = resolve_birth(&parsed, draft, selection, day);
+
+    let mut todo = Todo::new(parsed.title.clone(), planner.peek().next_sort_order());
+    todo.project_id = match birth.project {
+        BirthProject::None => None,
+        BirthProject::Existing(id) => Some(id),
+        // Created only now, at commit: an abandoned draft creates nothing.
+        BirthProject::Create(title) => Some(create_project(planner, &title)),
+    };
+    todo.bucket = birth.bucket;
+    todo.scheduled_for = birth.scheduled_for;
+
+    // Tokens beat defaults; defaults beat nothing.
+    let default_estimate = settings.peek().planner_default_estimate_minutes;
+    todo.estimate_minutes = parsed
+        .estimate_minutes
+        .or((default_estimate > 0).then_some(default_estimate));
+    todo.tags = parsed.tags;
+    todo.deadline = parsed.deadline;
+    todo.time_of_day = parsed.time_of_day;
+    todo.priority = parsed.priority;
+
+    // An @clock token also implies a time-of-day group when none was given
+    // explicitly, so "@7pm" lands in This Evening without a second token.
+    if todo.time_of_day.is_none() {
+        todo.time_of_day = parsed.block_start.map(|m| match m / 60 {
+            0..=11 => TimeOfDay::Morning,
+            12..=16 => TimeOfDay::Afternoon,
+            _ => TimeOfDay::Evening,
+        });
+    }
+
+    if let Err(e) = store::save_todo(&todo) {
+        tracing::error!("planner: failed to save new todo: {}", e);
+    }
+
+    // resolve_birth already gave an @clock todo its day.
+    let block = match (todo.scheduled_for, parsed.block_start) {
+        (Some(d), Some(start)) => {
+            let duration = todo
+                .estimate_minutes
+                .unwrap_or(settings.peek().planner_default_block_minutes)
+                .max(15);
+            let block = TimeBlock {
+                id: uuid::Uuid::new_v4().to_string(),
+                todo_id: Some(todo.id.clone()),
+                title: todo.title.clone(),
+                start: local_minutes_to_utc(d, start),
+                end: local_minutes_to_utc(d, start + duration),
+                source: BlockSource::Manual,
+            };
+            persist_block(&block);
+            Some(block)
+        }
+        _ => None,
+    };
+
+    {
+        let mut state = planner.write();
+        state.upsert_todo(todo.clone());
+        if let Some(b) = block {
+            state.blocks.push(b);
+        }
+    }
+    Some(todo)
+}
+
+/// One row of the `+project` autocomplete list.
+#[derive(Clone, Debug, PartialEq)]
+enum ProjectRow {
+    Project(Ranked),
+    Create(String),
+}
+
+/// Input + `+project` autocomplete + chip row, shared by the Planner's
+/// inline add and the ⌘K palette. They differ only in classes and in what
+/// Enter / Esc do.
+#[component]
+pub(crate) fn QuickAddField(
+    draft: Signal<QuickAddDraft>,
+    /// The context the todo is born into (the palette passes Inbox).
+    selection: PlannerSelection,
+    /// Enter (false) / ⇧Enter (true) with the list closed.
+    on_submit: EventHandler<bool>,
+    /// Esc with the list closed. The palette closes; the inline add blurs.
+    on_escape: EventHandler<()>,
+    input_class: String,
+    placeholder: String,
+    #[props(default)] autofocus: bool,
+) -> Element {
+    let planner = use_context::<Signal<PlannerState>>();
+    let mut hi = use_signal(|| 0usize);
+    // Esc closes the list for this query only; typing on reopens it.
+    let mut dismissed_for = use_signal(|| None::<String>);
+    let mut input_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
+
+    let text = draft.read().text.clone();
+    let query = active_project_query(&text).map(str::to_string);
+    let rows: Vec<ProjectRow> = match &query {
+        Some(q) if dismissed_for.read().as_deref() != Some(q.as_str()) => {
+            let state = planner.read();
+            let ix = ProjectIndex::from_state(&state).with_pins(&draft.read().pins);
+            // An exact token needs no list: "… +hobbes-rc⏎" submits at once.
+            let exact = matches!(
+                ix.resolve(q),
+                ProjectResolution::Resolved { tier: MatchTier::Exact, .. }
+            );
+            if exact {
+                Vec::new()
+            } else {
+                let mut rows: Vec<ProjectRow> =
+                    ix.rank(q).into_iter().take(8).map(ProjectRow::Project).collect();
+                let title = title_from_query(q);
+                if !title.is_empty() {
+                    rows.push(ProjectRow::Create(title));
+                }
+                rows
+            }
+        }
+        _ => Vec::new(),
+    };
+    let list_open = !rows.is_empty();
+    let hi_now = (*hi.read()).min(rows.len().saturating_sub(1));
+
+    let accept = move |row: ProjectRow| {
+        {
+            let mut d = draft.write();
+            match row {
+                ProjectRow::Project(r) => {
+                    d.text = set_project_token(&d.text, Some(&r.slug));
+                    d.pins.insert(r.slug, r.id);
+                }
+                ProjectRow::Create(title) => {
+                    d.text = set_project_token(&d.text, Some(&title));
+                    d.create_project = Some(title);
+                }
+            }
+            // The trailing space closes the list; the next ↵ submits.
+            d.text.push(' ');
+        }
+        hi.set(0);
+    };
+
+    let query_for_list = query.clone().unwrap_or_default();
+
+    rsx! {
+        div {
+            class: "relative",
+            input {
+                class: "{input_class}",
+                r#type: "text",
+                placeholder: "{placeholder}",
+                value: "{text}",
+                autofocus,
+                onmounted: move |evt| {
+                    let mounted = evt.data();
+                    input_el.set(Some(mounted.clone()));
+                    if autofocus {
+                        spawn(async move {
+                            let _ = mounted.set_focus(true).await;
+                        });
+                    }
+                },
+                oninput: move |evt| {
+                    draft.write().text = evt.value();
+                    hi.set(0);
+                },
+                onkeydown: {
+                    let rows = rows.clone();
+                    let query = query.clone();
+                    let mut accept = accept;
+                    move |evt: KeyboardEvent| {
+                        let key = evt.key();
+                        let ctrl = evt.modifiers().ctrl();
+                        // Every key the list claims is prevent_default()ed, so
+                        // the global hotkey listener (which skips
+                        // defaultPrevented) never sees ⌃N/⌃P or friends.
+                        if list_open {
+                            let step: Option<i64> = match &key {
+                                Key::ArrowDown => Some(1),
+                                Key::ArrowUp => Some(-1),
+                                Key::Character(c) if ctrl && c.eq_ignore_ascii_case("n") => Some(1),
+                                Key::Character(c) if ctrl && c.eq_ignore_ascii_case("p") => Some(-1),
+                                _ => None,
+                            };
+                            if let Some(s) = step {
+                                evt.prevent_default();
+                                let n = rows.len() as i64;
+                                hi.set((hi_now as i64 + s).rem_euclid(n) as usize);
+                                return;
+                            }
+                            match key {
+                                // ⇧↵ accepts too — it never submits past an open list.
+                                Key::Enter | Key::Tab => {
+                                    evt.prevent_default();
+                                    if let Some(row) = rows.get(hi_now) {
+                                        accept(row.clone());
+                                    }
+                                    return;
+                                }
+                                Key::Escape => {
+                                    // Stop here so the palette card doesn't close.
+                                    evt.prevent_default();
+                                    evt.stop_propagation();
+                                    dismissed_for.set(query.clone());
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                        match key {
+                            Key::Enter => {
+                                evt.prevent_default();
+                                on_submit.call(evt.modifiers().contains(Modifiers::SHIFT));
+                            }
+                            Key::Escape => {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                                on_escape.call(());
+                            }
+                            // The tokenized-input gesture: ⌫ in an empty input
+                            // clears the inherited project, never typed text.
+                            Key::Backspace => {
+                                let clear = {
+                                    let d = draft.peek();
+                                    d.text.is_empty() && d.inherited.is_some()
+                                };
+                                if clear {
+                                    evt.prevent_default();
+                                    draft.write().inherited = None;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                },
+            }
+            if list_open {
+                div {
+                    class: "{POPOVER} left-0 right-auto w-72",
+                    div { class: "{MENU_LABEL}", "Project" }
+                    for (i, row) in rows.iter().cloned().enumerate() {
+                        button {
+                            key: "{i}",
+                            class: if i == hi_now { "{MENU_ITEM} bg-input" } else { "{MENU_ITEM}" },
+                            // Keep focus (and the caret) in the input.
+                            onmousedown: move |evt| evt.prevent_default(),
+                            onmouseenter: move |_| hi.set(i),
+                            onclick: {
+                                let row = row.clone();
+                                let mut accept = accept;
+                                move |evt: MouseEvent| {
+                                    evt.stop_propagation();
+                                    accept(row.clone());
+                                    if let Some(el) = input_el.peek().clone() {
+                                        spawn(async move {
+                                            let _ = el.set_focus(true).await;
+                                        });
+                                    }
+                                }
+                            },
+                            match row.clone() {
+                                ProjectRow::Project(r) => rsx! {
+                                    Icon { width: 11, height: 11, icon: fi_icons::FiFolder }
+                                    span {
+                                        class: "flex-1 truncate",
+                                        for (j, (run, hit)) in highlight_runs(&r.title, &query_for_list).into_iter().enumerate() {
+                                            span { key: "{j}", class: if hit { "text-primary-300" } else { "" }, "{run}" }
+                                        }
+                                    }
+                                    if let Some(area) = r.area.clone() {
+                                        span { class: "{META}", "{area}" }
+                                    }
+                                },
+                                ProjectRow::Create(title) => rsx! {
+                                    Icon { width: 11, height: 11, icon: fi_icons::FiPlus }
+                                    span { class: "flex-1 truncate", "Create project “{title}”" }
+                                },
+                            }
+                        }
+                    }
+                    div {
+                        class: "{MENU_RULE}",
+                    }
+                    div { class: "px-2.5 pb-1 text-[11px] text-fg-muted", "↑↓ choose · ↵ pick · esc close" }
+                }
+            }
+        }
+        QuickAddPreview { draft, selection, input_el }
+    }
+}
+
+/// The project pill's state, first in the chip row.
+#[derive(Clone, Debug, PartialEq)]
+enum ProjectPill {
+    /// A resolved `+token`. `not_view` names the view's project it overrides.
+    Token { title: String, not_view: Option<String> },
+    Creating { title: String },
+    Inherited { title: String, why: InheritedFrom },
+}
+
+/// The token chips under a quick-add input: what Enter will actually do.
+#[component]
+fn QuickAddPreview(
+    draft: Signal<QuickAddDraft>,
+    selection: PlannerSelection,
+    input_el: Signal<Option<std::rc::Rc<MountedData>>>,
+) -> Element {
+    let planner = use_context::<Signal<PlannerState>>();
+    let settings = use_context::<Signal<Settings>>();
+    let mut picker_open = use_signal(|| false);
+    // Parsed inline on every keystroke (P-012: draft is a Signal, so this
+    // tracks). The chips show what Enter will actually do — the premium tell
+    // of Things/Todoist quick entry is that tokens are confirmed before commit.
+    let day = today();
+    let (preview, birth, pill) = {
+        let state = planner.read();
+        let d = draft.read();
+        let preview = d.parse(&state, day);
+        let birth = resolve_birth(&preview, &d, &selection, day);
+        let title_of = |id: &str| state.projects.iter().find(|p| p.id == id).map(|p| p.title.clone());
+        let pill = match &birth.project {
+            BirthProject::Create(title) => Some(ProjectPill::Creating { title: title.clone() }),
+            BirthProject::Existing(id) if preview.project.is_some() => {
+                let not_view = match &selection {
+                    PlannerSelection::Project(v) if v != id => title_of(v),
+                    _ => None,
+                };
+                title_of(id).map(|title| ProjectPill::Token { title, not_view })
+            }
+            // The inline add in a project view shows no pill: the heading
+            // already says which project.
+            BirthProject::Existing(id) => d.inherited.as_ref().and_then(|i| {
+                title_of(id).map(|title| ProjectPill::Inherited { title, why: i.why })
+            }),
+            BirthProject::None => None,
+        };
+        (preview, birth, pill)
+    };
+    let current_project = match &birth.project {
+        BirthProject::Existing(id) => Some(id.clone()),
+        _ => None,
+    };
+    let miss_label = match &preview.project_miss {
+        Some(ProjectResolution::NoMatch { query }) => {
+            Some(format!("+{query} · no such project, stays in title"))
+        }
+        Some(ProjectResolution::Ambiguous { query, candidates }) => {
+            Some(format!("+{query} · {candidates} projects match, stays in title"))
+        }
+        _ => None,
+    };
+    let timeline_hint = preview
+        .block_start
+        .map(|m| format!("Enter to add · goes on the timeline at {}", fmt_hhmm(m)));
+    let priority_display = settings.read().planner_priority.clone();
+
+    let refocus = move || {
+        if let Some(el) = input_el.peek().clone() {
+            spawn(async move {
+                let _ = el.set_focus(true).await;
+            });
+        }
+    };
+
+    rsx! {
+        if preview.has_tokens() || pill.is_some() {
+            div {
+                class: "mt-2 flex flex-wrap items-center gap-1.5",
+                if pill.is_some() || miss_label.is_some() {
+                    div {
+                        class: "relative flex items-center gap-1.5 shrink-0",
+                        match pill.clone() {
+                            Some(ProjectPill::Inherited { title, why }) => rsx! {
+                                span {
+                                    class: "{PILL} border-dashed border-primary-600 text-fg pr-1",
+                                    button {
+                                        class: "inline-flex items-center gap-1.5 max-w-48 hover:text-fg",
+                                        title: "Change project",
+                                        onclick: move |evt| {
+                                            evt.stop_propagation();
+                                            picker_open.toggle();
+                                        },
+                                        Icon { width: 10, height: 10, icon: fi_icons::FiFolder }
+                                        span { class: "truncate", "{title}" }
+                                        span { class: "text-fg-muted",
+                                            match why {
+                                                InheritedFrom::View => "· from view",
+                                                InheritedFrom::LastCapture => "· from last",
+                                            }
+                                        }
+                                    }
+                                    button {
+                                        class: "px-1 text-fg-muted hover:text-fg",
+                                        title: "Don't file into this project (⌫ in an empty input)",
+                                        onclick: move |evt| {
+                                            evt.stop_propagation();
+                                            draft.write().inherited = None;
+                                        },
+                                        "×"
+                                    }
+                                }
+                            },
+                            Some(ProjectPill::Token { title, not_view }) => rsx! {
+                                button {
+                                    class: "{PILL} border-primary-600 text-fg max-w-64 hover:brightness-125",
+                                    title: "Change project",
+                                    onclick: move |evt| {
+                                        evt.stop_propagation();
+                                        picker_open.toggle();
+                                    },
+                                    Icon { width: 10, height: 10, icon: fi_icons::FiFolder }
+                                    span { class: "truncate", "{title}" }
+                                    if let Some(v) = not_view {
+                                        span { class: "text-fg-muted truncate", "· not {v}" }
+                                    }
+                                }
+                            },
+                            Some(ProjectPill::Creating { title }) => rsx! {
+                                button {
+                                    class: "{PILL} border-dashed border-primary-600 text-fg max-w-64",
+                                    title: "Created when you add this to-do",
+                                    onclick: move |evt| {
+                                        evt.stop_propagation();
+                                        picker_open.toggle();
+                                    },
+                                    Icon { width: 10, height: 10, icon: fi_icons::FiPlus }
+                                    span { class: "truncate", "New project “{title}”" }
+                                }
+                            },
+                            None => rsx! {},
+                        }
+                        if let Some(label) = miss_label.clone() {
+                            button {
+                                class: "{PILL} border-yellow-700 text-yellow-300 max-w-72",
+                                title: "Not filed — pick a project",
+                                onclick: move |evt| {
+                                    evt.stop_propagation();
+                                    picker_open.toggle();
+                                },
+                                span { class: "truncate", "{label}" }
+                            }
+                        }
+                        if *picker_open.read() {
+                            div {
+                                class: "fixed inset-0 z-40",
+                                onclick: move |evt| {
+                                    evt.stop_propagation();
+                                    picker_open.set(false);
+                                },
+                            }
+                            div {
+                                class: "{POPOVER} left-0 right-auto",
+                                onkeydown: {
+                                    move |evt: KeyboardEvent| {
+                                        if evt.key() == Key::Escape {
+                                            evt.prevent_default();
+                                            evt.stop_propagation();
+                                            picker_open.set(false);
+                                            refocus();
+                                        }
+                                    }
+                                },
+                                ProjectPicker {
+                                    current: current_project.clone(),
+                                    heading: "File under…",
+                                    on_pick: {
+                                        move |pick: Option<String>| {
+                                            apply_project_pick(draft, &planner.peek(), pick);
+                                            picker_open.set(false);
+                                            refocus();
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(m) = preview.estimate_minutes {
+                    span { class: "{PILL}", "{model::format_minutes(m)}" }
+                }
+                if let Some(start) = preview.block_start {
+                    span {
+                        class: "{PILL} border-primary-600 text-fg",
+                        "on timeline @{fmt_hhmm(start)}"
+                    }
+                }
+                if let Some(tod) = preview.time_of_day {
+                    span { class: "{PILL}",
+                        match tod {
+                            TimeOfDay::Morning => "morning",
+                            TimeOfDay::Afternoon => "afternoon",
+                            TimeOfDay::Evening => "this evening",
+                        }
+                    }
+                }
+                if let Some(d) = preview.scheduled {
+                    span {
+                        class: "{PILL}",
+                        Icon { width: 10, height: 10, icon: fi_icons::FiCalendar }
+                        "→ {views::friendly_date(d, day)}"
+                    }
+                }
+                if let Some(d) = preview.deadline {
+                    span {
+                        class: "{PILL} border-red-700 text-red-400",
+                        "due {views::friendly_date(d, day)}"
+                    }
+                }
+                if let Some(p) = preview.priority {
+                    span {
+                        class: "{PILL} {priority_tone_class(p)}",
+                        "{priority_display.badge(p)} · {priority_display.name(p)}"
+                    }
+                }
+                for tag in preview.tags.iter() {
+                    span { class: "{PILL}", "#{tag}" }
+                }
+                if preview.title.is_empty() {
+                    if preview.has_tokens() {
+                        span { class: "text-[11px] text-fg-muted", "…needs a title" }
+                    }
+                } else if let Some(hint) = timeline_hint {
+                    span { class: "text-[11px] text-fg-muted ml-auto", "{hint}" }
+                }
+            }
+        }
+    }
+}
+
+/// One rendered section of the list: a header (or none, for the lead
+/// section) and its rows, owned so the render doesn't borrow planner state.
+struct Section {
+    id: String,
+    label: Option<String>,
+    warn: bool,
+    band: bool,
+    count: Option<usize>,
+    estimate_minutes: Option<u32>,
+    rows: Vec<Todo>,
+}
+
+impl Section {
+    fn from_group(g: RowGroup<'_>, grouped: bool) -> Self {
+        let open = g.rows.iter().filter(|t| !t.status.is_closed()).count();
+        let counted = g.label.is_some() && (g.band || grouped);
+        Section {
+            count: counted.then_some(if open > 0 { open } else { g.rows.len() }),
+            estimate_minutes: (grouped && g.estimate_minutes > 0).then_some(g.estimate_minutes),
+            id: g.id,
+            label: g.label,
+            warn: g.warn,
+            band: g.band,
+            rows: g.rows.into_iter().cloned().collect(),
+        }
+    }
+}
+
+#[component]
+fn TodoList(
+    selection: Signal<PlannerSelection>,
+    order: Signal<ListOrder>,
+    undo: Signal<Option<AdoptUndo>>,
+    flip: Signal<(u64, u32)>,
+    set_order: Callback<ListOrder>,
+) -> Element {
+    let planner = use_context::<Signal<PlannerState>>();
+    let settings = use_context::<Signal<Settings>>();
     let fleet_state = use_context::<Signal<crate::fleet::FleetState>>();
     let sel = selection.read().clone();
+    let current = *order.read();
     let day = today();
-    let state = planner.read();
+    let in_logbook = sel == PlannerSelection::View(TodoView::Logbook);
 
-    let is_today = sel == PlannerSelection::View(TodoView::Today);
-    let is_upcoming = sel == PlannerSelection::View(TodoView::Upcoming);
-
-    // Upcoming renders under day headers — the same grouped query the AI's
-    // list tool flattens, so the two orderings can't drift.
-    let upcoming_groups: Vec<(NaiveDate, Vec<Todo>)> = if is_upcoming {
-        views::upcoming_grouped(&state.todos, day)
+    // ── Arrange ────────────────────────────────────────────────────────────
+    // The lens runs over the same queries as before (`in_view`,
+    // `completed_today`, `upcoming_grouped`); Manual + no grouping renders
+    // exactly what those return.
+    let sections: Vec<Section> = {
+        let state = planner.read();
+        let slots = block_slots(&state.todos, &state.blocks);
+        let projects: HashMap<String, (f64, String)> = state
+            .projects
+            .iter()
+            .map(|p| (p.id.clone(), (p.sort_order, p.title.clone())))
+            .collect();
+        let inputs = |split_evening: bool, bands: bool| ArrangeInputs {
+            today: day,
+            slots: &slots,
+            projects: &projects,
+            split_evening,
+            bands,
+        };
+        let grouped = current.group != GroupBy::None;
+        match &sel {
+            PlannerSelection::View(TodoView::Logbook) => {
+                let rows = todos_for_selection(&state, &sel, day);
+                if rows.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Section {
+                        id: "main".into(),
+                        label: None,
+                        warn: false,
+                        band: false,
+                        count: None,
+                        estimate_minutes: None,
+                        rows,
+                    }]
+                }
+            }
+            // Day headers are Upcoming's grouping; the sort applies within
+            // each day, with no bands (headers never nest).
+            PlannerSelection::View(TodoView::Upcoming) => {
+                let within = ListOrder { group: GroupBy::None, ..current };
+                let inputs = inputs(false, false);
+                views::upcoming_grouped(&state.todos, day)
+                    .into_iter()
+                    .map(|(d, ts)| Section {
+                        id: format!("day-{d}"),
+                        label: Some(views::friendly_date(d, day)),
+                        warn: false,
+                        band: false,
+                        count: None,
+                        estimate_minutes: None,
+                        rows: views::arrange(ts, Vec::new(), within, &inputs)
+                            .into_iter()
+                            .flat_map(|g| g.rows)
+                            .cloned()
+                            .collect(),
+                    })
+                    .collect()
+            }
+            // Completing a todo keeps its row visible for the rest of the
+            // day (struck through, reopenable in place): Today passes the
+            // day's closures alongside the open work — a separate query from
+            // view membership, which the AI's list tool needs to stay "open
+            // work owed".
+            PlannerSelection::View(TodoView::Today) => views::arrange(
+                views::in_view(&state.todos, TodoView::Today, day),
+                views::completed_today(&state.todos, day),
+                current,
+                &inputs(true, true),
+            )
             .into_iter()
-            .map(|(d, ts)| (d, ts.into_iter().cloned().collect()))
+            .map(|g| Section::from_group(g, grouped))
+            .collect(),
+            _ => {
+                let open = todos_for_selection(&state, &sel, day);
+                views::arrange(open.iter().collect(), Vec::new(), current, &inputs(false, true))
+                    .into_iter()
+                    .map(|g| Section::from_group(g, grouped))
+                    .collect()
+            }
+        }
+    };
+    // Priority bands speak the user's priority names (views stays pure and
+    // names them by quadrant).
+    let sections: Vec<Section> = if current.key == SortKey::Priority {
+        let names = settings.read().planner_priority.clone();
+        sections
+            .into_iter()
+            .map(|mut s| {
+                if let Some(p) = s.id.strip_prefix("band-").and_then(Priority::parse) {
+                    s.label = Some(names.name(p));
+                }
+                s
+            })
             .collect()
     } else {
+        sections
+    };
+    let is_empty = sections.is_empty();
+
+    // Each group's open rows in on-screen order: what a drag or a menu move
+    // reorders within, and what an adopt flattens.
+    let drag_groups: Vec<(String, Vec<String>)> = if in_logbook {
         Vec::new()
+    } else {
+        sections
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.rows
+                        .iter()
+                        .filter(|t| !t.status.is_closed())
+                        .map(|t| t.id.clone())
+                        .collect(),
+                )
+            })
+            .collect()
     };
 
-    // Today gets its "This Evening" split; every other selection is one flat
-    // list. Completing a todo must keep its row visible for the rest of the
-    // day (struck through, reopenable in place), so Today appends the day's
-    // completions after the open rows in each section — a separate query from
-    // the view membership, which the AI's list tool needs to stay "open work
-    // owed".
-    let (main_rows, evening_rows): (Vec<Todo>, Vec<Todo>) = if is_today {
-        let sections = views::today_sections(&state.todos, day);
-        let (done_evening, done_daytime): (Vec<&Todo>, Vec<&Todo>) =
-            views::completed_today(&state.todos, day)
-                .into_iter()
-                .partition(|t| t.time_of_day == Some(TimeOfDay::Evening));
-        (
-            sections
-                .daytime
-                .into_iter()
-                .chain(done_daytime)
-                .cloned()
-                .collect(),
-            sections
-                .evening
-                .into_iter()
-                .chain(done_evening)
-                .cloned()
-                .collect(),
-        )
-    } else if is_upcoming {
-        (Vec::new(), Vec::new())
-    } else {
-        (todos_for_selection(&state, &sel, day), Vec::new())
-    };
-    let is_empty = main_rows.is_empty() && evening_rows.is_empty() && upcoming_groups.is_empty();
+    // ── Drag plumbing ──────────────────────────────────────────────────────
+    let mut drag = use_hook(|| CopyValue::new(Option::<ListDrag>::None));
+    let mut drag_active = use_signal(|| false);
+
+    let reorder = use_callback({
+        let groups = drag_groups.clone();
+        move |(id, r): (String, Reorder)| {
+            // ⌥↑/⌥↓ are Manual-only; top/bottom work from any mode (a sorted
+            // list adopts, like a drag).
+            if matches!(r, Reorder::Up | Reorder::Down) && order.peek().key != SortKey::Manual {
+                return;
+            }
+            let Some((gid, ids)) = groups.iter().find(|g| g.1.contains(&id)) else {
+                return;
+            };
+            let from = ids.iter().position(|x| *x == id).unwrap_or(0);
+            let Some(to) = reorder_target(from, ids.len(), r) else {
+                return;
+            };
+            flip_snap();
+            apply_move(planner, order, undo, set_order, &groups, &id, gid, to);
+            bump_flip(flip, 220);
+        }
+    });
+    use_context_provider(|| ListDragContext { drag, reorder });
+
+    let commit_drag = use_callback({
+        let groups = drag_groups.clone();
+        move |_: ()| {
+            let taken = drag.write().take();
+            drag_active.set(false);
+            let Some(d) = taken else { return };
+            if !d.active {
+                return;
+            }
+            // Snap while the lifted row still sits under the pointer, so the
+            // FLIP play settles it from there into its slot.
+            flip_snap();
+            if d.over_index != d.from_index {
+                apply_move(planner, order, undo, set_order, &groups, &d.todo_id, &d.group_id, d.over_index);
+            }
+            bump_flip(flip, 180);
+        }
+    });
 
     // One read of the fleet mirror for the whole list: rows receive their own
     // carrier session as a prop rather than each reaching for shared state.
@@ -722,57 +2063,123 @@ fn TodoList(selection: Signal<PlannerSelection>) -> Element {
     rsx! {
         div {
             class: "flex flex-col px-4",
+            // Arming → live: the drag starts only after 4px of travel, so a
+            // click on a row (title, pills, buttons) stays a click.
+            onmousemove: {
+                let groups = drag_groups.clone();
+                move |evt: MouseEvent| {
+                    let y = evt.client_coordinates().y;
+                    let went_live = {
+                        let mut w = drag.write();
+                        match w.as_mut() {
+                            Some(d) if !d.active && (y - d.grab_y).abs() > 4.0 => {
+                                match groups.iter().find(|g| g.1.contains(&d.todo_id)) {
+                                    Some((gid, ids)) => {
+                                        let from = ids.iter().position(|x| *x == d.todo_id).unwrap_or(0);
+                                        d.group_id = gid.clone();
+                                        d.ids = ids.clone();
+                                        d.from_index = from;
+                                        d.over_index = from;
+                                        d.active = true;
+                                        true
+                                    }
+                                    None => {
+                                        *w = None;
+                                        false
+                                    }
+                                }
+                            }
+                            _ => false,
+                        }
+                    };
+                    if went_live {
+                        drag_active.set(true);
+                    }
+                }
+            },
+            onmouseup: move |_| {
+                if !*drag_active.peek() {
+                    drag.set(None);
+                }
+            },
+            onmouseleave: move |_| {
+                if !*drag_active.peek() {
+                    drag.set(None);
+                }
+            },
             if is_empty {
                 p { class: "px-2.5 py-8 text-sm text-fg-muted", "{empty_state_line(&sel)}" }
             }
-            for todo in main_rows {
-                // Cloned because the generated key borrows `todo.id` after the
-                // prop takes ownership.
-                TodoRow {
-                    key: "{todo.id}",
-                    fleet: carrier(&todo),
-                    todo: todo.clone(),
-                    selection,
-                }
-            }
-            for (date, rows) in upcoming_groups {
+            for section in sections {
                 div {
-                    key: "day-{date}",
-                    h2 {
-                        class: "{SECTION_HEADER}",
-                        "{views::friendly_date(date, day)}"
+                    key: "{section.id}",
+                    if let Some(label) = section.label.clone() {
+                        GroupHeader {
+                            id: section.id.clone(),
+                            label,
+                            count: section.count,
+                            estimate_minutes: section.estimate_minutes,
+                            band: section.band,
+                            warn: section.warn,
+                        }
                     }
-                    for todo in rows {
+                    for todo in section.rows {
+                        // Cloned because the generated key borrows `todo.id`
+                        // after the prop takes ownership.
                         TodoRow {
                             key: "{todo.id}",
                             fleet: carrier(&todo),
+                            draggable: !in_logbook && !todo.status.is_closed(),
+                            sort_key: current.key,
                             todo: todo.clone(),
                             selection,
                         }
                     }
                 }
             }
-            if !evening_rows.is_empty() {
-                h2 { class: "{SECTION_HEADER}", "This evening" }
-                for todo in evening_rows {
-                    TodoRow {
-                        key: "{todo.id}",
-                        fleet: carrier(&todo),
-                        todo: todo.clone(),
-                        selection,
-                    }
+            // While a drag is live, a fullscreen overlay owns the pointer —
+            // the column-resize pattern from PlannerView. Positions go straight
+            // to the DOM; only the insertion index lives in Rust.
+            if *drag_active.read() {
+                div {
+                    class: "fixed inset-0 z-50 cursor-grabbing",
+                    onmousemove: move |evt: MouseEvent| {
+                        let y = evt.client_coordinates().y;
+                        let js = {
+                            let mut w = drag.write();
+                            let Some(d) = w.as_mut() else { return };
+                            let dy = y - d.grab_y;
+                            d.over_index = drag_over_index(d.from_index, d.ids.len(), dy);
+                            format!(
+                                "window.hobbesDrag?.move({}, {}, {}, {})",
+                                serde_json::to_string(&d.ids).unwrap_or_else(|_| "[]".into()),
+                                d.from_index,
+                                d.over_index,
+                                dy
+                            )
+                        };
+                        let _ = document::eval(&js);
+                    },
+                    onmouseup: move |_| commit_drag.call(()),
+                    onmouseleave: move |_| commit_drag.call(()),
                 }
             }
         }
     }
 }
 
-/// The project popover's body and the ⋯ menu's "Move to project…" both need
-/// the same list, so it is one component.
+/// The project list behind every project picker: the row's pill, the ⋯
+/// menu's "Move to project…", and the quick-add pill and palette header. It
+/// only reports the pick; each caller decides what a pick does.
 #[component]
-fn ProjectPicker(todo_id: String, on_pick: EventHandler<()>) -> Element {
+pub(crate) fn ProjectPicker(
+    current: Option<String>,
+    on_pick: EventHandler<Option<String>>,
+    #[props(into, default = "Move to project…".to_string())] heading: String,
+) -> Element {
     let planner = use_context::<Signal<PlannerState>>();
-    let projects: Vec<(String, String)> = {
+    let mut filter = use_signal(String::new);
+    let (projects, show_filter): (Vec<(String, String)>, bool) = {
         let state = planner.read();
         let mut ps: Vec<(String, String)> = state
             .projects
@@ -781,30 +2188,52 @@ fn ProjectPicker(todo_id: String, on_pick: EventHandler<()>) -> Element {
             .map(|p| (p.id.clone(), p.title.clone()))
             .collect();
         ps.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-        ps
+        // A filter field once the list outgrows a glance.
+        let show_filter = ps.len() > 6;
+        let q = filter.read().trim().to_string();
+        if !q.is_empty() {
+            ps = ProjectIndex::from_state(&state)
+                .rank(&q)
+                .into_iter()
+                .map(|r| (r.id, r.title))
+                .collect();
+        }
+        (ps, show_filter)
     };
-    let current = planner
-        .read()
-        .todo(&todo_id)
-        .and_then(|t| t.project_id.clone());
+    let first = projects.first().map(|p| p.0.clone());
 
     rsx! {
-        div {
-            class: "px-2.5 pt-1.5 pb-1 text-[11px] uppercase tracking-[0.08em] text-fg-muted",
-            "Move to project…"
+        div { class: "{MENU_LABEL}", "{heading}" }
+        if show_filter {
+            div {
+                class: "px-2.5 pb-1.5",
+                input {
+                    class: "w-full rounded border border-subtle bg-input px-1.5 py-0.5 text-[11px] text-fg focus:outline-none",
+                    r#type: "text",
+                    placeholder: "Filter projects…",
+                    autofocus: true,
+                    value: "{filter}",
+                    onclick: move |evt| evt.stop_propagation(),
+                    oninput: move |evt| filter.set(evt.value()),
+                    onkeydown: move |evt: KeyboardEvent| {
+                        if evt.key() == Key::Enter {
+                            evt.prevent_default();
+                            if let Some(id) = first.clone() {
+                                on_pick.call(Some(id));
+                            }
+                        }
+                    },
+                }
+            }
         }
-        if projects.is_empty() {
+        if projects.is_empty() && filter.read().is_empty() {
             div { class: "px-2.5 py-1.5 text-[11px] text-fg-muted", "No projects yet." }
         }
         button {
             class: "{MENU_ITEM}",
-            onclick: {
-                let todo_id = todo_id.clone();
-                move |evt: MouseEvent| {
-                    evt.stop_propagation();
-                    mutate_todo(planner, &todo_id, |t| t.project_id = None);
-                    on_pick.call(());
-                }
+            onclick: move |evt: MouseEvent| {
+                evt.stop_propagation();
+                on_pick.call(None);
             },
             span { class: "w-3 shrink-0", if current.is_none() { "✓" } }
             span { class: "truncate text-fg-muted", "No project" }
@@ -814,13 +2243,10 @@ fn ProjectPicker(todo_id: String, on_pick: EventHandler<()>) -> Element {
                 key: "{pid}",
                 class: "{MENU_ITEM}",
                 onclick: {
-                    let todo_id = todo_id.clone();
                     let pid = pid.clone();
                     move |evt: MouseEvent| {
                         evt.stop_propagation();
-                        let pid = pid.clone();
-                        mutate_todo(planner, &todo_id, |t| t.project_id = Some(pid));
-                        on_pick.call(());
+                        on_pick.call(Some(pid.clone()));
                     }
                 },
                 span { class: "w-3 shrink-0", if current.as_deref() == Some(pid.as_str()) { "✓" } }
@@ -837,6 +2263,10 @@ fn TodoRow(
     /// from inside a row).
     fleet: Option<FleetSession>,
     mut selection: Signal<PlannerSelection>,
+    /// Which chip gets the faint "this is the sort key" ring.
+    sort_key: SortKey,
+    /// Grip visible + mousedown arms a drag. False for done rows.
+    draggable: bool,
 ) -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let settings = use_context::<Signal<Settings>>();
@@ -851,6 +2281,7 @@ fn TodoRow(
     let mut pick_day = use_signal(String::new);
     let mut detail_open = use_context::<crate::components::todo_detail::TodoDetailContext>().0;
     let mut selected_block = use_context::<SelectedBlockContext>().0;
+    let drag_ctx = try_use_context::<ListDragContext>();
 
     let sel = selection.read().clone();
     let id = todo.id.clone();
@@ -958,15 +2389,7 @@ fn TodoRow(
     // must be legible from every visual state, not just the ruler.
     let block_info: Option<(String, String)> = todo.scheduled_for.and_then(|d| {
         let state = planner.read();
-        state
-            .blocks
-            .iter()
-            .filter(|b| {
-                b.todo_id.as_deref() == Some(todo.id.as_str())
-                    && b.start.with_timezone(&Local).date_naive() == d
-            })
-            .min_by_key(|b| b.start)
-            .map(|b| {
+        first_block_on_day(&state.blocks, &todo.id, d).map(|b| {
                 (
                     b.start.with_timezone(&Local).format("%H:%M").to_string(),
                     b.id.clone(),
@@ -1095,6 +2518,21 @@ fn TodoRow(
         }
     };
 
+    // The faint ring on whichever chip the list is sorted by.
+    let ring = |key: SortKey| if sort_key == key { KEY_RING } else { "" };
+    // The Time sort reads the timebox; an unboxed row's date pill stands in.
+    let time_ring_on_date = block_info.is_none();
+
+    let priority_display = settings.read().planner_priority.clone();
+
+    let set_priority = {
+        let id = id.clone();
+        move |p: Option<Priority>| {
+            mutate_todo(planner, &id, |t| t.priority = p);
+            menu.set(None);
+        }
+    };
+
     let menu_now = *menu.read();
     // An open popover must survive the pointer leaving the hover zone.
     let cluster_class = if menu_now.is_some() {
@@ -1105,13 +2543,87 @@ fn TodoRow(
 
     rsx! {
         div {
-            class: "{row_class}",
+            class: "{row_class} focus:outline-none focus-visible:bg-section",
+            // FLIP and the drag find rows by this.
+            "data-row-id": "{todo.id}",
+            tabindex: "0",
             // A wandering pointer disarms the delete confirmation.
             onmouseleave: move |_| {
                 if *delete_armed.peek() {
                     delete_armed.set(false);
                 }
             },
+            // Arms a drag; TodoList makes it live after 4px of travel. Not
+            // while editing the title or with a popover open (their inputs
+            // need the mouse).
+            onmousedown: {
+                let id = id.clone();
+                move |evt: MouseEvent| {
+                    if !draggable || *editing.peek() || menu.peek().is_some() {
+                        return;
+                    }
+                    if evt.trigger_button() != Some(MouseButton::Primary) {
+                        return;
+                    }
+                    if let Some(mut ctx) = drag_ctx {
+                        ctx.drag.set(Some(ListDrag {
+                            todo_id: id.clone(),
+                            grab_y: evt.client_coordinates().y,
+                            ..Default::default()
+                        }));
+                    }
+                }
+            },
+            // ⌥↑ / ⌥↓ nudge a focused row (Manual only — the list enforces it).
+            // 1–4 set the priority, 0 clears it, p cycles it. Keys typed
+            // into the title editor or a popover's input bubble up here too,
+            // hence the editing / open-menu guard.
+            onkeydown: {
+                let id = id.clone();
+                let mut set_priority = set_priority.clone();
+                move |evt: KeyboardEvent| {
+                    if *editing.peek() || menu.peek().is_some() {
+                        return;
+                    }
+                    let mods = evt.modifiers();
+                    let bare = !(mods.alt() || mods.ctrl() || mods.meta() || mods.shift());
+                    if bare && !is_done && !in_logbook {
+                        if let Key::Character(c) = evt.key() {
+                            let current = planner.peek().todo(&id).and_then(|t| t.priority);
+                            let next = match c.as_str() {
+                                "p" | "P" => Some(Priority::cycle(current)),
+                                "0" => Some(None),
+                                d => Priority::parse(d).map(Some),
+                            };
+                            if let Some(next) = next {
+                                evt.prevent_default();
+                                set_priority(next);
+                                return;
+                            }
+                        }
+                    }
+                    if !draggable || !mods.alt() {
+                        return;
+                    }
+                    let r = match evt.key() {
+                        Key::ArrowUp => Reorder::Up,
+                        Key::ArrowDown => Reorder::Down,
+                        _ => return,
+                    };
+                    evt.prevent_default();
+                    if let Some(ctx) = drag_ctx {
+                        ctx.reorder.call((id.clone(), r));
+                    }
+                }
+            },
+
+            if draggable {
+                span {
+                    class: "absolute -left-3 top-1/2 -translate-y-1/2 select-none text-[11px] leading-none text-fg-muted opacity-0 group-hover:opacity-100 cursor-grab transition-opacity",
+                    title: "Drag to reorder",
+                    "⠿"
+                }
+            }
 
             // ── Column 1 — WHO ────────────────────────────────────────────
             div {
@@ -1255,8 +2767,14 @@ fn TodoRow(
                                 div { class: "h-px bg-[var(--color-border-muted)] my-1" }
                             }
                             ProjectPicker {
-                                todo_id: id.clone(),
-                                on_pick: move |_| menu.set(None),
+                                current: todo.project_id.clone(),
+                                on_pick: {
+                                    let id = id.clone();
+                                    move |pid: Option<String>| {
+                                        mutate_todo(planner, &id, |t| t.set_project(pid));
+                                        menu.set(None);
+                                    }
+                                },
                             }
                         }
                     }
@@ -1441,11 +2959,77 @@ fn TodoRow(
                                     Icon { width: 12, height: 12, icon: fi_icons::FiInfo }
                                     span { "Details" }
                                 }
+                                if draggable {
+                                    for (r, label) in [(Reorder::Top, "Move to top"), (Reorder::Bottom, "Move to bottom")] {
+                                        button {
+                                            key: "{label}",
+                                            class: "{MENU_ITEM}",
+                                            onclick: {
+                                                let id = id.clone();
+                                                move |evt: MouseEvent| {
+                                                    evt.stop_propagation();
+                                                    menu.set(None);
+                                                    if let Some(ctx) = drag_ctx {
+                                                        ctx.reorder.call((id.clone(), r));
+                                                    }
+                                                }
+                                            },
+                                            span { class: "w-3 shrink-0 text-center", if r == Reorder::Top { "↑" } else { "↓" } }
+                                            span { "{label}" }
+                                        }
+                                    }
+                                }
+                                if !in_logbook && !is_done {
+                                    div { class: "{MENU_RULE}" }
+                                    div { class: "{MENU_LABEL}", "Priority" }
+                                    div {
+                                        class: "flex items-center gap-1 px-2.5 pb-1.5",
+                                        for p in Priority::ALL {
+                                            button {
+                                                key: "{p.as_str()}",
+                                                class: if todo.priority == Some(p) {
+                                                    "{PILL} px-1.5 font-mono {priority_tone_class(p)} ring-1 ring-primary-300/50"
+                                                } else {
+                                                    "{PILL} px-1.5 font-mono {priority_tone_class(p)} hover:brightness-125"
+                                                },
+                                                title: "{priority_display.describe(p)}",
+                                                onclick: {
+                                                    let mut set = set_priority.clone();
+                                                    move |evt: MouseEvent| {
+                                                        evt.stop_propagation();
+                                                        set(Some(p));
+                                                    }
+                                                },
+                                                "{priority_display.badge(p)}"
+                                            }
+                                        }
+                                        if todo.priority.is_some() {
+                                            button {
+                                                class: "ml-auto text-[11px] text-fg-muted hover:text-fg",
+                                                title: "Clear priority",
+                                                onclick: {
+                                                    let mut set = set_priority.clone();
+                                                    move |evt: MouseEvent| {
+                                                        evt.stop_propagation();
+                                                        set(None);
+                                                    }
+                                                },
+                                                "Clear"
+                                            }
+                                        }
+                                    }
+                                }
                                 if !in_logbook {
                                     div { class: "h-px bg-[var(--color-border-muted)] my-1" }
                                     ProjectPicker {
-                                        todo_id: id.clone(),
-                                        on_pick: move |_| menu.set(None),
+                                        current: todo.project_id.clone(),
+                                        on_pick: {
+                                            let id = id.clone();
+                                            move |pid: Option<String>| {
+                                                mutate_todo(planner, &id, |t| t.set_project(pid));
+                                                menu.set(None);
+                                            }
+                                        },
                                     }
                                 }
                                 div { class: "h-px bg-[var(--color-border-muted)] my-1" }
@@ -1486,9 +3070,90 @@ fn TodoRow(
                             "Open"
                         }
                     }
+                    // Priority badge. Mirrors the estimate chip: an untriaged
+                    // row wears a ghost only on hover, and a click cycles
+                    // Q1 → Q2 → Q3 → Q4 → none. ⌥-click (or right-click)
+                    // opens the named list; a focused row takes 1–4 / 0 / p.
+                    div {
+                        class: "relative shrink-0",
+                        button {
+                            class: match todo.priority {
+                                Some(p) => format!("{PILL} px-1.5 font-mono {} hover:brightness-125{}", priority_tone_class(p), ring(SortKey::Priority)),
+                                None => format!("{PILL} px-1.5 font-mono opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 hover:text-fg transition-opacity"),
+                            },
+                            title: match todo.priority {
+                                Some(p) => format!("{}. Click to cycle, ⌥-click to choose · keys 1–4, 0 clears", priority_display.describe(p)),
+                                None => "Priority — click to cycle, ⌥-click to choose · keys 1–4".to_string(),
+                            },
+                            onclick: {
+                                let mut set = set_priority.clone();
+                                let current = todo.priority;
+                                move |evt: MouseEvent| {
+                                    evt.stop_propagation();
+                                    if evt.modifiers().alt() {
+                                        let next = (menu_now != Some(RowMenu::Priority)).then_some(RowMenu::Priority);
+                                        menu.set(next);
+                                    } else {
+                                        set(Priority::cycle(current));
+                                    }
+                                }
+                            },
+                            oncontextmenu: move |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                                let next = (menu_now != Some(RowMenu::Priority)).then_some(RowMenu::Priority);
+                                menu.set(next);
+                            },
+                            match todo.priority {
+                                Some(p) => priority_display.badge(p),
+                                None => priority_display.badge(Priority::UrgentImportant).replace('1', "–"),
+                            }
+                        }
+                        if menu_now == Some(RowMenu::Priority) {
+                            div {
+                                class: "fixed inset-0 z-40",
+                                onclick: move |_| menu.set(None),
+                            }
+                            div {
+                                class: "{POPOVER}",
+                                div { class: "{MENU_LABEL}", "Priority" }
+                                for q in Priority::ALL {
+                                    button {
+                                        key: "{q.as_str()}",
+                                        class: "{MENU_ITEM}",
+                                        onclick: {
+                                            let mut set = set_priority.clone();
+                                            move |evt: MouseEvent| {
+                                                evt.stop_propagation();
+                                                set(Some(q));
+                                            }
+                                        },
+                                        span { class: "w-3 shrink-0", if Some(q) == todo.priority { "✓" } }
+                                        span { class: "{PILL} px-1.5 font-mono {priority_tone_class(q)}", "{priority_display.badge(q)}" }
+                                        span { class: "flex-1", "{priority_display.name(q)}" }
+                                        span { class: "{META}", "{q.quadrant()}" }
+                                    }
+                                }
+                                div { class: "{MENU_RULE}" }
+                                button {
+                                    class: "{MENU_ITEM}",
+                                    onclick: {
+                                        let mut set = set_priority.clone();
+                                        move |evt: MouseEvent| {
+                                            evt.stop_propagation();
+                                            set(None);
+                                        }
+                                    },
+                                    span { class: "w-3 shrink-0" }
+                                    span { class: "flex-1 text-fg-muted", "No priority" }
+                                    span { class: "{META}", "0" }
+                                }
+                            }
+                        }
+                    }
                     button {
                         class: if todo.estimate_minutes.is_some() {
-                            "{META} hover:text-fg"
+                            "{META} hover:text-fg{ring(SortKey::Estimate)}"
                         } else {
                             "{META} opacity-0 group-hover:opacity-100 hover:text-fg transition-opacity"
                         },
@@ -1505,7 +3170,7 @@ fn TodoRow(
                         // to Today with its block selected, so "@ 09:00" is
                         // always one click from the timebox it names.
                         button {
-                            class: "{META} hover:text-fg",
+                            class: "{META} hover:text-fg{ring(SortKey::Time)}",
                             title: "On the timeline — click to show it in Today",
                             onclick: move |_| {
                                 selected_block.set(Some(block_id.clone()));
@@ -1516,7 +3181,7 @@ fn TodoRow(
                     }
                     if let Some(deadline) = todo.deadline {
                         span {
-                            class: "{PILL} {due_tone_class(due_tone(deadline, day))}",
+                            class: "{PILL} {due_tone_class(due_tone(deadline, day))}{ring(SortKey::Deadline)}",
                             "due {views::friendly_date(deadline, day)}"
                         }
                     }
@@ -1526,12 +3191,13 @@ fn TodoRow(
                     {
                         let scheduled = date_label.is_some();
                         let label = date_label.clone().unwrap_or_else(|| "When".to_string());
+                        let date_ring = if time_ring_on_date && scheduled { ring(SortKey::Time) } else { "" };
                         rsx! {
                         div {
                             class: "relative shrink-0",
                             button {
                                 class: if scheduled {
-                                    "{PILL} hover:text-fg hover:border-subtle"
+                                    "{PILL} hover:text-fg hover:border-subtle{date_ring}"
                                 } else {
                                     "{PILL} opacity-0 group-hover:opacity-100 hover:text-fg transition-opacity"
                                 },
@@ -1941,6 +3607,78 @@ mod tests {
         assert_eq!(profile_pill_border_class("nonsense"), "border-faint");
     }
 
+    // ── list order helpers ─────────────────────────────────────────────────
+
+    fn ids(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reorder_targets_stay_inside_the_group() {
+        assert_eq!(reorder_target(2, 4, Reorder::Top), Some(0));
+        assert_eq!(reorder_target(2, 4, Reorder::Bottom), Some(3));
+        assert_eq!(reorder_target(2, 4, Reorder::Up), Some(1));
+        assert_eq!(reorder_target(2, 4, Reorder::Down), Some(3));
+        // Already there → no-op, never a wasted write.
+        assert_eq!(reorder_target(0, 4, Reorder::Top), None);
+        assert_eq!(reorder_target(0, 4, Reorder::Up), None);
+        assert_eq!(reorder_target(3, 4, Reorder::Down), None);
+        assert_eq!(reorder_target(3, 4, Reorder::Bottom), None);
+        assert_eq!(reorder_target(5, 4, Reorder::Top), None);
+    }
+
+    #[test]
+    fn moved_lifts_and_reinserts() {
+        let list = ids(&["a", "b", "c", "d"]);
+        assert_eq!(moved(&list, 0, 2), ids(&["b", "c", "a", "d"]));
+        assert_eq!(moved(&list, 3, 0), ids(&["d", "a", "b", "c"]));
+        assert_eq!(moved(&list, 1, 1), list);
+    }
+
+    #[test]
+    fn drag_over_index_counts_whole_rows_and_clamps() {
+        assert_eq!(drag_over_index(1, 4, 0.0), 1);
+        assert_eq!(drag_over_index(1, 4, 17.0), 1, "under half a row stays put");
+        assert_eq!(drag_over_index(1, 4, 19.0), 2);
+        assert_eq!(drag_over_index(1, 4, 36.0 * 10.0), 3);
+        assert_eq!(drag_over_index(1, 4, -36.0 * 10.0), 0);
+        assert_eq!(drag_over_index(0, 0, 50.0), 0);
+    }
+
+    #[test]
+    fn flatten_with_replaces_only_the_dragged_group() {
+        let groups = vec![
+            ("band-overdue".to_string(), ids(&["a", "b"])),
+            ("band-later".to_string(), ids(&["c", "d"])),
+        ];
+        assert_eq!(
+            flatten_with(&groups, "band-later", &ids(&["d", "c"])),
+            ids(&["a", "b", "d", "c"])
+        );
+    }
+
+    #[test]
+    fn order_hint_is_silent_in_the_default_state() {
+        assert_eq!(order_hint(ListOrder::default()), None);
+        let sorted = ListOrder { key: SortKey::Deadline, dir: SortDir::Asc, group: GroupBy::None };
+        assert_eq!(
+            order_hint(sorted).as_deref(),
+            Some("Due date · Soonest first — drag a row to make this your order")
+        );
+        let grouped = ListOrder { group: GroupBy::Project, ..ListOrder::default() };
+        assert_eq!(
+            order_hint(grouped).as_deref(),
+            Some("Grouped by project — drag within a group to reorder")
+        );
+    }
+
+    #[test]
+    fn priority_tones_reuse_existing_row_colours() {
+        assert_eq!(priority_tone_class(Priority::UrgentImportant), due_tone_class(DueTone::Overdue));
+        assert_eq!(priority_tone_class(Priority::Urgent), due_tone_class(DueTone::Soon));
+        assert_eq!(priority_tone_class(Priority::Neither), due_tone_class(DueTone::Neutral));
+    }
+
     // ── pre-existing helpers ───────────────────────────────────────────────
 
     #[test]
@@ -1987,5 +3725,119 @@ mod tests {
         assert_eq!(cycle_estimate(Some(300)), Some(120));
         // ...and the next click continues the ladder normally.
         assert_eq!(cycle_estimate(cycle_estimate(Some(45))), Some(120));
+    }
+
+    // ── Quick-add birth ─────────────────────────────────────────────────────
+
+    fn planner_with_projects() -> PlannerState {
+        let p = |id: &str, title: &str, sort_order: f64| model::Project {
+            id: id.into(),
+            title: title.into(),
+            notes: String::new(),
+            area_id: None,
+            status: TodoStatus::default(),
+            deadline: None,
+            sort_order,
+            path: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let mut state = PlannerState::default();
+        state.projects = vec![p("rc", "Hobbes RC", 1.0), p("reno", "Home renovation", 2.0)];
+        state
+    }
+
+    fn birth(draft: &QuickAddDraft, sel: &PlannerSelection) -> Birth {
+        let day = d("2026-09-24");
+        let parsed = draft.parse(&planner_with_projects(), day);
+        resolve_birth(&parsed, draft, sel, day)
+    }
+
+    fn text(t: &str) -> QuickAddDraft {
+        QuickAddDraft { text: t.into(), ..Default::default() }
+    }
+
+    fn inherited(id: &str) -> Option<Inherited> {
+        Some(Inherited { project_id: id.into(), why: InheritedFrom::View })
+    }
+
+    #[test]
+    fn token_overrides_view_project() {
+        let b = birth(&text("tiles +reno"), &PlannerSelection::Project("rc".into()));
+        assert_eq!(b.project, BirthProject::Existing("reno".into()));
+        assert_eq!(b.bucket, TodoBucket::Anytime);
+
+        let mut with_inherited = text("tiles +reno");
+        with_inherited.inherited = inherited("rc");
+        let b = birth(&with_inherited, &PlannerSelection::View(TodoView::Inbox));
+        assert_eq!(b.project, BirthProject::Existing("reno".into()));
+    }
+
+    #[test]
+    fn inherited_used_when_no_token() {
+        let mut draft = text("ship notes");
+        draft.inherited = inherited("rc");
+        let b = birth(&draft, &PlannerSelection::View(TodoView::Inbox));
+        assert_eq!(b.project, BirthProject::Existing("rc".into()));
+        assert_eq!(b.bucket, TodoBucket::Anytime, "filed into a project = triaged");
+    }
+
+    #[test]
+    fn cleared_inherited_means_no_project() {
+        let b = birth(&text("ship notes"), &PlannerSelection::View(TodoView::Inbox));
+        assert_eq!(b.project, BirthProject::None);
+        assert_eq!(b.bucket, TodoBucket::Inbox);
+    }
+
+    #[test]
+    fn view_project_is_the_inline_default() {
+        let b = birth(&text("ship notes"), &PlannerSelection::Project("rc".into()));
+        assert_eq!(b.project, BirthProject::Existing("rc".into()));
+    }
+
+    #[test]
+    fn project_in_inbox_view_is_born_triaged() {
+        let b = birth(&text("ship +rc"), &PlannerSelection::View(TodoView::Inbox));
+        assert_eq!(b.project, BirthProject::Existing("rc".into()));
+        assert_eq!(b.bucket, TodoBucket::Anytime);
+        assert_eq!(b.scheduled_for, None);
+    }
+
+    #[test]
+    fn project_with_someday_view_stays_someday() {
+        let b = birth(&text("ship +rc"), &PlannerSelection::View(TodoView::Someday));
+        assert_eq!(b.bucket, TodoBucket::Someday);
+        let today = birth(&text("ship +rc"), &PlannerSelection::View(TodoView::Today));
+        assert_eq!(today.scheduled_for, Some(d("2026-09-24")));
+    }
+
+    #[test]
+    fn create_project_only_when_token_unchanged() {
+        let mut draft = text("sand it +garden-shed ");
+        draft.create_project = Some("Garden shed".into());
+        let b = birth(&draft, &PlannerSelection::View(TodoView::Inbox));
+        assert_eq!(b.project, BirthProject::Create("Garden shed".into()));
+        assert_eq!(b.bucket, TodoBucket::Anytime);
+
+        // Token edited after the pick: the pending create is dropped.
+        draft.text = "sand it +garden".into();
+        let b = birth(&draft, &PlannerSelection::View(TodoView::Inbox));
+        assert_eq!(b.project, BirthProject::None);
+        assert_eq!(b.bucket, TodoBucket::Inbox);
+    }
+
+    #[test]
+    fn create_row_titles_and_list_highlights() {
+        assert_eq!(title_from_query("garden-shed"), "Garden shed");
+        assert_eq!(title_from_query("x"), "X");
+        let runs = highlight_runs("Home renovation", "reno");
+        assert_eq!(
+            runs,
+            vec![
+                ("Home ".to_string(), false),
+                ("reno".to_string(), true),
+                ("vation".to_string(), false)
+            ]
+        );
     }
 }

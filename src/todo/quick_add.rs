@@ -13,13 +13,24 @@
 //! | `@morning` `@afternoon` `@evening` | time of day group |
 //! | `*fri` `*tomorrow` `*today` | scheduled day (same day words as `!`) |
 //! | `!fri` `!tomorrow` `!today` | deadline (weekday = next occurrence, today counts) |
+//! | `!!1`…`!!4` `!!p1`…`!!p4` `!!do` `!!schedule` `!!delegate` `!!drop` | Eisenhower priority (Q1–Q4) |
+//! | `+hobbes` `+hobbes-rc` `+rc` | project (slug / word prefix; must resolve) |
 //!
 //! Shared by the quick-add input; the AI goes through its structured tools and
 //! never needs this.
 
 use chrono::{Datelike, NaiveDate, Weekday};
 
-use super::model::TimeOfDay;
+use super::model::{Priority, TimeOfDay};
+use super::project_match::{self, MatchTier, ProjectIndex, ProjectResolution};
+
+/// A `+token` that resolved to an open project.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectPick {
+    pub id: String,
+    pub title: String,
+    pub tier: MatchTier,
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QuickAddParse {
@@ -32,6 +43,14 @@ pub struct QuickAddParse {
     pub time_of_day: Option<TimeOfDay>,
     /// Local minutes since midnight where the todo should be time-blocked.
     pub block_start: Option<u32>,
+    /// Eisenhower quadrant (`!!2`). `!` alone already means deadline, so
+    /// priority doubles the sigil rather than claiming a new one.
+    pub priority: Option<Priority>,
+    /// A `+token` that resolved (last one wins). Consumed from the title.
+    pub project: Option<ProjectPick>,
+    /// The last `+token` that did NOT resolve. It stays in the title; kept
+    /// here only so the preview can show the amber "stays in title" pill.
+    pub project_miss: Option<ProjectResolution>,
 }
 
 impl QuickAddParse {
@@ -43,10 +62,32 @@ impl QuickAddParse {
             || self.scheduled.is_some()
             || self.time_of_day.is_some()
             || self.block_start.is_some()
+            || self.priority.is_some()
+            || self.project.is_some()
+            || self.project_miss.is_some()
     }
 }
 
+/// Unchanged signature: an empty index means `+` never consumes, so every
+/// caller that doesn't know about projects behaves exactly as before.
+/// (The UI now parses through `parse_quick_add_with`; this is the stable
+/// project-less entry point the tests pin.)
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_quick_add(input: &str, today: NaiveDate) -> QuickAddParse {
+    parse_quick_add_with(input, today, &ProjectIndex::empty())
+}
+
+/// `+word` whose first character could start a project token. Digit-led
+/// words (`+1`, `+15%`) are plain text.
+fn project_query(word: &str) -> Option<&str> {
+    let rest = word.strip_prefix('+')?;
+    rest.chars()
+        .next()
+        .filter(|c| c.is_alphanumeric() && !c.is_ascii_digit())
+        .map(|_| rest)
+}
+
+pub fn parse_quick_add_with(input: &str, today: NaiveDate, projects: &ProjectIndex) -> QuickAddParse {
     let mut out = QuickAddParse::default();
     let mut title_words: Vec<&str> = Vec::new();
 
@@ -87,6 +128,15 @@ pub fn parse_quick_add(input: &str, today: NaiveDate) -> QuickAddParse {
                 }
                 None => false,
             },
+            // Checked before the single-`!` deadline arm, which would
+            // otherwise see "!2" and leave the word in the title.
+            ("!", rest) if rest.starts_with('!') => match Priority::parse(&rest[1..]) {
+                Some(p) => {
+                    out.priority = Some(p);
+                    true
+                }
+                None => false,
+            },
             ("!", rest) => match parse_day_word(rest, today) {
                 Some(d) => {
                     out.deadline = Some(d);
@@ -103,6 +153,22 @@ pub fn parse_quick_add(input: &str, today: NaiveDate) -> QuickAddParse {
                 }
                 None => false,
             },
+            // `+project`: consumed only when it resolves. A miss stays in the
+            // title (and flags the amber preview pill); an empty index means
+            // the caller doesn't know about projects, so no pill either.
+            ("+", _) if !projects.is_empty() => match project_query(word) {
+                Some(q) => match projects.resolve(q) {
+                    ProjectResolution::Resolved { id, title, tier } => {
+                        out.project = Some(ProjectPick { id, title, tier });
+                        true
+                    }
+                    miss => {
+                        out.project_miss = Some(miss);
+                        false
+                    }
+                },
+                None => false,
+            },
             _ => false,
         };
         if !consumed {
@@ -112,6 +178,38 @@ pub fn parse_quick_add(input: &str, today: NaiveDate) -> QuickAddParse {
 
     out.title = title_words.join(" ");
     out
+}
+
+/// The `+word` being typed at the end of the input, if any: drives the
+/// autocomplete list. v1 treats the caret as being at the end, so a trailing
+/// space closes it. `"x +ho"` → `Some("ho")`; a bare `"x +"` → `Some("")`.
+pub fn active_project_query(input: &str) -> Option<&str> {
+    if input.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let last = input.split_whitespace().last()?;
+    if last == "+" {
+        return Some("");
+    }
+    project_query(last)
+}
+
+/// Replace the last `+project` word with `+{slug}` (appending one if there's
+/// none), or remove every `+project` word when `slug` is `None`. The pill and
+/// the list both edit the text through this, so the text stays the source of
+/// truth. A bare trailing `+` counts as the word being replaced.
+pub fn set_project_token(input: &str, slug: Option<&str>) -> String {
+    let mut words: Vec<&str> = input.split_whitespace().collect();
+    let is_token = |w: &str| w == "+" || project_query(w).is_some();
+    let token = slug.map(|s| format!("+{}", project_match::slug(s)));
+    match token {
+        None => words.retain(|w| !is_token(w)),
+        Some(ref t) => match words.iter().rposition(|w| is_token(w)) {
+            Some(i) => words[i] = t,
+            None => words.push(t),
+        },
+    }
+    words.join(" ")
 }
 
 /// `"30m"`, `"1h30m"`, `"2h"`, or bare `"90"` (minutes). Rejects zero.
@@ -264,6 +362,24 @@ mod tests {
     }
 
     #[test]
+    fn double_bang_sets_the_eisenhower_quadrant() {
+        let p = parse_quick_add("Call the bank !!1 !fri", today());
+        assert_eq!(p.title, "Call the bank");
+        assert_eq!(p.priority, Some(Priority::UrgentImportant));
+        assert_eq!(p.deadline, Some(date("2026-08-14")), "!fri is still a deadline");
+        assert!(p.has_tokens());
+
+        assert_eq!(parse_quick_add("x !!schedule", today()).priority, Some(Priority::Important));
+        assert_eq!(parse_quick_add("x !!Q3", today()).priority, Some(Priority::Urgent));
+        assert_eq!(parse_quick_add("x !!drop", today()).priority, Some(Priority::Neither));
+
+        // Unknown quadrants and a bare "!!" stay in the title.
+        let p = parse_quick_add("wow !! really !!9", today());
+        assert_eq!(p.title, "wow !! really !!9");
+        assert_eq!(p.priority, None);
+    }
+
+    #[test]
     fn the_screenshot_case_parses() {
         // The exact input that motivated this: "Review Emails ~30m".
         let p = parse_quick_add("Review Emails ~30m", today());
@@ -377,5 +493,91 @@ mod tests {
         assert_eq!(parse_quick_add("x @9:75", today()).block_start, None);
         assert_eq!(parse_quick_add("x @13pm", today()).block_start, None);
         assert_eq!(parse_quick_add("x @0pm", today()).block_start, None);
+    }
+
+    fn projects() -> ProjectIndex {
+        use crate::todo::model::Project;
+        let p = |id: &str, title: &str, sort_order: f64| Project {
+            id: id.into(),
+            title: title.into(),
+            notes: String::new(),
+            area_id: None,
+            status: Default::default(),
+            deadline: None,
+            sort_order,
+            path: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let state = crate::todo::PlannerState {
+            projects: vec![p("rc", "Hobbes RC", 1.0), p("reno", "Home renovation", 2.0)],
+            ..Default::default()
+        };
+        ProjectIndex::from_state(&state)
+    }
+
+    #[test]
+    fn plus_token_is_consumed_when_it_resolves() {
+        let p = parse_quick_add_with("Ship notes +hobbes-rc ~30m", today(), &projects());
+        assert_eq!(p.title, "Ship notes");
+        assert_eq!(p.project.as_ref().map(|p| p.id.as_str()), Some("rc"));
+        assert_eq!(p.estimate_minutes, Some(30));
+        assert!(p.project_miss.is_none());
+    }
+
+    #[test]
+    fn unresolved_plus_stays_in_title() {
+        for input in ["+1 on the proposal", "C++ refactor", "budget +15%"] {
+            let p = parse_quick_add_with(input, today(), &projects());
+            assert_eq!(p.title, input);
+            assert_eq!(p.project, None);
+            assert_eq!(p.project_miss, None, "digit-led / non-token: no amber noise");
+        }
+        let p = parse_quick_add_with("buy +garden-shed", today(), &projects());
+        assert_eq!(p.title, "buy +garden-shed");
+        assert!(matches!(p.project_miss, Some(ProjectResolution::NoMatch { .. })));
+        assert!(p.has_tokens(), "the amber pill needs the chip row");
+    }
+
+    #[test]
+    fn empty_index_never_consumes_plus() {
+        let p = parse_quick_add("Ship +hobbes", today());
+        assert_eq!(p.title, "Ship +hobbes");
+        assert_eq!(p.project, None);
+        assert_eq!(p.project_miss, None);
+        assert!(!p.has_tokens());
+    }
+
+    #[test]
+    fn last_resolving_plus_wins_and_all_resolving_are_consumed() {
+        let p = parse_quick_add_with("tiles +rc +reno", today(), &projects());
+        assert_eq!(p.title, "tiles");
+        assert_eq!(p.project.map(|p| p.id), Some("reno".into()));
+    }
+
+    #[test]
+    fn bare_plus_stays_in_title() {
+        let p = parse_quick_add_with("a + b", today(), &projects());
+        assert_eq!(p.title, "a + b");
+        assert!(!p.has_tokens());
+    }
+
+    #[test]
+    fn set_project_token_replaces_appends_and_removes() {
+        assert_eq!(set_project_token("x +ho", Some("Hobbes RC")), "x +hobbes-rc");
+        assert_eq!(set_project_token("x +", Some("hobbes-rc")), "x +hobbes-rc");
+        assert_eq!(set_project_token("x ~30m", Some("reno")), "x ~30m +reno");
+        assert_eq!(set_project_token("x +rc ~30m", None), "x ~30m");
+        assert_eq!(set_project_token("+1 idea +rc", None), "+1 idea", "+1 is text");
+    }
+
+    #[test]
+    fn active_project_query_only_for_trailing_word() {
+        assert_eq!(active_project_query("x +ho"), Some("ho"));
+        assert_eq!(active_project_query("x +"), Some(""));
+        assert_eq!(active_project_query("x +ho "), None);
+        assert_eq!(active_project_query("x +1"), None);
+        assert_eq!(active_project_query("x ho"), None);
+        assert_eq!(active_project_query(""), None);
     }
 }

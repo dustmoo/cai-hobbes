@@ -79,6 +79,10 @@ pub struct HotkeySettings {
     pub toggle_planner: String,
     #[serde(default = "default_toggle_fleet")]
     pub toggle_fleet: String,
+    /// Open the quick-capture palette: one line straight into the Planner,
+    /// from anywhere in the app.
+    #[serde(default = "default_quick_capture")]
+    pub quick_capture: String,
     #[serde(default = "default_toggle_profile")]
     pub toggle_profile: String,
     #[serde(default = "default_toggle_provider")]
@@ -134,6 +138,7 @@ impl Default for HotkeySettings {
             toggle_mcp: default_toggle_mcp(),
             toggle_planner: default_toggle_planner(),
             toggle_fleet: default_toggle_fleet(),
+            quick_capture: default_quick_capture(),
             toggle_profile: default_toggle_profile(),
             toggle_provider: default_toggle_provider(),
             toggle_attachments: default_toggle_attachments(),
@@ -176,6 +181,11 @@ fn default_toggle_planner() -> String {
 // F ("fleet") is free today.
 fn default_toggle_fleet() -> String {
     "CmdOrCtrl+Shift+F".to_string()
+}
+// The command-palette convention (Slack, Linear, Raycast). Plain Cmd+K is
+// otherwise unclaimed here.
+fn default_quick_capture() -> String {
+    "CmdOrCtrl+K".to_string()
 }
 fn default_toggle_profile() -> String {
     "CmdOrCtrl+Shift+P".to_string()
@@ -392,6 +402,9 @@ pub struct Settings {
     /// quick-add `@time` token on a todo without an estimate.
     #[serde(default = "default_planner_block_minutes")]
     pub planner_default_block_minutes: u32,
+    /// How priorities are labelled (Q1–Q4 or P1–P4, plus custom names).
+    #[serde(default)]
+    pub planner_priority: crate::todo::model::PriorityDisplay,
 
     // ── Fleet (Pro) ─────────────────────────────────────────────────────────
     /// Master switch for fleet observation: when on (and Pro is active), the
@@ -852,6 +865,7 @@ impl Default for Settings {
             planner_calendar_counts_against_capacity: true,
             planner_default_estimate_minutes: 0,
             planner_default_block_minutes: default_planner_block_minutes(),
+            planner_priority: Default::default(),
             fleet_enabled: false,
             fleet_briefs_enabled: true,
             fleet_retire_minutes: default_fleet_retire_minutes(),
@@ -2069,6 +2083,11 @@ pub struct UiState {
     pub planner_left_width: f64,
     #[serde(default = "default_planner_today_width")]
     pub planner_today_width: f64,
+    /// Per-list display order (sort lens + grouping), keyed by the planner's
+    /// `list_key()`: "today", "upcoming", "inbox", …, or "project:{id}".
+    /// Missing = Manual. A view preference, never written to the todos.
+    #[serde(default)]
+    pub planner_list_orders: std::collections::HashMap<String, crate::todo::views::ListOrder>,
     /// Default state for tool call Arguments section (expanded or collapsed)
     #[serde(default = "default_true", alias = "show_tool_arguments")]
     pub default_tool_arguments_open: bool,
@@ -2166,12 +2185,24 @@ fn default_planner_today_width() -> f64 {
     320.0
 }
 
+impl UiState {
+    /// Drop saved list orders for projects that no longer exist. Leftover
+    /// keys are harmless; this just keeps ui_state.json from accreting them.
+    pub fn prune_planner_list_orders(&mut self, live_project_ids: &[&str]) {
+        self.planner_list_orders.retain(|key, _| match key.strip_prefix("project:") {
+            Some(id) => live_project_ids.contains(&id),
+            None => true,
+        });
+    }
+}
+
 impl Default for UiState {
     fn default() -> Self {
         Self {
             settings_panel_width: 420.0, // Comfortable width for 1440px window
             planner_left_width: default_planner_left_width(),
             planner_today_width: default_planner_today_width(),
+            planner_list_orders: std::collections::HashMap::new(),
             default_tool_arguments_open: true,
             default_tool_response_open: false,
             default_tool_thought_open: false,
@@ -2364,6 +2395,26 @@ pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ui_state_without_list_orders_loads_manual() {
+        let mut state: UiState = serde_json::from_str(r#"{"settings_panel_width": 400.0}"#).unwrap();
+        assert!(state.planner_list_orders.is_empty(), "missing field = every list Manual");
+
+        use crate::todo::views::{ListOrder, SortKey};
+        let sorted = ListOrder { key: SortKey::Priority, ..Default::default() };
+        state.planner_list_orders.insert("today".into(), sorted);
+        state.planner_list_orders.insert("project:gone".into(), sorted);
+        state.planner_list_orders.insert("project:live".into(), sorted);
+        let json = serde_json::to_string(&state).unwrap();
+        let mut back: UiState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.planner_list_orders.get("today"), Some(&sorted));
+
+        back.prune_planner_list_orders(&["live"]);
+        assert!(back.planner_list_orders.contains_key("today"));
+        assert!(back.planner_list_orders.contains_key("project:live"));
+        assert!(!back.planner_list_orders.contains_key("project:gone"));
+    }
+
     /// Every Claude model slug used to fall through `get_default_model_icon`'s
     /// generic fallbacks with no dedicated branch at all — silently plausible
     /// (a Sonnet slug matching "pro" never occurs, so it landed on the bare
@@ -2438,7 +2489,7 @@ mod tests {
         // `default_claude_model_slots()` — kept as a literal here (rather
         // than importing the constant) precisely so a slug change is a
         // visible, reviewed diff in this test, not a silent pass-through.
-        assert_eq!(s.claude_config.model_slots[0], "claude-opus-5");
+        assert_eq!(s.claude_config.model_slots[0], "claude-opus-5-5");
     }
 
     #[test]
@@ -2906,5 +2957,6 @@ mod tests {
         });
         let restored: HotkeySettings = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.toggle_fleet, default_toggle_fleet());
+        assert_eq!(restored.quick_capture, "CmdOrCtrl+K");
     }
 }

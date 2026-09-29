@@ -33,6 +33,33 @@ pub(crate) enum PlannerSelection {
     Project(String),
 }
 
+impl PlannerSelection {
+    /// The key a list's display order is saved under in
+    /// `UiState.planner_list_orders`.
+    pub(crate) fn list_key(&self) -> String {
+        match self {
+            PlannerSelection::View(v) => v.as_str().to_string(),
+            PlannerSelection::Project(id) => format!("project:{id}"),
+        }
+    }
+
+    /// The built-in view, or `None` for a project list — the shape
+    /// `views::order_options` takes.
+    pub(crate) fn view(&self) -> Option<TodoView> {
+        match self {
+            PlannerSelection::View(v) => Some(*v),
+            PlannerSelection::Project(_) => None,
+        }
+    }
+}
+
+/// The list the Planner is showing, mirrored to an app-root context so
+/// surfaces mounted outside `PlannerView` (the ⌘K palette) can see it.
+/// `None` while the Planner is unmounted. Readers should `peek()`: the
+/// palette only samples it when it opens.
+#[derive(Clone, Copy)]
+pub(crate) struct PlannerFocusHint(pub(crate) Signal<Option<PlannerSelection>>);
+
 /// Which timeline block is selected on the Today rail. Provided at the
 /// PlannerView root (same pattern as TodoDetailContext) so a row's timebox
 /// chip can jump to Today with its block already highlighted.
@@ -236,6 +263,17 @@ pub fn PlannerView() -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let settings = use_context::<Signal<Settings>>();
     let selection = use_signal(|| PlannerSelection::View(TodoView::Today));
+
+    // Mirror the selection into the root hint. peek-and-set, so the effect
+    // tracks only `selection` (P-012: no read-write loop).
+    let mut focus_hint = use_context::<PlannerFocusHint>().0;
+    use_effect(move || {
+        let current = selection.read().clone();
+        if focus_hint.peek().as_ref() != Some(&current) {
+            focus_hint.set(Some(current));
+        }
+    });
+    use_drop(move || focus_hint.set(None));
 
     // Which todo's detail card is open (U2.1) — consumed by TodoRow's info
     // button and by the card rendered at this root.

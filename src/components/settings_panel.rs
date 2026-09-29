@@ -965,6 +965,60 @@ pub fn SettingsPanel() -> Element {
                                             }
                                         }
                                     }
+
+                                    // Priority naming: display only — P1 is Q1, so switching
+                                    // never rewrites a todo.
+                                    {
+                                        use crate::todo::model::{Priority, PriorityDisplay, PriorityScheme};
+                                        let scheme = local_settings.read().planner_priority.scheme;
+                                        rsx! {
+                                            div {
+                                                class: "mt-4 mb-1",
+                                                label { class: "block text-sm font-medium text-fg-muted mb-1", "Priority Labels" }
+                                                p { class: "text-xs text-fg-muted mb-1", "How the four priority levels read on rows, menus and band headers. Rename any level; blank uses the default. Rows take 1–4 (0 clears, p cycles) when focused." }
+                                                select {
+                                                    class: "mb-2 block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",
+                                                    onchange: move |e| {
+                                                        local_settings.write().planner_priority.scheme = if e.value() == "linear" {
+                                                            PriorityScheme::Linear
+                                                        } else {
+                                                            PriorityScheme::Eisenhower
+                                                        };
+                                                    },
+                                                    option { value: "eisenhower", selected: scheme == PriorityScheme::Eisenhower, "Eisenhower quadrants (Q1–Q4)" }
+                                                    option { value: "linear", selected: scheme == PriorityScheme::Linear, "Linear scale (P1–P4)" }
+                                                }
+                                                div {
+                                                    class: "grid grid-cols-[2.5rem_1fr] items-center gap-x-2 gap-y-1.5",
+                                                    for p in Priority::ALL {
+                                                        {
+                                                            let i = p.quadrant() as usize - 1;
+                                                            let display = local_settings.read().planner_priority.clone();
+                                                            let value = display.names.get(i).cloned().unwrap_or_default();
+                                                            rsx! {
+                                                                span { key: "b-{i}", class: "font-mono text-xs text-fg-muted", "{display.badge(p)}" }
+                                                                input {
+                                                                    key: "n-{i}",
+                                                                    r#type: "text",
+                                                                    class: "w-64 rounded border border-subtle bg-input px-3 py-1.5 text-sm text-fg",
+                                                                    placeholder: "{PriorityDisplay::default_name(scheme, p)}",
+                                                                    value: "{value}",
+                                                                    oninput: move |e| {
+                                                                        let mut s = local_settings.write();
+                                                                        let names = &mut s.planner_priority.names;
+                                                                        if names.len() < 4 {
+                                                                            names.resize(4, String::new());
+                                                                        }
+                                                                        names[i] = e.value();
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -984,6 +1038,8 @@ pub fn SettingsPanel() -> Element {
                                         p { "@morning  @evening    time-of-day group" }
                                         p { "*mon  *tomorrow       scheduled day" }
                                         p { "!fri  !tomorrow       deadline" }
+                                        p { "!!1…!!4  !!p1…!!p4    priority" }
+                                        p { "+hobbes  +hobbes-rc   project (slug or word prefix)" }
                                     }
                                 }
                             }
@@ -4503,6 +4559,15 @@ pub fn SettingsPanel() -> Element {
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_fleet.clone(),
                                             onchange: move |v: String| local_settings.write().hotkeys.toggle_fleet = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Quick Capture to Planner" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.quick_capture.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.quick_capture = v,
                                         }
                                     }
 

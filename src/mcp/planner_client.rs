@@ -52,6 +52,7 @@ impl PlannerClient {
                                         "time_of_day": { "type": "string", "enum": ["morning", "afternoon", "evening"], "description": "Rough slot within the scheduled day." },
                                         "deadline": { "type": "string", "description": "The day it is actually due (YYYY-MM-DD, 'today' or 'tomorrow')." },
                                         "estimate_minutes": { "type": "integer", "description": "Estimated focused minutes of work." },
+                                        "priority": { "type": "string", "enum": ["urgent_important", "important", "urgent", "neither"], "description": "Eisenhower quadrant: urgent_important (Q1, do first), important (Q2, schedule), urgent (Q3, delegate), neither (Q4, drop). Leave unset unless the user states or clearly implies it." },
                                         "project_id": { "type": "string", "description": "Id of an existing project to file it under." },
                                         "linked_session": { "type": "string", "description": "Fleet session carrying this todo: a session id from HOBBES_FLEET_STATUS, or a unique live session name." },
                                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Free-form tags." },
@@ -77,7 +78,7 @@ impl PlannerClient {
                     "Update one or more todos: patch any mutable field, or set 'status' to \
                     complete, cancel, or reopen them. Setting status to in_progress starts focus mode: only one todo is ever in focus, the previous one is paused automatically with its elapsed time banked. Setting status back to 'open' on an in-progress todo pauses its timer and banks the elapsed time — this is how you stop a focus timer you started. Pass an explicit JSON null to CLEAR an \
                     optional field (scheduled_for, time_of_day, deadline, estimate_minutes, \
-                    project_id) — omitted fields are left untouched. Replacing 'checklist' \
+                    priority, project_id) — omitted fields are left untouched. Replacing 'checklist' \
                     resets item completion. {}",
                     SHARED_NOTE
                 ).into()),
@@ -100,6 +101,7 @@ impl PlannerClient {
                                         "time_of_day": { "type": ["string", "null"], "enum": ["morning", "afternoon", "evening", null], "description": "null clears it." },
                                         "deadline": { "type": ["string", "null"], "description": "YYYY-MM-DD, 'today' or 'tomorrow'; null clears it." },
                                         "estimate_minutes": { "type": ["integer", "null"], "description": "null clears it." },
+                                        "priority": { "type": ["string", "null"], "enum": ["urgent_important", "important", "urgent", "neither", null], "description": "Eisenhower quadrant (Q1–Q4); null clears it." },
                                         "project_id": { "type": ["string", "null"], "description": "null clears it." },
                                         "linked_session": { "type": ["string", "null"], "description": "Fleet session carrying this todo (id from HOBBES_FLEET_STATUS or unique live name); null clears the link. Setting status to in_progress auto-links the calling session when unlinked." },
                                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Replaces the full tag list." },

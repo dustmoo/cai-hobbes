@@ -456,6 +456,7 @@ pub enum MenuAction {
     Mcp,
     Planner,
     Fleet,
+    QuickCapture,
     Profile,
     Attachments,
 }
@@ -539,6 +540,11 @@ fn app() -> Element {
     // bounded by human effort, so there is no lazy-loading path to justify.
     // Safe here: session_store::init() ran in main() before the app launched.
     let mut planner_state = use_context_provider(|| Signal::new(todo::PlannerState::load()));
+    // Which list the Planner is showing, for surfaces mounted outside it
+    // (the ⌘K palette pre-seeds its project from this).
+    use_context_provider(|| {
+        components::planner_view::PlannerFocusHint(Signal::new(None))
+    });
 
     // Fleet (Pro): the hook listener runs on plain tokio tasks with its
     // canonical state in `fleet::shared()` — this signal is a UI mirror fed
@@ -1617,6 +1623,7 @@ fn app() -> Element {
     let mut show_session_manager = use_signal(|| false);
     let mut show_settings_panel = use_signal(|| false);
     let mut show_mcp_manager = use_signal(|| false);
+    let mut show_quick_capture = use_signal(|| false);
     // The planner is its own tab in the tab bar, not a sidebar: `open` is
     // whether the tab exists, `active` whether it (vs. the selected session's
     // chat) fills the main column. Selecting any session tab deactivates the
@@ -2117,6 +2124,9 @@ fn app() -> Element {
                     tracing::info!("MenuAction::Fleet triggered");
                     chat_command.set(Some(ChatCommand::ToggleFleet));
                 }
+                MenuAction::QuickCapture => {
+                    chat_command.set(Some(ChatCommand::ToggleQuickCapture));
+                }
                 MenuAction::Profile => {
                     tracing::info!("MenuAction::Profile triggered");
                     chat_command.set(Some(ChatCommand::ToggleProfile));
@@ -2146,6 +2156,7 @@ fn app() -> Element {
                         "view_mcp" => Some(MenuAction::Mcp),
                         "view_planner" => Some(MenuAction::Planner),
                         "view_fleet" => Some(MenuAction::Fleet),
+                        "view_quick_capture" => Some(MenuAction::QuickCapture),
                         "view_profile" => Some(MenuAction::Profile),
                         "view_attachments" => Some(MenuAction::Attachments),
                         _ => None,
@@ -2716,6 +2727,10 @@ fn app() -> Element {
                         fleet_active.set(false);
                     }
                 }
+                ChatCommand::ToggleQuickCapture => {
+                    let open = *show_quick_capture.peek();
+                    show_quick_capture.set(!open);
+                }
                 ChatCommand::ToggleFleet => {
                     // Mirror of TogglePlanner: first invocation opens+focuses,
                     // then toggles; the ✕ is the only way to close the tab.
@@ -2858,6 +2873,8 @@ fn app() -> Element {
                     // cannot consume it directly. `StreamBridge` is mounted
                     // *inside* `StreamManager` specifically to bridge that gap.
                     StreamBridge {}
+                    // Cmd+K quick capture into the Planner, over any view.
+                    components::quick_capture::QuickCapture { open: show_quick_capture }
                     ConfirmDeleteModal {
                         is_visible: show_confirm_modal,
                         title: "Delete Session".to_string(),

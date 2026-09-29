@@ -126,9 +126,21 @@ const MIGRATION_V3: &str = "
     CREATE INDEX IF NOT EXISTS idx_todo_focus_sessions_start ON todo_focus_sessions(started_at);
 ";
 
+/// Eisenhower priority, denormalised from `data` like the other sortable
+/// fields. Existing rows keep NULL — the JSON has no `priority` key, which
+/// deserialises to `None` ("not triaged"), so no backfill is needed.
+const MIGRATION_V4: &str = "
+    ALTER TABLE todos ADD COLUMN priority TEXT;
+";
+
 /// Ordered migrations. Append only — never edit a shipped entry, since
 /// databases in the wild have already recorded it as applied.
-const MIGRATIONS: &[(i32, &str)] = &[(1, MIGRATION_V1), (2, MIGRATION_V2), (3, MIGRATION_V3)];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (1, MIGRATION_V1),
+    (2, MIGRATION_V2),
+    (3, MIGRATION_V3),
+    (4, MIGRATION_V4),
+];
 
 /// Create the planner schema and apply any pending migrations.
 ///
@@ -217,15 +229,16 @@ pub fn upsert_todo_conn(conn: &Connection, todo: &Todo, seq: i64) -> rusqlite::R
     })?;
     conn.execute(
         "INSERT INTO todos (id, title, status, bucket, project_id, area_id, scheduled_for,
-                            deadline, estimate_mins, sort_order, completed_at, updated_at, seq, data)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                            deadline, estimate_mins, sort_order, completed_at, updated_at, seq, data,
+                            priority)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(id) DO UPDATE SET
              title = excluded.title, status = excluded.status, bucket = excluded.bucket,
              project_id = excluded.project_id, area_id = excluded.area_id,
              scheduled_for = excluded.scheduled_for, deadline = excluded.deadline,
              estimate_mins = excluded.estimate_mins, sort_order = excluded.sort_order,
              completed_at = excluded.completed_at, updated_at = excluded.updated_at,
-             seq = excluded.seq, data = excluded.data
+             seq = excluded.seq, data = excluded.data, priority = excluded.priority
          WHERE excluded.seq >= todos.seq",
         params![
             todo.id,
@@ -242,6 +255,7 @@ pub fn upsert_todo_conn(conn: &Connection, todo: &Todo, seq: i64) -> rusqlite::R
             fmt_ts(&todo.updated_at),
             seq,
             data,
+            todo.priority.map(|p| p.as_str()),
         ],
     )?;
     Ok(())
@@ -546,6 +560,14 @@ pub fn delete_block(id: &str) -> Result<(), String> {
     with_conn(|conn| delete_by_id_conn(conn, "todo_blocks", id))
 }
 
+pub fn delete_focus_session_conn(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    delete_by_id_conn(conn, "todo_focus_sessions", id)
+}
+
+pub fn delete_focus_session(id: &str) -> Result<(), String> {
+    with_conn(|conn| delete_focus_session_conn(conn, id))
+}
+
 pub fn save_calendar_event(event: &CalendarEvent) -> Result<(), String> {
     let seq = next_seq();
     with_conn(|conn| upsert_calendar_event_conn(conn, event, seq))
@@ -572,7 +594,7 @@ pub fn delete_calendar_events_for_subscription(subscription_id: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::todo::model::{BlockSource, TodoBucket, TodoStatus};
+    use crate::todo::model::{BlockSource, Priority, TodoBucket, TodoStatus};
     use chrono::{NaiveDate, Utc};
 
     /// Planner tables land in the shared schema, so the session store's
@@ -1028,7 +1050,7 @@ mod tests {
         )
         .unwrap();
         // Pre-existing data must survive the upgrade.
-        upsert_todo_conn(&conn, &sample(), 1).unwrap();
+        insert_pre_v4_todo(&conn, &sample());
 
         create_schema(&conn).unwrap();
 
@@ -1132,6 +1154,21 @@ mod tests {
     }
 
     #[test]
+    fn delete_focus_session_conn_removes_the_row() {
+        with_db(|conn| {
+            let session = sample_session("fs_1");
+            upsert_focus_session_conn(conn, &session, 1).unwrap();
+            assert_eq!(load_all_conn(conn).unwrap().focus_sessions.len(), 1);
+
+            delete_focus_session_conn(conn, "fs_1").unwrap();
+            assert!(load_all_conn(conn).unwrap().focus_sessions.is_empty());
+
+            // Deleting an id that was never there is a no-op, not an error.
+            delete_focus_session_conn(conn, "fs_missing").unwrap();
+        });
+    }
+
+    #[test]
     fn a_stale_focus_session_write_cannot_clobber_a_newer_row() {
         with_db(|conn| {
             let mut newer = sample_session("fs_1");
@@ -1179,7 +1216,7 @@ mod tests {
             [],
         )
         .unwrap();
-        upsert_todo_conn(&conn, &sample(), 1).unwrap();
+        insert_pre_v4_todo(&conn, &sample());
 
         create_schema(&conn).unwrap();
 
@@ -1190,10 +1227,71 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
         assert_eq!(load_all_conn(&conn).unwrap().todos.len(), 1);
         upsert_focus_session_conn(&conn, &sample_session("fs_1"), 2).unwrap();
         assert_eq!(load_all_conn(&conn).unwrap().focus_sessions.len(), 1);
+    }
+
+    /// A todo row as a pre-v4 build wrote it: no `priority` column, and no
+    /// `priority` key in the JSON.
+    fn insert_pre_v4_todo(conn: &Connection, todo: &Todo) {
+        let mut data = serde_json::to_value(todo).unwrap();
+        data.as_object_mut().unwrap().remove("priority");
+        conn.execute(
+            "INSERT INTO todos (id, title, status, bucket, sort_order, updated_at, seq, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            params![
+                todo.id,
+                todo.title,
+                todo.status.as_str(),
+                todo.bucket.as_str(),
+                todo.sort_order,
+                fmt_ts(&todo.updated_at),
+                data.to_string(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_v4_adds_priority_and_old_rows_load_unset() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                 domain  TEXT PRIMARY KEY,
+                 version INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        for sql in [MIGRATION_V1, MIGRATION_V2, MIGRATION_V3] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO schema_migrations (domain, version) VALUES ('todo', 3)",
+            [],
+        )
+        .unwrap();
+        insert_pre_v4_todo(&conn, &sample());
+
+        create_schema(&conn).unwrap();
+
+        let loaded = load_all_conn(&conn).unwrap();
+        assert_eq!(loaded.todos.len(), 1);
+        assert_eq!(loaded.todos[0].priority, None, "old rows are not triaged");
+
+        // ...and a fresh write fills the new column.
+        let mut t = loaded.todos[0].clone();
+        t.priority = Some(Priority::Important);
+        upsert_todo_conn(&conn, &t, 2).unwrap();
+        let col: Option<String> = conn
+            .query_row("SELECT priority FROM todos WHERE id = ?1", params![t.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(col.as_deref(), Some("important"));
+        assert_eq!(
+            load_all_conn(&conn).unwrap().todos[0].priority,
+            Some(Priority::Important)
+        );
     }
 
     #[test]

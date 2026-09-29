@@ -12,8 +12,10 @@ use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
 use crate::components::planner_rows::{set_schedule, ScheduleChoice};
-use crate::components::planner_view::{mutate_todo, persist_block};
-use crate::todo::model::{self, ChecklistItem, TimeOfDay, TodoOrigin, TodoStatus};
+use crate::components::planner_view::{mutate_todo, persist_block, persist_focus_sessions};
+use crate::todo::model::{
+    self, ChecklistItem, FocusSession, Priority, TimeOfDay, TodoOrigin, TodoStatus,
+};
 use crate::todo::views;
 use crate::todo::PlannerState;
 
@@ -51,6 +53,19 @@ pub(crate) fn valid_tag(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
+/// A focus session's local start–end text, e.g. `"9:14 PM – 7:02 AM"`. A
+/// still-open session (no `ended_at`) reads `"9:14 PM – running"`.
+pub(crate) fn focus_time_range_label(
+    started_at: chrono::DateTime<chrono::Utc>,
+    ended_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    let start = started_at.with_timezone(&Local).format("%-I:%M %p").to_string();
+    match ended_at {
+        Some(end) => format!("{} – {}", start, end.with_timezone(&Local).format("%-I:%M %p")),
+        None => format!("{} – running", start),
+    }
+}
+
 #[component]
 pub fn TodoDetailCard() -> Element {
     let open = use_context::<TodoDetailContext>().0;
@@ -80,6 +95,13 @@ fn DetailCardInner(todo_id: String) -> Element {
         use_signal(|| estimate_input_value(seed.as_ref().and_then(|t| t.estimate_minutes)));
     let mut checklist_draft = use_signal(String::new);
     let mut tag_draft = use_signal(String::new);
+
+    // Time-entries editing: which focus session (if any) has its duration
+    // open as a text input, and the input's buffer.
+    let mut editing_session_id = use_signal(|| None::<String>);
+    let mut session_edit_buf = use_signal(String::new);
+    // Two-step "Remove?" confirm — armed for at most one session at a time.
+    let mut confirm_remove_id = use_signal(|| None::<String>);
 
     // If the todo disappears underneath (deleted from a row, by the AI, or
     // from another surface) the card must not keep editing a ghost.
@@ -165,6 +187,65 @@ fn DetailCardInner(todo_id: String) -> Element {
         }
     };
 
+    // Commits the session-edit buffer for whichever session is currently
+    // being edited. Junk/0 restores the buffer to the session's current
+    // minutes (mirrors `commit_estimate`) rather than guessing or exiting.
+    let commit_session_edit = move || {
+        let Some(session_id) = editing_session_id.peek().clone() else {
+            return;
+        };
+        let raw = session_edit_buf.peek().clone();
+        let current_minutes = planner
+            .peek()
+            .focus_sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.minutes);
+        match crate::todo::quick_add::parse_duration_minutes(raw.trim()) {
+            Some(m) if m > 0 => {
+                let result = {
+                    planner.write().set_focus_session_minutes(&session_id, m, chrono::Utc::now())
+                };
+                if let Some((session, todo)) = result {
+                    if let Err(e) = crate::todo::store::save_focus_session(&session) {
+                        tracing::error!(
+                            "planner: failed to save focus session {}: {}",
+                            session.id,
+                            e
+                        );
+                    }
+                    if let Err(e) = crate::todo::store::save_todo(&todo) {
+                        tracing::error!("planner: failed to save todo {}: {}", todo.id, e);
+                    }
+                }
+                persist_focus_sessions(&mut planner);
+                editing_session_id.set(None);
+            }
+            _ => {
+                session_edit_buf.set(estimate_input_value(current_minutes));
+            }
+        }
+    };
+
+    // Deletes a focus session outright (after the two-step confirm).
+    let delete_session = move |session_id: String| {
+        let result = { planner.write().delete_focus_session(&session_id, chrono::Utc::now()) };
+        if let Some((session, todo)) = result {
+            if let Err(e) = crate::todo::store::delete_focus_session(&session.id) {
+                tracing::error!(
+                    "planner: failed to delete focus session {}: {}",
+                    session.id,
+                    e
+                );
+            }
+            if let Err(e) = crate::todo::store::save_todo(&todo) {
+                tracing::error!("planner: failed to save todo {}: {}", todo.id, e);
+            }
+        }
+        persist_focus_sessions(&mut planner);
+        confirm_remove_id.set(None);
+    };
+
     let add_checklist_item = {
         let id = id.clone();
         move || {
@@ -224,7 +305,21 @@ fn DetailCardInner(todo_id: String) -> Element {
     let created_label =
         views::friendly_date(todo.created_at.with_timezone(&Local).date_naive(), today);
 
+    // Newest-first; this card's own entries only.
+    let mut sessions: Vec<FocusSession> = planner
+        .read()
+        .focus_sessions
+        .iter()
+        .filter(|s| s.todo_id == id)
+        .cloned()
+        .collect();
+    sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+
     let label_class = "pb-1 text-xs font-medium text-fg-muted";
+    let priority_display = use_context::<Signal<crate::settings::Settings>>()
+        .read()
+        .planner_priority
+        .clone();
     let input_class = "w-full rounded border border-subtle bg-input px-2 py-1.5 text-sm text-fg placeholder:text-fg-muted focus:outline-none focus:border-faint";
     let clear_class = "shrink-0 rounded px-2 py-1 text-xs text-fg-muted hover:bg-input hover:text-fg";
     let tod_options: [(&str, TimeOfDay); 3] = [
@@ -238,7 +333,7 @@ fn DetailCardInner(todo_id: String) -> Element {
             class: "fixed inset-0 z-50 flex items-center justify-center bg-black/70",
             onclick: move |_| open.set(None),
             div {
-                class: "flex max-h-[80vh] w-[480px] flex-col gap-4 overflow-y-auto rounded-lg border border-subtle bg-section p-5",
+                class: "relative flex max-h-[80vh] w-[480px] flex-col gap-4 overflow-y-auto rounded-lg border border-subtle bg-section p-5",
                 tabindex: "0",
                 autofocus: true,
                 onmounted: move |evt| {
@@ -249,13 +344,32 @@ fn DetailCardInner(todo_id: String) -> Element {
                 },
                 onkeydown: move |evt: KeyboardEvent| {
                     if evt.key() == Key::Escape {
-                        open.set(None);
+                        // Esc backs out of a pending "Remove?" before closing.
+                        if confirm_remove_id.peek().is_some() {
+                            confirm_remove_id.set(None);
+                        } else {
+                            open.set(None);
+                        }
                     }
                 },
-                onclick: move |e| e.stop_propagation(),
+                // A click anywhere else in the card disarms a pending "Remove?".
+                onclick: move |e| {
+                    e.stop_propagation();
+                    if confirm_remove_id.peek().is_some() {
+                        confirm_remove_id.set(None);
+                    }
+                },
+
+                button {
+                    class: "absolute right-3 top-3 z-10 rounded p-1 text-fg-muted hover:bg-input hover:text-fg",
+                    title: "Close (Esc)",
+                    onclick: move |_| open.set(None),
+                    Icon { width: 14, height: 14, icon: fi_icons::FiX }
+                }
 
                 // Title + status
                 div {
+                    class: "pr-7",
                     input {
                         class: "w-full rounded border border-subtle bg-input px-3 py-2 text-sm font-medium text-fg focus:outline-none focus:border-faint",
                         r#type: "text",
@@ -495,6 +609,39 @@ fn DetailCardInner(todo_id: String) -> Element {
                     }
                 }
 
+                // Priority — the Eisenhower quadrant (named per the user's scheme). Clicking the active
+                // segment clears it back to "not triaged".
+                div {
+                    p { class: "{label_class}", "Priority" }
+                    div {
+                        class: "grid grid-cols-4 gap-1",
+                        for p in Priority::ALL {
+                            {
+                                let active = todo.priority == Some(p);
+                                let id = id.clone();
+                                rsx! {
+                                    button {
+                                        key: "{p.as_str()}",
+                                        class: if active {
+                                            "rounded border border-subtle bg-btn-primary px-2 py-1 text-xs text-fg"
+                                        } else {
+                                            "rounded border border-faint px-2 py-1 text-xs text-fg-muted hover:bg-input hover:text-fg"
+                                        },
+                                        title: "{priority_display.describe(p)}",
+                                        onclick: move |_| {
+                                            mutate_todo(planner, &id, move |t| {
+                                                t.priority = if t.priority == Some(p) { None } else { Some(p) };
+                                            });
+                                        },
+                                        span { class: "font-mono", "{priority_display.badge(p)}" }
+                                        " {priority_display.short_name(p)}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Tags
                 div {
                     p { class: "{label_class}", "Tags" }
@@ -553,6 +700,128 @@ fn DetailCardInner(todo_id: String) -> Element {
                     }
                 }
 
+                // Time entries — only when this todo has any focus sessions.
+                if !sessions.is_empty() {
+                    div {
+                        p { class: "{label_class}", "Time entries" }
+                        div {
+                            class: "flex flex-col gap-1",
+                            for session in sessions.iter().cloned() {
+                                {
+                                    let session_id = session.id.clone();
+                                    let is_editing = editing_session_id.read().as_deref() == Some(session_id.as_str());
+                                    let is_confirming = confirm_remove_id.read().as_deref() == Some(session_id.as_str());
+                                    let is_open = session.ended_at.is_none();
+                                    let date_label = views::friendly_date(
+                                        session.started_at.with_timezone(&Local).date_naive(),
+                                        today,
+                                    );
+                                    let range_label = focus_time_range_label(session.started_at, session.ended_at);
+                                    let duration_label = model::format_minutes(session.minutes);
+                                    rsx! {
+                                        div {
+                                            key: "{session.id}",
+                                            class: "group flex items-center gap-2 rounded px-1 py-0.5 hover:bg-card",
+                                            div {
+                                                class: "min-w-0 flex-1",
+                                                div {
+                                                    class: "flex items-center gap-1.5 text-xs text-fg",
+                                                    span { "{date_label}" }
+                                                    span { class: "text-fg-muted", "·" }
+                                                    span { class: "text-fg-muted", "{range_label}" }
+                                                    if session.actor.is_agent() {
+                                                        span {
+                                                            class: "rounded-full bg-input px-1.5 py-0 text-[10px] uppercase tracking-wide text-fg-muted",
+                                                            "Agent"
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(unclamped) = session.unclamped_minutes {
+                                                    p {
+                                                        class: "text-[11px] text-fg-muted",
+                                                        "ran {model::format_minutes(unclamped)}, capped"
+                                                    }
+                                                }
+                                            }
+                                            if is_open {
+                                                span { class: "shrink-0 text-xs text-fg-muted", "running" }
+                                            } else if is_editing {
+                                                input {
+                                                    class: "w-20 shrink-0 rounded border border-subtle bg-input px-1.5 py-0.5 text-xs text-fg focus:outline-none focus:border-faint",
+                                                    r#type: "text",
+                                                    value: "{session_edit_buf}",
+                                                    autofocus: true,
+                                                    oninput: move |evt| session_edit_buf.set(evt.value()),
+                                                    onkeydown: {
+                                                        let mut commit = commit_session_edit;
+                                                        move |evt: KeyboardEvent| {
+                                                            if evt.key() == Key::Enter {
+                                                                evt.prevent_default();
+                                                                commit();
+                                                            } else if evt.key() == Key::Escape {
+                                                                evt.stop_propagation();
+                                                                editing_session_id.set(None);
+                                                            }
+                                                        }
+                                                    },
+                                                    onblur: {
+                                                        let mut commit = commit_session_edit;
+                                                        move |_| commit()
+                                                    },
+                                                }
+                                            } else {
+                                                button {
+                                                    class: "shrink-0 rounded px-1 text-xs text-fg-muted hover:bg-input hover:text-fg",
+                                                    title: "Edit duration",
+                                                    onclick: {
+                                                        let session_id = session_id.clone();
+                                                        let minutes = session.minutes;
+                                                        move |_| {
+                                                            session_edit_buf.set(estimate_input_value(Some(minutes)));
+                                                            editing_session_id.set(Some(session_id.clone()));
+                                                        }
+                                                    },
+                                                    "{duration_label}"
+                                                }
+                                            }
+                                            if !is_open {
+                                                if is_confirming {
+                                                    button {
+                                                        class: "shrink-0 rounded px-1.5 py-0.5 text-xs text-red-400 hover:text-red-300",
+                                                        // Stop the click reaching the card, which disarms.
+                                                        onclick: {
+                                                            let mut delete = delete_session;
+                                                            let session_id = session_id.clone();
+                                                            move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                delete(session_id.clone());
+                                                            }
+                                                        },
+                                                        "Remove?"
+                                                    }
+                                                } else {
+                                                    button {
+                                                        class: "shrink-0 rounded p-1 text-fg-muted opacity-0 group-hover:opacity-100 hover:text-red-400",
+                                                        title: "Remove entry",
+                                                        onclick: {
+                                                            let session_id = session_id.clone();
+                                                            move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                confirm_remove_id.set(Some(session_id.clone()));
+                                                            }
+                                                        },
+                                                        Icon { width: 12, height: 12, icon: fi_icons::FiTrash2 }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Read-only footer
                 div {
                     class: "flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-faint pt-3 text-xs text-fg-muted",
@@ -561,13 +830,6 @@ fn DetailCardInner(todo_id: String) -> Element {
                     }
                     span { "{origin_label}" }
                     span { "Created {created_label}" }
-                    div { class: "flex-1" }
-                    button {
-                        class: "rounded p-1 text-fg-muted hover:bg-input hover:text-fg",
-                        title: "Close (Esc)",
-                        onclick: move |_| open.set(None),
-                        Icon { width: 14, height: 14, icon: fi_icons::FiX }
-                    }
                 }
             }
         }
@@ -607,6 +869,22 @@ mod tests {
         assert_eq!(estimate_input_value(Some(90)), "1h30m");
         assert_eq!(estimate_input_value(Some(120)), "2h");
         assert_eq!(estimate_input_value(Some(45)), "45m");
+    }
+
+    #[test]
+    fn focus_time_range_label_formats_closed_and_open_sessions() {
+        use chrono::TimeZone;
+        // 2026-01-01 02:14 UTC / 10:02 UTC — exact local rendering depends on
+        // the test machine's timezone, so just check the shape and the join.
+        let start = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 2, 14, 0).unwrap();
+        let end = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 10, 2, 0).unwrap();
+
+        let closed = focus_time_range_label(start, Some(end));
+        assert!(closed.contains(" – "), "closed range must join with an en dash: {closed}");
+        assert!(!closed.contains("running"));
+
+        let open = focus_time_range_label(start, None);
+        assert!(open.ends_with(" – running"), "open session must read '… – running': {open}");
     }
 
     #[test]

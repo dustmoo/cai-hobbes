@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::components::shared::ToolCallStatus;
 
 use super::model::{
-    self, Area, BlockSource, CalendarEvent, ChecklistItem, DayPlan, Project, TimeBlock, TimeOfDay,
+    self, Area, BlockSource, CalendarEvent, ChecklistItem, DayPlan, Priority, Project, TimeBlock, TimeOfDay,
     Todo, TodoBucket, TodoOrigin, TodoStatus, SORT_STEP,
 };
 use super::views::{self, TodoView};
@@ -65,6 +65,15 @@ fn parse_time_of_day(raw: &str) -> Result<TimeOfDay, String> {
             raw
         )),
     }
+}
+
+fn parse_priority(raw: &str) -> Result<Priority, String> {
+    Priority::parse(raw).ok_or_else(|| {
+        format!(
+            "invalid priority '{}' — expected urgent_important, important, urgent, or neither",
+            raw
+        )
+    })
 }
 
 fn parse_status(raw: &str) -> Result<TodoStatus, String> {
@@ -246,6 +255,9 @@ fn build_todo(
     }
     if let Some(v) = obj.get("estimate_minutes").filter(|v| !v.is_null()) {
         todo.estimate_minutes = Some(parse_estimate(v)?);
+    }
+    if let Some(raw) = obj.get("priority").and_then(|v| v.as_str()) {
+        todo.priority = Some(parse_priority(raw)?);
     }
     if let Some(project_id) = obj.get("project_id").and_then(|v| v.as_str()) {
         if !state.projects.iter().any(|p| p.id == project_id) {
@@ -457,6 +469,7 @@ fn apply_todo_update(
         as_str_value(v).and_then(parse_time_of_day)
     })?;
     let estimate = patch_from(obj, "estimate_minutes", parse_estimate)?;
+    let priority = patch_from(obj, "priority", |v| as_str_value(v).and_then(parse_priority))?;
     let project_id = patch_from(obj, "project_id", |v| {
         as_str_value(v).map(str::to_string)
     })?;
@@ -500,6 +513,7 @@ fn apply_todo_update(
     deadline.apply(&mut todo.deadline);
     time_of_day.apply(&mut todo.time_of_day);
     estimate.apply(&mut todo.estimate_minutes);
+    priority.apply(&mut todo.priority);
     project_id.apply(&mut todo.project_id);
     linked_session.apply(&mut todo.linked_fleet_session);
     // Auto-link: agent focus starting on an unlinked todo binds it to the

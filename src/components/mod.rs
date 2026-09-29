@@ -37,6 +37,7 @@ pub mod planner_view;
 pub mod planner_rows;
 pub mod planner_timeline;
 pub mod todo_detail;
+pub mod quick_capture;
 pub mod quick_fix;
 pub mod shared;
 pub mod smithery_registry;

@@ -60,6 +60,9 @@ pub fn build_menu(_settings: &Settings) -> Menu {
 
     let fleet_item = MenuItem::with_id("view_fleet", "Fleet", true, None);
 
+    let quick_capture_item =
+        MenuItem::with_id("view_quick_capture", "Quick Capture…", true, None);
+
     let profile_item = MenuItem::with_id("view_profile", "Profile Selector", true, None);
 
     let attachments_item = MenuItem::with_id("view_attachments", "Add Attachments", true, None);
@@ -70,6 +73,7 @@ pub fn build_menu(_settings: &Settings) -> Menu {
             &mcp_item,
             &planner_item,
             &fleet_item,
+            &quick_capture_item,
             &profile_item,
             &attachments_item,
         ])

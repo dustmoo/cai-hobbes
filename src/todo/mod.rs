@@ -17,6 +17,7 @@ pub mod dispatch;
 pub mod handlers;
 pub mod ics;
 pub mod model;
+pub mod project_match;
 pub mod quick_add;
 pub mod store;
 pub mod views;
@@ -84,6 +85,107 @@ impl PlannerState {
             .fold(f64::NEG_INFINITY, f64::max)
             .max(0.0)
             + model::SORT_STEP
+    }
+
+    /// Drag in Manual: place `id` between two on-screen neighbours, writing
+    /// one row through [`model::sort_between`]. `list` is the list's open
+    /// rows in their on-screen order *after* the move; when the neighbours'
+    /// gap has collapsed it is renormalised onto a fresh ladder (starting at
+    /// its lowest existing slot, so it stays roughly where it was relative to
+    /// other lists) and every row in it is returned. Returns the ids to
+    /// persist.
+    pub fn move_between(
+        &mut self,
+        id: &str,
+        before: Option<&str>,
+        after: Option<&str>,
+        list: &[String],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<String> {
+        let slot = |state: &Self, n: Option<&str>| n.and_then(|n| state.todo(n)).map(|t| t.sort_order);
+        let (b, a) = (slot(self, before), slot(self, after));
+        if self.todo(id).is_none() {
+            return Vec::new();
+        }
+
+        if !model::needs_renormalise(b, a) {
+            let t = self.todo_mut(id).expect("checked above");
+            t.sort_order = model::sort_between(b, a);
+            t.updated_at = now;
+            return vec![id.to_string()];
+        }
+
+        let pos: std::collections::HashMap<&str, usize> =
+            list.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+        let mut rows: Vec<&mut Todo> = self
+            .todos
+            .iter_mut()
+            .filter(|t| pos.contains_key(t.id.as_str()))
+            .collect();
+        rows.sort_by_key(|t| pos[t.id.as_str()]);
+        let base = rows.iter().map(|t| t.sort_order).fold(f64::INFINITY, f64::min);
+        let base = if base.is_finite() { base } else { 0.0 };
+        model::renormalise(rows.iter_mut().map(|t| &mut **t));
+        for t in rows.iter_mut() {
+            t.sort_order += base;
+            t.updated_at = now;
+        }
+        rows.iter().map(|t| t.id.clone()).collect()
+    }
+
+    /// Drag in a sorted view: make `ids` (the on-screen order) the manual
+    /// order by permuting their *existing* sort_order slots, so the list's
+    /// position relative to todos outside it is untouched. (If two slots
+    /// have collapsed together they're first spread onto a ladder from the
+    /// lowest, which a permutation alone couldn't order.) Returns the prior
+    /// `(id, sort_order)` of every row that changed — the Undo record, and
+    /// the ids to persist.
+    pub fn adopt_order(
+        &mut self,
+        ids: &[String],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<(String, f64)> {
+        let ids: Vec<&String> = ids.iter().filter(|id| self.todo(id).is_some()).collect();
+        let mut slots: Vec<f64> = ids
+            .iter()
+            .filter_map(|id| self.todo(id).map(|t| t.sort_order))
+            .collect();
+        slots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if slots.windows(2).any(|w| w[1] - w[0] < model::SORT_MIN_GAP) {
+            let base = slots.first().copied().unwrap_or(0.0);
+            for (i, s) in slots.iter_mut().enumerate() {
+                *s = base + i as f64 * model::SORT_STEP;
+            }
+        }
+
+        let mut previous = Vec::new();
+        for (id, slot) in ids.into_iter().zip(slots) {
+            let t = self.todo_mut(id).expect("filtered above");
+            if t.sort_order != slot {
+                previous.push((id.clone(), t.sort_order));
+                t.sort_order = slot;
+                t.updated_at = now;
+            }
+        }
+        previous
+    }
+
+    /// Undo an [`adopt_order`](Self::adopt_order): put the recorded slots
+    /// back. Returns the ids to persist.
+    pub fn restore_order(
+        &mut self,
+        previous: &[(String, f64)],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<String> {
+        let mut changed = Vec::new();
+        for (id, slot) in previous {
+            if let Some(t) = self.todo_mut(id) {
+                t.sort_order = *slot;
+                t.updated_at = now;
+                changed.push(id.clone());
+            }
+        }
+        changed
     }
 
     /// The capacity a day is planned against: its stored `DayPlan` if the day
@@ -177,6 +279,87 @@ impl PlannerState {
             dirty.push(s.id.clone());
         }
         self.dirty_focus_sessions.extend(dirty);
+    }
+
+    /// Correct a closed session's banked minutes by hand (e.g. a timer left
+    /// running overnight). Only closed rows qualify — `None` if the session
+    /// is missing or still live, since a live row's minutes aren't banked
+    /// yet. `started_at` is kept and `ended_at` recomputed from it so the
+    /// row's interval stays internally consistent; `unclamped_minutes` is
+    /// cleared because the user has now stated the true figure, superseding
+    /// any earlier `sanitize_stale_focus` clamp note. The owning todo's
+    /// `actual_minutes` is adjusted by the delta (never recomputed from
+    /// scratch — it may also hold legacy minutes with no session row) and
+    /// its `updated_at` bumped. If the owning todo no longer exists the
+    /// session is left untouched and `None` is returned, since there would
+    /// be nowhere to bank the delta.
+    pub fn set_focus_session_minutes(
+        &mut self,
+        session_id: &str,
+        minutes: u32,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<(FocusSession, model::Todo)> {
+        let session = self
+            .focus_sessions
+            .iter()
+            .find(|s| s.id == session_id)?;
+        if session.is_open() {
+            return None;
+        }
+        let todo_id = session.todo_id.clone();
+        self.todo(&todo_id)?;
+        let old_minutes = session.minutes;
+
+        let s = self
+            .focus_sessions
+            .iter_mut()
+            .find(|s| s.id == session_id)?;
+        s.ended_at = Some(s.started_at + chrono::Duration::minutes(minutes as i64));
+        s.minutes = minutes;
+        s.unclamped_minutes = None;
+        let session_clone = s.clone();
+        self.dirty_focus_sessions.push(session_id.to_string());
+
+        let t = self.todo_mut(&todo_id)?;
+        if minutes >= old_minutes {
+            t.actual_minutes = t.actual_minutes.saturating_add(minutes - old_minutes);
+        } else {
+            t.actual_minutes = t.actual_minutes.saturating_sub(old_minutes - minutes);
+        }
+        t.updated_at = now;
+        let todo_clone = t.clone();
+
+        Some((session_clone, todo_clone))
+    }
+
+    /// Delete a closed session row entirely (e.g. an accidental timer that
+    /// should never have counted). Only closed rows qualify — `None` if the
+    /// session is missing or still live; the UI does not offer delete on a
+    /// running timer. Subtracts the row's banked minutes from the owning
+    /// todo's `actual_minutes` (saturating) and bumps `updated_at`. If the
+    /// owning todo no longer exists the row is still removed (it must not
+    /// linger), but `None` is returned since there's no todo to hand back.
+    pub fn delete_focus_session(
+        &mut self,
+        session_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<(FocusSession, model::Todo)> {
+        let idx = self
+            .focus_sessions
+            .iter()
+            .position(|s| s.id == session_id)?;
+        if self.focus_sessions[idx].is_open() {
+            return None;
+        }
+        let removed = self.focus_sessions.remove(idx);
+        self.dirty_focus_sessions.retain(|id| id != session_id);
+
+        let t = self.todo_mut(&removed.todo_id)?;
+        t.actual_minutes = t.actual_minutes.saturating_sub(removed.minutes);
+        t.updated_at = now;
+        let todo_clone = t.clone();
+
+        Some((removed, todo_clone))
     }
 
     /// Enter focus on one todo, pausing whichever held it before — at most one
@@ -475,6 +658,118 @@ impl PlannerState {
 mod tests {
     use super::*;
     use model::{BlockSource, TimeBlock, Todo};
+
+    fn at(id: &str, sort_order: f64) -> Todo {
+        let mut t = Todo::new(id, sort_order);
+        t.id = id.into();
+        t
+    }
+
+    fn manual_ids(state: &PlannerState) -> Vec<String> {
+        let mut ts: Vec<&Todo> = state.todos.iter().collect();
+        ts.sort_by(|a, b| a.sort_order.partial_cmp(&b.sort_order).unwrap());
+        ts.into_iter().map(|t| t.id.clone()).collect()
+    }
+
+    #[test]
+    fn move_between_writes_one_row() {
+        let now = chrono::Utc::now();
+        let mut state = PlannerState::default();
+        for (id, o) in [("a", 0.0), ("b", 1024.0), ("c", 2048.0)] {
+            state.upsert_todo(at(id, o));
+        }
+        let list: Vec<String> = ["a", "c", "b"].iter().map(|s| s.to_string()).collect();
+        let changed = state.move_between("c", Some("a"), Some("b"), &list, now);
+        assert_eq!(changed, vec!["c"]);
+        assert_eq!(manual_ids(&state), vec!["a", "c", "b"]);
+
+        // To the top: no neighbour above.
+        let changed = state.move_between("b", None, Some("a"), &list, now);
+        assert_eq!(changed, vec!["b"]);
+        assert_eq!(manual_ids(&state), vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn move_between_renormalises_a_collapsed_gap() {
+        let now = chrono::Utc::now();
+        let mut state = PlannerState::default();
+        for (id, o) in [("a", 5000.0), ("b", 5000.0 + 1e-9), ("c", 9000.0)] {
+            state.upsert_todo(at(id, o));
+        }
+        let list: Vec<String> = ["a", "c", "b"].iter().map(|s| s.to_string()).collect();
+        let changed = state.move_between("c", Some("a"), Some("b"), &list, now);
+        assert_eq!(changed.len(), 3, "the whole list is rewritten");
+        assert_eq!(manual_ids(&state), vec!["a", "c", "b"]);
+        assert_eq!(state.todo("a").unwrap().sort_order, 5000.0, "ladder starts at the lowest slot");
+        assert_eq!(state.todo("b").unwrap().sort_order, 5000.0 + 2.0 * model::SORT_STEP);
+    }
+
+    #[test]
+    fn adopt_order_reuses_existing_slots() {
+        let now = chrono::Utc::now();
+        let mut state = PlannerState::default();
+        // "x" is outside the list and sits between its members.
+        for (id, o) in [("a", 100.0), ("x", 150.0), ("b", 200.0), ("c", 300.0)] {
+            state.upsert_todo(at(id, o));
+        }
+        let before: Vec<f64> = ["a", "b", "c"].iter().map(|id| state.todo(id).unwrap().sort_order).collect();
+
+        let ids: Vec<String> = ["c", "a", "b"].iter().map(|s| s.to_string()).collect();
+        let previous = state.adopt_order(&ids, now);
+
+        let mut after: Vec<f64> = ["a", "b", "c"].iter().map(|id| state.todo(id).unwrap().sort_order).collect();
+        after.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(after, before, "the set of slots is unchanged");
+        assert_eq!(manual_ids(&state), vec!["c", "x", "a", "b"], "x keeps its slot");
+        assert_eq!(previous.len(), 3);
+
+        // Undo puts every slot back.
+        let restored = state.restore_order(&previous, now);
+        assert_eq!(restored.len(), 3);
+        assert_eq!(manual_ids(&state), vec!["a", "x", "b", "c"]);
+    }
+
+    #[test]
+    fn adopt_order_is_a_no_op_when_already_in_order() {
+        let mut state = PlannerState::default();
+        for (id, o) in [("a", 1.0), ("b", 2.0)] {
+            state.upsert_todo(at(id, o));
+        }
+        let ids: Vec<String> = vec!["a".into(), "b".into()];
+        assert!(state.adopt_order(&ids, chrono::Utc::now()).is_empty());
+    }
+
+    #[test]
+    fn ai_list_ignores_display_order() {
+        use crate::todo::views::{self, ArrangeInputs, GroupBy, ListOrder, SortDir, SortKey};
+        let today = chrono::Local::now().date_naive();
+        let mut state = PlannerState::default();
+        for (id, o, title) in [("a", 1.0, "zeta"), ("b", 2.0, "alpha")] {
+            let mut t = at(id, o);
+            t.title = title.into();
+            t.scheduled_for = Some(today);
+            t.bucket = model::TodoBucket::Anytime;
+            state.upsert_todo(t);
+        }
+        let before = handlers::handle_todo_list(&state, &serde_json::json!({}), today).1;
+
+        // Arranging for display is pure — it can't touch the state the
+        // AI's list reads, whatever the lens.
+        let slots = std::collections::HashMap::new();
+        let projects = std::collections::HashMap::new();
+        let inputs = ArrangeInputs { today, slots: &slots, projects: &projects, split_evening: true, bands: true };
+        let groups = views::arrange(
+            views::in_view(&state.todos, views::TodoView::Today, today),
+            Vec::new(),
+            ListOrder { key: SortKey::Title, dir: SortDir::Asc, group: GroupBy::None },
+            &inputs,
+        );
+        assert_eq!(groups[0].rows[0].title, "alpha");
+
+        let after = handlers::handle_todo_list(&state, &serde_json::json!({}), today).1;
+        assert_eq!(before, after);
+        assert!(after.find("zeta").unwrap() < after.find("alpha").unwrap(), "manual order");
+    }
 
     fn date(s: &str) -> chrono::NaiveDate {
         s.parse().unwrap()
@@ -895,6 +1190,114 @@ mod tests {
         assert_focus_invariant(&state);
         state.remove_todo(&id_b);
         assert_focus_invariant(&state);
+    }
+
+    #[test]
+    fn editing_a_closed_session_adjusts_actual_minutes_by_delta_and_ended_at() {
+        let now = chrono::Utc::now();
+        let mut state = PlannerState::default();
+        let mut t = Todo::new("overnight timer", 0.0);
+        t.id = "td_1".into();
+        // Legacy minutes with no session row behind them — must survive
+        // untouched, since actual_minutes is never recomputed from scratch.
+        t.actual_minutes = 10;
+        state.upsert_todo(t);
+
+        state.start_focus("td_1", now, model::FocusActor::Person);
+        let session_id = state.open_focus_session_for("td_1").unwrap().id.clone();
+        state.stop_focus(now); // banks 0 minutes (started == stopped == now)
+        assert_eq!(state.todo("td_1").unwrap().actual_minutes, 10);
+
+        let (session, todo) = state
+            .set_focus_session_minutes(&session_id, 480, now)
+            .expect("closed session edits");
+        assert_eq!(session.minutes, 480);
+        assert_eq!(session.ended_at, Some(session.started_at + chrono::Duration::minutes(480)));
+        assert_eq!(todo.actual_minutes, 10 + 480, "delta-adjusted, legacy minutes preserved");
+        assert_eq!(state.todo("td_1").unwrap().actual_minutes, 490);
+        assert_eq!(state.focus_sessions[0].minutes, 480);
+
+        // A second edit down to 30 subtracts the delta (450), not the total.
+        let (session2, todo2) = state.set_focus_session_minutes(&session_id, 30, now).unwrap();
+        assert_eq!(session2.minutes, 30);
+        assert_eq!(todo2.actual_minutes, 40, "10 legacy + 30 for the corrected session");
+    }
+
+    #[test]
+    fn editing_a_session_clears_unclamped_minutes() {
+        let now: chrono::DateTime<chrono::Utc> = "2026-08-13T09:00:00Z".parse().unwrap();
+        let mut state = PlannerState::default();
+        let mut t = Todo::new("forgotten overnight", 0.0);
+        t.id = "td_1".into();
+        t.status = model::TodoStatus::InProgress;
+        t.started_at = Some(now - chrono::Duration::hours(10));
+        state.upsert_todo(t);
+        state.focus_sessions.push(model::FocusSession::open(
+            "td_1",
+            now - chrono::Duration::hours(10),
+            model::FocusActor::Person,
+        ));
+
+        // Recover the stale session: clamps to 120 minutes and stamps
+        // `unclamped_minutes` with the real (dishonest) elapsed time.
+        state.sanitize_stale_focus(now);
+        let session_id = state.focus_sessions[0].id.clone();
+        assert_eq!(state.focus_sessions[0].minutes, 120);
+        assert!(state.focus_sessions[0].unclamped_minutes.is_some());
+
+        let (session, _) = state.set_focus_session_minutes(&session_id, 45, now).unwrap();
+        assert_eq!(session.minutes, 45);
+        assert!(
+            session.unclamped_minutes.is_none(),
+            "the user has now stated the truth, superseding the recovery clamp note"
+        );
+    }
+
+    #[test]
+    fn edit_and_delete_refuse_open_sessions() {
+        let now = chrono::Utc::now();
+        let mut state = PlannerState::default();
+        let mut t = Todo::new("in progress", 0.0);
+        t.id = "td_1".into();
+        state.upsert_todo(t);
+        state.start_focus("td_1", now, model::FocusActor::Person);
+        let session_id = state.open_focus_session_for("td_1").unwrap().id.clone();
+
+        assert!(state.set_focus_session_minutes(&session_id, 30, now).is_none());
+        assert!(state.delete_focus_session(&session_id, now).is_none());
+        assert!(state.focus_sessions.iter().any(|s| s.id == session_id && s.is_open()));
+
+        // Unknown ids are harmless no-ops too.
+        assert!(state.set_focus_session_minutes("nope", 30, now).is_none());
+        assert!(state.delete_focus_session("nope", now).is_none());
+    }
+
+    #[test]
+    fn deleting_a_session_subtracts_and_removes_the_row() {
+        let now = chrono::Utc::now();
+        let mut state = PlannerState::default();
+        let mut t = Todo::new("has a bad timer", 0.0);
+        t.id = "td_1".into();
+        t.actual_minutes = 10; // legacy minutes, no session behind them
+        state.upsert_todo(t);
+
+        state.start_focus("td_1", now, model::FocusActor::Person);
+        let session_id = state.open_focus_session_for("td_1").unwrap().id.clone();
+        state.stop_focus(now);
+        // Simulate a banked session (stop_focus closes at `now` == started,
+        // so bank some minutes by hand for the test).
+        state.focus_sessions[0].minutes = 60;
+        if let Some(t) = state.todo_mut("td_1") {
+            t.actual_minutes = 70; // 10 legacy + 60 banked
+        }
+
+        let rows_before = state.focus_sessions.len();
+        let (removed, todo) = state.delete_focus_session(&session_id, now).unwrap();
+        assert_eq!(removed.id, session_id);
+        assert_eq!(todo.actual_minutes, 10, "legacy minutes preserved, banked 60 subtracted");
+        assert_eq!(state.focus_sessions.len(), rows_before - 1);
+        assert!(!state.focus_sessions.iter().any(|s| s.id == session_id));
+        assert_eq!(state.todo("td_1").unwrap().actual_minutes, 10);
     }
 
     #[test]
