@@ -5,8 +5,9 @@ use super::super::planner_view::{persist_todo, today, PlannerSelection};
 use crate::settings::Settings;
 use crate::todo::PlannerState;
 use dioxus::prelude::*;
-use super::{PILL, META, POPOVER, MENU_ITEM, SECTION_HEADER, MENU_LABEL, MENU_RULE, QuickAdd, TodoList};
+use super::{PILL, META, POPOVER, MENU_ITEM, SECTION_HEADER, MENU_LABEL, MENU_RULE, TodoList};
 use super::helpers::{order_hint, view_title};
+use super::quick_add::{QuickAdd};
 use super::reorder::{AdoptUndo, bump_flip, flip_snap};
 
 #[component]
