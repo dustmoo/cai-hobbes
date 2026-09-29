@@ -7,10 +7,11 @@ use std::collections::HashMap;
 use crate::settings::Settings;
 use crate::todo::PlannerState;
 use dioxus::prelude::*;
-use super::{MENU_ITEM, MENU_LABEL, TodoRow};
+use super::{MENU_ITEM, MENU_LABEL};
 use super::centre::{GroupHeader};
 use super::helpers::{block_slots, empty_state_line, todos_for_selection};
 use super::reorder::{AdoptUndo, ListDrag, ListDragContext, Reorder, apply_move, bump_flip, drag_over_index, flip_snap, reorder_target};
+use super::row::{TodoRow};
 
 /// One rendered section of the list: a header (or none, for the lead
 /// section) and its rows, owned so the render doesn't borrow planner state.
