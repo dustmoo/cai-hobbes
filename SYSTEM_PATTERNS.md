@@ -199,6 +199,23 @@ For deeper documentation on specific subsystems:
 
 **Rule:** new settings tabs go in `tabs/<name>.rs` and receive shared state via `SettingsCtx` props, not new hooks. Any state that must survive switching tabs (drafts, collapse flags, modal state) is a hook in `SettingsPanel` passed down; calling `use_signal` inside a tab component resets it on every tab switch.
 
+### Module map: mcp/manager/
+
+`McpManager` is one type with several `impl McpManager` blocks, one per concern, in child modules (children can see the parent's private fields). Public paths are unchanged: everything is still `crate::mcp::manager::X`.
+
+| File | Owns |
+|------|------|
+| `mod.rs` | Types only, plus `new` and the small state accessors: consts (`COMPOSIO_NATIVE_PREFIX`, `HOBBES_*_SERVER`), `is_composio_native`, `is_builtin_virtual_server`, `McpServerConfig`, `McpContext`, `McpServerContext`, `ServerStatus`, `McpServerStatus`, `McpClientType`, `ActiveMcpClient`, `AuthRequiredInfo`, the `McpManager` struct; `new`, `inject_custom_credentials`, `set_initial_*`, `set_server_on_demand`/`set_server_loaded`, `is_server_loaded`, `get_client`. Re-exports the `pub(crate)` Composio key helpers. |
+| `lifecycle.rs` | Server start/stop: `launch_servers`, `retry_server`, `reconnect_stdio_server`, `install_mcp_server`, `load_server`, `unload_server`, `reload_config`, `clear_dynamic_tools_for`, terminal reaping/shutdown, `get_sane_path`, `get_critical_env_vars`, `is_auth_error`, `is_needs_setup_error`. |
+| `tool_call.rs` | Tool execution: `use_mcp_tool`, `process_tool_output`, `try_auth_recovery`, `get_local_meta_tools`, `score_tool_relevance`, `GEMINI_TOOL_LIMIT`. |
+| `composio.rs` | Composio key resolution and purge helpers (`composio_server_key`, `resolve_composio_key`, `ComposioKeyLookup`, `purge_composio_profile_state`, + their tests) and the profile/client methods: native client init/reinit, `find_composio_client`, `composio_client_for_profile`, `get_composio_toolkits`, `recreate_composio_server`, `initiate_composio_auth`. |
+| `composio_toolkits.rs` | Per-toolkit tool operations: `connect_toolkit`, `remove_toolkit`, `reload_composio_tools`, `set_composio_toolkit_tools`, `rollback_partial_connect`, `clear_dynamic_tools_for_toolkit`, `get_composio_toolkit_tool_state`. |
+| `config.rs` | `mcp_servers.json` persistence: `load_configs`, `save_configs`, `add_or_update_mcp_server`. |
+| `oauth.rs` | `start_oauth_flow`, `complete_oauth_flow`. |
+| `status.rs` | `get_mcp_context`, `get_all_server_statuses`, `invalidate_status_cache(_async)`. |
+
+**Rule:** new `McpManager` methods go in the module for their concern as a separate `impl McpManager` block; `mod.rs` holds types only. A private method called from a sibling module is `pub(super)` — no wider.
+
 ---
 
 *This document supersedes `memory-bank/systemPatterns.md` as of Beta release.*
@@ -233,7 +250,7 @@ After successful re-auth, `try_auth_recovery()` returns `is_error: Some(false)` 
 > - **Fallthrough after proactive reconnect**: Same issue — executes tool before token syncs → 401 → `try_auth_recovery` fires second reconnect
 > - **Case-sensitive cache keys**: `toolkit_account_map` keys must be **lowercase**. API slug casing varies between endpoints.
 
-**Location**: `src/mcp/composio_client/mod.rs` → `reconnect_toolkit()`, `src/mcp/manager.rs` → `try_auth_recovery()`
+**Location**: `src/mcp/composio_client/mod.rs` → `reconnect_toolkit()`, `src/mcp/manager/tool_call.rs` → `try_auth_recovery()`
 
 ---
 
@@ -258,7 +275,7 @@ All auth error detection is centralized in `ToolExecuteResponse::is_auth_error()
 
 `COMPOSIO_CLEAR_TOOLS` flushes the cache. `build_mcp_context()` includes dynamic cache as a virtual server.
 
-**Location**: `src/mcp/manager.rs`
+**Location**: `src/mcp/manager/tool_call.rs` (`use_mcp_tool`, `GEMINI_TOOL_LIMIT`)
 
 ---
 
