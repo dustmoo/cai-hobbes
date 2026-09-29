@@ -266,7 +266,8 @@ mod tests {
     use crate::fleet::{FleetOrigin, FleetSession, FleetStatus};
     use crate::todo::model::{FocusActor, FocusSession, Priority, Todo, TodoStatus};
     use crate::todo::views::{GroupBy, ListOrder, SortDir, SortKey};
-    use super::super::{DEFAULT_PROFILE_COLOR, DueTone, due_tone_class};
+    use super::super::schedule::{DueTone, due_tone_class};
+    use super::super::{DEFAULT_PROFILE_COLOR};
 
     fn fleet_session(origin: FleetOrigin, status: FleetStatus) -> FleetSession {
         let mut s = FleetSession {
