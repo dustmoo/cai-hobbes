@@ -11,8 +11,9 @@ use crate::settings::Settings;
 use crate::todo::store;
 use crate::todo::PlannerState;
 use dioxus::prelude::*;
-use super::{PILL, META, POPOVER, MENU_ITEM, MENU_LABEL, MENU_RULE, ProjectPicker};
+use super::{PILL, META, POPOVER, MENU_ITEM, MENU_LABEL, MENU_RULE};
 use super::helpers::{priority_tone_class, todos_for_selection};
+use super::list::{ProjectPicker};
 
 /// Where a quick-add surface's default project came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
