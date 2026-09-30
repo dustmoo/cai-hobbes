@@ -2180,6 +2180,14 @@ pub struct UiState {
     pub fleet_tab_open: bool,
     #[serde(default)]
     pub fleet_active: bool,
+    /// Show open tabs as a vertical list in a left sidebar instead of the
+    /// top strip (which then keeps only the app chrome). Off = the strip.
+    #[serde(default)]
+    pub tabs_as_sidebar: bool,
+    /// The tab sidebar's display order (sort lens + grouping). A view
+    /// preference, never written to `open_tabs`. Missing = open order.
+    #[serde(default)]
+    pub tab_sidebar_order: crate::tab_list::TabListOrder,
 }
 
 fn default_token_display_mode() -> String {
@@ -2228,6 +2236,8 @@ impl Default for UiState {
             planner_active: false,
             fleet_tab_open: false,
             fleet_active: false,
+            tabs_as_sidebar: false,
+            tab_sidebar_order: crate::tab_list::TabListOrder::default(),
             mcp_instructions_collapsed: false,
             composio_toolkit_expanded: false,
             selected_byoa_slug: None,
@@ -2422,6 +2432,26 @@ mod tests {
         assert!(back.planner_list_orders.contains_key("today"));
         assert!(back.planner_list_orders.contains_key("project:live"));
         assert!(!back.planner_list_orders.contains_key("project:gone"));
+    }
+
+    #[test]
+    fn ui_state_without_tab_sidebar_fields_keeps_the_top_strip() {
+        let state: UiState = serde_json::from_str(r#"{"settings_panel_width": 400.0}"#).unwrap();
+        assert!(!state.tabs_as_sidebar, "missing field = today's top tab strip");
+        assert!(state.tab_sidebar_order.is_manual());
+
+        use crate::tab_list::{TabGroupBy, TabListOrder, TabSortKey};
+        use crate::todo::views::SortDir;
+        let mut state = state;
+        state.tabs_as_sidebar = true;
+        state.tab_sidebar_order = TabListOrder {
+            key: TabSortKey::Recent,
+            dir: SortDir::Desc,
+            group: TabGroupBy::Project,
+        };
+        let back: UiState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(back.tabs_as_sidebar);
+        assert_eq!(back.tab_sidebar_order, state.tab_sidebar_order);
     }
 
     /// Every Claude model slug used to fall through `get_default_model_icon`'s

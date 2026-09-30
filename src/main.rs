@@ -50,6 +50,7 @@ mod session;
 mod session_events;
 mod session_store;
 mod str_utils;
+mod tab_list;
 mod timers;
 mod todo;
 mod usage_log;
