@@ -6,7 +6,7 @@ use super::reorder::{bump_flip, flip_snap, AdoptUndo};
 use super::{MENU_ITEM, MENU_LABEL, MENU_RULE, META, PILL, POPOVER, SECTION_HEADER};
 use crate::settings::Settings;
 use crate::todo::model::{self};
-use crate::todo::views::{self, GroupBy, ListOrder, SortDir, SortKey, TodoView};
+use crate::todo::views::{self, ListOrder, OrderGroup, OrderKey, SortDir, TodoView};
 use crate::todo::PlannerState;
 use chrono::{Local, Utc};
 use dioxus::prelude::*;
@@ -199,22 +199,32 @@ pub(crate) fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
 /// The toolbar pill + popover. Reads "Manual ▾" when idle; lit primary with
 /// its own direction arrow and a × when any lens is on. Owns no order state:
 /// the order lives in CentreColumn so TodoList and the control agree.
+///
+/// Generic over the list's key/group vocabulary so the tab sidebar
+/// (`tab_list::TabListOrder`) shares this exact control; the idle label is
+/// the key type's own manual label (`K::default()`).
 #[component]
-fn ListOrderControl(
-    order: Signal<ListOrder>,
+pub(crate) fn ListOrderControl<K: OrderKey, G: OrderGroup>(
+    order: Signal<ListOrder<K, G>>,
     /// Keys valid for this list (see `views::order_options`).
-    keys: Vec<SortKey>,
+    keys: Vec<K>,
     /// Group options valid for this list; empty hides the Group section.
-    groups: Vec<GroupBy>,
-    on_change: EventHandler<ListOrder>,
+    groups: Vec<G>,
+    on_change: EventHandler<ListOrder<K, G>>,
 ) -> Element {
     let mut open = use_signal(|| false);
     let current = *order.read();
-    let pill_label = match (current.key, current.group) {
-        (SortKey::Manual, GroupBy::None) => "Manual".to_string(),
-        (SortKey::Manual, g) => format!("By {}", g.label().to_lowercase()),
-        (k, GroupBy::None) => k.label().to_string(),
-        (k, g) => format!("{} · {}", k.label(), g.label().to_lowercase()),
+    let manual = K::default();
+    let ungrouped = G::default();
+    let pill_label = match (current.key == manual, current.group == ungrouped) {
+        (true, true) => manual.label().to_string(),
+        (true, false) => format!("By {}", current.group.label().to_lowercase()),
+        (false, true) => current.key.label().to_string(),
+        (false, false) => format!(
+            "{} · {}",
+            current.key.label(),
+            current.group.label().to_lowercase()
+        ),
     };
     let arrow = if current.dir == SortDir::Asc {
         "↑"
@@ -226,7 +236,7 @@ fn ListOrderControl(
         .dir_label(current.dir.flipped())
         .map(|l| format!("Flip to {}", l.to_lowercase()))
         .unwrap_or_default();
-    let mut pick = move |next: ListOrder| {
+    let mut pick = move |next: ListOrder<K, G>| {
         open.set(false);
         if next != current {
             on_change.call(next);
@@ -241,7 +251,7 @@ fn ListOrderControl(
                     class: "{PILL} hover:text-fg hover:border-subtle",
                     title: "Sort and group this list",
                     onclick: move |_| open.toggle(),
-                    "Manual ▾"
+                    "{manual.label()} ▾"
                 }
             } else {
                 span {
@@ -252,7 +262,7 @@ fn ListOrderControl(
                         onclick: move |_| open.toggle(),
                         "{pill_label}"
                     }
-                    if current.key != SortKey::Manual {
+                    if current.key != manual {
                         button {
                             class: "font-mono hover:text-fg",
                             title: "{flip_title}",
@@ -263,7 +273,7 @@ fn ListOrderControl(
                     button {
                         class: "rounded-full px-1 hover:text-fg hover:bg-input",
                         title: "Back to manual order",
-                        onclick: move |_| pick(ListOrder::default()),
+                        onclick: move |_| pick(ListOrder::<K, G>::default()),
                         "×"
                     }
                 }
@@ -289,7 +299,7 @@ fn ListOrderControl(
                             }
                         }
                     }
-                    if current.key != SortKey::Manual {
+                    if current.key != manual {
                         div { class: "{MENU_RULE}" }
                         div { class: "{MENU_LABEL}", "Direction" }
                         for d in [SortDir::Asc, SortDir::Desc] {
