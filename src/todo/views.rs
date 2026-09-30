@@ -1090,7 +1090,7 @@ mod tests {
         );
         assert_eq!(titles(sections.daytime), vec!["a", "b"]);
         assert_eq!(groups[1].label.as_deref(), Some("This evening"));
-        assert!(ListOrder::default().is_manual());
+        assert!(<ListOrder>::default().is_manual());
     }
 
     #[test]
@@ -1339,7 +1339,7 @@ mod tests {
         let json = serde_json::to_string(&o).unwrap();
         assert_eq!(serde_json::from_str::<ListOrder>(&json).unwrap(), o);
         assert_eq!(serde_json::from_str::<ListOrder>("{}").unwrap(), ListOrder::default());
-        assert_eq!(ListOrder::default().key, SortKey::Manual);
+        assert_eq!(<ListOrder>::default().key, SortKey::Manual);
 
         // A key the list doesn't offer falls back to Manual.
         let (keys, groups) = order_options(Some(TodoView::Inbox));
