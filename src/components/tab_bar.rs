@@ -58,6 +58,11 @@ pub struct TabBarProps {
     pub fleet_attention: usize,
     pub on_select_fleet: EventHandler<()>,
     pub on_close_fleet: EventHandler<()>,
+    /// False when the tab sidebar is listing the tabs
+    /// (`UiState::tabs_as_sidebar`): the strip then keeps only its app
+    /// chrome — tiger menu, History/MCP, new tab.
+    #[props(default = true)]
+    pub show_tabs: bool,
 }
 
 pub fn TabBar(props: TabBarProps) -> Element {
@@ -212,7 +217,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
             // container queries hide, so it always shows every layer
             // regardless of width, same guarantee as before.
             {
-                rsx! {
+                props.show_tabs.then(|| rsx! {
                     for (idx, session_id) in props.open_tabs.iter().enumerate() {
                         {
                     // A session tab is never shown active while the planner tab
@@ -470,12 +475,12 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     }
                 }
                 }
-            }
+            })
             }
 
             // Planner tab — a pinned app view, not a session: no rename, and
             // closing it never touches session state.
-            if props.planner_tab_open {
+            if props.show_tabs && props.planner_tab_open {
                 div {
                     class: if props.planner_active {
                         "group relative flex items-center h-full px-3 cursor-pointer shrink-0 select-none bg-card border-b-2 border-b-primary-500"
@@ -510,7 +515,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
 
             // Fleet tab — same pinned-app-view idiom as the planner, plus an
             // attention badge (sessions waiting on the user).
-            if props.fleet_tab_open {
+            if props.show_tabs && props.fleet_tab_open {
                 div {
                     class: if props.fleet_active {
                         "group relative flex items-center h-full px-3 cursor-pointer shrink-0 select-none bg-card border-b-2 border-b-primary-500"

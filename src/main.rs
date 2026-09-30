@@ -1638,6 +1638,11 @@ fn app() -> Element {
         // Never restore both views active; planner wins the tie.
         ui_state.peek().fleet_active && !ui_state.peek().planner_active
     });
+    // Tabs as a left sidebar list instead of the top strip — a display
+    // preference toggled from Settings at runtime. Memoised so the frequent
+    // unrelated `ui_state` writes (tab persistence, widths) don't re-render
+    // the whole app; only a flip of this flag does.
+    let tabs_as_sidebar = use_memo(move || ui_state.read().tabs_as_sidebar);
     let mut settings_panel_width = use_signal(|| ui_state.read().settings_panel_width);
     let mut is_dragging = use_signal(|| false);
     let mut drag_start_info = use_signal(|| (0.0, 0.0)); // (start_x, start_width)
@@ -2316,6 +2321,9 @@ fn app() -> Element {
                 let scale_factor = window.scale_factor();
                 let logical_size = current_physical_size.to_logical::<f64>(scale_factor);
 
+                // The tab sidebar is deliberately not counted: unlike these
+                // panels it is still showing at the next launch, so it's part
+                // of the window's normal content width.
                 let sidebar_visible = *show_session_manager.read()
                     || *show_settings_panel.read()
                     || *show_mcp_manager.read();
@@ -2929,6 +2937,71 @@ fn app() -> Element {
                                 // When the user releases the mouse, save the last known size.
 
 
+                            // Tab list sidebar (UiState::tabs_as_sidebar). Not part of
+                            // the History/Settings/MCP group below: those are transient
+                            // tool panels sharing one width slot and one divider, while
+                            // this is persistent navigation — it stays put, at a fixed
+                            // width, and a tool panel opens to its right. Same open-tabs
+                            // state and handlers as the TabBar further down.
+                            if tabs_as_sidebar() {
+                                div {
+                                    class: "h-full shrink-0",
+                                    {
+                                        let tabs = open_tabs.read();
+                                        let state = session_state.read();
+                                        let entries: Vec<components::tab_sidebar::TabSidebarEntry> = tabs.iter().map(|id| {
+                                            let s = state.sessions.get(id);
+                                            let last_updated = s.map(|s| s.last_updated).unwrap_or_else(chrono::Utc::now);
+                                            components::tab_sidebar::TabSidebarEntry {
+                                                session_id: id.clone(),
+                                                title: s.map(|s| s.display_title()).unwrap_or_else(|| "New Session".to_string()),
+                                                emoji: s.and_then(|s| s.tab_emoji.clone()),
+                                                date: s.map(|s| s.short_date()).unwrap_or_default(),
+                                                topic: s.and_then(|s| s.tab_topic()),
+                                                profile: s.and_then(|s| {
+                                                    settings.read().resolve_session_profile_display_name(
+                                                        s.composio_profile.as_deref(),
+                                                    )
+                                                }),
+                                                project_id: s.and_then(|s| s.project_id.clone()),
+                                                last_updated,
+                                                started: s.and_then(|s| s.messages.first()).map(|m| m.created_at).unwrap_or(last_updated),
+                                            }
+                                        }).collect();
+                                        rsx! {
+                                            components::tab_sidebar::TabSidebar {
+                                                tabs: entries,
+                                                active_tab_index: *active_tab_index.read(),
+                                                on_select_tab: switch_tab_fn,
+                                                on_close_tab: close_tab_fn,
+                                                on_new_tab: move |_| new_tab_fn(),
+                                                planner_tab_open: *planner_tab_open.read(),
+                                                planner_active: *planner_active.read(),
+                                                on_select_planner: move |_| {
+                                                    planner_active.set(true);
+                                                    fleet_active.set(false);
+                                                },
+                                                on_close_planner: move |_| {
+                                                    planner_active.set(false);
+                                                    planner_tab_open.set(false);
+                                                },
+                                                fleet_tab_open: *fleet_tab_open.read(),
+                                                fleet_active: *fleet_active.read(),
+                                                fleet_attention: fleet_state.read().attention_count(),
+                                                on_select_fleet: move |_| {
+                                                    fleet_active.set(true);
+                                                    planner_active.set(false);
+                                                },
+                                                on_close_fleet: move |_| {
+                                                    fleet_active.set(false);
+                                                    fleet_tab_open.set(false);
+                                                },
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             // Session Manager Sidebar
                             if *show_session_manager.read() {
                                 div {
@@ -3088,6 +3161,7 @@ fn app() -> Element {
                                                 fleet_active.set(false);
                                                 fleet_tab_open.set(false);
                                             },
+                                            show_tabs: !tabs_as_sidebar(),
                                         }
                                     }
                                 }
