@@ -50,6 +50,19 @@ const MAX_EXEC_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_TAIL_TIMEOUT_SECS: u64 = 5;
 const MAX_TAIL_TIMEOUT_SECS: u64 = 60;
 
+/// Appended to PATH when present and missing: `zsh -f` skips ~/.zshrc, which
+/// is where rustup/cargo, pipx and Homebrew usually land, so a login-only PATH
+/// misses `cargo`, `claude`, etc.
+const PATH_FIXUP: &str = "for d in \"$HOME/.cargo/bin\" \"$HOME/.local/bin\" /opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin; do \
+[ -d \"$d\" ] && case \":$PATH:\" in *\":$d:\"*) ;; *) PATH=\"$PATH:$d\";; esac; done; export PATH;";
+
+/// `hobbes_detach LOGFILE cmd args…` — start a fully detached process: new
+/// session (no controlling tty, so no SIGHUP when the shell or pty goes away
+/// and `/dev/tty` opens fail), own process group, stdin from /dev/null,
+/// stdout+stderr appended to LOGFILE. macOS has no `setsid(1)`, so perl does it.
+const DETACH_FN: &str = "hobbes_detach() { local _log=\"$1\"; shift; \
+perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; exec @ARGV or exit 127' \"$@\" </dev/null >>\"$_log\" 2>&1 & disown 2>/dev/null; };";
+
 /// Per-call session context resolved by the CALLER — the manager has no
 /// SessionState/PlannerState, so the call site passes the chat session id,
 /// resolved working directory, and project. Built for EVERY tool call now
@@ -620,6 +633,8 @@ fn spawn_shell(cwd: &str, init_sentinel: &str) -> Result<PtySession, String> {
          stty -echo 2>/dev/null; export TERM=dumb; \
          [ -f /etc/zprofile ] && source /etc/zprofile >/dev/null 2>&1; \
          [ -f \"$HOME/.zprofile\" ] && source \"$HOME/.zprofile\" >/dev/null 2>&1; \
+         {PATH_FIXUP} \
+         {DETACH_FN} \
          printf '\\n{init_sentinel} %d\\n' $?"
     ))?;
     Ok(session)
@@ -911,7 +926,10 @@ impl TerminalClient {
                      PATH). The shell survives between calls — cd, exports, and \
                      virtualenvs persist. Starts in the session's project directory. \
                      Returns output and exit code; long commands return partial state \
-                     with guidance to HOBBES_TERMINAL_TAIL."
+                     with guidance to HOBBES_TERMINAL_TAIL. To start a long-lived background \
+                     process that must outlive the shell and HOBBES_TERMINAL_RESET, use \
+                     `hobbes_detach LOGFILE cmd args…` (own session, no tty, stdin from \
+                     /dev/null) instead of `nohup … &`."
                         .into(),
                 ),
                 input_schema: Arc::new(
@@ -1479,5 +1497,138 @@ mod tests {
         let mut small = vec![1u8, 2];
         assert!(!trim_front(&mut small, 16));
         assert_eq!(small, vec![1, 2]);
+    }
+    fn bg_ctx(id: &str) -> TerminalCtx {
+        TerminalCtx {
+            session_id: id.into(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            project_id: None,
+        }
+    }
+
+    /// Run `cmd`, asserting EXEC returns (finished, not "still running")
+    /// well inside its timeout.
+    async fn exec_finishes(client: &TerminalClient, ctx: &TerminalCtx, cmd: &str) -> String {
+        let args = serde_json::json!({"command": cmd, "timeout_secs": 8});
+        let out = client.exec(ctx, &args).await.unwrap();
+        assert!(!out.contains("still running"), "`{cmd}` hung: {out}");
+        out
+    }
+
+    #[tokio::test]
+    async fn exec_returns_with_background_children() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("bg1");
+        for cmd in [
+            "sleep 120 &",
+            "(sleep 121 &) ; echo done-subshell",
+            "nohup sleep 122 </dev/null >/dev/null 2>&1 & disown",
+            "sleep 123 & disown; echo disowned",
+            // opens the controlling tty like `claude` does
+            "(sh -c 'exec 3</dev/tty; sleep 124' </dev/null >/dev/null 2>&1 &) ; echo tty-child",
+            "python3 -c \"import os; open('/dev/tty','w').write('x')\" & disown",
+        ] {
+            exec_finishes(&client, &ctx, cmd).await;
+        }
+        // The shell is still usable afterwards.
+        let out = exec_finishes(&client, &ctx, "echo still-alive").await;
+        assert!(out.contains("still-alive"), "{out}");
+        client.shutdown_all().await;
+    }
+
+    /// A background child that READS the controlling tty (as an interactive
+    /// CLI probing for a terminal does). In a subshell (the `cwd` wrapper) it
+    /// stays in the foreground process group and would race zsh for the
+    /// sentinel line we type next.
+    #[tokio::test]
+    async fn exec_survives_background_tty_reader() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("bg2");
+        let reader = "sh -c 'cat </dev/tty >/dev/null' </dev/null >/dev/null 2>&1";
+        exec_finishes(&client, &ctx, &format!("{reader} & disown")).await;
+        exec_finishes(&client, &ctx, &format!("({reader} &)")).await;
+        let args = serde_json::json!({
+            "command": format!("{reader} & disown"),
+            "cwd": "/tmp",
+            "timeout_secs": 8
+        });
+        let out = client.exec(&ctx, &args).await.unwrap();
+        assert!(!out.contains("still running"), "cwd-wrapped hung: {out}");
+        // Give the readers time to start blocking on the tty, then keep going:
+        // later commands must not be swallowed by them.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for i in 0..3 {
+            let out = exec_finishes(&client, &ctx, &format!("echo after-reader-{i}")).await;
+            assert!(out.contains(&format!("after-reader-{i}")), "{out}");
+        }
+        client.shutdown_all().await;
+    }
+
+    /// Manual repro with the real CLI: `cargo test --release -- --ignored real_claude`.
+    #[tokio::test]
+    #[ignore]
+    async fn real_claude_background_spawn() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("bg-claude");
+        let out = exec_finishes(
+            &client,
+            &ctx,
+            "nohup claude -p 'say hi' </dev/null > /tmp/hobbes-bg-claude.log 2>&1 & disown",
+        )
+        .await;
+        eprintln!("first: {out}");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let out = exec_finishes(&client, &ctx, "echo next; stty -a | head -3").await;
+        eprintln!("second: {out}");
+        client.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn shell_path_includes_cargo_bin() {
+        let Some(home) = dirs::home_dir() else { return };
+        let cargo_bin = home.join(".cargo/bin");
+        if !cargo_bin.is_dir() {
+            return;
+        }
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("bg-path");
+        let out = exec_finishes(&client, &ctx, "echo $PATH").await;
+        assert!(out.contains(".cargo/bin"), "PATH lacks ~/.cargo/bin: {out}");
+        client.shutdown_all().await;
+    }
+
+    /// `hobbes_detach` children live in their own session: no controlling
+    /// tty, and RESET (which kills the shell and closes the pty) leaves them.
+    #[tokio::test]
+    async fn detached_spawn_survives_reset_without_tty() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("bg-detach");
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let log = std::env::temp_dir().join(format!("hobbes-detach-{tag}.log"));
+        let log_s = log.to_string_lossy().into_owned();
+        exec_finishes(
+            &client,
+            &ctx,
+            &format!(
+                "hobbes_detach {log_s} sh -c 'if (: </dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi; sleep 3; echo ALIVE_{tag}'"
+            ),
+        )
+        .await;
+        // Reset immediately: the child must outlive the shell.
+        client
+            .execute_tool("HOBBES_TERMINAL_RESET", serde_json::json!({}), Some(ctx.clone()))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains(&format!("ALIVE_{tag}")) {
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&log);
+        assert!(text.contains("NO_TTY"), "child had a tty: {text:?}");
+        assert!(text.contains(&format!("ALIVE_{tag}")), "child killed by RESET: {text:?}");
     }
 }
