@@ -18,6 +18,7 @@ pub mod skill_editor;
 pub mod stream_manager;
 pub mod syntax_highlighter;
 pub mod tab_bar;
+pub mod tab_sidebar;
 pub mod tool_call_display;
 
 pub mod builtin_tools;

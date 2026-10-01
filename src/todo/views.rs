@@ -330,31 +330,62 @@ impl GroupBy {
     }
 }
 
+/// A sort key a [`ListOrder`] can carry. `Default` must be the list's own
+/// manual order — the one with no direction and no indicator.
+pub trait OrderKey: Copy + Eq + Default + 'static {
+    fn label(self) -> &'static str;
+    fn dir_label(self, dir: SortDir) -> Option<&'static str>;
+}
+
+/// A grouping a [`ListOrder`] can carry. `Default` must be "no grouping".
+pub trait OrderGroup: Copy + Eq + Default + 'static {
+    fn label(self) -> &'static str;
+}
+
+impl OrderKey for SortKey {
+    fn label(self) -> &'static str {
+        SortKey::label(self)
+    }
+    fn dir_label(self, dir: SortDir) -> Option<&'static str> {
+        SortKey::dir_label(self, dir)
+    }
+}
+
+impl OrderGroup for GroupBy {
+    fn label(self) -> &'static str {
+        GroupBy::label(self)
+    }
+}
+
 /// How one list is ordered on screen. A lens: never written to todos.
+///
+/// Generic so other lists (the tab sidebar's `tab_list::TabListOrder`) share
+/// the same lens shape and the same `ListOrderControl`; the defaults keep
+/// every planner use a plain `ListOrder`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ListOrder {
+pub struct ListOrder<K = SortKey, G = GroupBy> {
     #[serde(default)]
-    pub key: SortKey,
+    pub key: K,
     #[serde(default)]
     pub dir: SortDir,
     #[serde(default)]
-    pub group: GroupBy,
+    pub group: G,
 }
 
-impl ListOrder {
+impl<K: OrderKey, G: OrderGroup> ListOrder<K, G> {
     /// The default state: no indicator, drag handles live.
     pub fn is_manual(&self) -> bool {
-        self.key == SortKey::Manual && self.group == GroupBy::None
+        self.key == K::default() && self.group == G::default()
     }
 
     /// Drop anything this list doesn't offer (a stored Time sort on a list
     /// that no longer has it, say) back to its default.
-    pub fn sanitized(self, keys: &[SortKey], groups: &[GroupBy]) -> Self {
-        let key = if keys.contains(&self.key) { self.key } else { SortKey::Manual };
-        let group = if groups.contains(&self.group) { self.group } else { GroupBy::None };
+    pub fn sanitized(self, keys: &[K], groups: &[G]) -> Self {
+        let key = if keys.contains(&self.key) { self.key } else { K::default() };
+        let group = if groups.contains(&self.group) { self.group } else { G::default() };
         // Manual has no direction; keep the stored one from leaking into
         // equality checks.
-        let dir = if key == SortKey::Manual { SortDir::Asc } else { self.dir };
+        let dir = if key == K::default() { SortDir::Asc } else { self.dir };
         ListOrder { key, dir, group }
     }
 }
@@ -450,7 +481,7 @@ fn fold_char(c: char) -> char {
 /// A title chunk for natural ordering. Variant order matters: numbers sort
 /// before words, as in Finder.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum NatChunk {
+pub(crate) enum NatChunk {
     /// (digit count without leading zeros, digits) — compares numerically
     /// without overflow on absurdly long numbers.
     Num(usize, String),
@@ -458,7 +489,7 @@ enum NatChunk {
 }
 
 /// Case- and accent-insensitive, numeric-aware: "Step 2" < "Step 10".
-fn natural_key(title: &str) -> Vec<NatChunk> {
+pub(crate) fn natural_key(title: &str) -> Vec<NatChunk> {
     let mut out = Vec::new();
     let mut buf = String::new();
     let mut in_num = false;
@@ -1059,7 +1090,7 @@ mod tests {
         );
         assert_eq!(titles(sections.daytime), vec!["a", "b"]);
         assert_eq!(groups[1].label.as_deref(), Some("This evening"));
-        assert!(ListOrder::default().is_manual());
+        assert!(<ListOrder>::default().is_manual());
     }
 
     #[test]
@@ -1308,7 +1339,7 @@ mod tests {
         let json = serde_json::to_string(&o).unwrap();
         assert_eq!(serde_json::from_str::<ListOrder>(&json).unwrap(), o);
         assert_eq!(serde_json::from_str::<ListOrder>("{}").unwrap(), ListOrder::default());
-        assert_eq!(ListOrder::default().key, SortKey::Manual);
+        assert_eq!(<ListOrder>::default().key, SortKey::Manual);
 
         // A key the list doesn't offer falls back to Manual.
         let (keys, groups) = order_options(Some(TodoView::Inbox));

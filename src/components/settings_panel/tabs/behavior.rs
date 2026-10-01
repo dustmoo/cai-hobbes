@@ -51,6 +51,26 @@ pub(in super::super) fn BehaviorTab(
                                         option { value: "System", selected: local_settings.read().theme == crate::settings::Theme::System, "System" }
                                     }
                                 }
+                                div {
+                                    class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-t border-faint",
+                                    div {
+                                        label { class: "text-sm text-fg", "Tabs as Sidebar List" }
+                                        p { class: "text-xs text-fg-muted", "List open tabs in a sortable left sidebar instead of the top strip" }
+                                    }
+                                    div {
+                                        class: "justify-self-end",
+                                        Toggle {
+                                            checked: ui_state.read().tabs_as_sidebar,
+                                            onchange: move |v| {
+                                                let mut state = ui_state.write();
+                                                state.tabs_as_sidebar = v;
+                                                let state_clone = state.clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             // 1. Context & History (Global Defaults)

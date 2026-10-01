@@ -21,7 +21,7 @@ mod schedule;
 #[cfg(test)]
 mod test_support;
 
-pub(crate) use centre::CentreColumn;
+pub(crate) use centre::{CentreColumn, ListOrderControl};
 pub(crate) use list::ProjectPicker;
 pub(crate) use quick_add::{
     apply_project_pick, birth_project_title, commit_quick_add, landing_label, resolve_birth,
@@ -43,7 +43,7 @@ const BTN_SECONDARY: &str =
 const POPOVER: &str = "absolute right-0 top-full mt-1 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 py-1";
 const MENU_ITEM: &str =
     "w-full flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-fg text-left hover:bg-input";
-const SECTION_HEADER: &str =
+pub(crate) const SECTION_HEADER: &str =
     "text-[11px] uppercase tracking-[0.08em] text-fg-muted px-2.5 pt-3.5 pb-1";
 
 const MENU_LABEL: &str = "px-2.5 pt-1.5 pb-1 text-[11px] uppercase tracking-[0.08em] text-fg-muted";
