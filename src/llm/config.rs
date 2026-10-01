@@ -315,6 +315,24 @@ fn default_true() -> bool {
     true
 }
 
+pub fn default_keepalive_max_idle_minutes() -> u32 {
+    30
+}
+
+pub fn default_keepalive_daily_cap_usd() -> f64 {
+    1.0
+}
+
+pub fn default_keepalive_min_prefix_tokens() -> u32 {
+    8_000
+}
+
+/// 4m15s: fires well inside the 5-minute TTL even with timer and clock
+/// jitter (the TTL counts from the start of the previous request).
+pub fn default_keepalive_refresh_secs() -> u32 {
+    255
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClaudeConfig {
     #[serde(skip)]
@@ -335,6 +353,24 @@ pub struct ClaudeConfig {
     /// diagnostics beta so the API names where a cache miss diverged.
     #[serde(default)]
     pub cache_diagnostics: bool,
+    /// Keep an idle tab's 5-minute cache entry alive with cheap
+    /// `max_tokens: 0` refresh requests (see `llm::claude::keepalive`).
+    #[serde(default = "default_true")]
+    pub keepalive_enabled: bool,
+    /// Stop refreshing once the tab has been idle this long.
+    #[serde(default = "default_keepalive_max_idle_minutes")]
+    pub keepalive_max_idle_minutes: u32,
+    /// Daily ceiling on keep-alive spend (USD, local day, all tabs).
+    #[serde(default = "default_keepalive_daily_cap_usd")]
+    pub keepalive_daily_cap_usd: f64,
+    /// Cached prefixes smaller than this aren't worth refreshing
+    /// (settings.json only, no UI).
+    #[serde(default = "default_keepalive_min_prefix_tokens")]
+    pub keepalive_min_prefix_tokens: u32,
+    /// Seconds after a request starts before it is refreshed. Clamped below
+    /// the 5-minute TTL (settings.json only, no UI).
+    #[serde(default = "default_keepalive_refresh_secs")]
+    pub keepalive_refresh_secs: u32,
     #[serde(default = "default_claude_model_slots")]
     pub model_slots: Vec<String>, // Provider-scoped quick-switch slots
     /// Per-provider context tuning overrides (None = use global defaults)
@@ -354,6 +390,11 @@ impl Default for ClaudeConfig {
             prompt_caching_enabled: true,
             cache_ttl: ClaudeCacheTtl::default(),
             cache_diagnostics: false,
+            keepalive_enabled: true,
+            keepalive_max_idle_minutes: default_keepalive_max_idle_minutes(),
+            keepalive_daily_cap_usd: default_keepalive_daily_cap_usd(),
+            keepalive_min_prefix_tokens: default_keepalive_min_prefix_tokens(),
+            keepalive_refresh_secs: default_keepalive_refresh_secs(),
             model_slots: default_claude_model_slots(),
             context_tuning: ContextTuningPreset::default(),
         }

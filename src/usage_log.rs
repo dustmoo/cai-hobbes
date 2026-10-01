@@ -27,6 +27,69 @@ pub struct UsageLogEntry {
     /// Calculated cost in USD
     #[serde(default)]
     pub cost: Option<f64>,
+    /// A chat turn, or a prompt-cache keep-alive refresh. Entries written
+    /// before the field existed are turns.
+    #[serde(default)]
+    pub kind: UsageKind,
+    /// Prompt-cache telemetry (Claude only); absent on other providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheTelemetry>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageKind {
+    #[default]
+    Turn,
+    Keepalive,
+}
+
+/// Per-entry prompt-cache data that drives the TTL decision
+/// (`scripts/cache_report.py`). Token counts are Anthropic's raw fields.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheTelemetry {
+    /// Model prices at log time, so the report needs no price table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_price_per_mtok: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_price_per_mtok: Option<f64>,
+    /// "5m" or "1h".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+
+    // ── Turn entries: the turn's first request ──
+    /// Seconds from the previous request's start to this one's; None after
+    /// a restart (no previous request in this process).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_gap_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_input_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_cache_read: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_cache_write: Option<i32>,
+    /// A keep-alive refresh hit between the previous request and this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_bridged: Option<bool>,
+    /// Keep-alive refreshes sent in that gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_pings_in_gap: Option<u32>,
+
+    // ── Turn entries: later requests of the turn (tool loop) ──
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within_turn_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within_turn_cache_read: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within_turn_cache_write: Option<i64>,
+
+    // ── Keep-alive entries ──
+    /// Cached prefix being refreshed (last real request's read + write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_tokens: Option<i32>,
+    /// Seconds since the tab's last real request started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
 }
 
 /// Append-only usage ledger persisted to `usage_log.json`.
@@ -85,6 +148,19 @@ impl UsageLog {
     #[allow(dead_code)] // Future: wired in when UsageLog drives the All-Time UI
     pub fn total_cost(&self) -> f64 {
         self.entries.iter().filter_map(|e| e.cost).sum()
+    }
+
+    /// Keep-alive spend since local midnight of `now`'s day.
+    pub fn keepalive_spend_on_day(&self, now: DateTime<chrono::Local>) -> f64 {
+        let day = now.date_naive();
+        self.entries
+            .iter()
+            .rev()
+            .take_while(|e| e.timestamp.with_timezone(&chrono::Local).date_naive() >= day)
+            .filter(|e| e.kind == UsageKind::Keepalive)
+            .filter(|e| e.timestamp.with_timezone(&chrono::Local).date_naive() == day)
+            .filter_map(|e| e.cost)
+            .sum()
     }
 
     /// Sum of all recorded tokens.
@@ -205,6 +281,8 @@ mod tests {
             cached_content_tokens: None,
             cache_creation_tokens: None,
             cost: Some(0.0023),
+            kind: UsageKind::Turn,
+            cache: None,
         });
 
         assert_eq!(log.entries.len(), 1);
@@ -227,6 +305,8 @@ mod tests {
             cached_content_tokens: None,
             cache_creation_tokens: None,
             cost: Some(0.01),
+            kind: UsageKind::Turn,
+            cache: None,
         });
 
         log.entries.push(UsageLogEntry {
@@ -240,6 +320,8 @@ mod tests {
             cached_content_tokens: None,
             cache_creation_tokens: None,
             cost: Some(0.05),
+            kind: UsageKind::Turn,
+            cache: None,
         });
 
         assert!((log.total_cost() - 0.06).abs() < 0.0001);
@@ -260,6 +342,8 @@ mod tests {
             cached_content_tokens: Some(10),
             cache_creation_tokens: None,
             cost: Some(0.001),
+            kind: UsageKind::Turn,
+            cache: None,
         });
 
         let json = serde_json::to_string_pretty(&log).expect("serialize");
@@ -288,6 +372,8 @@ mod tests {
                 cached_content_tokens: Some(2_000),
                 cache_creation_tokens: None,
                 cost: Some(0.0123),
+            kind: UsageKind::Turn,
+            cache: None,
             });
         }
 
@@ -323,6 +409,8 @@ mod tests {
                 cached_content_tokens: None,
                 cache_creation_tokens: None,
                 cost: Some(0.0001),
+            kind: UsageKind::Turn,
+            cache: None,
             });
         }
         log.enforce_size_cap();
