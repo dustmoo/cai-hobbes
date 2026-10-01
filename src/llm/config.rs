@@ -331,6 +331,10 @@ pub struct ClaudeConfig {
     pub prompt_caching_enabled: bool,
     #[serde(default)]
     pub cache_ttl: ClaudeCacheTtl,
+    /// Debug flag (settings.json only, no UI): opt into Anthropic's cache
+    /// diagnostics beta so the API names where a cache miss diverged.
+    #[serde(default)]
+    pub cache_diagnostics: bool,
     #[serde(default = "default_claude_model_slots")]
     pub model_slots: Vec<String>, // Provider-scoped quick-switch slots
     /// Per-provider context tuning overrides (None = use global defaults)
@@ -349,6 +353,7 @@ impl Default for ClaudeConfig {
             extended_thinking: false,
             prompt_caching_enabled: true,
             cache_ttl: ClaudeCacheTtl::default(),
+            cache_diagnostics: false,
             model_slots: default_claude_model_slots(),
             context_tuning: ContextTuningPreset::default(),
         }

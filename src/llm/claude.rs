@@ -82,6 +82,430 @@ fn claude_usage(
     }
 }
 
+// ── Prompt-cache diagnostics ──
+//
+// A cache miss reports only token counts, not which part of the prompt moved.
+// Every cached request is fingerprinted (tools, each system block, each
+// message) and compared with the previous request of the same conversation,
+// so the miss log can name the first component that changed.
+
+/// Beta header value that opts into Anthropic's server-side cache diagnosis.
+const CACHE_DIAGNOSIS_BETA: &str = "cache-diagnosis-2026-04-07";
+/// `cache_creation_input_tokens` above this logs the divergence at `info`.
+const CACHE_WRITE_LOG_THRESHOLD: i32 = 4096;
+/// Conversations remembered by the process-wide fingerprint store.
+const FINGERPRINT_STORE_CAP: usize = 16;
+
+/// What `build_request` appended after the cached history. It changes every
+/// turn by design, so it is excluded from the fingerprints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolatileTail {
+    None,
+    /// A trailing `role: "system"` message.
+    SystemMessage,
+    /// A text block appended to the final user message.
+    TextBlock,
+    /// A new trailing user message (history ended on an assistant turn).
+    UserMessage,
+}
+
+/// Role and block types of a message: log-safe, never content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MessageShape {
+    role: String,
+    blocks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestFingerprint {
+    /// Conversation key: hash of the first (stable) system block plus the
+    /// first message. The connector never sees the session id and
+    /// `LlmPrompt` can't carry one, but a conversation's persona block and
+    /// opening message are fixed for its lifetime and differ between tabs.
+    key: u64,
+    /// Hash of all system blocks; groups requests that share a stable prefix
+    /// when the first message was front-trimmed away.
+    system_key: u64,
+    tools: u64,
+    tools_len: usize,
+    system: Vec<u64>,
+    messages: Vec<u64>,
+    shapes: Vec<MessageShape>,
+}
+
+fn hash_value<H: std::hash::Hasher>(v: &Value, h: &mut H) {
+    use std::hash::Hash;
+    match v {
+        Value::Null => 0u8.hash(h),
+        Value::Bool(b) => (1u8, *b).hash(h),
+        Value::Number(n) => (2u8, n.to_string()).hash(h),
+        Value::String(s) => (3u8, s).hash(h),
+        Value::Array(a) => {
+            (4u8, a.len()).hash(h);
+            a.iter().for_each(|x| hash_value(x, h));
+        }
+        Value::Object(m) => {
+            (5u8, m.len()).hash(h);
+            for (k, x) in m {
+                k.hash(h);
+                hash_value(x, h);
+            }
+        }
+    }
+}
+
+/// Hash a content block ignoring its top-level `cache_control`, which moves
+/// between requests by design.
+fn hash_block<H: std::hash::Hasher>(block: &Value, h: &mut H) {
+    use std::hash::Hash;
+    match block.as_object() {
+        Some(m) => {
+            for (k, x) in m.iter().filter(|(k, _)| *k != "cache_control") {
+                k.hash(h);
+                hash_value(x, h);
+            }
+        }
+        None => hash_value(block, h),
+    }
+}
+
+/// Fingerprint of one message, `cache_control` stripped. `drop_last_block`
+/// leaves out the trailing volatile text block.
+fn hash_message(m: &Value, drop_last_block: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    m["role"].as_str().hash(&mut h);
+    match m["content"].as_array() {
+        Some(blocks) => {
+            let n = blocks.len() - usize::from(drop_last_block && !blocks.is_empty());
+            blocks[..n].iter().for_each(|b| hash_block(b, &mut h));
+        }
+        None => hash_value(&m["content"], &mut h),
+    }
+    h.finish()
+}
+
+fn hash_one(v: &Value) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hash_value(v, &mut h);
+    h.finish()
+}
+
+fn message_shape(m: &Value) -> MessageShape {
+    let blocks = match m["content"].as_array() {
+        Some(bs) => bs
+            .iter()
+            .map(|b| b["type"].as_str().unwrap_or("?").to_string())
+            .collect(),
+        None => vec!["text".to_string()],
+    };
+    MessageShape {
+        role: m["role"].as_str().unwrap_or("?").to_string(),
+        blocks,
+    }
+}
+
+/// Fingerprint a built request. Call it BEFORE adding the `diagnostics`
+/// field. Runs once per request, never per SSE chunk.
+fn fingerprint_request(request: &Value, tail: VolatileTail) -> RequestFingerprint {
+    use std::hash::{Hash, Hasher};
+    let system: Vec<u64> = match request["system"].as_array() {
+        Some(blocks) => blocks
+            .iter()
+            .map(|b| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                hash_block(b, &mut h);
+                h.finish()
+            })
+            .collect(),
+        // Caching off: a single plain string.
+        None if request["system"].is_string() => vec![hash_one(&request["system"])],
+        None => Vec::new(),
+    };
+    let (tools, tools_len) = match request["tools"].as_array() {
+        Some(t) => (hash_one(&request["tools"]), t.len()),
+        None => (0, 0),
+    };
+    let all: &[Value] = request["messages"].as_array().map_or(&[], |v| v.as_slice());
+    let stable = match tail {
+        VolatileTail::SystemMessage | VolatileTail::UserMessage => {
+            &all[..all.len().saturating_sub(1)]
+        }
+        VolatileTail::None | VolatileTail::TextBlock => all,
+    };
+    let last = stable.len().saturating_sub(1);
+    let messages: Vec<u64> = stable
+        .iter()
+        .enumerate()
+        .map(|(i, m)| hash_message(m, tail == VolatileTail::TextBlock && i == last))
+        .collect();
+    let shapes = stable.iter().map(message_shape).collect();
+
+    let mut kh = std::collections::hash_map::DefaultHasher::new();
+    (system.first(), messages.first()).hash(&mut kh);
+    let mut sh = std::collections::hash_map::DefaultHasher::new();
+    system.hash(&mut sh);
+    RequestFingerprint {
+        key: kh.finish(),
+        system_key: sh.finish(),
+        tools,
+        tools_len,
+        system,
+        messages,
+        shapes,
+    }
+}
+
+/// The first component that differs between two consecutive requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Divergence {
+    Tools {
+        prev_len: usize,
+        new_len: usize,
+    },
+    System(usize),
+    /// Same index, different hash.
+    InPlaceEdit {
+        index: usize,
+        shape: MessageShape,
+    },
+    /// New messages equal the old ones shifted by `k`.
+    FrontTrim(usize),
+    /// New history is a strict prefix of the old one.
+    Truncated {
+        new_len: usize,
+    },
+    /// Everything shared is byte-identical (append-only, or a server-side /
+    /// TTL cause the fingerprints can't see).
+    None,
+}
+
+impl std::fmt::Display for Divergence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tools { prev_len, new_len } => {
+                write!(f, "tools changed ({prev_len} -> {new_len} defs)")
+            }
+            Self::System(i) => write!(f, "system[{i}] changed"),
+            Self::InPlaceEdit { index, shape } => write!(
+                f,
+                "messages[{index}] changed (role={}, blocks=[{}]) kind=in-place edit",
+                shape.role,
+                shape.blocks.join(",")
+            ),
+            Self::FrontTrim(k) => write!(f, "front-trim by {k} messages kind=front-trim"),
+            Self::Truncated { new_len } => {
+                write!(f, "history truncated to {new_len} messages")
+            }
+            Self::None => write!(f, "no component changed (TTL expiry or server-side)"),
+        }
+    }
+}
+
+/// Smallest `k >= 1` such that the old messages from `k` onward equal the new
+/// messages over their whole overlap (at least two, or all of a shorter one).
+fn front_trim_shift(prev: &[u64], new: &[u64]) -> Option<usize> {
+    (1..prev.len()).find(|&k| {
+        let m = (prev.len() - k).min(new.len());
+        m >= new.len().min(2) && m > 0 && prev[k..k + m] == new[..m]
+    })
+}
+
+fn find_divergence(prev: &RequestFingerprint, new: &RequestFingerprint) -> Divergence {
+    if prev.tools != new.tools {
+        return Divergence::Tools {
+            prev_len: prev.tools_len,
+            new_len: new.tools_len,
+        };
+    }
+    let shared = prev.system.len().min(new.system.len());
+    if let Some(i) = (0..shared).find(|&i| prev.system[i] != new.system[i]) {
+        return Divergence::System(i);
+    }
+    if prev.system.len() != new.system.len() {
+        return Divergence::System(shared);
+    }
+    let shared = prev.messages.len().min(new.messages.len());
+    match (0..shared).find(|&i| prev.messages[i] != new.messages[i]) {
+        Some(i) => match front_trim_shift(&prev.messages, &new.messages) {
+            Some(k) => Divergence::FrontTrim(k),
+            None => Divergence::InPlaceEdit {
+                index: i,
+                shape: new.shapes[i].clone(),
+            },
+        },
+        None if new.messages.len() < prev.messages.len() => Divergence::Truncated {
+            new_len: new.messages.len(),
+        },
+        None => Divergence::None,
+    }
+}
+
+struct StoredRequest {
+    fingerprint: RequestFingerprint,
+    message_id: Option<String>,
+    seq: u64,
+    at: std::time::Instant,
+}
+
+/// The previous request matched to the current one.
+#[derive(Debug, Clone)]
+struct PreviousRequest {
+    fingerprint: RequestFingerprint,
+    message_id: Option<String>,
+    age: std::time::Duration,
+}
+
+/// Request-time state carried to the point where usage arrives.
+struct CacheDiagState {
+    fingerprint: RequestFingerprint,
+    previous: Option<PreviousRequest>,
+}
+
+fn fingerprint_store() -> &'static std::sync::Mutex<Vec<StoredRequest>> {
+    static STORE: std::sync::OnceLock<std::sync::Mutex<Vec<StoredRequest>>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Find the stored request this one continues: same conversation key; else
+/// same first message (system block changed); else same system prefix whose
+/// messages are this request's shifted by a front-trim.
+fn lookup_previous(fp: &RequestFingerprint) -> Option<PreviousRequest> {
+    let store = fingerprint_store().lock().ok()?;
+    let found = store
+        .iter()
+        .find(|e| e.fingerprint.key == fp.key)
+        .or_else(|| {
+            store
+                .iter()
+                .filter(|e| {
+                    !e.fingerprint.messages.is_empty()
+                        && e.fingerprint.messages.first() == fp.messages.first()
+                })
+                .max_by_key(|e| e.seq)
+        })
+        .or_else(|| {
+            store
+                .iter()
+                .filter(|e| {
+                    e.fingerprint.system_key == fp.system_key
+                        && front_trim_shift(&e.fingerprint.messages, &fp.messages).is_some()
+                })
+                .max_by_key(|e| e.seq)
+        })?;
+    Some(PreviousRequest {
+        fingerprint: found.fingerprint.clone(),
+        message_id: found.message_id.clone(),
+        age: found.at.elapsed(),
+    })
+}
+
+/// Record a completed request, replacing the entry it continued.
+fn store_request(
+    fp: RequestFingerprint,
+    previous: Option<&PreviousRequest>,
+    message_id: Option<String>,
+) {
+    let Ok(mut store) = fingerprint_store().lock() else {
+        return;
+    };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(prev) = previous {
+        store.retain(|e| e.fingerprint != prev.fingerprint);
+    }
+    store.retain(|e| e.fingerprint.key != fp.key);
+    store.push(StoredRequest {
+        fingerprint: fp,
+        message_id,
+        seq,
+        at: std::time::Instant::now(),
+    });
+    while store.len() > FINGERPRINT_STORE_CAP {
+        if let Some(oldest) = (0..store.len()).min_by_key(|&i| store[i].seq) {
+            store.remove(oldest);
+        }
+    }
+}
+
+/// Depth-first search for a `diagnostics` key anywhere in a streamed event.
+/// The response shape is unconfirmed, so it is located rather than assumed.
+fn find_diagnostics(v: &Value) -> Option<&Value> {
+    match v {
+        Value::Object(m) => m
+            .get("diagnostics")
+            .filter(|d| !d.is_null())
+            .or_else(|| m.values().find_map(find_diagnostics)),
+        Value::Array(a) => a.iter().find_map(find_diagnostics),
+        _ => None,
+    }
+}
+
+/// What a streamed event line contributes to the cache diagnosis.
+#[derive(Debug, Default, PartialEq)]
+struct LineMeta {
+    message_id: Option<String>,
+    diagnostics: Option<Value>,
+}
+
+/// Pull `message.id` (from `message_start`) and any `diagnostics` value out
+/// of an SSE line. Cheap substring gate first so ordinary delta lines are
+/// never parsed twice.
+fn scan_line_meta(line: &str) -> LineMeta {
+    let mut meta = LineMeta::default();
+    if !line.contains("\"message_start\"") && !line.contains("\"diagnostics\"") {
+        return meta;
+    }
+    let Some(json_str) = line.trim().strip_prefix("data:") else {
+        return meta;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(json_str.trim()) else {
+        return meta;
+    };
+    if val["type"] == "message_start" {
+        meta.message_id = val["message"]["id"].as_str().map(str::to_string);
+    }
+    meta.diagnostics = find_diagnostics(&val).cloned();
+    meta
+}
+
+/// Whether a response is a cache miss worth an `info` line.
+fn is_notable_miss(created: i32, read: i32, has_previous: bool) -> bool {
+    has_previous && (created > CACHE_WRITE_LOG_THRESHOLD || read == 0)
+}
+
+/// Format the divergence line. Hashes, indices, roles and block types only.
+fn format_miss_line(
+    state: &CacheDiagState,
+    prev: &PreviousRequest,
+    read: i32,
+    created: i32,
+) -> String {
+    let divergence = find_divergence(&prev.fingerprint, &state.fingerprint);
+    format!(
+        "Claude cache miss: read={read} written={created} prev_messages={} new_messages={} since_prev={}s first divergence: {divergence}",
+        prev.fingerprint.messages.len(),
+        state.fingerprint.messages.len(),
+        prev.age.as_secs(),
+    )
+}
+
+/// Request-time debug line: one per request.
+fn format_summary_line(fp: &RequestFingerprint, has_previous: bool) -> String {
+    format!(
+        "Claude cache fingerprint: key={:016x} tools={:016x} ({}) system_blocks={} messages={} last_message={:016x} baseline={}",
+        fp.key,
+        fp.tools,
+        fp.tools_len,
+        fp.system.len(),
+        fp.messages.len(),
+        fp.messages.last().copied().unwrap_or(0),
+        has_previous,
+    )
+}
+
 pub struct ClaudeConnector {
     config: ClaudeConfig,
 }
@@ -112,6 +536,78 @@ impl ClaudeConnector {
             .unwrap_or(ceiling)
             .min(ceiling)
             .max(1)
+    }
+
+    /// `anthropic-beta` header value: every beta this request opts into,
+    /// comma-joined, or `None` when there are none.
+    fn anthropic_beta_header(&self) -> Option<String> {
+        let mut betas: Vec<&str> = Vec::new();
+        if self.config.cache_diagnostics {
+            betas.push(CACHE_DIAGNOSIS_BETA);
+        }
+        (!betas.is_empty()).then(|| betas.join(","))
+    }
+
+    /// Add the `diagnostics` request field when the debug flag is on.
+    fn apply_cache_diagnostics(&self, request: &mut Value, previous_id: Option<&str>) {
+        if self.config.cache_diagnostics {
+            request["diagnostics"] = json!({ "previous_message_id": previous_id });
+        }
+    }
+
+    /// Build the request, fingerprint it (before the `diagnostics` field is
+    /// added) and match it to the previous request of this conversation.
+    fn prepare_request(&self, prompt: &LlmPrompt) -> (Value, Option<CacheDiagState>) {
+        let (mut request, tail) = self.build_request(prompt, true);
+        if !self.config.prompt_caching_enabled {
+            self.apply_cache_diagnostics(&mut request, None);
+            return (request, None);
+        }
+        let fingerprint = fingerprint_request(&request, tail);
+        let previous = lookup_previous(&fingerprint);
+        tracing::debug!("{}", format_summary_line(&fingerprint, previous.is_some()));
+        self.apply_cache_diagnostics(
+            &mut request,
+            previous.as_ref().and_then(|p| p.message_id.as_deref()),
+        );
+        (
+            request,
+            Some(CacheDiagState {
+                fingerprint,
+                previous,
+            }),
+        )
+    }
+
+    /// Called once per response, when usage is final: log the divergence on a
+    /// notable miss, log any server diagnosis, and remember this request.
+    fn finish_cache_diag(
+        &self,
+        state: Option<CacheDiagState>,
+        created: Option<i32>,
+        read: Option<i32>,
+        message_id: Option<String>,
+        diagnostics: Option<&Value>,
+    ) {
+        let Some(state) = state else {
+            return;
+        };
+        let (created, read) = (created.unwrap_or(0), read.unwrap_or(0));
+        let notable = state
+            .previous
+            .as_ref()
+            .is_some_and(|_| is_notable_miss(created, read, true));
+        if let (true, Some(prev)) = (notable, &state.previous) {
+            tracing::info!("{}", format_miss_line(&state, prev, read, created));
+        }
+        if let Some(d) = diagnostics {
+            if notable {
+                tracing::info!("Claude cache diagnostics (server): {}", d);
+            } else {
+                tracing::debug!("Claude cache diagnostics (server): {}", d);
+            }
+        }
+        store_request(state.fingerprint, state.previous.as_ref(), message_id);
     }
 
     /// Fallback resolution for a prefixed tool name → (server, tool) when it
@@ -165,6 +661,248 @@ impl ClaudeConnector {
     }
 }
 
+impl ClaudeConnector {
+    /// Build the native request plus a note of which volatile tail (if any)
+    /// was appended, so the cache fingerprints can exclude it.
+    fn build_request(
+        &self,
+        prompt: &LlmPrompt,
+        streaming: bool,
+    ) -> (serde_json::Value, VolatileTail) {
+        // Extended thinking is only sent when enabled AND the model supports it.
+        // Gated here so thinking blocks in history are serialized consistently.
+        // Always-on models (Fable 5.1, Opus 5.5) think regardless of the toggle
+        // and reject a tool loop whose signed thinking blocks were dropped, so
+        // for them the toggle cannot switch thinking off.
+        let model = ClaudeModel::from_slug(&self.config.model);
+        let thinking_enabled = model.thinking_always_on()
+            || (self.config.extended_thinking && model.supports_thinking());
+
+        // Build the Anthropic `messages` array. Claude only allows "user" and
+        // "assistant" roles; tool results ride inside user-turn content blocks.
+        let mut messages: Vec<serde_json::Value> = Vec::new();
+
+        for msg in &prompt.messages {
+            let mut content: Vec<serde_json::Value> = Vec::new();
+
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        if !text.is_empty() {
+                            content.push(json!({ "type": "text", "text": text }));
+                        }
+                    }
+                    ContentBlock::Thinking { text, signature } => {
+                        // Anthropic requires a thinking block to be replayed with
+                        // its signature and to appear first in the assistant turn
+                        // (history is already ordered thinking-first). Only include
+                        // when thinking is enabled AND we have a non-empty signature
+                        // — a thinking block without a valid signature returns a 400.
+                        // An empty `thinking` text is still replayed: always-on
+                        // models return signed blocks with no text, and dropping
+                        // them from a tool loop is itself a 400.
+                        // Otherwise omit (safe: we never end on an assistant turn, so
+                        // the "must start with thinking" rule never applies here).
+                        if thinking_enabled {
+                            if let Some(sig) = signature {
+                                if !sig.is_empty() {
+                                    content.push(json!({
+                                        "type": "thinking",
+                                        "thinking": text,
+                                        "signature": sig,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    ContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                        ..
+                    } => {
+                        // `input` must be a JSON object.
+                        let input = if arguments.is_object() {
+                            arguments.clone()
+                        } else if let Some(s) = arguments.as_str() {
+                            serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({}))
+                        } else {
+                            json!({})
+                        };
+                        content.push(json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": input,
+                        }));
+                    }
+                    ContentBlock::ToolResult {
+                        call_id,
+                        content: c,
+                        ..
+                    } => {
+                        let result_str = if c.is_string() {
+                            c.as_str().unwrap_or("").to_string()
+                        } else {
+                            serde_json::to_string(c).unwrap_or_else(|_| "{}".to_string())
+                        };
+                        content.push(json!({
+                            "type": "tool_result",
+                            "tool_use_id": call_id,
+                            "content": result_str,
+                        }));
+                    }
+                    ContentBlock::Image { mime_type, data } => {
+                        content.push(json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime_type,
+                                "data": data,
+                            }
+                        }));
+                    }
+                }
+            }
+
+            if content.is_empty() {
+                continue;
+            }
+
+            // Map neutral role → Anthropic role. Tool results and any System-role
+            // messages are folded into the "user" turn.
+            let role = match msg.role {
+                ChatRole::Assistant => "assistant",
+                ChatRole::User | ChatRole::System | ChatRole::Tool => "user",
+            };
+
+            messages.push(json!({ "role": role, "content": content }));
+        }
+
+        // Prompt caching: tools → system → messages is the render order, so
+        // volatile per-turn content must live at the very end of `messages`
+        // or it would invalidate everything after it.
+        let mut system_blocks: Vec<serde_json::Value> = Vec::new();
+        let mut tail = VolatileTail::None;
+        if self.config.prompt_caching_enabled {
+            let marker = cache_control_marker(self.config.cache_ttl);
+            let (stable, volatile) = split_system(
+                prompt.system.as_deref().unwrap_or(""),
+                prompt.system_volatile_offset,
+            );
+            if !stable.trim().is_empty() {
+                system_blocks.push(json!({
+                    "type": "text",
+                    "text": stable,
+                    "cache_control": marker,
+                }));
+            }
+
+            let last_is_user = messages.last().is_some_and(|m| m["role"] == "user");
+            let volatile = volatile.trim();
+            let history_end = messages.len().checked_sub(1);
+            // Breakpoint on the last history block (before any volatile tail
+            // is attached), so each request reads the prior conversation.
+            let marked =
+                history_end.and_then(|end| mark_last_block(&mut messages[..=end], end, &marker));
+            if !volatile.is_empty() {
+                if last_is_user && model.supports_mid_conversation_system() {
+                    messages.push(json!({ "role": "system", "content": volatile }));
+                    tail = VolatileTail::SystemMessage;
+                } else if last_is_user {
+                    if let Some(blocks) = messages
+                        .last_mut()
+                        .and_then(|m| m["content"].as_array_mut())
+                    {
+                        blocks.push(json!({ "type": "text", "text": volatile }));
+                        tail = VolatileTail::TextBlock;
+                    }
+                } else {
+                    // Assistant-last (or empty): the volatile text rides in a
+                    // new user message after the cached history.
+                    messages.push(json!({
+                        "role": "user",
+                        "content": [{ "type": "text", "text": volatile }],
+                    }));
+                    tail = VolatileTail::UserMessage;
+                }
+            }
+            // A second breakpoint on the previous user turn keeps long tool
+            // loops inside the API's 20-block lookback window.
+            if let Some(m) = marked {
+                if let Some(prev_user) = (0..m).rev().find(|&i| messages[i]["role"] == "user") {
+                    mark_last_block(&mut messages[..=prev_user], prev_user, &marker);
+                }
+            }
+        }
+
+        let mut request = json!({
+            "model": self.config.model,
+            "max_tokens": self.effective_max_tokens(),
+            "messages": messages,
+            "stream": streaming,
+        });
+
+        // System prompt is a top-level field on Anthropic (not a message).
+        if self.config.prompt_caching_enabled {
+            if !system_blocks.is_empty() {
+                request["system"] = json!(system_blocks);
+            }
+        } else if let Some(system) = &prompt.system {
+            if !system.is_empty() {
+                request["system"] = json!(system);
+            }
+        }
+
+        // Adaptive thinking (GA on modern models; auto-enables interleaved
+        // thinking with tools). budget_tokens is intentionally NOT used — it is
+        // removed on current models and returns 400.
+        if thinking_enabled {
+            request["thinking"] = if model.thinking_always_on() {
+                // These models default `display` to "omitted" (empty thinking
+                // text), which would leave the thinking pane blank and hide
+                // the narration they write between tool calls.
+                json!({ "type": "adaptive", "display": "summarized" })
+            } else {
+                json!({ "type": "adaptive" })
+            };
+        }
+
+        // Tools — sent with prompt_builder-consistent prefixed names so the
+        // streamed `tool_use.name` resolves back via the same map.
+        if !prompt.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = prompt
+                .tools
+                .iter()
+                .map(|t| {
+                    let prefixed =
+                        crate::gemini::convert::get_prefixed_tool_name(&t.server_name, &t.name);
+                    json!({
+                        "name": prefixed,
+                        "description": t.description,
+                        "input_schema": t.parameters,
+                    })
+                })
+                .collect();
+            request["tools"] = json!(tools);
+        }
+
+        if self.config.model.is_empty() {
+            tracing::error!("Claude request: model is EMPTY — this will 400. Check settings.");
+        }
+
+        tracing::debug!(
+            "Claude request: model='{}', max_tokens={}, {} messages, {} tools",
+            self.config.model,
+            self.effective_max_tokens(),
+            messages.len(),
+            prompt.tools.len(),
+        );
+
+        (request, tail)
+    }
+}
+
 #[async_trait]
 impl LlmConnector for ClaudeConnector {
     async fn generate_content_stream(
@@ -186,7 +924,8 @@ impl LlmConnector for ClaudeConnector {
             }
         };
 
-        let native_request = self.to_native_request(&prompt_data, true);
+        let (native_request, mut cache_state) = self.prepare_request(&prompt_data);
+        let beta_header = self.anthropic_beta_header();
 
         // Reverse-map prefixed tool names → (server_name, tool_name), matching the
         // exact format prompt_builder uses for history. Anthropic echoes the tool
@@ -274,15 +1013,15 @@ impl LlmConnector for ClaudeConnector {
         for attempt in 0..=MAX_RETRIES {
             let backoff = std::time::Duration::from_millis(500u64 * (1u64 << attempt));
 
-            let response = match client
+            let mut http_request = client
                 .post(ANTHROPIC_API_URL)
                 .header("content-type", "application/json")
                 .header("x-api-key", &api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
-                .body(body_str.clone())
-                .send()
-                .await
-            {
+                .header("anthropic-version", ANTHROPIC_VERSION);
+            if let Some(betas) = &beta_header {
+                http_request = http_request.header("anthropic-beta", betas);
+            }
+            let response = match http_request.body(body_str.clone()).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     if attempt < MAX_RETRIES {
@@ -327,7 +1066,9 @@ impl LlmConnector for ClaudeConnector {
                             messages: stripped_messages,
                             tools: prompt_data.tools.clone(),
                         };
-                        let stripped_native = self.to_native_request(&stripped_prompt, true);
+                        let (stripped_native, stripped_state) =
+                            self.prepare_request(&stripped_prompt);
+                        cache_state = stripped_state;
                         body_str = serde_json::to_string(&stripped_native)
                             .expect("Failed to serialize Claude request body");
                         continue;
@@ -371,6 +1112,10 @@ impl LlmConnector for ClaudeConnector {
             let mut usage_completion: i32 = 0;
             let mut usage_cached: Option<i32> = None;
             let mut usage_created: Option<i32> = None;
+            // Request-id / diagnostics for the cache diagnosis, from the SSE
+            // lines that carry them.
+            let mut response_message_id: Option<String> = None;
+            let mut response_diagnostics: Option<Value> = None;
             // Only Text/Thinking are streamed to the UI mid-flight; tool calls and
             // usage are buffered and emitted at the end. So this gates retry safely.
             let mut has_sent_data = false;
@@ -409,6 +1154,14 @@ impl LlmConnector for ClaudeConnector {
                 while let Some(i) = buffer.iter().position(|&b| b == b'\n') {
                     let line_bytes = buffer.drain(..=i).collect::<Vec<u8>>();
                     let line = String::from_utf8_lossy(&line_bytes);
+
+                    let meta = scan_line_meta(&line);
+                    if meta.message_id.is_some() {
+                        response_message_id = meta.message_id;
+                    }
+                    if meta.diagnostics.is_some() {
+                        response_diagnostics = meta.diagnostics;
+                    }
 
                     for event in self.parse_stream_chunk(&line) {
                         match event {
@@ -472,6 +1225,13 @@ impl LlmConnector for ClaudeConnector {
                             }
                             StreamEvent::Done => {
                                 flush_tool_calls(&mut pending_tool_calls, &tx);
+                                self.finish_cache_diag(
+                                    cache_state.take(),
+                                    usage_created,
+                                    usage_cached,
+                                    response_message_id.take(),
+                                    response_diagnostics.as_ref(),
+                                );
                                 emit_usage(
                                     usage_prompt,
                                     usage_completion,
@@ -497,6 +1257,13 @@ impl LlmConnector for ClaudeConnector {
 
             // Stream ended without an explicit message_stop — flush what we have.
             flush_tool_calls(&mut pending_tool_calls, &tx);
+            self.finish_cache_diag(
+                cache_state.take(),
+                usage_created,
+                usage_cached,
+                response_message_id.take(),
+                response_diagnostics.as_ref(),
+            );
             emit_usage(
                 usage_prompt,
                 usage_completion,
@@ -693,233 +1460,7 @@ You MUST respond with ONLY valid JSON (no prose, no markdown fences) containing 
 
 impl LlmFormatConverter for ClaudeConnector {
     fn to_native_request(&self, prompt: &LlmPrompt, streaming: bool) -> serde_json::Value {
-        // Extended thinking is only sent when enabled AND the model supports it.
-        // Gated here so thinking blocks in history are serialized consistently.
-        // Always-on models (Fable 5.1, Opus 5.5) think regardless of the toggle
-        // and reject a tool loop whose signed thinking blocks were dropped, so
-        // for them the toggle cannot switch thinking off.
-        let model = ClaudeModel::from_slug(&self.config.model);
-        let thinking_enabled = model.thinking_always_on()
-            || (self.config.extended_thinking && model.supports_thinking());
-
-        // Build the Anthropic `messages` array. Claude only allows "user" and
-        // "assistant" roles; tool results ride inside user-turn content blocks.
-        let mut messages: Vec<serde_json::Value> = Vec::new();
-
-        for msg in &prompt.messages {
-            let mut content: Vec<serde_json::Value> = Vec::new();
-
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        if !text.is_empty() {
-                            content.push(json!({ "type": "text", "text": text }));
-                        }
-                    }
-                    ContentBlock::Thinking { text, signature } => {
-                        // Anthropic requires a thinking block to be replayed with
-                        // its signature and to appear first in the assistant turn
-                        // (history is already ordered thinking-first). Only include
-                        // when thinking is enabled AND we have a non-empty signature
-                        // — a thinking block without a valid signature returns a 400.
-                        // An empty `thinking` text is still replayed: always-on
-                        // models return signed blocks with no text, and dropping
-                        // them from a tool loop is itself a 400.
-                        // Otherwise omit (safe: we never end on an assistant turn, so
-                        // the "must start with thinking" rule never applies here).
-                        if thinking_enabled {
-                            if let Some(sig) = signature {
-                                if !sig.is_empty() {
-                                    content.push(json!({
-                                        "type": "thinking",
-                                        "thinking": text,
-                                        "signature": sig,
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                    ContentBlock::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                        ..
-                    } => {
-                        // `input` must be a JSON object.
-                        let input = if arguments.is_object() {
-                            arguments.clone()
-                        } else if let Some(s) = arguments.as_str() {
-                            serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({}))
-                        } else {
-                            json!({})
-                        };
-                        content.push(json!({
-                            "type": "tool_use",
-                            "id": id,
-                            "name": name,
-                            "input": input,
-                        }));
-                    }
-                    ContentBlock::ToolResult {
-                        call_id,
-                        content: c,
-                        ..
-                    } => {
-                        let result_str = if c.is_string() {
-                            c.as_str().unwrap_or("").to_string()
-                        } else {
-                            serde_json::to_string(c).unwrap_or_else(|_| "{}".to_string())
-                        };
-                        content.push(json!({
-                            "type": "tool_result",
-                            "tool_use_id": call_id,
-                            "content": result_str,
-                        }));
-                    }
-                    ContentBlock::Image { mime_type, data } => {
-                        content.push(json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": mime_type,
-                                "data": data,
-                            }
-                        }));
-                    }
-                }
-            }
-
-            if content.is_empty() {
-                continue;
-            }
-
-            // Map neutral role → Anthropic role. Tool results and any System-role
-            // messages are folded into the "user" turn.
-            let role = match msg.role {
-                ChatRole::Assistant => "assistant",
-                ChatRole::User | ChatRole::System | ChatRole::Tool => "user",
-            };
-
-            messages.push(json!({ "role": role, "content": content }));
-        }
-
-        // Prompt caching: tools → system → messages is the render order, so
-        // volatile per-turn content must live at the very end of `messages`
-        // or it would invalidate everything after it.
-        let mut system_blocks: Vec<serde_json::Value> = Vec::new();
-        if self.config.prompt_caching_enabled {
-            let marker = cache_control_marker(self.config.cache_ttl);
-            let (stable, volatile) = split_system(
-                prompt.system.as_deref().unwrap_or(""),
-                prompt.system_volatile_offset,
-            );
-            if !stable.trim().is_empty() {
-                system_blocks.push(json!({
-                    "type": "text",
-                    "text": stable,
-                    "cache_control": marker,
-                }));
-            }
-
-            let last_is_user = messages.last().is_some_and(|m| m["role"] == "user");
-            let volatile = volatile.trim();
-            let history_end = messages.len().checked_sub(1);
-            // Breakpoint on the last history block (before any volatile tail
-            // is attached), so each request reads the prior conversation.
-            let marked =
-                history_end.and_then(|end| mark_last_block(&mut messages[..=end], end, &marker));
-            if !volatile.is_empty() {
-                if last_is_user && model.supports_mid_conversation_system() {
-                    messages.push(json!({ "role": "system", "content": volatile }));
-                } else if last_is_user {
-                    if let Some(blocks) = messages
-                        .last_mut()
-                        .and_then(|m| m["content"].as_array_mut())
-                    {
-                        blocks.push(json!({ "type": "text", "text": volatile }));
-                    }
-                } else {
-                    // Assistant-last (or empty): the volatile text rides in a
-                    // new user message after the cached history.
-                    messages.push(json!({
-                        "role": "user",
-                        "content": [{ "type": "text", "text": volatile }],
-                    }));
-                }
-            }
-            // A second breakpoint on the previous user turn keeps long tool
-            // loops inside the API's 20-block lookback window.
-            if let Some(m) = marked {
-                if let Some(prev_user) = (0..m).rev().find(|&i| messages[i]["role"] == "user") {
-                    mark_last_block(&mut messages[..=prev_user], prev_user, &marker);
-                }
-            }
-        }
-
-        let mut request = json!({
-            "model": self.config.model,
-            "max_tokens": self.effective_max_tokens(),
-            "messages": messages,
-            "stream": streaming,
-        });
-
-        // System prompt is a top-level field on Anthropic (not a message).
-        if self.config.prompt_caching_enabled {
-            if !system_blocks.is_empty() {
-                request["system"] = json!(system_blocks);
-            }
-        } else if let Some(system) = &prompt.system {
-            if !system.is_empty() {
-                request["system"] = json!(system);
-            }
-        }
-
-        // Adaptive thinking (GA on modern models; auto-enables interleaved
-        // thinking with tools). budget_tokens is intentionally NOT used — it is
-        // removed on current models and returns 400.
-        if thinking_enabled {
-            request["thinking"] = if model.thinking_always_on() {
-                // These models default `display` to "omitted" (empty thinking
-                // text), which would leave the thinking pane blank and hide
-                // the narration they write between tool calls.
-                json!({ "type": "adaptive", "display": "summarized" })
-            } else {
-                json!({ "type": "adaptive" })
-            };
-        }
-
-        // Tools — sent with prompt_builder-consistent prefixed names so the
-        // streamed `tool_use.name` resolves back via the same map.
-        if !prompt.tools.is_empty() {
-            let tools: Vec<serde_json::Value> = prompt
-                .tools
-                .iter()
-                .map(|t| {
-                    let prefixed =
-                        crate::gemini::convert::get_prefixed_tool_name(&t.server_name, &t.name);
-                    json!({
-                        "name": prefixed,
-                        "description": t.description,
-                        "input_schema": t.parameters,
-                    })
-                })
-                .collect();
-            request["tools"] = json!(tools);
-        }
-
-        if self.config.model.is_empty() {
-            tracing::error!("Claude request: model is EMPTY — this will 400. Check settings.");
-        }
-
-        tracing::debug!(
-            "Claude request: model='{}', max_tokens={}, {} messages, {} tools",
-            self.config.model,
-            self.effective_max_tokens(),
-            messages.len(),
-            prompt.tools.len(),
-        );
-
-        request
+        self.build_request(prompt, streaming).0
     }
 
     fn parse_stream_chunk(&self, chunk: &str) -> Vec<StreamEvent> {
@@ -1789,5 +2330,248 @@ mod tests {
             serde_json::from_str(r#"{"model":"claude-opus-5-5","summary_model":null}"#).unwrap();
         assert!(cfg.prompt_caching_enabled);
         assert_eq!(cfg.cache_ttl, ClaudeCacheTtl::FiveMinutes);
+    }
+
+    // ── Cache diagnostics ──
+
+    fn fp_of(c: &ClaudeConnector, p: &LlmPrompt) -> RequestFingerprint {
+        let (req, tail) = c.build_request(p, true);
+        fingerprint_request(&req, tail)
+    }
+
+    fn grown(n: usize) -> Vec<ChatMessage> {
+        (0..n)
+            .map(|i| {
+                let role = if i % 2 == 0 {
+                    ChatRole::User
+                } else {
+                    ChatRole::Assistant
+                };
+                text_msg(role, &format!("message {i}"))
+            })
+            .collect()
+    }
+
+    fn tool_def(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: "d".to_string(),
+            parameters: json!({ "type": "object" }),
+            server_name: "srv".to_string(),
+        }
+    }
+
+    #[test]
+    fn fingerprints_ignore_cache_control_and_volatile_tail() {
+        let c = cache_connector("claude-opus-4-8", true, ClaudeCacheTtl::FiveMinutes);
+        let sys_a = "STABLE-PART VOLATILE-ONE";
+        let sys_b = "STABLE-PART VOLATILE-TWO-DIFFERENT";
+        let off = Some("STABLE-PART".len());
+        let a = fp_of(&c, &cache_prompt(sys_a, off, grown(3)));
+        let b = fp_of(&c, &cache_prompt(sys_b, off, grown(3)));
+        assert_eq!(a, b);
+
+        // Markers moving: strip them from a built request and the hashes match.
+        let (req, tail) = c.build_request(&cache_prompt(sys_a, off, grown(3)), true);
+        let mut bare = req.clone();
+        for m in bare["messages"].as_array_mut().unwrap() {
+            if let Some(blocks) = m["content"].as_array_mut() {
+                for b in blocks {
+                    b.as_object_mut().unwrap().remove("cache_control");
+                }
+            }
+        }
+        assert_eq!(
+            fingerprint_request(&req, tail).messages,
+            fingerprint_request(&bare, tail).messages
+        );
+
+        // Text-block tail (model without mid-conversation system) and a
+        // trailing user message (assistant-last) are excluded too.
+        let old = cache_connector("claude-haiku-4-5", true, ClaudeCacheTtl::FiveMinutes);
+        assert_eq!(
+            fp_of(&old, &cache_prompt(sys_a, off, grown(3))),
+            fp_of(&old, &cache_prompt(sys_b, off, grown(3)))
+        );
+        assert_eq!(
+            fp_of(&old, &cache_prompt(sys_a, off, grown(4))).messages,
+            fp_of(&old, &cache_prompt(sys_b, off, grown(4))).messages
+        );
+        // ...but a real content change is seen.
+        let mut edited = grown(3);
+        edited[1] = text_msg(ChatRole::Assistant, "changed");
+        assert_ne!(a, fp_of(&c, &cache_prompt(sys_a, off, edited)));
+    }
+
+    #[test]
+    fn divergence_finder_names_the_first_changed_component() {
+        let c = cache_connector("claude-opus-4-8", true, ClaudeCacheTtl::FiveMinutes);
+        let prompt = |sys: &str, msgs: Vec<ChatMessage>, tools: &[&str]| LlmPrompt {
+            tools: tools.iter().map(|t| tool_def(t)).collect(),
+            ..cache_prompt(sys, None, msgs)
+        };
+        let base = fp_of(&c, &prompt("sys", grown(7), &["a"]));
+
+        // Appending is not a divergence.
+        let appended = fp_of(&c, &prompt("sys", grown(9), &["a"]));
+        assert_eq!(find_divergence(&base, &appended), Divergence::None);
+
+        let tools = fp_of(&c, &prompt("sys", grown(7), &["a", "b"]));
+        assert_eq!(
+            find_divergence(&base, &tools),
+            Divergence::Tools {
+                prev_len: 1,
+                new_len: 2
+            }
+        );
+
+        let system = fp_of(&c, &prompt("sys2", grown(7), &["a"]));
+        assert_eq!(find_divergence(&base, &system), Divergence::System(0));
+
+        let mut edited = grown(7);
+        edited[4] = text_msg(ChatRole::User, "edited");
+        let edit = fp_of(&c, &prompt("sys", edited, &["a"]));
+        match find_divergence(&base, &edit) {
+            Divergence::InPlaceEdit { index, shape } => {
+                assert_eq!(index, 4);
+                assert_eq!(shape.role, "user");
+                assert_eq!(shape.blocks, vec!["text"]);
+            }
+            other => panic!("expected in-place edit, got {other:?}"),
+        }
+
+        // Front-trim by 2: new history is the old one shifted, plus a turn.
+        let trimmed: Vec<ChatMessage> = grown(10).split_off(2);
+        let trim = fp_of(&c, &prompt("sys", trimmed, &["a"]));
+        assert_eq!(find_divergence(&base, &trim), Divergence::FrontTrim(2));
+        assert!(Divergence::FrontTrim(2).to_string().contains("front-trim"));
+
+        let short = fp_of(&c, &prompt("sys", grown(3), &["a"]));
+        assert_eq!(
+            find_divergence(&base, &short),
+            Divergence::Truncated { new_len: 3 }
+        );
+    }
+
+    #[test]
+    fn conversation_key_is_stable_while_the_conversation_grows() {
+        let c = cache_connector("claude-opus-4-8", true, ClaudeCacheTtl::FiveMinutes);
+        let a = fp_of(&c, &cache_prompt("persona", None, grown(3)));
+        let b = fp_of(&c, &cache_prompt("persona", None, grown(9)));
+        assert_eq!(a.key, b.key);
+        let other_tab = fp_of(&c, &cache_prompt("persona", None, vec![text_msg(ChatRole::User, "hi")]));
+        assert_ne!(a.key, other_tab.key);
+    }
+
+    #[test]
+    fn store_matches_growth_and_front_trim_and_caps_entries() {
+        let c = cache_connector("claude-opus-4-8", true, ClaudeCacheTtl::FiveMinutes);
+        let sys = "store-test-persona";
+        let first = fp_of(&c, &cache_prompt(sys, None, grown(5)));
+        assert!(lookup_previous(&first).is_none());
+        store_request(first.clone(), None, Some("msg_1".into()));
+
+        let next = fp_of(&c, &cache_prompt(sys, None, grown(7)));
+        let prev = lookup_previous(&next).expect("same key");
+        assert_eq!(prev.message_id.as_deref(), Some("msg_1"));
+        store_request(next.clone(), Some(&prev), Some("msg_2".into()));
+
+        let trimmed = fp_of(&c, &cache_prompt(sys, None, grown(9).split_off(2)));
+        assert_ne!(trimmed.key, next.key);
+        let prev = lookup_previous(&trimmed).expect("front-trim match");
+        assert_eq!(prev.message_id.as_deref(), Some("msg_2"));
+
+        for i in 0..(FINGERPRINT_STORE_CAP * 2) {
+            let mut fp = first.clone();
+            fp.key = 1_000 + i as u64;
+            store_request(fp, None, None);
+        }
+        assert!(fingerprint_store().lock().unwrap().len() <= FINGERPRINT_STORE_CAP);
+    }
+
+    #[test]
+    fn miss_line_names_divergence_without_content() {
+        let c = cache_connector("claude-opus-4-8", true, ClaudeCacheTtl::FiveMinutes);
+        let prev_fp = fp_of(&c, &cache_prompt("s", None, grown(7)));
+        let mut edited = grown(7);
+        edited[3] = text_msg(ChatRole::Assistant, "SECRET-CONTENT");
+        let state = CacheDiagState {
+            fingerprint: fp_of(&c, &cache_prompt("s", None, edited)),
+            previous: None,
+        };
+        let prev = PreviousRequest {
+            fingerprint: prev_fp,
+            message_id: None,
+            age: std::time::Duration::from_secs(12),
+        };
+        let line = format_miss_line(&state, &prev, 1200, 67000);
+        assert!(line.contains("read=1200 written=67000"));
+        assert!(line.contains("prev_messages=7 new_messages=7"));
+        assert!(line.contains("messages[3] changed (role=assistant, blocks=[text]) kind=in-place edit"));
+        assert!(!line.contains("SECRET"));
+        assert!(is_notable_miss(5000, 100, true));
+        assert!(is_notable_miss(0, 0, true));
+        assert!(!is_notable_miss(100, 9000, true));
+        assert!(!is_notable_miss(9000, 0, false));
+    }
+
+    #[test]
+    fn cache_diagnostics_adds_field_and_header_only_when_on() {
+        let on = ClaudeConnector::new(ClaudeConfig {
+            model: "claude-opus-4-8".to_string(),
+            cache_diagnostics: true,
+            ..Default::default()
+        });
+        let off = cache_connector("claude-opus-4-8", true, ClaudeCacheTtl::FiveMinutes);
+        assert_eq!(on.anthropic_beta_header().as_deref(), Some("cache-diagnosis-2026-04-07"));
+        assert_eq!(off.anthropic_beta_header(), None);
+
+        let (mut req, _) = on.build_request(&cache_prompt("s", None, grown(1)), true);
+        on.apply_cache_diagnostics(&mut req, Some("msg_abc"));
+        assert_eq!(req["diagnostics"], json!({ "previous_message_id": "msg_abc" }));
+        on.apply_cache_diagnostics(&mut req, None);
+        assert_eq!(req["diagnostics"], json!({ "previous_message_id": null }));
+
+        let (mut req, _) = off.build_request(&cache_prompt("s", None, grown(1)), true);
+        off.apply_cache_diagnostics(&mut req, Some("msg_abc"));
+        assert!(req.get("diagnostics").is_none());
+    }
+
+    #[test]
+    fn prepare_request_fingerprints_before_diagnostics_field() {
+        let on = ClaudeConnector::new(ClaudeConfig {
+            model: "claude-opus-4-8".to_string(),
+            cache_diagnostics: true,
+            ..Default::default()
+        });
+        let (req, state) = on.prepare_request(&cache_prompt("prepare-test", None, grown(3)));
+        assert!(req.get("diagnostics").is_some());
+        assert!(state.is_some());
+    }
+
+    #[test]
+    fn scan_line_meta_finds_message_id_and_diagnostics_defensively() {
+        let start = r#"data: {"type":"message_start","message":{"id":"msg_01","usage":{"input_tokens":5}}}"#;
+        let m = scan_line_meta(start);
+        assert_eq!(m.message_id.as_deref(), Some("msg_01"));
+        assert_eq!(m.diagnostics, None);
+
+        let nested = r#"data: {"type":"message_start","message":{"id":"msg_02","diagnostics":{"cache_miss":{"component":"tools"}}}}"#;
+        assert_eq!(
+            scan_line_meta(nested).diagnostics,
+            Some(json!({ "cache_miss": { "component": "tools" } }))
+        );
+        let delta = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"diagnostics":{"x":1}}"#;
+        assert_eq!(scan_line_meta(delta).diagnostics, Some(json!({ "x": 1 })));
+
+        let text = r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"diagnostics"}}"#;
+        assert_eq!(scan_line_meta(text), LineMeta::default());
+    }
+
+    #[test]
+    fn old_claude_config_json_defaults_cache_diagnostics_off() {
+        let cfg: ClaudeConfig =
+            serde_json::from_str(r#"{"model":"claude-opus-5-5","summary_model":null}"#).unwrap();
+        assert!(!cfg.cache_diagnostics);
     }
 }
