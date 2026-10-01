@@ -1695,6 +1695,66 @@ pub(in super::super) fn GeneralTab(
                                                         }
                                                     }
                                                     p { class: "text-xs text-fg-muted mt-1", "Cache writes cost 1.25x the input price (5 minutes) or 2x (1 hour); reads cost a small fraction." }
+                                                    if !one_hour {
+                                                        {
+                                                            let ka = local_settings.read().claude_config.keepalive_enabled;
+                                                            let max_idle = local_settings.read().claude_config.keepalive_max_idle_minutes;
+                                                            let cap = local_settings.read().claude_config.keepalive_daily_cap_usd;
+                                                            let on_cls = "px-3 py-1 rounded-md text-sm font-medium bg-btn-primary text-fg";
+                                                            let off_cls = "px-3 py-1 rounded-md text-sm font-medium bg-input text-fg-muted hover:text-fg";
+                                                            rsx! {
+                                                                div {
+                                                                    class: "mt-3 flex items-center justify-between",
+                                                                    label { class: "block text-sm font-medium text-fg-muted", "Keep cache warm while I'm away" }
+                                                                    button {
+                                                                        class: if ka { on_cls } else { off_cls },
+                                                                        onclick: move |_| {
+                                                                            let cur = local_settings.read().claude_config.keepalive_enabled;
+                                                                            local_settings.write().claude_config.keepalive_enabled = !cur;
+                                                                        },
+                                                                        if ka { "On" } else { "Off" }
+                                                                    }
+                                                                }
+                                                                p { class: "text-xs text-fg-muted mt-1", "Sends a tiny request every ~4 minutes to an idle tab so its cache doesn't expire (a refresh costs a tenth of a rewrite)." }
+                                                                if ka {
+                                                                    div {
+                                                                        class: "mt-3 flex items-center justify-between",
+                                                                        label { class: "block text-sm font-medium text-fg-muted", "Stop after idle for" }
+                                                                        div {
+                                                                            class: "flex gap-2",
+                                                                            for m in [15u32, 30, 60] {
+                                                                                button {
+                                                                                    key: "ka-idle-{m}",
+                                                                                    class: if max_idle == m { on_cls } else { off_cls },
+                                                                                    onclick: move |_| {
+                                                                                        local_settings.write().claude_config.keepalive_max_idle_minutes = m;
+                                                                                    },
+                                                                                    "{m} min"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    div {
+                                                                        class: "mt-3 flex items-center justify-between",
+                                                                        label { class: "block text-sm font-medium text-fg-muted", "Daily spend cap" }
+                                                                        div {
+                                                                            class: "flex gap-2",
+                                                                            for c in [0.5f64, 1.0, 2.0, 5.0] {
+                                                                                button {
+                                                                                    key: "ka-cap-{c}",
+                                                                                    class: if (cap - c).abs() < 1e-9 { on_cls } else { off_cls },
+                                                                                    onclick: move |_| {
+                                                                                        local_settings.write().claude_config.keepalive_daily_cap_usd = c;
+                                                                                    },
+                                                                                    "${c:.2}"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
