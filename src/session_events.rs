@@ -223,6 +223,7 @@ fn blank_session() -> Session {
         tab_emoji: None,
         tab_title: None,
         name_user_set: false,
+        tab_title_provisional: false,
     }
 }
 

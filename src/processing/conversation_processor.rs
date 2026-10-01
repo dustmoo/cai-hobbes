@@ -23,6 +23,13 @@ impl ConversationProcessor {
         session: &Session,
         _settings: &Settings,
     ) -> Option<ConversationSummary> {
+        // Nothing to summarize yet. The profile note below is always present,
+        // so without this an empty tab (e.g. a profile switch's ForceRefresh
+        // on a fresh tab) gets a summary of just that note.
+        if session.messages.is_empty() {
+            return None;
+        }
+
         // 1. Get the previous summary from the active context by serializing the struct
         let previous_summary = serde_json::to_string(&session.active_context.conversation_summary)
             .unwrap_or_else(|e| {

@@ -129,31 +129,46 @@ pub fn normalize_tab_title(raw: Option<&str>) -> Option<String> {
     }
 }
 
+/// User messages a tab needs before its title stops being provisional. The
+/// first title lands early (after the first real exchange) so every tab —
+/// including background/dispatched ones — gets an identity quickly; the first
+/// summary once the conversation reaches this many user messages may replace
+/// it once, and then the title locks for good.
+pub const TAB_TITLE_MATURE_USER_MESSAGES: usize = 3;
+
 /// Applies an AI-proposed tab emoji/topic from a freshly computed
 /// [`ConversationSummary`] to `session.tab_title`/`tab_emoji`, normalizing
 /// both first (never applied raw) and honoring the `name_user_set` guard — a
 /// user rename always wins, forever.
 ///
-/// This only ever writes the TITLE once per tab: as soon as `tab_title` has
-/// a value (from an earlier call here), later calls are a no-op even though
-/// `name_user_set` is still false. Without this, every subsequent summary
-/// (each idle pause, each tool-call turn) would keep re-proposing a
-/// title/emoji as the conversation's topic drifts — a tab you'd already
-/// learned to recognize would relabel itself out from under you while
-/// switching between a handful of tabs, which is more disorienting than a
-/// once-picked title going slightly stale.
+/// Nothing is written until the tab has at least one user message: a summary
+/// of an empty tab (e.g. the profile-switch `ForceRefresh`, which sees only a
+/// "current Composio profile" system note) otherwise names the tab after that
+/// note ("Profile Setup") before the user has said anything.
+///
+/// The TITLE is written at most twice per tab:
+/// 1. A provisional title from the first summary that proposes one
+///    (`tab_title_provisional = true` while the tab is still short).
+/// 2. One retitle from the first summary after the tab reaches
+///    [`TAB_TITLE_MATURE_USER_MESSAGES`] user messages — an opening exchange
+///    is often too thin to name the conversation it turns into. The title
+///    then locks (`tab_title_provisional = false`).
+///
+/// After that, later summaries (each idle pause, each tool-call turn) are a
+/// no-op. Without the lock the tab would keep re-proposing a title as the
+/// conversation's topic drifts — a tab you'd already learned to recognize
+/// would relabel itself out from under you while switching between a
+/// handful of tabs, which is more disorienting than a picked title going
+/// slightly stale.
 ///
 /// The lock is keyed on `tab_title` specifically, NOT `tab_emoji` —
 /// `normalize_tab_emoji` always returns a fallback glyph even when the raw
 /// proposal was empty/invalid (it never produces `None`), so an early,
-/// low-quality summary (e.g. seconds after a brand new tab opens, before
-/// there's enough conversation for a real topic) reliably writes SOME emoji
-/// while leaving `tab_title` empty. Locking on emoji too would freeze that
-/// tab on a bare fallback emoji + date forever, with the real title that a
-/// later, more mature summary would have proposed never getting a chance to
-/// land. Emoji may keep refreshing (harmlessly re-picking the same fallback,
-/// or a better one once the model has more to go on) until a real title
-/// finally arrives, at which point both lock together.
+/// low-quality summary reliably writes SOME emoji while leaving `tab_title`
+/// empty. Locking on emoji too would freeze that tab on a bare fallback
+/// emoji + date forever. Emoji may keep refreshing until a real title
+/// arrives; on the mature retitle, emoji is only replaced together with a
+/// title so the pair stays consistent.
 ///
 /// Every caller that computes a `ConversationSummary` (the proactive
 /// tool-call-turn summarizer in `stream_manager.rs`, and the idle-inactivity
@@ -166,8 +181,8 @@ pub fn normalize_tab_title(raw: Option<&str>) -> Option<String> {
 ///
 /// Returns `Some((emoji, title))` when it actually wrote something, for the
 /// caller to journal as `SessionEvent::TabTitled`; `None` when the summary
-/// carried no proposal, the tab already has an identity (user-set or
-/// AI-proposed), or was renamed by the user.
+/// carried no proposal, the tab's identity is locked (user-set or a final AI
+/// title), the tab is still too short to retitle, or it has no user message.
 pub fn apply_tab_identity_from_summary(
     session: &mut Session,
     summary: &ConversationSummary,
@@ -175,7 +190,13 @@ pub fn apply_tab_identity_from_summary(
     if session.name_user_set {
         return None;
     }
-    if session.tab_title.is_some() {
+    let user_messages = session.user_message_count();
+    if user_messages == 0 {
+        return None;
+    }
+    let mature = user_messages >= TAB_TITLE_MATURE_USER_MESSAGES;
+    let retitling = session.tab_title.is_some();
+    if retitling && !(session.tab_title_provisional && mature) {
         return None;
     }
     let raw_title = summary.tab_title.as_deref();
@@ -184,9 +205,14 @@ pub fn apply_tab_identity_from_summary(
         return None;
     }
     let title = normalize_tab_title(raw_title);
+    if retitling && title.is_none() {
+        // Keep the provisional title; a later summary gets another try.
+        return None;
+    }
     let emoji = normalize_tab_emoji(raw_emoji);
     if let Some(title) = &title {
         session.tab_title = Some(title.clone());
+        session.tab_title_provisional = !mature;
     }
     session.tab_emoji = Some(emoji.clone());
     Some((Some(emoji), title))
@@ -318,6 +344,12 @@ pub struct Session {
     /// overwrites `name`/`tab_title` again once this is set.
     #[serde(default)]
     pub name_user_set: bool,
+    /// True while `tab_title` is an early AI guess that the first summary
+    /// after [`TAB_TITLE_MATURE_USER_MESSAGES`] user messages may replace
+    /// once. False for locked titles, programmatic titles, and every tab
+    /// saved before this field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tab_title_provisional: bool,
 }
 
 /// Stamp `created_at` on a message that is already in `messages`, without
@@ -385,6 +417,29 @@ pub fn move_message_to_end(
 }
 
 impl Session {
+    /// Number of messages the user wrote in this tab.
+    pub fn user_message_count(&self) -> usize {
+        self.messages.iter().filter(|m| m.author == "User").count()
+    }
+
+    /// True when a summary could still set or refine this tab's title: it has
+    /// a user message, no user rename, and either no title yet or a
+    /// provisional one that is now old enough to be replaced. The turn-end
+    /// summarizer uses this to summarize tabs the idle scheduler never
+    /// reaches (e.g. background tabs from HOBBES_DISPATCH).
+    pub fn wants_tab_identity(&self) -> bool {
+        if self.name_user_set {
+            return false;
+        }
+        let user_messages = self.user_message_count();
+        if user_messages == 0 {
+            return false;
+        }
+        self.tab_title.is_none()
+            || (self.tab_title_provisional
+                && user_messages >= TAB_TITLE_MATURE_USER_MESSAGES)
+    }
+
     /// The tab's headline label: the user's own name wins forever, then the
     /// AI-derived topic, then the creation-date placeholder (`name`, before
     /// any rename or summary).
@@ -1506,6 +1561,7 @@ impl SessionState {
             tab_emoji: None,
             tab_title: None,
             name_user_set: false,
+            tab_title_provisional: false,
         };
         // Birth event: a journal that starts with SessionCreated is
         // "journal-complete" and can be rebuilt from nothing via project().
@@ -1841,7 +1897,113 @@ mod tests {
             s.name = name.to_string();
             s.name_user_set = name_user_set;
             s.tab_title = tab_title.map(str::to_string);
+            add_user_messages(&mut s, 1);
             s
+        }
+
+        fn add_user_messages(s: &mut Session, n: usize) {
+            for _ in 0..n {
+                s.messages.push(crate::components::chat::Message {
+                    id: uuid::Uuid::new_v4(),
+                    author: "User".to_string(),
+                    content: crate::components::shared::MessageContent::Text {
+                        content: "hi".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                        signature_provider: None,
+                    },
+                    attachments: Vec::new(),
+                    comments: Vec::new(),
+                    created_at: Utc::now(),
+                    usage: None,
+                });
+            }
+        }
+
+        fn proposal(title: &str, emoji: &str) -> ConversationSummary {
+            ConversationSummary {
+                tab_title: Some(title.to_string()),
+                tab_emoji: Some(emoji.to_string()),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn an_empty_tab_is_never_titled() {
+            // A profile switch's ForceRefresh summarizes a fresh tab that
+            // only carries a system note; that must not name the tab.
+            let mut session = create_test_session();
+            let result =
+                apply_tab_identity_from_summary(&mut session, &proposal("Profile Setup", "🆔"));
+            assert_eq!(result, None);
+            assert_eq!(session.tab_title, None);
+            assert_eq!(session.tab_emoji, None);
+            assert!(!session.wants_tab_identity());
+        }
+
+        #[test]
+        fn an_early_title_is_provisional_and_replaced_once_the_tab_matures() {
+            let mut session = session_with("Sep 30 - 09:00 AM", false, None);
+            assert!(session.wants_tab_identity());
+            apply_tab_identity_from_summary(&mut session, &proposal("Quick question", "❓"))
+                .expect("first title lands");
+            assert!(session.tab_title_provisional);
+            assert!(!session.wants_tab_identity());
+
+            // Still short: later summaries don't touch the provisional title.
+            add_user_messages(&mut session, 1);
+            assert_eq!(
+                apply_tab_identity_from_summary(&mut session, &proposal("Other", "🐛")),
+                None
+            );
+            assert_eq!(session.tab_title.as_deref(), Some("Quick question"));
+
+            // Mature: one retitle, then locked.
+            add_user_messages(&mut session, TAB_TITLE_MATURE_USER_MESSAGES - 2);
+            assert!(session.wants_tab_identity());
+            apply_tab_identity_from_summary(&mut session, &proposal("Trust dispatch", "🎯"))
+                .expect("mature retitle lands");
+            assert_eq!(session.tab_title.as_deref(), Some("Trust dispatch"));
+            assert_eq!(session.tab_emoji.as_deref(), Some("🎯"));
+            assert!(!session.tab_title_provisional);
+            assert!(!session.wants_tab_identity());
+
+            add_user_messages(&mut session, 5);
+            assert_eq!(
+                apply_tab_identity_from_summary(&mut session, &proposal("Drifted", "🐛")),
+                None
+            );
+            assert_eq!(session.tab_title.as_deref(), Some("Trust dispatch"));
+        }
+
+        #[test]
+        fn a_mature_summary_without_a_title_keeps_the_provisional_one_open() {
+            let mut session = session_with("Sep 30 - 09:00 AM", false, None);
+            apply_tab_identity_from_summary(&mut session, &proposal("Quick question", "❓"));
+            add_user_messages(&mut session, TAB_TITLE_MATURE_USER_MESSAGES);
+            assert_eq!(
+                apply_tab_identity_from_summary(&mut session, &proposal("", "🐛")),
+                None
+            );
+            assert_eq!(session.tab_title.as_deref(), Some("Quick question"));
+            assert_eq!(session.tab_emoji.as_deref(), Some("❓"));
+            assert!(session.tab_title_provisional);
+        }
+
+        #[test]
+        fn a_title_first_set_on_a_mature_tab_locks_immediately() {
+            let mut session = session_with("Sep 30 - 09:00 AM", false, None);
+            add_user_messages(&mut session, TAB_TITLE_MATURE_USER_MESSAGES);
+            apply_tab_identity_from_summary(&mut session, &proposal("Trust dispatch", "🎯"));
+            assert!(!session.tab_title_provisional);
+            assert!(!session.wants_tab_identity());
+        }
+
+        #[test]
+        fn a_user_renamed_tab_never_wants_identity() {
+            let mut session = session_with("Mine", true, None);
+            add_user_messages(&mut session, 5);
+            assert!(!session.wants_tab_identity());
         }
 
         fn create_test_session() -> Session {
@@ -1870,6 +2032,7 @@ mod tests {
                 tab_emoji: None,
                 tab_title: None,
                 name_user_set: false,
+            tab_title_provisional: false,
             }
         }
 
@@ -2712,6 +2875,7 @@ mod tests {
             tab_emoji: None,
             tab_title: None,
             name_user_set: false,
+            tab_title_provisional: false,
             messages: vec![
                 Message {
                     id: msg1_id,

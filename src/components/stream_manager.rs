@@ -1359,7 +1359,7 @@ impl StreamManagerContext {
                         .read()
                         .sessions
                         .get(&session_id)
-                        .map(|s| (s.messages.len(), s.tab_title.is_none() && !s.name_user_set))
+                        .map(|s| (s.messages.len(), s.wants_tab_identity()))
                         .unwrap_or((0, false));
                     let (tuning, context_tokens, enable_summarization) = {
                         let settings_guard = self.settings.read();
@@ -1398,10 +1398,11 @@ impl StreamManagerContext {
                         "Proactive summarizer: dynamic threshold resolved"
                     );
 
-                    // An untitled tab also summarizes here: a tab working in the
-                    // background (e.g. HOBBES_DISPATCH) is never the active tab
-                    // when the idle scheduler fires, so this is its only chance
-                    // to get an emoji/topic.
+                    // A tab still wanting its title (none yet, or a provisional
+                    // one now old enough to replace) also summarizes here: a tab
+                    // working in the background (e.g. HOBBES_DISPATCH) is never
+                    // the active tab when the idle scheduler fires, so this is
+                    // its only chance to get an emoji/topic.
                     if (msg_count >= threshold || needs_identity)
                         && msg_count > 0
                         && enable_summarization
