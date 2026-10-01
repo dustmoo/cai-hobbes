@@ -1652,6 +1652,7 @@ impl SessionState {
     }
 
     pub fn delete_session_raw(&mut self, id: &str) {
+        crate::llm::claude::keepalive::cancel_session(id);
         // Harvest cost/token data before destruction so lifetime counters survive deletion
         if let Some(session) = self.sessions.get(id) {
             self.lifetime_cost += session.total_cost();

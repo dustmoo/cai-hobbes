@@ -4,6 +4,8 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+pub mod keepalive;
+
 use super::claude_models::ClaudeModel;
 use super::config::{ClaudeCacheTtl, ClaudeConfig};
 use super::convert::{LlmFormatConverter, StreamEvent};
@@ -557,11 +559,12 @@ impl ClaudeConnector {
 
     /// Build the request, fingerprint it (before the `diagnostics` field is
     /// added) and match it to the previous request of this conversation.
-    fn prepare_request(&self, prompt: &LlmPrompt) -> (Value, Option<CacheDiagState>) {
+    fn prepare_request(&self, prompt: &LlmPrompt) -> (Value, Option<CacheDiagState>, bool) {
         let (mut request, tail) = self.build_request(prompt, true);
+        let turn_start = keepalive::is_turn_start(&request, tail);
         if !self.config.prompt_caching_enabled {
             self.apply_cache_diagnostics(&mut request, None);
-            return (request, None);
+            return (request, None, turn_start);
         }
         let fingerprint = fingerprint_request(&request, tail);
         let previous = lookup_previous(&fingerprint);
@@ -576,6 +579,7 @@ impl ClaudeConnector {
                 fingerprint,
                 previous,
             }),
+            turn_start,
         )
     }
 
@@ -903,6 +907,26 @@ impl ClaudeConnector {
     }
 }
 
+/// Ties a keep-alive registration to one real request: `finish` re-arms the
+/// refresh timer; dropping unfinished (error, cancel) just clears the busy flag.
+struct KeepaliveGuard(Option<String>);
+
+impl KeepaliveGuard {
+    fn finish(&mut self, body: &str, input: i32, read: Option<i32>, created: Option<i32>) {
+        if let Some(id) = self.0.take() {
+            keepalive::finish_request(&id, body, input, read, created);
+        }
+    }
+}
+
+impl Drop for KeepaliveGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            keepalive::abort_request(&id);
+        }
+    }
+}
+
 #[async_trait]
 impl LlmConnector for ClaudeConnector {
     async fn generate_content_stream(
@@ -910,7 +934,7 @@ impl LlmConnector for ClaudeConnector {
         prompt_data: LlmPrompt,
         tx: mpsc::UnboundedSender<StreamMessage>,
         _mcp_context: Option<McpContext>,
-        _session_id: Option<String>,
+        session_id: Option<String>,
     ) {
         let api_key = match self.resolve_api_key() {
             Ok(k) => k,
@@ -924,8 +948,11 @@ impl LlmConnector for ClaudeConnector {
             }
         };
 
-        let (native_request, mut cache_state) = self.prepare_request(&prompt_data);
+        let (native_request, mut cache_state, turn_start) = self.prepare_request(&prompt_data);
         let beta_header = self.anthropic_beta_header();
+        // Keep-alive bookkeeping needs the session; every exit path below
+        // either `finish`es or `abort`s the request via this guard.
+        let mut ka_guard = KeepaliveGuard(None);
 
         // Reverse-map prefixed tool names → (server_name, tool_name), matching the
         // exact format prompt_builder uses for history. Anthropic echoes the tool
@@ -950,6 +977,16 @@ impl LlmConnector for ClaudeConnector {
 
         let mut body_str = serde_json::to_string(&native_request)
             .expect("Failed to serialize Claude request body");
+
+        if let (Some(id), true) = (session_id.as_deref(), cache_state.is_some()) {
+            keepalive::begin_request(keepalive::RequestStart {
+                session_id: id,
+                config: &self.config,
+                api_key: &api_key,
+                turn_start,
+            });
+            ka_guard.0 = Some(id.to_string());
+        }
 
         let model_for_cost = ClaudeModel::from_slug(&self.config.model);
 
@@ -1066,7 +1103,7 @@ impl LlmConnector for ClaudeConnector {
                             messages: stripped_messages,
                             tools: prompt_data.tools.clone(),
                         };
-                        let (stripped_native, stripped_state) =
+                        let (stripped_native, stripped_state, _) =
                             self.prepare_request(&stripped_prompt);
                         cache_state = stripped_state;
                         body_str = serde_json::to_string(&stripped_native)
@@ -1225,6 +1262,7 @@ impl LlmConnector for ClaudeConnector {
                             }
                             StreamEvent::Done => {
                                 flush_tool_calls(&mut pending_tool_calls, &tx);
+                                ka_guard.finish(&body_str, usage_prompt, usage_cached, usage_created);
                                 self.finish_cache_diag(
                                     cache_state.take(),
                                     usage_created,
@@ -1257,6 +1295,7 @@ impl LlmConnector for ClaudeConnector {
 
             // Stream ended without an explicit message_stop — flush what we have.
             flush_tool_calls(&mut pending_tool_calls, &tx);
+            ka_guard.finish(&body_str, usage_prompt, usage_cached, usage_created);
             self.finish_cache_diag(
                 cache_state.take(),
                 usage_created,
@@ -2544,7 +2583,7 @@ mod tests {
             cache_diagnostics: true,
             ..Default::default()
         });
-        let (req, state) = on.prepare_request(&cache_prompt("prepare-test", None, grown(3)));
+        let (req, state, _) = on.prepare_request(&cache_prompt("prepare-test", None, grown(3)));
         assert!(req.get("diagnostics").is_some());
         assert!(state.is_some());
     }
