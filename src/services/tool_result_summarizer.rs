@@ -159,6 +159,7 @@ mod tests {
             tab_title: None,
             name_user_set: false,
             tab_title_provisional: false,
+            history_anchor: None,
         }
     }
 

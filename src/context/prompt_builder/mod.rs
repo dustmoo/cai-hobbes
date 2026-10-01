@@ -144,6 +144,7 @@ impl<'a> PromptBuilder<'a> {
                 tools: ctx.tools,
             },
             pages_to_store: linearised.pages_to_store,
+            history_anchor: linearised.history_anchor,
         }
     }
 

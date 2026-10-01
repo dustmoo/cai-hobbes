@@ -38,6 +38,7 @@ fn create_test_session() -> Session {
         tab_title: None,
         name_user_set: false,
         tab_title_provisional: false,
+        history_anchor: None,
     }
 }
 
@@ -1646,4 +1647,299 @@ fn budget_applies_across_stable_and_volatile_parts() {
     let mut big_text = base();
     PromptBuilder::compose_system_for_budget(&mut big_text, budget_chars, Some(1000), &tuning);
     assert!(!big_text.contains_key("composio_context"), "fixed text counts");
+}
+
+// =========================================================================
+// Forward-only history window (prompt-cache stable trimming)
+// =========================================================================
+
+use super::message_history::resolve_history_window;
+
+/// A realistic message stream: turn `t` is a user text, `2 + t % 4` tool
+/// calls, then the assistant's reply. `reply_len` pads the reply so the char
+/// budget can bind on small windows.
+fn realistic_stream(turns: usize, reply_len: usize) -> Vec<Message> {
+    let mut out = Vec::new();
+    for t in 0..turns {
+        out.push(user_text_msg(&format!("request number {t}")));
+        for k in 0..(2 + t % 4) {
+            out.push(tool_call_msg(
+                &format!("TOOL_{k}"),
+                format!("{{\"turn\":{t},\"step\":{k},\"ok\":true}}"),
+                None,
+            ));
+        }
+        let mut reply = format!("Reply to request {t}. ");
+        while reply.len() < reply_len {
+            reply.push_str("More detail about the result. ");
+        }
+        out.push(assistant_text_msg(&reply));
+    }
+    out
+}
+
+fn is_user_text(m: &Message) -> bool {
+    m.author == "User" && matches!(m.content, MessageContent::Text { .. })
+}
+
+/// Outgoing messages minus a trailing continuation nudge — the nudge is
+/// request-only scaffolding at the tail, never part of a cached prefix.
+fn outgoing_history(result: &PromptBuildResult) -> Vec<ChatMessage> {
+    let mut msgs = result.prompt.messages.clone();
+    if msgs.last().is_some_and(|m| {
+        matches!(&m.content[..], [ContentBlock::Text { text }] if text == CONTINUATION_NUDGE)
+    }) {
+        msgs.pop();
+    }
+    msgs
+}
+
+struct GrowthReport {
+    builds: usize,
+    trims: usize,
+    max_included: usize,
+}
+
+/// Append `stream` to `session` one message at a time, building (and
+/// persisting the anchor, as `chat.rs` does) after every append. Asserts the
+/// cache-stability invariants on every step and returns trim statistics.
+fn grow_and_check(session: &mut Session, settings: &Settings, stream: Vec<Message>) -> GrowthReport {
+    let mut prev: Option<Vec<ChatMessage>> = None;
+    let mut report = GrowthReport { builds: 0, trims: 0, max_included: 0 };
+    for msg in stream {
+        session.messages.push(msg);
+        let anchor_before = session.history_anchor;
+        let result = PromptBuilder::new(session, settings).build_prompt(String::new());
+        session.history_anchor = result.history_anchor;
+        report.builds += 1;
+        let current = outgoing_history(&result);
+
+        let start = session
+            .history_anchor
+            .and_then(|id| session.messages.iter().position(|m| m.id == id))
+            .unwrap_or(0);
+        report.max_included = report.max_included.max(session.messages.len() - start);
+
+        if session.history_anchor != anchor_before {
+            report.trims += 1;
+            let latest_user = session.messages.iter().rposition(is_user_text).unwrap();
+            assert!(
+                is_user_text(&session.messages[start]),
+                "a trim must cut at a user text message (turn start)"
+            );
+            assert!(start < latest_user, "a trim must never cut into the current turn");
+            assert!(
+                anchor_before
+                    .and_then(|id| session.messages.iter().position(|m| m.id == id))
+                    .is_none_or(|old| old < start),
+                "the anchor only moves forward"
+            );
+        } else if let Some(prev) = &prev {
+            assert!(
+                current.len() >= prev.len() && current[..prev.len()] == prev[..],
+                "without a trim, build {} must extend the previous request exactly \
+                 (prev {} msgs, now {} msgs)",
+                report.builds,
+                prev.len(),
+                current.len()
+            );
+        }
+        prev = Some(current);
+    }
+    report
+}
+
+/// The Opus 5.5 regression: past the history limit the window used to slide
+/// by one message per request, so the message after the pinned first user
+/// message changed every time and the provider cache missed all history.
+#[test]
+fn history_window_is_prefix_stable_and_trims_in_chunks() {
+    let mut session = create_test_session();
+    let settings = Settings::default();
+    let limit = settings.chat_history_length;
+    // ~3x the limit, in realistic turns.
+    let stream = realistic_stream(60, 200);
+    let total = stream.len();
+    assert!(total >= 3 * limit, "stream should reach ~3x the limit ({total})");
+
+    let report = grow_and_check(&mut session, &settings, stream);
+    assert_eq!(report.builds, total);
+    assert!(report.trims >= 2, "a 3x-limit chat must trim more than once");
+    // A trim drops to <= 2/3 of the limit, so the next one is >= ~limit/3
+    // messages away: at most one per chunk, never one per message.
+    let max_trims = total / (limit / 3) + 1;
+    assert!(
+        report.trims <= max_trims,
+        "{} trims over {} builds — expected at most {max_trims}",
+        report.trims,
+        total
+    );
+    // The window never grows past the limit by more than one turn's worth.
+    assert!(
+        report.max_included <= limit + 7,
+        "included history {} exceeded the limit {limit}",
+        report.max_included
+    );
+}
+
+/// Same invariants on a finite (16K) window where the char budget, not the
+/// message count, decides when to trim — and the history still fits.
+#[test]
+fn small_window_trims_in_chunks_and_still_fits() {
+    let mut session = create_test_session();
+    session.llm_provider = Some(LlmProvider::OpenAiCompat);
+    session.chat_model = Some("local-model".to_string());
+    let mut settings = Settings::default();
+    settings.openai_compat_config.endpoint = "http://localhost:11434/v1".to_string();
+    settings.openai_compat_config.max_context_tokens = Some(16_000);
+
+    let stream = realistic_stream(40, 4_000);
+    let total = stream.len();
+    let report = grow_and_check(&mut session, &settings, stream);
+    assert!(report.trims >= 2, "the char budget should force trims on 16K");
+    assert!(
+        report.trims * 5 < total,
+        "{} trims over {} builds is not chunked",
+        report.trims,
+        total
+    );
+    assert!(
+        report.max_included < settings.chat_history_length,
+        "the char budget, not the count, should bind here"
+    );
+
+    // The final request still fits the window.
+    let builder = PromptBuilder::new(&session, &settings);
+    let tuning = builder.effective_tuning();
+    let result = builder.build_prompt(String::new());
+    let message_chars: usize = result
+        .prompt
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .map(|b| match b {
+            ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => text.len(),
+            ContentBlock::ToolCall { name, arguments, .. } => name.len() + arguments.to_string().len(),
+            ContentBlock::ToolResult { content, .. } => content.to_string().len(),
+            _ => 0,
+        })
+        .sum();
+    let window_chars = (16_000.0 * tuning.chars_per_token) as usize;
+    let system_chars = result.prompt.system.as_deref().map_or(0, str::len);
+    assert!(
+        system_chars + message_chars <= window_chars,
+        "request ({system_chars} system + {message_chars} history chars) must fit {window_chars}"
+    );
+}
+
+/// A session saved before the anchor existed deserializes with no anchor, and
+/// a set anchor round-trips.
+#[test]
+fn session_without_history_anchor_deserializes() {
+    let mut session = create_test_session();
+    session.messages = realistic_stream(1, 10);
+    let mut json = serde_json::to_value(&session).unwrap();
+    assert!(json.get("history_anchor").is_none(), "None is not serialized");
+    json.as_object_mut().unwrap().remove("history_anchor");
+    let old: Session = serde_json::from_value(json).expect("old session JSON loads");
+    assert_eq!(old.history_anchor, None);
+
+    session.history_anchor = Some(session.messages[0].id);
+    let round: Session =
+        serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+    assert_eq!(round.history_anchor, session.history_anchor);
+}
+
+/// A deleted anchor (rewind, message removal) recovers by recomputing from
+/// the start of the chat — the same result a session with no anchor gets.
+#[test]
+fn deleted_history_anchor_recovers() {
+    let settings = Settings::default();
+    let mut session = create_test_session();
+    let _ = grow_and_check(&mut session, &settings, realistic_stream(40, 200));
+    let anchor = session.history_anchor.expect("a long chat has an anchor");
+
+    // Delete the anchor message itself.
+    session.messages.retain(|m| m.id != anchor);
+    let recovered = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+    let mut fresh = session.clone();
+    fresh.history_anchor = None;
+    let from_scratch = PromptBuilder::new(&fresh, &settings).build_prompt(String::new());
+
+    assert_eq!(recovered.history_anchor, from_scratch.history_anchor);
+    assert_eq!(recovered.prompt.messages, from_scratch.prompt.messages);
+    let new_anchor = recovered.history_anchor.expect("still over the limit — re-anchored");
+    let idx = session.messages.iter().position(|m| m.id == new_anchor).unwrap();
+    assert!(is_user_text(&session.messages[idx]));
+    let limit = settings.chat_history_length;
+    assert!(session.messages.len() - idx <= limit * 2 / 3, "re-anchored at the low-water mark");
+}
+
+/// The window never cuts into the in-progress turn: a single turn longer than
+/// the limit keeps its whole run (and its user message) rather than splitting.
+#[test]
+fn history_window_never_cuts_into_the_current_turn() {
+    let mut messages = vec![user_text_msg("first"), assistant_text_msg("ok")];
+    messages.push(user_text_msg("long task"));
+    for k in 0..30 {
+        messages.push(tool_call_msg(&format!("T{k}"), "{}".to_string(), None));
+    }
+    let window = resolve_history_window(&messages, None, Some(0), 10, None);
+    assert!(
+        window.start_index <= 2,
+        "the current turn's user message (idx 2) must stay in the window"
+    );
+    // Re-resolving with the returned anchor is a fixed point.
+    let again = resolve_history_window(&messages, window.anchor, Some(0), 10, None);
+    assert_eq!(again, window);
+}
+
+/// Under the limit nothing moves: no anchor, the whole chat is sent.
+#[test]
+fn history_window_untouched_under_the_limit() {
+    let messages = realistic_stream(3, 10);
+    let window = resolve_history_window(&messages, None, Some(0), 75, None);
+    assert_eq!(window.start_index, 0);
+    assert_eq!(window.anchor, None);
+}
+
+/// A char budget that jitters between requests (the system prompt carries
+/// per-turn content) must not flip the window back and forth: after a trim,
+/// alternating budgets resolve the same window on every build.
+#[test]
+fn jittering_char_budget_does_not_flip_the_window() {
+    let messages = realistic_stream(30, 1_000);
+    let budget = 40_000usize;
+    let first = resolve_history_window(&messages, None, Some(0), 1_000, Some(budget));
+    assert!(first.anchor.is_some(), "the budget should force a trim");
+    let mut anchor = first.anchor;
+    for i in 0..20 {
+        // +/-5% wobble around the budget.
+        let b = if i % 2 == 0 { budget * 95 / 100 } else { budget * 105 / 100 };
+        let w = resolve_history_window(&messages, anchor, Some(0), 1_000, Some(b));
+        assert_eq!(w, first, "build {i}: window moved under a jittering budget");
+        anchor = w.anchor;
+    }
+}
+
+/// The live send pushes the user message (and an empty reply placeholder) onto
+/// the session before building, so the builder must be called with an empty
+/// `user_message`; the message must then appear exactly once, as the last turn.
+#[test]
+fn live_send_includes_the_user_message_once() {
+    let mut reply = user_text_msg("first reply");
+    reply.author = "Hobbes".to_string();
+    let mut placeholder = user_text_msg("");
+    placeholder.author = "Hobbes".to_string();
+    let mut session = create_test_session();
+    session.messages = vec![user_text_msg("first ask"), reply, user_text_msg("second ask"), placeholder];
+    let settings = Settings::default();
+    let result = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+    let msgs = &result.prompt.messages;
+    let count = msgs
+        .iter()
+        .filter(|m| m.content.iter().any(|b| matches!(b, crate::llm::ContentBlock::Text { text } if text == "second ask")))
+        .count();
+    assert_eq!(count, 1);
+    assert_eq!(msgs.last().map(|m| m.role.clone()), Some(crate::llm::ChatRole::User));
 }
